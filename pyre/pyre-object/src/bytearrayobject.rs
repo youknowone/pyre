@@ -5,12 +5,15 @@
 use crate::pyobject::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub static BYTEARRAY_TYPE: PyType = crate::pyobject::new_pytype("bytearray");
+pub static BYTEARRAY_TYPE: PyType =
+    crate::pyobject::new_pytype_with_user_subclass("bytearray", &BYTEARRAY_USER_TYPE);
+/// `W_BytearrayObjectUser` (`typedef.py _getusercls(W_BytearrayObject)`).
+pub static BYTEARRAY_USER_TYPE: PyType =
+    crate::pyobject::new_user_pytype("bytearray", &BYTEARRAY_TYPE);
 
 /// Python bytearray object.
 ///
-/// Layout: `[ob_header | data | length | alloc | logical_offset | exports |
-/// w_dict | w_weakreflifeline | w_slots]`
+/// Layout: `[ob_header | data | length | alloc | logical_offset | exports]`
 #[repr(C)]
 pub struct W_BytearrayObject {
     pub ob_header: PyObject,
@@ -52,16 +55,25 @@ pub struct W_BytearrayObject {
     /// `_exports` — count of active buffer exports.  Size-changing mutators
     /// are refused while this is positive (`_check_exports`).
     pub exports: i64,
-    /// Mapdict `dict`/`weakref` SPECIAL slots for user subclasses.
-    pub w_dict: PyObjectRef,
-    pub w_weakreflifeline: PyObjectRef,
-    /// PyPy `BaseUserClassMapdict` indexed slot storage for a user subclass.
-    /// Exact bytearrays and subclasses with no populated slots keep `PY_NULL`.
-    pub w_slots: PyObjectRef,
+}
+
+/// The translated user-subclass layout selected by `typedef.py _getusercls`.
+/// `W_BytearrayObject` remains the base payload; `MapdictStorageMixin`
+/// contributes its fields only to the generated user class.
+#[repr(C)]
+pub struct W_BytearrayObjectUser {
+    pub base: W_BytearrayObject,
+    pub map: usize,
+    pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 /// GC type id assigned to `W_BytearrayObject` at JitDriver init time.
 pub const W_BYTEARRAY_GC_TYPE_ID: u32 = 28;
+/// User-subclass bytearray layout (`typedef.py` `_getusercls`). Unconditional,
+/// so its tid sits with the other closed ids (164) ahead of the
+/// target-gated tail.
+pub const W_BYTEARRAY_USER_GC_TYPE_ID: u32 = 164;
+pub const W_BYTEARRAY_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_BytearrayObjectUser>();
 
 impl W_BytearrayObject {
     /// `_Py_atomic_load_ssize_relaxed(&ob_size)` on the byte count.
@@ -91,19 +103,20 @@ pub const BYTEARRAY_LOGICAL_OFFSET_OFFSET: usize =
     std::mem::offset_of!(W_BytearrayObject, logical_offset);
 /// `W_BytearrayObject.exports` — `_exports`.
 pub const BYTEARRAY_EXPORTS_OFFSET: usize = std::mem::offset_of!(W_BytearrayObject, exports);
-/// `W_BytearrayObject.w_dict` — mapdict's `dict` SPECIAL slot.
-pub const BYTEARRAY_W_DICT_OFFSET: usize = std::mem::offset_of!(W_BytearrayObject, w_dict);
-/// `W_BytearrayObject.w_weakreflifeline` — mapdict's `weakref` SPECIAL slot.
-pub const BYTEARRAY_W_WEAKREFLIFELINE_OFFSET: usize =
-    std::mem::offset_of!(W_BytearrayObject, w_weakreflifeline);
-/// `W_BytearrayObject.w_slots` — `BaseUserClassMapdict` indexed slot storage.
-pub const BYTEARRAY_W_SLOTS_OFFSET: usize = std::mem::offset_of!(W_BytearrayObject, w_slots);
 
 impl crate::lltype::GcType for W_BytearrayObject {
     fn type_id() -> u32 {
         W_BYTEARRAY_GC_TYPE_ID
     }
     const SIZE: usize = W_BYTEARRAY_OBJECT_SIZE;
+}
+
+impl crate::lltype::GcType for W_BytearrayObjectUser {
+    #[inline(always)]
+    fn type_id() -> u32 {
+        W_BYTEARRAY_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_BYTEARRAY_USER_OBJECT_SIZE;
 }
 
 /// Allocate a new bytearray from an owned byte buffer.
@@ -145,9 +158,6 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
         alloc,
         logical_offset: 0,
         exports: 0,
-        w_dict: PY_NULL,
-        w_weakreflifeline: PY_NULL,
-        w_slots: PY_NULL,
     };
     if !raw.is_null() {
         unsafe {
@@ -199,27 +209,28 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
     let root_base = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
-        <W_BytearrayObject as crate::lltype::GcType>::type_id(),
-        <W_BytearrayObject as crate::lltype::GcType>::SIZE,
+        W_BYTEARRAY_USER_GC_TYPE_ID,
+        W_BYTEARRAY_USER_OBJECT_SIZE,
     );
-    let payload = W_BytearrayObject {
-        ob_header: PyObject {
-            ob_type: &BYTEARRAY_TYPE as *const PyType,
-            w_class: crate::gc_roots::shadow_stack_get(root_base),
+    let payload = W_BytearrayObjectUser {
+        base: W_BytearrayObject {
+            ob_header: PyObject {
+                ob_type: &BYTEARRAY_USER_TYPE as *const PyType,
+                w_class: crate::gc_roots::shadow_stack_get(root_base),
+            },
+            data: crate::lltype::malloc_raw(bytes.to_vec()),
+            length: crate::object_array::length_cell(bytes.len()),
+            alloc: if bytes.is_empty() { 0 } else { bytes.len() + 1 },
+            logical_offset: 0,
+            exports: 0,
         },
-        data: crate::lltype::malloc_raw(bytes.to_vec()),
-        length: crate::object_array::length_cell(bytes.len()),
-        alloc: if bytes.is_empty() { 0 } else { bytes.len() + 1 },
-        logical_offset: 0,
-        exports: 0,
-        w_dict: PY_NULL,
-        w_weakreflifeline: PY_NULL,
-        w_slots: PY_NULL,
+        map: 0,
+        storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {
         crate::lltype::malloc_typed(payload) as PyObjectRef
     } else {
-        unsafe { std::ptr::write(raw as *mut W_BytearrayObject, payload) };
+        unsafe { std::ptr::write(raw as *mut W_BytearrayObjectUser, payload) };
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     };
@@ -230,65 +241,11 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
     obj
 }
 
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_bytearray_getdict(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BytearrayObject)).w_dict }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_bytearray_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
-    unsafe { (*(obj as *mut W_BytearrayObject)).w_dict = w_dict };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-}
-
-/// Read one app-level `__slots__` entry from a `bytearray` subclass.
-///
-/// PyPy's `BaseUserClassMapdict.getslotvalue` indexes the instance-owned
-/// storage by `Member.index`; `PY_NULL` is the unbound-slot sentinel.
-pub unsafe fn w_bytearray_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    let slots = unsafe { (*(obj as *const W_BytearrayObject)).w_slots };
-    unsafe { crate::slots::slot_get(slots, index) }
-}
-
-/// Write one app-level `__slots__` entry on a `bytearray` subclass.
-pub unsafe fn w_bytearray_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    crate::slot_set_direct!(obj, index, value, W_BytearrayObject, w_slots)
-}
-
-/// Clear one app-level `__slots__` entry on a `bytearray` subclass.
-pub unsafe fn w_bytearray_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    let slots = unsafe { (*(obj as *const W_BytearrayObject)).w_slots };
-    unsafe { crate::slots::slot_del(slots, index) }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_bytearray_getweakref(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BytearrayObject)).w_weakreflifeline }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_bytearray_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
-    unsafe { (*(obj as *mut W_BytearrayObject)).w_weakreflifeline = lifeline };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-}
-
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_bytearray(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &BYTEARRAY_TYPE) }
+    unsafe { py_type_check(obj, &BYTEARRAY_TYPE) || py_type_check(obj, &BYTEARRAY_USER_TYPE) }
 }
 
 /// # Safety
@@ -507,6 +464,27 @@ pub unsafe fn w_bytearray_exports_decref(obj: PyObjectRef) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `typedef.py _getusercls(W_BytearrayObject)`: a subclass instance is
+    /// `W_BytearrayObjectUser` carrying `BYTEARRAY_USER_TYPE`.
+    #[test]
+    fn bytearray_subclass_instance_carries_user_typeptr() {
+        assert_eq!(
+            W_BYTEARRAY_OBJECT_SIZE,
+            std::mem::size_of::<PyObject>()
+                + std::mem::size_of::<*mut Vec<u8>>()
+                + std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+                + std::mem::size_of::<usize>() * 2
+                + std::mem::size_of::<i64>()
+        );
+        let obj = w_bytearray_subclass_from_bytes(b"ab", get_instantiate(&BYTEARRAY_TYPE));
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &BYTEARRAY_USER_TYPE));
+            assert!(is_bytearray(obj));
+            assert!(!crate::pyobject::is_exact_type(obj, &BYTEARRAY_TYPE));
+            assert_eq!(w_bytearray_len(obj), 2);
+        }
+    }
 
     #[test]
     fn test_bytearray_basic() {

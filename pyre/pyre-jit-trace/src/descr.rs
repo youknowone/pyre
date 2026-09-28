@@ -1419,15 +1419,6 @@ static W_UNICODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| 
                 false,
             ),
             (
-                "w_slots",
-                pyre_object::unicodeobject::UNICODE_W_SLOTS_OFFSET,
-                std::mem::size_of::<pyre_object::PyObjectRef>(),
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
                 "index_storage",
                 pyre_object::unicodeobject::UNICODE_INDEX_STORAGE_OFFSET,
                 std::mem::size_of::<*mut pyre_object::rutf8::Utf8IndexStorage>(),
@@ -1489,24 +1480,6 @@ static W_BYTES_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 pyre_object::bytesobject::BYTES_CTYPES_KEEPALIVE_REFS_OFFSET,
                 std::mem::size_of::<usize>(),
                 Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "w_dict",
-                pyre_object::bytesobject::BYTES_W_DICT_OFFSET,
-                std::mem::size_of::<pyre_object::PyObjectRef>(),
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
-                "w_weakreflifeline",
-                pyre_object::bytesobject::BYTES_W_WEAKREFLIFELINE_OFFSET,
-                std::mem::size_of::<pyre_object::PyObjectRef>(),
-                Type::Ref,
                 false,
                 false,
                 false,
@@ -1573,33 +1546,6 @@ static W_BYTEARRAY_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 std::mem::size_of::<i64>(),
                 Type::Int,
                 true,
-                false,
-                false,
-            ),
-            (
-                "w_dict",
-                pyre_object::bytearrayobject::BYTEARRAY_W_DICT_OFFSET,
-                std::mem::size_of::<pyre_object::PyObjectRef>(),
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
-                "w_weakreflifeline",
-                pyre_object::bytearrayobject::BYTEARRAY_W_WEAKREFLIFELINE_OFFSET,
-                std::mem::size_of::<pyre_object::PyObjectRef>(),
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
-                "w_slots",
-                pyre_object::bytearrayobject::BYTEARRAY_W_SLOTS_OFFSET,
-                std::mem::size_of::<pyre_object::PyObjectRef>(),
-                Type::Ref,
-                false,
                 false,
                 false,
             ),
@@ -2800,15 +2746,6 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 8,
                 Type::Int,
                 true,
-                false,
-                false,
-            ),
-            (
-                "W_TupleObject.w_dict",
-                std::mem::offset_of!(W_TupleObject, w_dict),
-                std::mem::size_of::<usize>(),
-                Type::Ref,
-                false,
                 false,
                 false,
             ),
@@ -4680,6 +4617,32 @@ static W_COMPLEX_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::ne
     )
 });
 
+static W_BYTES_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::bytesobject::W_BYTES_USER_OBJECT_SIZE,
+        pyre_object::bytesobject::W_BYTES_USER_GC_TYPE_ID,
+        &pyre_object::bytesobject::BYTES_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::bytesobject::W_BytesObjectUser, map),
+        std::mem::offset_of!(pyre_object::bytesobject::W_BytesObjectUser, storage),
+        "W_BytesObjectUser",
+        "bytesobject::W_BytesObjectUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x50,
+    )
+});
+
+static W_BYTEARRAY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::bytearrayobject::W_BYTEARRAY_USER_OBJECT_SIZE,
+        pyre_object::bytearrayobject::W_BYTEARRAY_USER_GC_TYPE_ID,
+        &pyre_object::bytearrayobject::BYTEARRAY_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::bytearrayobject::W_BytearrayObjectUser, map),
+        std::mem::offset_of!(pyre_object::bytearrayobject::W_BytearrayObjectUser, storage),
+        "W_BytearrayObjectUser",
+        "bytearrayobject::W_BytearrayObjectUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x60,
+    )
+});
+
 /// `W_ObjectObject.map` (`objectobject.rs`) — the instance shape word,
 /// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). Read as an
 /// `Int` word so the LOAD_ATTR fast path can `guard_value` it to a constant map
@@ -4713,6 +4676,10 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_INT_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_float(obj) } {
         field_descr_from_group(&W_FLOAT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
+        field_descr_from_group(&W_BYTES_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        field_descr_from_group(&W_BYTEARRAY_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_complex(obj) } {
         field_descr_from_group(&W_COMPLEX_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_str(obj) } {
@@ -4736,6 +4703,10 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_INT_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_float(obj) } {
         field_descr_from_group(&W_FLOAT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
+        field_descr_from_group(&W_BYTES_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        field_descr_from_group(&W_BYTEARRAY_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_complex(obj) } {
         field_descr_from_group(&W_COMPLEX_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_str(obj) } {
@@ -6586,6 +6557,14 @@ mod tests {
             0x6100_0041
         );
         assert_eq!(
+            W_BYTES_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0050
+        );
+        assert_eq!(
+            W_BYTEARRAY_USER_DESCR_GROUP.field_descrs[1].index(),
+            0x6100_0061
+        );
+        assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
             Type::Ref
         );
@@ -8187,8 +8166,14 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("bytesobject::W_BytesObject", || {
         LazyLock::force(&W_BYTES_DESCR_GROUP);
     }),
+    ("bytesobject::W_BytesObjectUser", || {
+        LazyLock::force(&W_BYTES_USER_DESCR_GROUP);
+    }),
     ("bytearrayobject::W_BytearrayObject", || {
         LazyLock::force(&W_BYTEARRAY_DESCR_GROUP);
+    }),
+    ("bytearrayobject::W_BytearrayObjectUser", || {
+        LazyLock::force(&W_BYTEARRAY_USER_DESCR_GROUP);
     }),
     ("setobject::W_SetObject", || {
         LazyLock::force(&W_SET_DESCR_GROUP);
@@ -9806,8 +9791,7 @@ pub fn stale_absent_containers() -> Vec<String> {
 /// One struct's field map holds both spellings a field descriptor can carry:
 /// the bare `field` and the `STRUCT.field` form `PyreFieldDescr` stores, which
 /// `get_field_descr` composes, and a single map mixes them — `W_TupleObject`'s holds
-/// `wrappeditems` and `hash` bare beside `PyObject.w_class` and
-/// `W_TupleObject.w_dict`. Which one a field arrives under depends on the
+/// `wrappeditems` and `hash` bare beside `PyObject.w_class`. Which one a field arrives under depends on the
 /// producer that reached it first, so an analyzer member naming the field
 /// bare cannot be resolved by exact match alone. `all_fielddescrs`'s
 /// field-walk already joins the two forms this way.

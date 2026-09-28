@@ -112,7 +112,7 @@ pub unsafe fn utf8_payload_wtf8(value: *const UnicodeValueStorage) -> &'static W
 /// Python string object.
 ///
 /// Layout:
-/// `[ob_type | w_class | value:*mut STR | byte_len | len | w_slots |
+/// `[ob_type | w_class | value:*mut STR | byte_len | len |
 ///   index_storage:*mut Utf8IndexStorage | hash]`
 /// `value` is `_utf8`: an rstr `STR` (`lowlevel_string`: hash @0, len @8,
 /// chars @16).  `byte_len` is `len(_utf8)` (RPython STR `rstr.py
@@ -128,13 +128,6 @@ pub struct W_UnicodeObject {
     pub value: *mut UnicodeValueStorage,
     pub byte_len: usize,
     pub len: usize,
-    /// PyPy `BaseUserClassMapdict` slot storage for a `str` subclass.
-    ///
-    /// Exact strings and subclasses without populated slots keep `PY_NULL`.
-    /// A slots-bearing subclass owns an object-strategy list indexed by the
-    /// `Member.index` from its layout. Keeping this on the object mirrors
-    /// PyPy's `_mapdict_*storage` owner and avoids an address-keyed side table.
-    pub w_slots: PyObjectRef,
     /// `W_UnicodeObject._index_storage` (`unicodeobject.py`) — the
     /// `rutf8` code point index table, built on the first non-ASCII index and
     /// null until then.  A pure cache: dropping it only costs the next lookup a
@@ -183,8 +176,6 @@ pub const UNICODE_VALUE_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, va
 pub const UNICODE_BYTE_LEN_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, byte_len);
 /// Field offset of `len` (codepoint count) for UNICODE UNICODELEN parity.
 pub const UNICODE_LEN_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, len);
-/// Field offset of the subclass slot-storage list.
-pub const UNICODE_W_SLOTS_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, w_slots);
 /// Field offset of the `rutf8` code point index table.
 pub const UNICODE_INDEX_STORAGE_OFFSET: usize =
     std::mem::offset_of!(W_UnicodeObject, index_storage);
@@ -278,7 +269,6 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
         value,
         byte_len,
         len: char_len,
-        w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
         hash: 0,
     }) as PyObjectRef
@@ -346,7 +336,6 @@ pub fn w_str_from_storage_and_length(
         value,
         byte_len,
         len: length,
-        w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
         hash: 0,
     }) as PyObjectRef
@@ -377,7 +366,6 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
         value,
         byte_len,
         len: char_len,
-        w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
         hash: 0,
     }) as PyObjectRef
@@ -496,7 +484,6 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
         value,
         byte_len,
         len: char_len,
-        w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
         hash: 0,
     };
@@ -545,7 +532,6 @@ pub unsafe fn w_str_from_wtf8_managed_collecting(value: Wtf8Buf) -> PyObjectRef 
         value,
         byte_len,
         len: char_len,
-        w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
         hash: 0,
     };
@@ -646,7 +632,6 @@ pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
         value,
         byte_len,
         len: char_len,
-        w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
         hash: 0,
     }) as PyObjectRef
@@ -683,7 +668,6 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
             value: crate::gc_roots::shadow_stack_get(value_slot) as *mut UnicodeValueStorage,
             byte_len,
             len: char_len,
-            w_slots: PY_NULL,
             index_storage: std::ptr::null_mut(),
             hash: 0,
         },
@@ -710,35 +694,6 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
     };
     crate::gc_hook::maybe_register_finalizer(obj);
     obj
-}
-
-/// Read one app-level `__slots__` entry from a `str` subclass.
-///
-/// PyPy's `BaseUserClassMapdict.getslotvalue` indexes the instance-owned
-/// storage list by `Member.index`.  `PY_NULL` is the unbound-slot sentinel.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_str_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    let slots = unsafe { (*(obj as *const W_UnicodeObject)).w_slots };
-    unsafe { crate::slots::slot_get(slots, index) }
-}
-
-/// Write one app-level `__slots__` entry on a `str` subclass.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_str_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    crate::slot_set_direct!(obj, index, value, W_UnicodeObject, w_slots)
-}
-
-/// Clear one app-level `__slots__` entry on a `str` subclass.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_str_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    let slots = unsafe { (*(obj as *const W_UnicodeObject)).w_slots };
-    unsafe { crate::slots::slot_del(slots, index) }
 }
 
 /// FNV-1a over the key bytes, the digest the type-lookup method cache already
@@ -1773,8 +1728,7 @@ mod tests {
         assert_eq!(UNICODE_VALUE_OFFSET, 16);
         assert_eq!(UNICODE_BYTE_LEN_OFFSET, 24);
         assert_eq!(UNICODE_LEN_OFFSET, 32);
-        assert_eq!(UNICODE_W_SLOTS_OFFSET, 40);
-        assert_eq!(UNICODE_INDEX_STORAGE_OFFSET, 48);
+        assert_eq!(UNICODE_INDEX_STORAGE_OFFSET, 40);
     }
 
     #[test]

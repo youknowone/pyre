@@ -529,6 +529,8 @@ unsafe fn is_generated_user_layout_family(obj: PyObjectRef) -> bool {
             || pyre_object::is_float(obj)
             || pyre_object::is_complex(obj)
             || pyre_object::is_str(obj)
+            || pyre_object::bytesobject::is_bytes(obj)
+            || pyre_object::bytearrayobject::is_bytearray(obj)
             || (pyre_object::is_tuple(obj)
                 && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj))
     }
@@ -566,6 +568,8 @@ pub unsafe fn has_mapdict_layout(obj: PyObjectRef) -> bool {
         || type_id == pyre_object::complexobject::W_COMPLEX_USER_GC_TYPE_ID
         || type_id == pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID
         || type_id == pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID
+        || type_id == pyre_object::bytesobject::W_BYTES_USER_GC_TYPE_ID
+        || type_id == pyre_object::bytearrayobject::W_BYTEARRAY_USER_GC_TYPE_ID
 }
 
 /// Whether attribute access for `obj` routes through mapdict storage. This is
@@ -3467,6 +3471,24 @@ impl MapdictCarrier {
         }
         if unsafe { pyre_object::is_float(obj) } {
             let user = obj as *mut pyre_object::floatobject::W_FloatObjectUser;
+            return unsafe {
+                (
+                    std::ptr::addr_of_mut!((*user).map),
+                    std::ptr::addr_of_mut!((*user).storage),
+                )
+            };
+        }
+        if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
+            let user = obj as *mut pyre_object::bytesobject::W_BytesObjectUser;
+            return unsafe {
+                (
+                    std::ptr::addr_of_mut!((*user).map),
+                    std::ptr::addr_of_mut!((*user).storage),
+                )
+            };
+        }
+        if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+            let user = obj as *mut pyre_object::bytearrayobject::W_BytearrayObjectUser;
             return unsafe {
                 (
                     std::ptr::addr_of_mut!((*user).map),

@@ -774,28 +774,30 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (156, Some(0)),
     (157, Some(0)),
-    // 158-162 are `typedef.py` `_getusercls` layouts
-    // (int/str/tuple/float/complex user), each an rclass subclass of the
-    // builtin it was made from.
+    // 158-164 are `typedef.py` `_getusercls` layouts
+    // (int/str/tuple/float/complex/bytes/bytearray user), each an rclass
+    // subclass of the builtin it was made from.
     (158, Some(1)),
     (159, Some(34)),
     (160, Some(8)),
     (161, Some(2)),
     (162, Some(54)),
+    (163, Some(27)),
+    (164, Some(28)),
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail so its id stays 163 on every target.
-    (163, Some(0)),
-    // Native-only type IDs 164 and 165 represent `posix.DirEntry` and
+    // posix / console tail so its id stays 165 on every target.
+    (165, Some(0)),
+    // Native-only type IDs 166 and 167 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (164, Some(0)),
+    (166, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (165, Some(0)),
+    (167, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (166, Some(0)),
+    (168, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1335,6 +1337,8 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(160, &TUPLE_USER_TYPE),
         subclass_range_alias(161, &FLOAT_USER_TYPE),
         subclass_range_alias(162, &COMPLEX_USER_TYPE),
+        subclass_range_alias(163, &crate::bytesobject::BYTES_USER_TYPE),
+        subclass_range_alias(164, &crate::bytearrayobject::BYTEARRAY_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),

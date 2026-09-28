@@ -447,13 +447,12 @@ mod tests {
 
         assert_eq!(std::mem::size_of::<W_IntObject>(), 24);
         assert_eq!(std::mem::size_of::<W_BoolObject>(), 24);
-        assert_eq!(std::mem::size_of::<W_UnicodeObject>(), 64);
-        assert_eq!(std::mem::size_of::<W_TupleObject>(), 40);
+        assert_eq!(std::mem::size_of::<W_UnicodeObject>(), 56);
+        assert_eq!(std::mem::size_of::<W_TupleObject>(), 32);
         assert_eq!(INT_INTVAL_OFFSET, 16);
         assert_eq!(UNICODE_VALUE_OFFSET, 16);
         assert_eq!(std::mem::offset_of!(W_TupleObject, hash), 16);
         assert_eq!(std::mem::offset_of!(W_TupleObject, wrappeditems), 24);
-        assert_eq!(std::mem::offset_of!(W_TupleObject, w_dict), 32);
     }
 
     #[test]

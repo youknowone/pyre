@@ -73,10 +73,6 @@ pub struct W_TupleObject {
     /// `len(l.items)`); empty tuples carry a 0-cap header-only
     /// allocation (non-null pointer).
     pub wrappeditems: *mut ItemsBlock,
-    /// Mapdict's per-instance `dict` SPECIAL slot in the legacy tuple layout.
-    /// User subclasses use [`W_TupleObjectUser`]'s translated mapdict mixin;
-    /// exact tuples leave this null.
-    pub w_dict: PyObjectRef,
 }
 
 /// The translated user-subclass layout selected by `typedef.py _getusercls`.
@@ -455,7 +451,6 @@ fn w_tuple_new_array_backed_impl(
                 ob_header: header(),
                 hash: AtomicI64::new(TUPLE_HASH_UNSET),
                 wrappeditems: items_block,
-                w_dict: PY_NULL,
             },
             map: 0,
             storage: std::ptr::null_mut(),
@@ -465,7 +460,6 @@ fn w_tuple_new_array_backed_impl(
             ob_header: header(),
             hash: AtomicI64::new(TUPLE_HASH_UNSET),
             wrappeditems: items_block,
-            w_dict: PY_NULL,
         })) as PyObjectRef
     }
 }
@@ -487,7 +481,6 @@ unsafe fn write_tuple_layout(
                         ob_header: header,
                         hash: AtomicI64::new(TUPLE_HASH_UNSET),
                         wrappeditems,
-                        w_dict: PY_NULL,
                     },
                     map: 0,
                     storage: std::ptr::null_mut(),
@@ -502,7 +495,6 @@ unsafe fn write_tuple_layout(
                     ob_header: header,
                     hash: AtomicI64::new(TUPLE_HASH_UNSET),
                     wrappeditems,
-                    w_dict: PY_NULL,
                 },
             )
         };

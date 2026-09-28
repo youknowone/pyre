@@ -893,8 +893,16 @@ unsafe fn bytes_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
         let data_slot = std::ptr::addr_of_mut!(bytes.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
-    f(&mut bytes.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut bytes.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+}
+
+unsafe fn bytes_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { bytes_object_custom_trace(obj_addr, f) };
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
 }
 
 /// Custom trace for `W_BytearrayObject`. Same GC-managed leaf storage box as
@@ -906,9 +914,19 @@ unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
         let data_slot = std::ptr::addr_of_mut!(ba.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
-    f(&mut ba.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut ba.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut ba.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+}
+
+unsafe fn bytearray_user_object_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    unsafe { bytearray_object_custom_trace(obj_addr, f) };
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
 }
 
 /// `interp_array.py W_ArrayBase.__del__`: free the raw element buffer when
@@ -1041,7 +1059,6 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
     let tuple_ptr = obj_addr as *mut pyre_object::tupleobject::W_TupleObject;
     let tuple = unsafe { &mut *tuple_ptr };
     f(&mut tuple.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut tuple.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     let block = tuple.wrappeditems;
     if block.is_null() {
         return;
@@ -1083,7 +1100,6 @@ unsafe fn unicode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     {
         f(std::ptr::addr_of_mut!(unicode.value) as *mut majit_ir::GcRef);
     }
-    f(&mut unicode.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !unicode.index_storage.is_null()
         && pyre_object::gc_hook::try_gc_owns_object(unicode.index_storage as *mut u8)
     {
@@ -3972,8 +3988,44 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::pyobject::COMPLEX_USER_TYPE as *const _ as usize,
         complex_user_tid,
     );
+    let bytes_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::bytesobject::W_BYTES_USER_OBJECT_SIZE,
+        w_bytes_tid,
+        bytes_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        bytes_user_tid,
+        pyre_object::bytesobject::W_BYTES_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::bytesobject::BYTES_USER_TYPE as *const _ as usize,
+        bytes_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::bytesobject::BYTES_USER_TYPE as *const _ as usize,
+        bytes_user_tid,
+    );
+    let bytearray_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::bytearrayobject::W_BYTEARRAY_USER_OBJECT_SIZE,
+        w_bytearray_tid,
+        bytearray_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        bytearray_user_tid,
+        pyre_object::bytearrayobject::W_BYTEARRAY_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::bytearrayobject::BYTEARRAY_USER_TYPE as *const _ as usize,
+        bytearray_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::bytearrayobject::BYTEARRAY_USER_TYPE as *const _ as usize,
+        bytearray_user_tid,
+    );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 163),
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 165),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,
