@@ -16565,43 +16565,28 @@ pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::P
 ///     return result
 /// ```
 ///
-/// `int_w` already mirrors `getindex_w(w_int, w_OverflowError)` for the
-/// already-int caller contract here: long values that do not fit `i64`
-/// raise `OverflowError` ("int too large to convert to int") via
-/// `intobject.py` / `longobject.py` `_int_w`.
+/// `getindex_w(w_int, w_OverflowError)` is [`getindex_w_index`].
 fn _check_len_result(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
-    // `w_int` is read back from its slot after each call that can collect.
-    // One bracket over the whole body keeps its close off the path between
-    // `int_w` and the `match` on its result.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = _roots.pin_roots(&[w_int]);
     // `lt(w_int, 0)` — a negative length (including a negative bignum) raises
     // ValueError, checked before the machine-word fit so it wins over the
     // OverflowError. `w_int` is already the `space.index` result, so this is a
-    // plain int comparison.
-    let w_zero = pyre_object::w_int_new(0);
-    let w_lt = crate::objspace::descroperation::compare(
-        _roots.get(base),
-        w_zero,
-        crate::objspace::descroperation::CompareOp::Lt,
-    )?;
-    if is_true(w_lt)? {
-        return Err(crate::PyError::value_error("__len__() should return >= 0"));
-    }
-    // `getindex_w(w_int, w_OverflowError)` — a length that does not fit a
-    // machine word reports the source type, `oefmt("cannot fit '%T' into an
-    // index-sized integer", w_obj)`, not the coerced int.
-    match int_w(_roots.get(base)) {
-        Ok(n) => Ok(n),
-        Err(e) if e.kind == PyErrorKind::OverflowError => Err(PyError::new(
-            PyErrorKind::OverflowError,
-            format!(
-                "cannot fit '{}' into an index-sized integer",
-                object_functionstr_type_name(_roots.get(base))
-            ),
-        )),
-        Err(e) => Err(e),
-    }
+    // plain int comparison.  It is read back from its slot after each call
+    // that can collect.
+    let w_int = {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = _roots.pin_roots(&[w_int]);
+        let w_zero = pyre_object::w_int_new(0);
+        let w_lt = crate::objspace::descroperation::compare(
+            _roots.get(base),
+            w_zero,
+            crate::objspace::descroperation::CompareOp::Lt,
+        )?;
+        if is_true(w_lt)? {
+            return Err(crate::PyError::value_error("__len__() should return >= 0"));
+        }
+        _roots.get(base)
+    };
+    unsafe { getindex_w_index(w_int) }
 }
 
 /// pypy/objspace/descroperation.py `len_w`.
