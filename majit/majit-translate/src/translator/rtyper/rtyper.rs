@@ -2256,6 +2256,23 @@ impl RPythonTyper {
             // `rtype_compare_template`, exactly as `mul` / `lt` route.
             "uint_mul_high" => super::rint::rtype_template(hop, "mul_high"),
             "uint_lt" => super::rint::rtype_compare_template(hop, "lt"),
+            // `jtransform.py` `_int_to_int_cast` emits `int_signext(v, nbytes)`
+            // for a narrower signed target (`cast_primitive` onto a signed
+            // integer whose range does not cover the source). The front spells
+            // that leaf as the binop `signext`; both operands and the result
+            // are the signed word, and the op cannot raise.
+            "signext" => {
+                let vlist = hop.inputargs(vec![
+                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                ])?;
+                hop.exception_cannot_occur()?;
+                Ok(hop.genop(
+                    "int_signext",
+                    vlist,
+                    GenopResult::LLType(LowLevelType::Signed),
+                ))
+            }
             // Front-end `(lo..=hi).contains` emits the llop directly:
             // `n <= m < p`, result Bool.  Three signed inputs; it cannot raise.
             "int_between" => {

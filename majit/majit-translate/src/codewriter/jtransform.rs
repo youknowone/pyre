@@ -1520,8 +1520,9 @@ fn collect_unsigned_vars(graph: &FunctionGraph) -> std::collections::HashSet<u64
     unsigned
 }
 
-/// After `_rewrite_symmetric`, rename `lt`/`le`/`gt`/`ge`/`rshift` to
-/// `uint_*` when both pre-alias operands are unsigned producers.
+/// After `_rewrite_symmetric`, rename `lt`/`le`/`gt`/`ge` to `uint_*`
+/// when both pre-alias operands are unsigned, and `rshift` when the
+/// shifted value is (`lloperation.py` `uint_rshift` count stays signed).
 /// `eq`/`ne` and wrapping add/sub/mul stay `int_*`. `uint_floordiv` /
 /// `uint_mod` are not emitted (`blackhole.py` has neither).
 fn prefix_unsigned_binop(
@@ -1543,7 +1544,15 @@ fn prefix_unsigned_binop(
     else {
         return op;
     };
-    if !unsigned.contains(&orig_lhs.id()) || !unsigned.contains(&orig_rhs.id()) {
+    let lhs_unsigned = unsigned.contains(&orig_lhs.id());
+    let rhs_unsigned = unsigned.contains(&orig_rhs.id());
+    // `lloperation.py` `uint_rshift` is `(r_uint, int)`: the count stays
+    // signed. Ordered compares need both sides (`IntegerRepr.opprefix`).
+    let apply = match name.as_str() {
+        "rshift" => lhs_unsigned,
+        _ => lhs_unsigned && rhs_unsigned,
+    };
+    if !apply {
         return op;
     }
     let OpKind::BinOp {

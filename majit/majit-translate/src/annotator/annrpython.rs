@@ -2612,6 +2612,14 @@ impl RPythonAnnotator {
                         "int_between" if sp.args.len() == 3 => {
                             Some(SomeValue::Bool(super::model::SomeBool::new()))
                         }
+                        // `jtransform.py` `_int_to_int_cast` emits
+                        // `int_signext(v, nbytes)`. The front spells that
+                        // leaf `signext`. Flowspace has no operator of that
+                        // name, so an unbound result stays `Impossible` /
+                        // `Void` and rtype then disagrees with `Signed`.
+                        "signext" if sp.args.len() == 2 => Some(SomeValue::Integer(
+                            super::model::SomeInteger::new(false, false),
+                        )),
                         _ => None,
                     }
                 };

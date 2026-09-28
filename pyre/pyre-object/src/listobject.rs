@@ -1149,6 +1149,8 @@ const INT_OR_FLOAT_INT_HIGH_WORD: u32 = 0xffff_fffe;
 
 #[inline]
 fn int_or_float_is_int(value: i64) -> bool {
+    // `longlong2float.py` `is_int32_from_longlong_nan`: unsigned shift of
+    // the longlong, then the high word compared with `0xfffffffe`.
     ((value as u64) >> 32) as u32 == INT_OR_FLOAT_INT_HIGH_WORD
 }
 
@@ -1166,6 +1168,9 @@ fn int_or_float_encode_float(value: f64) -> Option<i64> {
 
 #[inline]
 fn int_or_float_decode_int(value: i64) -> i64 {
+    // `longlong2float.py` `decode_int32_from_longlong_nan`:
+    // `rffi.cast(Signed, rffi.cast(INT, value))` — truncate to 4 bytes,
+    // then sign-extend.
     value as u32 as i32 as i64
 }
 
