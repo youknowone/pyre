@@ -421,7 +421,7 @@ fn main() {
             gc_tys.extend(opt);
         }
         if std::env::var("GC_SLICE_ARGS").is_ok() {
-            let slices = liveness::gc_slice_type_ids(&llbc);
+            let slices = liveness::gc_slice_type_ids(&llbc, &gc_tys);
             println!("   &[PyObjectRef] type ids: {}", slices.len());
             gc_tys.extend(slices);
         }

@@ -22,8 +22,8 @@
 use std::collections::{HashMap, HashSet};
 
 use majit_charon_reader::ullbc::{
-    CallFunc, CallKind, FunId, Operand, Place, PlaceKind, Rvalue, StmtKind, SwitchTargets,
-    TermKind, TyRef,
+    CallFunc, CallKind, FunId, Operand, Place, PlaceKind, ProjectionElem, Rvalue, StmtKind,
+    SwitchTargets, TermKind, TyRef,
 };
 
 /// One call that can collect, with GC pointers live across it and no bracket.
@@ -311,17 +311,48 @@ pub fn gc_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
     out
 }
 
-/// The type ids of `&[PyObjectRef]` in *this* artefact, read off
-/// `pin_roots`'s parameter.
+/// The type ids of `&[PyObjectRef]` in *this* artefact.
 ///
 /// A builtin receives its arguments as a native slice: a copy the collector
 /// does not rewrite, so an element read after a collecting call is the same
-/// stale word a bare local would be.
-pub fn gc_slice_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
-    llbc.iter_local_fns()
-        .filter(|fd| fd.item_meta.name_path().ends_with("gc_roots::pin_roots"))
-        .filter_map(|fd| fd.signature.inputs.last().and_then(ty_id))
-        .collect()
+/// stale word a bare local would be.  Each borrow region is its own type id,
+/// so the spellings are read off every body's locals, as for `Option`.
+pub fn gc_slice_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64>) -> HashSet<u64> {
+    let id_of = |v: &serde_json::Value| {
+        v.get("Deduplicated")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                v.pointer("/HashConsedValue/0")
+                    .and_then(serde_json::Value::as_u64)
+            })
+    };
+    let body_of = |v: &serde_json::Value| {
+        v.pointer("/HashConsedValue/1")
+            .cloned()
+            .or_else(|| id_of(v).and_then(|id| llbc.dedup_body(id).cloned()))
+    };
+    let mut seen = HashSet::new();
+    let mut out = HashSet::new();
+    for fd in llbc.iter_local_fns() {
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
+        for l in &body.locals.locals {
+            let Some(t) = ty_id(&l.ty) else { continue };
+            if gc_tys.contains(&t) || !seen.insert(t) {
+                continue;
+            }
+            let elem = llbc
+                .dedup_body(t)
+                .and_then(|b| b.pointer("/Ref/1").cloned())
+                .and_then(|inner| body_of(&inner))
+                .and_then(|inner| inner.get("Slice").and_then(id_of));
+            if elem.is_some_and(|e| gc_tys.contains(&e)) {
+                out.insert(t);
+            }
+        }
+    }
+    out
 }
 
 /// The type ids of `Option<PyObjectRef>` in *this* artefact.
@@ -836,9 +867,19 @@ pub fn scan(
                     mut_borrow_of.remove(&d);
                     continue;
                 }
+                // A two-phase call argument reborrows: `_t = &mut _l;
+                // _u = &TwoPhaseMut (*_t)`, so a deref of a recorded borrow
+                // names the same local.
                 if let Rvalue::Ref { place, kind, .. } = &rv
                     && matches!(kind.as_str(), Some("Mut" | "TwoPhaseMut"))
-                    && let Some(l) = bare_local(place)
+                    && let Some(l) = bare_local(place).or_else(|| match &place.kind {
+                        PlaceKind::Projection(base, ProjectionElem::Atom(elem))
+                            if elem == "Deref" =>
+                        {
+                            bare_local(base).and_then(|t| mut_borrow_of.get(&t).copied())
+                        }
+                        _ => None,
+                    })
                 {
                     mut_borrow_of.insert(d, l);
                 }
