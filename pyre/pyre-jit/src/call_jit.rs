@@ -3892,10 +3892,44 @@ pub fn trace_and_compile_from_bridge(
                 .map(|result| result.frames.clone())
                 .unwrap_or_default()
         };
+        // `frame_value_count_at` materializes `jitcodes[jitcode_pos]` before
+        // it counts the section (`resume.py` `staticdata.jitcodes`). A
+        // skeleton at that index makes `read_frame_liveness_reg_indices`
+        // return empty banks, so `consume_boxes` sees a length mismatch.
+        let materialized: Vec<Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>>> =
+            resume_frames
+                .iter()
+                .map(|section| {
+                    usize::try_from(section.jitcode_index)
+                        .ok()
+                        .and_then(|index| {
+                            pyre_jit_trace::state::ensure_build_time_jitcode_at(index)
+                                .map(|payload| std::sync::Arc::clone(&payload.jitcode))
+                        })
+                })
+                .collect();
+        let resume_liveness = pyre_jit_trace::state::liveness_info_snapshot();
+        let resume_op_live = pyre_jit_trace::state::op_live();
         let (driver, _) = crate::eval::driver_pair();
-        driver
+        let consumed = driver
             .meta_interp_mut()
-            .rebuild_portal_framestack_from_resumedata(portal, &resume_frames, raw_values);
+            .rebuild_portal_framestack_from_resumedata(
+                portal,
+                &resume_frames,
+                raw_values,
+                &materialized,
+                &resume_liveness,
+                resume_op_live,
+            );
+        if !consumed {
+            // `resume.py consume_boxes` always consumes the section. A
+            // liveness/section length mismatch does not build the bridge;
+            // the same blackhole fallback as the other resume errors.
+            if driver.is_tracing() {
+                driver.meta_interp_mut().abort_trace(false);
+            }
+            return BridgeResolution::ResumeBlackhole;
+        }
     }
     // `_prepare_exception_resumption` (pyjitpl.py) +
     // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception
