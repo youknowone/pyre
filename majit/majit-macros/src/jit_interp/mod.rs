@@ -4935,7 +4935,7 @@ mod tests {
              emptiness of the list: `majit-metainterp`'s dispatch-IR fixtures \
              spell `greens = []` precisely to grade the empty-greens encoding \
              (`num_green_args == 0`, and no `BC_*_GUARD_VALUE` in the prefix, \
-             mirroring `jtransform.py:1693-1714 promote_greens`), so refusing \
+             mirroring `jtransform.py` `promote_greens`), so refusing \
              this spelling deletes the only tests of the state the refusal \
              above is about. Expansion was:\n{empty_greens}"
         );

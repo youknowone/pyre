@@ -168,7 +168,7 @@ impl RegAllocatorState {
             }
         }
         // Variables used in exit links stay alive until block end.
-        // RPython `rpython/jit/codewriter/regalloc.py:71-78 compute_liveness`:
+        // RPython `liveness.py` `compute_liveness`:
         // iterate `block.exits` for `link.args` + `block.exitswitch` for the
         // branch condition.
         for link in &block.exits {

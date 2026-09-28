@@ -4666,7 +4666,7 @@ fn function_graph_to_flowspace_inner(
     // here, RPython's checkgraph treats target inputargs as definitions
     // in the target block, not as the predecessor's Variable object.
     //
-    // RPython `flowmodel.py:281 FunctionGraph.getreturnvar(self)`
+    // RPython `model.py` `FunctionGraph.getreturnvar`
     // returns `self.returnblock.inputargs[0]` unconditionally — there
     // is no fallback for an empty `inputargs` list, and a malformed
     // graph raises `IndexError` at this site rather than fabricating a
@@ -4698,10 +4698,10 @@ fn function_graph_to_flowspace_inner(
             TyperError::message(format!(
                 "function_graph_to_flowspace: legacy graph {:?} has no \
                  returnblock {:?} with at least one inputarg — \
-                 `model::FunctionGraph::with_return_var` (model.rs:983-988) \
+                 `model::FunctionGraph::with_return_var` \
                  builds the returnblock with `inputargs: vec![return_value]` \
-                 by invariant; matches RPython `flowmodel.py:281 \
-                 getreturnvar()` which indexes `returnblock.inputargs[0]` \
+                 by invariant; matches RPython `model.py` `getreturnvar` \
+                 which indexes `returnblock.inputargs[0]` \
                  without a fallback",
                 legacy.name, legacy.returnblock,
             ))
@@ -4866,7 +4866,7 @@ fn function_graph_to_flowspace_inner(
                              name {name:?} (result {result_var:?}) was not threaded \
                              through Link.args / target inputargs by the \
                              predecessor block.  RPython has no body-`Input` \
-                             op (flowcontext.py:872-884 LOAD_FAST writes locals \
+                             op (`flowcontext.py` `LOAD_FAST` writes locals \
                              into self.locals_w; cross-block reads go via the \
                              target block's pre-allocated inputargs).  Producer \
                              gap — either Cat 2.1 cross-block locals threading \

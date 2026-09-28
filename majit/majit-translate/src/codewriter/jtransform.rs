@@ -2581,8 +2581,8 @@ impl<'a> Transformer<'a> {
         graph.alloc_value_var_with_type(ty)
     }
 
-    /// RPython parity: `Variable.concretetype = ty` (`flowmodel.py
-    /// Variable.__init__`).  Updates the backing Variable's
+    /// RPython parity: `Variable.concretetype = ty` (`model.py`
+    /// `Variable`).  Updates the backing Variable's
     /// `concretetype` cell in-place; the optional shape lets the
     /// jtransform rewrite arms call this with `op.result.clone()`
     /// for result-less ops without an extra guard.
@@ -3791,8 +3791,8 @@ impl<'a> Transformer<'a> {
             //       semantic `%` / `//`).  This route stamps
             //       `int.py_mod` / `int.py_div` oopspec on the
             //       residual call so optimisations
-            //       (`rewrite.py:713-766 optimize_call_int_py_div`,
-            //       `intbounds.py:1654 postprocess_int_floordiv`)
+            //       (`intutils.py` `py_div_bound`,
+            //       `intbounds.py` `OptIntBounds`)
             //       recognise it, and the helper output is
             //       PYTHON-FLOOR (`rint.py ll_int_py_div` /
             //       `ll_int_py_mod`).

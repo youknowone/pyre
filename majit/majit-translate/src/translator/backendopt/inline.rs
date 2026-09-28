@@ -1084,7 +1084,7 @@ impl<'t> BaseInliner<'t> {
     pub fn get_graph_from_op(&self, op: &SpaceOperation) -> Option<GraphRef> {
         assert_eq!(
             op.opname, "direct_call",
-            "inline.py:190 get_graph_from_op: op.opname must be 'direct_call'",
+            "inline.py `get_graph_from_op`: op.opname must be 'direct_call'",
         );
         op.args
             .first()
@@ -1430,12 +1430,12 @@ impl<'t> BaseInliner<'t> {
                     .inputargs
                     .iter()
                     .position(|ia| ia == a)
-                    .expect("inline.py:285 afterblock.inputargs.index(arg)");
+                    .expect("inline.py `find_args_in_exceptional_case`: afterblock.inputargs.index(arg)");
                 linkargs.push(Hlvalue::Variable(
                     passon_vars
                         .get(idx.wrapping_sub(1))
                         .cloned()
-                        .expect("inline.py:286 passon_vars[index-1]"),
+                        .expect("inline.py `find_args_in_exceptional_case`: passon_vars[index-1]"),
                 ));
             }
         }
@@ -1563,14 +1563,14 @@ impl<'t> BaseInliner<'t> {
             .operations
             .get(index_operation)
             .cloned()
-            .expect("inline.py:196 block.operations[index_operation]");
+            .expect("inline.py `inline_once`: block.operations[index_operation]");
         let graph_to_inline = self
             .get_graph_from_op(&op)
-            .expect("inline.py:197 get_graph_from_op: callee graph required");
+            .expect("inline.py `get_graph_from_op`: callee graph required");
         self.op = Some(op.clone());
         self.graph_to_inline = Some(graph_to_inline.clone());
         self.exception_guarded = false;
-        // Upstream `:199-207 if self.op is block.raising_op:` —
+        // `inline.py` `inline_once` checks `if self.op is block.raising_op:` —
         // identity-compares the call op against the block's raising
         // op. Pyre's `Block::raising_op()` returns the trailing op
         // when `block.canraise()`. Compare by SpaceOperation
@@ -1698,7 +1698,7 @@ impl<'t> BaseInliner<'t> {
         let op = self
             .op
             .as_ref()
-            .expect("inline.py:196 self.op set in inline_once")
+            .expect("inline.py `inline_once`: self.op set")
             .clone();
         let after_first = afterblock
             .borrow()
@@ -1724,7 +1724,7 @@ impl<'t> BaseInliner<'t> {
         let graph_to_inline = self
             .graph_to_inline
             .as_ref()
-            .expect("inline.py:197 graph_to_inline set in inline_once")
+            .expect("inline.py `inline_once`: graph_to_inline set")
             .clone();
         let inline_startblock = graph_to_inline.borrow().startblock.clone();
         let copiedstartblock = self.copy_block(&inline_startblock);

@@ -20,8 +20,7 @@ pyre_interpreter::py_module! {
         ],
     },
     functions: {
-        // PyPy `lib_pypy/_typing.py:19` spells this `def _idfunc(_, x):
-        // return x`: `DescrOperation.get_and_call_args` passes the NewType
+        // `_idfunc(_, x)` returns `x`. `DescrOperation.get_and_call_args` passes the NewType
         // receiver explicitly for every Function subclass, including a module
         // builtin stored as `NewType.__call__`.  CPython 3.14 exposes the same
         // helper as a non-descriptor METH_O builtin, so retain its direct

@@ -1247,7 +1247,7 @@ mod oparg_minimal {
             !prefix.contains(&BC_INT_GUARD_VALUE)
                 && !prefix.contains(&BC_REF_GUARD_VALUE)
                 && !prefix.contains(&BC_FLOAT_GUARD_VALUE),
-            "A.3.5 (jtransform.py:1693-1714): empty greens must not emit any \
+            "A.3.5 (`jtransform.py` `promote_greens`): empty greens must not emit any \
              *_guard_value before BC_JIT_MERGE_POINT; prefix={:?}",
             prefix
         );
@@ -1681,12 +1681,12 @@ mod oparg_with_pc_green {
             .position(|&b| b == BC_JIT_MERGE_POINT || b == BC_JIT_MERGE_POINT_C)
             .expect("BC_JIT_MERGE_POINT(_C) must be present");
 
-        // jtransform.py:1693: pc is Int → int_guard_value must precede merge point.
+        // `jtransform.py` `promote_greens`: pc is Int → int_guard_value must precede merge point.
         let igv_pos = code[..mp_pos]
             .iter()
             .position(|&b| b == BC_INT_GUARD_VALUE)
             .expect(
-                "A.3.5 (jtransform.py:1693): pc green must be promoted via \
+                "A.3.5 (`jtransform.py` `promote_greens`): pc green must be promoted via \
                  BC_INT_GUARD_VALUE before BC_JIT_MERGE_POINT",
             );
 
@@ -1978,7 +1978,7 @@ mod oparg_with_body_local_state_le_green {
             .iter()
             .position(|&b| b == BC_INT_GUARD_VALUE)
             .expect(
-                "A.3.5 (jtransform.py:1693): body-local green `g` must be \
+                "A.3.5 (`jtransform.py` `promote_greens`): body-local green `g` must be \
                  promoted via BC_INT_GUARD_VALUE before BC_JIT_MERGE_POINT",
             );
         assert!(
@@ -2282,7 +2282,7 @@ mod oparg_with_body_local_method_call_green {
             .iter()
             .position(|&b| b == BC_INT_GUARD_VALUE)
             .expect(
-                "A.3.5 (jtransform.py:1693): body-local green `g` must \
+                "A.3.5 (`jtransform.py` `promote_greens`): body-local green `g` must \
                  be promoted via BC_INT_GUARD_VALUE before \
                  BC_JIT_MERGE_POINT",
             );

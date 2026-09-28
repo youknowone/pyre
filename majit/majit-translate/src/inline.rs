@@ -209,12 +209,12 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         graph.blocks[new_block_id.0].operations = new_ops;
 
         // Identify the callee's canonical returnblock by ID, matching
-        // upstream `rpython/translator/backendopt/inline.py:289
-        // rewire_returnblock` which reads `graph_to_inline.returnblock`
+        // upstream `inline.py` `rewire_returnblock`, which reads
+        // `graph_to_inline.returnblock`
         // and rewires its exits to point at the caller's afterblock.
         let is_returnblock = callee_block.id == callee.returnblock;
         if is_returnblock {
-            // Upstream `backendopt/inline.py:289-296`:
+            // `inline.py` `rewire_returnblock`:
             //   copiedreturnblock = copy_block(self.graph_to_inline.returnblock)
             //   linkargs = ([copiedreturnblock.inputargs[0]] + passon_vars)
             //   linkfrominlined = Link(linkargs, afterblock)
@@ -1240,7 +1240,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // `OpKind::ConstInt` / `OpKind::ConstFloat` materialize a
         // `Variable` for a literal in pyre's IR.  There
         // is NO upstream `int_constant` op — RPython's `Constant` is
-        // a value class (`flowmodel.py Constant(rfloat)`), not an
+        // a value class (`model.py` `Constant`), not an
         // operation, so it appears inline in `op.args` rather than
         // as a standalone op in `block.operations`.  Pyre's
         // op-shaped representation is forced by the

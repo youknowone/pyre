@@ -7167,7 +7167,7 @@ impl OptContext {
         // descrs reach this function.
         assert!(
             op.getdescr().is_none_or(|d| d.is_resume_guard()),
-            "optimizer.py:723 store_final_boxes_in_guard expects \
+            "optimizer.py `store_final_boxes_in_guard` expects \
              ResumeGuardDescr, got non-resume descr (kind={:?}, copied={})",
             op.getdescr().map(|d| d.index()),
             op.getdescr().is_some_and(|d| d.is_resume_guard_copied())

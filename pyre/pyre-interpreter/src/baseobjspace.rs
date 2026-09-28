@@ -9444,8 +9444,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                     return Ok(if closure.is_null() { w_none() } else { closure });
                 }
                 "__globals__" => {
-                    // `funcobject.py:325 fget_func_globals` returns
-                    // `self.w_func_globals` directly — the function's
+                    // `function.py` `Function.w_func_globals` is the function's
                     // `w_func_globals_obj` field, the canonical W_DictObject
                     // shared with the defining module's `__dict__`.
                     return Ok(unsafe { crate::function_get_globals_obj(obj) });
@@ -17148,8 +17147,9 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<Wtf8Buf, crate::PyE
     // general rule, which is why it goes through the same helper the generic
     // path below uses.
     if !w_function.is_null() && unsafe { crate::function::is_function(w_function) } {
-        // function.py:2108 `qualname = w_function.qualname` — match
-        // PyPy's stored `qualname` field via the helper that walks
+        // `baseobjspace.py` `object_functionstr` reads `w_function.qualname`
+        // (`function.py` `fget_func_qualname`). Match that stored field
+        // via the helper that walks
         // the stored `qualname` → `code.qualname` → `name`.
         // The qualname is WTF-8 and this text becomes a TypeError's
         // `args[0]` prefix, so `format!` (which would render it through

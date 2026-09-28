@@ -7274,7 +7274,7 @@ mod tests {
             assert!(guard.has_descr(), "guard should have a descriptor");
             assert!(
                 guard.getdescr().unwrap().is_resume_guard(),
-                "optimizer.py:723: descr must be a ResumeGuardDescr subtype"
+                "optimizer.py `store_final_boxes_in_guard`: descr must be a ResumeGuardDescr subtype"
             );
         }
         let peel_index = guards[0].getdescr().unwrap().index();

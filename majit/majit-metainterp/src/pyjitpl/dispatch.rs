@@ -2210,13 +2210,13 @@ where
         runtime_value: i64,
         resume_pc: usize,
     ) -> OpRef {
-        // pyjitpl.py:1920-1921
+        // `pyjitpl.py` `implement_guard_value`
         if box_.is_constant() {
             return box_;
         }
-        // pyjitpl.py:1923 `executor.constant_from_op(box)`.
+        // `executor.py` `constant_from_op`.
         let promoted_box = ctx.const_int(runtime_value);
-        // pyjitpl.py:1924-1925
+        // `pyjitpl.py` `implement_guard_value`
         self.record_state_guard(
             ctx,
             sym,
@@ -2227,7 +2227,7 @@ where
         );
         // pyjitpl.py `replace_box`.
         self.replace_box(ctx, box_, promoted_box, Type::Int);
-        // pyjitpl.py:1927
+        // `pyjitpl.py` `implement_guard_value`
         promoted_box
     }
 
@@ -6511,7 +6511,7 @@ where
                 // typed register lists (`[len:u8][reg:u8 * N]`).
                 let opcode = bytecode;
                 let frame = self.frames.current_mut();
-                // jtransform.py:1693-1706 emits a `-live-` (op3) immediately
+                // `jtransform.py` `promote_greens` emits a `-live-` (op3) immediately
                 // BEFORE the `jit_merge_point` op; the GUARD_FUTURE_CONDITION
                 // recorded at loop close resumes through it
                 // (`JitCodeBuilder::live_placeholder` in
@@ -6592,7 +6592,7 @@ where
                 // (pyjitpl.py).  Slots 0..3 hold the green
                 // register bytes; each green register MUST hold a
                 // Const at trace time (the `emit_promote_greens` /
-                // `<kind>_guard_value` chain at `jtransform.py:1693-1712`
+                // `<kind>_guard_value` chain at `jtransform.py` `promote_greens`
                 // promotes each green to a constant before the
                 // `BC_JIT_MERGE_POINT`).  A non-constant green here
                 // indicates a macro emission gap.  RPython
@@ -6751,7 +6751,7 @@ where
                                 "BC_JIT_MERGE_POINT: green register \
                                  {reg} (slot {slot}) holds non-Const \
                                  OpRef {opref:?} — emit_promote_greens \
-                                 (jtransform.py:1693) must run before \
+                                 (`jtransform.py` `promote_greens`) must run before \
                                  the merge point so all greens are \
                                  constants (pyjitpl.py:1530-1535 \
                                  verify_green_args)",

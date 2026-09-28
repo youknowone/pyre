@@ -10400,7 +10400,7 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
         wc.registers_r.get(0).expect("ref register in range"),
         last_args1.to_opref(),
         "register slot still holding the original OpRef must be rewritten \
-             to the promoted constant (pyjitpl.py:1923 replace_box)",
+             to the promoted constant (`pyjitpl.py` `replace_box`)",
     );
 }
 
@@ -10493,7 +10493,7 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
         wc.registers_i.get(0).expect("int register in range"),
         last_args1.to_opref(),
         "register slot still holding the original OpRef must be rewritten \
-         to the promoted constant (pyjitpl.py:1923 replace_box)",
+         to the promoted constant (`pyjitpl.py` `replace_box`)",
     );
 }
 

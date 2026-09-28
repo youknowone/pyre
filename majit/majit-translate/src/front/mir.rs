@@ -6201,8 +6201,8 @@ impl<'a> Lowering<'a> {
 
         let arg_count = body.locals.arg_count as usize;
         // Arguments become startblock inputargs in source order
-        // (RPython parity: `flowcontext.py:333` populates `locals_w[:argcount]`
-        // from `flowmodel.py:130` `Block(inputargs)`).
+        // (RPython parity: `flowcontext.py` `init_locals_stack` fills
+        // `locals_w`; arguments are `model.py` `Block` inputargs).
         //
         // Each parameter is also emitted as a paired `OpKind::Input { name,
         // ty }` op into the startblock.  Downstream consumers

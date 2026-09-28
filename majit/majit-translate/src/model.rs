@@ -824,7 +824,7 @@ pub enum OpKind {
     ConstInt128(i128),
     /// Translation-time `r_ulonglonglong` constant.
     ConstUInt128(u128),
-    /// RPython `flowmodel.py:Constant(bool_value)` — a bool constant
+    /// RPython `model.py` `Constant(bool_value)` — a bool constant
     /// whose `concretetype` is `lltype.Bool`. The codewriter folds Bool
     /// into kind `'int'` (`rpython/jit/codewriter/flatten.py:getkind`),
     /// so backend lowering shares the integer materialization path with
@@ -833,14 +833,14 @@ pub enum OpKind {
     /// instead of `SomeInteger`, and selects `BoolRepr`
     /// (`rpython/rtyper/rbool.py`) instead of `IntegerRepr`.
     ConstBool(bool),
-    /// RPython `flowmodel.py:Constant(rfloat)` — a float constant whose
+    /// RPython `model.py` `Constant(rfloat)` — a float constant whose
     /// `concretetype` is `lltype.Float`.  Stored as the f64 bit pattern
     /// (`history.py ConstFloat.getfloatstorage`) so PartialEq/Hash
     /// stay derivable.  The assembler materialises this through the
     /// existing `constants_f` pool with a `float_copy` op, mirroring
     /// the `ConstInt` → `int_copy` lowering.
     ConstFloat(u64),
-    /// RPython `flowmodel.py:Constant(value)` whose `concretetype` is
+    /// RPython `model.py` `Constant(value)` whose `concretetype` is
     /// `lltype.SingleFloat` — a Rust `f32` literal.  Stored as the f32
     /// bit pattern, which is what distinguishes it from [`OpKind::ConstFloat`]:
     /// a Charon float constant records its width (`{"Float": {"value":
@@ -853,13 +853,13 @@ pub enum OpKind {
     /// reaches upstream's `Constant(value, SingleFloat)` through
     /// `op.args`, and refuses the graph.
     ConstSingleFloat(u32),
-    /// RPython `flowmodel.py:Constant(str_value)` after
+    /// RPython `model.py` `Constant(str_value)` after
     /// `StringRepr.convert_const` resolves the host string to a
     /// prebuilt `Ptr(STR)`. The pre-jtransform string-constant fold
     /// carries bytes here; the assembler mints the lltype pointer and
     /// materialises it through the ref constant pool.
     ConstStr(Vec<u8>),
-    /// RPython `flowmodel.py:Constant(host_object)` resolved by the
+    /// RPython `model.py` `Constant(host_object)` resolved by the
     /// rtyper to a singleton instance pointer
     /// (`rtyper/rpbc.py::SingleFrozenPBCRepr`).  Stored as a thin
     /// `HostObject` handle so the assembler can stash
@@ -7368,7 +7368,7 @@ impl FunctionGraph {
     /// Create a block with `num_args` fresh inputarg `Variable`s
     /// (Phi nodes), each minted via `alloc_value_var_with_type` with
     /// `ConcreteType::Unknown` and returned to the caller for direct
-    /// use.  RPython parity: `flowmodel.py:130-145 Block(inputargs)`
+    /// use.  RPython parity: `model.py` `Block`
     /// where each inputarg is a fresh Variable.
     pub fn create_block_with_arg_vars(
         &mut self,

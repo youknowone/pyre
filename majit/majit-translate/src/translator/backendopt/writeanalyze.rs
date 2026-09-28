@@ -311,7 +311,7 @@ fn as_variable(hv: Hlvalue) -> Option<Variable> {
 }
 
 /// `op.args[i].concretetype` for an `Hlvalue` arg
-/// (`finalizer.py:159-160` pattern). Upstream reaches `.concretetype`
+/// (`finalizer.py` `analyze_simple_operation`). Upstream reaches `.concretetype`
 /// directly; a missing arg slot or an absent `concretetype` is a
 /// malformed/un-rtyped graph, so the port fails loud (IndexError /
 /// AttributeError parity) rather than synthesising a `None`-typed effect.

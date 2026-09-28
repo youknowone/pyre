@@ -6265,7 +6265,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// `error.py space.type(value).name`, the qualified typedef name
     /// (`interp_scandir.py 'posix.DirEntry'`), which is what
     /// `w_type_get_name` returns; the flag-driven `reduce_newobj` refusal in
-    /// `reduce_protocol_app.py:13-14` spells it with the bare `__name__`.
+    /// `reduce_protocol_app.py` `reduce_1` spells it with `__name__`.
     fn dir_entry_reduce_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let type_name = match crate::typedef::r#type(args[0]) {
             Some(tp) => unsafe { pyre_object::typeobject::w_type_get_name(tp.as_ptr()) },

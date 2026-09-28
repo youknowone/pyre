@@ -3839,7 +3839,8 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         false
     }
 
-    /// optimizer.py:723 / compile.py:838 `assert isinstance(descr,
+    /// `optimizer.py` `store_final_boxes_in_guard` /
+    /// `compile.py` `ResumeGuardDescr`. `assert isinstance(descr,
     /// compile.ResumeGuardDescr)` parity.  Returns true on
     /// `ResumeGuardDescr` and the subclasses that inherit it
     /// (`ResumeAtPositionDescr`, `ResumeGuardForcedDescr`,

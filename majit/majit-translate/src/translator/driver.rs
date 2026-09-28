@@ -1787,7 +1787,7 @@ impl TranslationDriver {
             let newexename = PathBuf::from(basename);
             shutil_copy(&exename, &newexename).map_err(|e| TaskError {
                 message: format!(
-                    "driver.py:481 shutil_copy({}, {}): {e}",
+                    "driver.py `shutil_copy`({}, {}): {e}",
                     exename.display(),
                     newexename.display()
                 ),
@@ -1806,7 +1806,7 @@ impl TranslationDriver {
                     })?);
                 shutil_copy(&soname, &newsoname).map_err(|e| TaskError {
                     message: format!(
-                        "driver.py:486 shutil_copy({}, {}): {e}",
+                        "driver.py `shutil_copy`({}, {}): {e}",
                         soname.display(),
                         newsoname.display()
                     ),

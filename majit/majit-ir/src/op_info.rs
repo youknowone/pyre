@@ -54,7 +54,7 @@ pub enum OpInfo {
     Unknown,
     /// shortpreamble.py `empty_info` sentinel.
     EmptyInfo(EmptyInfo),
-    /// Known integer bounds. info.py:1264 IntBound.
+    /// Known integer bounds. `intutils.py` `IntBound`.
     /// `IntBound::from_constant(v)` is the canonical Int constant carrier.
     /// Chunked [`IntBoundRc`] so first mint leaves the 56-byte
     /// `RcBox<RefCell<IntBound>>` class.

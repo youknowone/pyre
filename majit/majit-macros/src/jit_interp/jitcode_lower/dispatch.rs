@@ -3339,7 +3339,7 @@ pub(super) fn emit_promote_greens(lowerer: &mut Lowerer, config: &LowererConfig)
         let ident = match green {
             syn::Expr::Path(p) => p.path.get_ident().unwrap_or_else(|| {
                 panic!(
-                    "A.3.5 (jtransform.py:1693): green expression must be a single-segment \
+                    "A.3.5 (`jtransform.py` `promote_greens`): green expression must be a single-segment \
                      ident for promote_greens. Got: {:?}",
                     p.path
                         .segments
@@ -3349,7 +3349,7 @@ pub(super) fn emit_promote_greens(lowerer: &mut Lowerer, config: &LowererConfig)
                 )
             }),
             _ => panic!(
-                "A.3.5 (jtransform.py:1693): green expression must be a single-segment \
+                "A.3.5 (`jtransform.py` `promote_greens`): green expression must be a single-segment \
                  ident for promote_greens. Got non-path expression: {}",
                 quote::quote!(#green)
             ),
@@ -3357,7 +3357,7 @@ pub(super) fn emit_promote_greens(lowerer: &mut Lowerer, config: &LowererConfig)
         let ident_name = ident.to_string();
         let binding = lowerer.bindings.get(&ident_name).unwrap_or_else(|| {
             panic!(
-                "A.3.5 (jtransform.py:1693): green '{}' declared in #[jit_interp(greens = ...)] \
+                "A.3.5 (`jtransform.py` `promote_greens`): green '{}' declared in #[jit_interp(greens = ...)] \
                  but not bound at portal entry. Available bindings: {:?}",
                 ident_name,
                 lowerer.bindings.keys().collect::<Vec<_>>(),
@@ -3970,7 +3970,7 @@ pub(crate) fn lower_dispatch_body(
         .max(ref_identity_end)
         .max(config.float_identity_end());
 
-    // A.3.6.1 (jtransform.py:1693): bind body-local `let` stmts that
+    // A.3.6.1 (`jtransform.py` `promote_greens`): bind body-local `let` stmts that
     // appear BEFORE `jit_merge_point!()` in the dispatch while-body, so
     // that consumer-declared `greens = [<body-local>]` (say
     // `greens = [ok]`) resolve via `lowerer.bindings` when
@@ -3982,7 +3982,7 @@ pub(crate) fn lower_dispatch_body(
         return None;
     }
 
-    // A.3.5 (jtransform.py:1693-1714): emit a `-live-` + `<kind>_guard_value`
+    // A.3.5 (`jtransform.py` `promote_greens`): emit a `-live-` + `<kind>_guard_value`
     // pair for each declared green BEFORE `jit_merge_point`.  Forces every
     // green to a constant at trace time; `pyjitpl.py verify_green_args` asserts all greens
     // are constants when the merge point is reached.

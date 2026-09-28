@@ -723,7 +723,7 @@ fn try_generate_jitcode_body_inner(
     })
 }
 
-/// A.3.6.1 (jtransform.py:1693-1714): bind body-local `let` stmts that
+/// A.3.6.1 (`jtransform.py` `promote_greens`): bind body-local `let` stmts that
 /// appear in the dispatch while-body BEFORE the `jit_merge_point!()`
 /// macro stmt, so that consumer-declared
 /// `#[jit_interp(greens = [<body-local>])]` (say `greens = [ok]` with

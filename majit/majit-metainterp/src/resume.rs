@@ -720,20 +720,20 @@ pub fn exit_pending_field_layout(
     let descr = pf
         .descr
         .clone()
-        .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
-    let item_index =
-        if descr.as_array_descr().is_some() {
-            Some(usize::try_from(pf.item_index).expect(
-                "resume.py:1003 setarrayitem pending field requires non-negative item_index",
-            ))
-        } else if descr.as_field_descr().is_some() {
-            None
-        } else {
-            panic!(
-                "pending field descr must be FieldDescr or ArrayDescr (descr={:?})",
-                descr,
-            );
-        };
+        .expect("resume.py `_prepare_pendingfields`: PENDINGFIELDSTRUCT.lldescr must be set");
+    let item_index = if descr.as_array_descr().is_some() {
+        Some(
+            usize::try_from(pf.item_index)
+                .expect("resume.py `setarrayitem` pending field requires non-negative item_index"),
+        )
+    } else if descr.as_field_descr().is_some() {
+        None
+    } else {
+        panic!(
+            "pending field descr must be FieldDescr or ArrayDescr (descr={:?})",
+            descr,
+        );
+    };
     ExitPendingFieldLayout {
         descr: pf.descr.clone(),
         is_array_item: item_index.is_some(),
@@ -7476,10 +7476,9 @@ impl<'a> ResumeDataDirectReader<'a> {
             // this by setting `pf.descr = pf_op.descr.clone()` for
             // every pending field (pf_op is always a Setfield_gc /
             // Setarrayitem_gc op with a descr).
-            let descr = pf
-                .descr
-                .as_ref()
-                .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
+            let descr = pf.descr.as_ref().expect(
+                "resume.py `_prepare_pendingfields`: PENDINGFIELDSTRUCT.lldescr must be set",
+            );
             let field_info = if let Some(fd) = descr.as_field_descr() {
                 Some((fd.offset(), fd.field_size(), fd.field_type()))
             } else if descr.as_array_descr().is_some() {
@@ -7734,7 +7733,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     ) {
         let ad = arraydescr
             .as_array_descr()
-            .expect("resume.py:1009 setarrayitem requires ArrayDescr");
+            .expect("resume.py `setarrayitem` requires ArrayDescr");
         if ad.is_array_of_pointers() {
             // resume.py:1011 self.bh_setarrayitem_gc_r(array, index, fieldnum, arraydescr)
             let value = self.decode_ref(fieldnum);

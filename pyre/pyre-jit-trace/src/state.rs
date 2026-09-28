@@ -8976,7 +8976,7 @@ fn prepare_bridge_pending_fields(
         };
         let is_exc_channel = pending.item_index < 0 && std::sync::Arc::ptr_eq(descr, &target_descr);
 
-        // resume.py:1002-1005: both operands use the same tagged decoder as
+        // `resume.py` `_prepare_pendingfields`: both operands use the same tagged decoder as
         // frame boxes.  Decode the target as well as the fieldbox so virtual
         // preparation and malformed-tag checks stay aligned with deopt.
         let rd_consts = storage.rd_consts();

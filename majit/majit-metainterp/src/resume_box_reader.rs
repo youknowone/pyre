@@ -1374,7 +1374,7 @@ pub fn replay_pending_fields(
             }
             continue;
         };
-        // resume.py:1002-1005 both operands use the same tagged decoder as frame
+        // `resume.py` `_prepare_pendingfields` decodes both operands the same way as frame
         // boxes.
         let rd_consts = storage.rd_consts();
         let target = majit_ir::resumedata::decode_tagged_value(

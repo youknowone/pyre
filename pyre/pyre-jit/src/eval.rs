@@ -14394,7 +14394,7 @@ fn replay_pending_fields(
         let descr = pf
             .descr
             .as_ref()
-            .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
+            .expect("resume.py `_prepare_pendingfields`: PENDINGFIELDSTRUCT.lldescr must be set");
         // resume.py _prepare_pendingfields:
         //   if itemindex < 0: setfield(struct, fieldnum, descr)
         //   else:             setarrayitem(struct, itemindex, fieldnum, descr)

@@ -182,7 +182,7 @@ fn kill_assertion_link(graph: &FunctionGraph, link: &LinkRef) -> Result<bool, Ta
         .as_ref()
         .and_then(|prev| prev.upgrade())
         .ok_or_else(|| TaskError {
-            message: "removeassert.py:39 kill_assertion_link: link.prevblock missing".to_string(),
+            message: "removeassert.py `kill_assertion_link`: link.prevblock missing".to_string(),
         })?;
     let mut exits: Vec<LinkRef> = block.borrow().exits.clone();
     if exits.len() <= 1 {
@@ -192,7 +192,7 @@ fn kill_assertion_link(graph: &FunctionGraph, link: &LinkRef) -> Result<bool, Ta
         .iter()
         .position(|candidate| Rc::ptr_eq(candidate, link))
         .ok_or_else(|| TaskError {
-            message: "removeassert.py:39 kill_assertion_link: link not in prevblock.exits"
+            message: "removeassert.py `kill_assertion_link`: link not in prevblock.exits"
                 .to_string(),
         })?;
     let mut remove_condition = exits.len() == 2;
@@ -209,12 +209,13 @@ fn kill_assertion_link(graph: &FunctionGraph, link: &LinkRef) -> Result<bool, Ta
             if !remove_condition {
                 return Err(TaskError {
                     message:
-                        "removeassert.py:49 kill_assertion_link: bool exitswitch without two exits"
+                        "removeassert.py `kill_assertion_link`: bool exitswitch without two exits"
                             .to_string(),
                 });
             }
             let exitswitch = exitswitch.expect("checked above");
-            // Upstream `:72 newops = LowLevelOpList()` — no rtyper
+            // `removeassert.py` `kill_assertion_link` emits
+            // `newops = LowLevelOpList()` — no rtyper
             // argument. Mirrors the no-arg form: only `bool_not` /
             // `debug_assert` are emitted, neither requires the
             // typer.

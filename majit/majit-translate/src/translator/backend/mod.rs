@@ -102,7 +102,7 @@ impl CBuilderRef {
         }
     }
 
-    /// Upstream `cbuilder.shared_library_name` (`driver.py:486`).
+    /// Upstream `genc.py` `shared_library_name`.
     pub fn shared_library_name(&self) -> Option<PathBuf> {
         match self {
             CBuilderRef::Standalone(b) => b.shared_library_name.borrow().clone(),
