@@ -23,17 +23,18 @@ Use the canonical fetcher:
 
 ```sh
 scripts/install-charon.py
-../.pyre-build/charon/<platform>/charon toolchain-path  # one-time nightly install (~1 min)
+../.pyre-build/charon/<platform>/<version>/charon toolchain-path  # one-time nightly install (~1 min)
 ```
 
-The script pins `CHARON_VERSION_DEFAULT="nightly-2026.05.29"` and installs
-to a shared cache at `../.pyre-build/charon/<platform>` by default, so sibling
-worktrees reuse the same Charon binary. Override with
-`PYRE_SHARED_BUILD=/path/to/cache` or `CHARON_DEST=/path/to/bin`; use
+The script pins `CHARON_VERSION_DEFAULT="nightly-2026.09.26"` and installs
+to a shared cache at `../.pyre-build/charon/<platform>/<version>` by default,
+so sibling worktrees on the same pin reuse the binary and an older pin keeps
+its own directory. Override with `PYRE_SHARED_BUILD=/path/to/cache` or
+`CHARON_DEST=/path/to/bin`; use
 `CHARON_VERSION=nightly-YYYY.MM.DD scripts/install-charon.py` to bump.
 
-Charon itself is `0.1.196`. It internally pins Rust toolchain
-`nightly-2026-02-07` (`rustc-dev`, `llvm-tools-preview`, `rust-src`,
+Charon itself follows that nightly tag. It internally pins Rust toolchain
+`nightly-2026-09-17` (`rustc-dev`, `llvm-tools-preview`, `rust-src`,
 `miri` components); `charon toolchain-path` auto-installs the
 toolchain on first run via rustup. There is no formal stable release
 tag — every release is a nightly tag.
@@ -49,7 +50,7 @@ nightly; it only needs the `.llbc` JSON.
 ../../scripts/install-charon.py
 
 # 1. regenerate the checked-in fixture, in place (run from this directory).
-#    <charon> is ../../../.pyre-build/charon/<platform>/charon by default —
+#    <charon> is ../../../.pyre-build/charon/<platform>/<version>/charon by default —
 #    the location `install-charon.py` writes to.
 <charon> cargo --ullbc --dest-file "$PWD/corpus.ullbc"
 

@@ -77,8 +77,12 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                 let look_inside = global_marker_bool(llbc, gd).unwrap_or_else(|| {
                     panic!(
                         "_jit_look_inside_ marker `{path}` has an undecodable bool \
-                         initializer; the macro emits a literal bool, so this signals \
-                         a Charon encoding change"
+                         initializer; init={:?} value={}",
+                        marker_init_fun_id(gd),
+                        gd.rest
+                            .get("value")
+                            .map(|v| v.to_string())
+                            .unwrap_or_default()
                     )
                 });
                 let hint = if look_inside {
@@ -321,19 +325,40 @@ fn strip_crate_prefix(path: &str) -> String {
 }
 
 fn global_marker_bool(llbc: &Llbc, gd: &GlobalDecl) -> Option<bool> {
-    let init_id = gd.rest.get("init")?.as_u64()?;
+    if let Some(value) = gd.rest.get("value")
+        && let Some(b) = decode_bool_const(llbc, value)
+    {
+        return Some(b);
+    }
+    let init_id = marker_init_fun_id(gd)?;
+    bool_assigned_to_return(llbc, init_id)
+}
+
+pub(crate) fn marker_init_fun_id(gd: &GlobalDecl) -> Option<u64> {
+    let value = gd.rest.get("value")?;
+    let body = value
+        .get("Value")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .unwrap_or(value);
+    let lit = body.as_array()?.first()?;
+    lit.pointer("/Call/0/kind/Fun")
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn bool_assigned_to_return(llbc: &Llbc, init_id: u64) -> Option<bool> {
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
     for block in &body.body {
         for stmt in &block.statements {
-            let StmtKind::Assign(place, Rvalue::Use(Operand::Const(value))) =
-                stmt.stmt_kind().ok()?
+            let Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Const(value), _))) =
+                stmt.stmt_kind()
             else {
                 continue;
             };
             if !matches!(place.kind, PlaceKind::Local(0)) {
                 continue;
             }
-            if let Some(b) = decode_bool_const(&value) {
+            if let Some(b) = decode_bool_const(llbc, &value) {
                 return Some(b);
             }
         }
@@ -342,15 +367,21 @@ fn global_marker_bool(llbc: &Llbc, gd: &GlobalDecl) -> Option<bool> {
 }
 
 /// Read the `&'static str` value of an oopspec marker const. The init
-/// body assigns `Local(0) = Const(ConstantExpr)` whose `kind` nests the
-/// string literal (`{"kind": {"Literal": {"Str": spec}}, "ty": …}`),
-/// mirroring [`global_marker_bool`]'s bool path.
+/// body assigns `Local(0) = Const(ConstantExpr)` whose kind is the
+/// string literal (`[{"Str": spec}, ty]`), mirroring [`global_marker_bool`]'s bool path.
 fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
-    let init_id = gd.rest.get("init")?.as_u64()?;
+    if let Some(value) = gd.rest.get("value")
+        && let Some(spec) = decode_str_const(llbc, value)
+    {
+        return Some(spec);
+    }
+    // Named consts point at their initializer by a `Call` inside `value`,
+    // not by an `init` field.
+    let init_id = marker_init_fun_id(gd)?;
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
     for block in &body.body {
         for stmt in &block.statements {
-            let StmtKind::Assign(place, Rvalue::Use(Operand::Const(value))) =
+            let StmtKind::Assign(place, Rvalue::Use(Operand::Const(value), _)) =
                 stmt.stmt_kind().ok()?
             else {
                 continue;
@@ -358,7 +389,7 @@ fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
             if !matches!(place.kind, PlaceKind::Local(0)) {
                 continue;
             }
-            if let Some(s) = decode_str_const(&value) {
+            if let Some(s) = decode_str_const(llbc, &value) {
                 return Some(s);
             }
         }
@@ -366,63 +397,15 @@ fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
     None
 }
 
-fn decode_str_const(value: &serde_json::Value) -> Option<String> {
-    if let Some(s) = value.as_str() {
-        return Some(s.to_string());
-    }
-    let obj = value.as_object()?;
-    for key in ["Str", "str"] {
-        if let Some(v) = obj.get(key)
-            && let Some(s) = v.as_str()
-        {
-            return Some(s.to_string());
-        }
-    }
-    // `ConstantExpr` nests the literal under `kind` →
-    // `{"Literal": {"Str": spec}}`; descend through both wrappers.
-    for key in ["kind", "Literal"] {
-        if let Some(nested) = obj.get(key)
-            && let Some(s) = decode_str_const(nested)
-        {
-            return Some(s);
-        }
-    }
-    None
+fn decode_str_const(llbc: &Llbc, value: &serde_json::Value) -> Option<String> {
+    llbc.const_expr_literal(value)?
+        .get("Str")?
+        .as_str()
+        .map(str::to_string)
 }
 
-fn decode_bool_const(value: &serde_json::Value) -> Option<bool> {
-    if let Some(b) = value.as_bool() {
-        return Some(b);
-    }
-    let obj = value.as_object()?;
-    for key in ["Bool", "bool"] {
-        if let Some(v) = obj.get(key) {
-            return v.as_bool();
-        }
-    }
-    if let Some(lit) = obj.get("Literal") {
-        if let Some(b) = lit.as_bool() {
-            return Some(b);
-        }
-        if let Some(lit_obj) = lit.as_object() {
-            for key in ["Bool", "bool"] {
-                if let Some(v) = lit_obj.get(key) {
-                    return v.as_bool();
-                }
-            }
-        }
-    }
-    if let Some(scalar) = obj.get("Scalar").or_else(|| obj.get("scalar")) {
-        return decode_bool_const(scalar);
-    }
-    // A `ConstantExpr` nests the literal under `kind`
-    // (`{"kind": {"Literal": {"Bool": b}}, "ty": …}`).  The marker init
-    // assigns exactly this shape (`Local(0) = Const(ConstantExpr)`), so
-    // descend through `kind` to reach the literal instead of missing it.
-    if let Some(kind) = obj.get("kind") {
-        return decode_bool_const(kind);
-    }
-    None
+fn decode_bool_const(llbc: &Llbc, value: &serde_json::Value) -> Option<bool> {
+    llbc.const_expr_literal(value)?.get("Bool")?.as_bool()
 }
 
 #[cfg(test)]
@@ -521,37 +504,41 @@ mod tests {
         assert!(parse_immutable_entry_list("").is_empty());
     }
 
+    fn empty_llbc() -> majit_charon_reader::Llbc {
+        majit_charon_reader::Llbc::from_slice(
+            br#"{"charon_version":"t","has_errors":false,"translated":{"crate_name":"c","fun_decls":[]}}"#,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn decode_str_const_reads_constant_expr_literal() {
-        // The exact shape Charon emits for `const X: &str = "spec"`:
-        // `Local(0) = Const(ConstantExpr{kind:{Literal:{Str:spec}}})`.
+        let llbc = empty_llbc();
+        // `const X: &str = "spec"` is a hash-consed constant expression
+        // `{"Value":[id, [{"Str": spec}, ty]]}`.
         let value = serde_json::json!({
-            "kind": {"Literal": {"Str": "list.int_capacity(l)"}},
-            "ty": {"Deduplicated": 7911}
+            "Value": [1, [{"Str": "list.int_capacity(l)"}, {"Deduplicated": 7911}]]
         });
         assert_eq!(
-            decode_str_const(&value).as_deref(),
+            decode_str_const(&llbc, &value).as_deref(),
+            Some("list.int_capacity(l)")
+        );
+        let inline = serde_json::json!([{"Str": "list.int_capacity(l)"}, {"Deduplicated": 7911}]);
+        assert_eq!(
+            decode_str_const(&llbc, &inline).as_deref(),
             Some("list.int_capacity(l)")
         );
     }
 
     #[test]
-    fn decode_str_const_reads_bare_and_wrapped_strings() {
-        assert_eq!(
-            decode_str_const(&serde_json::json!("plain")).as_deref(),
-            Some("plain")
-        );
-        assert_eq!(
-            decode_str_const(&serde_json::json!({"Str": "wrapped"})).as_deref(),
-            Some("wrapped")
-        );
-    }
-
-    #[test]
     fn decode_str_const_rejects_non_string() {
-        assert_eq!(decode_str_const(&serde_json::json!(42)), None);
+        let llbc = empty_llbc();
+        assert_eq!(decode_str_const(&llbc, &serde_json::json!(42)), None);
         assert_eq!(
-            decode_str_const(&serde_json::json!({"kind": {"Literal": {"Bool": true}}})),
+            decode_str_const(
+                &llbc,
+                &serde_json::json!([{"Bool": true}, {"Deduplicated": 1}])
+            ),
             None
         );
     }

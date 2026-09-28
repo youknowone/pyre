@@ -65,7 +65,7 @@ impl SpecQueue {
             let Some(body) = value.get("Unstructured") else {
                 return false;
             };
-            mentions_own_clause(body, llbc)
+            mentions_own_clause(body, llbc, Space::Ty)
         });
         self.clause_body.insert(fd.def_id, has);
         has
@@ -235,8 +235,12 @@ pub(crate) fn concrete_type_args(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let open = |items: &[Value]| items.iter().any(|item| contains_depth0_var(item, llbc, 0));
-    if open(&types) || open(&const_generics) {
+    let open = |items: &[Value], space: Space| {
+        items
+            .iter()
+            .any(|item| contains_depth0_var(item, llbc, space, None, 0))
+    };
+    if open(&types, Space::Ty) || open(&const_generics, Space::Const) {
         return None;
     }
     Some((types, const_generics))
@@ -283,9 +287,8 @@ pub(crate) fn trait_impl_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Va
     let arr = payload.as_array()?;
     let resolved = resolve_trait_ref(arr.first()?, llbc, 0)?;
     let impl_id = trait_impl_id(&resolved, llbc, 0)?;
-    let decl_id = arr.get(2)?.as_u64()?;
     let method_idx = arr.get(1)?.as_u64()?;
-    let fn_id = impl_method_fn_id(llbc, impl_id, decl_id, method_idx)?;
+    let fn_id = impl_method_fn_id(llbc, impl_id, method_idx)?;
     let generics = resolved
         .pointer("/kind/TraitImpl/generics")
         .cloned()
@@ -293,31 +296,22 @@ pub(crate) fn trait_impl_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Va
     Some((fn_id, generics))
 }
 
-fn impl_method_fn_id(llbc: &Llbc, impl_id: u64, decl_id: u64, method_idx: u64) -> Option<u64> {
-    let methods = llbc
-        .trait_impls_raw()
+/// The impl's own body for the trait's `method_idx`-th method. Each impl
+/// method is tagged `{"TraitMethod": [trait_id, method_idx]}`; a method the
+/// impl does not override is absent and answers `None`.
+fn impl_method_fn_id(llbc: &Llbc, impl_id: u64, method_idx: u64) -> Option<u64> {
+    llbc.trait_impls_raw()
         .get(impl_id as usize)?
         .get("methods")?
-        .as_array()?;
-    for method in methods {
-        let Some(kind) = method
-            .get("kind")
-            .and_then(|kind| kind.get("TraitMethod"))
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-        let Some(id) = kind.first().and_then(Value::as_u64) else {
-            continue;
-        };
-        if id == decl_id {
-            return method.get("skip_binder")?.get("id")?.as_u64();
-        }
-    }
-    methods
-        .get(method_idx as usize)?
-        .get("skip_binder")?
-        .get("id")?
+        .as_array()?
+        .iter()
+        .find(|method| {
+            method
+                .pointer("/kind/TraitMethod/1")
+                .and_then(Value::as_u64)
+                == Some(method_idx)
+        })?
+        .pointer("/skip_binder/id")?
         .as_u64()
 }
 
@@ -380,15 +374,16 @@ fn resolve_trait_ref(v: &Value, llbc: &Llbc, depth: usize) -> Option<Value> {
     resolve_trait_ref(implied.get(index)?, llbc, depth + 1)
 }
 
+/// A trait ref behind its `Deduplicated` / `Value` hash-cons wrapper.
 fn unwrap_ref<'a>(v: &'a Value, llbc: &'a Llbc, depth: usize) -> Option<&'a Value> {
     if depth > 8 {
         return None;
     }
     let obj = v.as_object()?;
     if let Some(id) = obj.get("Deduplicated").and_then(Value::as_u64) {
-        return unwrap_ref(llbc.dedup_body(id)?, llbc, depth + 1);
+        return unwrap_ref(llbc.dedup_trait_body(id)?, llbc, depth + 1);
     }
-    if let Some(arr) = obj.get("HashConsedValue").and_then(Value::as_array)
+    if let Some(arr) = obj.get("Value").and_then(Value::as_array)
         && arr.len() == 2
     {
         return unwrap_ref(&arr[1], llbc, depth + 1);
@@ -396,7 +391,10 @@ fn unwrap_ref<'a>(v: &'a Value, llbc: &'a Llbc, depth: usize) -> Option<&'a Valu
     Some(v)
 }
 
-fn clause_index(v: &Value, llbc: &Llbc) -> Option<usize> {
+fn clause_index(v: &Value, llbc: &Llbc, space: Space) -> Option<usize> {
+    if space != Space::TraitRef {
+        return None;
+    }
     let obj = unwrap_ref(v, llbc, 0)?;
     let bound = obj.get("kind")?.get("Clause")?.get("Bound")?.as_array()?;
     if bound.first()?.as_u64()? != 0 {
@@ -405,33 +403,39 @@ fn clause_index(v: &Value, llbc: &Llbc) -> Option<usize> {
     Some(bound.get(1)?.as_u64()? as usize)
 }
 
-fn mentions_own_clause(v: &Value, llbc: &Llbc) -> bool {
-    mentions_own_clause_at(v, llbc, 0)
+fn mentions_own_clause(v: &Value, llbc: &Llbc, space: Space) -> bool {
+    mentions_own_clause_at(v, llbc, space, None, 0)
 }
 
-fn mentions_own_clause_at(v: &Value, llbc: &Llbc, depth: usize) -> bool {
+fn mentions_own_clause_at(
+    v: &Value,
+    llbc: &Llbc,
+    space: Space,
+    key: Option<&str>,
+    depth: usize,
+) -> bool {
     if depth > 64 {
         return false;
     }
-    if clause_index(v, llbc).is_some() {
+    if clause_index(v, llbc, space).is_some() {
         return true;
     }
-    if let Some(body) = indirect_body(v, llbc) {
-        return mentions_own_clause_at(&body, llbc, depth + 1);
+    if let Some(body) = indirect_body(v, llbc, space) {
+        return mentions_own_clause_at(&body, llbc, space, None, depth + 1);
     }
     match v {
-        Value::Array(items) => items
-            .iter()
-            .any(|item| mentions_own_clause_at(item, llbc, depth + 1)),
-        Value::Object(map) => map
-            .values()
-            .any(|item| mentions_own_clause_at(item, llbc, depth + 1)),
+        Value::Array(items) => items.iter().enumerate().any(|(i, item)| {
+            mentions_own_clause_at(item, llbc, space.element(key, i), None, depth + 1)
+        }),
+        Value::Object(map) => map.iter().any(|(k, item)| {
+            mentions_own_clause_at(item, llbc, space.field(k), Some(k), depth + 1)
+        }),
         _ => false,
     }
 }
 
 /// Replace depth-0 type variables with `types[i]` and depth-0 const-generic
-/// variables with `const_generics[i]`. A `Deduplicated` / `HashConsedValue`
+/// variables with `const_generics[i]`. A `Deduplicated` / `Value`
 /// node whose resolved body contains such a variable is replaced by the
 /// substituted plain node. The shared dedup table is not written.
 pub(crate) fn substitute_type_vars(
@@ -440,7 +444,7 @@ pub(crate) fn substitute_type_vars(
     types: &[Value],
     const_generics: &[Value],
 ) {
-    subst_vars(body, llbc, types, const_generics, 0);
+    subst_vars(body, llbc, types, const_generics, Space::Ty, None, 0);
 }
 
 /// `fd.signature` with the same depth-0 substitution as the copied body.
@@ -465,7 +469,7 @@ fn subst_tyref(ty: &TyRef, llbc: &Llbc, types: &[Value], const_generics: &[Value
     let mut value = match ty {
         TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
         TyRef::Inline { value: (id, body) } => {
-            serde_json::json!({ "HashConsedValue": [id, body] })
+            serde_json::json!({ "Value": [id, body] })
         }
         TyRef::Other(body) => body.clone(),
     };
@@ -473,7 +477,15 @@ fn subst_tyref(ty: &TyRef, llbc: &Llbc, types: &[Value], const_generics: &[Value
     serde_json::from_value(value.clone()).unwrap_or(TyRef::Other(value))
 }
 
-fn subst_vars(v: &mut Value, llbc: &Llbc, types: &[Value], const_generics: &[Value], depth: usize) {
+fn subst_vars(
+    v: &mut Value,
+    llbc: &Llbc,
+    types: &[Value],
+    const_generics: &[Value],
+    space: Space,
+    key: Option<&str>,
+    depth: usize,
+) {
     if depth > 64 {
         return;
     }
@@ -489,20 +501,46 @@ fn subst_vars(v: &mut Value, llbc: &Llbc, types: &[Value], const_generics: &[Val
         *v = replacement.clone();
         return;
     }
-    if let Some(mut plain) = indirect_body_with_var(v, llbc) {
-        subst_vars(&mut plain, llbc, types, const_generics, depth + 1);
+    if let Some(mut plain) = indirect_body_with_var(v, llbc, space) {
+        subst_vars(
+            &mut plain,
+            llbc,
+            types,
+            const_generics,
+            space,
+            None,
+            depth + 1,
+        );
         *v = plain;
         return;
     }
     match v {
         Value::Array(items) => {
-            for item in items {
-                subst_vars(item, llbc, types, const_generics, depth + 1);
+            for (i, item) in items.iter_mut().enumerate() {
+                let item_space = space.element(key, i);
+                subst_vars(
+                    item,
+                    llbc,
+                    types,
+                    const_generics,
+                    item_space,
+                    None,
+                    depth + 1,
+                );
             }
         }
         Value::Object(map) => {
-            for item in map.values_mut() {
-                subst_vars(item, llbc, types, const_generics, depth + 1);
+            for (k, item) in map.iter_mut() {
+                let item_space = space.field(k);
+                subst_vars(
+                    item,
+                    llbc,
+                    types,
+                    const_generics,
+                    item_space,
+                    Some(k),
+                    depth + 1,
+                );
             }
         }
         _ => {}
@@ -539,91 +577,168 @@ fn const_var_index(v: &Value) -> Option<usize> {
         .map(|index| index as usize)
 }
 
-fn contains_depth0_var(v: &Value, llbc: &Llbc, depth: usize) -> bool {
+fn contains_depth0_var(
+    v: &Value,
+    llbc: &Llbc,
+    space: Space,
+    key: Option<&str>,
+    depth: usize,
+) -> bool {
     if depth > 64 {
         return false;
     }
     if type_var_index(v).is_some() || const_var_index(v).is_some() {
         return true;
     }
-    if let Some(body) = indirect_body(v, llbc) {
-        return contains_depth0_var(&body, llbc, depth + 1);
+    if let Some(body) = indirect_body(v, llbc, space) {
+        return contains_depth0_var(&body, llbc, space, None, depth + 1);
     }
     match v {
-        Value::Array(items) => items
-            .iter()
-            .any(|item| contains_depth0_var(item, llbc, depth + 1)),
+        Value::Array(items) => items.iter().enumerate().any(|(i, item)| {
+            contains_depth0_var(item, llbc, space.element(key, i), None, depth + 1)
+        }),
         Value::Object(map) => map
-            .values()
-            .any(|item| contains_depth0_var(item, llbc, depth + 1)),
+            .iter()
+            .any(|(k, item)| contains_depth0_var(item, llbc, space.field(k), Some(k), depth + 1)),
         _ => false,
     }
 }
 
 /// Resolved body of a dedup wrapper when that body contains a depth-0
 /// variable. `None` when `v` is not a wrapper or the body has no such variable.
-fn indirect_body_with_var(v: &Value, llbc: &Llbc) -> Option<Value> {
-    let body = indirect_body(v, llbc)?;
-    if contains_depth0_var(&body, llbc, 0) {
+fn indirect_body_with_var(v: &Value, llbc: &Llbc, space: Space) -> Option<Value> {
+    let body = indirect_body(v, llbc, space)?;
+    if contains_depth0_var(&body, llbc, space, None, 0) {
         Some(body)
     } else {
         None
     }
 }
 
-fn indirect_body(v: &Value, llbc: &Llbc) -> Option<Value> {
+/// The body behind a `Deduplicated` id (read in `space`'s table) or an
+/// inline `Value: [id, body]` hash-cons wrapper.
+fn indirect_body(v: &Value, llbc: &Llbc, space: Space) -> Option<Value> {
     let obj = v.as_object()?;
     if obj.len() != 1 {
         return None;
     }
     if let Some(id) = obj.get("Deduplicated").and_then(Value::as_u64) {
-        return llbc.dedup_body(id).cloned();
+        return space.dedup_body(llbc, id).cloned();
     }
-    let arr = obj.get("HashConsedValue").and_then(Value::as_array)?;
+    let arr = obj.get("Value").and_then(Value::as_array)?;
     if arr.len() != 2 {
         return None;
-    }
-    if let Some(id) = arr.first().and_then(Value::as_u64)
-        && let Some(body) = llbc.dedup_body(id)
-    {
-        return Some(body.clone());
     }
     Some(arr[1].clone())
 }
 
+/// The hash-cons table a `Deduplicated` id indexes. Charon numbers types,
+/// trait refs, constants and spans independently, so an id is read in the
+/// table of the position it occupies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Space {
+    Ty,
+    TraitRef,
+    Const,
+    /// A source span. It names no type, so its id is never resolved.
+    Span,
+}
+
+impl Space {
+    fn dedup_body(self, llbc: &Llbc, id: u64) -> Option<&Value> {
+        match self {
+            Space::Ty => llbc.dedup_body(id),
+            Space::TraitRef => llbc.dedup_trait_body(id),
+            Space::Const => llbc.dedup_const_body(id),
+            Space::Span => None,
+        }
+    }
+
+    /// Space of the value stored under `key` in an object of this space.
+    fn field(self, key: &str) -> Space {
+        if self == Space::Span {
+            return self;
+        }
+        match key {
+            "span" | "generated_from_span" => Space::Span,
+            "ty" | "types" | "inputs" | "output" => Space::Ty,
+            // `generics.trait_refs`, an impl's `implied_trait_refs`, and the
+            // `[trait_ref, ..]` payloads of a trait call, a parent clause,
+            // an associated type and an associated const.
+            "trait_refs" | "implied_trait_refs" | "Trait" | "ParentClause" | "TraitType"
+            | "TraitConst" => Space::TraitRef,
+            "const_generics" | "Const" => Space::Const,
+            _ => self,
+        }
+    }
+
+    /// Space of the `index`-th element of an array stored under `key`
+    /// (`None` for an array that is itself a resolved hash-cons body).
+    fn element(self, key: Option<&str>, index: usize) -> Space {
+        if self == Space::Span {
+            return self;
+        }
+        match key {
+            // `{"Array": [elem_ty, len_const, ..]}`.
+            Some("Array") => {
+                if index == 1 {
+                    Space::Const
+                } else {
+                    Space::Ty
+                }
+            }
+            // `[trait_ref, index]` / `[trait_ref, name]`: only the head is a
+            // trait ref.
+            Some("Trait" | "ParentClause" | "TraitType" | "TraitConst") if index > 0 => Space::Ty,
+            // A constant body is `[kind, ty]`.
+            None if self == Space::Const && index == 1 => Space::Ty,
+            _ => self,
+        }
+    }
+}
+
 fn substitute_clauses(v: &mut Value, llbc: &Llbc, trait_refs: &[Value]) {
-    substitute_clauses_at(v, llbc, trait_refs, 0);
+    substitute_clauses_at(v, llbc, trait_refs, Space::Ty, None, 0);
 }
 
 /// Same shape as [`subst_vars`]: a depth-0 `Clause` is replaced in place;
-/// a `Deduplicated` / `HashConsedValue` wrapper whose resolved body
+/// a `Deduplicated` / `Value` wrapper whose resolved body
 /// mentions one is replaced by a plain copy of that body (the shared
 /// dedup table is not written) and the copy is walked. Anything else is
 /// walked through its children.
-fn substitute_clauses_at(v: &mut Value, llbc: &Llbc, trait_refs: &[Value], depth: usize) {
+fn substitute_clauses_at(
+    v: &mut Value,
+    llbc: &Llbc,
+    trait_refs: &[Value],
+    space: Space,
+    key: Option<&str>,
+    depth: usize,
+) {
     if depth > 64 {
         return;
     }
-    if let Some(index) = clause_index(v, llbc)
+    if let Some(index) = clause_index(v, llbc, space)
         && let Some(replacement) = trait_refs.get(index)
     {
         *v = replacement.clone();
         return;
     }
-    if let Some(mut plain) = indirect_body_with_clause(v, llbc) {
-        substitute_clauses_at(&mut plain, llbc, trait_refs, depth + 1);
+    if let Some(mut plain) = indirect_body_with_clause(v, llbc, space) {
+        substitute_clauses_at(&mut plain, llbc, trait_refs, space, None, depth + 1);
         *v = plain;
         return;
     }
     match v {
         Value::Array(items) => {
-            for item in items {
-                substitute_clauses_at(item, llbc, trait_refs, depth + 1);
+            for (i, item) in items.iter_mut().enumerate() {
+                let item_space = space.element(key, i);
+                substitute_clauses_at(item, llbc, trait_refs, item_space, None, depth + 1);
             }
         }
         Value::Object(map) => {
-            for item in map.values_mut() {
-                substitute_clauses_at(item, llbc, trait_refs, depth + 1);
+            for (k, item) in map.iter_mut() {
+                let item_space = space.field(k);
+                substitute_clauses_at(item, llbc, trait_refs, item_space, Some(k), depth + 1);
             }
         }
         _ => {}
@@ -632,9 +747,9 @@ fn substitute_clauses_at(v: &mut Value, llbc: &Llbc, trait_refs: &[Value], depth
 
 /// Resolved body of a dedup wrapper when that body mentions a depth-0
 /// `Clause`. `None` when `v` is not a wrapper or the body has no such clause.
-fn indirect_body_with_clause(v: &Value, llbc: &Llbc) -> Option<Value> {
-    let body = indirect_body(v, llbc)?;
-    if mentions_own_clause(&body, llbc) {
+fn indirect_body_with_clause(v: &Value, llbc: &Llbc, space: Space) -> Option<Value> {
+    let body = indirect_body(v, llbc, space)?;
+    if mentions_own_clause(&body, llbc, space) {
         Some(body)
     } else {
         None
@@ -642,7 +757,7 @@ fn indirect_body_with_clause(v: &Value, llbc: &Llbc) -> Option<Value> {
 }
 
 /// Charon type expression spelled from declaration names. Extraction-local
-/// ids are followed (`Deduplicated`, `HashConsedValue`) or replaced by
+/// ids are followed (`Deduplicated`, `Value`) or replaced by
 /// `name_path`, never printed.
 pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
     if depth > 32 {
@@ -657,7 +772,7 @@ pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
                 None => "?dedup".to_string(),
             };
         }
-        if let Some(arr) = obj.get("HashConsedValue").and_then(Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(Value::as_array)
             && arr.len() == 2
         {
             return spec_type_name(&arr[1], llbc, depth + 1);
@@ -672,8 +787,8 @@ pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
     let Some(obj) = v.as_object() else {
         return canonical_type_json(v, llbc, depth);
     };
-    if let Some(lit) = obj.get("Literal") {
-        return spec_literal(lit);
+    if let Some(scalar) = obj.get("Scalar") {
+        return crate::front::mir::charon_literal_to_ast_string(scalar);
     }
     if let Some(r) = obj.get("Ref") {
         return spec_ref(r, llbc, depth);
@@ -687,7 +802,11 @@ pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
     if let Some(arr) = obj.get("Array").and_then(Value::as_array) {
         return spec_array_pair(arr, llbc, depth);
     }
-    if let Some(elem) = obj.get("Slice") {
+    if let Some(elem) = obj
+        .get("Slice")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+    {
         return format!("[{}]", spec_type_name(elem, llbc, depth + 1));
     }
     if let Some(fnptr) = obj.get("FnPtr") {
@@ -696,11 +815,16 @@ pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
     canonical_type_json(v, llbc, depth)
 }
 
+/// A const generic is a `ConstantExpr`: an integer literal spells its
+/// decimal value, any other kind its canonical JSON.
 fn spec_const_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
-    if let Some(n) = scalar_decimal(v) {
+    if let Some(n) = llbc.const_expr_literal(v).as_ref().and_then(scalar_decimal) {
         return n;
     }
-    spec_type_name(v, llbc, depth)
+    match llbc.const_expr_kind(v) {
+        Some(kind) => canonical_type_json(&kind, llbc, depth),
+        None => canonical_type_json(v, llbc, depth),
+    }
 }
 
 fn spec_trait_ref_name(v: &Value, llbc: &Llbc) -> String {
@@ -784,36 +908,6 @@ fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
     Some(format!("{name}{}", angle_args(&types, &consts)))
 }
 
-fn spec_literal(lit: &Value) -> String {
-    if let Some(atom) = lit.as_str() {
-        return match atom {
-            "Bool" => "bool".to_string(),
-            "Char" => "char".to_string(),
-            other => format!("lit_{other}"),
-        };
-    }
-    if let Some(obj) = lit.as_object() {
-        if let Some(int) = obj
-            .get("Int")
-            .or_else(|| obj.get("UInt"))
-            .or_else(|| obj.get("Integer"))
-            .and_then(Value::as_str)
-        {
-            return int.to_ascii_lowercase();
-        }
-        if let Some(float) = obj.get("Float").and_then(Value::as_str) {
-            return match float {
-                "F16" => "f16".to_string(),
-                "F32" => "f32".to_string(),
-                "F64" => "f64".to_string(),
-                "F128" => "f128".to_string(),
-                other => format!("float_{other}"),
-            };
-        }
-    }
-    lit.to_string()
-}
-
 fn spec_ref(r: &Value, llbc: &Llbc, depth: usize) -> String {
     let (ty, kind) = if let Some(arr) = r.as_array() {
         (arr.get(1), arr.get(2).and_then(Value::as_str))
@@ -866,59 +960,42 @@ fn spec_adt(adt: &serde_json::Map<String, Value>, llbc: &Llbc, depth: usize) -> 
         .into_iter()
         .map(|cg| spec_const_name(cg, llbc, depth + 1))
         .collect::<Vec<_>>();
-    let id = adt.get("id");
-    if let Some(atom) = id.and_then(Value::as_str) {
-        if atom == "Tuple" {
-            return match types.as_slice() {
-                [] => "()".to_string(),
-                [one] => format!("({one},)"),
-                many => format!("({})", many.join(",")),
-            };
-        }
-        return format!("adt_{atom}{}", angle_args(&types, &consts));
+    let tref = Value::Object(adt.clone());
+    if crate::front::mir::type_decl_ref_builtin(&tref) == Some("Tuple") {
+        return match types.as_slice() {
+            [] => "()".to_string(),
+            [one] => format!("({one},)"),
+            many => format!("({})", many.join(",")),
+        };
     }
-    if let Some(id_obj) = id.and_then(Value::as_object) {
-        if let Some(def_id) = id_obj.get("Adt").and_then(Value::as_u64) {
-            let name = llbc
-                .type_by_id(def_id)
-                .map(|td| td.item_meta.name_path())
-                .unwrap_or_else(|| "?adt".to_string());
-            return format!("{name}{}", angle_args(&types, &consts));
-        }
-        if let Some(builtin) = id_obj.get("Builtin") {
-            return spec_builtin(builtin, &types, &consts);
-        }
+    if let Some(builtin) = adt.get("builtin").filter(|b| !b.is_null()) {
+        return spec_builtin(builtin, &types, &consts);
+    }
+    if let Some(def_id) = crate::front::mir::type_decl_ref_adt_id(adt) {
+        let name = llbc
+            .type_by_id(def_id)
+            .map(|td| td.item_meta.name_path())
+            .unwrap_or_else(|| "?adt".to_string());
+        return format!("{name}{}", angle_args(&types, &consts));
     }
     canonical_type_json(&Value::Object(adt.clone()), llbc, depth)
 }
 
+/// `builtin` is the `TypeDeclRef` tag: `"Box"` or `"Str"` (tuples are
+/// spelled by the caller).
 fn spec_builtin(builtin: &Value, types: &[String], consts: &[String]) -> String {
-    let name = builtin.as_str().or_else(|| {
-        builtin
-            .as_object()
-            .and_then(|map| map.keys().next().map(String::as_str))
-    });
-    match name {
+    match builtin.as_str() {
         Some("Box") => format!("Box{}", angle_args(types, consts)),
-        Some("Slice") => match types.first() {
-            Some(inner) => format!("[{inner}]"),
-            None => "slice".to_string(),
-        },
         Some("Str") => "str".to_string(),
-        Some("Array") => {
-            let elem = types.first().map(String::as_str).unwrap_or("");
-            let len = consts.first().map(String::as_str).unwrap_or("N");
-            format!("[{elem};{len}]")
-        }
         Some(other) => format!("builtin_{other}{}", angle_args(types, consts)),
         None => format!("builtin{}", angle_args(types, consts)),
     }
 }
 
 fn spec_array_pair(arr: &[Value], llbc: &Llbc, depth: usize) -> String {
-    if arr.len() == 2 {
+    if arr.len() == 3 {
         let elem = spec_type_name(&arr[0], llbc, depth + 1);
-        let len = spec_const_name(&arr[1], llbc, depth + 1);
+        let len = crate::front::mir::charon_array_len_to_string(&arr[1], llbc);
         format!("[{elem};{len}]")
     } else {
         canonical_type_json(&Value::Array(arr.to_vec()), llbc, depth)
@@ -969,40 +1046,30 @@ fn angle_args(types: &[String], consts: &[String]) -> String {
     format!("<{}>", args.join(","))
 }
 
+/// The decimal of a `{"Scalar": {"Signed" | "Unsigned": [width, n]}}` literal.
 fn scalar_decimal(v: &Value) -> Option<String> {
-    fn from_scalar(scalar: &Value) -> Option<String> {
-        let obj = scalar.as_object()?;
-        for key in ["Unsigned", "Signed"] {
-            let parts = obj.get(key)?.as_array()?;
-            let n = parts.last()?;
-            if let Some(text) = n.as_str() {
-                return Some(text.to_string());
-            }
-            if let Some(n) = n.as_u64() {
-                return Some(n.to_string());
-            }
-        }
-        None
-    }
-    if let Some(scalar) = v.get("Scalar") {
-        return from_scalar(scalar);
-    }
-    if let Some(scalar) = v.pointer("/Value/Scalar") {
-        return from_scalar(scalar);
-    }
-    if let Some(scalar) = v.pointer("/kind/Literal/Scalar") {
-        return from_scalar(scalar);
-    }
-    v.pointer("/kind/Value/Scalar").and_then(from_scalar)
+    let scalar = v.get("Scalar")?.as_object()?;
+    let n = ["Unsigned", "Signed"]
+        .iter()
+        .find_map(|key| scalar.get(*key)?.as_array()?.last())?;
+    n.as_str()
+        .map(str::to_string)
+        .or_else(|| n.as_u64().map(|n| n.to_string()))
 }
 
 fn canonical_type_json(v: &Value, llbc: &Llbc, depth: usize) -> String {
-    resolve_decl_ids(v, llbc, depth).to_string()
+    resolve_decl_ids(v, llbc, Space::Ty, None, depth).to_string()
 }
 
-/// Compact JSON with `Deduplicated` / `HashConsedValue` followed and every
+/// Compact JSON with `Deduplicated` / `Value` followed and every
 /// ADT, trait, impl and fun id replaced by that declaration's `name_path`.
-fn resolve_decl_ids(v: &Value, llbc: &Llbc, depth: usize) -> Value {
+fn resolve_decl_ids(
+    v: &Value,
+    llbc: &Llbc,
+    space: Space,
+    key: Option<&str>,
+    depth: usize,
+) -> Value {
     if depth > 64 {
         return Value::String("deep".into());
     }
@@ -1010,15 +1077,15 @@ fn resolve_decl_ids(v: &Value, llbc: &Llbc, depth: usize) -> Value {
         && obj.len() == 1
     {
         if let Some(id) = obj.get("Deduplicated").and_then(Value::as_u64) {
-            return match llbc.dedup_body(id) {
-                Some(body) => resolve_decl_ids(body, llbc, depth + 1),
+            return match space.dedup_body(llbc, id) {
+                Some(body) => resolve_decl_ids(body, llbc, space, None, depth + 1),
                 None => Value::String("?dedup".into()),
             };
         }
-        if let Some(arr) = obj.get("HashConsedValue").and_then(Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(Value::as_array)
             && arr.len() == 2
         {
-            return resolve_decl_ids(&arr[1], llbc, depth + 1);
+            return resolve_decl_ids(&arr[1], llbc, space, None, depth + 1);
         }
         if let Some(id) = obj.get("Adt").and_then(Value::as_u64) {
             return Value::String(type_path(llbc, id));
@@ -1031,14 +1098,17 @@ fn resolve_decl_ids(v: &Value, llbc: &Llbc, depth: usize) -> Value {
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|item| resolve_decl_ids(item, llbc, depth + 1))
+                .enumerate()
+                .map(|(i, item)| {
+                    resolve_decl_ids(item, llbc, space.element(key, i), None, depth + 1)
+                })
                 .collect(),
         ),
         Value::Object(map) => {
             let mut out = serde_json::Map::new();
             for (key, child) in map {
                 let replaced = match key.as_str() {
-                    "TraitImpl" => resolve_trait_impl_value(child, llbc, depth),
+                    "TraitImpl" => resolve_trait_impl_value(child, llbc, space, depth),
                     "id" if child.as_u64().is_some() => {
                         Value::String(decl_path(llbc, child.as_u64().unwrap()))
                     }
@@ -1062,7 +1132,7 @@ fn resolve_decl_ids(v: &Value, llbc: &Llbc, depth: usize) -> Value {
                             .map(|td| td.item_meta.name_path())
                             .unwrap_or_else(|| "?".to_string()),
                     ),
-                    _ => resolve_decl_ids(child, llbc, depth + 1),
+                    _ => resolve_decl_ids(child, llbc, space.field(key), Some(key), depth + 1),
                 };
                 out.insert(key.clone(), replaced);
             }
@@ -1107,9 +1177,9 @@ fn canon_key(fn_name: &str, traits: &[String], types: &[String], consts: &[Strin
     out
 }
 
-fn resolve_trait_impl_value(v: &Value, llbc: &Llbc, depth: usize) -> Value {
+fn resolve_trait_impl_value(v: &Value, llbc: &Llbc, space: Space, depth: usize) -> Value {
     let Some(obj) = v.as_object() else {
-        return resolve_decl_ids(v, llbc, depth + 1);
+        return resolve_decl_ids(v, llbc, space, None, depth + 1);
     };
     let mut out = serde_json::Map::new();
     for (key, child) in obj {
@@ -1120,7 +1190,10 @@ fn resolve_trait_impl_value(v: &Value, llbc: &Llbc, depth: usize) -> Value {
             out.insert(key.clone(), Value::String(name));
             continue;
         }
-        out.insert(key.clone(), resolve_decl_ids(child, llbc, depth + 1));
+        out.insert(
+            key.clone(),
+            resolve_decl_ids(child, llbc, space.field(key), Some(key), depth + 1),
+        );
     }
     Value::Object(out)
 }
@@ -1187,7 +1260,10 @@ mod tests {
     }
 
     fn usize_const(n: &str) -> Value {
-        json!({"Value": {"Scalar": {"Unsigned": ["Usize", n]}}})
+        json!([
+            {"Integer": {"Unsigned": ["Usize", n]}},
+            {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+        ])
     }
 
     /// `fn f<const N: usize>()` at `N = 4` and `N = 8` is two graphs.
@@ -1227,7 +1303,7 @@ mod tests {
     /// The same instantiation through a `Deduplicated` id and inline is one leaf.
     #[test]
     fn spec_leaf_dedup_matches_inline_body() {
-        let inline = json!({"Literal": {"Int": "I64"}});
+        let inline = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let file = json!({
             "charon_version": "t",
             "has_errors": false,
@@ -1245,7 +1321,7 @@ mod tests {
                     "signature": {
                         "is_unsafe": false,
                         "inputs": [],
-                        "output": {"HashConsedValue": [7, inline]}
+                        "output": {"Value": [7, inline]}
                     },
                     "body": null
                 }],
@@ -1270,7 +1346,7 @@ mod tests {
     #[test]
     fn spec_leaf_keeps_ref_distinct_from_referent() {
         let llbc = empty_llbc();
-        let ty = json!({"Literal": {"Int": "I64"}});
+        let ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let shared = json!({"Ref": ["Erased", ty, "Shared"]});
         let bare = json!({"types": [ty], "trait_refs": [], "const_generics": []});
         let reference = json!({"types": [shared], "trait_refs": [], "const_generics": []});
@@ -1303,11 +1379,11 @@ mod tests {
                         "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
                         "is_local": true
                     },
-                    "signature": {"is_unsafe": false, "inputs": [], "output": {"Literal": {"Int": "Usize"}}},
+                    "signature": {"is_unsafe": false, "inputs": [], "output": {"Scalar": {"Integer": {"Unsigned": "Usize"}}}},
                     "generics": {
                         "regions": [],
                         "types": [],
-                        "const_generics": [{"index": 0, "name": "N", "ty": {"Literal": "Usize"}}],
+                        "const_generics": [{"index": 0, "name": "N", "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}}}],
                         "trait_clauses": []
                     },
                     "body": null
@@ -1325,8 +1401,9 @@ mod tests {
         );
     }
 
-    /// A wrapper whose shared body holds a depth-0 `TypeVar` and a depth-0
-    /// `Clause` is substituted in the copy. The dedup table stays shared.
+    /// A wrapper whose shared type body holds a depth-0 `TypeVar` and a
+    /// depth-0 `Clause` is substituted in the copy. The dedup table stays
+    /// shared.
     #[test]
     fn clause_subst_follows_dedup_and_hash_cons_without_writing_the_table() {
         let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
@@ -1336,7 +1413,8 @@ mod tests {
             "const_generics": [],
             "trait_refs": [{"kind": {"Clause": {"Bound": [0, 0]}}}]
         });
-        let i64_ty = json!({"Literal": {"Int": "I64"}});
+        let wrapper = json!({"Adt": {"id": 0, "generics": generics}});
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let impl_ref = json!({"kind": {"TraitImpl": {"id": 0, "generics": {"regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": []}}}});
         let body = json!({
             "Unstructured": {
@@ -1345,7 +1423,7 @@ mod tests {
                     "arg_count": 0,
                     "locals": [
                         {"index": 0, "name": null, "span": span, "ty": {"Deduplicated": 11}},
-                        {"index": 1, "name": null, "span": span, "ty": {"HashConsedValue": [11, generics]}}
+                        {"index": 1, "name": null, "span": span, "ty": {"Value": [11, wrapper]}}
                     ]
                 },
                 "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}}]
@@ -1365,7 +1443,7 @@ mod tests {
                         "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
                         "is_local": true
                     },
-                    "signature": {"is_unsafe": false, "inputs": [], "output": {"HashConsedValue": [11, generics]}},
+                    "signature": {"is_unsafe": false, "inputs": [], "output": {"Value": [11, wrapper]}},
                     "body": body
                 }],
                 "files": []
@@ -1373,8 +1451,8 @@ mod tests {
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
         let shared = llbc.dedup_body(11).expect("dedup 11").clone();
-        assert!(mentions_own_clause(&shared, &llbc));
-        assert!(contains_depth0_var(&shared, &llbc, 0));
+        assert!(mentions_own_clause(&shared, &llbc, Space::Ty));
+        assert!(contains_depth0_var(&shared, &llbc, Space::Ty, None, 0));
         let fd = llbc.fn_by_id(0).expect("f");
         let copied =
             substituted_unstructured(fd, &llbc, &[impl_ref.clone()], &[i64_ty.clone()], &[])
@@ -1390,6 +1468,64 @@ mod tests {
         }
         assert_eq!(llbc.dedup_body(11), Some(&shared));
         assert!(value_has_depth0_type_var(&shared) && value_has_depth0_clause(&shared));
+    }
+
+    /// A span is hash-consed in a table of its own. A span id equal to a
+    /// type id whose body holds a depth-0 variable stays a span in the copy.
+    #[test]
+    fn span_id_is_not_read_as_a_type_id() {
+        let span_body = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}, "generated_from_span": null});
+        let span = json!({"Deduplicated": 11});
+        let wrapper = json!({"Adt": {"id": 0, "generics": {"regions": [], "types": [{"TypeVar": {"Bound": [0, 0]}}], "const_generics": [], "trait_refs": []}}});
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let body = json!({
+            "Unstructured": {
+                "span": {"Value": [11, span_body]},
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [{"index": 0, "name": null, "span": span, "ty": {"Value": [11, wrapper]}}]
+                },
+                "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}}]
+            }
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["f", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {"is_unsafe": false, "inputs": [], "output": {"Deduplicated": 11}},
+                    "body": body
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        assert!(contains_depth0_var(
+            llbc.dedup_body(11).expect("type 11"),
+            &llbc,
+            Space::Ty,
+            None,
+            0
+        ));
+        let fd = llbc.fn_by_id(0).expect("f");
+        let copied = substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[])
+            .expect("a span id resolved as a type breaks the copy");
+        let majit_charon_reader::ullbc::TyRef::Other(local_ty) = &copied.locals.locals[0].ty else {
+            panic!("wrapper survived in {:?}", copied.locals.locals[0].ty);
+        };
+        assert!(
+            !value_has_depth0_type_var(local_ty),
+            "type var survived: {local_ty}"
+        );
     }
 
     fn value_has_depth0_type_var(v: &Value) -> bool {

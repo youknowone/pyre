@@ -138,7 +138,7 @@ jobs:
       # CHARON_VERSION_DEFAULT in scripts/install-charon.py: it drives both
       # the cache keys below AND install-charon.py's .installed-version
       # stamp, so a pin bump here misses the cache and re-installs.
-      CHARON_VERSION: nightly-2026.05.29
+      CHARON_VERSION: nightly-2026.09.26
     steps: &prepare-charon-llbc-steps
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -215,15 +215,15 @@ jobs:
     # Charon's rustc is a different compiler from the stable rust-cache
     # toolchain. Its rlibs cannot live in `target/` or every extract
     # rebuilds the graph. `extract-llbc.py` writes them under
-    # `.pyre-build/charon-target` (`CHARON_TARGET_DIR`). Restore before
-    # Extract; save only when Charon actually rewrote a crate, under a
-    # lockfile key so a second extract of the same lock is an exact hit
-    # and does not clone the dir.
+    # `.pyre-build/charon-target` (`CHARON_TARGET_DIR`; the Windows job sets
+    # a shorter one). Restore before Extract; save only when Charon actually
+    # rewrote a crate, under a lockfile key so a second extract of the same
+    # lock is an exact hit and does not clone the dir.
     - name: Restore Charon cargo target
       id: charon-target-cache
       uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
-        path: .pyre-build/charon-target
+        path: ${{ env.CHARON_TARGET_DIR || '.pyre-build/charon-target' }}
         key: charon-target-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ hashFiles('Cargo.lock') }}
         restore-keys: |
           charon-target-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
@@ -485,7 +485,7 @@ jobs:
          steps.llbc-extract.outputs.pyre_jit_rewrote == '1')
       uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
-        path: .pyre-build/charon-target
+        path: ${{ env.CHARON_TARGET_DIR || '.pyre-build/charon-target' }}
         key: charon-target-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ hashFiles('Cargo.lock') }}
     - name: Upload LLBC artifact
       # Hand the ullbc set (freshly extracted, or restored from the cache
@@ -550,8 +550,18 @@ jobs:
     if: ${{ github.event.pull_request.draft != true }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.05.29
+      CHARON_VERSION: nightly-2026.09.26
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      # Cargo passes one `-L dependency=<target>/<triple>/debug/build/<pkg>/<hash>/out`
+      # per dependency, and pyre-interpreter has 263 of them. Under the
+      # workspace's `.pyre-build/charon-target/<key>` the rustc line is about
+      # 43k characters, past the 32767 Windows allows, so cargo hands it to
+      # the wrapper as an `@argfile`. charon-driver looks for `--target` in
+      # its own argv before rustc expands the file, misses it, and compiles
+      # the crate as a host dependency against the normal sysroot: every
+      # `--extern` fails with E0463. A two-level target dir brings the line
+      # to about 29k.
+      CHARON_TARGET_DIR: D:\ct
     steps: *prepare-charon-llbc-steps
 
   cargo-test-linux:
@@ -573,7 +583,7 @@ jobs:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.05.29
+      CHARON_VERSION: nightly-2026.09.26
 
     steps: &cargo-test-steps
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -603,7 +613,7 @@ jobs:
     - name: Restore Charon executable permissions (Unix)
       if: runner.os != 'Windows'
       shell: bash
-      run: chmod +x .pyre-build/charon/*/charon .pyre-build/charon/*/charon-driver
+      run: chmod +x .pyre-build/charon/*/*/charon .pyre-build/charon/*/*/charon-driver
     - name: Download LLBC artifact
       # Run-scoped handoff from prepare-charon-llbc. Unlike actions/cache,
       # an artifact is exempt from the repo-wide 10 GB cache budget and its
@@ -786,7 +796,7 @@ jobs:
     if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.05.29
+      CHARON_VERSION: nightly-2026.09.26
     steps: *cargo-test-steps
 
   cargo-test-windows:
@@ -801,7 +811,7 @@ jobs:
     if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.05.29
+      CHARON_VERSION: nightly-2026.09.26
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps: *cargo-test-steps
 
@@ -827,7 +837,7 @@ jobs:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.05.29
+      CHARON_VERSION: nightly-2026.09.26
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -848,7 +858,7 @@ jobs:
         path: .pyre-build/charon
     - name: Restore Charon executable permissions
       shell: bash
-      run: chmod +x .pyre-build/charon/*/charon .pyre-build/charon/*/charon-driver
+      run: chmod +x .pyre-build/charon/*/*/charon .pyre-build/charon/*/*/charon-driver
     - name: Download LLBC artifact
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
@@ -942,7 +952,7 @@ jobs:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.05.29
+      CHARON_VERSION: nightly-2026.09.26
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -998,7 +1008,7 @@ jobs:
     - name: Restore Charon executable permissions
       if: ${{ steps.environment.outputs.match != 'false' }}
       shell: bash
-      run: chmod +x .pyre-build/charon/*/charon .pyre-build/charon/*/charon-driver
+      run: chmod +x .pyre-build/charon/*/*/charon .pyre-build/charon/*/*/charon-driver
     - name: Download LLBC artifact
       if: ${{ steps.environment.outputs.match != 'false' }}
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1094,7 +1104,7 @@ jobs:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.05.29
+      CHARON_VERSION: nightly-2026.09.26
 
     steps: &pyre-check-steps
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -1139,7 +1149,7 @@ jobs:
     - name: Restore Charon executable permissions (Unix)
       if: runner.os != 'Windows'
       shell: bash
-      run: chmod +x .pyre-build/charon/*/charon .pyre-build/charon/*/charon-driver
+      run: chmod +x .pyre-build/charon/*/*/charon .pyre-build/charon/*/*/charon-driver
     - name: Download LLBC artifact
       # Run-scoped handoff from prepare-charon-llbc. Unlike actions/cache,
       # an artifact is exempt from the repo-wide 10 GB cache budget and its
@@ -1435,7 +1445,7 @@ jobs:
           label: dynasm+cranelift
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.05.29
+      CHARON_VERSION: nightly-2026.09.26
     steps: *pyre-check-steps
 
   pyre-check-windows:
@@ -1456,6 +1466,6 @@ jobs:
           label: dynasm
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.05.29
+      CHARON_VERSION: nightly-2026.09.26
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps: *pyre-check-steps

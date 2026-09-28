@@ -195,7 +195,7 @@ fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
 fn opener_blocks(llbc: &Llbc, body: &Unstructured) -> std::collections::HashMap<u64, usize> {
     let mut out = std::collections::HashMap::new();
     for (i, bb) in body.body.iter().enumerate() {
-        let Ok(TermKind::Call { call, .. }) = bb.term() else {
+        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
             continue;
         };
         let PlaceKind::Local(local) = call.dest.kind else {
@@ -401,7 +401,7 @@ fn nearly_every_dropped_bracket_closes() {
 fn owed_closes(llbc: &Llbc, body: &Unstructured) -> usize {
     let moved = moved_out_locals(body);
     let erased = erased_root_bracket_guards(llbc, body);
-    let live = reachable_without_unwind(body);
+    let live = reachable_without_unwind(llbc, body);
     guard_drop_sites(llbc, body)
         .filter(|(bb, local)| {
             live[*bb] && !moved.contains(local) && !erased.contains(&(*local as usize))
@@ -415,7 +415,7 @@ fn guard_drop_sites<'a>(
     body: &'a Unstructured,
 ) -> impl Iterator<Item = (usize, u64)> + 'a {
     body.body.iter().enumerate().filter_map(move |(i, bb)| {
-        let Ok(TermKind::Drop { place, .. }) = bb.term() else {
+        let Ok(TermKind::Drop { place, .. }) = bb.term(llbc) else {
             return None;
         };
         let PlaceKind::Local(local) = place.kind else {
@@ -426,7 +426,7 @@ fn guard_drop_sites<'a>(
 }
 
 /// MIR blocks reachable from the entry without taking an unwind edge.
-fn reachable_without_unwind(body: &Unstructured) -> Vec<bool> {
+fn reachable_without_unwind(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
     let mut seen = vec![false; body.body.len()];
     let mut stack = vec![0usize];
     while let Some(b) = stack.pop() {
@@ -434,7 +434,7 @@ fn reachable_without_unwind(body: &Unstructured) -> Vec<bool> {
             continue;
         }
         seen[b] = true;
-        let Ok(term) = body.body[b].term() else {
+        let Ok(term) = body.body[b].term(llbc) else {
             continue;
         };
         match term {
