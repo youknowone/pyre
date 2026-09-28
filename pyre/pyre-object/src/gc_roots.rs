@@ -616,9 +616,18 @@ impl Drop for RootScope {
 pub fn root_scope_close(scope: &RootScope) {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
+    let cell = shadow_stack_cell();
+    // `pop_roots` closes brackets innermost first.  A save point above the
+    // live length means an enclosing bracket already closed and discarded
+    // this one's pins: the guard, or a value owning it, outlived that
+    // bracket, and every slot it reads back is gone.
+    debug_assert!(
+        scope.save_point <= shadow_stack_cell_len(cell),
+        "a root scope closed after a bracket that enclosed it"
+    );
     // `truncate` is a no-op if `save_point >= len()`, which is
     // the steady-state case for an empty bracket.
-    shadow_stack_cell_truncate(shadow_stack_cell(), scope.save_point);
+    shadow_stack_cell_truncate(cell, scope.save_point);
 }
 
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to
