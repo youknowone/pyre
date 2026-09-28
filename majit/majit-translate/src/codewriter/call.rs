@@ -1027,6 +1027,36 @@ pub(crate) struct StoreCore {
     /// way `rtyper.py specialize_more_blocks` hands the graphs that appear
     /// after a pass to that pass on arrival.
     passes: Vec<StorePass>,
+    /// The funcobjs the front end declares, registered on this store's
+    /// next lookup (`bookkeeper.py getdesc`: a `FunctionDesc` exists from
+    /// the first time a function object is seen).
+    declarations: FuncObjDeclarations,
+    /// How many of `declarations` this store has registered.
+    declared_upto: std::cell::Cell<usize>,
+}
+
+/// A funcobj the front end declared under the path its call sites name:
+/// its graph, built on first demand, and its registration's stamps.
+#[derive(Clone)]
+pub(crate) struct DeclaredFuncObj {
+    pub(crate) path: CallPath,
+    pub(crate) graph: crate::model::LazyGraph,
+    pub(crate) transform: GraphTransform,
+}
+
+/// The funcobjs the front end has declared, in order. Shared by every copy
+/// of the store, each registering the ones it has not seen yet.
+#[derive(Clone, Default)]
+pub(crate) struct FuncObjDeclarations(std::rc::Rc<std::cell::RefCell<Vec<DeclaredFuncObj>>>);
+
+impl FuncObjDeclarations {
+    pub(crate) fn push(&self, declared: DeclaredFuncObj) {
+        self.0.borrow_mut().push(declared);
+    }
+
+    fn get(&self, index: usize) -> Option<DeclaredFuncObj> {
+        self.0.borrow().get(index).cloned()
+    }
 }
 
 /// One source funcobj's stored graph plus the metadata derived from it at
@@ -1128,7 +1158,135 @@ struct FuncObjAttrs {
     return_type: Option<String>,
 }
 
+/// A `func` attribute a decorator sets (`rlib/jit.py` `@elidable`,
+/// `@oopspec`, `@loop_invariant`, the GC transformer hints), as its
+/// harvested hint spells it.
+pub(crate) enum DecoratorAttr {
+    Oopspec(String),
+    /// `support.py argnames = ll_func.__code__.co_varnames[:nb_args]`,
+    /// paired with `#[oopspec(...)]` by
+    /// `front::llbc_hints::harvest_hints_from_llbcs`.
+    OopspecArgnames(Vec<String>),
+    AroundstateTarget(String, i64),
+    Elidable,
+    CannotRaise,
+    MemerrorOnly,
+    LoopInvariant,
+    CloseStack,
+    CannotCollect,
+    /// `random_effects_on_gcobjs`, read off the funcobj by
+    /// `analyze_external_call` alone, so it only speaks for a funcobj that
+    /// ends up with no graph.
+    GcEffects,
+}
+
+impl DecoratorAttr {
+    pub(crate) fn from_hint(hint: &str) -> Option<Self> {
+        if let Some(spec) = hint.strip_prefix("oopspec:") {
+            return Some(Self::Oopspec(spec.to_string()));
+        }
+        if let Some(rest) = hint.strip_prefix("aroundstate_target:") {
+            let Some((save, identity)) = rest.split_once(':') else {
+                panic!("aroundstate_target hint `{hint}` is missing save_err");
+            };
+            let Ok(save_err) = save.parse::<i64>() else {
+                panic!("aroundstate_target hint `{hint}` has an undecodable save_err");
+            };
+            return Some(Self::AroundstateTarget(identity.to_string(), save_err));
+        }
+        if let Some(names) = hint.strip_prefix("oopspec_argnames:") {
+            let argnames: Vec<String> = names
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return (!argnames.is_empty()).then_some(Self::OopspecArgnames(argnames));
+        }
+        Some(match hint {
+            "elidable" => Self::Elidable,
+            "elidable_cannot_raise" | "cannot_raise" => Self::CannotRaise,
+            "elidable_or_memerror" => Self::MemerrorOnly,
+            "loopinvariant" => Self::LoopInvariant,
+            "close_stack" => Self::CloseStack,
+            "cannot_collect" => Self::CannotCollect,
+            // rlib/jit.py — @not_in_trace sets func.oopspec = "jit.not_in_trace()"
+            "not_in_trace" => Self::Oopspec("jit.not_in_trace".to_string()),
+            "gc_effects" => Self::GcEffects,
+            _ => return None,
+        })
+    }
+}
+
 impl FuncObjAttrs {
+    /// The attributes the decorators behind `hints` set on a fresh funcobj:
+    /// what [`CallControl::mark_decorator_hints`] writes, and the hint tokens
+    /// it stamps.
+    fn from_decorator_hints(hints: &[String]) -> Self {
+        let mut attrs = Self::default();
+        for attr in hints
+            .iter()
+            .filter_map(|hint| DecoratorAttr::from_hint(hint))
+        {
+            let func = &mut attrs.func;
+            let token = match attr {
+                DecoratorAttr::Oopspec(spec) => {
+                    func.oopspec = Some(spec);
+                    None
+                }
+                DecoratorAttr::OopspecArgnames(argnames) => {
+                    func.oopspec_argnames = argnames;
+                    None
+                }
+                DecoratorAttr::AroundstateTarget(identity, save_err) => {
+                    func.call_aroundstate_target = Some((identity, save_err));
+                    Some("aroundstate")
+                }
+                DecoratorAttr::Elidable => {
+                    func.elidable = true;
+                    Some("elidable")
+                }
+                DecoratorAttr::CannotRaise => {
+                    assert!(
+                        !func.memerror_only_assertion,
+                        "conflicting elidable exception assertions: \
+                         already marked memerror-only, cannot also mark cannot-raise"
+                    );
+                    func.cannot_raise_assertion = true;
+                    None
+                }
+                DecoratorAttr::MemerrorOnly => {
+                    assert!(
+                        !func.cannot_raise_assertion,
+                        "conflicting elidable exception assertions: \
+                         already marked cannot-raise, cannot also mark memerror-only"
+                    );
+                    func.memerror_only_assertion = true;
+                    None
+                }
+                DecoratorAttr::LoopInvariant => {
+                    func.loop_invariant = true;
+                    Some("loopinvariant")
+                }
+                DecoratorAttr::CloseStack => {
+                    func.close_stack = true;
+                    Some("close_stack")
+                }
+                DecoratorAttr::CannotCollect => {
+                    func.cannot_collect = true;
+                    None
+                }
+                DecoratorAttr::GcEffects => {
+                    func.random_effects_on_gcobjs = true;
+                    None
+                }
+            };
+            if let Some(token) = token {
+                attrs.merge_hints(&[token.to_string()]);
+            }
+        }
+        attrs
+    }
+
     fn merge_hints(&mut self, hints: &[String]) {
         for hint in hints {
             if !self.hints.contains(hint) {
@@ -1263,8 +1421,65 @@ impl StoreCore {
         Signature::new(argnames, None, None)
     }
 
+    /// Read declarations from `declarations`, which this store registers
+    /// from now on. Only a store that has registered none can switch.
+    pub(crate) fn use_declarations(&mut self, declarations: FuncObjDeclarations) {
+        assert_eq!(
+            self.declared_upto.get(),
+            self.declarations.0.borrow().len(),
+            "the store switches declarations with some unregistered"
+        );
+        self.declarations = declarations;
+        self.declared_upto.set(0);
+    }
+
+    /// Register the funcobjs declared since the last lookup.
+    fn register_declared(&self) {
+        loop {
+            let upto = self.declared_upto.get();
+            let Some(declared) = self.declarations.get(upto) else {
+                return;
+            };
+            self.declared_upto.set(upto + 1);
+            self.declare(declared);
+        }
+    }
+
+    /// Register a declared funcobj without building its graph, carrying the
+    /// attributes its decorators set. A declaration precedes every store
+    /// pass, so its build catches up on all of them. Another alias of the
+    /// same funcobj folds its stamps onto the stored slot.
+    fn declare(&self, declared: DeclaredFuncObj) {
+        let DeclaredFuncObj {
+            path,
+            graph,
+            transform,
+        } = declared;
+        let key = graph.graph_key();
+        let mut attrs = FuncObjAttrs::from_decorator_hints(&transform.hints);
+        let mut graphs = self.graphs.borrow_mut();
+        match graphs.get_mut(&key) {
+            None => {
+                let mut slot = GraphSlot::lazy(graph, transform, 0);
+                slot.attrs = attrs;
+                graphs.insert(key.clone(), std::rc::Rc::new(slot));
+            }
+            Some(slot) => {
+                assert!(
+                    slot.is_source(&graph),
+                    "declared funcobj {path:?} names the graph of another funcobj"
+                );
+                attrs.hints.splice(0..0, transform.hints);
+                attrs.return_type = transform.return_type;
+                std::rc::Rc::make_mut(slot).attrs_mut().fold(&attrs);
+            }
+        }
+        self.path_to_key.borrow_mut().insert(path, key);
+    }
+
     /// The slot of the funcobj `path` names.
     fn slot_for(&self, path: &CallPath) -> Option<std::rc::Rc<GraphSlot>> {
+        self.register_declared();
         let key = self.path_to_key.borrow().get(path)?.clone();
         self.graphs.borrow().get(&key).cloned()
     }
@@ -1355,6 +1570,7 @@ impl StoreCore {
     /// it, so the pass never reads the graph it is writing. A slot the pass
     /// builds on the way (reading another funcobj) catches up on it there.
     fn run_pass(&mut self, pass: StorePass) {
+        self.register_declared();
         let keys: Vec<GraphKey> = self
             .graphs
             .get_mut()
@@ -1383,6 +1599,7 @@ impl StoreCore {
     pub(crate) fn insert(&mut self, path: CallPath, graph: impl Into<std::rc::Rc<FunctionGraph>>) {
         let graph = graph.into();
         let key = graph.graph_key();
+        self.register_declared();
         if let Some(slot) = self.graphs.get_mut().get(&key).cloned() {
             self.slot_graph(&slot);
         }
@@ -1432,6 +1649,7 @@ impl StoreCore {
     ) {
         let key = graph.graph_key();
         let since = self.passes.len();
+        self.register_declared();
         match self.slot_mut(&key) {
             None => {
                 let mut slot = GraphSlot::lazy(graph, transform, since);
@@ -1488,6 +1706,7 @@ impl StoreCore {
     /// graph. `None` when `path` names no funcobj or its build produced no
     /// graph.
     pub(crate) fn func_mut(&mut self, path: &CallPath) -> Option<&mut crate::model::FuncEffects> {
+        self.register_declared();
         let key = self.path_to_key.get_mut().get(path)?.clone();
         Some(self.slot_mut(&key)?.attrs_mut().func())
     }
@@ -1505,6 +1724,7 @@ impl StoreCore {
 
     /// Add `hints` to the funcobj `path` names without building its graph.
     pub(crate) fn merge_hints(&mut self, path: &CallPath, hints: &[String]) {
+        self.register_declared();
         let Some(key) = self.path_to_key.get_mut().get(path).cloned() else {
             return;
         };
@@ -1522,6 +1742,7 @@ impl StoreCore {
 
     /// [`Self::get_built`] for writing.
     pub(crate) fn get_built_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
+        self.register_declared();
         let key = self.path_to_key.get_mut().get(path)?.clone();
         let built = self.slot_mut(&key)?.graph.get_mut()?.as_mut()?;
         Some(std::rc::Rc::make_mut(&mut built.graph))
@@ -1530,6 +1751,7 @@ impl StoreCore {
     /// `GraphKey` of the funcobj `path` names. Alias spellings of one
     /// source graph share this key; a path with no registration has none.
     pub(crate) fn key_for(&self, path: &CallPath) -> Option<GraphKey> {
+        self.register_declared();
         self.path_to_key.borrow().get(path).cloned()
     }
 
@@ -1557,6 +1779,7 @@ impl StoreCore {
     /// builds: a funcobj whose build later produces no graph still answers
     /// `true`, as the external funcobj it then is.
     pub(crate) fn names_funcobj(&self, path: &CallPath) -> bool {
+        self.register_declared();
         self.path_to_key.borrow().contains_key(path)
     }
 
@@ -1575,6 +1798,7 @@ impl StoreCore {
     /// graph built.  The same graph appears once per alias, mirroring the
     /// old per-path map.
     pub(crate) fn iter(&self) -> Vec<(CallPath, std::rc::Rc<FunctionGraph>)> {
+        self.register_declared();
         let paths: Vec<CallPath> = self.path_to_key.borrow().keys().cloned().collect();
         paths
             .into_iter()
@@ -1589,6 +1813,7 @@ impl StoreCore {
     /// building a graph: the `code` object each `FunctionDesc` is made
     /// from (`bookkeeper.py getdesc`), its graph built at `cachedgraph`.
     pub(crate) fn iter_declared(&self) -> Vec<(CallPath, std::rc::Rc<FunctionGraph>)> {
+        self.register_declared();
         let path_to_key = self.path_to_key.borrow();
         let graphs = self.graphs.borrow();
         path_to_key
@@ -1603,6 +1828,7 @@ impl StoreCore {
     /// Remove one built graph so a caller can mutate it while still
     /// borrowing the rest of the store. Alias paths keep their `GraphKey`.
     fn take_graph(&mut self, key: &GraphKey) -> Option<FunctionGraph> {
+        self.register_declared();
         let graphs = self.graphs.get_mut();
         let slot = graphs.remove(key)?;
         if slot.graph.get().is_some_and(Option::is_some) {
@@ -1626,6 +1852,7 @@ impl StoreCore {
     /// Number of registered alias spellings (path count), matching the old
     /// `HashMap<CallPath, _>::len()` so `iter()`-sized allocations stay correct.
     pub(crate) fn len(&self) -> usize {
+        self.register_declared();
         self.path_to_key.borrow().len()
     }
 }
@@ -4240,6 +4467,12 @@ impl CallControl {
 
     /// Register a free function graph.
     /// RPython: graphs are discovered via funcptr linkage.
+    /// Register the funcobjs `declarations` holds, now and as the front
+    /// end declares more.
+    pub(crate) fn use_funcobj_declarations(&mut self, declarations: FuncObjDeclarations) {
+        self.function_graphs.use_declarations(declarations);
+    }
+
     pub fn register_function_graph(&mut self, path: CallPath, graph: impl Into<GraphSource>) {
         self.insert_function_graph_indexed(path.clone(), graph.into());
         // The deferred `Some([])` marker is resolvable as soon as its
@@ -7235,17 +7468,43 @@ impl CallControl {
     /// Harvested `aroundstate_target:<save_err>:<identity>` hint.  Returns
     /// whether `hint` was that token.
     pub fn mark_aroundstate_hint(&mut self, path: CallPath, hint: &str) -> bool {
-        let Some(rest) = hint.strip_prefix("aroundstate_target:") else {
+        if !hint.starts_with("aroundstate_target:") {
             return false;
+        }
+        let Some(DecoratorAttr::AroundstateTarget(identity, save_err)) =
+            DecoratorAttr::from_hint(hint)
+        else {
+            unreachable!("an aroundstate_target hint decodes to its attribute");
         };
-        let Some((save, identity)) = rest.split_once(':') else {
-            panic!("aroundstate_target hint `{hint}` is missing save_err");
-        };
-        let Ok(save_err) = save.parse::<i64>() else {
-            panic!("aroundstate_target hint `{hint}` has an undecodable save_err");
-        };
-        self.mark_call_aroundstate_target(path, identity.to_string(), save_err);
+        self.mark_call_aroundstate_target(path, identity, save_err);
         true
+    }
+
+    /// Write the `func` attributes the decorators behind `hints` set onto the
+    /// funcobj `path` names.
+    pub fn mark_decorator_hints(&mut self, path: &CallPath, hints: &[String]) {
+        for attr in hints
+            .iter()
+            .filter_map(|hint| DecoratorAttr::from_hint(hint))
+        {
+            let path = path.clone();
+            match attr {
+                DecoratorAttr::Oopspec(spec) => self.mark_oopspec(path, spec),
+                DecoratorAttr::OopspecArgnames(argnames) => {
+                    self.mark_oopspec_argnames(path, argnames)
+                }
+                DecoratorAttr::AroundstateTarget(identity, save_err) => {
+                    self.mark_call_aroundstate_target(path, identity, save_err)
+                }
+                DecoratorAttr::Elidable => self.mark_elidable(path),
+                DecoratorAttr::CannotRaise => self.mark_cannot_raise_assertion(path),
+                DecoratorAttr::MemerrorOnly => self.mark_memerror_only_assertion(path),
+                DecoratorAttr::LoopInvariant => self.mark_loopinvariant(path),
+                DecoratorAttr::CloseStack => self.mark_close_stack(path),
+                DecoratorAttr::CannotCollect => self.mark_cannot_collect(path),
+                DecoratorAttr::GcEffects => self.mark_external_gc_effects(path),
+            }
+        }
     }
 
     /// `call.py` `getcalldescr`: `assert getattr(funcobj, 'natural_arity', -1) == -1`

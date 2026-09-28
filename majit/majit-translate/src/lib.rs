@@ -634,64 +634,6 @@ pub fn analyze_multiple_pipeline_from_llbc_with_modules(
     )
 }
 
-/// `func` attributes a decorator sets (`rlib/jit.py` `@elidable`,
-/// `@oopspec`, `@loop_invariant`, the GC transformer hints), written onto
-/// the funcobj under each of its `paths`.
-fn mark_funcobj_hints(
-    call_control: &mut call::CallControl,
-    paths: &[crate::parse::CallPath],
-    hints: &[String],
-) {
-    for hint in hints {
-        for p in paths {
-            // rlib/jit.py — `@oopspec(spec)` registers func.oopspec = spec.
-            if let Some(spec) = hint.strip_prefix("oopspec:") {
-                call_control.mark_oopspec(p.clone(), spec.to_string());
-                continue;
-            }
-            if call_control.mark_aroundstate_hint(p.clone(), hint) {
-                continue;
-            }
-            // `support.py argnames = ll_func.__code__.co_varnames[:nb_args]`
-            // — companion hint emitted by `front::llbc_hints::harvest_hints_from_llbcs`
-            // when `#[oopspec(...)]` is paired with a function signature.
-            // Threads the declaration-order parameter names into
-            // `CallControl::oopspec_argnames` so `parse_oopspec`
-            // (`support.py:701-715` port) can resolve identifier
-            // slots in the spec's `(...)` pattern.
-            if let Some(names) = hint.strip_prefix("oopspec_argnames:") {
-                let argnames: Vec<String> = names
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if !argnames.is_empty() {
-                    call_control.mark_oopspec_argnames(p.clone(), argnames);
-                }
-                continue;
-            }
-            match hint.as_str() {
-                "elidable" => call_control.mark_elidable(p.clone()),
-                "elidable_cannot_raise" => call_control.mark_cannot_raise_assertion(p.clone()),
-                "cannot_raise" => call_control.mark_cannot_raise_assertion(p.clone()),
-                "elidable_or_memerror" => call_control.mark_memerror_only_assertion(p.clone()),
-                "loopinvariant" => call_control.mark_loopinvariant(p.clone()),
-                "close_stack" => call_control.mark_close_stack(p.clone()),
-                "cannot_collect" => call_control.mark_cannot_collect(p.clone()),
-                // rlib/jit.py — @not_in_trace sets func.oopspec = "jit.not_in_trace()"
-                "not_in_trace" => {
-                    call_control.mark_oopspec(p.clone(), "jit.not_in_trace".to_string());
-                }
-                // `random_effects_on_gcobjs` is read off the funcobj by
-                // `analyze_external_call` alone, so it only speaks for a
-                // path that ends up with no graph.
-                "gc_effects" => call_control.mark_external_gc_effects(p.clone()),
-                _ => {}
-            }
-        }
-    }
-}
-
 /// A registration of the funcobj `graph` that stamps the source return type
 /// (`funcptr._obj.TO.RESULT`) and then `hints` onto its copy of the graph.
 fn lazy_graph_source(
@@ -1190,12 +1132,29 @@ fn analyze_pipeline_from_module_paths(
         }
     }
     mark_phase!("build_semantic_program_from_parsed_files");
-    // Clause specializations register apart from the declared functions,
-    // under the one path their call sites name (below).
+    // A clause specialization is another graph of its generic funcobj
+    // (`description.py FunctionDesc.cachedgraph(key)`), reached only from
+    // the call sites that name it: it is declared under that one path, with
+    // no alias spelling, class member or indirect-call family row of its
+    // own.
+    let funcobj_declarations = call::FuncObjDeclarations::default();
     let (spec_functions, functions): (Vec<_>, Vec<_>) = std::mem::take(&mut program.functions)
         .into_iter()
         .partition(|func| func.spec_path.is_some());
     program.functions = functions;
+    for func in spec_functions {
+        funcobj_declarations.push(call::DeclaredFuncObj {
+            path: func
+                .spec_path
+                .clone()
+                .expect("a spec function names its path"),
+            graph: func.lazy_graph().clone(),
+            transform: call::GraphTransform {
+                return_type: func.return_type.clone(),
+                hints: func.hints.clone(),
+            },
+        });
+    }
     prof.note(|| {
         // Counts the bodies built so far; the note builds none.
         let built = || {
@@ -1450,6 +1409,7 @@ fn analyze_pipeline_from_module_paths(
     // ── Build CallControl (RPython call.py) ──
     // Populate with all discovered function graphs and trait impl methods.
     let mut call_control = call::CallControl::new();
+    call_control.use_funcobj_declarations(funcobj_declarations);
     // RPython: known struct types for get_type_flag(ARRAY.OF) → FLAG_STRUCT.
     call_control.set_known_struct_names(program.known_struct_names.clone());
     // RPython: struct field types for op.args[0].concretetype resolution.
@@ -2259,7 +2219,9 @@ fn analyze_pipeline_from_module_paths(
             // `#[cannot_collect]` / elidable hint.
             free_function_alias_paths(&func.name, &func.module_path)
         };
-        mark_funcobj_hints(&mut call_control, &paths, &func.hints);
+        for path in &paths {
+            call_control.mark_decorator_hints(path, &func.hints);
+        }
     }
     // A `dont_look_inside` helper is residualized and may never appear in
     // `program.functions`. Its harvested `cannot_raise` mark must still
@@ -2449,19 +2411,6 @@ fn analyze_pipeline_from_module_paths(
         "collect_oldgen_nonmoving",
     ] {
         call_control.mark_canmallocgc(parse::CallPath::from_segments(["majit_gc", gc_entry]));
-    }
-    // A clause specialization is another graph of its generic funcobj
-    // (`description.py FunctionDesc.cachedgraph(key)`), reached only from
-    // the call sites that name it: no alias spelling, class member or
-    // indirect-call family row of its own.
-    for func in &spec_functions {
-        let path = func
-            .spec_path
-            .clone()
-            .expect("a spec function names its path");
-        let graph = lazy_graph_source(func.lazy_graph(), &func.return_type, &func.hints);
-        call_control.register_function_graph(path.clone(), graph);
-        mark_funcobj_hints(&mut call_control, std::slice::from_ref(&path), &func.hints);
     }
     // warmspot.py `WarmRunnerDesc.__init__`: `if policy is None: policy =
     // JitPolicy()`.
