@@ -22383,11 +22383,6 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Stamp byte-view / ARRAY identity onto a `first` / `last` site.
-    /// `as_bytes()` aliases the receiver to the `StringRepr`, so the
-    /// successful arm must emit `__string_byte_getitem`; any other
-    /// proven element spelling rides on `array_type_id` the way
-    /// [`Self::recognize_slice_get_site`] does.
     /// Whether the receiver of a recognized slice call is an `as_bytes()` view
     /// of a string rather than a GC array, i.e. carries a `StringRepr` length
     /// and a `__string_byte_getitem` element read.
@@ -22399,6 +22394,11 @@ impl<'a> Lowering<'a> {
             .is_some_and(|local| self.string_byte_view_locals.contains(&local))
     }
 
+    /// Stamp byte-view / ARRAY identity onto a `first` / `last` site.
+    /// `as_bytes()` aliases the receiver to the `StringRepr`, so the
+    /// successful arm must emit `__string_byte_getitem`; any other
+    /// proven element spelling rides on `array_type_id` the way
+    /// [`Self::recognize_slice_get_site`] does.
     fn annotate_slice_first_site(
         &self,
         site: &mut crate::front::slice_first::SliceFirstSite,
