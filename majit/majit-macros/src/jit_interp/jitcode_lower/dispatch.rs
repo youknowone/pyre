@@ -1084,13 +1084,6 @@ fn try_lower_have_argument_guard(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
         return false;
     };
 
-    let const_reg = lowerer.alloc_reg();
-    lowerer.emit_op(
-        OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-        quote! {
-            __builder.load_const_i_value(#const_reg as u16, #const_ident as i64);
-        },
-    );
     let ok_label = lowerer.alloc_label();
     lowerer.emit_aux(quote! { let #ok_label = __builder.new_label(); });
     let local_reg = local.reg;
@@ -1103,15 +1096,12 @@ fn try_lower_have_argument_guard(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
         quote! { let _ = __builder.live_placeholder(); },
     );
     lowerer.emit_op(
-        OpMeta::conditional_guard_compare(
-            Register::int(local_reg),
-            Register::int(const_reg),
-            ok_label.clone(),
-        ),
+        OpMeta::conditional_guard(Register::int(local_reg), ok_label.clone()),
         quote! {
-            __builder.goto_if_not_int_lt(
+            __builder.goto_if_not_int_const(
+                majit_ir::OpCode::IntLt,
                 #local_reg as u16,
-                #const_reg as u16,
+                #const_ident as i64,
                 #ok_label,
             );
         },
@@ -1204,27 +1194,20 @@ fn try_lower_oparg_merge_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
         return false;
     }
 
-    let const_reg = lowerer.alloc_reg();
     let oparg_reg = lhs_binding.reg;
     let arg_reg = arg_binding.reg;
     lowerer.emit_op(
-        OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-        quote! {
-            __builder.load_const_i_value(#const_reg as u16, #mul_lit as i64);
-        },
-    );
-    lowerer.emit_op(
         OpMeta::linear(
             OpKind::BinopI,
-            vec![Register::int(oparg_reg), Register::int(const_reg)],
+            vec![Register::int(oparg_reg)],
             vec![Register::int(oparg_reg)],
         ),
         quote! {
-            __builder.record_binop_i(
+            __builder.record_binop_i_const(
                 #oparg_reg as u16,
                 majit_ir::OpCode::IntMul,
                 #oparg_reg as u16,
-                #const_reg as u16,
+                #mul_lit as i64,
             );
         },
     );
@@ -1529,28 +1512,21 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
             return false;
         };
         let pc_reg = pc.reg;
-        // Load the increment into a fresh tmp int register, then emit
-        // int_add(pc_reg, pc_reg, tmp_reg). RPython `pyopcode.py:181`
-        // `next_instr += 2` is the canonical N=2 case.
-        let tmp_reg = lowerer.alloc_reg();
-        lowerer.emit_op(
-            OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(tmp_reg)]),
-            quote::quote! {
-                __builder.load_const_i_value(#tmp_reg as u16, #increment as i64);
-            },
-        );
+        // `int_add(pc_reg, Constant(N))`: the increment stays a constant
+        // operand. RPython `pyopcode.py:181` `next_instr += 2` is the
+        // canonical N=2 case.
         lowerer.emit_op(
             OpMeta::linear(
                 OpKind::BinopI,
-                vec![Register::int(pc_reg), Register::int(tmp_reg)],
+                vec![Register::int(pc_reg)],
                 vec![Register::int(pc_reg)],
             ),
             quote::quote! {
-                __builder.record_binop_i(
+                __builder.record_binop_i_const(
                     #pc_reg as u16,
                     majit_ir::OpCode::IntAdd,
                     #pc_reg as u16,
-                    #tmp_reg as u16,
+                    #increment as i64,
                 );
             },
         );
@@ -2322,14 +2298,40 @@ mod pc_pinned_write_tests {
             "pc = tgt must not record IntAdd(x, 0), got {emitted}"
         );
     }
+
+    /// `pc += 1` keeps the increment a constant operand of `int_add`
+    /// (`assembler.py` `emit_const`), with no register load before it.
+    #[test]
+    fn pc_increment_is_an_add_with_a_constant_operand() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.pc_pinned = true;
+        lowerer
+            .bindings
+            .insert("pc".to_string(), binding(0, BindingKind::Int));
+        let expr: Expr = syn::parse_str("pc += 1").expect("parse pc increment");
+
+        assert_eq!(lowerer.lower_pc_pinned_write(&expr), Some(()));
+        assert_eq!(lowerer.op_metadata.len(), 1);
+        assert_eq!(lowerer.op_metadata[0].reads, vec![Register::int(0)]);
+        assert_eq!(lowerer.op_metadata[0].writes, vec![Register::int(0)]);
+        let emitted = lowerer.statements[0].to_string();
+        assert!(
+            emitted.contains("record_binop_i_const") && emitted.contains("IntAdd"),
+            "pc += 1 must be int_add with a constant, got {emitted}"
+        );
+        assert!(
+            !emitted.contains("load_const_i_value"),
+            "pc += 1 must not load the constant into a register, got {emitted}"
+        );
+    }
 }
 
 impl<'c> Lowerer<'c> {
     /// Green-pc inline dispatch pc-write pinning (see `Lowerer::pc_pinned`).
     /// Lowers `pc += N`, `pc = pc + N`, and the generic branch `pc = <expr>`
     /// so the result lands in pc's register (reg0), the slot the dispatch
-    /// merge point reads.  `pc += N` emits `record_binop_i(pc_reg, IntAdd,
-    /// pc_reg, const_N)` — the same advance shape as the dispatch-top
+    /// merge point reads.  `pc += N` emits `int_add(pc_reg, Constant(N))`
+    /// through `record_binop_i_const` — the same advance shape as the dispatch-top
     /// opcode-fetch (`try_lower_opcode_fetch_stmt` Pattern 2).  `pc = target`
     /// lowers the RHS then copies it into pc_reg via `int_copy` / `move_i`
     /// (`blackhole.py bhimpl_int_copy`); that is a register rename, not an
@@ -2344,25 +2346,18 @@ impl<'c> Lowerer<'c> {
         let pc_reg = self.bindings.get("pc")?.reg;
 
         if let Some(increment) = pc_self_increment(expr) {
-            let tmp_reg = self.alloc_reg();
-            self.emit_op(
-                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(tmp_reg)]),
-                quote::quote! {
-                    __builder.load_const_i_value(#tmp_reg as u16, #increment as i64);
-                },
-            );
             self.emit_op(
                 OpMeta::linear(
                     OpKind::BinopI,
-                    vec![Register::int(pc_reg), Register::int(tmp_reg)],
+                    vec![Register::int(pc_reg)],
                     vec![Register::int(pc_reg)],
                 ),
                 quote::quote! {
-                    __builder.record_binop_i(
+                    __builder.record_binop_i_const(
                         #pc_reg as u16,
                         majit_ir::OpCode::IntAdd,
                         #pc_reg as u16,
-                        #tmp_reg as u16,
+                        #increment as i64,
                     );
                 },
             );

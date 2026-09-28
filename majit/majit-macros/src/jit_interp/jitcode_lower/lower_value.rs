@@ -2826,21 +2826,17 @@ impl<'c> Lowerer<'c> {
         }
 
         let x_reg = inner.reg;
-        let one_reg = self.alloc_reg();
-        self.emit_op(
-            OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(one_reg)]),
-            quote! { __builder.load_const_i_value(#one_reg, 1i64); },
-        );
-
+        let one = quote! { 1i64 };
         let shl_reg = self.alloc_reg();
         let lshift = syn::Ident::new("IntLshift", proc_macro2::Span::call_site());
         self.emit_op(
             OpMeta::linear(
                 OpKind::BinopI,
-                Register::ints(&[x_reg, one_reg]),
+                Register::ints(&[x_reg]),
                 vec![Register::int(shl_reg)],
             ),
-            binop_i_emit_tokens(shl_reg, &lshift, x_reg, one_reg),
+            binop_i_const_emit_tokens(shl_reg, &lshift, x_reg, &one)
+                .expect("int_lshift accepts a constant operand"),
         );
 
         let res_reg = self.alloc_reg();
@@ -2848,10 +2844,11 @@ impl<'c> Lowerer<'c> {
         self.emit_op(
             OpMeta::linear(
                 OpKind::BinopI,
-                Register::ints(&[shl_reg, one_reg]),
+                Register::ints(&[shl_reg]),
                 vec![Register::int(res_reg)],
             ),
-            binop_i_emit_tokens(res_reg, &or, shl_reg, one_reg),
+            binop_i_const_emit_tokens(res_reg, &or, shl_reg, &one)
+                .expect("int_or accepts a constant operand"),
         );
         Some(Binding {
             reg: res_reg,

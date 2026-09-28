@@ -344,26 +344,19 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
         return Err("arm body has no `pc` binding for the pc-return writeback".to_string());
     };
     let pc_reg = pc_binding.reg;
-    let tmp_reg = lowerer.alloc_reg();
-    lowerer.emit_op(
-        OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(tmp_reg)]),
-        quote! {
-            __builder.load_const_i_value(#tmp_reg as u16, #increment as i64);
-        },
-    );
     let ret_reg = lowerer.alloc_reg();
     lowerer.emit_op(
         OpMeta::linear(
             OpKind::BinopI,
-            vec![Register::int(pc_reg), Register::int(tmp_reg)],
+            vec![Register::int(pc_reg)],
             vec![Register::int(ret_reg)],
         ),
         quote! {
-            __builder.record_binop_i(
+            __builder.record_binop_i_const(
                 #ret_reg as u16,
                 majit_ir::OpCode::IntAdd,
                 #pc_reg as u16,
-                #tmp_reg as u16,
+                #increment as i64,
             );
         },
     );
