@@ -31000,36 +31000,75 @@ fn gc_root_scope_base_path(name: &str) -> bool {
 ///
 /// A guard is never partially moved — it owns no droppable field and its own
 /// fields are private — so a direct `Local` operand is the whole move set.
+///
+/// An operand is a move of the local only if it carries the local's declared
+/// type.  Charon can spell an operand with a local index that is not the one
+/// it declares: the `len` of a bounds-check `Assert` has been seen spelled as
+/// a `usize` under the index of a local declared as a `RootScope`.
+/// Counting that as a move would retire the guard.
 fn moved_out_locals(body: &Unstructured) -> bit_set::BitSet {
-    fn scan(v: &serde_json::Value, out: &mut bit_set::BitSet) {
+    fn ty_ref_id(v: &serde_json::Value) -> Option<u64> {
+        v.get("Deduplicated")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                v.get("HashConsedValue")
+                    .and_then(|h| h.get(0))
+                    .and_then(serde_json::Value::as_u64)
+            })
+    }
+    fn scan(
+        v: &serde_json::Value,
+        declared: &std::collections::HashMap<u64, u64>,
+        out: &mut bit_set::BitSet,
+    ) {
         match v {
             serde_json::Value::Object(map) => {
-                if let Some(local) = map
-                    .get("Move")
-                    .and_then(|place| place.get("kind"))
-                    .and_then(|kind| kind.get("Local"))
-                    .and_then(serde_json::Value::as_u64)
+                if let Some(place) = map.get("Move")
+                    && let Some(local) = place
+                        .get("kind")
+                        .and_then(|kind| kind.get("Local"))
+                        .and_then(serde_json::Value::as_u64)
                 {
-                    out.insert(local as usize);
+                    let spelled = place.get("ty").and_then(ty_ref_id);
+                    let mismatched = matches!(
+                        (spelled, declared.get(&local)),
+                        (Some(a), Some(b)) if a != *b
+                    );
+                    if !mismatched {
+                        out.insert(local as usize);
+                    }
                 }
                 for nested in map.values() {
-                    scan(nested, out);
+                    scan(nested, declared, out);
                 }
             }
             serde_json::Value::Array(items) => {
                 for nested in items {
-                    scan(nested, out);
+                    scan(nested, declared, out);
                 }
             }
             _ => {}
         }
     }
+    let declared: std::collections::HashMap<u64, u64> = body
+        .locals
+        .locals
+        .iter()
+        .filter_map(|l| {
+            let id = match &l.ty {
+                majit_charon_reader::ullbc::TyRef::Dedup { id } => *id,
+                majit_charon_reader::ullbc::TyRef::Inline { value: (id, _) } => *id,
+                _ => return None,
+            };
+            Some((l.index, id))
+        })
+        .collect();
     let mut out = bit_set::BitSet::new();
     for bb in &body.body {
         for stmt in &bb.statements {
-            scan(&stmt.kind, &mut out);
+            scan(&stmt.kind, &declared, &mut out);
         }
-        scan(&bb.terminator.kind, &mut out);
+        scan(&bb.terminator.kind, &declared, &mut out);
     }
     out
 }
