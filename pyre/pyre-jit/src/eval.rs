@@ -1598,7 +1598,7 @@ use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new_managed, w_tuple_new
 const JIT_THRESHOLD: u32 = majit_metainterp::jit::PARAMETERS.threshold;
 type JitDriverPair = (
     JitDriver<PyreJitState>,
-    std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
+    Option<std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>>,
 );
 
 thread_local! {
@@ -5144,9 +5144,11 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // computes the hidden mutate field's address, pyre unlinks the instance
     // and flips every loop flag it recorded.
     majit_metainterp::set_force_quasi_immutable_hook(Some(crate::call_jit::force_quasi_immutable));
-    let info = build_pyframe_virtualizable_info();
+    // `warmspot.py` builds `VirtualizableInfo` while translating the
+    // portal. The cold counter tick does not read it. The first trace
+    // or compiled entry calls `ensure_pyframe_virtualizable`, which
+    // publishes the one Arc onto jd0 before `staticdata` is cloned.
     let mut d = JitDriver::new(JIT_THRESHOLD);
-    d.set_virtualizable_info(info.clone());
     // info.py `ConstPtrInfo.getstrlen1(mode)` — install pyre's
     // `W_UnicodeObject` length reader so constant STRLEN / UNICODELEN ops
     // fold to `IntBound::from_constant(len)` during intbounds
@@ -5227,7 +5229,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // warmspot.py `jd.portal_runner_adr = adr_of(ll_portal_runner)`.
     let mut jd = PyreJitState::pypyjit_driver_descriptor();
     jd.result_type = majit_ir::Type::Ref;
-    jd.virtualizable_info = Some(info.clone());
+    // Filled by `ensure_pyframe_virtualizable` before the first trace.
     jd.portal_runner_adr = crate::call_jit::ll_portal_runner_shim as *const () as i64;
     jd.handle_jitexc_from_bh = Some(pyre_portal_runner);
     // warmstate.py get_unique_id(greenkey) → interp_jit.py get_unique_id.
@@ -5317,7 +5319,30 @@ fn build_jit_driver_pair() -> JitDriverPair {
     );
     pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
     pyre_interpreter::executioncontext::register_force_vref_hook(force_pyframe_vref);
-    (d, info)
+    (d, None)
+}
+
+/// One `VirtualizableInfo` for the pypyjit portal, built on the first
+/// trace or compiled entry rather than on the cold counter tick.
+fn ensure_pyframe_virtualizable(
+    pair: &mut JitDriverPair,
+) -> std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo> {
+    if let Some(info) = pair.1.clone() {
+        return info;
+    }
+    let installed = pair.0.meta_interp().virtualizable_info().cloned();
+    if let Some(info) = installed {
+        pair.1 = Some(info.clone());
+        return info;
+    }
+    let info = build_pyframe_virtualizable_info();
+    pair.0
+        .meta_interp_mut()
+        .jitdriver_sd_mut(0)
+        .expect("jd0")
+        .virtualizable_info = Some(info.clone());
+    pair.1 = Some(info.clone());
+    info
 }
 
 /// After `write_from_resume_data_partial` copies every
@@ -5403,7 +5428,10 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
     if frame.is_null() {
         return;
     }
-    let (driver, info) = driver_pair();
+    let pair = driver_pair();
+    let info_arc = ensure_pyframe_virtualizable(pair);
+    let info = info_arc.as_ref();
+    let driver = &mut pair.0;
     unsafe {
         let mut traced_frame_escaped = false;
         let tracing_frame = driver.meta_interp_mut().trace_ctx().and_then(|ctx| {
@@ -5853,7 +5881,8 @@ fn mapdict_method_cache_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef
 pub(crate) fn get_virtualizable_info() -> *const majit_metainterp::virtualizable::VirtualizableInfo
 {
     let pair = driver_pair();
-    std::sync::Arc::as_ptr(&pair.1)
+    let info = ensure_pyframe_virtualizable(pair);
+    std::sync::Arc::as_ptr(&info)
 }
 
 /// pypy/module/pypyjit/interp_jit.py → PyPyJitDriver(JitDriver).
@@ -5964,7 +5993,10 @@ impl PyPyJitDriver {
             return false;
         }
         let env = PyreEnv;
-        let (driver, info) = driver_pair();
+        let pair = driver_pair();
+        let info_arc = ensure_pyframe_virtualizable(pair);
+        let info = info_arc.as_ref();
+        let driver = &mut pair.0;
         let loop_pycode = pycode as *const ();
         let green_key_hash = make_green_key(loop_pycode, next_instr, is_being_profiled);
         let green_key = driver.resolve_cell_key(green_key_hash, || {
@@ -8258,6 +8290,10 @@ fn publish_kind0_descrs_before_trace() {
 fn install_build_time_liveness_before_trace(
     meta: &mut majit_metainterp::MetaInterp<crate::jit::state::PyreMeta>,
 ) {
+    if meta.virtualizable_info().is_none() {
+        let info = build_pyframe_virtualizable_info();
+        meta.jitdriver_sd_mut(0).expect("jd0").virtualizable_info = Some(info);
+    }
     if meta.staticdata.op_live >= 0 {
         return;
     }
@@ -12007,7 +12043,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let entry_pc = frame_root.frame().next_instr();
     let is_being_profiled = frame_root.frame().get_is_being_profiled();
     let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
-    let (driver, info) = driver_pair();
+    let pair = driver_pair();
 
     // `maybe_compile_and_run` matches the greens with `JitCell.comparekey`
     // before anything is read off a cell, so resolve the bucket hash to the key
@@ -12022,7 +12058,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `code_ptr` is the PyCode object `frame.pycode` holds, which is the green
     // `interp_jit.PyPyJitDriver` carries, so the typed key built here names the
     // cell `green_key_hash` hashes.
-    let green_key = driver.resolve_cell_key(green_key_hash, || {
+    let green_key = pair.0.resolve_cell_key(green_key_hash, || {
         pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
     });
 
@@ -12031,7 +12067,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // Asking the door first read the token and its compiled meta for a cell
     // this then declines anyway, and ticked the counter for a call upstream
     // never counts.
-    if driver.meta_interp().is_tracing_key((
+    if pair.0.meta_interp().is_tracing_key((
         frame_root.frame().pycode as usize,
         frame_root.frame().next_instr(),
     )) {
@@ -12047,10 +12083,15 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `has_runnable_compiled_loop`, the counter gate, then
     // `has_runnable_compiled_loop` again to decide the run -- walked it three
     // times to learn one thing, on every call that refused.
-    let step = driver.function_entry_step(green_key, green_key_hash, (code_ptr as usize, entry_pc));
+    let step = pair
+        .0
+        .function_entry_step(green_key, green_key_hash, (code_ptr as usize, entry_pc));
     if matches!(step, FunctionEntryStep::NotHot) {
         return None;
     }
+    let info_arc = ensure_pyframe_virtualizable(pair);
+    let info = info_arc.as_ref();
+    let driver = &mut pair.0;
 
     // `warmstate.py maybe_compile_and_run` carries the token the cell read
     // produced out through `EnterJitAssembler(procedure_token, *execute_args)`;
@@ -14131,7 +14172,7 @@ fn build_resumed_frames(
         // `set_virtualizable_info` at JIT_DRIVER init rather than rebuilding
         // a fresh instance, so the guard-failure recovery path shares a
         // single vinfo identity with the tracing / blackhole consumers.
-        let vinfo = crate::eval::driver_pair().1.clone();
+        let vinfo = crate::eval::ensure_pyframe_virtualizable(crate::eval::driver_pair());
         match vable_mode {
             ResumeVableMode::GuardFailureSync => {
                 sync_virtualizable_after_guard_failure(&resolved_vable, frame_u8, &vinfo);
