@@ -3900,6 +3900,50 @@ fn emit_determinism_trace(phase: &str, index: usize, canonical_key: &str) {
     );
 }
 
+/// `warmspot.py WarmRunnerDesc.check_access_directly_sanity`: no graph
+/// outside the JIT graph set is `access_directly`.
+///
+/// `specialize.py default_specialize` (`description.rs`) writes the flag on
+/// the annotator's graphs, and upstream's codewriter reads it after the
+/// annotator ran. Here `find_all_graphs` runs before the prepass annotates,
+/// so the flag is first readable after Phase A. Upstream walks
+/// `collect_called_graphs(entry_point_graph)`; the graphs the annotator
+/// reached are the ones its `FunctionDesc`s cached. The JIT graph set is
+/// taken per function: a candidate's `(AccessDirect, key)` copy belongs to
+/// it, since the BFS that chose the candidates ran before the copy existed.
+fn check_access_directly_sanity(
+    call_registry: &CallRegistry,
+    candidate_graphs: &HashSet<crate::parse::CallPath>,
+) {
+    let jit_descs: HashSet<*const RefCell<crate::annotator::description::FunctionDesc>> =
+        candidate_graphs
+            .iter()
+            .filter_map(|path| {
+                call_registry.lookup(&FunctionPathKey::from_segments(
+                    path.segments.iter().cloned(),
+                ))
+            })
+            .map(|entry| Rc::as_ptr(&entry.function_desc))
+            .collect();
+    for entry in call_registry.bookkeeper().descs.borrow().values() {
+        let crate::annotator::description::DescEntry::Func(func) = entry else {
+            continue;
+        };
+        let desc = func.func();
+        if jit_descs.contains(&Rc::as_ptr(&desc)) {
+            continue;
+        }
+        let desc = desc.borrow();
+        for graph in desc.cache.borrow().values() {
+            assert!(
+                !graph.access_directly.get(),
+                "access_directly on {}, which is outside the JIT graph set",
+                desc.name
+            );
+        }
+    }
+}
+
 fn run_two_phase_prepass_inner(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
@@ -3993,6 +4037,8 @@ fn run_two_phase_prepass_inner(
             }
         }
     }
+
+    check_access_directly_sanity(call_registry, candidate_graphs);
 
     if rtyper_verbose_enabled() {
         emit_disposition_histogram("phaseA", &phase_a_reasons);
@@ -4813,6 +4859,53 @@ mod tests {
     use crate::flowspace::model::BlockKey;
     use crate::model::{Block, BlockId, LinkArg, ValueType};
     use crate::translator::rtyper::legacy_annotator::setbinding;
+
+    /// A registry whose one funcobj, `owner::flagged`, has an annotator
+    /// graph flagged `access_directly`.
+    fn registry_with_a_flagged_graph() -> (std::rc::Rc<CallRegistry>, crate::parse::CallPath) {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let path = crate::parse::CallPath {
+            segments: vec!["owner".into(), "flagged".into()],
+        };
+        let mut graph = LegacyGraph::new("flagged");
+        graph.set_return(graph.startblock, None);
+        graph.source_identity = Some("owner::flagged".into());
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(path.clone(), graph);
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments(["owner", "flagged"]))
+            .unwrap();
+        let pygraph = entry
+            .function_desc
+            .borrow()
+            .cachedgraph(
+                crate::annotator::description::GraphCacheKey::None,
+                None,
+                None,
+            )
+            .unwrap();
+        pygraph.access_directly.set(true);
+        (registry, path)
+    }
+
+    /// `warmspot.py check_access_directly_sanity`: a JIT graph may be
+    /// `access_directly`.
+    #[test]
+    fn an_access_directly_jit_graph_passes_the_sanity_check() {
+        let (registry, path) = registry_with_a_flagged_graph();
+        check_access_directly_sanity(&registry, &HashSet::from([path]));
+    }
+
+    /// `warmspot.py check_access_directly_sanity`: a graph outside the JIT
+    /// graph set may not.
+    #[test]
+    #[should_panic(expected = "access_directly on flagged, which is outside the JIT graph set")]
+    fn an_access_directly_graph_outside_the_jit_set_fails_the_sanity_check() {
+        let (registry, _) = registry_with_a_flagged_graph();
+        check_access_directly_sanity(&registry, &HashSet::new());
+    }
 
     #[test]
     fn registry_population_keeps_memo_source_policy_without_lifting_host_body() {

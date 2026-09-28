@@ -9,9 +9,10 @@
 //! Pyre's interpreter is hand-written Rust and no struct carries that
 //! parameter, so the declaration is supplied out of band by the consumer, the
 //! same way the codewriter's `GraphTransformConfig::vable_fields` is
-//! (`rvirtualizable.rs` records why). This module is where the front end
-//! reads it back, so the minter's class test can run before there is a
-//! `ClassDesc` to ask.
+//! (`rvirtualizable.rs` records why). This module is where it is read back:
+//! the bookkeeper stamps it on the class host (`stamp_host_virtualizable`),
+//! where the `hint` entry's class test finds it, and the front end asks it
+//! which fields are arrays.
 //!
 //! Upstream the declaration is per-CLASS Bookkeeper state, so it is neither
 //! thread- nor invocation-scoped: `get_param` asks the class every time.
@@ -24,16 +25,15 @@
 //! invocation — the shape `local_crates` has.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::model::{ConstValue, HostObject};
 
 thread_local! {
     /// Per-pipeline-invocation `_virtualizable_` roots, seeded by the
-    /// consumer before it builds a program and read back by
-    /// `front::semantic::propagate_access_directly` during the SAME
-    /// invocation.
+    /// consumer before it builds a program and read back by the front end
+    /// and the bookkeeper during the SAME invocation.
     ///
     /// Thread-local for the reason `local_crates.rs` spells out: a translate
     /// pipeline runs start-to-finish on one thread, and a process-global
@@ -85,13 +85,6 @@ pub fn declarations_from_config(config: &GraphTransformConfig) -> Vec<(String, V
     add(&config.vable_fields, "");
     add(&config.vable_arrays, "[*]");
     declarations
-}
-
-/// The registered roots for the current pipeline invocation. Empty when the
-/// consumer declared none, which makes the minter's class test fail closed —
-/// upstream's erasing branch.
-pub(crate) fn virtualizable_roots() -> HashSet<String> {
-    REGISTERED.with(|registered| registered.borrow().keys().cloned().collect())
 }
 
 /// `cls._virtualizable_ = [...]` (`interp_jit.py` assigns it on the frame

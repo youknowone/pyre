@@ -7189,19 +7189,11 @@ pub struct FunctionGraph {
     /// Upstream writes it at exactly one place, `specialize.py
     /// default_specialize`, for a graph whose ARGUMENT annotation arrived
     /// carrying the flag that the `hint` ExtRegistryEntry in `rlib/jit.py`
-    /// mints on `SomeInstance.flags`. The flowspace pipeline ports that on
-    /// `PyGraph::access_directly`; the LLBC path has no annotator to carry a
-    /// flag on an annotation, so `front::semantic::propagate_access_directly`
-    /// does the same propagation over the op stream and writes this field.
-    /// That port is narrower than upstream in three named ways, recorded on
-    /// its own doc: a callee reached through both flagged and unflagged calls
-    /// stays unflagged, because one graph per function cannot carry both
-    /// access modes and `policy::look_inside_graph` aborts on a flag it
-    /// cannot honour; the alias closure follows only `Link`s and the
-    /// representation casts; and a value is taken for a virtualizable
-    /// instance only when the lowered graph records a class root the
-    /// consumer declared through `virtualizable_decl`. A `false` here
-    /// therefore does not mean the value never reached the graph.
+    /// mints on `SomeInstance.flags`. That is ported on the annotator's
+    /// `PyGraph::access_directly`; the prepass annotator runs after
+    /// `find_all_graphs`, so its flag is checked by
+    /// `cutover::check_access_directly_sanity` and nothing sets this field
+    /// before the policy reads it.
     pub access_directly: bool,
     /// Per-function effect attributes RPython reads off `graph.func`
     /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default

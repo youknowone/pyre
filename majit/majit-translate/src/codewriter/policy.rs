@@ -179,17 +179,16 @@ pub trait JitPolicy {
         // virtualizable from the JIT's view; upstream therefore aborts
         // translation loudly. Pyre carries the same flag where upstream
         // does, on the graph: `FunctionGraph::access_directly`, beside
-        // `hints`. The flowspace pipeline writes the flag through
-        // `description.rs default_specialize`; the LLBC path writes it
-        // through `front::semantic::propagate_access_directly`, which walks
-        // the op stream because there is no annotator to carry a flag on an
-        // annotation.
+        // `hints`.
         //
-        // This is the first of upstream's two gates on the flag. The
-        // second, `warmspot.py check_access_directly_sanity`, walks
-        // everything reachable from the entry point and asserts that no
-        // graph outside the JIT graph set is `access_directly`; it has no
-        // port here.
+        // This is the first of upstream's two gates on the flag. Upstream
+        // annotates before `find_all_graphs`; the prepass annotator
+        // (`description.rs default_specialize`) runs after it, so its flag
+        // reaches the second gate, `warmspot.py
+        // check_access_directly_sanity`
+        // (`cutover::check_access_directly_sanity`, after Phase A), which
+        // asserts that no graph outside the JIT graph set is
+        // `access_directly`.
         if see_function && !res && graph.access_directly {
             panic!(
                 "access_directly on a function which we don't see: {}",

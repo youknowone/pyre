@@ -1513,7 +1513,7 @@ impl<'l> CrateLowering<'l> {
         graph.name = spec_segments(llbc, fd, &header.name).join("::");
         // `FunctionDesc.cachedgraph` returns the specialized graph of the
         // same function object, so the copy keeps `_jit_look_inside_`.
-        // `propagate_access_directly` reads that hint off the callee.
+        // `look_inside_graph` reads that hint off the callee.
         let mut lowered = header.into_function(graph);
         if dont_look_inside.contains(&policy_fn_path)
             && !lowered.hints.iter().any(|hint| hint == "dont_look_inside")
@@ -1533,7 +1533,7 @@ impl CrateLoweringState {
     /// reads them, and the positional layouts below must not reach it.
     pub(crate) fn finish(
         &mut self,
-        mut functions: Vec<crate::front::semantic::SemanticFunction>,
+        functions: Vec<crate::front::semantic::SemanticFunction>,
     ) -> crate::front::semantic::SemanticProgram {
         let known_trait_names = self.known_trait_names.clone();
         let mut struct_field_attrs = self.struct_field_attrs.clone();
@@ -1545,15 +1545,6 @@ impl CrateLoweringState {
         let mut struct_ids = std::mem::take(&mut self.struct_ids);
         let skipped = self.skipped.take();
         let atomic_load_decls = self.atomic_load_decls.take();
-        let dont_look_inside = &self.dont_look_inside;
-        // `specialize.py default_specialize` runs while the annotator walks
-        // calls; on this path the whole function set has to exist first, so it
-        // runs here, once, over the finished list.
-        crate::front::semantic::propagate_access_directly(
-            &mut functions,
-            dont_look_inside,
-            &crate::virtualizable_decl::virtualizable_roots(),
-        );
         register_synthetic_positional_metadata(
             &functions,
             &mut known_struct_names,
