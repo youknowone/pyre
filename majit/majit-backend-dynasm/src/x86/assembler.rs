@@ -8482,17 +8482,14 @@ impl<'a> Assembler386<'a> {
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; ja =>slow_path);
 
-        // Fast path: update nursery_free, zero header, compute obj ptr.
+        // Fast path: update nursery_free, compute obj ptr.
+        // `gen_initialize_tid` writes the whole header word.
         // Stage the `*nf = new_free` store through R11; materialise the
         // payload pointer directly into `result_reg` (regalloc forces it
         // to ECX, MALLOC_NURSERY_RESULT) so both paths converge with the
         // payload in the same register.
         rx86::mov_ri(&mut self.mc, scratch, nf);
         rx86::mov_mr(&mut self.mc, (scratch, 0), rx86::EDX);
-        dynasm!(self.mc ; .arch x64
-                    ; mov QWORD [rcx], 0       // zero GcHeader
-
-        );
         let result_reg_for_payload = match result_loc {
             Some(Loc::Reg(r)) => r.value,
             _ => crate::regloc::ECX.value,

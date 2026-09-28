@@ -7462,21 +7462,15 @@ pub fn make_vtable_field_descr() -> DescrRef {
 /// framework-GC object's header.  None on Boehm builds (gc.py:157), where
 /// `gen_initialize_tid` is a no-op.
 ///
-/// pyre's `GcHeader` stores the logical RPython word in `tid_and_flags`, split
-/// into native half-word type-id and flag fields (`FLAG_SHIFT = LONG_BIT/2`).
-/// The descr addresses the *type id* slot only — `offset = 0`,
-/// `field_size = WORD/2`. Restricting the store width to that half-word is
-/// what lets `gen_initialize_tid` overwrite the type
-/// id without disturbing flag bits the runtime may already have set on
-/// the same word: collector.rs's `alloc_in_oldgen` ORs in
-/// `TRACK_YOUNG_PTRS` for any object the malloc-nursery slow path
-/// promotes to the old gen, and a full-word store would silently wipe
-/// it.  Upstream rewrite.py:914-918 has no analogue because
-/// `incminimark.HDR.tid` is a single Signed field where `tid` and
-/// flags coexist in the same value, and the rewriter never re-stamps
-/// tid after a slow malloc — pyre's split layout requires a narrower
-/// store at this site instead.  The header sits *before* the object
-/// pointer; `gen_initialize_tid` translates the descr's offset by
+/// pyre's `GcHeader` stores the logical RPython word in `tid_and_flags`:
+/// type id in the lower native half-word, flags above it
+/// (`FLAG_SHIFT = LONG_BIT/2`), like `incminimark.HDR.tid`. The descr
+/// covers that whole native word — `offset = 0`, `field_size = WORD` —
+/// so the one store `gen_initialize_tid` emits writes the type id and
+/// clears the flags, as upstream's Signed `HDR.tid` store does. On wasm32
+/// the physical header keeps four more bytes of ABI padding after the
+/// word; the store leaves them alone. The header sits *before* the
+/// object pointer; `gen_initialize_tid` translates the descr's offset by
 /// `-HDR_SIZE` to point at the header word.
 ///
 /// Cached as a process-wide singleton via `OnceLock` to mirror gc.py's
@@ -7486,15 +7480,14 @@ pub fn make_tid_field_descr() -> DescrRef {
     static TID_FIELD_DESCR: OnceLock<DescrRef> = OnceLock::new();
     TID_FIELD_DESCR
         .get_or_init(|| {
-            // header.rs splits the logical native word in half: type id
-            // first, then flags (TRACK_YOUNG_PTRS / VISITED / PINNED /
-            // HAS_CARDS …). Owned by the GC, not the JIT.
+            // header.rs packs type id and flags (TRACK_YOUNG_PTRS /
+            // VISITED / PINNED / HAS_CARDS …) into one native word.
             // is_immutable=false: incminimark mutates flag bits on mark
             // and rewrites the whole word on forwarding.
             Arc::new(SimpleFieldDescr::new(
                 0x7000_0000,
-                0,                                // offset within HDR
-                std::mem::size_of::<usize>() / 2, // HALFWORD type-id field
+                0,                            // offset within HDR
+                std::mem::size_of::<usize>(), // Signed HDR.tid
                 crate::Type::Int,
                 false, // is_immutable — flags / forwarding marker mutate
             ))
