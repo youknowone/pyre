@@ -982,17 +982,11 @@ impl PackedFrameState {
     }
 }
 
-/// One artefact's lowering context: the declaration tables every body of
-/// the artefact lowers against, the hint sets harvested from it, its
-/// root-stack analyzer and its clause-specialization queue.
-///
-/// `build_semantic_program_from_llbc_with_static_addrs_filtered` lowers each
-/// declaration through [`CrateLowering::lower_decl`] and each queued
-/// specialization through [`CrateLowering::lower_spec`].
-struct CrateLowering<'l> {
-    llbc: &'l Llbc,
-    static_addrs: crate::HostStaticAddrs<'l>,
-    jitdriver_receiver_roots: &'l [String],
+/// One artefact's lowering state: the declaration tables every body of the
+/// artefact lowers against, the hint sets harvested from it, its root-stack
+/// analysis, its clause-specialization queue and the declarations that did
+/// not lower. A [`CrateLowering`] borrows it together with the artefact.
+struct CrateLoweringState {
     known_struct_names: std::collections::HashSet<String>,
     known_trait_names: std::collections::HashSet<String>,
     struct_fields: crate::front::semantic::StructFieldRegistry,
@@ -1009,7 +1003,7 @@ struct CrateLowering<'l> {
     not_rpython: std::collections::HashSet<String>,
     /// One root-stack analysis per artefact, so a callee shared by many
     /// brackets is analysed once (`GraphAnalyzer._analyzed_calls`).
-    root_stack: RootStackAnalyzer<'l>,
+    root_stack: RootStackState,
     spec: std::cell::RefCell<crate::front::clause_spec::SpecQueue>,
     skipped: std::cell::RefCell<Vec<(String, String)>>,
     atomic_load_decls: std::cell::RefCell<
@@ -1017,13 +1011,22 @@ struct CrateLowering<'l> {
     >,
 }
 
-impl<'l> CrateLowering<'l> {
-    fn new(
-        llbc: &'l Llbc,
-        static_addrs: crate::HostStaticAddrs<'l>,
-        jitdriver_receiver_roots: &'l [String],
-        cross_tombstoned_leaves: &std::collections::HashSet<String>,
-    ) -> Self {
+/// One artefact's lowering context: the artefact, the host addresses and
+/// jitdriver roots its bodies lower against, and its [`CrateLoweringState`].
+///
+/// `build_semantic_program_from_llbc_with_static_addrs_filtered` lowers each
+/// declaration through [`CrateLowering::lower_decl`] and each queued
+/// specialization through [`CrateLowering::lower_spec`].
+struct CrateLowering<'l> {
+    llbc: &'l Llbc,
+    static_addrs: crate::HostStaticAddrs<'l>,
+    jitdriver_receiver_roots: &'l [String],
+    state: &'l CrateLoweringState,
+    root_stack: RootStackAnalyzer<'l>,
+}
+
+impl CrateLoweringState {
+    fn new(llbc: &Llbc, cross_tombstoned_leaves: &std::collections::HashSet<String>) -> Self {
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -1152,9 +1155,6 @@ impl<'l> CrateLowering<'l> {
             .map(|(path, _)| path.clone())
             .collect();
         Self {
-            llbc,
-            static_addrs,
-            jitdriver_receiver_roots,
             known_struct_names,
             known_trait_names,
             struct_fields,
@@ -1167,10 +1167,27 @@ impl<'l> CrateLowering<'l> {
             dont_look_inside,
             elidable_residual,
             not_rpython,
-            root_stack: RootStackAnalyzer::new(llbc),
+            root_stack: RootStackState::new(llbc),
             spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
             skipped: std::cell::RefCell::new(Vec::new()),
             atomic_load_decls: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl<'l> CrateLowering<'l> {
+    fn new(
+        llbc: &'l Llbc,
+        static_addrs: crate::HostStaticAddrs<'l>,
+        jitdriver_receiver_roots: &'l [String],
+        state: &'l CrateLoweringState,
+    ) -> Self {
+        Self {
+            llbc,
+            static_addrs,
+            jitdriver_receiver_roots,
+            state,
+            root_stack: RootStackAnalyzer::new(llbc, &state.root_stack),
         }
     }
 
@@ -1182,22 +1199,25 @@ impl<'l> CrateLowering<'l> {
         module_filter: Option<&std::collections::HashSet<String>>,
         function_filter: Option<&std::collections::HashSet<String>>,
     ) -> Option<crate::front::semantic::SemanticFunction> {
-        let Self {
-            llbc,
-            static_addrs,
-            jitdriver_receiver_roots,
+        let CrateLoweringState {
             known_trait_names,
             struct_field_attrs,
             tombstoned_leaves,
             dont_look_inside,
             elidable_residual,
             not_rpython,
-            root_stack,
             spec,
+            skipped,
+            atomic_load_decls,
             ..
-        } = self;
-        let (llbc, static_addrs, jitdriver_receiver_roots) =
-            (*llbc, *static_addrs, *jitdriver_receiver_roots);
+        } = self.state;
+        let Self {
+            llbc,
+            static_addrs,
+            jitdriver_receiver_roots,
+            ref root_stack,
+            ..
+        } = *self;
         // Charon emits static / const initialiser bodies (e.g. the
         // body that builds `static NONE_SINGLETON`) as ordinary
         // `FunDecl` entries whose `src` is `GlobalInitializer` of the
@@ -1322,11 +1342,11 @@ impl<'l> CrateLowering<'l> {
             Err(e) => {
                 let msg = e.to_string();
                 if let Some(reason) = atomic_reasons.first() {
-                    self.atomic_load_decls
+                    atomic_load_decls
                         .borrow_mut()
                         .push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
                 }
-                self.skipped.borrow_mut().push((header.name, msg));
+                skipped.borrow_mut().push((header.name, msg));
                 return None;
             }
         };
@@ -1335,7 +1355,7 @@ impl<'l> CrateLowering<'l> {
 
     /// Pop the next queued clause specialization.
     fn pop_spec(&self) -> Option<crate::front::clause_spec::SpecRequest> {
-        self.spec.borrow_mut().pop()
+        self.state.spec.borrow_mut().pop()
     }
 
     /// Lower one clause specialization. `None` when its body does not
@@ -1344,21 +1364,24 @@ impl<'l> CrateLowering<'l> {
         &self,
         req: crate::front::clause_spec::SpecRequest,
     ) -> Option<crate::front::semantic::SemanticFunction> {
-        let Self {
-            llbc,
-            static_addrs,
-            jitdriver_receiver_roots,
+        let CrateLoweringState {
             known_trait_names,
             struct_field_attrs,
             tombstoned_leaves,
             dont_look_inside,
             elidable_residual,
-            root_stack,
             spec,
+            skipped,
+            atomic_load_decls,
             ..
-        } = self;
-        let (llbc, static_addrs, jitdriver_receiver_roots) =
-            (*llbc, *static_addrs, *jitdriver_receiver_roots);
+        } = self.state;
+        let Self {
+            llbc,
+            static_addrs,
+            jitdriver_receiver_roots,
+            ref root_stack,
+            ..
+        } = *self;
         let spec_name = req.leaf.clone();
         let Some(fd) = llbc.fn_by_id(req.fn_id) else {
             return None;
@@ -1370,7 +1393,7 @@ impl<'l> CrateLowering<'l> {
             &req.types,
             &req.const_generics,
         ) else {
-            self.skipped
+            skipped
                 .borrow_mut()
                 .push((spec_name, "no substituted unstructured body".into()));
             return None;
@@ -1427,11 +1450,11 @@ impl<'l> CrateLowering<'l> {
             Err(e) => {
                 let msg = e.to_string();
                 if let Some(reason) = atomic_reasons.first() {
-                    self.atomic_load_decls
+                    atomic_load_decls
                         .borrow_mut()
                         .push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
                 }
-                self.skipped.borrow_mut().push((spec_name, msg));
+                skipped.borrow_mut().push((spec_name, msg));
                 return None;
             }
         };
@@ -1447,7 +1470,9 @@ impl<'l> CrateLowering<'l> {
         }
         Some(lowered)
     }
+}
 
+impl CrateLoweringState {
     /// `specialize.py default_specialize` and the positional-aggregate
     /// layouts over the lowered set, the coverage report, and the program.
     fn finish(
@@ -1564,12 +1589,8 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     function_filter: Option<&std::collections::HashSet<String>>,
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    let ctx = CrateLowering::new(
-        llbc,
-        static_addrs,
-        jitdriver_receiver_roots,
-        cross_tombstoned_leaves,
-    );
+    let state = CrateLoweringState::new(llbc, cross_tombstoned_leaves);
+    let ctx = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state);
     let mut functions: Vec<_> = llbc
         .iter_local_fns()
         .filter_map(|fd| ctx.lower_decl(fd, module_filter, function_filter))
@@ -1580,7 +1601,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     while let Some(req) = ctx.pop_spec() {
         functions.extend(ctx.lower_spec(req));
     }
-    Ok(ctx.finish(functions))
+    Ok(state.finish(functions))
 }
 /// Declaration facts of one function or clause specialization: every
 /// `SemanticFunction` field but the body, plus the `graph.func` fields
@@ -3321,7 +3342,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         builder_mode,
         &accum,
         &mut atomic_load_reasons,
-        &RootStackAnalyzer::new(llbc),
+        &RootStackAnalyzer::new(llbc, &RootStackState::new(llbc)),
         None,
         false,
     )
@@ -29165,6 +29186,11 @@ fn root_bracket_erase_enabled() -> bool {
 /// That is the "covered" test in [`Self::analyze_body`].
 pub(crate) struct RootStackAnalyzer<'a> {
     llbc: &'a Llbc,
+    state: &'a RootStackState,
+}
+
+/// The per-artefact caches a [`RootStackAnalyzer`] fills.
+pub(crate) struct RootStackState {
     /// Whether this artefact defines the root-stack API.  A dependency cannot
     /// name a crate built on top of it, so a foreign body here reaches the
     /// root stack only through a callback it is handed, and that callback is
@@ -29201,8 +29227,8 @@ struct TraitMethodBodies {
 
 type RootStackTracker = crate::translator::backendopt::graphanalyze::DependencyTracker<bool, u64>;
 
-impl<'a> RootStackAnalyzer<'a> {
-    pub(crate) fn new(llbc: &'a Llbc) -> Self {
+impl RootStackState {
+    pub(crate) fn new(llbc: &Llbc) -> Self {
         let root_api_is_local = llbc.iter_type_decls().any(|decl| {
             decl.item_meta.is_local && gc_root_scope_type_path(&decl.item_meta.name_path())
         });
@@ -29217,7 +29243,6 @@ impl<'a> RootStackAnalyzer<'a> {
                     .any(|s| s == ROOT_SCOPE_MODULE)
             });
         Self {
-            llbc,
             root_api_is_local,
             root_api_is_visible,
             analyzed_calls: std::cell::RefCell::new(crate::tool::algo::unionfind::UnionFind::new(
@@ -29227,6 +29252,12 @@ impl<'a> RootStackAnalyzer<'a> {
             scope_constructors: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
+}
+
+impl<'a> RootStackAnalyzer<'a> {
+    pub(crate) fn new(llbc: &'a Llbc, state: &'a RootStackState) -> Self {
+        Self { llbc, state }
+    }
 
     /// Whether this call returns a value owning a bracket the callee opened.
     /// The caller's local holding the result is then that bracket's guard:
@@ -29235,7 +29266,7 @@ impl<'a> RootStackAnalyzer<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        if let Some(&known) = self.scope_constructors.borrow().get(id) {
+        if let Some(&known) = self.state.scope_constructors.borrow().get(id) {
             return known;
         }
         let answer = self
@@ -29247,7 +29278,10 @@ impl<'a> RootStackAnalyzer<'a> {
                     regular_call_name_path(reg, self.llbc)
                 })
             });
-        self.scope_constructors.borrow_mut().insert(*id, answer);
+        self.state
+            .scope_constructors
+            .borrow_mut()
+            .insert(*id, answer);
         answer
     }
 
@@ -29294,8 +29328,8 @@ impl<'a> RootStackAnalyzer<'a> {
         if fd.body.is_none() {
             return self.analyze_external_call(fd);
         }
-        if !seen.enter(id, &mut self.analyzed_calls.borrow_mut()) {
-            return seen.get_cached_result(id, &mut self.analyzed_calls.borrow_mut());
+        if !seen.enter(id, &mut self.state.analyzed_calls.borrow_mut()) {
+            return seen.get_cached_result(id, &mut self.state.analyzed_calls.borrow_mut());
         }
         let result = match fd.unstructured() {
             Some(mut body) => {
@@ -29306,7 +29340,7 @@ impl<'a> RootStackAnalyzer<'a> {
             }
             None => self.analyze_external_call(fd),
         };
-        seen.leave_with(id, result, &mut self.analyzed_calls.borrow_mut());
+        seen.leave_with(id, result, &mut self.state.analyzed_calls.borrow_mut());
         result
     }
 
@@ -29323,13 +29357,13 @@ impl<'a> RootStackAnalyzer<'a> {
     /// can reach the stack but a callback.
     fn analyze_external_call(&self, fd: &FunDecl) -> bool {
         if fd.item_meta.is_local {
-            return self.root_api_is_visible;
+            return self.state.root_api_is_visible;
         }
-        if self.root_api_is_local {
+        if self.state.root_api_is_local {
             return false;
         }
         if !self.llbc.has_root_stack_effects() {
-            return self.root_api_is_visible;
+            return self.state.root_api_is_visible;
         }
         let path = fd.item_meta.name_path();
         let krate = path.split("::").next().unwrap_or_default();
@@ -29358,6 +29392,7 @@ impl<'a> RootStackAnalyzer<'a> {
             return true;
         };
         let bodies = self
+            .state
             .trait_methods
             .get_or_init(|| trait_method_bodies(self.llbc));
         let mut targets: Vec<u64> = Vec::new();
@@ -29406,7 +29441,7 @@ impl<'a> RootStackAnalyzer<'a> {
         // crate built on top of it supplies, which is a callback, as in
         // `analyze_external_call`.
         if targets.is_empty() {
-            return self.root_api_is_visible;
+            return self.state.root_api_is_visible;
         }
         targets
             .into_iter()
@@ -30268,7 +30303,8 @@ fn pin_roots_slice_values(
 /// touch the stack.  Paths that name several bodies (`<Impl>::new`) are
 /// listed if any of them touches.
 pub fn harvest_root_stack_touching_paths(llbc: &Llbc) -> Vec<String> {
-    let analyzer = RootStackAnalyzer::new(llbc);
+    let root_state = RootStackState::new(llbc);
+    let analyzer = RootStackAnalyzer::new(llbc, &root_state);
     let mut touching: Vec<String> = llbc
         .iter_local_fns()
         .filter(|fd| fd.body.is_some() && analyzer.fn_touches_root_stack(fd.def_id))
@@ -30305,7 +30341,8 @@ fn analyze_root_brackets(
 /// the lowering dropped on the floor.
 pub fn erased_root_bracket_guards(llbc: &Llbc, body: &Unstructured) -> Vec<usize> {
     let moved = MovedOutLocals::new(body);
-    let root_stack = RootStackAnalyzer::new(llbc);
+    let root_stack_state = RootStackState::new(llbc);
+    let root_stack = RootStackAnalyzer::new(llbc, &root_stack_state);
     analyze_root_brackets(body, llbc, &moved, &root_stack)
         .scopes
         .iter()
@@ -50211,7 +50248,7 @@ mod tests {
                 &dont_look_inside,
                 &tombstoned_leaves,
                 &accum,
-                &super::RootStackAnalyzer::new(&llbc),
+                &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             )
             .unwrap();
             assert_eq!(
@@ -54942,7 +54979,7 @@ mod tests {
             &dont_look_inside,
             &tombstoned_leaves,
             &accum,
-            &super::RootStackAnalyzer::new(&llbc),
+            &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
         )
         .unwrap();
         let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
@@ -55566,7 +55603,7 @@ mod tests {
             &dont_look_inside,
             &tombstoned,
             &accum,
-            &super::RootStackAnalyzer::new(&llbc),
+            &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
         )
         .unwrap();
         let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
@@ -55608,7 +55645,7 @@ mod tests {
             &dont_look_inside,
             &tombstoned,
             &accum,
-            &super::RootStackAnalyzer::new(&llbc),
+            &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
         )
         .unwrap();
         let base = TyRef::Other(serde_json::json!({"Adt": {"id": 1, "builtin": null}}));
@@ -55739,7 +55776,7 @@ mod tests {
             &dont_look_inside,
             &cross,
             &accum_a,
-            &super::RootStackAnalyzer::new(&a),
+            &super::RootStackAnalyzer::new(&a, &super::RootStackState::new(&a)),
         )
         .unwrap();
         let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
@@ -55779,7 +55816,7 @@ mod tests {
             &dont_look_inside,
             &cross,
             &accum_b,
-            &super::RootStackAnalyzer::new(&b),
+            &super::RootStackAnalyzer::new(&b, &super::RootStackState::new(&b)),
         )
         .unwrap();
         let (owner_b, field_b, _, id_b) = lowering_b
@@ -57189,7 +57226,8 @@ mod tests {
             ),
         ];
         let llbc = llbc_with_types("pyre_object", vec![], funs);
-        let analyzer = super::RootStackAnalyzer::new(&llbc);
+        let state = super::RootStackState::new(&llbc);
+        let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
         let direct = |id: u64| -> RegularCall {
             serde_json::from_value(serde_json::json!({"kind": {"Fun": id}, "generics": null}))
                 .expect("fixture call parses")
@@ -57355,7 +57393,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({"kind": {"Fun": id}, "generics": null}))
                 .expect("fixture call parses")
         };
-        let analyzer = super::RootStackAnalyzer::new(&llbc);
+        let root_state = super::RootStackState::new(&llbc);
+        let analyzer = super::RootStackAnalyzer::new(&llbc, &root_state);
         assert!(
             analyzer.regular_call_touches_root_stack(&direct(4)),
             "inner leaves a pin for its caller"
@@ -57464,7 +57503,8 @@ mod tests {
         .expect("fixture call parses");
 
         let below = artefact("majit_rlib", false);
-        let analyzer = super::RootStackAnalyzer::new(&below);
+        let root_state = super::RootStackState::new(&below);
+        let analyzer = super::RootStackAnalyzer::new(&below, &root_state);
         assert!(
             !analyzer.regular_call_touches_root_stack(&direct),
             "an opaque local body below the API cannot reach the stack"
@@ -57475,7 +57515,8 @@ mod tests {
         );
 
         let above = artefact("pyre_object", true);
-        let analyzer = super::RootStackAnalyzer::new(&above);
+        let root_state = super::RootStackState::new(&above);
+        let analyzer = super::RootStackAnalyzer::new(&above, &root_state);
         assert!(analyzer.regular_call_touches_root_stack(&direct));
         assert!(analyzer.regular_call_touches_root_stack(&method));
     }
@@ -57653,7 +57694,8 @@ mod tests {
 
         // The bracket closes every pin `operands` makes, so its caller sees
         // no change to the root stack.
-        let analyzer = super::RootStackAnalyzer::new(&llbc);
+        let root_state = super::RootStackState::new(&llbc);
+        let analyzer = super::RootStackAnalyzer::new(&llbc, &root_state);
         let direct: RegularCall =
             serde_json::from_value(serde_json::json!({"kind": {"Fun": 4}, "generics": null}))
                 .expect("fixture call parses");
