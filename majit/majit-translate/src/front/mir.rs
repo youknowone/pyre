@@ -39652,13 +39652,21 @@ struct FmtChain {
 /// Match a `FunctionPath`'s trailing segments against `tail`, so a
 /// crate-qualified spelling (`core::fmt::Arguments::new`) and the
 /// crate-stripped front-end spelling (`fmt::Arguments::new`) both
-/// resolve.
+/// resolve.  The leaf is compared through its `__spec_` marker: a
+/// specialized copy is the same function.
 fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
     segments.len() >= tail.len()
         && segments[segments.len() - tail.len()..]
             .iter()
             .zip(tail)
-            .all(|(s, t)| s.as_str() == *t)
+            .enumerate()
+            .all(|(i, (s, t))| {
+                if i + 1 == tail.len() {
+                    crate::front::clause_spec::unspecialized_leaf(s) == *t
+                } else {
+                    s.as_str() == *t
+                }
+            })
 }
 
 /// `core::result::<Impl>::map_err` / `std::result::Result::map_err`.
@@ -43668,6 +43676,18 @@ mod tests {
             serde_json::json!({"Ref": ["Erased", {"Scalar": {"Integer": {"Signed": "I64"}}}, "Shared"]}),
         )
         .unwrap()
+    }
+
+    /// A specialized copy's leaf matches its template's tail.
+    #[test]
+    fn a_spec_leaf_matches_its_template_tail() {
+        use crate::front::mir::fmt_path_ends_with;
+        let segs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let spec = segs(&["lltype", "malloc_typed__spec_W_X_0123456789abcdef"]);
+        assert!(fmt_path_ends_with(&spec, &["lltype", "malloc_typed"]));
+        assert!(!fmt_path_ends_with(&spec, &["lltype", "malloc"]));
+        let inner = segs(&["malloc_typed__spec_X_0123456789abcdef", "new"]);
+        assert!(!fmt_path_ends_with(&inner, &["malloc_typed", "new"]));
     }
 
     /// `&i64` and `i64` are different banks. `slice::Iter<i64>`'s type

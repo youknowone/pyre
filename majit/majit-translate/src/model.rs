@@ -4146,7 +4146,8 @@ pub fn fuse_boxing_alloc(
         if segments.len() < 2 || segments[segments.len() - 2] != "lltype" {
             return None;
         }
-        match segments[segments.len() - 1].as_str() {
+        // A specialized copy is the same allocator.
+        match crate::front::clause_spec::unspecialized_leaf(&segments[segments.len() - 1]) {
             flavor @ ("malloc"
             | "malloc_typed"
             | "malloc_typed_managed"
