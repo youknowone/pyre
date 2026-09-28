@@ -16569,30 +16569,35 @@ pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::P
 /// already-int caller contract here: long values that do not fit `i64`
 /// raise `OverflowError` ("int too large to convert to int") via
 /// `intobject.py` / `longobject.py` `_int_w`.
-fn _check_len_result(mut w_int: PyObjectRef) -> Result<i64, crate::PyError> {
+fn _check_len_result(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
+    // `w_int` is read back from its slot after each call that can collect.
+    // One bracket over the whole body keeps its close off the path between
+    // `int_w` and the `match` on its result.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(&[w_int]);
     // `lt(w_int, 0)` — a negative length (including a negative bignum) raises
     // ValueError, checked before the machine-word fit so it wins over the
     // OverflowError. `w_int` is already the `space.index` result, so this is a
     // plain int comparison.
-    let w_lt = pyre_object::with_roots!(w_int => crate::objspace::descroperation::compare(
-        w_int,
-        pyre_object::w_int_new(0),
+    let w_zero = pyre_object::w_int_new(0);
+    let w_lt = crate::objspace::descroperation::compare(
+        _roots.get(base),
+        w_zero,
         crate::objspace::descroperation::CompareOp::Lt,
-    ))?;
-    let negative = pyre_object::with_roots!(w_int => is_true(w_lt))?;
-    if negative {
+    )?;
+    if is_true(w_lt)? {
         return Err(crate::PyError::value_error("__len__() should return >= 0"));
     }
     // `getindex_w(w_int, w_OverflowError)` — a length that does not fit a
     // machine word reports the source type, `oefmt("cannot fit '%T' into an
     // index-sized integer", w_obj)`, not the coerced int.
-    match pyre_object::with_roots!(w_int => int_w(w_int)) {
+    match int_w(_roots.get(base)) {
         Ok(n) => Ok(n),
         Err(e) if e.kind == PyErrorKind::OverflowError => Err(PyError::new(
             PyErrorKind::OverflowError,
             format!(
                 "cannot fit '{}' into an index-sized integer",
-                object_functionstr_type_name(w_int)
+                object_functionstr_type_name(_roots.get(base))
             ),
         )),
         Err(e) => Err(e),
