@@ -145,6 +145,18 @@ pub struct OptRewrite {
     pending_loopinvariant_key: Option<i64>,
 }
 
+/// The loop `rewrite.py` runs over an `intdiv` result: send each operation
+/// from the head of the pass chain and take the last one, which computes the
+/// value.
+fn send_extra_operations(ctx: &mut OptContext, operations: Vec<majit_ir::OpRc>) -> Operand {
+    let mut newop = None;
+    for operation in operations {
+        ctx.send_extra_operation_rc(operation.clone());
+        newop = Some(operation);
+    }
+    Operand::from_bound_op(&newop.expect("intdiv returns at least two operations"))
+}
+
 impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
@@ -274,15 +286,11 @@ impl OptRewrite {
             if divisor >= 3 && ctx.supports_efficient_uint_mul_high {
                 // rewrite.py:770 `known_nonneg = b1.known_nonnegative()`:
                 // a non-negative dividend skips the sign-correction ops.
-                let result = intdiv::division_operations(
-                    arg0.to_opref(),
-                    divisor,
-                    known_nonneg,
-                    ctx.current_pass_idx,
+                let b_res = send_extra_operations(
                     ctx,
+                    intdiv::division_operations(&arg0, divisor, known_nonneg),
                 );
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_res = ctx.get_box_replacement_operand(result);
                 ctx.make_equal_to(&b_old, &b_res);
                 return OptimizationResult::Remove;
             }
@@ -375,15 +383,9 @@ impl OptRewrite {
             && known_nonneg
             && ctx.supports_efficient_uint_mul_high
         {
-            let result = intdiv::modulo_operations(
-                arg0.to_opref(),
-                divisor,
-                known_nonneg,
-                ctx.current_pass_idx,
-                ctx,
-            );
+            let b_res =
+                send_extra_operations(ctx, intdiv::modulo_operations(&arg0, divisor, known_nonneg));
             let b_old = Operand::from_bound_op(op_rc);
-            let b_res = ctx.get_box_replacement_operand(result);
             ctx.make_equal_to(&b_old, &b_res);
             return OptimizationResult::Remove;
         }
@@ -1166,15 +1168,8 @@ impl OptRewrite {
         // rewrite.py:797-805: intdiv.modulo_operations fallback, which emits
         // UINT_MUL_HIGH unconditionally.  The residual call always goes away.
         let known_nonneg = b1.known_nonnegative();
-        let result_ref = crate::optimizeopt::intdiv::modulo_operations(
-            arg1.to_opref(),
-            val,
-            known_nonneg,
-            ctx.current_pass_idx,
-            ctx,
-        );
+        let b_res = send_extra_operations(ctx, intdiv::modulo_operations(&arg1, val, known_nonneg));
         let b_old = Operand::from_bound_op(op_rc);
-        let b_res = ctx.get_box_replacement_operand(result_ref);
         ctx.make_equal_to(&b_old, &b_res);
         ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)
@@ -1270,15 +1265,9 @@ impl OptRewrite {
         // rewrite.py:758-766: intdiv.division_operations fallback, which emits
         // UINT_MUL_HIGH unconditionally.  The residual call always goes away.
         let known_nonneg = b1.known_nonnegative();
-        let result_ref = crate::optimizeopt::intdiv::division_operations(
-            arg1.to_opref(),
-            val,
-            known_nonneg,
-            ctx.current_pass_idx,
-            ctx,
-        );
+        let b_res =
+            send_extra_operations(ctx, intdiv::division_operations(&arg1, val, known_nonneg));
         let b_old = Operand::from_bound_op(op_rc);
-        let b_res = ctx.get_box_replacement_operand(result_ref);
         ctx.make_equal_to(&b_old, &b_res);
         ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)

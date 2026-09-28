@@ -4,9 +4,8 @@
 ///
 /// Replaces signed integer division by a constant with a sequence of
 /// UINT_MUL_HIGH + shift operations, avoiding the expensive `idiv` instruction.
-use majit_ir::{Op, OpCode, OpRef};
-
-use crate::optimizeopt::OptContext;
+use majit_ir::operand::Operand;
+use majit_ir::{Const, Op, OpCode, OpRc};
 
 /// Compute magic numbers for division by constant `m`.
 ///
@@ -58,25 +57,17 @@ fn full_mul_u64(a: u64, b: u64) -> (u64, u64) {
     (result as u64, (result >> 64) as u64)
 }
 
-/// RPython intdiv.py: emit an op through the pass chain.
-///
-/// In RPython, intdiv returns a list of ops and the caller sends each
-/// through `send_extra_operation()`. In majit, we use `emit_extra()`
-/// to route through downstream passes, matching the upstream semantics.
-fn emit_op(ctx: &mut OptContext, pass_idx: usize, op: Op) -> OpRef {
-    ctx.emit_extra(pass_idx, op)
+fn const_int(value: i64) -> Operand {
+    Operand::const_(Const::Int(value))
 }
 
-/// Generate division operations: `n // m` using multiply-and-shift.
-///
-/// `pass_idx`: caller's pass index, so synthesized ops route through
-/// downstream passes via `emit_extra` (matching RPython's
-/// `send_extra_operation`).
+/// intdiv.py `division_operations`: the operations computing `n // m`,
+/// not yet sent, the result last.
 ///
 /// Algorithm:
 /// ```text
 ///   t = n >> 63            (sign bits: 0 or -1)
-///   nt = n ^ t             (absolute value - 1 if negative)
+///   nt = n ^ t             (conditional negate: n if n >= 0, ~n if n < 0)
 ///   mul = UINT_MUL_HIGH(nt, k)
 ///   sh = UINT_RSHIFT(mul, i)
 ///   result = sh ^ t        (negate back if needed)
@@ -87,126 +78,69 @@ fn emit_op(ctx: &mut OptContext, pass_idx: usize, op: Op) -> OpRef {
 ///   mul = UINT_MUL_HIGH(n, k)
 ///   result = UINT_RSHIFT(mul, i)
 /// ```
-pub fn division_operations(
-    n_ref: OpRef,
-    m: i64,
-    known_nonneg: bool,
-    pass_idx: usize,
-    ctx: &mut OptContext,
-) -> OpRef {
-    let (k, i) = magic_numbers(m);
+pub fn division_operations(n_box: &Operand, m: i64, known_nonneg: bool) -> Vec<OpRc> {
+    let (kk, ii) = magic_numbers(m);
 
-    let k_ref = ctx.make_constant_int(k as i64);
-    let i_ref = ctx.make_constant_int(i as i64);
-
-    if !known_nonneg {
-        // t = n >> 63
-        let shift63_ref = ctx.make_constant_int(63);
-        let arg_n = ctx.materialize_operand_at(n_ref);
-        let arg_shift63 = ctx.materialize_operand_at(shift63_ref);
-        let t_ref = emit_op(
-            ctx,
-            pass_idx,
-            Op::new(OpCode::IntRshift, &[arg_n.clone(), arg_shift63.clone()]),
-        );
-
-        // nt = n ^ t
-        let arg_n = ctx.materialize_operand_at(n_ref);
-        let arg_t = ctx.materialize_operand_at(t_ref);
-        let nt_ref = emit_op(
-            ctx,
-            pass_idx,
-            Op::new(OpCode::IntXor, &[arg_n.clone(), arg_t.clone()]),
-        );
-
-        // mul = UINT_MUL_HIGH(nt, k)
-        let arg_nt = ctx.materialize_operand_at(nt_ref);
-        let arg_k = ctx.materialize_operand_at(k_ref);
-        let mul_ref = emit_op(
-            ctx,
-            pass_idx,
-            Op::new(OpCode::UintMulHigh, &[arg_nt.clone(), arg_k.clone()]),
-        );
-
-        // sh = UINT_RSHIFT(mul, i)
-        let arg_mul = ctx.materialize_operand_at(mul_ref);
-        let arg_i = ctx.materialize_operand_at(i_ref);
-        let sh_ref = emit_op(
-            ctx,
-            pass_idx,
-            Op::new(OpCode::UintRshift, &[arg_mul.clone(), arg_i.clone()]),
-        );
-
-        // result = sh ^ t
-        let arg_sh = ctx.materialize_operand_at(sh_ref);
-        let arg_t = ctx.materialize_operand_at(t_ref);
-        emit_op(
-            ctx,
-            pass_idx,
-            Op::new(OpCode::IntXor, &[arg_sh.clone(), arg_t.clone()]),
-        )
-    } else {
-        // mul = UINT_MUL_HIGH(n, k)
-        let arg_n = ctx.materialize_operand_at(n_ref);
-        let arg_k = ctx.materialize_operand_at(k_ref);
-        let mul_ref = emit_op(
-            ctx,
-            pass_idx,
-            Op::new(OpCode::UintMulHigh, &[arg_n.clone(), arg_k.clone()]),
-        );
-
-        // result = UINT_RSHIFT(mul, i)
-        let arg_mul = ctx.materialize_operand_at(mul_ref);
-        let arg_i = ctx.materialize_operand_at(i_ref);
-        emit_op(
-            ctx,
-            pass_idx,
-            Op::new(OpCode::UintRshift, &[arg_mul.clone(), arg_i.clone()]),
-        )
+    let sign = (!known_nonneg).then(|| {
+        let t_box = OpRc::new(Op::new(
+            OpCode::IntRshift,
+            &[n_box.clone(), const_int(i64::from(i64::BITS - 1))],
+        ));
+        let nt_box = OpRc::new(Op::new(
+            OpCode::IntXor,
+            &[n_box.clone(), Operand::from_bound_op(&t_box)],
+        ));
+        (t_box, nt_box)
+    });
+    let nt = match &sign {
+        Some((_, nt_box)) => Operand::from_bound_op(nt_box),
+        None => n_box.clone(),
+    };
+    let mul_box = OpRc::new(Op::new(OpCode::UintMulHigh, &[nt, const_int(kk as i64)]));
+    let sh_box = OpRc::new(Op::new(
+        OpCode::UintRshift,
+        &[Operand::from_bound_op(&mul_box), const_int(i64::from(ii))],
+    ));
+    match sign {
+        Some((t_box, nt_box)) => {
+            let final_box = OpRc::new(Op::new(
+                OpCode::IntXor,
+                &[
+                    Operand::from_bound_op(&sh_box),
+                    Operand::from_bound_op(&t_box),
+                ],
+            ));
+            vec![t_box, nt_box, mul_box, sh_box, final_box]
+        }
+        None => vec![mul_box, sh_box],
     }
 }
 
-/// Generate modulo operations: `n % m` using division + multiply + subtract.
-///
-/// Computes: `n - (n // m) * m`.
-pub fn modulo_operations(
-    n_ref: OpRef,
-    m: i64,
-    known_nonneg: bool,
-    pass_idx: usize,
-    ctx: &mut OptContext,
-) -> OpRef {
-    let div_ref = division_operations(n_ref, m, known_nonneg, pass_idx, ctx);
-
-    // product = div_result * m
-    let m_ref = ctx.make_constant_int(m);
-    let arg_div = ctx.materialize_operand_at(div_ref);
-    let arg_m = ctx.materialize_operand_at(m_ref);
-    let product_ref = emit_op(
-        ctx,
-        pass_idx,
-        Op::new(OpCode::IntMul, &[arg_div.clone(), arg_m.clone()]),
-    );
-
-    // remainder = n - product
-    let arg_n = ctx.materialize_operand_at(n_ref);
-    let arg_product = ctx.materialize_operand_at(product_ref);
-    emit_op(
-        ctx,
-        pass_idx,
-        Op::new(OpCode::IntSub, &[arg_n.clone(), arg_product.clone()]),
-    )
+/// intdiv.py `modulo_operations`: the operations computing
+/// `n - (n // m) * m`, not yet sent, the result last.
+pub fn modulo_operations(n_box: &Operand, m: i64, known_nonneg: bool) -> Vec<OpRc> {
+    let mut operations = division_operations(n_box, m, known_nonneg);
+    let quotient = Operand::from_bound_op(operations.last().expect("a division emits operations"));
+    let mul_box = OpRc::new(Op::new(OpCode::IntMul, &[quotient, const_int(m)]));
+    let diff_box = OpRc::new(Op::new(
+        OpCode::IntSub,
+        &[n_box.clone(), Operand::from_bound_op(&mul_box)],
+    ));
+    operations.push(mul_box);
+    operations.push(diff_box);
+    operations
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimizeopt::OptContext;
 
-    fn drain_extra_ops(ctx: &mut OptContext) {
-        while let Some((_, op)) = ctx.extra_operations_after.pop_front() {
-            ctx.push_new_operation(op);
-        }
+    fn input() -> Operand {
+        Operand::from_bound_op(&OpRc::new(Op::new(OpCode::SameAsI, &[])))
+    }
+
+    fn opcodes(operations: &[OpRc]) -> Vec<OpCode> {
+        operations.iter().map(|op| op.opcode).collect()
     }
 
     // ── magic_numbers tests ──
@@ -293,92 +227,66 @@ mod tests {
 
     #[test]
     fn test_division_ops_emits_correct_sequence() {
-        let mut ctx = OptContext::new(16);
-        // op0 = input variable n
-        let n_op = Op::new(OpCode::SameAsI, &[]);
-        let n_ref = ctx.emit(n_op);
-
-        let result_ref = division_operations(n_ref, 7, false, 0, &mut ctx);
-        drain_extra_ops(&mut ctx);
-
-        // Constants live in the constant table, not new_operations.
-        // The helper emits five queued operations after the input.
-        assert_eq!(ctx.new_operations.len(), 6); // 1 input + 5 queued ops
-
-        // Check the final op is IntXor (sign correction)
-        let final_op = &ctx.new_operations[result_ref.raw() as usize];
-        assert_eq!(final_op.opcode, OpCode::IntXor);
-
-        // Verify UintMulHigh is present
-        let has_mul_high = ctx
-            .new_operations
-            .iter()
-            .any(|op| op.opcode == OpCode::UintMulHigh);
-        assert!(has_mul_high, "should contain UintMulHigh");
-
-        // Verify UintRshift is present
-        let has_rshift = ctx
-            .new_operations
-            .iter()
-            .any(|op| op.opcode == OpCode::UintRshift);
-        assert!(has_rshift, "should contain UintRshift");
+        let n = input();
+        let operations = division_operations(&n, 7, false);
+        assert_eq!(
+            opcodes(&operations),
+            [
+                OpCode::IntRshift,
+                OpCode::IntXor,
+                OpCode::UintMulHigh,
+                OpCode::UintRshift,
+                OpCode::IntXor,
+            ]
+        );
+        // The sign word feeds the negate and the final correction.
+        let t = Operand::from_bound_op(&operations[0]);
+        assert!(operations[1].arg(1).same_box(&t));
+        assert!(operations[4].arg(1).same_box(&t));
+        assert!(operations[0].arg(0).same_box(&n));
     }
 
     #[test]
     fn test_division_ops_known_nonneg() {
-        let mut ctx = OptContext::new(8);
-        let n_op = Op::new(OpCode::SameAsI, &[]);
-        let n_ref = ctx.emit(n_op);
-
-        let result_ref = division_operations(n_ref, 7, true, 0, &mut ctx);
-        drain_extra_ops(&mut ctx);
-
-        // known_nonneg emits two queued operations after the input.
-        assert_eq!(ctx.new_operations.len(), 3); // 1 input + 2 queued ops
-
-        let final_op = &ctx.new_operations[result_ref.raw() as usize];
-        assert_eq!(final_op.opcode, OpCode::UintRshift);
+        let n = input();
+        let operations = division_operations(&n, 7, true);
+        assert_eq!(
+            opcodes(&operations),
+            [OpCode::UintMulHigh, OpCode::UintRshift]
+        );
+        assert!(operations[0].arg(0).same_box(&n));
     }
 
     // ── modulo_operations tests ──
 
     #[test]
     fn test_modulo_ops_emits_correct_sequence() {
-        let mut ctx = OptContext::new(16);
-        let n_op = Op::new(OpCode::SameAsI, &[]);
-        let n_ref = ctx.emit(n_op);
-
-        let result_ref = modulo_operations(n_ref, 7, false, 0, &mut ctx);
-        drain_extra_ops(&mut ctx);
-
-        // Five queued division ops + IntMul + IntSub after the input.
-        assert_eq!(ctx.new_operations.len(), 8); // 1 input + 7 queued ops
-
-        let final_op = &ctx.new_operations[result_ref.raw() as usize];
-        assert_eq!(final_op.opcode, OpCode::IntSub);
-
-        // Verify IntMul is present (div_result * m)
-        let has_mul = ctx
-            .new_operations
-            .iter()
-            .any(|op| op.opcode == OpCode::IntMul);
-        assert!(has_mul, "should contain IntMul for div*m");
+        let n = input();
+        let operations = modulo_operations(&n, 7, false);
+        assert_eq!(operations.len(), 7);
+        assert_eq!(operations[5].opcode, OpCode::IntMul);
+        assert_eq!(operations[6].opcode, OpCode::IntSub);
+        assert!(
+            operations[5]
+                .arg(0)
+                .same_box(&Operand::from_bound_op(&operations[4]))
+        );
+        assert!(operations[6].arg(0).same_box(&n));
     }
 
     #[test]
     fn test_modulo_ops_known_nonneg() {
-        let mut ctx = OptContext::new(12);
-        let n_op = Op::new(OpCode::SameAsI, &[]);
-        let n_ref = ctx.emit(n_op);
-
-        let result_ref = modulo_operations(n_ref, 7, true, 0, &mut ctx);
-        drain_extra_ops(&mut ctx);
-
-        // Two queued division ops + IntMul + IntSub after the input.
-        assert_eq!(ctx.new_operations.len(), 5); // 1 input + 4 queued ops
-
-        let final_op = &ctx.new_operations[result_ref.raw() as usize];
-        assert_eq!(final_op.opcode, OpCode::IntSub);
+        let n = input();
+        let operations = modulo_operations(&n, 7, true);
+        assert_eq!(
+            opcodes(&operations),
+            [
+                OpCode::UintMulHigh,
+                OpCode::UintRshift,
+                OpCode::IntMul,
+                OpCode::IntSub,
+            ]
+        );
     }
 
     // ── Edge cases ──

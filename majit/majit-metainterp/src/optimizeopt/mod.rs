@@ -3868,6 +3868,17 @@ impl OptContext {
         }
     }
 
+    /// `send_extra_operation` when the caller already holds the ResOperation
+    /// object (`rewrite.py` sending each operation `intdiv` built). Queue
+    /// that `OpRc` so a box built on an earlier one stays bound to it.
+    pub fn send_extra_operation_rc(&mut self, op: majit_ir::OpRc) -> OpRef {
+        if self.in_final_emission {
+            self.emit_rc(op)
+        } else {
+            self.emit_extra_at(0, op)
+        }
+    }
+
     pub fn initialize_imported_short_preamble_builder(
         &mut self,
         label_args: &[OpRef],
