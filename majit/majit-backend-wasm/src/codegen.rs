@@ -765,6 +765,20 @@ struct PeepSink<'sink, 'buf> {
     /// `i64::MIN` means the next push must store.
     gcmap_known: i64,
     gcmap_ctrl: Vec<GcmapCtrl>,
+    /// `gc_ll_descr.write_barrier_descr` as `_reload_frame_if_necessary`
+    /// reads it; `None` when the module has no collector barrier or no
+    /// collecting site.
+    frame_wb: Option<FrameWriteBarrier>,
+}
+
+/// The jitframe barrier operands: `wasm_jit_write_barrier`, its
+/// `(i64) -> i64` residual type, and the flag byte it tests.
+#[derive(Clone, Copy)]
+struct FrameWriteBarrier {
+    fn_ptr: i64,
+    type_idx: u32,
+    flag_byteofs: i32,
+    if_flag: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -821,6 +835,7 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
             gcmap_frame_local: 0,
             gcmap_known: i64::MIN,
             gcmap_ctrl: Vec::new(),
+            frame_wb: None,
         }
     }
 
@@ -2662,27 +2677,18 @@ fn emit_write_barrier(
     Ok(())
 }
 
-/// Publish Ref-home writes made since the preceding safepoint.  A live old
-/// JitFrame is scanned directly while it is on the shadow stack, but after a
-/// minor collection its remembered-state flag must be re-established before a
-/// later home store can survive the next collection.
-fn emit_jitframe_write_barrier(
-    sink: &mut PeepSink<'_, '_>,
-    residual_type_base: Option<u32>,
-    wb: &WriteBarrierHelpers,
-    gcmap_ptr: i64,
-    ca_reload_fn_ptr: i64,
-    jf_top_addr: Option<u32>,
-) -> Result<(), BackendError> {
-    let Some(base) = residual_type_base else {
-        return Err(BackendError::Unsupported(
-            "wasm codegen: jitframe write barrier has no residual call type".into(),
-        ));
+/// assembler.py `_reload_frame_if_necessary` tail:
+/// `_write_barrier_fastpath(mc, wbdescr, [ebp], array=False, is_frame=True)`.
+/// Local 0 was just reloaded; a frame the collection promoted has
+/// TRACK_YOUNG_PTRS set and joins the remembered set before the home stores
+/// that follow. Frames never use card marking. The helper cannot collect
+/// (`_build_wb_slowpath(for_frame=True)`), so no gcmap is pushed and the
+/// frame is not reloaded again. Off-GC frames reserve a zeroed header too
+/// (`alloc_off_gc_jitframe`), so their flag-byte read is valid.
+fn emit_frame_write_barrier(sink: &mut PeepSink<'_, '_>) {
+    let Some(wb) = sink.frame_wb else {
+        return;
     };
-    // aarch64/assembler.py _reload_frame_if_necessary invokes
-    // _write_barrier_fastpath(is_frame=True): frames never use card marking.
-    // Off-GC frames reserve a zeroed header too (alloc_off_gc_jitframe), so
-    // their flag-byte read is valid and does not enter the guarded helper.
     sink.local_get(0);
     sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_sub();
@@ -2696,16 +2702,10 @@ fn emit_jitframe_write_barrier(
     sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_sub();
     sink.i64_extend_i32_u();
-    emit_push_gcmap(sink, gcmap_ptr);
     sink.i32_const(wb.fn_ptr as i32);
-    sink.call_indirect(0, base + 1);
+    sink.call_indirect(0, wb.type_idx);
     sink.drop();
-    if gcmap_ptr != 0 {
-        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
-        emit_pop_gcmap(sink);
-    }
     sink.end();
-    Ok(())
 }
 
 /// Date a use at `at` unless it is an owner-defined value leaking into an
@@ -2944,7 +2944,7 @@ fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize
 /// before `CALL(realloc_frame)`). Zero means this entry has no Ref input.
 fn emit_check_frame_depth(
     sink: &mut PeepSink<'_, '_>,
-    frame: FrameGeometry,
+    depth_items: usize,
     realloc_fn_ptr: i64,
     residual_type_base: u32,
     gcmap_ptr: i64,
@@ -2958,7 +2958,7 @@ fn emit_check_frame_depth(
     sink.i32_const(len_size);
     sink.i32_sub();
     sink.i32_load(mem32(0));
-    sink.i32_const(frame.signed_item_count() as i32);
+    sink.i32_const(depth_items as i32);
     sink.i32_lt_u();
     sink.if_(BlockType::Empty);
     // IncreaseStackSlowPath.generate_body: push_gcmap(store=True) before
@@ -2973,7 +2973,7 @@ fn emit_check_frame_depth(
     }
     sink.local_get(0);
     sink.i64_extend_i32_u();
-    sink.i64_const(frame.signed_item_count() as i64);
+    sink.i64_const(depth_items as i64);
     sink.i32_const(realloc_fn_ptr as i32);
     sink.call_indirect(0, residual_type_base + 2);
     sink.i32_wrap_i64();
@@ -3034,12 +3034,14 @@ fn emit_reload_frame_if_necessary(
         // this does not need the residual direct-call type to be declared.
         emit_ca_reload_top(sink, top_addr);
         sink.local_set(0);
+        emit_frame_write_barrier(sink);
     } else if let Some(base) = residual_type_base.filter(|_| ca_reload_fn_ptr != 0) {
         sink.i32_const(ca_reload_fn_ptr as i32);
         sink.call_indirect(0, base);
         sink.i32_wrap_i64();
         sink.local_set(0);
         sink.sync_gcmap_frame();
+        emit_frame_write_barrier(sink);
     } else {
         // No shadow top and no reload helper: no active GC, or an embedder
         // that never pushed a JitFrame. Reloading from a shadow stack that
@@ -3060,6 +3062,7 @@ fn emit_reload_ca_frame_if_necessary(
         debug_assert!(residual_type_base.is_some());
         emit_ca_reload_top(sink, inline.jf_top_addr);
         sink.local_set(0);
+        emit_frame_write_barrier(sink);
     } else {
         emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, None);
     }
@@ -4277,6 +4280,16 @@ pub struct CaParams {
     /// `_check_frame_depth` so a frame that already fits stays byte-identical.
     /// `(i64 items, i64 depth) -> i64` at residual type base + 2.
     pub realloc_fn_ptr: i64,
+    /// Signed item count `_check_frame_depth` compares against. Zero uses
+    /// [`FrameGeometry::signed_item_count`] of this module. `assemble_bridge`
+    /// passes `max(frame_depth, jump target jfi_frame_depth)` without changing
+    /// this module's spill or home offsets.
+    pub frame_depth_items: usize,
+    /// Geometry of this module's cross-module JUMP target. `None` stores at
+    /// this module's own offsets. An inlined region carries the same geometry
+    /// on [`ExternalJump`] instead, because the owner's params describe the
+    /// owner loop.
+    pub external_jump_frame: Option<FrameGeometry>,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -4371,6 +4384,8 @@ fn nursery_header_tid_store(
 
 /// `CALL_MALLOC_NURSERY_VARSIZE` slow arm: the arity-5 array helper
 /// (`wasm_jit_alloc_array(type_id, base_size, item_size, length, len_offset)`).
+/// x86 `MallocCondVarsizeSlowPath.generate_body` `push_gcmap`s before the
+/// call; the caller's `emit_reload_refs_from_homes` pops it.
 fn emit_alloc_array_helper(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -4382,6 +4397,8 @@ fn emit_alloc_array_helper(
     len_offset: i64,
     new_array_fn_ptr: i64,
     residual_type_base: u32,
+    site_gcmap: &[i64],
+    op_idx: usize,
 ) {
     sink.i64_const(type_id);
     sink.i64_const(base_size);
@@ -4389,6 +4406,7 @@ fn emit_alloc_array_helper(
     emit_resolve(sink, constants, value_types, length);
     sink.i64_const(len_offset);
     sink.i32_const(new_array_fn_ptr as i32);
+    emit_push_site(sink, site_gcmap, op_idx);
     sink.call_indirect(0, residual_type_base + 5);
 }
 
@@ -4643,6 +4661,9 @@ pub struct ExternalJump {
     /// Resume-at-LABEL dispatch key: `target label ordinal + 1`, or `0` when
     /// the target is not peeled.
     pub key: u32,
+    /// Target loop's frame. Spill and dispatch-key stores use these offsets
+    /// (`remap_frame_layout`); the narrow shim reloads the same words.
+    pub frame: FrameGeometry,
 }
 
 pub struct InlinedBridge {
@@ -4920,6 +4941,16 @@ fn rebase_region_value_ids(
 pub fn build_wasm_module(
     inputs: &ModuleBuildInputs,
 ) -> Result<BuildWasmModuleOutput, BackendError> {
+    build_wasm_module_reporting_shortage(inputs, &mut None)
+}
+
+/// [`build_wasm_module`], also naming the frame layout shortage when the build
+/// declines because `inputs.frame` is too small. A caller that may grow the
+/// frame (`_check_frame_depth`) extends it by that shortage and builds again.
+pub(crate) fn build_wasm_module_reporting_shortage(
+    inputs: &ModuleBuildInputs,
+    shortage_out: &mut Option<super::FrameShortage>,
+) -> Result<BuildWasmModuleOutput, BackendError> {
     let ModuleBuildInputs {
         inputargs,
         ops,
@@ -5135,19 +5166,11 @@ pub fn build_wasm_module(
         } else {
             0
         };
+        // `adr_jump_offset` is stamped by the caller once the module is
+        // accepted (`patch_pending_failure_recoveries`). A build that is
+        // declined after this point drops the cell array, so a stamp written
+        // here would leave the descr naming freed memory for the next compile.
         g.bridge_cell = addr;
-        if addr != 0 && preexisting.is_none() {
-            if let Some(meta) = g.meta_descr.as_ref() {
-                if let Some(fd) = meta.as_fail_descr() {
-                    if !fd.is_finish() {
-                        let stamp = std::panic::AssertUnwindSafe(|| {
-                            fd.set_adr_jump_offset(addr as usize);
-                        });
-                        let _ = std::panic::catch_unwind(stamp);
-                    }
-                }
-            }
-        }
     }
     let cell_addrs: Vec<u32> = guards.iter().map(|g| g.bridge_cell).collect();
 
@@ -5204,6 +5227,7 @@ pub fn build_wasm_module(
         if !inlined_bridges.is_empty() {
             super::record_inline_geometry(shortage.kind, shortage.needed, shortage.available);
         }
+        *shortage_out = Some(shortage);
         return Err(BackendError::Unsupported(format!(
             "wasm backend: {} frame value slots exceed frozen frame layout ({})",
             shortage.needed, shortage.available,
@@ -5311,6 +5335,7 @@ pub fn build_wasm_module(
         if !inlined_bridges.is_empty() {
             super::record_inline_geometry(shortage.kind, shortage.needed, shortage.available);
         }
+        *shortage_out = Some(shortage);
         let reason = match shortage.kind {
             super::FrameShortageKind::OrdinaryRefHomes => format!(
                 "wasm backend: {} ordinary ref homes exceed frozen frame layout ({})",
@@ -5364,14 +5389,9 @@ pub fn build_wasm_module(
                     .map(|_| 1),
             )
             .max();
-        // `emit_jitframe_write_barrier` is a generated one-argument helper,
-        // not a trace operation visible to the ordinary residual census.
-        let scanned = if num_ref_homes != 0
-            && analysis_ops
-                .iter()
-                .any(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2))
-            && analysis_ops.iter().any(|op| op.opcode.can_malloc())
-        {
+        // `emit_frame_write_barrier` after each frame reload calls the
+        // one-argument `wasm_jit_write_barrier`, which no trace operation names.
+        let scanned = if wb.fn_ptr != 0 && analysis_ops.iter().any(collecting_site) {
             Some(scanned.map_or(1, |arity| arity.max(1)))
         } else {
             scanned
@@ -5393,7 +5413,9 @@ pub fn build_wasm_module(
     };
     // `_check_frame_depth` calls `wasm_realloc_frame(items, depth) -> items`,
     // the same `(i64, i64) -> i64` family as residual arity 2.
-    let emit_frame_realloc = frame.has_tail() && ca.realloc_fn_ptr != 0;
+    // `_check_frame_depth` runs when the bridge must grow the live frame,
+    // including a compact bridge whose jump target is deeper (`assemble_bridge`).
+    let emit_frame_realloc = ca.realloc_fn_ptr != 0;
     let residual_max_arity = if emit_frame_realloc {
         Some(residual_max_arity.unwrap_or(0).max(2))
     } else {
@@ -6057,6 +6079,11 @@ fn build_function(
     let gcmap_frame_local = ca
         .compute_home_gcmap
         .then_some(resume_key_local + u32::from(resume_dispatch));
+    // One i32 for the `_check_frame_depth` result. That pointer must not
+    // reuse `bridge_slot_local`; the epilogue loads a table index through
+    // it, and a frame address is out of range.
+    let realloc_result_local =
+        resume_key_local + u32::from(resume_dispatch) + u32::from(gcmap_frame_local.is_some());
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
@@ -6134,7 +6161,9 @@ fn build_function(
             + extra_alloc_i32
             + u32::from(trace_entry_needs_key_local)
             + u32::from(resume_dispatch)
-            + u32::from(gcmap_frame_local.is_some()),
+            + u32::from(gcmap_frame_local.is_some())
+            // `_check_frame_depth` result; see `realloc_result_local`.
+            + 1,
         ValType::I32,
     ));
     let mut func = Function::new(locals);
@@ -6143,22 +6172,37 @@ fn build_function(
     if let Some(frame_local) = gcmap_frame_local {
         sink.gcmap_frame_local = frame_local;
     }
+    if wb.fn_ptr != 0
+        && ops.iter().any(collecting_site)
+        && let Some(base) = residual_type_base
+    {
+        sink.frame_wb = Some(FrameWriteBarrier {
+            fn_ptr: wb.fn_ptr,
+            type_idx: base + 1,
+            flag_byteofs: wb.flag_byteofs,
+            if_flag: wb.if_flag,
+        });
+    }
 
     // assembler.py `_check_frame_depth` at bridge / entry-bridge entry.
     // The depth is a constant of this module; the running length is the
     // JitFrame `jf_frame` length word immediately before local 0.
-    if frame.has_tail()
-        && ca.realloc_fn_ptr != 0
+    if ca.realloc_fn_ptr != 0
         && let Some(base) = residual_type_base
     {
         let gcmap_ptr = realloc_entry_gcmap(frame, entry_inputargs, ca.gcmap_sink);
+        let depth_items = if ca.frame_depth_items != 0 {
+            ca.frame_depth_items
+        } else {
+            frame.signed_item_count()
+        };
         emit_check_frame_depth(
             &mut sink,
-            frame,
+            depth_items,
             ca.realloc_fn_ptr,
             base,
             gcmap_ptr,
-            bridge_slot_local,
+            realloc_result_local,
             ca.ca_reload_fn_ptr,
             ca.jf_top_addr,
             ca.attached.propagate_exception_descr,
@@ -6363,9 +6407,6 @@ fn build_function(
     let mut fused_guard_at: Option<usize> = None;
     let mut fused_condcall_at: Option<usize> = None;
     let mut skip_nursery_tid_store_at: Option<usize> = None;
-    let frame_can_escape = ops
-        .iter()
-        .any(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2));
     // `_finish_gcmap` is retained only for GUARD_NOT_FORCED_2
     // (`store_force_descr` / `genop_finish`). A leftover `jf_force_descr`
     // from the GUARD_NOT_FORCED that follows CALL_ASSEMBLER is not that map.
@@ -6407,16 +6448,6 @@ fn build_function(
         if skip_nursery_tid_store_at == Some(op_idx) {
             skip_nursery_tid_store_at = None;
             continue;
-        }
-        if frame_can_escape && ref_homes.len() != 0 && op.opcode.can_malloc() {
-            emit_jitframe_write_barrier(
-                &mut sink,
-                residual_type_base,
-                wb,
-                site_gcmap.get(op_idx).copied().unwrap_or(0),
-                ca.ca_reload_fn_ptr,
-                ca.jf_top_addr,
-            )?;
         }
         if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
             // End of the segment before label j (key-0 / earlier-label path).
@@ -6631,23 +6662,29 @@ fn build_function(
         }
         // The whole-function target is the one a label-less bridge module
         // carries; a region brings its own.
-        let jump_external: Option<(u32, u32, Option<(u32, u32)>)> = if op.opcode == OpCode::Jump {
-            match external_jump_by_op.get(op_idx).copied().flatten() {
-                Some(ext) => Some((ext.slot, ext.key, None)),
-                None if !has_loop => {
-                    Some((external_jump_slot, external_jump_key, external_jump_wide))
+        let jump_external: Option<(u32, u32, Option<(u32, u32)>, FrameGeometry)> =
+            if op.opcode == OpCode::Jump {
+                match external_jump_by_op.get(op_idx).copied().flatten() {
+                    Some(ext) => Some((ext.slot, ext.key, None, ext.frame)),
+                    None if !has_loop => Some((
+                        external_jump_slot,
+                        external_jump_key,
+                        external_jump_wide,
+                        ca.external_jump_frame.unwrap_or(frame),
+                    )),
+                    None => None,
                 }
-                None => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         match op.opcode {
             OpCode::Label => {}
 
             OpCode::Jump if jump_external.is_some() => {
-                let (external_jump_slot, external_jump_key, external_jump_wide) = jump_external
-                    .expect("the arm guard just established this JUMP has a cross-module target");
+                let (external_jump_slot, external_jump_key, external_jump_wide, jump_frame) =
+                    jump_external.expect(
+                        "the arm guard just established this JUMP has a cross-module target",
+                    );
                 // A JUMP in a trace with no local LABEL closes back into a
                 // *separate* loop module (a loop-closing bridge). There is no
                 // enclosing `loop` to `br` to, so hand the jump args — the
@@ -6680,7 +6717,8 @@ fn build_function(
                 let store_dispatch_key = |sink: &mut PeepSink<'_, '_>| {
                     sink.local_get(0); // frame_ptr
                     sink.i64_const(external_jump_key as i64); // dispatch key
-                    sink.i64_store(mem64(frame.dispatch_key_ofs));
+                    // Target's `br_table` loads its own `dispatch_key_ofs`.
+                    sink.i64_store(mem64(jump_frame.dispatch_key_ofs));
                 };
                 if let Some((wide_slot, wide_type_idx)) = external_jump_wide
                     .filter(|_| jump_args.len() <= crate::FROZEN_LABEL_PARAM_ARITY)
@@ -6715,7 +6753,8 @@ fn build_function(
                     for (i, jump_arg) in jump_args.iter().enumerate() {
                         sink.local_get(0); // frame_ptr
                         emit_resolve(&mut sink, constants, value_types, jump_arg.to_opref());
-                        sink.i64_store(mem64(frame.spill_slot_ofs(i as u64)));
+                        // Narrow shim reloads `spill_slot_ofs` of the target.
+                        sink.i64_store(mem64(jump_frame.spill_slot_ofs(i as u64)));
                     }
                     store_dispatch_key(&mut sink);
                     sink.local_get(0); // frame_ptr argument to the loop
@@ -8761,6 +8800,8 @@ fn build_function(
                         len_offset,
                         alloc.new_array_fn_ptr,
                         base,
+                        &site_gcmap,
+                        op_idx,
                     );
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -8814,6 +8855,8 @@ fn build_function(
                         len_offset,
                         alloc.new_array_fn_ptr,
                         base,
+                        &site_gcmap,
+                        op_idx,
                     );
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -8865,6 +8908,8 @@ fn build_function(
                         len_offset,
                         alloc.new_array_fn_ptr,
                         base,
+                        &site_gcmap,
+                        op_idx,
                     );
                 }
                 if !OpRef::raw_is_constant(vi) {
@@ -9460,6 +9505,7 @@ fn build_function(
                 if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
                     emit_ca_reload_caller(&mut sink, inline.jf_top_addr);
                     sink.local_set(0);
+                    emit_frame_write_barrier(&mut sink);
                 } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
                     emit_push_site(&mut sink, &site_gcmap, op_idx);
@@ -9467,6 +9513,7 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.local_set(0);
                     sink.sync_gcmap_frame();
+                    emit_frame_write_barrier(&mut sink);
                 }
                 // The frame ABI carries every scalar result as i64 bits. Ref
                 // and Int use those bits directly; Float crosses the local
