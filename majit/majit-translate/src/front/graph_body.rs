@@ -180,7 +180,15 @@ impl GraphBodyProvider {
         for function in &functions {
             function.lazy_graph().get();
         }
-        functions.extend(krate.lowering(&self.tables, |lowering| lowering.lower_specs()));
+        // Then every clause specialization those bodies queue, in queue
+        // order; building one queues the specializations its copy binds.
+        while let Some(req) = krate.lowering(&self.tables, |lowering| lowering.pop_spec()) {
+            let Some(spec) = self.declare_spec(&krate, req) else {
+                continue;
+            };
+            spec.lazy_graph().get();
+            functions.push(spec);
+        }
         let mut program = krate.state.finish(functions);
         mir::harden_duplicate_leaf_metadata(
             &mut program.struct_fields,
@@ -190,6 +198,26 @@ impl GraphBodyProvider {
         );
         self.crates.push(krate);
         program
+    }
+
+    /// The funcobj of the clause specialization `req`, its graph unbuilt.
+    /// `None`, recorded, when its body does not substitute.
+    fn declare_spec(
+        &self,
+        krate: &Rc<ProvidedCrate>,
+        req: crate::front::clause_spec::SpecRequest,
+    ) -> Option<SemanticFunction> {
+        krate.lowering(&self.tables, |lowering| {
+            let spec = lowering.declare_spec(req)?;
+            let stamp = spec.header.graph_stamp();
+            let declared = Rc::new(lowering.spec_header_graph(&spec));
+            let (krate, tables, body) = (krate.clone(), self.tables.clone(), spec.body.clone());
+            let graph = LazyGraph::deferred(declared.clone(), move || {
+                let graph = krate.lowering(&tables, |lowering| lowering.build_spec_body(&body))?;
+                Some(stamp_declared(&stamp, graph, &declared))
+            });
+            Some(spec.into_semantic(graph))
+        })
     }
 
     /// A funcobj per declaration of `krate` the membership gates admit,
@@ -312,22 +340,30 @@ impl ProvidedCrate {
     ) -> Option<FunctionGraph> {
         let fd = self.llbc.fn_by_id(def_id)?;
         self.lowering(tables, |lowering| match lowering.build_decl_body(fd) {
-            Ok(graph) => {
-                let graph = stamp.apply(graph);
-                assert_eq!(
-                    declaration(&graph),
-                    declaration(declared),
-                    "the built body of {} departs from its declaration",
-                    graph.name
-                );
-                Some(graph)
-            }
+            Ok(graph) => Some(stamp_declared(stamp, graph, declared)),
             Err(error) => {
                 lowering.record_decl_failure(fd, error);
                 None
             }
         })
     }
+}
+
+/// Stamp the funcobj's header on its built body, which must keep what the
+/// funcobj declared.
+fn stamp_declared(
+    stamp: &GraphStamp,
+    graph: FunctionGraph,
+    declared: &FunctionGraph,
+) -> FunctionGraph {
+    let graph = stamp.apply(graph);
+    assert_eq!(
+        declaration(&graph),
+        declaration(declared),
+        "the built body of {} departs from its declaration",
+        graph.name
+    );
+    graph
 }
 
 /// The part of a graph its declaration fixes: identity, `FUNC.RESULT`,

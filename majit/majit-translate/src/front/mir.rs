@@ -1502,7 +1502,7 @@ impl<'l> CrateLowering<'l> {
     }
 
     /// Pop the next queued clause specialization.
-    fn pop_spec(&self) -> Option<crate::front::clause_spec::SpecRequest> {
+    pub(crate) fn pop_spec(&self) -> Option<crate::front::clause_spec::SpecRequest> {
         self.state.spec.borrow_mut().pop()
     }
 
@@ -1512,30 +1512,30 @@ impl<'l> CrateLowering<'l> {
         &self,
         req: crate::front::clause_spec::SpecRequest,
     ) -> Option<crate::front::semantic::SemanticFunction> {
+        let spec = self.declare_spec(req)?;
+        let graph = self.build_spec_body(&spec.body)?;
+        let graph = spec.header.graph_stamp().apply(graph);
+        Some(spec.into_semantic(crate::model::LazyGraph::built(graph)))
+    }
+
+    /// Declare one clause specialization: the graph
+    /// `FunctionDesc.cachedgraph(key)` names before it builds it, with the
+    /// substituted body it is built from. `None`, recorded in `skipped`,
+    /// when the body does not substitute.
+    pub(crate) fn declare_spec(
+        &self,
+        req: crate::front::clause_spec::SpecRequest,
+    ) -> Option<DeclaredSpec> {
         let CrateLoweringState {
             known_trait_names,
-            struct_field_attrs,
-            tombstoned_leaves,
             dont_look_inside,
             elidable_residual,
             func_hints,
-            spec,
             skipped,
-            atomic_load_decls,
-            positional_shapes,
             ..
         } = self.state;
-        let Self {
-            llbc,
-            static_addrs,
-            jitdriver_receiver_roots,
-            ref root_stack,
-            ..
-        } = *self;
-        let spec_name = req.leaf.clone();
-        let Some(fd) = llbc.fn_by_id(req.fn_id) else {
-            return None;
-        };
+        let llbc = self.llbc;
+        let fd = llbc.fn_by_id(req.fn_id)?;
         let Some(mut body) = crate::front::clause_spec::substituted_unstructured(
             fd,
             llbc,
@@ -1545,7 +1545,7 @@ impl<'l> CrateLowering<'l> {
         ) else {
             skipped
                 .borrow_mut()
-                .push((spec_name, "no substituted unstructured body".into()));
+                .push((req.leaf, "no substituted unstructured body".into()));
             return None;
         };
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
@@ -1575,16 +1575,74 @@ impl<'l> CrateLowering<'l> {
             &dont_look_inside,
             &elidable_residual,
             func_hints,
-            static_addrs.error_carrier,
+            self.static_addrs.error_carrier,
             &policy_fn_path,
         );
-        let accum = AccumulatorFacts::build(llbc, &body);
+        let segments = spec_segments(llbc, fd, &header.name);
+        Some(DeclaredSpec {
+            body: std::rc::Rc::new(SpecBody {
+                name: header.name.clone(),
+                segments,
+                body,
+                fn_id: fd.def_id,
+            }),
+            header,
+            dont_look_inside: dont_look_inside.contains(&policy_fn_path),
+        })
+    }
+
+    /// The header graph of the declared clause specialization `spec`: its
+    /// startblock over the substituted locals and its header fields.
+    pub(crate) fn spec_header_graph(&self, spec: &DeclaredSpec) -> crate::model::FunctionGraph {
+        let fd = self
+            .llbc
+            .fn_by_id(spec.body.fn_id)
+            .expect("a declared specialization names its FunDecl");
+        let mut graph = crate::model::FunctionGraph::new(spec.body.segments.join("::"));
+        pygraph_initial_block(
+            &mut graph,
+            &spec.body.body.locals,
+            self.llbc,
+            fd.generics.as_ref(),
+            &self.state.tombstoned_leaves,
+        );
+        if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
+            graph.return_type = Some("()".to_string());
+        }
+        spec.header.graph_stamp().apply(graph)
+    }
+
+    /// Lower the substituted body of a declared clause specialization.
+    /// `None`, recorded in `skipped`, when it does not lower.
+    pub(crate) fn build_spec_body(&self, spec: &SpecBody) -> Option<crate::model::FunctionGraph> {
+        let CrateLoweringState {
+            struct_field_attrs,
+            tombstoned_leaves,
+            dont_look_inside,
+            spec: spec_queue,
+            skipped,
+            atomic_load_decls,
+            positional_shapes,
+            ..
+        } = self.state;
+        let Self {
+            llbc,
+            static_addrs,
+            jitdriver_receiver_roots,
+            ref root_stack,
+            ..
+        } = *self;
+        let fd = llbc
+            .fn_by_id(spec.fn_id)
+            .expect("a declared specialization names its FunDecl");
+        let body = &spec.body;
+        let accum = AccumulatorFacts::build(llbc, body);
         let builder_mode = accum.has_builder;
         let mut atomic_reasons = Vec::new();
         let mut graph = match lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             fd,
-            &body,
+            body,
             static_addrs,
             jitdriver_receiver_roots,
             &struct_field_attrs,
@@ -1594,7 +1652,7 @@ impl<'l> CrateLowering<'l> {
             &accum,
             &mut atomic_reasons,
             &root_stack,
-            Some(spec),
+            Some(spec_queue),
             true,
         ) {
             Ok(g) => g,
@@ -1605,24 +1663,50 @@ impl<'l> CrateLowering<'l> {
                         .borrow_mut()
                         .push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
                 }
-                skipped.borrow_mut().push((spec_name, msg));
+                skipped.borrow_mut().push((spec.name.clone(), msg));
                 return None;
             }
         };
-        let segments = spec_segments(llbc, fd, &header.name);
-        graph.name = segments.join("::");
+        graph.name = spec.segments.join("::");
         record_positional_shapes(&graph, &mut positional_shapes.borrow_mut());
-        // `FunctionDesc.cachedgraph` returns the specialized graph of the
-        // same function object, so the copy keeps `_jit_look_inside_`.
-        // `look_inside_graph` reads that hint off the callee.
-        let mut lowered = header.into_function(graph);
-        lowered.spec_path = Some(crate::parse::CallPath::from_segments(segments));
-        if dont_look_inside.contains(&policy_fn_path)
-            && !lowered.hints.iter().any(|hint| hint == "dont_look_inside")
-        {
+        Some(graph)
+    }
+}
+
+/// A clause specialization as declared: the header of its generic
+/// funcobj under the specialized signature, the path its call sites name,
+/// and the substituted body its graph is built from.
+pub(crate) struct DeclaredSpec {
+    pub(crate) header: SemanticFunctionHeader,
+    pub(crate) body: std::rc::Rc<SpecBody>,
+    dont_look_inside: bool,
+}
+
+/// What a clause specialization's graph is built from.
+pub(crate) struct SpecBody {
+    name: String,
+    segments: Vec<String>,
+    body: majit_charon_reader::ullbc::Unstructured,
+    fn_id: u64,
+}
+
+impl DeclaredSpec {
+    /// Assemble the `SemanticFunction` around the specialization's graph
+    /// handle. `FunctionDesc.cachedgraph` returns the specialized graph of
+    /// the same function object, so the copy keeps `_jit_look_inside_`:
+    /// `look_inside_graph` reads that hint off the callee.
+    pub(crate) fn into_semantic(
+        self,
+        graph: crate::model::LazyGraph,
+    ) -> crate::front::semantic::SemanticFunction {
+        let mut lowered = self.header.into_semantic(graph);
+        lowered.spec_path = Some(crate::parse::CallPath::from_segments(
+            self.body.segments.iter().cloned(),
+        ));
+        if self.dont_look_inside && !lowered.hints.iter().any(|hint| hint == "dont_look_inside") {
             lowered.hints.push("dont_look_inside".to_string());
         }
-        Some(lowered)
+        lowered
     }
 }
 
