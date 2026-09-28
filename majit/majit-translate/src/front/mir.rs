@@ -982,148 +982,222 @@ impl PackedFrameState {
     }
 }
 
-fn build_semantic_program_from_llbc_with_static_addrs_filtered(
-    llbc: &Llbc,
-    static_addrs: crate::HostStaticAddrs<'_>,
-    jitdriver_receiver_roots: &[String],
-    module_filter: Option<&std::collections::HashSet<String>>,
-    function_filter: Option<&std::collections::HashSet<String>>,
-    cross_tombstoned_leaves: &std::collections::HashSet<String>,
-) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    // ── Pass 1: walk type_decls + trait_decls ─────────────────────
-    let (
-        mut known_struct_names,
-        known_trait_names,
-        mut struct_fields,
-        mut enum_variant_by_discriminant,
-        mut struct_origins,
-        mut struct_field_attrs,
-        mut exact_layouts,
-        mut struct_ids,
-    ) = derive_program_metadata(llbc);
-    promote_cross_crate_stripped_keys(
-        llbc,
-        cross_tombstoned_leaves,
-        &mut known_struct_names,
-        &mut struct_fields,
-        &mut struct_field_attrs,
-        &mut exact_layouts,
-        &mut struct_ids,
-    );
-    // Only leaves this pass withdrew. A crate-root decl
-    // (`charon_corpus::ClassObject`) also stores an empty origin module,
-    // and that empty string is not a withdrawal.
-    let mut tombstoned_leaves = harden_duplicate_leaf_metadata(
-        &mut struct_fields,
-        &mut struct_origins,
-        &mut enum_variant_by_discriminant,
-        Some(&struct_ids),
-    );
+/// One artefact's lowering context: the declaration tables every body of
+/// the artefact lowers against, the hint sets harvested from it, its
+/// root-stack analyzer and its clause-specialization queue.
+///
+/// `build_semantic_program_from_llbc_with_static_addrs_filtered` lowers each
+/// declaration through [`CrateLowering::lower_decl`] and each queued
+/// specialization through [`CrateLowering::lower_spec`].
+struct CrateLowering<'l> {
+    llbc: &'l Llbc,
+    static_addrs: crate::HostStaticAddrs<'l>,
+    jitdriver_receiver_roots: &'l [String],
+    known_struct_names: std::collections::HashSet<String>,
+    known_trait_names: std::collections::HashSet<String>,
+    struct_fields: crate::front::semantic::StructFieldRegistry,
+    enum_variant_by_discriminant:
+        std::collections::HashMap<String, std::collections::HashMap<i64, String>>,
+    struct_origins: std::collections::HashMap<String, String>,
+    struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    exact_layouts:
+        std::collections::HashMap<majit_ir::descr::StructId, crate::front::semantic::ExactLayout>,
+    struct_ids: std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    tombstoned_leaves: std::collections::HashSet<String>,
+    dont_look_inside: std::collections::HashSet<String>,
+    elidable_residual: std::collections::HashSet<String>,
+    not_rpython: std::collections::HashSet<String>,
+    /// One root-stack analysis per artefact, so a callee shared by many
+    /// brackets is analysed once (`GraphAnalyzer._analyzed_calls`).
+    root_stack: RootStackAnalyzer<'l>,
+    spec: std::cell::RefCell<crate::front::clause_spec::SpecQueue>,
+    skipped: std::cell::RefCell<Vec<(String, String)>>,
+    atomic_load_decls: std::cell::RefCell<
+        Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
+    >,
+}
 
-    // Per-instantiation enum-variant pre-registration source (#100): a
-    // reference-payload generic enum constructor (`Result<Tuple>::Ok`)
-    // projects a per-instantiation variant class so its payload does not
-    // union across instantiations.  Publish a discriminant-table entry
-    // per such instantiation, keyed by the LEAF-suffixed `{leaf}{suffix}`
-    // — the exact spelling the constructor carries as its owner tail
-    // (`resolve_aggregate_adt`) — so the prologue pre-mint and the
-    // constructor pass the identical string to `canonical_struct_name`
-    // and resolve ONE variant classdef regardless of what
-    // `STRUCT_ORIGIN_REGISTRY` maps the base to.  The cloned tag→variant
-    // map is instantiation-invariant.  `pre_register_enum_variant_classes`
-    // accepts the `<`-bearing key (its filter admits `::`-qualified OR
-    // per-instantiation roots) and numbers the variant subclasses before
-    // `assign_inheritance_ids`, so the split classes drain rather than
-    // landing unnumbered (per-graph Skip).
-    let ref_enum_insts = collect_ref_enum_instantiations(llbc);
-    for inst in &ref_enum_insts {
-        let leaf = inst
-            .name_path
-            .rsplit("::")
-            .next()
-            .unwrap_or(&inst.name_path);
-        // Mirror the discriminant map to the `{leaf}{suffix}` spelling only
-        // while the bare leaf survived `harden_duplicate_leaf_metadata`.  A
-        // suffixed key carries no `::`, so it escapes the `::`-keyed
-        // dup-leaf pass; re-arming it for a leaf the hardening withdrew on
-        // cross-decl ambiguity would resurrect the silent-winner alias.
-        // Fail-closed — a withheld alias misses to the qualified key or
-        // routes the suffixed receiver to a per-graph Skip.
-        if !enum_variant_by_discriminant.contains_key(leaf) {
-            continue;
+impl<'l> CrateLowering<'l> {
+    fn new(
+        llbc: &'l Llbc,
+        static_addrs: crate::HostStaticAddrs<'l>,
+        jitdriver_receiver_roots: &'l [String],
+        cross_tombstoned_leaves: &std::collections::HashSet<String>,
+    ) -> Self {
+        // ── Pass 1: walk type_decls + trait_decls ─────────────────────
+        let (
+            mut known_struct_names,
+            known_trait_names,
+            mut struct_fields,
+            mut enum_variant_by_discriminant,
+            mut struct_origins,
+            mut struct_field_attrs,
+            mut exact_layouts,
+            mut struct_ids,
+        ) = derive_program_metadata(llbc);
+        promote_cross_crate_stripped_keys(
+            llbc,
+            cross_tombstoned_leaves,
+            &mut known_struct_names,
+            &mut struct_fields,
+            &mut struct_field_attrs,
+            &mut exact_layouts,
+            &mut struct_ids,
+        );
+        // Only leaves this pass withdrew. A crate-root decl
+        // (`charon_corpus::ClassObject`) also stores an empty origin module,
+        // and that empty string is not a withdrawal.
+        let mut tombstoned_leaves = harden_duplicate_leaf_metadata(
+            &mut struct_fields,
+            &mut struct_origins,
+            &mut enum_variant_by_discriminant,
+            Some(&struct_ids),
+        );
+
+        // Per-instantiation enum-variant pre-registration source (#100): a
+        // reference-payload generic enum constructor (`Result<Tuple>::Ok`)
+        // projects a per-instantiation variant class so its payload does not
+        // union across instantiations.  Publish a discriminant-table entry
+        // per such instantiation, keyed by the LEAF-suffixed `{leaf}{suffix}`
+        // — the exact spelling the constructor carries as its owner tail
+        // (`resolve_aggregate_adt`) — so the prologue pre-mint and the
+        // constructor pass the identical string to `canonical_struct_name`
+        // and resolve ONE variant classdef regardless of what
+        // `STRUCT_ORIGIN_REGISTRY` maps the base to.  The cloned tag→variant
+        // map is instantiation-invariant.  `pre_register_enum_variant_classes`
+        // accepts the `<`-bearing key (its filter admits `::`-qualified OR
+        // per-instantiation roots) and numbers the variant subclasses before
+        // `assign_inheritance_ids`, so the split classes drain rather than
+        // landing unnumbered (per-graph Skip).
+        let ref_enum_insts = collect_ref_enum_instantiations(llbc);
+        for inst in &ref_enum_insts {
+            let leaf = inst
+                .name_path
+                .rsplit("::")
+                .next()
+                .unwrap_or(&inst.name_path);
+            // Mirror the discriminant map to the `{leaf}{suffix}` spelling only
+            // while the bare leaf survived `harden_duplicate_leaf_metadata`.  A
+            // suffixed key carries no `::`, so it escapes the `::`-keyed
+            // dup-leaf pass; re-arming it for a leaf the hardening withdrew on
+            // cross-decl ambiguity would resurrect the silent-winner alias.
+            // Fail-closed — a withheld alias misses to the qualified key or
+            // routes the suffixed receiver to a per-graph Skip.
+            if !enum_variant_by_discriminant.contains_key(leaf) {
+                continue;
+            }
+            if let Some(bare) = enum_variant_by_discriminant.get(&inst.name_path).cloned() {
+                enum_variant_by_discriminant
+                    .entry(format!("{leaf}{}", inst.suffix))
+                    .or_insert(bare);
+            }
         }
-        if let Some(bare) = enum_variant_by_discriminant.get(&inst.name_path).cloned() {
-            enum_variant_by_discriminant
-                .entry(format!("{leaf}{}", inst.suffix))
-                .or_insert(bare);
+        // Per-instantiation SUFFIXED variant payload rows (#312 C4): give a
+        // narrowing-only reference-payload receiver its concrete payload type
+        // so the suffixed variant classdef does not stay `Impossible` → Skip.
+        register_ref_enum_instantiation_rows(
+            llbc,
+            &ref_enum_insts,
+            &enum_variant_by_discriminant,
+            &mut struct_fields,
+        );
+
+        // Pass 2 paints each ADT as its bare leaf. A leaf `harden` withdrew
+        // (`eval::Code` beside `module::struct::Code`) is not a class: the
+        // paint has to name the declaration actually being lowered, or the
+        // value seeds `SomeInstance(classdef=None)` and a later
+        // `__discriminant` read raises `MissingRTypeAttribute`. The set is
+        // the leaves the pass withdrew, not every empty origin: a crate-root
+        // decl stores an empty module without being a duplicate. Leaves that
+        // collide only across input LLBCs are absent from this file; the
+        // caller computed that verdict before lowering.
+        tombstoned_leaves.extend(cross_tombstoned_leaves.iter().cloned());
+
+        // ── Pass 2: lower every function body and build SemanticFunctions ─
+        // `@jit.dont_look_inside` (`rlib/jit.py`) callees declare a
+        // FUNC.RESULT that the legacy walker reads off the Call op's
+        // `result_ty` (`legacy_resolve.rs infer_concrete_from_op`), but the
+        // real path stubs the opaque body and otherwise drops the residual
+        // call result to void.  Harvest the marker set once (same
+        // `_jit_look_inside_` source as `merge_hints_from_llbcs`) so the
+        // per-fn push can stamp the matching `return_type` token, keyed by
+        // the identical `{module_path}::{name}` path the merge uses.
+        let harvested =
+            crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
+        let dont_look_inside: std::collections::HashSet<String> = harvested
+            .iter()
+            .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
+            .map(|(path, _)| path.clone())
+            .collect();
+        // `#[majit_macros::elidable]` callees (`llbc_hints.rs` maps the
+        // `_elidable_function_` marker → `"elidable"`): the codewriter's
+        // elidable effect already lowers the callsite to CALL_PURE and never
+        // looks inside the body.  Harvest the elidable set from the same
+        // vector so `stamp_return_token` can stamp the matching FUNC.RESULT
+        // token. `JitPolicy._reject_function()` makes this unconditional.
+        let elidable_residual: std::collections::HashSet<String> = harvested
+            .iter()
+            .filter(|(_, hints)| hints.iter().any(|h| h == "elidable"))
+            .map(|(path, _)| path.clone())
+            .collect();
+        // `objectmodel.py @not_rpython` sets `func._not_rpython_`; the
+        // flowspace refuses that function before executing its body
+        // (`flowspace/objspace.py:21-22 assert_rpythonic`).  Apply the same gate
+        // before MIR lowering, which also prevents host-only carrier types (for
+        // example rbigint.fromlong's i128 test surface) from becoming spurious
+        // translated graph-coverage failures.
+        let not_rpython: std::collections::HashSet<String> = harvested
+            .iter()
+            .filter(|(_, hints)| hints.iter().any(|h| h == "not_rpython"))
+            .map(|(path, _)| path.clone())
+            .collect();
+        Self {
+            llbc,
+            static_addrs,
+            jitdriver_receiver_roots,
+            known_struct_names,
+            known_trait_names,
+            struct_fields,
+            enum_variant_by_discriminant,
+            struct_origins,
+            struct_field_attrs,
+            exact_layouts,
+            struct_ids,
+            tombstoned_leaves,
+            dont_look_inside,
+            elidable_residual,
+            not_rpython,
+            root_stack: RootStackAnalyzer::new(llbc),
+            spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
+            skipped: std::cell::RefCell::new(Vec::new()),
+            atomic_load_decls: std::cell::RefCell::new(Vec::new()),
         }
     }
-    // Per-instantiation SUFFIXED variant payload rows (#312 C4): give a
-    // narrowing-only reference-payload receiver its concrete payload type
-    // so the suffixed variant classdef does not stay `Impossible` → Skip.
-    register_ref_enum_instantiation_rows(
-        llbc,
-        &ref_enum_insts,
-        &enum_variant_by_discriminant,
-        &mut struct_fields,
-    );
 
-    // Pass 2 paints each ADT as its bare leaf. A leaf `harden` withdrew
-    // (`eval::Code` beside `module::struct::Code`) is not a class: the
-    // paint has to name the declaration actually being lowered, or the
-    // value seeds `SomeInstance(classdef=None)` and a later
-    // `__discriminant` read raises `MissingRTypeAttribute`. The set is
-    // the leaves the pass withdrew, not every empty origin: a crate-root
-    // decl stores an empty module without being a duplicate. Leaves that
-    // collide only across input LLBCs are absent from this file; the
-    // caller computed that verdict before lowering.
-    tombstoned_leaves.extend(cross_tombstoned_leaves.iter().cloned());
-
-    // ── Pass 2: lower every function body and build SemanticFunctions ─
-    // `@jit.dont_look_inside` (`rlib/jit.py`) callees declare a
-    // FUNC.RESULT that the legacy walker reads off the Call op's
-    // `result_ty` (`legacy_resolve.rs infer_concrete_from_op`), but the
-    // real path stubs the opaque body and otherwise drops the residual
-    // call result to void.  Harvest the marker set once (same
-    // `_jit_look_inside_` source as `merge_hints_from_llbcs`) so the
-    // per-fn push can stamp the matching `return_type` token, keyed by
-    // the identical `{module_path}::{name}` path the merge uses.
-    let harvested = crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
-    let dont_look_inside: std::collections::HashSet<String> = harvested
-        .iter()
-        .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
-        .map(|(path, _)| path.clone())
-        .collect();
-    // `#[majit_macros::elidable]` callees (`llbc_hints.rs` maps the
-    // `_elidable_function_` marker → `"elidable"`): the codewriter's
-    // elidable effect already lowers the callsite to CALL_PURE and never
-    // looks inside the body.  Harvest the elidable set from the same
-    // vector so `stamp_return_token` can stamp the matching FUNC.RESULT
-    // token. `JitPolicy._reject_function()` makes this unconditional.
-    let elidable_residual: std::collections::HashSet<String> = harvested
-        .iter()
-        .filter(|(_, hints)| hints.iter().any(|h| h == "elidable"))
-        .map(|(path, _)| path.clone())
-        .collect();
-    // `objectmodel.py @not_rpython` sets `func._not_rpython_`; the
-    // flowspace refuses that function before executing its body
-    // (`flowspace/objspace.py:21-22 assert_rpythonic`).  Apply the same gate
-    // before MIR lowering, which also prevents host-only carrier types (for
-    // example rbigint.fromlong's i128 test surface) from becoming spurious
-    // translated graph-coverage failures.
-    let not_rpython: std::collections::HashSet<String> = harvested
-        .iter()
-        .filter(|(_, hints)| hints.iter().any(|h| h == "not_rpython"))
-        .map(|(path, _)| path.clone())
-        .collect();
-    let mut functions = Vec::new();
-    let mut skipped: Vec<(String, String)> = Vec::new();
-    let mut atomic_load_decls = Vec::new();
-    // One root-stack analysis per artefact, so a callee shared by many
-    // brackets is analysed once (`GraphAnalyzer._analyzed_calls`).
-    let root_stack = RootStackAnalyzer::new(llbc);
-    let spec = std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new());
-    for fd in llbc.iter_local_fns() {
+    /// Lower one declaration of this artefact. `None` when a gate refuses it
+    /// or its body does not lower; the latter is recorded in `skipped`.
+    fn lower_decl(
+        &self,
+        fd: &'l FunDecl,
+        module_filter: Option<&std::collections::HashSet<String>>,
+        function_filter: Option<&std::collections::HashSet<String>>,
+    ) -> Option<crate::front::semantic::SemanticFunction> {
+        let Self {
+            llbc,
+            static_addrs,
+            jitdriver_receiver_roots,
+            known_trait_names,
+            struct_field_attrs,
+            tombstoned_leaves,
+            dont_look_inside,
+            elidable_residual,
+            not_rpython,
+            root_stack,
+            spec,
+            ..
+        } = self;
+        let (llbc, static_addrs, jitdriver_receiver_roots) =
+            (*llbc, *static_addrs, *jitdriver_receiver_roots);
         // Charon emits static / const initialiser bodies (e.g. the
         // body that builds `static NONE_SINGLETON`) as ordinary
         // `FunDecl` entries whose `src` is `GlobalInitializer` of the
@@ -1136,7 +1210,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // orphan etype/evalue slots no longer reject the graph — this
         // skip is about call-target modelling, not adapter safety.)
         if fd.is_global_initializer().is_some() {
-            continue;
+            return None;
         }
         // Key each SemanticFunction by bare leaf name plus a separate
         // `module_path` so `lib.rs`'s `register_function_graph_alias`
@@ -1149,10 +1223,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             None => (String::new(), stripped),
         };
         if !should_lower_module(module_filter, &module_path) {
-            continue;
+            return None;
         }
         if !should_lower_function(function_filter, &name) {
-            continue;
+            return None;
         }
         let fn_path = if module_path.is_empty() {
             name.clone()
@@ -1164,7 +1238,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // for the policy and hint lookups every instance shares.
         let name = instance_leaf(llbc, fd).unwrap_or(name);
         if not_rpython.contains(&fn_path) {
-            continue;
+            return None;
         }
         // `FunDecl::body` is raw JSON and `unstructured()` re-parses it on
         // every call, so hold the one projection this iteration needs: it
@@ -1183,7 +1257,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
                 "declaration-has-no-unstructured-body",
                 &fn_path,
             );
-            continue;
+            return None;
         };
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         // A single function whose body the driver does not yet handle
@@ -1209,17 +1283,19 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &accum,
             &mut atomic_reasons,
             &root_stack,
-            Some(&spec),
+            Some(spec),
             false,
         ) {
             Ok(g) => g,
             Err(e) => {
                 let msg = e.to_string();
                 if let Some(reason) = atomic_reasons.first() {
-                    atomic_load_decls.push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
+                    self.atomic_load_decls
+                        .borrow_mut()
+                        .push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
                 }
-                skipped.push((name.clone(), msg));
-                continue;
+                self.skipped.borrow_mut().push((name.clone(), msg));
+                return None;
             }
         };
         // `return_type` stays `None` for ordinary fns: the Charon
@@ -1242,7 +1318,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // Without this, every impl method built by the MIR driver looks
         // like a free function to the canonical registration loop and
         // the impl-key return-type / hint registrations get dropped.
-        functions.push(semantic_function_from_lowered(
+        Some(semantic_function_from_lowered(
             llbc,
             fd,
             graph,
@@ -1254,18 +1330,38 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &elidable_residual,
             static_addrs.error_carrier,
             &fn_path,
-        ));
+        ))
     }
-    // `specialize.py` `cachedgraph` keys one graph per instantiation. The
-    // walk above enqueues each concrete call; lowering a copy enqueues the
-    // callees whose clauses that copy just bound.
-    loop {
-        let Some(req) = spec.borrow_mut().pop() else {
-            break;
-        };
+
+    /// Pop the next queued clause specialization.
+    fn pop_spec(&self) -> Option<crate::front::clause_spec::SpecRequest> {
+        self.spec.borrow_mut().pop()
+    }
+
+    /// Lower one clause specialization. `None` when its body does not
+    /// substitute or lower; either is recorded in `skipped`.
+    fn lower_spec(
+        &self,
+        req: crate::front::clause_spec::SpecRequest,
+    ) -> Option<crate::front::semantic::SemanticFunction> {
+        let Self {
+            llbc,
+            static_addrs,
+            jitdriver_receiver_roots,
+            known_trait_names,
+            struct_field_attrs,
+            tombstoned_leaves,
+            dont_look_inside,
+            elidable_residual,
+            root_stack,
+            spec,
+            ..
+        } = self;
+        let (llbc, static_addrs, jitdriver_receiver_roots) =
+            (*llbc, *static_addrs, *jitdriver_receiver_roots);
         let spec_name = req.leaf.clone();
         let Some(fd) = llbc.fn_by_id(req.fn_id) else {
-            continue;
+            return None;
         };
         let Some(mut body) = crate::front::clause_spec::substituted_unstructured(
             fd,
@@ -1274,8 +1370,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &req.types,
             &req.const_generics,
         ) else {
-            skipped.push((spec_name, "no substituted unstructured body".into()));
-            continue;
+            self.skipped
+                .borrow_mut()
+                .push((spec_name, "no substituted unstructured body".into()));
+            return None;
         };
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         let signature = crate::front::clause_spec::substituted_signature(
@@ -1300,17 +1398,19 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &accum,
             &mut atomic_reasons,
             &root_stack,
-            Some(&spec),
+            Some(spec),
             true,
         ) {
             Ok(g) => g,
             Err(e) => {
                 let msg = e.to_string();
                 if let Some(reason) = atomic_reasons.first() {
-                    atomic_load_decls.push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
+                    self.atomic_load_decls
+                        .borrow_mut()
+                        .push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
                 }
-                skipped.push((spec_name, msg));
-                continue;
+                self.skipped.borrow_mut().push((spec_name, msg));
+                return None;
             }
         };
         let stripped = strip_crate_prefix(&fd.item_meta.name_path());
@@ -1346,93 +1446,143 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         {
             lowered.hints.push("dont_look_inside".to_string());
         }
-        functions.push(lowered);
+        Some(lowered)
     }
-    // `specialize.py default_specialize` runs while the annotator walks
-    // calls; on this path the whole function set has to exist first, so it
-    // runs here, once, over the finished list.
-    crate::front::semantic::propagate_access_directly(
-        &mut functions,
-        &dont_look_inside,
-        &crate::virtualizable_decl::virtualizable_roots(),
-    );
-    register_synthetic_positional_metadata(
-        &functions,
-        &mut known_struct_names,
-        &mut struct_fields,
-        &mut struct_field_attrs,
-        &mut struct_ids,
-    );
-    // Coverage gate. Every `skipped` entry is a function whose MIR shape
-    // the driver could not lower — already after the reverse-postorder
-    // retry in `lower_fun_decl`. The tracked gaps are exactly the shapes
-    // `is_known_lowering_gap` recognises; its arms are the only statement
-    // of that set that cannot go stale. One of them, an "uninitialised local
-    // read" that even RPO could not bind, needs a genuine loop-carried def.
-    // PRE-EXISTING-ADAPTATION: unlike flowcontext.py
-    // FlowContext.record_block, this whole-program boundary does not
-    // propagate unsupported lowering. Both tracked and untracked failures
-    // omit a body; surviving callers need a valid residual target/ABI.
-    // The `regressions` bucket includes EVERY non-tracked skip, not only
-    // result-exception-lowering declines. #346 retires this fallback after
-    // ordinary lowering handles the reachable closure; check.py remains
-    // necessary but is not a proof that every omitted body is safe.
-    if !skipped.is_empty() {
-        let (tracked, regressions): (Vec<_>, Vec<_>) = skipped
-            .iter()
-            .partition(|(_, msg)| is_known_lowering_gap(msg));
-        if std::env::var("MAJIT_MIR_FRONTEND_DEBUG").is_ok() && !tracked.is_empty() {
-            eprintln!(
-                "[mir-frontend] {} function(s) skipped via a shape \
-                 `is_known_lowering_gap` recognises; the per-function \
-                 message below names which one, and all degrade to a \
-                 residual call:",
-                tracked.len()
-            );
-            for (name, msg) in tracked.iter().take(20) {
-                eprintln!("  {name}: {msg}");
+
+    /// `specialize.py default_specialize` and the positional-aggregate
+    /// layouts over the lowered set, the coverage report, and the program.
+    fn finish(
+        self,
+        mut functions: Vec<crate::front::semantic::SemanticFunction>,
+    ) -> crate::front::semantic::SemanticProgram {
+        let Self {
+            mut known_struct_names,
+            known_trait_names,
+            mut struct_fields,
+            enum_variant_by_discriminant,
+            struct_origins,
+            mut struct_field_attrs,
+            exact_layouts,
+            mut struct_ids,
+            dont_look_inside,
+            skipped,
+            atomic_load_decls,
+            ..
+        } = self;
+        let skipped = skipped.into_inner();
+        let atomic_load_decls = atomic_load_decls.into_inner();
+        // `specialize.py default_specialize` runs while the annotator walks
+        // calls; on this path the whole function set has to exist first, so it
+        // runs here, once, over the finished list.
+        crate::front::semantic::propagate_access_directly(
+            &mut functions,
+            &dont_look_inside,
+            &crate::virtualizable_decl::virtualizable_roots(),
+        );
+        register_synthetic_positional_metadata(
+            &functions,
+            &mut known_struct_names,
+            &mut struct_fields,
+            &mut struct_field_attrs,
+            &mut struct_ids,
+        );
+        // Coverage gate. Every `skipped` entry is a function whose MIR shape
+        // the driver could not lower — already after the reverse-postorder
+        // retry in `lower_fun_decl`. The tracked gaps are exactly the shapes
+        // `is_known_lowering_gap` recognises; its arms are the only statement
+        // of that set that cannot go stale. One of them, an "uninitialised local
+        // read" that even RPO could not bind, needs a genuine loop-carried def.
+        // PRE-EXISTING-ADAPTATION: unlike flowcontext.py
+        // FlowContext.record_block, this whole-program boundary does not
+        // propagate unsupported lowering. Both tracked and untracked failures
+        // omit a body; surviving callers need a valid residual target/ABI.
+        // The `regressions` bucket includes EVERY non-tracked skip, not only
+        // result-exception-lowering declines. #346 retires this fallback after
+        // ordinary lowering handles the reachable closure; check.py remains
+        // necessary but is not a proof that every omitted body is safe.
+        if !skipped.is_empty() {
+            let (tracked, regressions): (Vec<_>, Vec<_>) = skipped
+                .iter()
+                .partition(|(_, msg)| is_known_lowering_gap(msg));
+            if std::env::var("MAJIT_MIR_FRONTEND_DEBUG").is_ok() && !tracked.is_empty() {
+                eprintln!(
+                    "[mir-frontend] {} function(s) skipped via a shape \
+                     `is_known_lowering_gap` recognises; the per-function \
+                     message below names which one, and all degrade to a \
+                     residual call:",
+                    tracked.len()
+                );
+                for (name, msg) in tracked.iter().take(20) {
+                    eprintln!("  {name}: {msg}");
+                }
+            }
+            if !regressions.is_empty() {
+                let mut detail = String::new();
+                for (name, msg) in &regressions {
+                    detail.push_str(&format!("\n  - {name}: {msg}"));
+                }
+                // Report untracked body omissions too. No corresponding
+                // exception-to-residual catch exists in upstream
+                // ExceptionTransformer.transform_completely.
+                eprintln!(
+                    "[mir-coverage] {} function(s) with an unrecognised MIR shape \
+                     omitted; callers require a registered ABI-compatible residual; \
+                     shape-coverage gap:{detail}",
+                    regressions.len()
+                );
             }
         }
-        if !regressions.is_empty() {
-            let mut detail = String::new();
-            for (name, msg) in &regressions {
-                detail.push_str(&format!("\n  - {name}: {msg}"));
-            }
-            // Report untracked body omissions too. No corresponding
-            // exception-to-residual catch exists in upstream
-            // ExceptionTransformer.transform_completely.
-            eprintln!(
-                "[mir-coverage] {} function(s) with an unrecognised MIR shape \
-                 omitted; callers require a registered ABI-compatible residual; \
-                 shape-coverage gap:{detail}",
-                regressions.len()
-            );
+        crate::front::semantic::SemanticProgram {
+            functions,
+            harvested_hints: std::collections::HashMap::new(),
+            known_struct_names,
+            known_trait_names,
+            struct_fields,
+            // Immutable-field tracking depends on `#[majit_macros::immutable]`
+            // attribute serialization that Charon does not currently surface
+            // (the `attributes` array carries DocComment / Outer but not our
+            // proc-macro hints).
+            immutable_fields: std::collections::HashMap::new(),
+            enum_variant_by_discriminant,
+            struct_origins,
+            struct_field_attrs,
+            exact_layouts,
+            struct_ids,
+            // Populated post-build in `build_semantic_program_via_active_frontend`
+            // (it iterates the full LLBC set), mirroring `merge_hints_from_llbcs`.
+            unsafe_fn_stubs: Vec::new(),
+            foreign_opaque_method_externals: Vec::new(),
+            atomic_load_decls,
         }
     }
-    Ok(crate::front::semantic::SemanticProgram {
-        functions,
-        harvested_hints: std::collections::HashMap::new(),
-        known_struct_names,
-        known_trait_names,
-        struct_fields,
-        // Immutable-field tracking depends on `#[majit_macros::immutable]`
-        // attribute serialization that Charon does not currently surface
-        // (the `attributes` array carries DocComment / Outer but not our
-        // proc-macro hints).
-        immutable_fields: std::collections::HashMap::new(),
-        enum_variant_by_discriminant,
-        struct_origins,
-        struct_field_attrs,
-        exact_layouts,
-        struct_ids,
-        // Populated post-build in `build_semantic_program_via_active_frontend`
-        // (it iterates the full LLBC set), mirroring `merge_hints_from_llbcs`.
-        unsafe_fn_stubs: Vec::new(),
-        foreign_opaque_method_externals: Vec::new(),
-        atomic_load_decls,
-    })
 }
 
+fn build_semantic_program_from_llbc_with_static_addrs_filtered(
+    llbc: &Llbc,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
+    module_filter: Option<&std::collections::HashSet<String>>,
+    function_filter: Option<&std::collections::HashSet<String>>,
+    cross_tombstoned_leaves: &std::collections::HashSet<String>,
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    let ctx = CrateLowering::new(
+        llbc,
+        static_addrs,
+        jitdriver_receiver_roots,
+        cross_tombstoned_leaves,
+    );
+    let mut functions: Vec<_> = llbc
+        .iter_local_fns()
+        .filter_map(|fd| ctx.lower_decl(fd, module_filter, function_filter))
+        .collect();
+    // `specialize.py` `cachedgraph` keys one graph per instantiation. The
+    // walk above enqueues each concrete call; lowering a copy enqueues the
+    // callees whose clauses that copy just bound.
+    while let Some(req) = ctx.pop_spec() {
+        functions.extend(ctx.lower_spec(req));
+    }
+    Ok(ctx.finish(functions))
+}
 /// One lowered body as a `SemanticFunction`. `name` is the bare leaf or
 /// the specialized leaf; `signature` is the declaration signature or the
 /// substituted copy. `policy_fn_path` is `module_path::<bare leaf>`, the
