@@ -20733,7 +20733,7 @@ pub fn file_wrapper_type() -> PyObjectRef {
         let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_file_wrapper_type);
         // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
         // TextIOWrapper heap spec.  This legacy wrapper accessor must publish
-        // the same owner as `_io::textio::type_object`.
+        // the same owner as `_io::interp_textio::type_object`.
         crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         tp
@@ -23227,7 +23227,7 @@ fn builtin_open_impl(
     let (raw_type, console) = {
         let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
         if allow_windows_console
-            && crate::module::_io::winconsoleio::pyio_get_console_type(file) != '\0'
+            && crate::module::_io::interp_win32consoleio::pyio_get_console_type(file) != '\0'
         {
             (crate::module::_io::windows_console_io_type(), true)
         } else {

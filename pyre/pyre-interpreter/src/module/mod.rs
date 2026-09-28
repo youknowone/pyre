@@ -28,6 +28,8 @@ pub mod _types;
 pub mod _typing;
 pub mod _warnings;
 pub mod _weakref;
+#[cfg(windows)]
+pub mod _winreg;
 pub mod array;
 pub mod atexit;
 pub mod errno;
@@ -48,5 +50,3 @@ pub mod r#struct;
 pub mod sys;
 pub mod thread;
 pub mod time;
-#[cfg(windows)]
-pub mod winreg;

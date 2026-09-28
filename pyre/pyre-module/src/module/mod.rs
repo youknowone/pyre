@@ -5,8 +5,6 @@ pub mod _bisect;
 #[allow(non_snake_case)]
 pub mod _blake2;
 #[allow(non_snake_case)]
-pub mod _bz2;
-#[allow(non_snake_case)]
 #[cfg(all(
     feature = "host_env",
     not(feature = "sandbox"),
@@ -79,6 +77,8 @@ pub mod _winapi;
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _wmi;
 pub mod binascii;
+#[allow(non_snake_case)]
+pub mod bz2;
 pub mod cmath;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod fcntl;

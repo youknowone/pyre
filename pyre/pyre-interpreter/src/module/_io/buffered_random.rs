@@ -199,9 +199,9 @@ impl W_BufferedRandom {
             crate::builtins::memoryview_release(&[pyre_object::gc_roots::shadow_stack_get(sp + 2)]);
         let result = outcome?;
         if unsafe { pyre_object::is_none(result) } {
-            return Err(super::buffered::make_blocking_error());
+            return Err(super::interp_bufferedio::make_blocking_error());
         }
-        let size = super::buffered::raw_readinto_size(result, length)?;
+        let size = super::interp_bufferedio::raw_readinto_size(result, length)?;
         if self.abs_pos != -1 {
             self.abs_pos += size as i64;
         }
@@ -485,7 +485,7 @@ impl W_BufferedRandom {
             let dest = unsafe { output.as_mut_ptr().add(written) };
             let size = match self.raw_read(pyre_object::w_none(), dest, block) {
                 Ok(size) => size,
-                Err(error) if super::buffered::is_blocking_error(&error) => {
+                Err(error) if super::interp_bufferedio::is_blocking_error(&error) => {
                     return if output.is_empty() {
                         Ok(None)
                     } else {
@@ -507,7 +507,7 @@ impl W_BufferedRandom {
         while remaining > 0 && self.read_end < self.buffer_size {
             let size = match self.fill_buffer() {
                 Ok(size) => size,
-                Err(error) if super::buffered::is_blocking_error(&error) => {
+                Err(error) if super::interp_bufferedio::is_blocking_error(&error) => {
                     if output.is_empty() {
                         return Ok(None);
                     }
@@ -584,7 +584,7 @@ impl W_BufferedRandom {
                             Ok(read) => read,
                             // `r == -2` there -- the raw stream would have blocked
                             // -- is read as zero bytes, not as an error.
-                            Err(error) if super::buffered::is_blocking_error(&error) => 0,
+                            Err(error) if super::interp_bufferedio::is_blocking_error(&error) => 0,
                             Err(error) => return Err(error),
                         };
                     unsafe { out.set_len(read) };
@@ -594,7 +594,7 @@ impl W_BufferedRandom {
                 this.pos = 0;
                 have = match this.fill_buffer() {
                     Ok(size) => size,
-                    Err(error) if super::buffered::is_blocking_error(&error) => 0,
+                    Err(error) if super::interp_bufferedio::is_blocking_error(&error) => 0,
                     Err(error) => return Err(error),
                 };
             }
@@ -646,7 +646,7 @@ impl W_BufferedRandom {
                     let dest = (unsafe { target.as_mut_slice() })[written..].as_mut_ptr();
                     let size = match this.raw_read(pyre_object::w_none(), dest, remaining) {
                         Ok(size) => size,
-                        Err(error) if super::buffered::is_blocking_error(&error) => break,
+                        Err(error) if super::interp_bufferedio::is_blocking_error(&error) => break,
                         Err(error) => return Err(error),
                     };
                     if size == 0 {
@@ -666,7 +666,7 @@ impl W_BufferedRandom {
                 this.read_end = 0;
                 let size = match this.fill_buffer() {
                     Ok(size) => size,
-                    Err(error) if super::buffered::is_blocking_error(&error) => 0,
+                    Err(error) if super::interp_bufferedio::is_blocking_error(&error) => 0,
                     Err(error) => return Err(error),
                 };
                 if size == 0 {
@@ -785,7 +785,7 @@ impl W_BufferedRandom {
                 this.reader_reset_buf();
                 have = match this.fill_buffer() {
                     Ok(size) => size,
-                    Err(error) if super::buffered::is_blocking_error(&error) => 0,
+                    Err(error) if super::interp_bufferedio::is_blocking_error(&error) => 0,
                     Err(error) => return Err(error),
                 };
                 this.pos = 0;
@@ -831,7 +831,7 @@ impl W_BufferedRandom {
                 this.reader_reset_buf();
                 let filled = match this.fill_buffer() {
                     Ok(size) => size,
-                    Err(error) if super::buffered::is_blocking_error(&error) => 0,
+                    Err(error) if super::interp_bufferedio::is_blocking_error(&error) => 0,
                     Err(error) => return Err(error),
                 };
                 if filled == 0 {

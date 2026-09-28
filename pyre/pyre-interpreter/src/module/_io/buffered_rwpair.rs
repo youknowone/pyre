@@ -84,7 +84,7 @@ impl W_BufferedRWPair {
         let reader_size_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_int_new(buffer_size));
         let reader = crate::call::call_function_impl_result(
-            super::buffered::type_object(),
+            super::interp_bufferedio::type_object(),
             &[
                 pyre_object::gc_roots::shadow_stack_get(input_sp),
                 pyre_object::gc_roots::shadow_stack_get(reader_size_slot),

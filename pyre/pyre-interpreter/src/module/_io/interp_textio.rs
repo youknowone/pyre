@@ -675,7 +675,7 @@ impl W_TextIOWrapper {
             &[pyre_object::gc_roots::shadow_stack_get(size_slot)],
         )?;
         if unsafe { pyre_object::is_none(input) } {
-            return Err(super::buffered::make_blocking_error());
+            return Err(super::interp_bufferedio::make_blocking_error());
         }
         let input_bytes =
             unsafe { crate::builtins::file_write_buffer_bytes(input) }.map_err(|_| {
@@ -755,7 +755,7 @@ impl W_TextIOWrapper {
         let mut result = self.decoded.get_chars(None);
         let input = self.call_buffer("read", &[])?;
         if unsafe { pyre_object::is_none(input) } {
-            return Err(super::buffered::make_blocking_error());
+            return Err(super::interp_bufferedio::make_blocking_error());
         }
         let input_bytes =
             unsafe { crate::builtins::file_write_buffer_bytes(input) }.map_err(|_| {

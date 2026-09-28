@@ -1216,7 +1216,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // Windows.  It is subclassable and therefore participates in the same
         // rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(174, typed::<crate::module::_io::W_WindowsConsoleIO>()),
+        subclass_range_alias(174, typed::<crate::module::_io::W_WinConsoleIO>()),
     ];
     aliases.extend(module_subclass_range_aliases());
     aliases

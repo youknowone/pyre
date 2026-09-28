@@ -4085,7 +4085,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_io::W_WindowsConsoleIO
+        <pyre_interpreter::module::_io::W_WinConsoleIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // The classes `pyre-module` registers close the rclass census, numbered

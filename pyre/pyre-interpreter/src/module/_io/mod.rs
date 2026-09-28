@@ -7,27 +7,27 @@
 
 use pyre_object::*;
 
-mod buffered;
-pub use buffered::W_BufferedReader;
+mod interp_bufferedio;
+pub use interp_bufferedio::W_BufferedReader;
 mod buffered_writer;
 pub use buffered_writer::W_BufferedWriter;
 mod buffered_rwpair;
 pub use buffered_rwpair::W_BufferedRWPair;
 mod buffered_random;
 pub use buffered_random::W_BufferedRandom;
-mod bytesio;
-pub use bytesio::W_BytesIO;
-mod stringio;
-pub use stringio::W_StringIO;
-mod textio;
-pub use textio::W_TextIOWrapper;
+mod interp_bytesio;
+pub use interp_bytesio::W_BytesIO;
+mod interp_stringio;
+pub use interp_stringio::W_StringIO;
+mod interp_textio;
+pub use interp_textio::W_TextIOWrapper;
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-pub(crate) mod winconsoleio;
+pub(crate) mod interp_win32consoleio;
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-pub use winconsoleio::W_WindowsConsoleIO;
+pub use interp_win32consoleio::W_WinConsoleIO;
 
 pub fn text_io_wrapper_type() -> PyObjectRef {
-    textio::type_object()
+    interp_textio::type_object()
 }
 
 /// Whether `obj` has the `W_BytesIO` layout, including a Python subclass.
@@ -1480,11 +1480,11 @@ pub(crate) fn fileio_type() -> PyObjectRef {
 
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn windows_console_io_type() -> PyObjectRef {
-    winconsoleio::type_object()
+    interp_win32consoleio::type_object()
 }
 
 pub(crate) fn buffered_reader_type() -> PyObjectRef {
-    buffered::type_object()
+    interp_bufferedio::type_object()
 }
 
 pub(crate) fn buffered_writer_type() -> PyObjectRef {
@@ -1645,13 +1645,13 @@ crate::py_module! {
         // `FileIO` derives from `_RawIOBase`; the buffered classes from
         // `_BufferedIOBase` (`Modules/_io/_iomodule.c` PyInit__io).
         let file_io = fileio_type();
-        let buffered_reader = buffered::type_object();
+        let buffered_reader = interp_bufferedio::type_object();
         let buffered_writer = buffered_writer::type_object();
         let buffered_rwpair = buffered_rwpair::type_object();
         for (name, t) in [
             ("FileIO", file_io),
-            ("BytesIO", bytesio::type_object()),
-            ("StringIO", stringio::type_object()),
+            ("BytesIO", interp_bytesio::type_object()),
+            ("StringIO", interp_stringio::type_object()),
             ("BufferedReader", buffered_reader),
             ("BufferedWriter", buffered_writer),
             ("BufferedRWPair", buffered_rwpair),
@@ -1670,7 +1670,7 @@ crate::py_module! {
         // live on that one stream object.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
-            let console_io = winconsoleio::type_object();
+            let console_io = interp_win32consoleio::type_object();
             unsafe {
                 pyre_object::w_type_set_acceptable_as_base_class(console_io, true);
                 pyre_object::typeobject::w_type_set_hasdict(console_io, true);
