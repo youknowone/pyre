@@ -3135,6 +3135,15 @@ impl OptContext {
         }
     }
 
+    /// `emit_for_force` when the caller keeps the op as its box.
+    pub fn emit_for_force_rc(&mut self, op: majit_ir::OpRc) -> OpRef {
+        if self.in_final_emission {
+            self.emit_rc(op)
+        } else {
+            self.emit_extra_rc(self.current_pass_idx, op)
+        }
+    }
+
     /// optimizer.py new_const_item(arraydescr) — default value for
     /// the given item type.
     pub fn new_const_item(&mut self, item_type: Type) -> OpRef {
@@ -3158,12 +3167,12 @@ impl OptContext {
     }
 
     /// vstring.py getstrlen / 171-175 / 251-253 / 281-295
-    /// Per-subclass getstrlen() dispatch — returns a cached lgtop OpRef if
+    /// Per-subclass getstrlen() dispatch — returns a cached lgtop box if
     /// available, or computes/emits the length and caches in StrPtrInfo.lgtop.
-    /// Always returns a box (OpRef), never an i64 summary.
+    /// Always returns a box, never an i64 summary.
     ///
     /// Delegates to `getstrlen_for(opref, opref, mode)`.
-    pub fn getstrlen_opref(&mut self, opref: OpRef, mode: u8) -> OpRef {
+    pub fn getstrlen_opref(&mut self, opref: OpRef, mode: u8) -> Operand {
         self.getstrlen_for(opref, opref, mode)
     }
 
@@ -3175,7 +3184,7 @@ impl OptContext {
     /// PtrInfo.
     ///
     /// When both are the same, use `getstrlen_opref(opref, mode)` instead.
-    pub fn getstrlen_for(&mut self, info_opref: OpRef, op_opref: OpRef, mode: u8) -> OpRef {
+    pub fn getstrlen_for(&mut self, info_opref: OpRef, op_opref: OpRef, mode: u8) -> Operand {
         let resolved_box = self.get_box_replacement_operand_opt(info_opref);
         // vstring.py:112/283: if self.lgtop is not None: return self.lgtop
         if let Some(info) = resolved_box.as_ref().and_then(|b| self.getptrinfo(b))
@@ -3189,13 +3198,11 @@ impl OptContext {
             .and_then(|b| self.getptrinfo(b))
             .and_then(|info| info.get_known_str_length(self, mode));
         if let Some(len) = known_len {
-            let len_opref = self.make_constant_int(len);
-            // operand shim — write path through `materialize_operand_at` per the
-            // "Box always exists" invariant for set_forwarded mirrors.
+            let len_box = Operand::const_(majit_ir::Const::Int(len));
             if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
-                self.set_str_lgtop(&b, len_opref);
+                self.set_str_lgtop(&b, len_box.clone());
             }
-            return len_opref;
+            return len_box;
         }
         // vstring.py: VStringConcatInfo.getstrlen — recursive
         // dispatch: getstrlen on each child, then _int_add.
@@ -3216,13 +3223,10 @@ impl OptContext {
             // vstring.py:286-293
             let left_len = self.getstrlen_for(vleft, vleft, mode);
             let right_len = self.getstrlen_for(vright, vright, mode);
-            let left_len = self.materialize_operand_at(left_len);
-            let right_len = self.materialize_operand_at(right_len);
-            let result =
-                crate::optimizeopt::vstring::_int_add(&left_len, &right_len, self).to_opref();
+            let result = crate::optimizeopt::vstring::_int_add(&left_len, &right_len, self);
             // vstring.py: self.lgtop = _int_add(optstring, len1box, len2box)
             if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
-                self.set_str_lgtop(&b, result);
+                self.set_str_lgtop(&b, result.clone());
             }
             return result;
         }
@@ -3236,28 +3240,22 @@ impl OptContext {
             majit_ir::OpCode::Strlen
         };
         let arg1 = self.materialize_operand_at(op_resolved);
-        let strlen_op = majit_ir::Op::new(strlen_opcode, &[arg1]);
-        let result = self.emit_extra(self.current_pass_idx, strlen_op);
-        // vstring.py: lengthop.set_forwarded(self.getlenbound(mode))
-        // `set_forwarded` writes the bound unconditionally; route through
-        // `materialize_operand_at` so the new STRLEN/UNICODELEN box materializes for
-        // the IntBound install ("Box always exists" per resoperation.py).
-        // operand shim for `get_str_lenbound(&Operand)`; lazy-install of
-        // lenbound on the StrPtrInfo is a PtrInfo-internal mutation that
-        // RPython performs on the StrPtrInfo instance directly. Route
-        // through `materialize_operand_at` so the operand exists for the chain walk.
+        let lengthop = majit_ir::OpRc::new(majit_ir::Op::new(strlen_opcode, &[arg1]));
+        self.emit_extra_rc(self.current_pass_idx, lengthop.clone());
+        let result = Operand::from_bound_op(&lengthop);
+        // vstring.py: lengthop.set_forwarded(self.getlenbound(mode)). The
+        // lenbound is lazily installed on the StrPtrInfo, a PtrInfo-internal
+        // mutation.
         let lenbound = self
             .get_box_replacement_operand_opt(info_opref)
             .as_ref()
             .and_then(|b| self.get_str_lenbound(b));
-        if let Some(bound) = lenbound
-            && let Some(result_box) = self.get_box_replacement_operand_opt(result)
-        {
-            self.setintbound(&result_box, &bound);
+        if let Some(bound) = lenbound {
+            self.setintbound(&result, &bound);
         }
         // vstring.py:117: self.lgtop = lengthop
         if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
-            self.set_str_lgtop(&b, result);
+            self.set_str_lgtop(&b, result.clone());
         }
         result
     }
@@ -3266,20 +3264,17 @@ impl OptContext {
     /// box in `StrPtrInfo.lgtop`. Direct PtrInfo field write,
     /// unconditional per `info.py`.
     ///
-    /// `op: &Operand` is the StrPtrInfo-bearing box; `lgtop: OpRef` is the
-    /// length op's position, materialized to its bound producer before the
-    /// cache write so the field carries an `Operand` (never a position-only
-    /// box).
-    pub(crate) fn set_str_lgtop(&mut self, op: &Operand, lgtop: OpRef) {
+    /// `op: &Operand` is the StrPtrInfo-bearing box; `lgtop` is the length
+    /// box.
+    pub(crate) fn set_str_lgtop(&mut self, op: &Operand, lgtop: Operand) {
         // optimizer.py `get_box_replacement` chain walk before mutation.
         let resolved = op.get_box_replacement(false);
         if resolved.is_constant() {
             return;
         }
-        let lgtop_op = self.materialize_operand_at(lgtop);
         self.with_ptr_info_mut(&resolved, |info| {
             if let PtrInfo::Str(si) = info {
-                si.lgtop = Some(lgtop_op.clone());
+                si.lgtop = Some(lgtop.clone());
             }
         });
     }

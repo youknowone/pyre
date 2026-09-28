@@ -139,10 +139,7 @@ pub fn copy_str_content(
                 // instance routes the read through the shared strgetitem
                 // (make_nonnull_str, slice rebase, concat recursion, virtual /
                 // ConstPtr fold, residual) instead of reimplementing it here.
-                let charbox = {
-                    let ch = OptString.strgetitem_emit_box(&srcbox, &src_offset, mode, ctx);
-                    ctx.materialize_operand_at(ch)
-                };
+                let charbox = OptString.strgetitem_emit_box(&srcbox, &src_offset, mode, ctx);
                 src_offset = _int_add(&src_offset, &one, ctx);
                 let arg_target = ctx.resolve_operand_operand(targetbox);
                 let arg_dst_off = ctx.resolve_operand_operand(&dst_offset);
@@ -281,7 +278,6 @@ pub fn string_copy_parts(
             // lengthbox = self.getstrlen(op, optstring, mode)
             // srcbox = self.force_box(op, optstring)  -- no-op for non-virtual
             let lengthbox = ctx.getstrlen_opref(opref.to_opref(), mode);
-            let lengthbox = ctx.materialize_operand_at(lengthbox);
             let srcbox = force_child_for_string(opref, ctx);
             let zero = Operand::const_(Const::Int(0));
             copy_str_content(
@@ -410,16 +406,16 @@ impl OptString {
     /// OptContext::getstrlen_opref which handles per-variant dispatch
     /// and lgtop caching (box identity reuse).
     #[allow(dead_code)]
-    fn getstrlen(&self, op: &Operand, ctx: &mut OptContext) -> OpRef {
+    fn getstrlen(&self, op: &Operand, ctx: &mut OptContext) -> Operand {
         let mode = self.get_mode(op, ctx);
         ctx.getstrlen_opref(op.to_opref(), mode)
     }
 
-    /// vstring.py:112-114 — get the strlen OpRef if already known,
+    /// vstring.py `StrPtrInfo.getstrlen` — get the strlen box if already known,
     /// without emitting a new op. Checks lgtop first (RPython parity),
     /// then structurally-known constant length on the virtual variant.
     #[allow(dead_code)]
-    fn getstrlen_if_known(&self, op: &Operand, ctx: &mut OptContext) -> Option<OpRef> {
+    fn getstrlen_if_known(&self, op: &Operand, ctx: &mut OptContext) -> Option<Operand> {
         let resolved_box = ctx.resolve_operand_operand_opt(op);
         // vstring.py:112: if self.lgtop is not None: return self.lgtop
         if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b))
@@ -437,14 +433,14 @@ impl OptString {
                 info.get_known_str_length(ctx, mode)
             });
         if let Some(len) = known_len {
-            let len_opref = ctx.make_constant_int(len);
+            let len_box = Operand::const_(Const::Int(len));
             // Cache in lgtop for identity reuse. `resolved_box` is Some here
             // (known_len required its ptr_info), so reuse it instead of
             // re-resolving (vstring.py:117/174/293).
             if let Some(b) = &resolved_box {
-                ctx.set_str_lgtop(b, len_opref);
+                ctx.set_str_lgtop(b, len_box.clone());
             }
-            return Some(len_opref);
+            return Some(len_box);
         }
         None
     }
@@ -459,7 +455,13 @@ impl OptString {
     /// `_strgetitem`. Returns None when the char is not statically known: the
     /// `_optimize_STRGETITEM` dispatcher keeps the op in that case (resbox=op),
     /// while the string-compare callers route through `strgetitem_emit`.
-    fn strgetitem(&self, s: &Operand, index: i64, mode: u8, ctx: &mut OptContext) -> Option<OpRef> {
+    fn strgetitem(
+        &self,
+        s: &Operand,
+        index: i64,
+        mode: u8,
+        ctx: &mut OptContext,
+    ) -> Option<Operand> {
         let resolved_box = ctx.resolve_operand_operand_opt(s);
         // vstring.py:487: self.make_nonnull_str(s, mode) — ensure the receiver
         // carries a (nonnull) string PtrInfo before it is read. A no-op when the
@@ -486,7 +488,7 @@ impl OptString {
                     .as_deref()
                     .and_then(|resolver| resolver(r, mode))
                     .and_then(|chars| chars.get(index as usize).copied())?;
-                Some(ctx.make_constant_int(ch_val))
+                Some(Operand::const_(Const::Int(ch_val)))
             }
             _ => None,
         }
@@ -496,7 +498,7 @@ impl OptString {
     /// string-compare and inline-copy callers. Resolves a virtual/constant char
     /// via `strgetitem`, otherwise emits a residual STRGETITEM. Always returns a
     /// box, matching `strgetitem(None, ...)`.
-    fn strgetitem_emit(&self, s: &Operand, index: i64, mode: u8, ctx: &mut OptContext) -> OpRef {
+    fn strgetitem_emit(&self, s: &Operand, index: i64, mode: u8, ctx: &mut OptContext) -> Operand {
         if let Some(r) = self.strgetitem(s, index, mode, ctx) {
             return r;
         }
@@ -530,7 +532,7 @@ impl OptString {
             // constant — is not `isinstance(len1box, ConstInt)`, so it falls
             // through to the residual STRGETITEM on the whole concat.
             let len1box = ctx.getstrlen_opref(concat.vleft.to_opref(), mode);
-            if let Some(len1) = ctx.isinstance_const_int(len1box) {
+            if let Some(len1) = len1box.const_int() {
                 return if idx < len1 {
                     self.strgetitem_emit(&concat.vleft, idx, mode, ctx)
                 } else {
@@ -551,7 +553,7 @@ impl OptString {
         index_box: &Operand,
         mode: u8,
         ctx: &mut OptContext,
-    ) -> OpRef {
+    ) -> Operand {
         let get_opcode = if mode == mode_unicode {
             OpCode::Unicodegetitem
         } else {
@@ -564,7 +566,9 @@ impl OptString {
         // and to emit_extra(current_pass_idx) during the pass — identical to
         // the previous emit_extra(current_pass_idx) for the pass-time
         // string-compare / dispatcher callers.
-        ctx.emit_for_force(Op::new(get_opcode, &[arg_str.clone(), arg_index.clone()]))
+        let getop = OpRc::new(Op::new(get_opcode, &[arg_str.clone(), arg_index.clone()]));
+        ctx.emit_for_force_rc(getop.clone());
+        Operand::from_bound_op(&getop)
     }
 
     /// vstring.py strgetitem(None, s, index, mode) with a box-valued
@@ -580,7 +584,7 @@ impl OptString {
         index: &Operand,
         mode: u8,
         ctx: &mut OptContext,
-    ) -> OpRef {
+    ) -> Operand {
         if let Some(idx) = ctx
             .resolve_operand_operand_opt(index)
             .and_then(|b| ctx.get_constant_int_box(&b))
@@ -712,7 +716,7 @@ impl OptString {
             && let Some(ch_ref) = self.strgetitem(&str_ref, idx, mode, ctx)
         {
             let b_old = Operand::from_bound_op(op_rc);
-            let b_new = ctx.get_box_replacement_operand(ch_ref);
+            let b_new = ctx.resolve_operand_operand(&ch_ref);
             ctx.make_equal_to(&b_old, &b_new);
             return OptimizationResult::Remove;
         }
@@ -788,7 +792,7 @@ impl OptString {
             // ConstInt, matching strgetitem_emit's concat gate; a constant
             // IntBound on a non-ConstInt length is not enough.
             let len1box = ctx.getstrlen_opref(concat.vleft.to_opref(), mode);
-            if let Some(len1) = ctx.isinstance_const_int(len1box) {
+            if let Some(len1) = len1box.const_int() {
                 let (child, child_idx) = if idx < len1 {
                     (concat.vleft.clone(), idx)
                 } else {
@@ -826,7 +830,7 @@ impl OptString {
             let lgtop = ctx.getstrlen_opref(op.arg(0).to_opref(), mode);
             // vstring.py:531: self.make_equal_to(op, lgtop)
             let b_old = Operand::from_bound_op(op_rc);
-            let b_lgtop = ctx.get_box_replacement_operand(lgtop);
+            let b_lgtop = ctx.resolve_operand_operand(&lgtop);
             ctx.make_equal_to(&b_old, &b_lgtop);
             return OptimizationResult::Remove;
         }
@@ -889,7 +893,7 @@ impl OptString {
                 // vstring.py: vresult = self.strgetitem(None, ...) —
                 // const-folds a virtual/constant char or emits a STRGETITEM.
                 let ch_ref = self.strgetitem_emit(&src_ref_box, src_start + index, mode, ctx);
-                let char_ref = ctx.get_replacement_opref(ch_ref);
+                let char_ref = ctx.get_replacement_opref(ch_ref.to_opref());
                 if dst_virtual {
                     dst_chars.push(Some(char_ref));
                 } else {
@@ -1181,9 +1185,9 @@ impl OptString {
             None
         };
         // vstring.py:706-712: isinstance(ConstInt) + different values
-        if let (Some(l1), Some(l2)) = (l1box, l2box) {
-            let l1c = ctx.isinstance_const_int(l1);
-            let l2c = ctx.isinstance_const_int(l2);
+        if let (Some(l1), Some(l2)) = (&l1box, &l2box) {
+            let l1c = l1.const_int();
+            let l2c = l2.const_int();
             if let (Some(v1), Some(v2)) = (l1c, l2c)
                 && v1 != v2
             {
@@ -1201,20 +1205,24 @@ impl OptString {
         }
         // vstring.py: handle_str_equal_level2 both directions, each
         // passing the strlen box of its second argument computed above.
-        if let Some(result) = self.handle_str_equal_level2(&arg1, &arg2, l2box, op, mode, ctx) {
+        if let Some(result) =
+            self.handle_str_equal_level2(&arg1, &arg2, l2box.as_ref(), op, mode, ctx)
+        {
             return result;
         }
-        if let Some(result) = self.handle_str_equal_level2(&arg2, &arg1, l1box, op, mode, ctx) {
+        if let Some(result) =
+            self.handle_str_equal_level2(&arg2, &arg1, l1box.as_ref(), op, mode, ctx)
+        {
             return result;
         }
         // vstring.py:727-732: nonnull fallback with same_box check
         let a_nonnull = i1 && self.is_known_nonnull(&arg1, ctx);
         let b_nonnull = i2 && self.is_known_nonnull(&arg2, ctx);
         if a_nonnull && b_nonnull {
-            // vstring.py:728: l1box.same_box(l2box) routes through
-            // `OptContext::same_box` (history.py) which combines
-            // `get_box_replacement` + identity + Const value equality.
-            let same_len = matches!((l1box, l2box), (Some(a), Some(b)) if ctx.same_box(a, b));
+            // `opt_call_stroruni_STR_EQUAL`: l1box.same_box(l2box), compared on the
+            // `get_box_replacement` of each length box.
+            let same_len = matches!((&l1box, &l2box), (Some(a), Some(b))
+                if a.get_box_replacement(false).same_box(&b.get_box_replacement(false)));
             let oopspec = if same_len {
                 OopSpecIndex::StreqLengthok
             } else {
@@ -1247,7 +1255,7 @@ impl OptString {
         } else {
             None
         };
-        let l2_const = l2box.and_then(|r| ctx.isinstance_const_int(r));
+        let l2_const = l2box.and_then(|r| r.const_int());
         // vstring.py:742-756: isinstance(l2box, ConstInt) checks
         if let Some(l2val) = l2_const {
             if l2val == 0 {
@@ -1256,8 +1264,7 @@ impl OptString {
                     // vstring.py:745: self.make_nonnull_str(arg1, mode)
                     ctx.make_nonnull_str(arg1, mode);
                     // vstring.py: lengthbox = i1.getstrlen(arg1, self, mode)
-                    let lengthbox = ctx.getstrlen_opref(arg1.to_opref(), mode);
-                    let arg_len = ctx.materialize_operand_at(lengthbox);
+                    let arg_len = ctx.getstrlen_opref(arg1.to_opref(), mode);
                     let arg_zero = Operand::const_(Const::Int(0));
                     let mut eq_op = Op::new(OpCode::IntEq, &[arg_len.clone(), arg_zero.clone()]);
                     eq_op.pos().set(op.pos().get());
@@ -1275,15 +1282,13 @@ impl OptString {
                 } else {
                     None
                 };
-                let l1_const = l1box.and_then(|r| ctx.isinstance_const_int(r));
+                let l1_const = l1box.and_then(|r| r.const_int());
                 if l1_const == Some(1) {
                     // vstring.py:761-768: both length 1 → compare chars. Each
                     // strgetitem either folds a virtual/const char or emits a
                     // STRGETITEM, so both operands are always available.
-                    let c1 = self.strgetitem_emit(arg1, 0, mode, ctx);
-                    let c2 = self.strgetitem_emit(arg2, 0, mode, ctx);
-                    let arg_ch1 = ctx.materialize_operand_at(c1);
-                    let arg_ch2 = ctx.materialize_operand_at(c2);
+                    let arg_ch1 = self.strgetitem_emit(arg1, 0, mode, ctx);
+                    let arg_ch2 = self.strgetitem_emit(arg2, 0, mode, ctx);
                     let mut eq_op = Op::new(OpCode::IntEq, &[arg_ch1.clone(), arg_ch2.clone()]);
                     eq_op.pos().set(op.pos().get());
                     // vstring.py:765-767: replace_op_with(INT_EQ, [c1, c2]) then
@@ -1296,7 +1301,7 @@ impl OptString {
                     let source = info.s.to_opref();
                     let start = info.start.to_opref();
                     let length = info.lgtop.to_opref();
-                    let vchar = self.strgetitem_emit(arg2, 0, mode, ctx);
+                    let vchar = self.strgetitem_emit(arg2, 0, mode, ctx).to_opref();
                     return self.generate_modified_call(
                         OopSpecIndex::StreqSliceChar,
                         &[source, start, length, vchar],
@@ -1338,7 +1343,7 @@ impl OptString {
         &self,
         arg1: &Operand,
         arg2: &Operand,
-        l2box: Option<OpRef>,
+        l2box: Option<&Operand>,
         op: &Op,
         mode: u8,
         ctx: &mut OptContext,
@@ -1346,12 +1351,12 @@ impl OptString {
         // vstring.py:792-805: if l2box: l2info = self.getintbound(l2box)
         if let Some(l2ref) = l2box {
             let l2info = {
-                let b = ctx.get_box_replacement_operand(l2ref);
+                let b = ctx.resolve_operand_operand(l2ref);
                 ctx.getintbound_handle(&b).borrow().clone()
             };
             if l2info.is_constant() && l2info.get_constant_int() == 1 {
                 // vstring.py: vchar = self.strgetitem(None, arg2, CONST_0, mode)
-                let vchar = self.strgetitem_emit(arg2, 0, mode, ctx);
+                let vchar = self.strgetitem_emit(arg2, 0, mode, ctx).to_opref();
                 // vstring.py:800-804
                 let oopspec = if self.is_known_nonnull(arg1, ctx) {
                     OopSpecIndex::StreqNonnullChar
@@ -1462,8 +1467,8 @@ impl OptString {
         let l1box = ctx.getstrlen_opref(op.arg(1).to_opref(), mode);
         let l2box = ctx.getstrlen_opref(op.arg(2).to_opref(), mode);
         // vstring.py:825-828: isinstance(ConstInt) and both == 1
-        let l1c = ctx.isinstance_const_int(l1box);
-        let l2c = ctx.isinstance_const_int(l2box);
+        let l1c = l1box.const_int();
+        let l2c = l2box.const_int();
         if l1c == Some(1) && l2c == Some(1) {
             // vstring.py:830-836: comparing two single chars. `replace_op_with`
             // rewrites the original op into INT_SUB(char1, char2) preserving its
@@ -1473,10 +1478,8 @@ impl OptString {
             // a final Emit, which would skip every subsequent pass. Mirror that
             // with a new op whose pos is the original result position
             // (replace_op_with) and a Restart result (send_extra_operation).
-            let char1 = self.strgetitem_emit(&op.arg(1), 0, mode, ctx);
-            let char2 = self.strgetitem_emit(&op.arg(2), 0, mode, ctx);
-            let arg_char1 = ctx.materialize_operand_at(char1);
-            let arg_char2 = ctx.materialize_operand_at(char2);
+            let arg_char1 = self.strgetitem_emit(&op.arg(1), 0, mode, ctx);
+            let arg_char2 = self.strgetitem_emit(&op.arg(2), 0, mode, ctx);
             let mut sub_op = Op::new(OpCode::IntSub, &[arg_char1.clone(), arg_char2.clone()]);
             sub_op.pos().set(op.pos().get());
             return OptimizationResult::Restart(sub_op);
@@ -2059,11 +2062,11 @@ mod tests {
         let slice_op = ctx.materialize_operand_at(slice_ref);
         // Get char at index 0 of the slice -> should be source[1] = int_op(201)
         let ch = pass.strgetitem(&slice_op, 0, mode_string, &mut ctx);
-        assert_eq!(ch, Some(OpRef::int_op(201)));
+        assert_eq!(ch.map(|b| b.to_opref()), Some(OpRef::int_op(201)));
 
         // Get char at index 1 of the slice -> should be source[2] = int_op(202)
         let ch = pass.strgetitem(&slice_op, 1, mode_string, &mut ctx);
-        assert_eq!(ch, Some(OpRef::int_op(202)));
+        assert_eq!(ch.map(|b| b.to_opref()), Some(OpRef::int_op(202)));
     }
 
     #[test]
@@ -2098,11 +2101,13 @@ mod tests {
 
         let slice_op = ctx.materialize_operand_at(slice_ref);
         assert_eq!(
-            pass.strgetitem(&slice_op, 0, mode_string, &mut ctx),
+            pass.strgetitem(&slice_op, 0, mode_string, &mut ctx)
+                .map(|b| b.to_opref()),
             Some(OpRef::int_op(201))
         );
         assert_eq!(
-            pass.strgetitem(&slice_op, 1, mode_string, &mut ctx),
+            pass.strgetitem(&slice_op, 1, mode_string, &mut ctx)
+                .map(|b| b.to_opref()),
             Some(OpRef::int_op(202))
         );
     }
@@ -2137,7 +2142,7 @@ mod tests {
             .extra_operations_after
             .back()
             .expect("strgetitem_emit must emit a residual STRGETITEM");
-        assert_eq!(res, op.pos().get());
+        assert_eq!(res, Operand::from_bound_op(op));
         assert_eq!(op.opcode, OpCode::Strgetitem);
         // arg0 is the SOURCE (ref_op(10)), not the slice (ref_op(11)); arg1 is
         // `start + 0`, which collapses back to the start box (int_op(300)).
@@ -2184,7 +2189,7 @@ mod tests {
                 op.arg(1).get_box_replacement(false),
             )
         };
-        assert_eq!(res, res_pos);
+        assert_eq!(res.to_opref(), res_pos);
         assert_eq!(opcode, OpCode::Strgetitem);
         // arg0 is the RIGHT child (ref_op(11)), not the concat (ref_op(12)).
         assert_eq!(arg0, vright_ref);
@@ -2354,7 +2359,7 @@ mod tests {
             .back()
             .expect("getstrlen must emit a len op");
 
-        assert_eq!(len_ref, last_op.pos().get());
+        assert_eq!(len_ref, Operand::from_bound_op(last_op));
         assert_eq!(last_op.opcode, OpCode::Unicodelen);
         assert_eq!(
             last_op
@@ -2603,22 +2608,26 @@ mod tests {
         let concat_op = ctx.materialize_operand_at(concat);
         // Index 0 -> left[0] = 200
         assert_eq!(
-            pass.strgetitem(&concat_op, 0, mode_string, &mut ctx),
+            pass.strgetitem(&concat_op, 0, mode_string, &mut ctx)
+                .map(|b| b.to_opref()),
             Some(OpRef::int_op(200))
         );
         // Index 1 -> left[1] = 201
         assert_eq!(
-            pass.strgetitem(&concat_op, 1, mode_string, &mut ctx),
+            pass.strgetitem(&concat_op, 1, mode_string, &mut ctx)
+                .map(|b| b.to_opref()),
             Some(OpRef::int_op(201))
         );
         // Index 2 -> right[0] = 202
         assert_eq!(
-            pass.strgetitem(&concat_op, 2, mode_string, &mut ctx),
+            pass.strgetitem(&concat_op, 2, mode_string, &mut ctx)
+                .map(|b| b.to_opref()),
             Some(OpRef::int_op(202))
         );
         // Index 3 -> right[1] = 203
         assert_eq!(
-            pass.strgetitem(&concat_op, 3, mode_string, &mut ctx),
+            pass.strgetitem(&concat_op, 3, mode_string, &mut ctx)
+                .map(|b| b.to_opref()),
             Some(OpRef::int_op(203))
         );
     }
@@ -2687,18 +2696,14 @@ mod tests {
         let first = ctx.getstrlen_opref(p0, 0);
         let second = ctx.getstrlen_opref(p0, 0);
         // vstring.py:174: self.lgtop = ConstInt(len(self._chars))
-        // Both calls must return the SAME cached OpRef.
+        // Both calls must return the SAME cached box.
         assert_eq!(
             first, second,
             "lgtop must be reused: first={:?}, second={:?}",
             first, second
         );
         // The cached value must equal the Plain length (3).
-        assert_eq!(
-            ctx.get_box_replacement_operand_opt(first)
-                .and_then(|cb| cb.const_int()),
-            Some(3)
-        );
+        assert_eq!(first.const_int(), Some(3));
     }
 
     /// vstring.py: StrPtrInfo.getstrlen caches STRLEN result in lgtop.
@@ -2772,20 +2777,12 @@ mod tests {
         // Second call must return the same cached OpRef.
         let l1_again = pass.getstrlen_if_known(&p0_op, &mut ctx);
         let l2_again = pass.getstrlen_if_known(&p1_op, &mut ctx);
-        assert_eq!(l1, l1_again, "lgtop identity: p0 must return same OpRef");
-        assert_eq!(l2, l2_again, "lgtop identity: p1 must return same OpRef");
+        assert_eq!(l1, l1_again, "lgtop identity: p0 must return same box");
+        assert_eq!(l2, l2_again, "lgtop identity: p1 must return same box");
 
         // Both have value 3, and RPython's same_box checks constant equality.
-        assert_eq!(
-            ctx.get_box_replacement_operand_opt(l1.unwrap())
-                .and_then(|cb| cb.const_int()),
-            Some(3)
-        );
-        assert_eq!(
-            ctx.get_box_replacement_operand_opt(l2.unwrap())
-                .and_then(|cb| cb.const_int()),
-            Some(3)
-        );
+        assert_eq!(l1.and_then(|cb| cb.const_int()), Some(3));
+        assert_eq!(l2.and_then(|cb| cb.const_int()), Some(3));
     }
 
     /// vstring.py: copy_str_content uses getintbound().is_constant()
@@ -2899,7 +2896,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![arg2]
         );
-        assert_eq!(strlen_ref, strlen_op.pos().get());
+        assert_eq!(strlen_ref, Operand::from_bound_op(strlen_op));
 
         // Subsequent call must return the cached lgtop.
         let strlen_ref2 = ctx.getstrlen_opref(arg2, 0);
@@ -2924,13 +2921,9 @@ mod tests {
 
         // getstrlen_opref should cache lgtop = ConstInt(3).
         let len1 = ctx.getstrlen_opref(p0, 0);
-        assert_eq!(
-            ctx.get_box_replacement_operand_opt(len1)
-                .and_then(|cb| cb.const_int()),
-            Some(3)
-        );
+        assert_eq!(len1.const_int(), Some(3));
 
-        // Query again — must return the same cached OpRef.
+        // Query again — must return the same cached box.
         let len2 = ctx.getstrlen_opref(p0, 0);
         assert_eq!(len1, len2, "force-then-strlen: lgtop must be reused");
     }

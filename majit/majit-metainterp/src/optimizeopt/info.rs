@@ -285,7 +285,7 @@ pub trait StrPtrInfoExt {
         ctx: &crate::optimizeopt::OptContext,
         mode: u8,
     ) -> Option<Vec<i64>>;
-    fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<OpRef>;
+    fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<Operand>;
 }
 
 impl StrPtrInfoExt for StrPtrInfo {
@@ -397,15 +397,11 @@ impl StrPtrInfoExt for StrPtrInfo {
 
     /// vstring.py / 172 / 230 `strgetitem()` shape, collapsed into a single
     /// variant-dispatch method on the Rust side.
-    fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<OpRef> {
+    fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<Operand> {
         let index = usize::try_from(index).ok()?;
         match &self.variant {
             VStringVariant::Ptr => None,
-            VStringVariant::Plain(info) => info
-                ._chars
-                .get(index)
-                .and_then(|o| o.as_ref())
-                .map(|b| b.to_opref()),
+            VStringVariant::Plain(info) => info._chars.get(index).and_then(|o| o.clone()),
             VStringVariant::Slice(info) => {
                 // vstring.py: index = _int_add(sinfo.start, index), then
                 // the fold proceeds on `getintbound(index).is_constant()` — the
@@ -471,7 +467,7 @@ pub trait PtrInfoExt {
 
     /// vstring.py / 230 `strgetitem()` on string ptrinfo —
     /// virtual dispatch only.
-    fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<OpRef>;
+    fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<Operand>;
 
     /// info.py visitor_dispatch_virtual_type / 369 / 376 / 445 / 485 / 598 / 701 +
     /// vstring.py / 263 / 333 `visitor_dispatch_virtual_type`.
@@ -938,7 +934,7 @@ impl PtrInfoExt for PtrInfo {
     /// vstring.py / 230 `strgetitem()` on string ptrinfo — virtual dispatch only.
     /// ConstPtr constant resolution is handled by `OptString::strgetitem`
     /// (vstring.py `_strgetitem`), which needs `&mut OptContext`.
-    fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<OpRef> {
+    fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<Operand> {
         match self {
             PtrInfo::Str(info) => info.strgetitem(index, ctx),
             _ => None,
@@ -1737,8 +1733,6 @@ fn force_box_impl(
                 VStringVariant::Concat(info) => {
                     let left_len = ctx.getstrlen_opref(info.vleft.to_opref(), mode);
                     let right_len = ctx.getstrlen_opref(info.vright.to_opref(), mode);
-                    let left_len = ctx.materialize_operand_at(left_len);
-                    let right_len = ctx.materialize_operand_at(right_len);
                     crate::optimizeopt::vstring::_int_add(&left_len, &right_len, ctx).to_opref()
                 }
                 VStringVariant::Ptr => unreachable!(),
@@ -2463,7 +2457,10 @@ mod tests {
             Some(vec![97, 98, 99])
         );
         assert_eq!(info.get_known_str_length(&ctx, 0), Some(3));
-        assert_eq!(info.strgetitem(1, &ctx), Some(OpRef::int_op(11)));
+        assert_eq!(
+            info.strgetitem(1, &ctx).map(|b| b.to_opref()),
+            Some(OpRef::int_op(11))
+        );
     }
 
     #[test]
@@ -2548,7 +2545,10 @@ mod tests {
         });
         assert_eq!(slice.get_known_str_length(&ctx, 0), Some(2));
         assert_eq!(slice.get_constant_string_spec(&ctx, 0), Some(vec![98, 99]));
-        assert_eq!(slice.strgetitem(0, &ctx), Some(OpRef::int_op(11)));
+        assert_eq!(
+            slice.strgetitem(0, &ctx).map(|b| b.to_opref()),
+            Some(OpRef::int_op(11))
+        );
 
         let concat = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
@@ -2586,7 +2586,10 @@ mod tests {
             concat.get_constant_string_spec(&ctx, 0),
             Some(vec![97, 98, 99, 98, 99])
         );
-        assert_eq!(concat.strgetitem(3, &ctx), Some(OpRef::int_op(11)));
+        assert_eq!(
+            concat.strgetitem(3, &ctx).map(|b| b.to_opref()),
+            Some(OpRef::int_op(11))
+        );
     }
 
     #[test]
