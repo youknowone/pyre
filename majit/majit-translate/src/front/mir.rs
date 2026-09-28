@@ -647,7 +647,7 @@ fn collect_ref_enum_instantiations(llbc: &Llbc) -> Vec<RefEnumInst> {
         };
         for bb in &u.body {
             for st in &bb.statements {
-                let Ok(StmtKind::Assign(_, Rvalue::Aggregate(kind, _))) = st.stmt_kind() else {
+                let Ok(StmtKind::Assign(_, Rvalue::Aggregate(kind, _))) = st.stmt_kind_ref() else {
                     continue;
                 };
                 let Some(head) = kind
@@ -6651,11 +6651,11 @@ impl<'a> Lowering<'a> {
             return vec![];
         }
         let succs = |bb: usize| -> Vec<usize> {
-            let Ok(term) = self.body.body[bb].term(self.llbc) else {
+            let Ok(term) = self.body.body[bb].term_ref(self.llbc) else {
                 return vec![];
             };
             let raw: Vec<u64> = match term {
-                TermKind::Goto { target } => vec![target],
+                TermKind::Goto { target } => vec![*target],
                 TermKind::Call {
                     target, on_unwind, ..
                 }
@@ -6664,12 +6664,12 @@ impl<'a> Lowering<'a> {
                 }
                 | TermKind::Drop {
                     target, on_unwind, ..
-                } => vec![target, on_unwind],
+                } => vec![*target, *on_unwind],
                 TermKind::Switch { targets, .. } => match targets {
-                    SwitchTargets::If(a, b) => vec![a, b],
+                    SwitchTargets::If(a, b) => vec![*a, *b],
                     SwitchTargets::SwitchInt(_, arms, default) => {
                         let mut v: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
-                        v.push(default);
+                        v.push(*default);
                         v
                     }
                 },
@@ -6759,20 +6759,20 @@ impl<'a> Lowering<'a> {
     /// a live merge predecessor.
     fn model_succs(&self, mir_bb: usize) -> Vec<usize> {
         let n = self.body.body.len();
-        let Ok(term) = self.body.body[mir_bb].term(self.llbc) else {
+        let Ok(term) = self.body.body[mir_bb].term_ref(self.llbc) else {
             return vec![];
         };
         let raw: Vec<u64> = match term {
-            TermKind::Goto { target } => vec![target],
+            TermKind::Goto { target } => vec![*target],
             TermKind::Call { target, .. }
             | TermKind::Assert { target, .. }
-            | TermKind::Drop { target, .. } => vec![target],
+            | TermKind::Drop { target, .. } => vec![*target],
             TermKind::Switch { targets, .. } => match targets {
-                SwitchTargets::If(a, b) => vec![a, b],
+                SwitchTargets::If(a, b) => vec![*a, *b],
                 SwitchTargets::SwitchInt(_, arms, default) => {
                     let mut v: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
-                    if !self.switch_default_targets_panic_abort(default) {
-                        v.push(default);
+                    if !self.switch_default_targets_panic_abort(*default) {
+                        v.push(*default);
                     }
                     v
                 }
@@ -6799,7 +6799,7 @@ impl<'a> Lowering<'a> {
             self.body
                 .body
                 .get(bb as usize)
-                .and_then(|b| b.term(self.llbc).ok()),
+                .and_then(|b| b.term_ref(self.llbc).ok()),
             Some(TermKind::Abort(_)) | Some(TermKind::UnwindResume)
         )
     }
@@ -11320,7 +11320,7 @@ impl<'a> Lowering<'a> {
         let mut return_alias: Option<u64> = None;
         for block in &body.body {
             for stmt in &block.statements {
-                match stmt.stmt_kind() {
+                match stmt.stmt_kind_ref() {
                     Ok(StmtKind::StorageLive(_))
                     | Ok(StmtKind::StorageDead(_))
                     | Ok(StmtKind::PlaceMention(_))
@@ -11336,7 +11336,7 @@ impl<'a> Lowering<'a> {
                             return None;
                         }
                         let mut vals = Vec::with_capacity(operands.len());
-                        for op in &operands {
+                        for op in operands {
                             let Operand::Const(value) = op else {
                                 return None;
                             };
@@ -11356,11 +11356,11 @@ impl<'a> Lowering<'a> {
                     }
                     Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) => {
                         let (PlaceKind::Local(dst), PlaceKind::Local(source)) =
-                            (place.kind, source.kind)
+                            (&place.kind, &source.kind)
                         else {
                             return None;
                         };
-                        if borrow.replace((dst, source)).is_some() {
+                        if borrow.replace((*dst, *source)).is_some() {
                             return None;
                         }
                     }
@@ -11383,7 +11383,7 @@ impl<'a> Lowering<'a> {
                     _ => return None,
                 }
             }
-            match block.term(self.llbc) {
+            match block.term_ref(self.llbc) {
                 Ok(TermKind::Return) | Ok(TermKind::Goto { .. }) => {}
                 _ => return None,
             }
@@ -11683,7 +11683,7 @@ impl<'a> Lowering<'a> {
         let mut saw_return = false;
         for block in &body.body {
             for stmt in &block.statements {
-                match stmt.stmt_kind() {
+                match stmt.stmt_kind_ref() {
                     Ok(StmtKind::StorageLive(_))
                     | Ok(StmtKind::StorageDead(_))
                     | Ok(StmtKind::PlaceMention(_))
@@ -11700,7 +11700,7 @@ impl<'a> Lowering<'a> {
                     _ => return None,
                 }
             }
-            match block.term(self.llbc) {
+            match block.term_ref(self.llbc) {
                 // Data-dependent control flow or an unreadable terminator:
                 // the const value would not be the unconditional size_of.
                 Ok(TermKind::Switch { .. }) | Ok(TermKind::Unknown) | Err(_) => {
@@ -19568,7 +19568,7 @@ impl<'a> Lowering<'a> {
         let mut ordering = std::collections::HashMap::<usize, String>::new();
         for bb in &self.body.body {
             for stmt in &bb.statements {
-                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(local) = place.kind else {
@@ -19580,7 +19580,7 @@ impl<'a> Lowering<'a> {
             }
         }
         for bb in &self.body.body {
-            let Ok(term) = bb.term(self.llbc) else {
+            let Ok(term) = bb.term_ref(self.llbc) else {
                 continue;
             };
             let TermKind::Call { call, .. } = term else {
@@ -20685,7 +20685,7 @@ impl<'a> Lowering<'a> {
             let mut is_fixed = false;
             for bb in &self.body.body {
                 for stmt in &bb.statements {
-                    let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                    let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                         continue;
                     };
                     if !matches!(&place.kind, PlaceKind::Local(i) if *i as usize == local) {
@@ -26658,7 +26658,7 @@ fn compute_binop_result_locals(body: &Unstructured) -> std::collections::HashSet
     let mut set = std::collections::HashSet::new();
     for bb in &body.body {
         for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
             };
             if matches!(rvalue, Rvalue::BinaryOp(..))
@@ -26686,11 +26686,11 @@ fn compute_multi_assigned_locals(
     };
     for bb in &body.body {
         for stmt in &bb.statements {
-            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind() {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() {
                 bump(&place);
             }
         }
-        if let Ok(TermKind::Call { call, .. }) = bb.term(llbc) {
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) {
             bump(&call.dest);
         }
     }
@@ -27504,13 +27504,13 @@ fn is_fresh_str_builder(cache: &ScanCache, body: &Unstructured, llbc: &Llbc, c: 
     let mut ctor_def = false;
     for bb in &body.body {
         for st in &bb.statements {
-            if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind()
+            if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
                 && matches!(place.kind, PlaceKind::Local(i) if i as usize == c)
             {
                 def_count += 1;
             }
         }
-        if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
             && matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == c)
         {
             def_count += 1;
@@ -27573,7 +27573,7 @@ fn append_piece_accumulator_of_arg_temp(
         for block in &body.body {
             for stmt in &block.statements {
                 let Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) =
-                    stmt.stmt_kind()
+                    stmt.stmt_kind_ref()
                 else {
                     continue;
                 };
@@ -27891,7 +27891,7 @@ fn is_vec_index_mut_call(reg: &RegularCall, index_ty: Option<&TyRef>, llbc: &Llb
 fn str_chars_view_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<(usize, usize)> {
     let mut sites = Vec::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let CallFunc::Regular(reg) = &call.func else {
@@ -28294,7 +28294,7 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
 fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
     let mut out = bit_set::BitSet::with_capacity(body.body.len());
     for (bb_idx, bb) in body.body.iter().enumerate() {
-        if let Ok(TermKind::Drop { place, fn_ptr, .. }) = bb.term(llbc)
+        if let Ok(TermKind::Drop { place, fn_ptr, .. }) = bb.term_ref(llbc)
             && drop_lowers_as_glue_call(&place, &fn_ptr, llbc)
         {
             out.insert(bb_idx);
@@ -28527,7 +28527,7 @@ fn base_traces_to_items_block_accessor_matching(
         let mut is_accessor = false;
         for bb in &body.body {
             for stmt in &bb.statements {
-                if let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind()
+                if let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref()
                     && matches!(&place.kind, PlaceKind::Local(i) if *i as usize == cur)
                 {
                     producers += 1;
@@ -28571,7 +28571,7 @@ fn base_traces_to_items_block_accessor_matching(
                     }
                 }
             }
-            if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+            if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
                 && matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == cur)
             {
                 producers += 1;
@@ -28725,7 +28725,7 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
     };
     for bb in &body.body {
         for stmt in &bb.statements {
-            match stmt.stmt_kind() {
+            match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
                     scan_rvalue_dest_ref(&rvalue, dest, &mut census.read_derefs, &mut census.other);
                     classify_write_place(
@@ -28744,7 +28744,7 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
                 _ => {}
             }
         }
-        match bb.term(llbc) {
+        match bb.term_ref(llbc) {
             Ok(TermKind::Switch { discr, .. }) => bump_dest_ref(
                 operand_dest_ref(&discr, dest),
                 &mut census.read_derefs,
@@ -29258,7 +29258,7 @@ impl<'a> RootStackAnalyzer<'a> {
             // constructor's pins land in the bracket this body now holds.
             let opens = owned.opener.values().any(|&open_bb| open_bb == bb_idx);
             touches = touches
-                || match bb.term(self.llbc) {
+                || match bb.term_ref(self.llbc) {
                     Ok(TermKind::Call { .. }) if opens => false,
                     Ok(TermKind::Call { call, .. }) => match &call.func {
                         CallFunc::Regular(reg) => {
@@ -29418,7 +29418,7 @@ fn owned_root_scopes(
     let mut opener = std::collections::HashMap::new();
     let mut twice = bit_set::BitSet::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let CallFunc::Regular(reg) = &call.func else {
@@ -29542,7 +29542,7 @@ impl OwnedRootScopes {
                 .iter()
                 .enumerate()
                 .filter(|(_, bb)| {
-                    matches!(bb.term(llbc), Ok(TermKind::Drop { place, .. })
+                    matches!(bb.term_ref(llbc), Ok(TermKind::Drop { place, .. })
                         if matches!(place.kind, PlaceKind::Local(l) if l as usize == scope))
                 })
                 .map(|(i, _)| i)
@@ -29584,18 +29584,18 @@ fn block_successors(llbc: &Llbc, body: &Unstructured, bb: usize) -> Vec<usize> {
             out.push(target);
         }
     };
-    match body.body[bb].term(llbc) {
-        Ok(TermKind::Goto { target }) => push(target),
+    match body.body[bb].term_ref(llbc) {
+        Ok(TermKind::Goto { target }) => push(*target),
         Ok(TermKind::Switch { targets, .. }) => match targets {
             SwitchTargets::If(a, b) => {
-                push(a);
-                push(b);
+                push(*a);
+                push(*b);
             }
             SwitchTargets::SwitchInt(_, arms, default) => {
                 for (_, target) in arms {
-                    push(target);
+                    push(*target);
                 }
-                push(default);
+                push(*default);
             }
         },
         Ok(TermKind::Call {
@@ -29607,8 +29607,8 @@ fn block_successors(llbc: &Llbc, body: &Unstructured, bb: usize) -> Vec<usize> {
         | Ok(TermKind::Drop {
             target, on_unwind, ..
         }) => {
-            push(target);
-            push(on_unwind);
+            push(*target);
+            push(*on_unwind);
         }
         _ => {}
     }
@@ -29685,9 +29685,9 @@ fn root_pin_runs_once_per_opening(
 /// edge is taken when the opener itself fails, before the guard holds a
 /// scope, so no block reached only that way runs inside the bracket.
 fn root_bracket_entry(llbc: &Llbc, body: &Unstructured, opener: usize) -> Vec<usize> {
-    match body.body[opener].term(llbc) {
-        Ok(TermKind::Call { target, .. }) if (target as usize) < body.body.len() => {
-            vec![target as usize]
+    match body.body[opener].term_ref(llbc) {
+        Ok(TermKind::Call { target, .. }) if (*target as usize) < body.body.len() => {
+            vec![*target as usize]
         }
         _ => block_successors(llbc, body, opener),
     }
@@ -29708,7 +29708,7 @@ fn root_bracket_region(
         if bb == opener || !region.insert(bb) {
             continue;
         }
-        if matches!(body.body[bb].term(llbc), Ok(TermKind::Drop { place, .. }) if matches!(place.kind, PlaceKind::Local(local) if local as usize == scope))
+        if matches!(body.body[bb].term_ref(llbc), Ok(TermKind::Drop { place, .. }) if matches!(place.kind, PlaceKind::Local(local) if local as usize == scope))
         {
             continue;
         }
@@ -29788,7 +29788,7 @@ fn root_pin_value_is_stable(llbc: &Llbc, body: &Unstructured, local: usize) -> b
     let watched: bit_set::BitSet = std::iter::once(local).collect();
     for bb in &body.body {
         for stmt in &bb.statements {
-            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() {
+            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind_ref() {
                 if matches!(place.kind, PlaceKind::Local(dest) if dest as usize == local) {
                     definitions += 1;
                 }
@@ -29799,7 +29799,7 @@ fn root_pin_value_is_stable(llbc: &Llbc, body: &Unstructured, local: usize) -> b
                 }
             }
         }
-        if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
             && matches!(call.dest.kind, PlaceKind::Local(dest) if dest as usize == local)
         {
             definitions += 1;
@@ -29898,7 +29898,7 @@ fn root_bracket_stack_effects_are_known(
             continue;
         }
         for stmt in &body.body[bb].statements {
-            match stmt.stmt_kind() {
+            match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Borrowck(_)) => {
                 }
                 Ok(StmtKind::Assign(place, _)) if matches!(place.kind, PlaceKind::Local(_)) => {
@@ -29910,7 +29910,7 @@ fn root_bracket_stack_effects_are_known(
                 _ => return false,
             }
         }
-        match body.body[bb].term(llbc) {
+        match body.body[bb].term_ref(llbc) {
             Ok(TermKind::Drop { place, .. }) if matches!(place.kind, PlaceKind::Local(local) if local as usize == scope) =>
             {
                 continue;
@@ -30129,7 +30129,7 @@ fn analyze_root_brackets_with(
     let mut opener_block: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let CallFunc::Regular(reg) = &call.func else {
@@ -30160,20 +30160,20 @@ fn analyze_root_brackets_with(
     let mut aliases: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for bb in &body.body {
         for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(place, Rvalue::Ref { place: src, .. })) = stmt.stmt_kind()
+            let Ok(StmtKind::Assign(place, Rvalue::Ref { place: src, .. })) = stmt.stmt_kind_ref()
             else {
                 continue;
             };
-            let (PlaceKind::Local(dest), PlaceKind::Local(scope)) = (place.kind, src.kind) else {
+            let (PlaceKind::Local(dest), PlaceKind::Local(scope)) = (&place.kind, &src.kind) else {
                 continue;
             };
-            if !candidates.contains(scope as usize) {
+            if !candidates.contains(*scope as usize) {
                 continue;
             }
-            if let Some(previous) = aliases.insert(dest as usize, scope as usize) {
+            if let Some(previous) = aliases.insert(*dest as usize, *scope as usize) {
                 // One temporary borrowing two guards: give up on both.
                 candidates.remove(previous);
-                candidates.remove(scope as usize);
+                candidates.remove(*scope as usize);
             }
         }
     }
@@ -30185,7 +30185,7 @@ fn analyze_root_brackets_with(
     let mut assigned: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for bb in &body.body {
         for stmt in &bb.statements {
-            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind()
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
                 && let PlaceKind::Local(dest) = place.kind
             {
                 *assigned.entry(dest as usize).or_default() += 1;
@@ -30221,7 +30221,7 @@ fn analyze_root_brackets_with(
     let mut pin_runs: std::collections::HashMap<usize, (usize, Vec<usize>, Vec<usize>)> =
         std::collections::HashMap::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let CallFunc::Regular(reg) = &call.func else {
@@ -30237,7 +30237,7 @@ fn analyze_root_brackets_with(
             && path.split("::").any(|s| s == ROOT_SCOPE_MODULE)
         {
             let (Some(slice), PlaceKind::Local(dest)) =
-                (operand_local(call.args.first()), call.dest.kind)
+                (operand_local(call.args.first()), &call.dest.kind)
             else {
                 continue;
             };
@@ -30249,7 +30249,7 @@ fn analyze_root_brackets_with(
             };
             pin_runs.insert(bb_idx, (scope, run.0, run.1));
             free_sites.insert(bb_idx, scope);
-            bases.insert(dest as usize, scope);
+            bases.insert(*dest as usize, scope);
             continue;
         }
         let pins_many = path.rsplit("::").next() == Some("pin_roots") && call.args.len() == 2;
@@ -30257,7 +30257,7 @@ fn analyze_root_brackets_with(
             continue;
         }
         let (Some(receiver), PlaceKind::Local(dest)) =
-            (operand_local(call.args.first()), call.dest.kind)
+            (operand_local(call.args.first()), &call.dest.kind)
         else {
             continue;
         };
@@ -30275,7 +30275,7 @@ fn analyze_root_brackets_with(
             };
             pin_runs.insert(bb_idx, (scope, run.0, run.1));
         }
-        bases.insert(dest as usize, scope);
+        bases.insert(*dest as usize, scope);
     }
     // A copy of a `base()` result answers for the same slot, provided nothing
     // else ever writes the temporary that holds it.
@@ -30285,15 +30285,16 @@ fn analyze_root_brackets_with(
         changed = false;
         for bb in &body.body {
             for stmt in &bb.statements {
-                let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind() else {
-                    continue;
-                };
-                let (PlaceKind::Local(dest), Some(src)) =
-                    (place.kind, operand_local(Some(&operand)))
+                let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind_ref()
                 else {
                     continue;
                 };
-                let dest = dest as usize;
+                let (PlaceKind::Local(dest), Some(src)) =
+                    (&place.kind, operand_local(Some(&operand)))
+                else {
+                    continue;
+                };
+                let dest = *dest as usize;
                 if bases.contains_key(&dest) || !bases.contains_key(&src) {
                     continue;
                 }
@@ -30326,7 +30327,7 @@ fn analyze_root_brackets_with(
         std::collections::HashMap::new();
     for bb in &body.body {
         for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(place, Rvalue::BinaryOp(op, lhs, rhs))) = stmt.stmt_kind()
+            let Ok(StmtKind::Assign(place, Rvalue::BinaryOp(op, lhs, rhs))) = stmt.stmt_kind_ref()
             else {
                 continue;
             };
@@ -30353,7 +30354,7 @@ fn analyze_root_brackets_with(
     }
     for bb in &body.body {
         for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind_ref() else {
                 continue;
             };
             let PlaceKind::Local(dest) = place.kind else {
@@ -30401,7 +30402,7 @@ fn analyze_root_brackets_with(
     let mut gets: Vec<(usize, usize, usize)> = Vec::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
         for stmt in &bb.statements {
-            match stmt.stmt_kind() {
+            match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_))
                 | Ok(StmtKind::StorageDead(_))
                 | Ok(StmtKind::Borrowck(_)) => continue,
@@ -30439,7 +30440,7 @@ fn analyze_root_brackets_with(
             }
         }
         let term_kind = body.body[bb_idx].terminator.kind_value();
-        match bb.term(llbc) {
+        match bb.term_ref(llbc) {
             Ok(TermKind::Drop {
                 place:
                     Place {
@@ -30447,7 +30448,7 @@ fn analyze_root_brackets_with(
                         ..
                     },
                 ..
-            }) if candidates.contains(local as usize) => continue,
+            }) if candidates.contains(*local as usize) => continue,
             // The overflow check on a `base + k` sum.  It fails only past
             // `usize::MAX`, and the lowering strips it like every assert.
             Ok(TermKind::Assert { assert, .. })
@@ -31034,7 +31035,8 @@ fn analyze_owner_roots_with(
         changed = false;
         for bb in &body.body {
             for stmt in &bb.statements {
-                let Ok(StmtKind::Assign(place, Rvalue::Ref { place: src, .. })) = stmt.stmt_kind()
+                let Ok(StmtKind::Assign(place, Rvalue::Ref { place: src, .. })) =
+                    stmt.stmt_kind_ref()
                 else {
                     continue;
                 };
@@ -31072,7 +31074,7 @@ fn analyze_owner_roots_with(
     let names_watched = |op: &Operand| operand_local(Some(op)).is_some_and(|l| watched.contains(l));
     for bb in &body.body {
         for stmt in &bb.statements {
-            match stmt.stmt_kind() {
+            match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Borrowck(_)) => {
                     continue;
                 }
@@ -31099,7 +31101,7 @@ fn analyze_owner_roots_with(
                 return refuse();
             }
         }
-        match bb.term(llbc) {
+        match bb.term_ref(llbc) {
             Ok(TermKind::Drop {
                 place:
                     Place {
@@ -31107,7 +31109,7 @@ fn analyze_owner_roots_with(
                         ..
                     },
                 ..
-            }) if roots.contains(local as usize) => {}
+            }) if roots.contains(*local as usize) => {}
             Ok(TermKind::Call { call, .. }) => {
                 let callee = match &call.func {
                     CallFunc::Regular(reg) => callee_of(reg),
@@ -31640,7 +31642,7 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
     let mut index_call: std::collections::HashMap<usize, (Option<usize>, Option<usize>)> =
         std::collections::HashMap::new();
     for bb in &body.body {
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let CallFunc::Regular(reg) = &call.func else {
@@ -31707,7 +31709,7 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
     }
     for (bb_idx, bb) in body.body.iter().enumerate() {
         for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() else {
                 continue;
             };
             if let Some(p) = deref_write_base_local(&place)
@@ -31738,7 +31740,7 @@ fn compute_mir_liveness(
 
     for (bb_idx, bb) in body.body.iter().enumerate() {
         for stmt in &bb.statements {
-            let Ok(kind) = stmt.stmt_kind() else {
+            let Ok(kind) = stmt.stmt_kind_ref() else {
                 continue;
             };
             match kind {
@@ -31758,44 +31760,44 @@ fn compute_mir_liveness(
                 | StmtKind::Unknown => {}
             }
         }
-        let Ok(term) = bb.term(llbc) else {
+        let Ok(term) = bb.term_ref(llbc) else {
             continue;
         };
         match term {
             TermKind::Return => mark_local_use(0, &mut uses[bb_idx], &defs[bb_idx], n_locals),
             TermKind::Goto { target } => {
-                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, target, n_blocks)
+                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks)
             }
             TermKind::Switch { discr, targets } => {
                 mark_operand_use(&discr, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 match targets {
                     SwitchTargets::If(a, b) => {
-                        push_successor(&mut succs[bb_idx], &mut preds, bb_idx, a, n_blocks);
-                        push_successor(&mut succs[bb_idx], &mut preds, bb_idx, b, n_blocks);
+                        push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *a, n_blocks);
+                        push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *b, n_blocks);
                     }
                     SwitchTargets::SwitchInt(_, arms, default) => {
                         for (_, bb) in arms {
-                            push_successor(&mut succs[bb_idx], &mut preds, bb_idx, bb, n_blocks);
+                            push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *bb, n_blocks);
                         }
-                        push_successor(&mut succs[bb_idx], &mut preds, bb_idx, default, n_blocks);
+                        push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *default, n_blocks);
                     }
                 }
             }
             TermKind::Call { call, target, .. } => {
                 mark_call_uses(&call, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 mark_place_write(&call.dest, &mut uses[bb_idx], &mut defs[bb_idx], n_locals);
-                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, target, n_blocks);
+                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks);
             }
             TermKind::Assert { assert, target, .. } => {
                 mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx], n_locals);
-                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, target, n_blocks);
+                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks);
             }
             TermKind::Drop { place, target, .. } => {
                 // Glue calls read the dropped local; erased drops do not.
                 if glue_call_drops.contains(bb_idx) {
                     mark_place_use(&place, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 }
-                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, target, n_blocks)
+                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks)
             }
             TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {}
         }
@@ -39120,7 +39122,7 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
     for _ in 0..8192 {
         let block = u.body.get(bb)?;
         for stmt in &block.statements {
-            match stmt.stmt_kind() {
+            match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_))
                 | Ok(StmtKind::StorageDead(_))
                 | Ok(StmtKind::PlaceMention(_))
@@ -39145,14 +39147,14 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 _ => return None,
             }
         }
-        match block.term(llbc).ok()? {
+        match block.term_ref(llbc).ok()? {
             TermKind::Return => {
                 return match locals.get(&0)? {
                     ArrVal::Arr(items) => Some(items.clone()),
                     _ => None,
                 };
             }
-            TermKind::Goto { target } => bb = target as usize,
+            TermKind::Goto { target } => bb = *target as usize,
             TermKind::Assert { assert, target, .. } => {
                 let ArrVal::Lit(ConstLit::Bool(cond)) =
                     eval_arr_operand(llbc, &locals, &assert.cond)?
@@ -39162,7 +39164,7 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 if cond != assert.expected {
                     return None;
                 }
-                bb = target as usize;
+                bb = *target as usize;
             }
             TermKind::Switch { discr, targets } => {
                 let ArrVal::Lit(ConstLit::Bool(cond)) = eval_arr_operand(llbc, &locals, &discr)?
@@ -39172,14 +39174,14 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 let SwitchTargets::If(then_bb, else_bb) = targets else {
                     return None;
                 };
-                bb = (if cond { then_bb } else { else_bb }) as usize;
+                bb = *(if cond { then_bb } else { else_bb }) as usize;
             }
             TermKind::Call { call, target, .. } => {
                 let PlaceKind::Local(dst) = call.dest.kind else {
                     return None;
                 };
                 locals.insert(dst, eval_arr_call(llbc, &locals, &call, depth)?);
-                bb = target as usize;
+                bb = *target as usize;
             }
             TermKind::UnwindResume | TermKind::Abort(_) => return None,
             _ => return None,
@@ -39436,7 +39438,7 @@ fn const_eval_init_body_with_locals(
     for _ in 0..64 {
         let block = u.body.get(bb)?;
         for stmt in &block.statements {
-            match stmt.stmt_kind() {
+            match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_))
                 | Ok(StmtKind::StorageDead(_))
                 | Ok(StmtKind::PlaceMention(_))
@@ -39491,9 +39493,9 @@ fn const_eval_init_body_with_locals(
                 _ => return None,
             }
         }
-        match block.term(llbc).ok()? {
+        match block.term_ref(llbc).ok()? {
             TermKind::Return => return locals.get(&0).copied(),
-            TermKind::Goto { target } => bb = target as usize,
+            TermKind::Goto { target } => bb = *target as usize,
             TermKind::Assert { assert, target, .. } => {
                 let ConstLit::Bool(cond) = eval_operand(&locals, &assert.cond)? else {
                     return None;
@@ -39501,7 +39503,7 @@ fn const_eval_init_body_with_locals(
                 if cond != assert.expected {
                     return None;
                 }
-                bb = target as usize;
+                bb = *target as usize;
             }
             TermKind::Call { call, target, .. } => {
                 let PlaceKind::Local(dst) = call.dest.kind else {
@@ -39509,7 +39511,7 @@ fn const_eval_init_body_with_locals(
                 };
                 if let Some(size) = const_eval_size_align_call(llbc, &call) {
                     locals.insert(dst, size);
-                    bb = target as usize;
+                    bb = *target as usize;
                 } else {
                     let CallFunc::Regular(reg) = &call.func else {
                         return None;
@@ -39532,7 +39534,7 @@ fn const_eval_init_body_with_locals(
                         dst,
                         const_narrow_to_target(const_literal_ty(llbc, &call.dest.ty), result),
                     );
-                    bb = target as usize;
+                    bb = *target as usize;
                 }
             }
             _ => return None,
@@ -56520,7 +56522,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &run,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&run, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56540,7 +56542,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &constant,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&constant, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56559,7 +56561,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &restored,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&restored, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56578,7 +56580,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &clobbered,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&clobbered, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56600,7 +56602,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &free,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&free, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56620,7 +56622,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &stray,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&stray, bit_set::BitSet::new()),
             name_of,
             touches,
         );
