@@ -7014,6 +7014,84 @@ impl FuncEffects {
     }
 }
 
+/// A funcobj's flow graph, built on first demand
+/// (`description.py FunctionDesc.cachedgraph`). Clones share the one graph.
+#[derive(Clone)]
+pub struct LazyGraph(std::rc::Rc<LazyGraphCell>);
+
+struct LazyGraphCell {
+    graph: std::cell::OnceCell<Option<std::rc::Rc<FunctionGraph>>>,
+    build: std::cell::Cell<Option<Box<dyn FnOnce() -> Option<FunctionGraph>>>>,
+}
+
+impl LazyGraph {
+    /// A graph that is already built.
+    pub fn built(graph: impl Into<std::rc::Rc<FunctionGraph>>) -> Self {
+        Self(std::rc::Rc::new(LazyGraphCell {
+            graph: std::cell::OnceCell::from(Some(graph.into())),
+            build: std::cell::Cell::new(None),
+        }))
+    }
+
+    /// A graph `build` produces on first demand; `None` from `build` means
+    /// the funcobj has no graph.
+    pub fn deferred(build: impl FnOnce() -> Option<FunctionGraph> + 'static) -> Self {
+        Self(std::rc::Rc::new(LazyGraphCell {
+            graph: std::cell::OnceCell::new(),
+            build: std::cell::Cell::new(Some(Box::new(build))),
+        }))
+    }
+
+    /// The graph, built on the first call.
+    pub fn get(&self) -> Option<&std::rc::Rc<FunctionGraph>> {
+        let cell = &*self.0;
+        cell.graph
+            .get_or_init(|| cell.build.take()?().map(std::rc::Rc::new))
+            .as_ref()
+    }
+
+    /// Whether the graph has been built (or found absent) already.
+    pub fn is_built(&self) -> bool {
+        self.0.graph.get().is_some()
+    }
+
+    /// The graph for writing. A graph another holder shares is copied
+    /// first, so the write is seen through this handle only.
+    pub fn get_mut(&mut self) -> Option<&mut FunctionGraph> {
+        if std::rc::Rc::get_mut(&mut self.0).is_none() {
+            *self = match self.get() {
+                Some(graph) => Self::built(graph.clone()),
+                None => return None,
+            };
+        }
+        let cell = std::rc::Rc::get_mut(&mut self.0).expect("unshared handle");
+        if cell.graph.get().is_none() {
+            let built = cell
+                .build
+                .take()
+                .and_then(|build| build())
+                .map(std::rc::Rc::new);
+            let _ = cell.graph.set(built);
+        }
+        cell.graph.get_mut()?.as_mut().map(std::rc::Rc::make_mut)
+    }
+
+    /// Whether both handles share one graph.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl fmt::Debug for LazyGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.graph.get() {
+            Some(Some(graph)) => graph.fmt(f),
+            Some(None) => f.write_str("LazyGraph(<no graph>)"),
+            None => f.write_str("LazyGraph(<not built>)"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionGraph {
     pub name: String,

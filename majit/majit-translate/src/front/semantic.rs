@@ -46,7 +46,7 @@ pub type LoweringAbort = FlowingError;
 #[derive(Debug, Clone)]
 pub struct SemanticFunction {
     pub name: String,
-    pub(in crate::front) graph: FunctionGraph,
+    pub(in crate::front) graph: crate::model::LazyGraph,
     /// RPython: `op.result.concretetype` — full return type string.
     /// Used for array identity resolution on Call result values.
     pub return_type: Option<String>,
@@ -116,11 +116,13 @@ pub struct SemanticFunction {
 impl SemanticFunction {
     /// The function's flow graph (`description.py FunctionDesc.getuniquegraph`).
     pub fn graph(&self) -> &FunctionGraph {
-        &self.graph
+        self.graph.get().expect("a SemanticFunction has a graph")
     }
 
     pub fn graph_mut(&mut self) -> &mut FunctionGraph {
-        &mut self.graph
+        self.graph
+            .get_mut()
+            .expect("a SemanticFunction has a graph")
     }
 }
 
@@ -661,7 +663,12 @@ impl<'a> MirGraphLookup<'a> {
         let mut free_functions: HashMap<&'a str, Result<&'a FunctionGraph, ()>> = HashMap::new();
         for f in &program.functions {
             if let Some(owner) = f.self_ty_root.as_deref() {
-                Self::insert_or_mark_ambiguous(&mut impl_methods, owner, f.name.as_str(), &f.graph);
+                Self::insert_or_mark_ambiguous(
+                    &mut impl_methods,
+                    owner,
+                    f.name.as_str(),
+                    f.graph(),
+                );
                 // Also index by the bare leaf for callers that pass an
                 // unqualified owner (e.g. top-level `impl Drop for
                 // PyFrame` reached through `for_type`).  Bare leaf is the
@@ -673,19 +680,23 @@ impl<'a> MirGraphLookup<'a> {
                         &mut impl_methods,
                         leaf,
                         f.name.as_str(),
-                        &f.graph,
+                        f.graph(),
                     );
                 }
             } else if let Some(tr) = f.trait_root.as_deref() {
                 // Mark bare-leaf trait-name collisions ambiguous, mirroring
                 // the impl_methods / free_functions tables, so two distinct
                 // traits with a same-named default method do not last-win.
-                Self::insert_or_mark_ambiguous(&mut trait_defaults, tr, f.name.as_str(), &f.graph);
+                Self::insert_or_mark_ambiguous(&mut trait_defaults, tr, f.name.as_str(), f.graph());
             } else {
                 // Free function: index by bare name so the
                 // opcode-dispatch extractor can resolve
                 // `execute_opcode_step` and each `execute_<op>` handler.
-                Self::insert_free_or_mark_ambiguous(&mut free_functions, f.name.as_str(), &f.graph);
+                Self::insert_free_or_mark_ambiguous(
+                    &mut free_functions,
+                    f.name.as_str(),
+                    f.graph(),
+                );
             }
         }
         Self {
@@ -981,7 +992,7 @@ pub(crate) fn propagate_access_directly(
         hint_seeds.push(seeds);
         killed.push(dead);
         let mut func_edges = Vec::new();
-        for block in &func.graph.blocks {
+        for block in &func.graph().blocks {
             for op in &block.operations {
                 let crate::model::OpKind::Call { target, args, .. } = &op.kind else {
                     continue;
@@ -1048,7 +1059,7 @@ pub(crate) fn propagate_access_directly(
         for (i, func) in functions.iter().enumerate() {
             let mut seeds = hint_seeds[i].clone();
             if !flagged_params[i].is_empty() {
-                let inputargs = &func.graph.block(func.graph.startblock).inputargs;
+                let inputargs = &func.graph().block(func.graph().startblock).inputargs;
                 for &pos in &flagged_params[i] {
                     if let Some(arg) = inputargs.get(pos) {
                         seeds.insert(arg.id());
@@ -1083,7 +1094,7 @@ pub(crate) fn propagate_access_directly(
     }
 
     for (func, slots) in functions.iter_mut().zip(&flagged_params) {
-        func.graph.access_directly = !slots.is_empty();
+        func.graph_mut().access_directly = !slots.is_empty();
     }
 }
 
@@ -1115,7 +1126,7 @@ fn hint_seed_sets(
     let roots = class_roots(func);
     let mut seeds = std::collections::HashSet::new();
     let mut killed = std::collections::HashSet::new();
-    for block in &func.graph.blocks {
+    for block in &func.graph().blocks {
         for op in &block.operations {
             let crate::model::OpKind::Hint { value, kind } = &op.kind else {
                 continue;
@@ -1171,7 +1182,7 @@ fn class_roots(func: &SemanticFunction) -> std::collections::HashMap<u64, String
     }
 
     let mut roots: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
-    for block in &func.graph.blocks {
+    for block in &func.graph().blocks {
         for op in &block.operations {
             let Some(result) = &op.result else {
                 continue;
@@ -1219,7 +1230,7 @@ fn class_roots(func: &SemanticFunction) -> std::collections::HashMap<u64, String
     // `Hint` and `Link` are identity for the class; propagate across both.
     loop {
         let mut grew = false;
-        for block in &func.graph.blocks {
+        for block in &func.graph().blocks {
             for op in &block.operations {
                 let OpKind::Hint { value, .. } = &op.kind else {
                     continue;
@@ -1234,7 +1245,7 @@ fn class_roots(func: &SemanticFunction) -> std::collections::HashMap<u64, String
                 }
             }
             for link in &block.exits {
-                let target = func.graph.block(link.target);
+                let target = func.graph().block(link.target);
                 for (pos, arg) in link.args.iter().enumerate() {
                     let (Some(arg), Some(inputarg)) =
                         (arg.as_variable(), target.inputargs.get(pos))
@@ -1333,7 +1344,7 @@ fn is_representation_cast(segments: &[String]) -> bool {
 /// and the calls that consume the frame.
 fn alias_pairs(func: &SemanticFunction) -> Vec<(u64, u64)> {
     let mut pairs = Vec::new();
-    for block in &func.graph.blocks {
+    for block in &func.graph().blocks {
         for op in &block.operations {
             let crate::model::OpKind::Call { target, args, .. } = &op.kind else {
                 continue;
@@ -1349,7 +1360,7 @@ fn alias_pairs(func: &SemanticFunction) -> Vec<(u64, u64)> {
             }
         }
         for link in &block.exits {
-            let target = func.graph.block(link.target);
+            let target = func.graph().block(link.target);
             for (pos, arg) in link.args.iter().enumerate() {
                 if let (Some(arg), Some(inputarg)) = (arg.as_variable(), target.inputargs.get(pos))
                 {
@@ -1402,7 +1413,7 @@ mod tests {
     fn free_fn(name: &str) -> SemanticFunction {
         SemanticFunction {
             name: name.into(),
-            graph: FunctionGraph::new(name),
+            graph: crate::model::LazyGraph::built(FunctionGraph::new(name)),
             return_type: None,
             self_ty_root: None,
             trait_impl_id: None,
@@ -1428,16 +1439,19 @@ mod tests {
         let mut f = free_fn(name);
         let param = Variable::named("frame");
         declare_frame_param(&mut f, &param);
-        let start = f.graph.startblock;
+        let start = f.graph().startblock;
         let hinted = Variable::named("hinted");
         if let Some(kind) = hint {
-            f.graph.block_mut(start).operations.push(SpaceOperation {
-                result: Some(hinted.clone()),
-                kind: OpKind::Hint {
-                    value: param.clone(),
-                    kind,
-                },
-            });
+            f.graph_mut()
+                .block_mut(start)
+                .operations
+                .push(SpaceOperation {
+                    result: Some(hinted.clone()),
+                    kind: OpKind::Hint {
+                        value: param.clone(),
+                        kind,
+                    },
+                });
         }
         // With no hint the same slot passes the bare parameter, so the two
         // shapes differ only in whether the value was hinted.
@@ -1452,17 +1466,20 @@ mod tests {
                     }
                 })
                 .collect();
-            f.graph.block_mut(start).operations.push(SpaceOperation {
-                result: None,
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![(*callee).to_string()],
-                        fun_decl_id: None,
+            f.graph_mut()
+                .block_mut(start)
+                .operations
+                .push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: vec![(*callee).to_string()],
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(args),
+                        result_ty: ValueType::Void,
                     },
-                    args: crate::model::call_args(args),
-                    result_ty: ValueType::Void,
-                },
-            });
+                });
         }
         f
     }
@@ -1490,39 +1507,48 @@ mod tests {
         let mut f = free_fn(name);
         let param = Variable::named("frame");
         declare_frame_param(&mut f, &param);
-        let start = f.graph.startblock;
+        let start = f.graph().startblock;
         let hinted = Variable::named("hinted");
-        f.graph.block_mut(start).operations.push(SpaceOperation {
-            result: Some(hinted.clone()),
-            kind: OpKind::Hint {
-                value: param.clone(),
-                kind: crate::hints::HintKind::AccessDirectly,
-            },
-        });
+        f.graph_mut()
+            .block_mut(start)
+            .operations
+            .push(SpaceOperation {
+                result: Some(hinted.clone()),
+                kind: OpKind::Hint {
+                    value: param.clone(),
+                    kind: crate::hints::HintKind::AccessDirectly,
+                },
+            });
         let passed = if through_cast {
             let cast = Variable::named("cast");
-            f.graph.block_mut(start).operations.push(SpaceOperation {
-                result: Some(cast.clone()),
-                kind: crate::model::cast_pointer_call(receiver_root, hinted),
-            });
+            f.graph_mut()
+                .block_mut(start)
+                .operations
+                .push(SpaceOperation {
+                    result: Some(cast.clone()),
+                    kind: crate::model::cast_pointer_call(receiver_root, hinted),
+                });
             cast
         } else {
             hinted
         };
-        f.graph.block_mut(start).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::Call {
-                target: CallTarget::Method {
-                    name: method.to_string(),
-                    receiver_root: Some(receiver_root.to_string()),
-                    resolved_path: None,
-                    fun_decl_id: None,
-                    branch_payloads: None,
+        f.graph_mut()
+            .block_mut(start)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::Method {
+                        name: method.to_string(),
+                        receiver_root: Some(receiver_root.to_string()),
+                        resolved_path: None,
+                        fun_decl_id: None,
+                        branch_payloads: None,
+                    },
+                    args: crate::model::call_args(vec![passed]),
+                    result_ty: ValueType::Void,
                 },
-                args: crate::model::call_args(vec![passed]),
-                result_ty: ValueType::Void,
-            },
-        });
+            });
         f
     }
 
@@ -1531,16 +1557,19 @@ mod tests {
     /// class test has nothing to read and the hint seeds nothing.
     fn declare_frame_param(f: &mut SemanticFunction, param: &crate::flowspace::model::Variable) {
         use crate::model::{OpKind, SpaceOperation, ValueType};
-        let start = f.graph.startblock;
-        f.graph.block_mut(start).inputargs = vec![param.clone()];
-        f.graph.block_mut(start).operations.push(SpaceOperation {
-            result: Some(param.clone()),
-            kind: OpKind::Input {
-                name: "frame".to_string(),
-                ty: ValueType::Ref(Some("PyFrame".to_string())),
-                class_root: None,
-            },
-        });
+        let start = f.graph().startblock;
+        f.graph_mut().block_mut(start).inputargs = vec![param.clone()];
+        f.graph_mut()
+            .block_mut(start)
+            .operations
+            .push(SpaceOperation {
+                result: Some(param.clone()),
+                kind: OpKind::Input {
+                    name: "frame".to_string(),
+                    ty: ValueType::Ref(Some("PyFrame".to_string())),
+                    class_root: None,
+                },
+            });
     }
 
     /// The `_virtualizable_` declaration the tests hint against. Every test
@@ -1553,7 +1582,7 @@ mod tests {
     fn flags(functions: &[SemanticFunction]) -> Vec<(String, bool)> {
         functions
             .iter()
-            .map(|f| (f.name.clone(), f.graph.access_directly))
+            .map(|f| (f.name.clone(), f.graph().access_directly))
             .collect()
     }
 
@@ -1621,9 +1650,9 @@ mod tests {
             impl_method_qualified("PyFrame", "initialize_frame_scopes"),
         ];
         propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
-        assert!(!fns[0].graph.access_directly);
+        assert!(!fns[0].graph().access_directly);
         assert!(
-            fns[1].graph.access_directly,
+            fns[1].graph().access_directly,
             "a method call must reach its callee through the receiver root"
         );
     }
@@ -1639,8 +1668,8 @@ mod tests {
             impl_method_qualified("PyFrame", "run"),
         ];
         propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
-        assert!(!fns[1].graph.access_directly);
-        assert!(!fns[2].graph.access_directly);
+        assert!(!fns[1].graph().access_directly);
+        assert!(!fns[2].graph().access_directly);
     }
 
     /// The front end mints a fresh `Variable` for every block `inputarg`, so
@@ -1656,10 +1685,10 @@ mod tests {
         let mut caller = free_fn("dispatch");
         let param = Variable::named("frame");
         declare_frame_param(&mut caller, &param);
-        let start = caller.graph.startblock;
+        let start = caller.graph().startblock;
         let hinted = Variable::named("hinted");
         caller
-            .graph
+            .graph_mut()
             .block_mut(start)
             .operations
             .push(SpaceOperation {
@@ -1672,10 +1701,10 @@ mod tests {
         // The successor's inputarg is a DIFFERENT Variable, as the front end
         // mints it.
         let carried = Variable::named("carried");
-        let body = caller.graph.create_block();
-        caller.graph.block_mut(body).inputargs = vec![carried.clone()];
+        let body = caller.graph_mut().create_block();
+        caller.graph_mut().block_mut(body).inputargs = vec![carried.clone()];
         caller
-            .graph
+            .graph_mut()
             .block_mut(body)
             .operations
             .push(SpaceOperation {
@@ -1692,12 +1721,12 @@ mod tests {
                     result_ty: ValueType::Void,
                 },
             });
-        caller.graph.set_goto(start, body, vec![hinted]);
+        caller.graph_mut().set_goto(start, body, vec![hinted]);
 
         let mut fns = vec![caller, impl_method_qualified("PyFrame", "handle_bytecode")];
         propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(
-            fns[1].graph.access_directly,
+            fns[1].graph().access_directly,
             "a Link must carry the flag into the successor's inputarg"
         );
     }
@@ -1714,7 +1743,7 @@ mod tests {
         ];
         propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(
-            fns[1].graph.access_directly,
+            fns[1].graph().access_directly,
             "a representation cast must not lose the flag"
         );
     }
@@ -1737,7 +1766,7 @@ mod tests {
         // The hinted value is rooted `PyFrame`, but nothing declares it.
         propagate_access_directly(&mut fns, &Default::default(), &Default::default());
         assert!(
-            !fns[1].graph.access_directly,
+            !fns[1].graph().access_directly,
             "a hint on an undeclared class must not seed"
         );
     }
@@ -1760,7 +1789,7 @@ mod tests {
         let opaque: std::collections::HashSet<String> = ["residual".to_string()].into();
         propagate_access_directly(&mut fns, &opaque, &vable_roots());
         assert!(
-            !fns[1].graph.access_directly,
+            !fns[1].graph().access_directly,
             "a dont_look_inside callee must never carry the flag"
         );
     }
@@ -1785,7 +1814,7 @@ mod tests {
         let opaque: std::collections::HashSet<String> = ["helper".to_string()].into();
         propagate_access_directly(&mut fns, &opaque, &vable_roots());
         assert!(
-            !fns[1].graph.access_directly,
+            !fns[1].graph().access_directly,
             "a spec copy of a dont_look_inside helper must stay residual"
         );
     }
@@ -1805,8 +1834,8 @@ mod tests {
             free_fn("handle_bytecode"),
         ];
         propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
-        assert!(!fns[1].graph.access_directly);
-        assert!(!fns[2].graph.access_directly);
+        assert!(!fns[1].graph().access_directly);
+        assert!(!fns[2].graph().access_directly);
     }
 
     /// Upstream SPECIALIZES, so an unflagged caller keeps the original graph.
@@ -1825,7 +1854,7 @@ mod tests {
         ];
         propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(
-            !fns[2].graph.access_directly,
+            !fns[2].graph().access_directly,
             "reached with and without the flag must stay unflagged"
         );
     }
@@ -1843,9 +1872,9 @@ mod tests {
         // A callee that receives the flag, which then re-binds it away and
         // passes the result on.
         let mut mid = caller_hinting_arg0("app_profile_call", None, &[]);
-        let param = mid.graph.block(BlockId(0)).inputargs[0].clone();
+        let param = mid.graph().block(BlockId(0)).inputargs[0].clone();
         let normal = Variable::named("normal_w_object");
-        mid.graph
+        mid.graph_mut()
             .block_mut(BlockId(0))
             .operations
             .push(SpaceOperation {
@@ -1855,7 +1884,7 @@ mod tests {
                     kind: crate::hints::HintKind::NoAccessDirectly,
                 },
             });
-        mid.graph
+        mid.graph_mut()
             .block_mut(BlockId(0))
             .operations
             .push(SpaceOperation {
@@ -1881,11 +1910,11 @@ mod tests {
         ];
         propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(
-            fns[1].graph.access_directly,
+            fns[1].graph().access_directly,
             "app_profile_call itself is reached with the flag"
         );
         assert!(
-            !fns[2].graph.access_directly,
+            !fns[2].graph().access_directly,
             "the flag must not survive the access_directly=False re-bind"
         );
     }
@@ -1905,43 +1934,54 @@ mod tests {
         use crate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
 
         let mut ctor = free_fn("createframe_obj");
-        let start = ctor.graph.startblock;
+        let start = ctor.graph().startblock;
         let frame = Variable::named("frame");
-        ctor.graph.block_mut(start).operations.push(SpaceOperation {
-            result: Some(frame.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::synthetic_transparent_struct_ctor(
-                    vec!["pyre_interpreter".to_string(), "pyframe".to_string()],
-                    "PyFrame",
-                ),
-                args: Vec::new(),
-                result_ty: ValueType::Ref(Some("pyre_interpreter::pyframe::PyFrame".to_string())),
-            },
-        });
-        let hinted = Variable::named("hinted");
-        ctor.graph.block_mut(start).operations.push(SpaceOperation {
-            result: Some(hinted.clone()),
-            kind: OpKind::Hint {
-                value: frame,
-                kind: crate::hints::HintKind::FreshVirtualizable,
-            },
-        });
-        ctor.graph.block_mut(start).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec!["init_cells".to_string()],
-                    fun_decl_id: None,
+        ctor.graph_mut()
+            .block_mut(start)
+            .operations
+            .push(SpaceOperation {
+                result: Some(frame.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["pyre_interpreter".to_string(), "pyframe".to_string()],
+                        "PyFrame",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(
+                        "pyre_interpreter::pyframe::PyFrame".to_string(),
+                    )),
                 },
-                args: crate::model::call_args(vec![hinted]),
-                result_ty: ValueType::Void,
-            },
-        });
+            });
+        let hinted = Variable::named("hinted");
+        ctor.graph_mut()
+            .block_mut(start)
+            .operations
+            .push(SpaceOperation {
+                result: Some(hinted.clone()),
+                kind: OpKind::Hint {
+                    value: frame,
+                    kind: crate::hints::HintKind::FreshVirtualizable,
+                },
+            });
+        ctor.graph_mut()
+            .block_mut(start)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["init_cells".to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![hinted]),
+                    result_ty: ValueType::Void,
+                },
+            });
 
         let mut fns = vec![ctor, free_fn("init_cells")];
         propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(
-            fns[1].graph.access_directly,
+            fns[1].graph().access_directly,
             "the ctor's own name is the spelling the declared set holds"
         );
     }
@@ -1966,38 +2006,44 @@ mod tests {
         };
 
         let mut mid = caller_hinting_arg0("app_profile_call", None, &[]);
-        let start = mid.graph.startblock;
-        let param = mid.graph.block(BlockId(0)).inputargs[0].clone();
+        let start = mid.graph().startblock;
+        let param = mid.graph().block(BlockId(0)).inputargs[0].clone();
         let normal = Variable::named("normal_w_object");
-        mid.graph.block_mut(start).operations.push(SpaceOperation {
-            result: Some(normal.clone()),
-            kind: OpKind::Hint {
-                value: param.clone(),
-                kind: crate::hints::HintKind::NoAccessDirectly,
-            },
-        });
+        mid.graph_mut()
+            .block_mut(start)
+            .operations
+            .push(SpaceOperation {
+                result: Some(normal.clone()),
+                kind: OpKind::Hint {
+                    value: param.clone(),
+                    kind: crate::hints::HintKind::NoAccessDirectly,
+                },
+            });
 
         // The merge block's inputarg is a DIFFERENT Variable, as the front end
         // mints it, and both arms feed it.
         let merged = Variable::named("merged");
-        let body = mid.graph.create_block();
-        mid.graph.block_mut(body).inputargs = vec![merged.clone()];
-        mid.graph.block_mut(body).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec!["call_function".to_string()],
-                    fun_decl_id: None,
+        let body = mid.graph_mut().create_block();
+        mid.graph_mut().block_mut(body).inputargs = vec![merged.clone()];
+        mid.graph_mut()
+            .block_mut(body)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["call_function".to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![merged]),
+                    result_ty: ValueType::Void,
                 },
-                args: crate::model::call_args(vec![merged]),
-                result_ty: ValueType::Void,
-            },
-        });
+            });
         let still_flagged =
-            Link::from_variables(&mid.graph, vec![param], body, Some(ExitCase::Bool(true)));
+            Link::from_variables(mid.graph(), vec![param], body, Some(ExitCase::Bool(true)));
         let re_bound =
-            Link::from_variables(&mid.graph, vec![normal], body, Some(ExitCase::Bool(false)));
-        mid.graph.block_mut(start).exits = vec![still_flagged, re_bound];
+            Link::from_variables(mid.graph(), vec![normal], body, Some(ExitCase::Bool(false)));
+        mid.graph_mut().block_mut(start).exits = vec![still_flagged, re_bound];
 
         let mut fns = vec![
             caller_hinting_arg0(
@@ -2010,11 +2056,11 @@ mod tests {
         ];
         propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(
-            fns[1].graph.access_directly,
+            fns[1].graph().access_directly,
             "app_profile_call itself is still reached with the flag"
         );
         assert!(
-            !fns[2].graph.access_directly,
+            !fns[2].graph().access_directly,
             "a merge one arm re-bound away is not flagged, as `union` intersects"
         );
     }
@@ -2036,9 +2082,9 @@ mod tests {
         // flip it: give it only the unrelated operand.  Found by target
         // rather than by index — the startblock also carries the parameter
         // declaration and the hint.
-        let start = fns[0].graph.startblock;
+        let start = fns[0].graph().startblock;
         let log_call = fns[0]
-            .graph
+            .graph_mut()
             .block_mut(start)
             .operations
             .iter_mut()
@@ -2053,8 +2099,8 @@ mod tests {
             .expect("the log call");
         log_call[0] = crate::flowspace::model::Variable::named("unrelated").into();
         propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
-        assert!(fns[1].graph.access_directly, "handle_bytecode is flagged");
-        assert!(!fns[2].graph.access_directly, "log is not");
+        assert!(fns[1].graph().access_directly, "handle_bytecode is flagged");
+        assert!(!fns[2].graph().access_directly, "log is not");
     }
 
     fn impl_method(owner: &str, name: &str) -> SemanticFunction {

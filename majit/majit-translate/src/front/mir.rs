@@ -1806,7 +1806,7 @@ impl SemanticFunctionHeader {
         }
         crate::front::semantic::SemanticFunction {
             name: self.name,
-            graph,
+            graph: crate::model::LazyGraph::built(graph),
             return_type: self.return_type,
             self_ty_root: self.self_ty_root,
             trait_impl_id: self.trait_impl_id,
@@ -51019,7 +51019,7 @@ mod tests {
         }
         let functions = vec![crate::front::semantic::SemanticFunction {
             name: "array_shapes".into(),
-            graph,
+            graph: crate::model::LazyGraph::built(graph),
             return_type: None,
             self_ty_root: None,
             trait_impl_id: None,
