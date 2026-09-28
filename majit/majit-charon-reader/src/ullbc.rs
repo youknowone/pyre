@@ -19,7 +19,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 // FunDecl + meta
 
@@ -37,16 +37,10 @@ pub struct FunDecl {
     /// a `&T`-where-`T: Trait` parameter to its bound trait's name leaf.
     #[serde(default)]
     pub generics: Option<Value>,
-    /// Charon stamps this with the `GlobalDecl` id when the function
-    /// is a compiler-synthesised static / const initialiser body
-    /// (e.g. the body that constructs `static NONE_SINGLETON`'s
-    /// value).  Production lowering treats these as values rather
-    /// than call targets — they have no call sites in user code, and
-    /// their unwind paths use orphan exception slots that the
-    /// flowspace adapter cannot lift.  `None` for ordinary function
-    /// bodies.
+    /// Item origin. A global's initializer body is
+    /// `{"GlobalInitializer": {"id": <global def id>, ...}}`.
     #[serde(default)]
-    pub is_global_initializer: Option<u64>,
+    pub src: Option<Value>,
     /// `body` is `null` for opaque references and one of
     /// `{"Unstructured": {...}}`, `{"Structured": {...}}`, or
     /// `{"Error": {...}}` otherwise. Kept as the raw JSON text (not an
@@ -55,9 +49,37 @@ pub struct FunDecl {
     /// via [`FunDecl::unstructured`]. A schema change in the unused
     /// variants still does not break load.
     pub body: Option<Box<RawValue>>,
+    /// Class-1 hash-cons table shared by every decl in one artefact.
+    /// Switch arms name bool literals as `{"Deduplicated": id}`; the
+    /// body projection inlines those ids so `If` vs `SwitchInt` can be
+    /// told apart without a second parse of the artefact.
+    #[serde(skip)]
+    const_dedup: OnceLock<Arc<ConstDedupTable>>,
+}
+
+/// Sorted `dedup id → constant body` (`[kind, ty]`). Built once per
+/// artefact from the class-1 hash-cons entries.
+#[derive(Debug)]
+pub(crate) struct ConstDedupTable {
+    rows: Vec<(u64, Box<RawValue>)>,
+}
+
+impl ConstDedupTable {
+    pub(crate) fn from_rows(rows: Vec<(u64, Box<RawValue>)>) -> Self {
+        Self { rows }
+    }
+
+    fn get(&self, id: u64) -> Option<Value> {
+        let index = self.rows.binary_search_by_key(&id, |row| row.0).ok()?;
+        serde_json::from_str(self.rows[index].1.get()).ok()
+    }
 }
 
 impl FunDecl {
+    pub(crate) fn set_const_dedup(&self, table: Arc<ConstDedupTable>) {
+        let _ = self.const_dedup.set(table);
+    }
+
     /// Return the `Unstructured` (basic-block CFG) body if present.
     pub fn unstructured(&self) -> Option<Unstructured> {
         #[derive(Deserialize)]
@@ -66,9 +88,13 @@ impl FunDecl {
             unstructured: Unstructured,
         }
         let body = self.body.as_ref()?;
-        serde_json::from_str::<Proj>(body.get())
-            .ok()
-            .map(|p| p.unstructured)
+        let mut unstructured = serde_json::from_str::<Proj>(body.get()).ok()?.unstructured;
+        if let Some(table) = self.const_dedup.get() {
+            for block in &mut unstructured.body {
+                expand_switch_arm_consts(&mut block.terminator.kind, table);
+            }
+        }
+        Some(unstructured)
     }
 
     /// Source name of the first argument local (local index 1; index 0 is the
@@ -112,6 +138,15 @@ impl FunDecl {
 
     /// Returns `Some(msg)` if Charon recorded a translation error
     /// (e.g. `"charon does not support thread local references"`).
+    /// Global this function initialises, when `src` is `GlobalInitializer`.
+    pub fn global_initializer_id(&self) -> Option<u64> {
+        self.src
+            .as_ref()?
+            .get("GlobalInitializer")?
+            .get("id")?
+            .as_u64()
+    }
+
     pub fn error_message(&self) -> Option<String> {
         #[derive(Deserialize)]
         struct Proj {
@@ -401,8 +436,24 @@ pub enum TypeDeclKind {
 pub struct FieldDecl {
     pub name: Option<String>,
     pub ty: TyRef,
+    /// Tuple/variant payload fields are positional. Their source name is
+    /// `_0`; the flow graph still spells that slot `__pos_0`.
+    #[serde(default)]
+    pub is_positional: bool,
     #[serde(default)]
     pub attr_info: Option<AttrInfo>,
+}
+
+impl FieldDecl {
+    pub fn flow_name(&self, index: usize) -> String {
+        if self.is_positional {
+            format!("__pos_{index}")
+        } else {
+            self.name
+                .clone()
+                .unwrap_or_else(|| format!("__pos_{index}"))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,9 +478,13 @@ impl VariantDecl {
     /// for an enum known to carry integer discriminants assert presence
     /// at the use site.
     pub fn discriminant_i64(&self) -> Option<i64> {
-        let scalar = self.discriminant.as_ref()?.get("Scalar")?;
+        let value = self.discriminant.as_ref()?;
+        let scalar = value.get("Scalar").unwrap_or(value);
         let pair = scalar.get("Unsigned").or_else(|| scalar.get("Signed"))?;
-        pair.get(1)?.as_str()?.parse::<i64>().ok()
+        let text = pair.get(1)?;
+        text.as_str()
+            .and_then(|text| text.parse::<i64>().ok())
+            .or_else(|| text.as_i64())
     }
 }
 
@@ -493,25 +548,23 @@ impl ItemMeta {
                     ident: (s, disambiguator),
                 } => {
                     out.push_str(s);
-                    // Multiple anonymous closures in one function all
-                    // carry the bare segment `closure`; only the
-                    // disambiguator index distinguishes them.  Keep it
-                    // (as `closure#N`) so co-located closure envs mint
-                    // distinct ClassDefs instead of collapsing their
-                    // captured `__pos_N` fields onto one shared row.
                     if s == "closure" && *disambiguator > 0 {
                         out.push('#');
                         out.push_str(&disambiguator.to_string());
                     }
                 }
                 NameSeg::Other(v) => {
-                    let label = v
-                        .as_object()
-                        .and_then(|m| m.keys().next().cloned())
-                        .unwrap_or_else(|| "?".into());
-                    out.push('<');
-                    out.push_str(&label);
-                    out.push('>');
+                    if let Some(label) = builtin_path_label(v) {
+                        out.push_str(&label);
+                    } else {
+                        let label = v
+                            .as_object()
+                            .and_then(|m| m.keys().next().cloned())
+                            .unwrap_or_else(|| "?".into());
+                        out.push('<');
+                        out.push_str(&label);
+                        out.push('>');
+                    }
                 }
             }
         }
@@ -519,11 +572,47 @@ impl ItemMeta {
     }
 }
 
+/// Render a `Builtin` path segment. `Closure` keeps the `closure` /
+/// `closure#N` leaf so closure-env ClassDefs stay distinct. Other
+/// builtins use the segment's ident, with `#N` when the disambiguator
+/// is non-zero.
+fn builtin_path_label(seg: &Value) -> Option<String> {
+    let arr = seg.get("Builtin")?.as_array()?;
+    let dis = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
+    let kind = arr.first()?;
+    let (ident, dis) = if let Some(name) = kind.as_str() {
+        let ident = match name {
+            "Closure" => "closure",
+            "ClosureAsFn" => "as_fn",
+            "DropGlue" => "drop_glue",
+            "AnonConst" => "const",
+            "PromotedConst" => "promoted_const",
+            "VTable" => "vtable",
+            "VTableMethod" => "vtable_method",
+            "VTableDropShim" => "vtable_drop_shim",
+            "Str" => "str",
+            "Use" => "use",
+            other => other,
+        };
+        (ident, dis)
+    } else if let Some(n) = kind.get("Tuple").and_then(Value::as_u64) {
+        ("tuple", n)
+    } else {
+        return Some("<Builtin>".to_string());
+    };
+    if dis > 0 {
+        Some(format!("{ident}#{dis}"))
+    } else {
+        Some(ident.to_string())
+    }
+}
+
 /// Whether a struct-root leaf names a closure env — the bare `closure`
 /// or a disambiguated `closure#N` (see [`ItemMeta::name_path`]).  Leaf
 /// checks that special-case closures must accept both spellings.
 pub fn is_closure_leaf(leaf: &str) -> bool {
-    leaf == "closure" || leaf.starts_with("closure#")
+    leaf == "closure"
+        || (leaf.starts_with("closure#") && leaf[8..].bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,19 +635,80 @@ pub struct AttrInfo {
     pub public: bool,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Span {
-    pub data: SpanData,
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum SpanWire {
+    Untagged {
+        #[serde(rename = "Untagged")]
+        body: SpanBody,
+    },
+    Inline {
+        #[serde(rename = "Value")]
+        value: (u64, SpanBody),
+    },
+    Dedup {
+        #[serde(rename = "Deduplicated")]
+        id: u64,
+    },
+    Body(SpanBody),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+struct SpanBody {
+    data: SpanData,
+}
+
+#[derive(Debug, Clone)]
+pub struct Span {
+    pub data: SpanData,
+    dedup_id: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for Span {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = SpanWire::deserialize(deserializer)?;
+        Ok(match wire {
+            SpanWire::Untagged { body } | SpanWire::Body(body) => Span {
+                data: body.data,
+                dedup_id: None,
+            },
+            SpanWire::Inline { value: (_id, body) } => Span {
+                data: body.data,
+                dedup_id: None,
+            },
+            SpanWire::Dedup { id } => Span {
+                data: SpanData {
+                    file_id: 0,
+                    beg: Loc { line: 0, col: 0 },
+                    end: Loc { line: 0, col: 0 },
+                },
+                dedup_id: Some(id),
+            },
+        })
+    }
+}
+
+impl Span {
+    /// Span data, following a `Deduplicated` id through `lookup` when the
+    /// body was not inline.
+    pub fn resolve(&self, lookup: impl Fn(u64) -> Option<SpanData>) -> SpanData {
+        if let Some(id) = self.dedup_id {
+            if let Some(data) = lookup(id) {
+                return data;
+            }
+        }
+        self.data.clone()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SpanData {
     pub file_id: u64,
     pub beg: Loc,
     pub end: Loc,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Loc {
     pub line: u64,
     pub col: u64,
@@ -585,7 +735,7 @@ pub enum TyRef {
     },
     /// Inline value with hash-cons id.
     Inline {
-        #[serde(rename = "HashConsedValue")]
+        #[serde(rename = "Value")]
         value: (u64, Value),
     },
     /// Anything else (e.g. literal-int short forms).
@@ -662,10 +812,152 @@ impl BasicBlock {
 
     fn term_cached(&self) -> &Result<TermKind, String> {
         self.term_cache.get_or_init(|| {
-            let kind = &self.terminator.kind;
-            serde_json::from_value(kind.clone()).map_err(|e| format!("{e}; raw kind: {kind}"))
+            let kind = adapt_switch_kind(&self.terminator.kind);
+            serde_json::from_value(kind)
+                .map_err(|e| format!("{e}; raw kind: {}", self.terminator.kind))
         })
     }
+}
+
+/// Inline a switch-arm `{"Deduplicated": id}` constant so
+/// [`inline_bool_const`] can see `Bool`. Other dedup references stay
+/// as they are; only the arm literal is needed to tell `If` from
+/// `SwitchInt`.
+fn expand_switch_arm_consts(kind: &mut Value, table: &ConstDedupTable) {
+    let Some(pairs) = kind
+        .get_mut("Switch")
+        .and_then(|sw| sw.get_mut("data"))
+        .and_then(|data| data.get_mut("branches"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for pair in pairs.iter_mut() {
+        let Some(slot) = pair.as_array_mut().and_then(|pair| pair.first_mut()) else {
+            continue;
+        };
+        let Some(id) = slot.get("Deduplicated").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(body) = table.get(id) else {
+            continue;
+        };
+        *slot = serde_json::json!({"Value": [id, body]});
+    }
+}
+
+/// Project a `Switch { data, branches }` terminator into
+/// `Switch { discr, targets: SwitchInt }`. Arm constants stay in their
+/// serialized form; the lowering resolves `Value` / `Deduplicated`.
+fn adapt_switch_kind(kind: &Value) -> Value {
+    let Some(sw) = kind.get("Switch") else {
+        return kind.clone();
+    };
+    let Some(data) = sw.get("data") else {
+        return kind.clone();
+    };
+    let blocks = sw.get("branches").and_then(Value::as_array);
+    let block_at = |idx: u64| -> u64 {
+        blocks
+            .and_then(|rows| rows.get(idx as usize))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let scrut = data.get("scrutinee").cloned().unwrap_or(Value::Null);
+    let discr = if let Some(op) = scrut.get("Value") {
+        op.clone()
+    } else if let Some(place) = scrut.get("Discriminant") {
+        serde_json::json!({"Copy": place})
+    } else {
+        return kind.clone();
+    };
+    let mut arms = Vec::new();
+    if let Some(pairs) = data.get("branches").and_then(Value::as_array) {
+        for pair in pairs {
+            let Some(pair) = pair.as_array() else {
+                continue;
+            };
+            let konst = pair.first().cloned().unwrap_or(Value::Null);
+            let branch = pair.get(1).and_then(Value::as_u64).unwrap_or(0);
+            arms.push(serde_json::json!([konst, block_at(branch)]));
+        }
+    }
+    let default = match data.get("fallback").and_then(Value::as_u64) {
+        Some(branch) => block_at(branch),
+        None => arms
+            .last()
+            .and_then(|arm| arm.get(1))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    };
+    if let Some((then_bb, else_bb)) = bool_if_targets(&arms, default) {
+        return serde_json::json!({
+            "Switch": {
+                "discr": discr,
+                "targets": {"If": [then_bb, else_bb]}
+            }
+        });
+    }
+    serde_json::json!({
+        "Switch": {
+            "discr": discr,
+            "targets": {"SwitchInt": [Value::Null, arms, default]}
+        }
+    })
+}
+
+/// `true` arm, `false` arm. A missing side is the fallback block.
+fn bool_if_targets(arms: &[Value], default: u64) -> Option<(u64, u64)> {
+    let mut then_bb = None;
+    let mut else_bb = None;
+    for arm in arms {
+        let pair = arm.as_array()?;
+        let flag = inline_bool_const(pair.first()?)?;
+        let bb = pair.get(1)?.as_u64()?;
+        if flag {
+            then_bb = Some(bb);
+        } else {
+            else_bb = Some(bb);
+        }
+    }
+    if then_bb.is_none() && else_bb.is_none() {
+        return None;
+    }
+    Some((then_bb.unwrap_or(default), else_bb.unwrap_or(default)))
+}
+
+/// Old artefacts wrote `Use` as one operand object. The current form is
+/// `[operand, retag]`. Rewrite the object form before the typed parse.
+fn adapt_use_operand(kind: &Value) -> Value {
+    let Some(assign) = kind.get("Assign").and_then(Value::as_array) else {
+        return kind.clone();
+    };
+    let Some(use_op) = assign.get(1).and_then(|rv| rv.get("Use")) else {
+        return kind.clone();
+    };
+    if use_op.as_array().is_some() {
+        return kind.clone();
+    }
+    let mut rewritten = kind.clone();
+    if let Some(slot) = rewritten
+        .get_mut("Assign")
+        .and_then(Value::as_array_mut)
+        .and_then(|arr| arr.get_mut(1))
+        .and_then(|rv| rv.get_mut("Use"))
+    {
+        *slot = serde_json::json!([use_op, "No"]);
+    }
+    rewritten
+}
+
+fn inline_bool_const(value: &Value) -> Option<bool> {
+    let body = value
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .unwrap_or(value);
+    let kind = body.as_array().and_then(|arr| arr.first()).unwrap_or(body);
+    kind.get("Bool").and_then(Value::as_bool)
 }
 
 /// A block's terminator, carrying its own span the way a [`Statement`]
@@ -717,7 +1009,8 @@ impl Statement {
 
     fn stmt_cached(&self) -> &Result<StmtKind, String> {
         self.stmt_cache.get_or_init(|| {
-            serde_json::from_value::<StmtKind>(self.kind.clone())
+            let kind = adapt_use_operand(&self.kind);
+            serde_json::from_value::<StmtKind>(kind)
                 .map_err(|e| format!("{e}; raw kind: {}", self.kind))
         })
     }
@@ -738,6 +1031,8 @@ pub enum StmtKind {
     Assert(AssertStmt),
     /// `let _ = place` style references (MIR `PlaceMention`).
     PlaceMention(Place),
+    /// Borrow-checker-only statement. The payload is not lowered.
+    Borrowck(Value),
     /// Anything else (e.g. `Deinit`, `SetDiscriminant`, …).
     #[serde(other)]
     Unknown,
@@ -798,7 +1093,8 @@ impl ProjectionElem {
 
 #[derive(Debug, Clone, Deserialize)]
 pub enum Rvalue {
-    Use(Operand),
+    /// `Use(operand, retag)`. `retag` is `"Yes"` or `"No"`.
+    Use(Operand, Value),
     /// `BinaryOp(op, lhs, rhs)`. `op` is a tagged variant — primitive
     /// ops are atom strings (`"Add"`, `"Eq"`, …), wrap/overflow forms
     /// are objects (`{"Shr": "Wrap"}`, `{"Add": "Wrap"}`).
@@ -817,10 +1113,10 @@ pub enum Rvalue {
     Discriminant(Place),
     /// `Cast(kind, operand, target_ty)`.
     Cast(Value, Operand, TyRef),
-    /// `Len(place)` for slice / array length.
-    Len(Place),
-    /// `Repeat(operand, elem_ty, count)` for `[v; N]` literals.
-    Repeat(Operand, TyRef, Value),
+    /// `Len(place, elem_ty, const)`.
+    Len(Place, Value, Value),
+    /// `Repeat(operand, elem_ty, count, copy_proof)`.
+    Repeat(Operand, TyRef, Value, Value),
     /// `ShallowInitBox(operand, target_ty)` — emitted by `Box::new_in`
     /// and friends to allocate the box and initialise its contents.
     ShallowInitBox(Operand, TyRef),
@@ -830,8 +1126,8 @@ pub enum Rvalue {
         kind: Value,
         ptr_metadata: Value,
     },
-    /// `NullaryOp(op, type)` — `SizeOf(T)`, `AlignOf(T)`, etc.
-    NullaryOp(Value, TyRef),
+    /// `NullaryOp(op)` — `SizeOf(T)`, `AlignOf(T)`, etc.
+    NullaryOp(Value),
     #[serde(other)]
     Unknown,
 }
@@ -848,13 +1144,23 @@ pub enum Operand {
 /// The constant schema is `kind.FnDef.kind.Fun.Regular`. Literals,
 /// `VTableRef`, and `TraitConst` are not function items and return `None`.
 pub fn const_fn_def_regular_id(value: &Value) -> Option<u64> {
-    value
-        .get("kind")?
-        .get("FnDef")?
-        .get("kind")?
-        .get("Fun")?
-        .get("Regular")?
-        .as_u64()
+    let kind = const_expr_kind(value)?;
+    let fun = kind.get("FnDef")?.get("kind")?.get("Fun")?;
+    fun.as_u64().or_else(|| fun.get("Regular")?.as_u64())
+}
+
+/// Constant bodies are a `[kind, ty]` pair, possibly under `Value` /
+/// `Deduplicated` (the caller peels dedup before calling when needed).
+fn const_expr_kind(value: &Value) -> Option<&Value> {
+    let body = value
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .unwrap_or(value);
+    if let Some(arr) = body.as_array() {
+        return arr.first();
+    }
+    body.get("kind").or(Some(body))
 }
 
 // Terminators
@@ -945,14 +1251,23 @@ pub enum CallKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum FunId {
-    Regular {
-        #[serde(rename = "Regular")]
-        id: u64,
-    },
+    Regular { id: u64 },
     Other(Value),
+}
+
+impl<'de> Deserialize<'de> for FunId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        if let Some(id) = value.as_u64() {
+            return Ok(FunId::Regular { id });
+        }
+        if let Some(id) = value.get("Regular").and_then(Value::as_u64) {
+            return Ok(FunId::Regular { id });
+        }
+        Ok(FunId::Other(value))
+    }
 }
 
 impl CallFunc {

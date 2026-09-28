@@ -502,10 +502,36 @@ impl CallRegistry {
             // `.`-joined class the receiver getattr resolves to.  RPython
             // forbids closures (`_assert_rpythonic`), so there is no
             // upstream analogue.
-            if majit_charon_reader::ullbc::is_closure_leaf(owner)
-                && matches!(method.as_str(), "call_once" | "call" | "call_mut")
+            if matches!(method.as_str(), "call_once" | "call" | "call_mut")
+                && (majit_charon_reader::ullbc::is_closure_leaf(owner) || owner == "<Impl>")
             {
-                let stripped = segs[..segs.len() - 1].join("::");
+                let stripped = if majit_charon_reader::ullbc::is_closure_leaf(owner) {
+                    segs[..segs.len() - 1].join("::")
+                } else if segs.len() >= 3 {
+                    // `parent::<Impl>::call_*`: the env type is `parent::closure`.
+                    let parent = segs[..segs.len() - 2].join("::");
+                    let mut hits: Vec<&str> = full_by_stripped
+                        .keys()
+                        .copied()
+                        .filter(|key| {
+                            let Some(leaf) = key
+                                .strip_prefix(&parent)
+                                .and_then(|rest| rest.strip_prefix("::"))
+                            else {
+                                return false;
+                            };
+                            !leaf.contains("::")
+                                && majit_charon_reader::ullbc::is_closure_leaf(leaf)
+                        })
+                        .collect();
+                    hits.sort();
+                    if hits.len() != 1 {
+                        continue;
+                    }
+                    hits[0].to_string()
+                } else {
+                    continue;
+                };
                 let Some(&reg_key) = full_by_stripped.get(stripped.as_str()) else {
                     continue;
                 };

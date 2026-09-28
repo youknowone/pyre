@@ -320,12 +320,35 @@ fn strip_crate_prefix(path: &str) -> String {
     }
 }
 
+fn resolve_const<'a>(llbc: &'a Llbc, mut value: &'a serde_json::Value) -> &'a serde_json::Value {
+    for _ in 0..8 {
+        if let Some(id) = value
+            .get("Deduplicated")
+            .and_then(serde_json::Value::as_u64)
+            && let Some(body) = llbc.dedup_const(id).or_else(|| llbc.dedup_body(id))
+        {
+            value = body;
+            continue;
+        }
+        if let Some(body) = value
+            .get("Value")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.get(1))
+        {
+            value = body;
+            continue;
+        }
+        break;
+    }
+    value
+}
+
 fn global_marker_bool(llbc: &Llbc, gd: &GlobalDecl) -> Option<bool> {
-    let init_id = gd.rest.get("init")?.as_u64()?;
+    let init_id = llbc.global_init_fun_id(gd)?;
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
     for block in &body.body {
         for stmt in &block.statements {
-            let StmtKind::Assign(place, Rvalue::Use(Operand::Const(value))) =
+            let StmtKind::Assign(place, Rvalue::Use(Operand::Const(value), _)) =
                 stmt.stmt_kind().ok()?
             else {
                 continue;
@@ -333,7 +356,7 @@ fn global_marker_bool(llbc: &Llbc, gd: &GlobalDecl) -> Option<bool> {
             if !matches!(place.kind, PlaceKind::Local(0)) {
                 continue;
             }
-            if let Some(b) = decode_bool_const(&value) {
+            if let Some(b) = decode_bool_const(resolve_const(llbc, &value)) {
                 return Some(b);
             }
         }
@@ -346,11 +369,11 @@ fn global_marker_bool(llbc: &Llbc, gd: &GlobalDecl) -> Option<bool> {
 /// string literal (`{"kind": {"Literal": {"Str": spec}}, "ty": …}`),
 /// mirroring [`global_marker_bool`]'s bool path.
 fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
-    let init_id = gd.rest.get("init")?.as_u64()?;
+    let init_id = llbc.global_init_fun_id(gd)?;
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
     for block in &body.body {
         for stmt in &block.statements {
-            let StmtKind::Assign(place, Rvalue::Use(Operand::Const(value))) =
+            let StmtKind::Assign(place, Rvalue::Use(Operand::Const(value), _)) =
                 stmt.stmt_kind().ok()?
             else {
                 continue;
@@ -358,7 +381,7 @@ fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
             if !matches!(place.kind, PlaceKind::Local(0)) {
                 continue;
             }
-            if let Some(s) = decode_str_const(&value) {
+            if let Some(s) = decode_str_const(resolve_const(llbc, &value)) {
                 return Some(s);
             }
         }
@@ -369,6 +392,12 @@ fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
 fn decode_str_const(value: &serde_json::Value) -> Option<String> {
     if let Some(s) = value.as_str() {
         return Some(s.to_string());
+    }
+    if let Some(arr) = value.get("Value").and_then(serde_json::Value::as_array) {
+        return decode_str_const(arr.get(1)?);
+    }
+    if let Some(arr) = value.as_array() {
+        return decode_str_const(arr.first()?);
     }
     let obj = value.as_object()?;
     for key in ["Str", "str"] {
@@ -393,6 +422,12 @@ fn decode_str_const(value: &serde_json::Value) -> Option<String> {
 fn decode_bool_const(value: &serde_json::Value) -> Option<bool> {
     if let Some(b) = value.as_bool() {
         return Some(b);
+    }
+    if let Some(arr) = value.get("Value").and_then(serde_json::Value::as_array) {
+        return decode_bool_const(arr.get(1)?);
+    }
+    if let Some(arr) = value.as_array() {
+        return decode_bool_const(arr.first()?);
     }
     let obj = value.as_object()?;
     for key in ["Bool", "bool"] {

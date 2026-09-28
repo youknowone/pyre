@@ -35,7 +35,7 @@ fn zst_closure_and_then() -> Llbc {
     }]);
     let impl_seg = json!({"Impl": {"Ty": {
         "params": {"regions": [], "types": [], "const_generics": [], "trait_clauses": [], "regions_outlive": [], "types_outlive": [], "trait_type_constraints": []},
-        "skip_binder": {"HashConsedValue": [0, {"Adt": {"id": {"Adt": 0}, "generics": generics}}]},
+        "skip_binder": {"Value": [0, {"Adt": {"id": {"Adt": 0}, "generics": generics}}]},
         "kind": "InherentImplBlock"
     }}});
     let file = json!({"charon_version": "0.1.201", "has_errors": false,

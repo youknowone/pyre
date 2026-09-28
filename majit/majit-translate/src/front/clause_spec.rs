@@ -283,9 +283,8 @@ pub(crate) fn trait_impl_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Va
     let arr = payload.as_array()?;
     let resolved = resolve_trait_ref(arr.first()?, llbc, 0)?;
     let impl_id = trait_impl_id(&resolved, llbc, 0)?;
-    let decl_id = arr.get(2)?.as_u64()?;
     let method_idx = arr.get(1)?.as_u64()?;
-    let fn_id = impl_method_fn_id(llbc, impl_id, decl_id, method_idx)?;
+    let fn_id = impl_method_fn_id(llbc, impl_id, u64::MAX, method_idx)?;
     let generics = resolved
         .pointer("/kind/TraitImpl/generics")
         .cloned()
@@ -388,7 +387,7 @@ fn unwrap_ref<'a>(v: &'a Value, llbc: &'a Llbc, depth: usize) -> Option<&'a Valu
     if let Some(id) = obj.get("Deduplicated").and_then(Value::as_u64) {
         return unwrap_ref(llbc.dedup_body(id)?, llbc, depth + 1);
     }
-    if let Some(arr) = obj.get("HashConsedValue").and_then(Value::as_array)
+    if let Some(arr) = obj.get("Value").and_then(Value::as_array)
         && arr.len() == 2
     {
         return unwrap_ref(&arr[1], llbc, depth + 1);
@@ -431,7 +430,7 @@ fn mentions_own_clause_at(v: &Value, llbc: &Llbc, depth: usize) -> bool {
 }
 
 /// Replace depth-0 type variables with `types[i]` and depth-0 const-generic
-/// variables with `const_generics[i]`. A `Deduplicated` / `HashConsedValue`
+/// variables with `const_generics[i]`. A `Deduplicated` / `Value`
 /// node whose resolved body contains such a variable is replaced by the
 /// substituted plain node. The shared dedup table is not written.
 pub(crate) fn substitute_type_vars(
@@ -465,7 +464,7 @@ fn subst_tyref(ty: &TyRef, llbc: &Llbc, types: &[Value], const_generics: &[Value
     let mut value = match ty {
         TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
         TyRef::Inline { value: (id, body) } => {
-            serde_json::json!({ "HashConsedValue": [id, body] })
+            serde_json::json!({ "Value": [id, body] })
         }
         TyRef::Other(body) => body.clone(),
     };
@@ -579,7 +578,7 @@ fn indirect_body(v: &Value, llbc: &Llbc) -> Option<Value> {
     if let Some(id) = obj.get("Deduplicated").and_then(Value::as_u64) {
         return llbc.dedup_body(id).cloned();
     }
-    let arr = obj.get("HashConsedValue").and_then(Value::as_array)?;
+    let arr = obj.get("Value").and_then(Value::as_array)?;
     if arr.len() != 2 {
         return None;
     }
@@ -596,7 +595,7 @@ fn substitute_clauses(v: &mut Value, llbc: &Llbc, trait_refs: &[Value]) {
 }
 
 /// Same shape as [`subst_vars`]: a depth-0 `Clause` is replaced in place;
-/// a `Deduplicated` / `HashConsedValue` wrapper whose resolved body
+/// a `Deduplicated` / `Value` wrapper whose resolved body
 /// mentions one is replaced by a plain copy of that body (the shared
 /// dedup table is not written) and the copy is walked. Anything else is
 /// walked through its children.
@@ -642,7 +641,7 @@ fn indirect_body_with_clause(v: &Value, llbc: &Llbc) -> Option<Value> {
 }
 
 /// Charon type expression spelled from declaration names. Extraction-local
-/// ids are followed (`Deduplicated`, `HashConsedValue`) or replaced by
+/// ids are followed (`Deduplicated`, `Value`) or replaced by
 /// `name_path`, never printed.
 pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
     if depth > 32 {
@@ -657,7 +656,7 @@ pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
                 None => "?dedup".to_string(),
             };
         }
-        if let Some(arr) = obj.get("HashConsedValue").and_then(Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(Value::as_array)
             && arr.len() == 2
         {
             return spec_type_name(&arr[1], llbc, depth + 1);
@@ -1000,7 +999,7 @@ fn canonical_type_json(v: &Value, llbc: &Llbc, depth: usize) -> String {
     resolve_decl_ids(v, llbc, depth).to_string()
 }
 
-/// Compact JSON with `Deduplicated` / `HashConsedValue` followed and every
+/// Compact JSON with `Deduplicated` / `Value` followed and every
 /// ADT, trait, impl and fun id replaced by that declaration's `name_path`.
 fn resolve_decl_ids(v: &Value, llbc: &Llbc, depth: usize) -> Value {
     if depth > 64 {
@@ -1015,7 +1014,7 @@ fn resolve_decl_ids(v: &Value, llbc: &Llbc, depth: usize) -> Value {
                 None => Value::String("?dedup".into()),
             };
         }
-        if let Some(arr) = obj.get("HashConsedValue").and_then(Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(Value::as_array)
             && arr.len() == 2
         {
             return resolve_decl_ids(&arr[1], llbc, depth + 1);
@@ -1245,7 +1244,7 @@ mod tests {
                     "signature": {
                         "is_unsafe": false,
                         "inputs": [],
-                        "output": {"HashConsedValue": [7, inline]}
+                        "output": {"Value": [7, inline]}
                     },
                     "body": null
                 }],
@@ -1345,7 +1344,7 @@ mod tests {
                     "arg_count": 0,
                     "locals": [
                         {"index": 0, "name": null, "span": span, "ty": {"Deduplicated": 11}},
-                        {"index": 1, "name": null, "span": span, "ty": {"HashConsedValue": [11, generics]}}
+                        {"index": 1, "name": null, "span": span, "ty": {"Value": [11, generics]}}
                     ]
                 },
                 "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}}]
@@ -1365,7 +1364,7 @@ mod tests {
                         "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
                         "is_local": true
                     },
-                    "signature": {"is_unsafe": false, "inputs": [], "output": {"HashConsedValue": [11, generics]}},
+                    "signature": {"is_unsafe": false, "inputs": [], "output": {"Value": [11, generics]}},
                     "body": body
                 }],
                 "files": []

@@ -310,7 +310,7 @@ pub fn trait_ref_kind(llbc: &majit_charon_reader::Llbc, tref: &serde_json::Value
             Some(b) => b,
             None => return "unresolved-dedup".into(),
         }
-    } else if let Some(inline) = tref.pointer("/HashConsedValue/1") {
+    } else if let Some(inline) = tref.pointer("/Value/1") {
         inline
     } else {
         return "no-body".into();
@@ -742,7 +742,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
                 if let Ok(StmtKind::Assign(p, rv)) = st.stmt_kind()
                     && let Some(l) = root(&p)
                 {
-                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = &rv
+                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rv
                         && let PlaceKind::Projection(_, elem) = &src.kind
                     {
                         projected.insert(l, elem.label());
@@ -789,7 +789,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
                             "<- no definition".to_string()
                         };
                     }
-                    Some(Rvalue::Use(o) | Rvalue::Cast(_, o, _)) => {
+                    Some(Rvalue::Use(o, _) | Rvalue::Cast(_, o, _)) => {
                         if let Some(nl) = op_local(o) {
                             cur = Some(nl);
                             continue;
@@ -825,14 +825,14 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
 fn rvalue_label(r: &majit_charon_reader::ullbc::Rvalue) -> &'static str {
     use majit_charon_reader::ullbc::Rvalue as R;
     match r {
-        R::Use(_) => "Use",
+        R::Use(_, _) => "Use",
         R::BinaryOp(..) => "BinaryOp",
         R::UnaryOp(..) => "UnaryOp",
         R::Ref { .. } => "Ref",
         R::Aggregate(..) => "Aggregate",
         R::Discriminant(_) => "Discriminant",
         R::Cast(..) => "Cast",
-        R::Len(_) => "Len",
+        R::Len(_, _, _) => "Len",
         R::Repeat(..) => "Repeat",
         R::ShallowInitBox(..) => "ShallowInitBox",
         R::RawPtr { .. } => "RawPtr",
@@ -881,7 +881,7 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
         // stamps the same line, while two items collapsing onto one spelling
         // are written at two different lines.
         let key = if name.contains('<') {
-            format!("{name}@{}", fd.item_meta.span.data.beg.line)
+            format!("{name}@{}", llbc.span_data(&fd.item_meta.span).beg.line)
         } else {
             name.clone()
         };

@@ -60,6 +60,7 @@ fn main() {
                     Ok(StmtKind::Assign(..)) => "Assign",
                     Ok(StmtKind::Assert(..)) => "Assert (stmt)",
                     Ok(StmtKind::PlaceMention(_)) => "PlaceMention",
+                    Ok(StmtKind::Borrowck(_)) => "Borrowck",
                     Ok(StmtKind::Unknown) => "Unknown",
                     Err(_) => "DecodeError",
                 };

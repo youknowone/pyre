@@ -1139,7 +1139,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // reachable block closure, so an unreachable unwind block's
         // orphan etype/evalue slots no longer reject the graph — this
         // skip is about call-target modelling, not adapter safety.)
-        if fd.is_global_initializer.is_some() {
+        if fd.global_initializer_id().is_some() {
             continue;
         }
         // Key each SemanticFunction by bare leaf name plus a separate
@@ -7357,6 +7357,9 @@ impl<'a> Lowering<'a> {
             // Python-observable meaning.
             StmtKind::Assert(_) => Ok(()),
 
+            // Borrow-checker marker. It does not write a local.
+            StmtKind::Borrowck(_) => Ok(()),
+
             StmtKind::Assign(place, rvalue) => self.lower_assign(mir_bb, place, rvalue),
 
             StmtKind::Unknown => Err(LowerError::Unsupported(format!(
@@ -7394,7 +7397,7 @@ impl<'a> Lowering<'a> {
                 .get(&(index as usize))
                 .copied()
             && self.root_bracket.is_erased_scope(scope)
-            && matches!(&rvalue, Rvalue::Use(_))
+            && matches!(&rvalue, Rvalue::Use(_, _))
         {
             return Ok(());
         }
@@ -7404,7 +7407,7 @@ impl<'a> Lowering<'a> {
         if let PlaceKind::Local(index) = dest.kind
             && let Some(scope) = self.root_bracket.slot_temps.get(&(index as usize)).copied()
             && self.root_bracket.is_erased_scope(scope)
-            && matches!(&rvalue, Rvalue::Use(_) | Rvalue::BinaryOp(..))
+            && matches!(&rvalue, Rvalue::Use(_, _) | Rvalue::BinaryOp(..))
         {
             return Ok(());
         }
@@ -7454,7 +7457,7 @@ impl<'a> Lowering<'a> {
                 // still emit `__strlen` rather than `arraylen_gc`.
                 let dest_local = i as usize;
                 let inherit_byte_view = match &rvalue {
-                    Rvalue::Use(op) => self.operand_is_string_byte_view(op),
+                    Rvalue::Use(op, _) => self.operand_is_string_byte_view(op),
                     Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => self
                         .string_byte_view_locals
                         .iter()
@@ -7610,7 +7613,7 @@ impl<'a> Lowering<'a> {
         }
         // Only a bare constant operand qualifies; a computed rvalue still
         // flows through `build_rvalue`.
-        let Rvalue::Use(Operand::Const(value)) = rvalue else {
+        let Rvalue::Use(Operand::Const(value), _) = rvalue else {
             return None;
         };
         // Inline only a genuinely pooled constant matched to the target's
@@ -7769,6 +7772,7 @@ impl<'a> Lowering<'a> {
         mut value: LinkArg,
         dest_ty: &TyRef,
     ) -> Result<(), LowerError> {
+        let inner_ty = clone_tyref(&inner.ty);
         if let Some((owner, flat_name, owner_id)) =
             self.flatten_list_storage_field_write(&inner, &elem)
         {
@@ -8034,7 +8038,8 @@ impl<'a> Lowering<'a> {
                     // must not be stamped `Int`); the bare-label
                     // fallback keeps non-Adt containers lowering as
                     // before.
-                    let (field, ty) = match self.resolve_adt_field(field_payload) {
+                    let field_payload = self.field_payload_with_base(field_payload, &inner_ty);
+                    let (field, ty) = match self.resolve_adt_field(&field_payload) {
                         Some((owner_root, field_name, _field_ty, owner_id)) => {
                             // Rust type-checks every assignment against the
                             // projected place's substituted field type.  A
@@ -8061,7 +8066,7 @@ impl<'a> Lowering<'a> {
                             )
                         }
                         None => (
-                            FieldDescriptor::new(field_label_from_payload(field_payload), None),
+                            FieldDescriptor::new(field_label_from_payload(&field_payload), None),
                             ValueType::Int,
                         ),
                     };
@@ -8272,7 +8277,7 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
     ) -> Result<(Option<OpKind>, Variable), LowerError> {
         match rvalue {
-            Rvalue::Use(operand) => {
+            Rvalue::Use(operand, _) => {
                 let v = self.resolve_operand(mir_bb, operand)?;
                 // Plain use — reuse the operand's Variable without
                 // emitting a copy op. RPython does the same: a flow
@@ -8692,7 +8697,7 @@ impl<'a> Lowering<'a> {
             // walker path. The transparent `Array` ctor is not equivalent:
             // `Repeat` carries one fill value and a count, not per-slot
             // `__pos_N` writes.
-            Rvalue::Repeat(elem, _ty, count) => {
+            Rvalue::Repeat(elem, _ty, count, _) => {
                 let arg = self.resolve_operand(mir_bb, elem)?;
                 let res = self
                     .graph
@@ -8761,7 +8766,7 @@ impl<'a> Lowering<'a> {
             }
             // `Len(place)` — slice / array length. Synthetic 1-arg
             // call; needs no descriptor for now.
-            Rvalue::Len(place) => {
+            Rvalue::Len(place, _, _) => {
                 // A string-list items view is one word — the `GcArray` header
                 // — so `__len` over it is `ll_fixed_length` / `arraylen_gc`,
                 // the CAPACITY.  `ll_length` reads the list's own `l.length`
@@ -8801,7 +8806,7 @@ impl<'a> Lowering<'a> {
             }
             // `NullaryOp(op, ty)` — `SizeOf(T)`, `AlignOf(T)`, etc.
             // 0-arg synthetic Call carrying the op name.
-            Rvalue::NullaryOp(op_json, _ty) => {
+            Rvalue::NullaryOp(op_json) => {
                 let op_name = if let Some(s) = op_json.as_str() {
                     s.to_string()
                 } else if let Some(obj) = op_json.as_object() {
@@ -9938,8 +9943,8 @@ impl<'a> Lowering<'a> {
                 // typed analogue today.
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
-                    && let Some((owner_root, field_name, field_ty, owner_id)) =
-                        self.resolve_adt_field(field_payload)
+                    && let Some((owner_root, field_name, field_ty, owner_id)) = self
+                        .resolve_adt_field(&self.field_payload_with_base(field_payload, &inner.ty))
                 {
                     // Projecting the sized field of a `repr(transparent)`
                     // wrapper is the identity on its low-level value, including
@@ -10677,7 +10682,7 @@ impl<'a> Lowering<'a> {
         let head = adt.first()?;
         let type_id = match head.as_u64() {
             Some(id) => id,
-            None => head.get("id")?.get("Adt")?.as_u64()?,
+            None => json_adt_id(head.get("id")?)?,
         };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64)? as usize;
         let td = self.llbc.type_by_id(type_id)?;
@@ -10720,7 +10725,7 @@ impl<'a> Lowering<'a> {
         let head = adt.first()?;
         let type_id = match head.as_u64() {
             Some(id) => id,
-            None => head.get("id")?.get("Adt")?.as_u64()?,
+            None => json_adt_id(head.get("id")?)?,
         };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let td = self.llbc.type_by_id(type_id)?;
@@ -10924,6 +10929,30 @@ impl<'a> Lowering<'a> {
     /// owner_root is the variant-qualified `{enum_leaf}::{variant}` key
     /// (the variant subclass carries its own fields at the exact
     /// per-variant offset).
+    /// A field projection whose container is `null` names only the index.
+    /// The base place's type is the ADT. Spell that as `{"Adt": [id, null]}`
+    /// so [`Self::resolve_adt_field`] can read the declaration.
+    fn field_payload_with_base(
+        &self,
+        payload: &serde_json::Value,
+        base_ty: &TyRef,
+    ) -> serde_json::Value {
+        let Some(arr) = payload.as_array() else {
+            return payload.clone();
+        };
+        if arr.len() != 2 || arr[0].as_object().is_some() {
+            return payload.clone();
+        }
+        // `[variant, field]` — variant is `null` on a struct and a number on
+        // an enum. The ADT id lives on the base place, not in the projection.
+        let Some(type_id) = self.tyref_adt_def_id(base_ty) else {
+            return payload.clone();
+        };
+        let variant = arr[0].clone();
+        let index = arr[1].clone();
+        serde_json::json!([{"Adt": [type_id, variant]}, index])
+    }
+
     fn resolve_adt_field(
         &self,
         payload: &serde_json::Value,
@@ -10944,7 +10973,7 @@ impl<'a> Lowering<'a> {
         let head_adt = head.as_object();
         let type_id = match head.as_u64() {
             Some(id) => id,
-            None => head.get("id")?.get("Adt")?.as_u64()?,
+            None => json_adt_id(head.get("id")?)?,
         };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let field_idx = arr[1].as_u64()? as usize;
@@ -10991,10 +11020,7 @@ impl<'a> Lowering<'a> {
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) => {
                 let f = fields.get(field_idx)?;
-                let name = f
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("__pos_{field_idx}"));
+                let name = f.flow_name(field_idx);
                 let ty = clone_tyref(&f.ty);
                 let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
                     &name_path,
@@ -11006,10 +11032,7 @@ impl<'a> Lowering<'a> {
             (TypeDeclKind::Enum(variants), Some(vidx)) => {
                 let variant = variants.get(vidx as usize)?;
                 let f = variant.fields.get(field_idx)?;
-                let name = f
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("__pos_{field_idx}"));
+                let name = f.flow_name(field_idx);
                 let ty = clone_tyref(&f.ty);
                 // owner_root = the variant subclass `{enum_leaf}::{variant}`
                 // — the read resolves the variant's own field at its exact
@@ -11064,7 +11087,7 @@ impl<'a> Lowering<'a> {
         let head = adt.first()?;
         let vtable_id = match head.as_u64() {
             Some(id) => id,
-            None => head.get("id")?.get("Adt")?.as_u64()?,
+            None => json_adt_id(head.get("id")?)?,
         };
         // `resolve_adt_field` names the slot `method_<name>`; strip the
         // prefix for the trait method leaf.
@@ -11167,7 +11190,7 @@ impl<'a> Lowering<'a> {
         {
             return None;
         }
-        let init_id = gd.rest.get("init")?.as_u64()?;
+        let init_id = self.llbc.global_init_fun_id(gd)?;
         let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
         let mut array: Option<(u64, Vec<i64>)> = None;
         let mut borrow: Option<(u64, u64)> = None;
@@ -11217,7 +11240,7 @@ impl<'a> Lowering<'a> {
                             return None;
                         }
                     }
-                    Ok(StmtKind::Assign(place, Rvalue::Use(operand)))
+                    Ok(StmtKind::Assign(place, Rvalue::Use(operand, _)))
                         if matches!(place.kind, PlaceKind::Local(0)) =>
                     {
                         let source = match operand {
@@ -11476,10 +11499,9 @@ impl<'a> Lowering<'a> {
         if global_source_text_is_static_mut(g) {
             return None;
         }
-        let local = g
-            .rest
-            .get("init")
-            .and_then(serde_json::Value::as_u64)
+        let local = self
+            .llbc
+            .global_init_fun_id(g)
             .and_then(|init_id| self.llbc.fn_by_id(init_id))
             .and_then(|fd| {
                 if let Some(u) = fd.unstructured() {
@@ -11529,7 +11551,7 @@ impl<'a> Lowering<'a> {
         {
             return None;
         }
-        let init_id = gd.rest.get("init")?.as_u64()?;
+        let init_id = self.llbc.global_init_fun_id(gd)?;
         let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
 
         // The single `size_of`/`align_of` call that defines `_0`, captured
@@ -11620,7 +11642,7 @@ impl<'a> Lowering<'a> {
         {
             return None;
         }
-        let init_id = gd.rest.get("init")?.as_u64()?;
+        let init_id = self.llbc.global_init_fun_id(gd)?;
         let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
         const_eval_init_body(self.llbc, &body)
     }
@@ -12190,7 +12212,10 @@ impl<'a> Lowering<'a> {
         // Captured before `call.args` is consumed. A constant word
         // (`RBigInt::from(1)`) has no place type; its `ty` is what the
         // constructor residual below classifies.
-        let const_arg_ty = call.args.first().and_then(const_operand_tyref);
+        let const_arg_ty = call
+            .args
+            .first()
+            .and_then(|op| const_operand_tyref(op, self.llbc));
         // Captured before `call.args` is consumed: `slice::len` on
         // `Copy(*byte_view)` must see the mark `Rvalue::Len` already follows.
         let first_arg_is_string_byte_view = call
@@ -12212,7 +12237,10 @@ impl<'a> Lowering<'a> {
         // A constant word (`vb.int_eq(1)`) has no place type. Its declared
         // `ty` is what the int-comparison residual classifies, the same way
         // `RBigInt::from(1)` uses `const_arg_ty`.
-        let second_const_arg_ty = call.args.get(1).and_then(const_operand_tyref);
+        let second_const_arg_ty = call
+            .args
+            .get(1)
+            .and_then(|op| const_operand_tyref(op, self.llbc));
         // Function-item identity of arg #1, captured before `call.args` is
         // consumed.  `Option::map(opt, named_fn)` passes a `FnDef` constant
         // (or a Copy/Move of a `FnDef`-typed local); that shape has no
@@ -14669,7 +14697,7 @@ impl<'a> Lowering<'a> {
                 }
                 // `<[T]>::len` is already a low-level GcArray operation in
                 // the translated type model.  Emit ArrayLen directly, just
-                // as `Rvalue::Len(place)` eventually does, so a gateway
+                // as `Rvalue::Len(place, _, _)` eventually does, so a gateway
                 // wrapper's red `&[PyObjectRef]` argument never detours
                 // through an unregistered host residual.
                 //
@@ -15553,7 +15581,7 @@ impl<'a> Lowering<'a> {
                     // shape as the `elidable_promote` wrapper's
                     // `hint_promote_or_string`.
                     let promote_marker = self.jit_promote_marker(&reg);
-                    let fun_decl_id = regular_call_fun_decl_id(&reg.kind);
+                    let fun_decl_id = regular_call_fun_decl_id(&reg.kind, self.llbc);
                     let target = if let Some((trait_root, method_name)) =
                         abstract_trait_call_target(&reg, self.llbc)
                     {
@@ -17753,10 +17781,7 @@ impl<'a> Lowering<'a> {
                 if let Some(target) = self.specialized_trait_target(v) {
                     return Ok(target);
                 }
-                let fn_id = v
-                    .as_array()
-                    .and_then(|a| a.get(2))
-                    .and_then(serde_json::Value::as_u64);
+                let fn_id = trait_call_method_fun(self.llbc, v);
                 let direct = fn_id
                     .and_then(|id| self.llbc.fn_by_id(id))
                     .and_then(trait_method_owner);
@@ -19333,7 +19358,7 @@ impl<'a> Lowering<'a> {
         let head = adt.first()?;
         let type_id = match head.as_u64() {
             Some(id) => id,
-            None => head.get("id")?.get("Adt")?.as_u64()?,
+            None => json_adt_id(head.get("id")?)?,
         };
         let td = self.llbc.type_by_id(type_id)?;
         if td.item_meta.name_path() != "core::sync::atomic::Ordering" {
@@ -20348,7 +20373,7 @@ impl<'a> Lowering<'a> {
                         continue;
                     }
                     producers += 1;
-                    let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue else {
+                    let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = rvalue else {
                         continue;
                     };
                     if let PlaceKind::Local(i) = &src.kind {
@@ -20398,7 +20423,7 @@ impl<'a> Lowering<'a> {
         let head = adt.first()?;
         let type_id = match head.as_u64() {
             Some(id) => id,
-            None => head.get("id")?.get("Adt")?.as_u64()?,
+            None => json_adt_id(head.get("id")?)?,
         };
         Some(self.llbc.type_by_id(type_id)?.item_meta.name_path())
     }
@@ -21271,7 +21296,7 @@ impl<'a> Lowering<'a> {
             }
             // `U: From<T>` decl-ref generics carry `[U, T]`; equal
             // args select the reflexive blanket impl.  Compare by
-            // hash-cons id so an inline `HashConsedValue: [id, …]`
+            // hash-cons id so an inline `Value: [id, …]`
             // matches its `Deduplicated: id` reference.
             let types = decl.get("generics")?.get("types")?.as_array()?;
             if types.len() == 2 {
@@ -21351,9 +21376,7 @@ impl<'a> Lowering<'a> {
                     None => return false,
                 }
             }
-            if let Some(arr) = obj
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
+            if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
                 && arr.len() == 2
             {
                 v = &arr[1];
@@ -21387,7 +21410,7 @@ impl<'a> Lowering<'a> {
     ///
     /// - **InherentImplBlock**: `{"Ty": {"skip_binder": <TyExpr>}}` where
     ///   `<TyExpr>` is the type expression of `Self` in the impl block.
-    ///   It can be inline (`HashConsedValue: [id, body]`) or
+    ///   It can be inline (`Value: [id, body]`) or
     ///   deduplicated (`Deduplicated: id`).  When inline, the body
     ///   carries the ADT def_id directly (`{"Adt": {"id": {"Adt": <def_id>}}}`);
     ///   when deduplicated, we consult [`Self::dedup_to_adt_def_id`]
@@ -21423,14 +21446,12 @@ impl<'a> Lowering<'a> {
 
     /// Resolve a Charon type expression to the underlying ADT
     /// `def_id`, whether the expression is inline
-    /// (`HashConsedValue: [_, body]`) or deduplicated
+    /// (`Value: [_, body]`) or deduplicated
     /// (`Deduplicated: id`).  Returns `None` for non-ADT shapes
     /// (primitives, references, tuples).
     fn resolve_tyexpr_to_adt_def_id(&self, ty: &serde_json::Value) -> Option<u64> {
         let obj = ty.as_object()?;
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && let Some(body) = arr.get(1)
         {
             return inline_adt_def_id(body);
@@ -21682,9 +21703,7 @@ impl<'a> Lowering<'a> {
                 v = self.llbc.dedup_body(id)?;
                 continue;
             }
-            if let Some(arr) = obj
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
+            if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
                 && arr.len() == 2
             {
                 v = &arr[1];
@@ -21730,9 +21749,7 @@ impl<'a> Lowering<'a> {
                 v = self.llbc.dedup_body(id)?;
                 continue;
             }
-            if let Some(arr) = obj
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
+            if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
                 && arr.len() == 2
             {
                 v = &arr[1];
@@ -23207,6 +23224,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         if node.get("Literal").is_some()
+            || node.get("Scalar").is_some()
             || node.get("Ref").is_some()
             || node.get("RawPtr").is_some()
             || node.get("FnDef").is_some()
@@ -25365,7 +25383,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// The unwrapped ADT body `Value` a [`TyRef`] resolves to, following
-    /// `Deduplicated` / `HashConsedValue` wrapper layers.  The returned
+    /// `Deduplicated` / `Value` wrapper layers.  The returned
     /// object carries the `{"Adt": {"id": …, "generics": …}}` shape both
     /// [`inline_adt_def_id`] and [`adt_head_instantiation_suffix`] decode.
     /// `None` for non-ADT shapes.
@@ -25380,9 +25398,7 @@ impl<'a> Lowering<'a> {
                 v = self.llbc.dedup_body(id)?;
                 continue;
             }
-            if let Some(arr) = obj
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
+            if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
                 && arr.len() == 2
             {
                 v = &arr[1];
@@ -25487,9 +25503,7 @@ impl<'a> Lowering<'a> {
                 v = next;
                 continue;
             }
-            if let Some(arr) = obj
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
+            if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
                 && arr.len() == 2
             {
                 v = &arr[1];
@@ -25605,12 +25619,20 @@ impl<'a> Lowering<'a> {
             TyRef::Other(v) => v,
             TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
         };
-        value
-            .as_object()?
-            .get("Literal")?
-            .as_object()?
-            .get(kind)?
-            .as_str()
+        let obj = value.as_object()?;
+        if let Some(lit) = obj.get("Literal").and_then(serde_json::Value::as_object) {
+            return lit.get(kind)?.as_str();
+        }
+        let scalar = obj.get("Scalar")?;
+        if kind == "Float" {
+            return scalar.get("Float")?.as_str();
+        }
+        let side = match kind {
+            "Int" => "Signed",
+            "UInt" => "Unsigned",
+            _ => return None,
+        };
+        scalar.get("Integer")?.get(side)?.as_str()
     }
 
     /// Shared tail for the decomposed checked-arithmetic /
@@ -25749,6 +25771,13 @@ impl<'a> Lowering<'a> {
     ) -> Result<(), LowerError> {
         let bb_id = self.block_id[mir_bb];
         let discr_var = self.resolve_operand(mir_bb, discr)?;
+        let targets = if let SwitchTargets::SwitchInt(_, arms, default) = &targets
+            && let Some((then_bb, else_bb)) = bool_if_from_arms(arms, *default, self.llbc)
+        {
+            SwitchTargets::If(then_bb, else_bb)
+        } else {
+            targets
+        };
         match targets {
             SwitchTargets::If(then_bb, else_bb) => {
                 // Constant-bool discriminant: take the known arm
@@ -25821,7 +25850,7 @@ impl<'a> Lowering<'a> {
                 }
                 let mut links: Vec<Link> = Vec::new();
                 for (scalar, bb) in arms {
-                    let case = scalar_to_const_value(&scalar).ok_or_else(|| {
+                    let case = scalar_from_arm(&scalar, self.llbc).ok_or_else(|| {
                         LowerError::Unsupported(format!(
                             "bb{mir_bb}: SwitchInt case scalar shape not yet supported: {scalar}"
                         ))
@@ -25878,7 +25907,7 @@ impl<'a> Lowering<'a> {
         let mut some_bb: Option<u64> = None;
         let mut none_bb: Option<u64> = None;
         for (scalar, bb) in &arms {
-            let case = scalar_to_const_value(scalar).ok_or_else(|| {
+            let case = scalar_from_arm(scalar, self.llbc).ok_or_else(|| {
                 LowerError::Unsupported(format!(
                     "bb{mir_bb}: niche-Option SwitchInt case scalar shape not supported: {scalar}"
                 ))
@@ -26141,7 +26170,7 @@ fn push_registered_fun_path(llbc: &Llbc, id: u64, out: &mut Vec<String>) {
 
 fn rvalue_fundef(rvalue: &Rvalue) -> Option<u64> {
     match rvalue {
-        Rvalue::Use(operand) | Rvalue::UnaryOp(_, operand) | Rvalue::Cast(_, operand, _) => {
+        Rvalue::Use(operand, _) | Rvalue::UnaryOp(_, operand) | Rvalue::Cast(_, operand, _) => {
             operand_fundef(operand)
         }
         _ => None,
@@ -26791,15 +26820,15 @@ fn clean_accumulator_ref_temps_scan(
                                 return None; // `&c.field` / `&*c` — escape
                             }
                         }
-                        Rvalue::Len(p) | Rvalue::Discriminant(p) => {
+                        Rvalue::Len(p, _, _) | Rvalue::Discriminant(p) => {
                             if place_references_local(p, c) {
                                 return None;
                             }
                         }
-                        Rvalue::Use(op)
+                        Rvalue::Use(op, _)
                         | Rvalue::UnaryOp(_, op)
                         | Rvalue::Cast(_, op, _)
-                        | Rvalue::Repeat(op, _, _)
+                        | Rvalue::Repeat(op, _, _, _)
                         | Rvalue::ShallowInitBox(op, _) => {
                             if c_operand_kind(op, c) == Some(false) {
                                 return None;
@@ -26817,7 +26846,7 @@ fn clean_accumulator_ref_temps_scan(
                                 return None;
                             }
                         }
-                        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+                        Rvalue::NullaryOp(_) | Rvalue::Unknown => {}
                     }
                 }
                 Ok(StmtKind::Assert(a)) => {
@@ -26828,6 +26857,7 @@ fn clean_accumulator_ref_temps_scan(
                 Ok(StmtKind::PlaceMention(_))
                 | Ok(StmtKind::StorageLive(_))
                 | Ok(StmtKind::StorageDead(_))
+                | Ok(StmtKind::Borrowck(_))
                 | Ok(StmtKind::Unknown) => {}
                 Err(_) => return None,
             }
@@ -27271,10 +27301,10 @@ fn accumulator_materialization_site_count(
                     moves += 1;
                 }
                 match rvalue {
-                    Rvalue::Use(op)
+                    Rvalue::Use(op, _)
                     | Rvalue::UnaryOp(_, op)
                     | Rvalue::Cast(_, op, _)
-                    | Rvalue::Repeat(op, _, _)
+                    | Rvalue::Repeat(op, _, _, _)
                     | Rvalue::ShallowInitBox(op, _) => {
                         if is_move(op) {
                             moves += 1;
@@ -27626,7 +27656,7 @@ fn operand_is_lowlevel_string_chars_offset(body: &Unstructured, llbc: &Llbc, op:
         return false;
     };
     match defining_assign(body, local) {
-        Some(Rvalue::Use(inner)) => place_is_chars_offset_global(llbc, operand_place(inner)),
+        Some(Rvalue::Use(inner, _)) => place_is_chars_offset_global(llbc, operand_place(inner)),
         _ => false,
     }
 }
@@ -27695,7 +27725,7 @@ fn defining_assign<'a>(body: &'a Unstructured, local: usize) -> Option<&'a Rvalu
 /// rvalue that is not a plain local copy, stops the walk.
 fn peel_copies(body: &Unstructured, mut local: usize) -> Option<usize> {
     for _ in 0..32 {
-        let Some(Rvalue::Use(op)) = defining_assign(body, local) else {
+        let Some(Rvalue::Use(op, _)) = defining_assign(body, local) else {
             return Some(local);
         };
         let Some(next) = operand_local(Some(op)) else {
@@ -27714,7 +27744,7 @@ fn peel_copies(body: &Unstructured, mut local: usize) -> Option<usize> {
 fn peel_copy_and_cast(body: &Unstructured, mut local: usize) -> Option<usize> {
     for _ in 0..32 {
         match defining_assign(body, local) {
-            Some(Rvalue::Use(op)) => {
+            Some(Rvalue::Use(op, _)) => {
                 let Some(next) = operand_local(Some(op)) else {
                     return Some(local);
                 };
@@ -27812,13 +27842,10 @@ fn regular_call_name_path(reg: &RegularCall, llbc: &Llbc) -> Option<String> {
     llbc.fn_by_id(*id).map(|fd| fd.item_meta.name_path())
 }
 
-fn regular_call_fun_decl_id(kind: &CallKind) -> Option<u64> {
+fn regular_call_fun_decl_id(kind: &CallKind, llbc: &Llbc) -> Option<u64> {
     match kind {
         CallKind::Fun(FunId::Regular { id }) => Some(*id),
-        CallKind::Trait(v) => v
-            .as_array()
-            .and_then(|arr| arr.get(2))
-            .and_then(serde_json::Value::as_u64),
+        CallKind::Trait(v) => trait_call_method_fun(llbc, v),
         _ => None,
     }
 }
@@ -28008,13 +28035,17 @@ fn operand_tyref(op: &Operand) -> Option<&TyRef> {
 /// Declared type of an `Operand::Const`.
 ///
 /// Charon stores it beside the literal (`{"ty": {"Deduplicated": N}}` or an
-/// inline `HashConsedValue`). [`operand_tyref`] stays place-only; the rbigint
+/// inline `Value`). [`operand_tyref`] stays place-only; the rbigint
 /// constructor gate is the caller that has to see a constant word.
-fn const_operand_tyref(op: &Operand) -> Option<TyRef> {
+fn const_operand_tyref(op: &Operand, llbc: &Llbc) -> Option<TyRef> {
     let Operand::Const(value) = op else {
         return None;
     };
-    let ty = value.as_object()?.get("ty")?;
+    let peeled = peel_hashcons_value(llbc, value);
+    if let Some(arr) = peeled.as_array() {
+        return serde_json::from_value(arr.get(1)?.clone()).ok();
+    }
+    let ty = peeled.get("ty")?;
     serde_json::from_value(ty.clone()).ok()
 }
 
@@ -28023,10 +28054,14 @@ fn tyref_is_literal_bool(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(node) = tyref_node(ty, llbc) else {
         return false;
     };
-    let Some(lit) = node.as_object().and_then(|obj| obj.get("Literal")) else {
+    let Some(obj) = node.as_object() else {
         return false;
     };
-    lit.as_str() == Some("Bool") || lit.as_object().is_some_and(|obj| obj.contains_key("Bool"))
+    if let Some(lit) = obj.get("Literal") {
+        return lit.as_str() == Some("Bool")
+            || lit.as_object().is_some_and(|lit| lit.contains_key("Bool"));
+    }
+    obj.get("Scalar").and_then(serde_json::Value::as_str) == Some("Bool")
 }
 
 /// The decomposed brick-3 element-`add` gate
@@ -28158,7 +28193,7 @@ fn base_traces_to_items_block_accessor_matching(
                 {
                     producers += 1;
                     match &rvalue {
-                        Rvalue::Use(op) => copy_src = operand_local(Some(op)),
+                        Rvalue::Use(op, _) => copy_src = operand_local(Some(op)),
                         // `typed_items_block_items_base(..) as *const i64`
                         // changes only the raw-pointer pointee spelling. The
                         // address is identical, so follow it exactly as
@@ -28296,10 +28331,10 @@ fn classify_write_place(
 
 fn scan_rvalue_dest_ref(rvalue: &Rvalue, dest: usize, derefs: &mut usize, other: &mut usize) {
     match rvalue {
-        Rvalue::Use(op)
+        Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
         | Rvalue::Cast(_, op, _)
-        | Rvalue::Repeat(op, _, _)
+        | Rvalue::Repeat(op, _, _, _)
         | Rvalue::ShallowInitBox(op, _) => bump_dest_ref(operand_dest_ref(op, dest), derefs, other),
         Rvalue::BinaryOp(_, lhs, rhs) => {
             bump_dest_ref(operand_dest_ref(lhs, dest), derefs, other);
@@ -28309,7 +28344,7 @@ fn scan_rvalue_dest_ref(rvalue: &Rvalue, dest: usize, derefs: &mut usize, other:
         // element load, so any reference to `dest` here escapes.
         Rvalue::Ref { place, .. }
         | Rvalue::RawPtr { place, .. }
-        | Rvalue::Len(place)
+        | Rvalue::Len(place, _, _)
         | Rvalue::Discriminant(place) => {
             if place_references_local(place, dest) {
                 *other += 1;
@@ -28320,7 +28355,7 @@ fn scan_rvalue_dest_ref(rvalue: &Rvalue, dest: usize, derefs: &mut usize, other:
                 bump_dest_ref(operand_dest_ref(op, dest), derefs, other);
             }
         }
-        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+        Rvalue::NullaryOp(_) | Rvalue::Unknown => {}
     }
 }
 
@@ -28669,13 +28704,12 @@ impl<'a> RootStackAnalyzer<'a> {
         let Some(arr) = v.as_array() else {
             return true;
         };
-        let (Some(traitref), Some(method), Some(decl)) = (
-            arr.first(),
-            arr.get(1).and_then(serde_json::Value::as_u64),
-            arr.get(2).and_then(serde_json::Value::as_u64),
-        ) else {
+        let (Some(traitref), Some(method)) =
+            (arr.first(), arr.get(1).and_then(serde_json::Value::as_u64))
+        else {
             return true;
         };
+        let decl = trait_call_method_fun(self.llbc, v);
         let bodies = self
             .trait_methods
             .get_or_init(|| trait_method_bodies(self.llbc));
@@ -28692,7 +28726,9 @@ impl<'a> RootStackAnalyzer<'a> {
                     .copied(),
             );
         }
-        if self.llbc.fn_by_id(decl).is_some_and(|fd| fd.body.is_some()) {
+        if let Some(decl) = decl
+            && self.llbc.fn_by_id(decl).is_some_and(|fd| fd.body.is_some())
+        {
             targets.push(decl);
         }
         if targets.is_empty() {
@@ -28821,7 +28857,15 @@ fn trait_method_bodies(llbc: &Llbc) -> TraitMethodBodies {
 /// The function item a constant names, spelled as the `RegularCall` a direct
 /// call to it would carry.
 fn fn_def_of_const(c: &serde_json::Value) -> Option<RegularCall> {
-    let fn_def = c.get("kind")?.get("FnDef")?;
+    let body = c
+        .get("Value")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .unwrap_or(c);
+    let kind = body.as_array().and_then(|arr| arr.first()).unwrap_or(body);
+    let fn_def = kind
+        .get("FnDef")
+        .or_else(|| kind.get("kind").and_then(|k| k.get("FnDef")))?;
     serde_json::from_value::<RegularCall>(fn_def.clone()).ok()
 }
 
@@ -29427,7 +29471,7 @@ fn analyze_root_brackets_with(
         changed = false;
         for bb in &body.body {
             for stmt in &bb.statements {
-                let Ok(StmtKind::Assign(place, Rvalue::Use(operand))) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind() else {
                     continue;
                 };
                 let (PlaceKind::Local(dest), Some(src)) =
@@ -29494,7 +29538,7 @@ fn analyze_root_brackets_with(
     }
     for bb in &body.body {
         for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(place, Rvalue::Use(operand))) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind() else {
                 continue;
             };
             let PlaceKind::Local(dest) = place.kind else {
@@ -29551,7 +29595,7 @@ fn analyze_root_brackets_with(
                     continue;
                 }
                 // `_t = copy _slot`, the argument temporary (2.5) recorded.
-                Ok(StmtKind::Assign(place, Rvalue::Use(operand))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == operand_local(Some(&operand))) =>
+                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == operand_local(Some(&operand))) =>
                 {
                     continue;
                 }
@@ -29564,7 +29608,7 @@ fn analyze_root_brackets_with(
                 }
                 Ok(StmtKind::Assign(
                     place,
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src)),
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _),
                 )) if matches!(place.kind, PlaceKind::Local(d) if offsets.contains_key(&(d as usize)))
                     && checked_sum_field_local(&src, 0)
                         .is_some_and(|sum| sums.contains_key(&sum)) =>
@@ -30124,7 +30168,7 @@ fn analyze_owner_roots_with(
                 }
                 // A handle moved into another handle local, the return place
                 // included.
-                Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Move(src))))
+                Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Move(src), _)))
                     if matches!(place.kind, PlaceKind::Local(d) if roots.contains(d as usize))
                         && matches!(src.kind, PlaceKind::Local(s) if roots.contains(s as usize)) =>
                 {
@@ -30450,7 +30494,10 @@ fn compute_mir_liveness(
                 StmtKind::Assert(assert) => {
                     mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx], n_locals)
                 }
-                StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Unknown => {}
+                StmtKind::StorageLive(_)
+                | StmtKind::StorageDead(_)
+                | StmtKind::Borrowck(_)
+                | StmtKind::Unknown => {}
             }
         }
         let Ok(term) = bb.term() else {
@@ -30570,10 +30617,10 @@ fn mark_rvalue_uses(
     n_locals: usize,
 ) {
     match rvalue {
-        Rvalue::Use(op)
+        Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
         | Rvalue::Cast(_, op, _)
-        | Rvalue::Repeat(op, _, _)
+        | Rvalue::Repeat(op, _, _, _)
         | Rvalue::ShallowInitBox(op, _) => mark_operand_use(op, uses, defs, n_locals),
         Rvalue::BinaryOp(_, lhs, rhs) => {
             mark_operand_use(lhs, uses, defs, n_locals);
@@ -30581,14 +30628,14 @@ fn mark_rvalue_uses(
         }
         Rvalue::Ref { place, .. }
         | Rvalue::RawPtr { place, .. }
-        | Rvalue::Len(place)
+        | Rvalue::Len(place, _, _)
         | Rvalue::Discriminant(place) => mark_place_use(place, uses, defs, n_locals),
         Rvalue::Aggregate(_, operands) => {
             for op in operands {
                 mark_operand_use(op, uses, defs, n_locals);
             }
         }
-        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+        Rvalue::NullaryOp(_) | Rvalue::Unknown => {}
     }
 }
 
@@ -30981,7 +31028,7 @@ fn collect_fn_stubs_from_llbc_if(
         }
         // Global initializers are synthetic, not user-callable fns; the
         // MIR-driver lowering loop skips them too.
-        if fd.is_global_initializer.is_some() {
+        if fd.global_initializer_id().is_some() {
             continue;
         }
         // Reference returns (`&bool`, `&()`, …) stay out.  The projection
@@ -31081,7 +31128,7 @@ pub(crate) fn collect_marked_class_ctor_stubs_from_llbc(
     use crate::flowspace::argument::Signature;
     let mut out = Vec::new();
     for fd in llbc.iter_local_fns() {
-        if fd.is_global_initializer.is_some() {
+        if fd.global_initializer_id().is_some() {
             continue;
         }
         let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) else {
@@ -31166,7 +31213,7 @@ pub(crate) fn collect_foreign_opaque_method_externals(
     use crate::flowspace::argument::Signature;
     let mut out = Vec::new();
     for fd in llbc.iter_local_fns() {
-        if fd.is_global_initializer.is_some() {
+        if fd.global_initializer_id().is_some() {
             continue;
         }
         // Owner must be an impl-block method on an opaque ADT, with the
@@ -31409,9 +31456,7 @@ fn trait_default_owner_for_fundecl(
 /// Free-function version of [`Lowering::resolve_tyexpr_to_adt_def_id`].
 fn resolve_tyexpr_to_adt_def_id_free(llbc: &Llbc, ty: &serde_json::Value) -> Option<u64> {
     let obj = ty.as_object()?;
-    if let Some(arr) = obj
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
+    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
         && let Some(body) = arr.get(1)
     {
         return inline_adt_def_id(body);
@@ -31651,20 +31696,19 @@ fn aggregate_ctor_name(kind: &serde_json::Value) -> String {
     "ctor".to_string()
 }
 
-/// Project a `HashConsedValue` body to the underlying ADT
+/// Project a `Value` body to the underlying ADT
 /// `def_id` when the body has shape `{"Adt": {"id": {"Adt": <def_id>}}}`.
 /// Mirrors the reader's private helper used to build
 /// `Llbc::dedup_to_adt_def_id`; reproduced here because the inline
 /// arm of [`Lowering::resolve_tyexpr_to_adt_def_id`] decodes the
 /// same body shape without going through the dedup cache.
+fn json_adt_id(id: &serde_json::Value) -> Option<u64> {
+    id.as_u64()
+        .or_else(|| id.get("Adt").and_then(serde_json::Value::as_u64))
+}
+
 fn inline_adt_def_id(body: &serde_json::Value) -> Option<u64> {
-    body.as_object()?
-        .get("Adt")?
-        .as_object()?
-        .get("id")?
-        .as_object()?
-        .get("Adt")?
-        .as_u64()
+    json_adt_id(body.as_object()?.get("Adt")?.as_object()?.get("id")?)
 }
 
 /// An inline `Vec<T, A>` value, not `Box<Vec<_>>` and not `&Vec<_>`.
@@ -31762,7 +31806,7 @@ enum SpanKind {
     },
 }
 
-/// Peel `Deduplicated` / `HashConsedValue` wrappers off a Charon value.
+/// Peel `Deduplicated` / `Value` wrappers off a Charon value.
 fn peel_hashcons_value<'a>(
     llbc: &'a Llbc,
     mut value: &'a serde_json::Value,
@@ -31781,7 +31825,7 @@ fn peel_hashcons_value<'a>(
             }
         }
         if let Some(body) = obj
-            .get("HashConsedValue")
+            .get("Value")
             .and_then(serde_json::Value::as_array)
             .and_then(|arr| arr.get(1))
         {
@@ -31906,6 +31950,34 @@ fn transmute_is_same_layout_bank(src: &TyRef, dst: &TyRef, llbc: &Llbc) -> bool 
 fn tyref_exact_layout_size(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let obj = node.as_object()?;
+
+    if let Some(scalar) = obj.get("Scalar") {
+        if scalar.as_str() == Some("Bool") {
+            return Some(1);
+        }
+        if scalar.as_str() == Some("Char") {
+            return Some(4);
+        }
+        let scalar_size = |kind: &str| match kind {
+            "I8" | "U8" => Some(1),
+            "I16" | "U16" | "F16" => Some(2),
+            "I32" | "U32" | "F32" => Some(4),
+            "I64" | "U64" | "F64" => Some(8),
+            "I128" | "U128" | "F128" => Some(16),
+            "Isize" | "Usize" => Some(crate::layout::target_word_size() as u64),
+            _ => None,
+        };
+        if let Some(kind) = scalar.get("Float").and_then(serde_json::Value::as_str) {
+            return scalar_size(kind);
+        }
+        if let Some(int) = scalar.get("Integer") {
+            for side in ["Signed", "Unsigned"] {
+                if let Some(kind) = int.get(side).and_then(serde_json::Value::as_str) {
+                    return scalar_size(kind);
+                }
+            }
+        }
+    }
 
     if let Some(lit) = obj.get("Literal") {
         if let Some(atom) = lit.as_str() {
@@ -32292,7 +32364,7 @@ fn tyref_to_value_type_with(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> ValueType {
-    // The HashConsedValue arm carries the body inline; primitives
+    // The Value arm carries the body inline; primitives
     // typically land here.  The Deduplicated arm carries only an
     // ID; consult the dedup-body index to recover the inline shape
     // when it was recorded.  Ids never seen inline (or scanned out
@@ -32622,7 +32694,7 @@ fn tyref_enum_payload_value_type(
         return tyref_to_value_type_with(&TyRef::Other(pointee), llbc, tombstoned);
     }
     // A payload slot read straight out of `generics.types` may still carry
-    // the `HashConsedValue` / `Deduplicated` wrappers that
+    // the `Value` / `Deduplicated` wrappers that
     // [`tyref_to_value_type`]'s primitive match does not walk (it resolves a
     // `TyRef::Dedup`, not a node reached through one), so strip them the way
     // the peel above already does internally.
@@ -32774,9 +32846,7 @@ fn tyref_is_borrowed_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
             }
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             v = &arr[1];
@@ -32833,9 +32903,7 @@ fn tyref_shared_borrow_primitive_pointee(ty: &TyRef, llbc: &Llbc) -> Option<serd
             v = llbc.dedup_body(id)?;
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             v = &arr[1];
@@ -32856,7 +32924,7 @@ fn tyref_shared_borrow_primitive_pointee(ty: &TyRef, llbc: &Llbc) -> Option<serd
 ///
 /// Split out from [`tyref_shared_borrow_primitive_pointee`] because the
 /// pointee is reached after an arbitrary number of `Deduplicated` /
-/// `HashConsedValue` hops, exactly as the borrow itself was.
+/// `Value` hops, exactly as the borrow itself was.
 fn tyref_primitive_node<'l>(
     node: &'l serde_json::Value,
     llbc: &'l Llbc,
@@ -32868,9 +32936,7 @@ fn tyref_primitive_node<'l>(
             v = llbc.dedup_body(id)?;
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             v = &arr[1];
@@ -33810,7 +33876,7 @@ pub(crate) fn discover_foldable_const_lits(llbc: &Llbc) -> Vec<(String, OpKind)>
         if ambiguous.binary_search(&path).is_ok() {
             continue;
         }
-        let Some(init_id) = g.rest.get("init").and_then(serde_json::Value::as_u64) else {
+        let Some(init_id) = llbc.global_init_fun_id(g) else {
             continue;
         };
         let Some(fd) = llbc.fn_by_id(init_id) else {
@@ -33849,7 +33915,7 @@ pub(crate) fn register_ambiguous_impl_foldable_const_lits(llbc: &Llbc) {
         if global_is_thread_local(g) || global_source_text_is_static_mut(g) {
             continue;
         }
-        let Some(init_id) = g.rest.get("init").and_then(serde_json::Value::as_u64) else {
+        let Some(init_id) = llbc.global_init_fun_id(g) else {
             continue;
         };
         let Some(fd) = llbc.fn_by_id(init_id) else {
@@ -34032,13 +34098,7 @@ fn tyref_is_oparg(ty: &TyRef, llbc: &Llbc) -> bool {
 /// The ADT def_id of an (already wrapper-stripped) type node, or
 /// `None` for non-ADT nodes.
 fn adt_node_def_id(node: &serde_json::Value) -> Option<u64> {
-    node.as_object()?
-        .get("Adt")?
-        .as_object()?
-        .get("id")?
-        .as_object()?
-        .get("Adt")?
-        .as_u64()
+    json_adt_id(node.as_object()?.get("Adt")?.as_object()?.get("id")?)
 }
 
 /// The monomorphic-ADT class root of an (already wrapper-stripped)
@@ -34257,9 +34317,7 @@ fn type_node_is_mut_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> 
             node = body;
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             node = &arr[1];
@@ -34301,9 +34359,7 @@ fn type_node_is_fn_ptr<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> b
             node = body;
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             node = &arr[1];
@@ -34325,9 +34381,7 @@ fn type_node_fn_def_fun_id<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) 
             node = llbc.dedup_body(id)?;
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             node = &arr[1];
@@ -34368,7 +34422,7 @@ fn operand_fn_item_segments(llbc: &Llbc, op: Option<&Operand>) -> Option<Vec<Str
 }
 
 /// The pointee type node of a shared reference `&T` (`{"Ref": [region, ty,
-/// "Shared"]}`), after unwrapping `Deduplicated` / `HashConsedValue`
+/// "Shared"]}`), after unwrapping `Deduplicated` / `Value`
 /// indirection — or `None` when `node` is not a shared reference. The
 /// companion of [`type_node_is_mut_ref`]: that answers "is this `&mut`?",
 /// this returns the `&T` pointee so the caller can gate on its shape.
@@ -34382,9 +34436,7 @@ fn type_node_shared_ref_pointee<'l>(
             node = llbc.dedup_body(id)?;
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             node = &arr[1];
@@ -34402,7 +34454,7 @@ fn type_node_shared_ref_pointee<'l>(
 }
 
 /// The pointee type node of a raw pointer (`{"RawPtr": [ty, kind]}`), after
-/// unwrapping `Deduplicated` / `HashConsedValue` indirection — or `None` when
+/// unwrapping `Deduplicated` / `Value` indirection — or `None` when
 /// `node` is not a direct raw pointer. Deliberately does not peel a leading
 /// reference: `&RawPtr` is a shared-reference payload, not a raw-pointer
 /// payload.
@@ -34416,9 +34468,7 @@ fn type_node_raw_ptr_pointee<'l>(
             node = llbc.dedup_body(id)?;
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             node = &arr[1];
@@ -34446,9 +34496,7 @@ fn type_node_box_pointee<'l>(
             node = llbc.dedup_body(id)?;
             continue;
         }
-        if let Some(parts) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(parts) = obj.get("Value").and_then(serde_json::Value::as_array)
             && parts.len() == 2
         {
             node = &parts[1];
@@ -34498,7 +34546,7 @@ fn type_node_is_thin_box(node: &serde_json::Value, llbc: &Llbc) -> bool {
 }
 
 /// Strip the indirection wrappers a Charon type node can carry —
-/// `{"Deduplicated": id}` / `{"HashConsedValue": [id, ty]}` /
+/// `{"Deduplicated": id}` / `{"Value": [id, ty]}` /
 /// `{"Ref": [region, ty, kind]}` — and return the underlying type node
 /// (`Adt`, `TypeVar`, `Literal`, …).
 fn strip_ty_wrappers<'l>(
@@ -34511,9 +34559,7 @@ fn strip_ty_wrappers<'l>(
             node = llbc.dedup_body(id)?;
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             node = &arr[1];
@@ -34529,7 +34575,7 @@ fn strip_ty_wrappers<'l>(
 }
 
 /// Strip only the indirection wrappers — `{"Deduplicated": id}` and
-/// `{"HashConsedValue": [id, ty]}` — leaving any `Ref` in place.
+/// `{"Value": [id, ty]}` — leaving any `Ref` in place.
 ///
 /// [`strip_ty_wrappers`] peels `Ref` too, and peels it repeatedly.  A caller
 /// that must account for exactly one reference level cannot use it: over
@@ -34544,9 +34590,7 @@ fn strip_ty_indirections<'l>(
             node = llbc.dedup_body(id)?;
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             node = &arr[1];
@@ -34685,9 +34729,12 @@ fn json_ty_is_statically_sized(node: &serde_json::Value, llbc: &Llbc) -> bool {
     else {
         return false;
     };
-    // The tuple atom and a named `{"Adt": def_id}`; the `Builtin` ids stay
-    // out, so `Slice` and `Str` decline with the top-level spellings.
-    id.as_str() == Some("Tuple") || id.as_object().is_some_and(|m| m.contains_key("Adt"))
+    // The tuple atom and a named ADT. The id is a number, or the older
+    // `{"Adt": def_id}` object. `Builtin` ids stay out, so `Slice` and
+    // `Str` decline with the top-level spellings.
+    id.as_u64().is_some()
+        || id.as_str() == Some("Tuple")
+        || id.as_object().is_some_and(|m| m.contains_key("Adt"))
 }
 
 /// A Copy scalar: a Charon `Literal` integer, float, `bool`, or `char`.
@@ -34964,9 +35011,7 @@ fn typevar_bounded_by_into_string_value(
                 v = llbc.dedup_body(id)?;
                 continue;
             }
-            if let Some(arr) = obj
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
+            if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
                 && arr.len() == 2
             {
                 v = &arr[1];
@@ -35224,9 +35269,7 @@ fn output_type_is_ref(ty: &TyRef, llbc: &Llbc) -> bool {
                 None => return false,
             }
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             node = &arr[1];
@@ -35458,9 +35501,7 @@ fn tyref_reference_layout_string(ty: &TyRef, llbc: &Llbc) -> Option<String> {
         if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
             return visit(llbc.dedup_body(id)?, llbc, depth + 1);
         }
-        if let Some(pair) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(pair) = obj.get("Value").and_then(serde_json::Value::as_array)
             && pair.len() == 2
         {
             return visit(&pair[1], llbc, depth + 1);
@@ -35743,9 +35784,7 @@ pub(crate) fn charon_type_value_to_ast_string(
             None => format!("??unresolved_dedup#{id}"),
         };
     }
-    if let Some(arr) = obj
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
+    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
         && arr.len() == 2
     {
         return charon_type_value_to_ast_string(&arr[1], llbc, depth + 1);
@@ -35833,7 +35872,7 @@ pub(crate) fn charon_type_value_to_ast_string(
 /// trait's unique impl, rendering the bound concrete type.
 ///
 /// `traitref` names the trait via `trait_decl_ref.skip_binder.id`
-/// (possibly behind `HashConsedValue`/`Deduplicated` indirections);
+/// (possibly behind `Value`/`Deduplicated` indirections);
 /// `assoc` selects the associated item (an index in current Charon
 /// output).  Returns `None` — keeping the caller's `??TraitType`
 /// fallback — when the trait id cannot be recovered, when zero or
@@ -35885,7 +35924,7 @@ fn trait_assoc_projection_target<'a>(
     serde_json::from_value::<TyRef>(resolved?.clone()).ok()
 }
 
-/// Peel `Deduplicated` / `HashConsedValue` so a trait projection in an
+/// Peel `Deduplicated` / `Value` so a trait projection in an
 /// ADT generic argument is visible to [`trait_assoc_projection_target`].
 fn trait_payload_node<'a>(
     mut node: &'a serde_json::Value,
@@ -35897,9 +35936,7 @@ fn trait_payload_node<'a>(
             node = llbc.dedup_body(id)?;
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             node = &arr[1];
@@ -35978,7 +36015,7 @@ fn trait_impl_assoc_value<'a>(
 
 /// Recover the trait decl id a `TraitRef` names —
 /// `trait_decl_ref.skip_binder.id`, behind the usual
-/// `HashConsedValue` / `Deduplicated` indirections.
+/// `Value` / `Deduplicated` indirections.
 fn traitref_decl_id(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<u64> {
     if depth > 8 {
         return None;
@@ -35987,9 +36024,7 @@ fn traitref_decl_id(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<
     if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
         return traitref_decl_id(llbc.dedup_body(id)?, llbc, depth + 1);
     }
-    if let Some(arr) = obj
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
+    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
         && arr.len() == 2
     {
         return traitref_decl_id(&arr[1], llbc, depth + 1);
@@ -36001,7 +36036,7 @@ fn traitref_decl_id(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<
 }
 
 /// Recover the trait *impl* id a resolved `TraitRef` selected —
-/// `kind.TraitImpl.id`, behind the usual `HashConsedValue` /
+/// `kind.TraitImpl.id`, behind the usual `Value` /
 /// `Deduplicated` indirections.  `None` when the ref is still a
 /// clause/builtin obligation rather than a selected impl.
 fn traitref_impl_id(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<u64> {
@@ -36012,9 +36047,7 @@ fn traitref_impl_id(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<
     if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
         return traitref_impl_id(llbc.dedup_body(id)?, llbc, depth + 1);
     }
-    if let Some(arr) = obj
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
+    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
         && arr.len() == 2
     {
         return traitref_impl_id(&arr[1], llbc, depth + 1);
@@ -36022,7 +36055,7 @@ fn traitref_impl_id(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<
     obj.get("kind")?.get("TraitImpl")?.get("id")?.as_u64()
 }
 
-/// Unwrap a `TraitRef`'s `HashConsedValue` / `Deduplicated` indirections
+/// Unwrap a `TraitRef`'s `Value` / `Deduplicated` indirections
 /// to the underlying trait-ref object.
 fn traitref_unwrap<'a>(
     v: &'a serde_json::Value,
@@ -36034,11 +36067,10 @@ fn traitref_unwrap<'a>(
     }
     let obj = v.as_object()?;
     if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-        return traitref_unwrap(llbc.dedup_body(id)?, llbc, depth + 1);
+        let body = llbc.dedup_class(3, id).or_else(|| llbc.dedup_body(id))?;
+        return traitref_unwrap(body, llbc, depth + 1);
     }
-    if let Some(arr) = obj
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
+    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
         && arr.len() == 2
     {
         return traitref_unwrap(&arr[1], llbc, depth + 1);
@@ -36047,14 +36079,14 @@ fn traitref_unwrap<'a>(
 }
 
 /// Hash-cons identity of a type expression: the `Deduplicated` id or
-/// the inline `HashConsedValue: [id, …]` id.  Two type refs with the
+/// the inline `Value: [id, …]` id.  Two type refs with the
 /// same key denote the same monomorphized type.
 fn ty_dedup_key(v: &serde_json::Value) -> Option<u64> {
     let obj = v.as_object()?;
     if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
         return Some(id);
     }
-    obj.get("HashConsedValue")?.as_array()?.first()?.as_u64()
+    obj.get("Value")?.as_array()?.first()?.as_u64()
 }
 
 /// Outcome of devirtualizing a blanket `core::convert::<Impl>::into`
@@ -36556,7 +36588,7 @@ pub(crate) fn adt_head_instantiation_suffix(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
 ) -> Option<String> {
-    let def_id = adt.get("id")?.as_object()?.get("Adt")?.as_u64()?;
+    let def_id = json_adt_id(adt.get("id")?)?;
     let td = llbc.type_by_id(def_id)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
         return None;
@@ -36593,6 +36625,20 @@ fn charon_adt_to_ast_string(
             }
             other => format!("??adt_atom_{other}"),
         };
+    }
+    if let Some(def_id) = id.and_then(serde_json::Value::as_u64) {
+        if let Some(builtin) = adt.get("builtin").filter(|builtin| !builtin.is_null()) {
+            return charon_builtin_adt_to_ast_string(builtin, &type_args, adt);
+        }
+        let name = llbc
+            .type_by_id(def_id)
+            .map(|td| td.item_meta.name_path())
+            .unwrap_or_else(|| format!("??adt#{def_id}"));
+        let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+        if type_args.is_empty() {
+            return leaf;
+        }
+        return format!("{leaf}<{}>", type_args.join(","));
     }
     if let Some(id_obj) = id.and_then(|i| i.as_object()) {
         if let Some(def_id) = id_obj.get("Adt").and_then(serde_json::Value::as_u64) {
@@ -36766,6 +36812,28 @@ fn field_label_from_payload(payload: &serde_json::Value) -> String {
 /// matching the direct-path key
 /// `register_function_graph(direct_path, …)` at `lib.rs`
 /// (`extract_trait_impls`'s `<default methods of <Trait>>` branch).
+/// FunDecl id of a trait's method declaration. `src` is
+/// `TraitDefault { trait_ref.id, item_id }` and `item_id` is the method index.
+fn trait_call_method_fun(llbc: &Llbc, payload: &serde_json::Value) -> Option<u64> {
+    let arr = payload.as_array()?;
+    let method = arr.get(1)?.as_u64()?;
+    if let Some(trait_id) = traitref_decl_id(arr.first()?, llbc, 0)
+        && let Some(id) = trait_default_method_id(llbc, trait_id, method)
+    {
+        return Some(id);
+    }
+    arr.get(2).and_then(serde_json::Value::as_u64)
+}
+
+fn trait_default_method_id(llbc: &Llbc, trait_id: u64, method_idx: u64) -> Option<u64> {
+    llbc.iter_fun_decls().find_map(|fd| {
+        let src = fd.src.as_ref()?.get("TraitDefault")?;
+        let item = src.get("item_id")?.as_u64()?;
+        let id = src.get("trait_ref")?.get("id")?.as_u64()?;
+        (item == method_idx && id == trait_id).then_some(fd.def_id)
+    })
+}
+
 fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
     let segs = &fd.item_meta.name;
     if segs.len() < 2 {
@@ -36798,7 +36866,7 @@ fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
 /// row of graphs and emits `indirect_call`.
 ///
 /// The reference arrives either inline or hash-consed: Charon writes
-/// `HashConsedValue: [id, body]` at the first occurrence and `Deduplicated:
+/// `Value: [id, body]` at the first occurrence and `Deduplicated:
 /// id` afterwards. [`traitref_unwrap`] resolves both, and resolves them in a
 /// loop — either spelling can nest inside the other, so peeling one of each
 /// in a fixed order would leave a wrapper standing and make the `kind` read
@@ -36839,7 +36907,7 @@ fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String,
     if !trait_ref_is_dyn(payload.first()?, llbc) {
         return None;
     }
-    let method_id = payload.get(2)?.as_u64()?;
+    let method_id = trait_call_method_fun(llbc, value)?;
     let declaration = llbc.fn_by_id(method_id)?;
     if declaration.unstructured().is_some() {
         return None;
@@ -36893,8 +36961,7 @@ fn scalar_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<Str
 fn trait_call_label(v: &serde_json::Value) -> String {
     if let Some(arr) = v.as_array() {
         let method_idx = arr.get(1).and_then(Value::as_u64).unwrap_or(u64::MAX);
-        let decl_id = arr.get(2).and_then(Value::as_u64).unwrap_or(u64::MAX);
-        return format!("trait{decl_id}::m{method_idx}");
+        return format!("m{method_idx}");
     }
     "unknown".to_string()
 }
@@ -37415,14 +37482,14 @@ fn place_kind_label(k: &PlaceKind) -> &'static str {
 
 fn rvalue_variant_name(rv: &Rvalue) -> &'static str {
     match rv {
-        Rvalue::Use(_) => "Use",
+        Rvalue::Use(_, _) => "Use",
         Rvalue::BinaryOp(..) => "BinaryOp",
         Rvalue::UnaryOp(..) => "UnaryOp",
         Rvalue::Ref { .. } => "Ref",
         Rvalue::Aggregate(..) => "Aggregate",
         Rvalue::Discriminant(_) => "Discriminant",
         Rvalue::Cast(..) => "Cast",
-        Rvalue::Len(_) => "Len",
+        Rvalue::Len(_, _, _) => "Len",
         Rvalue::Repeat(..) => "Repeat",
         Rvalue::RawPtr { .. } => "RawPtr",
         Rvalue::NullaryOp(..) => "NullaryOp",
@@ -37582,7 +37649,7 @@ pub(crate) fn harvest_named_const_folds(llbc: &Llbc) -> std::collections::HashMa
         }
         let Some(op) = fold_named_const_on_llbc(llbc, gd.def_id)
             .or_else(|| {
-                let init_id = gd.rest.get("init")?.as_u64()?;
+                let init_id = llbc.global_init_fun_id(gd)?;
                 const_eval_init_body(llbc, &llbc.fn_by_id(init_id)?.unstructured()?)
             })
             .or_else(|| const_fn_int_array_op(llbc, gd.def_id))
@@ -37607,7 +37674,7 @@ fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
     {
         return None;
     }
-    let init_id = gd.rest.get("init")?.as_u64()?;
+    let init_id = llbc.global_init_fun_id(gd)?;
     let init = llbc.fn_by_id(init_id)?;
     let body = init.unstructured()?;
     // The initializer must be exactly one literal assignment to the
@@ -37703,7 +37770,7 @@ fn const_fn_int_array_op(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
     {
         return None;
     }
-    let init_id = gd.rest.get("init")?.as_u64()?;
+    let init_id = llbc.global_init_fun_id(gd)?;
     let items = eval_const_int_array(llbc, &llbc.fn_by_id(init_id)?.unstructured()?, 0)?;
     if items.is_empty() {
         return None;
@@ -37742,10 +37809,11 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
             match stmt.stmt_kind() {
                 Ok(StmtKind::StorageLive(_))
                 | Ok(StmtKind::StorageDead(_))
-                | Ok(StmtKind::PlaceMention(_)) => {}
+                | Ok(StmtKind::PlaceMention(_))
+                | Ok(StmtKind::Borrowck(_)) => {}
                 Ok(StmtKind::Assign(place, rvalue)) => {
                     if let Some((arr_local, index_op)) = array_index_place(&place) {
-                        let index = arr_index(&locals, &index_op)?;
+                        let index = arr_index(llbc, &locals, &index_op)?;
                         let value = arr_as_i64(&eval_arr_rvalue(llbc, &locals, &rvalue, depth)?)?;
                         let ArrVal::Arr(items) = locals.get_mut(&arr_local)? else {
                             return None;
@@ -37772,7 +37840,8 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
             }
             TermKind::Goto { target } => bb = target as usize,
             TermKind::Assert { assert, target, .. } => {
-                let ArrVal::Lit(ConstLit::Bool(cond)) = eval_arr_operand(&locals, &assert.cond)?
+                let ArrVal::Lit(ConstLit::Bool(cond)) =
+                    eval_arr_operand(llbc, &locals, &assert.cond)?
                 else {
                     return None;
                 };
@@ -37782,7 +37851,8 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 bb = target as usize;
             }
             TermKind::Switch { discr, targets } => {
-                let ArrVal::Lit(ConstLit::Bool(cond)) = eval_arr_operand(&locals, &discr)? else {
+                let ArrVal::Lit(ConstLit::Bool(cond)) = eval_arr_operand(llbc, &locals, &discr)?
+                else {
                     return None;
                 };
                 let SwitchTargets::If(then_bb, else_bb) = targets else {
@@ -37818,7 +37888,7 @@ fn eval_arr_call(
     };
     let path = llbc.fn_by_id(*id)?.item_meta.name_path();
     if path.ends_with("::len") && call.args.len() == 1 {
-        let ArrVal::SliceOf(arr_local) = eval_arr_operand(locals, &call.args[0])? else {
+        let ArrVal::SliceOf(arr_local) = eval_arr_operand(llbc, locals, &call.args[0])? else {
             return None;
         };
         let ArrVal::Arr(items) = locals.get(&arr_local)? else {
@@ -37841,10 +37911,10 @@ fn eval_arr_rvalue(
 ) -> Option<ArrVal> {
     let _ = llbc;
     match rvalue {
-        Rvalue::Use(op) => eval_arr_operand(locals, op),
-        Rvalue::Repeat(op, _, count) => {
-            let fill = arr_as_i64(&eval_arr_operand(locals, op)?)?;
-            let n = match decode_const_lit(count)? {
+        Rvalue::Use(op, _) => eval_arr_operand(llbc, locals, op),
+        Rvalue::Repeat(op, _, count, _) => {
+            let fill = arr_as_i64(&eval_arr_operand(llbc, locals, op)?)?;
+            let n = match decode_const_lit(llbc, count)? {
                 ConstLit::UInt(n) => n,
                 ConstLit::Int(n) if n >= 0 => n as u64,
                 _ => return None,
@@ -37873,21 +37943,21 @@ fn eval_arr_rvalue(
                     .and_then(|c| c.get("Unsize"))
                     .is_some()
             {
-                let ArrVal::RefOf(n) = eval_arr_operand(locals, op)? else {
+                let ArrVal::RefOf(n) = eval_arr_operand(llbc, locals, op)? else {
                     return None;
                 };
                 return Some(ArrVal::SliceOf(n));
             }
-            let ArrVal::Lit(lit) = eval_arr_operand(locals, op)? else {
+            let ArrVal::Lit(lit) = eval_arr_operand(llbc, locals, op)? else {
                 return None;
             };
             Some(ArrVal::Lit(const_eval_unop(kind, lit)?))
         }
         Rvalue::BinaryOp(kind, lhs, rhs) => {
-            let ArrVal::Lit(l) = eval_arr_operand(locals, lhs)? else {
+            let ArrVal::Lit(l) = eval_arr_operand(llbc, locals, lhs)? else {
                 return None;
             };
-            let ArrVal::Lit(r) = eval_arr_operand(locals, rhs)? else {
+            let ArrVal::Lit(r) = eval_arr_operand(llbc, locals, rhs)? else {
                 return None;
             };
             Some(ArrVal::Lit(const_eval_binop(kind, l, r)?))
@@ -37897,11 +37967,12 @@ fn eval_arr_rvalue(
 }
 
 fn eval_arr_operand(
+    llbc: &Llbc,
     locals: &std::collections::HashMap<u64, ArrVal>,
     op: &Operand,
 ) -> Option<ArrVal> {
     match op {
-        Operand::Const(value) => Some(ArrVal::Lit(decode_const_lit(value)?)),
+        Operand::Const(value) => Some(ArrVal::Lit(decode_const_lit(llbc, value)?)),
         Operand::Copy(place) | Operand::Move(place) => match &place.kind {
             PlaceKind::Local(n) => locals.get(n).cloned(),
             PlaceKind::Projection(inner, elem) => {
@@ -37945,8 +38016,12 @@ fn array_index_place(place: &Place) -> Option<(u64, Operand)> {
     Some((arr_local, op))
 }
 
-fn arr_index(locals: &std::collections::HashMap<u64, ArrVal>, op: &Operand) -> Option<usize> {
-    let ArrVal::Lit(lit) = eval_arr_operand(locals, op)? else {
+fn arr_index(
+    llbc: &Llbc,
+    locals: &std::collections::HashMap<u64, ArrVal>,
+    op: &Operand,
+) -> Option<usize> {
+    let ArrVal::Lit(lit) = eval_arr_operand(llbc, locals, op)? else {
         return None;
     };
     let n = match lit {
@@ -38000,7 +38075,7 @@ fn const_eval_init_body_with_locals(
                         {
                             return None;
                         }
-                        let init_id = global.rest.get("init")?.as_u64()?;
+                        let init_id = llbc.global_init_fun_id(global)?;
                         let init = llbc.fn_by_id(init_id)?;
                         if let Some(body) = init.unstructured() {
                             const_eval_init_body_lit(llbc, &body, depth + 1)
@@ -38032,7 +38107,7 @@ fn const_eval_init_body_with_locals(
                     }
                     _ => None,
                 },
-                Operand::Const(value) => decode_const_lit(value),
+                Operand::Const(value) => decode_const_lit(llbc, value),
             }
         };
     let mut bb = 0usize;
@@ -38050,7 +38125,7 @@ fn const_eval_init_body_with_locals(
                         return None;
                     };
                     let value = match &rvalue {
-                        Rvalue::Use(op) => eval_operand(&locals, op)?,
+                        Rvalue::Use(op, _) => eval_operand(&locals, op)?,
                         Rvalue::UnaryOp(kind, op) => {
                             const_eval_unop(kind, eval_operand(&locals, op)?)?
                         }
@@ -38205,10 +38280,7 @@ fn size_align_of_tyexpr(llbc: &Llbc, want_align: bool, ty: &serde_json::Value) -
 }
 
 fn tyexpr_body<'a>(llbc: &'a Llbc, ty: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
-    if let Some(arr) = ty
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
-    {
+    if let Some(arr) = ty.get("Value").and_then(serde_json::Value::as_array) {
         return arr.get(1);
     }
     if let Some(id) = ty.get("Deduplicated").and_then(serde_json::Value::as_u64) {
@@ -38253,8 +38325,32 @@ fn primitive_size_align(want_align: bool, lit: &serde_json::Value) -> Option<u64
     Some(if want_align { align } else { size })
 }
 
-fn decode_const_lit(value: &serde_json::Value) -> Option<ConstLit> {
-    let literal = value.get("kind")?.get("Literal")?;
+fn decode_const_lit(llbc: &Llbc, value: &serde_json::Value) -> Option<ConstLit> {
+    let value = peel_const_value(llbc, value);
+    let body = value
+        .get("Value")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .unwrap_or(value);
+    let kind = body.as_array().and_then(|arr| arr.first()).unwrap_or(body);
+    if let Some(flag) = kind.get("Bool").and_then(serde_json::Value::as_bool) {
+        return Some(ConstLit::Bool(flag));
+    }
+    if let Some(int) = kind.get("Integer").and_then(serde_json::Value::as_object)
+        && let Some((side, payload)) = int.into_iter().next()
+    {
+        let pair = payload.as_array()?;
+        let text = pair.get(1)?.as_str()?;
+        return match side.as_str() {
+            "Signed" => text.parse::<i64>().ok().map(ConstLit::Int),
+            "Unsigned" => text.parse::<u64>().ok().map(ConstLit::UInt),
+            _ => None,
+        };
+    }
+    let literal = kind
+        .get("kind")
+        .and_then(|k| k.get("Literal"))
+        .or_else(|| value.get("kind").and_then(|k| k.get("Literal")))?;
     if let Some(scalar) = literal.get("Scalar").and_then(serde_json::Value::as_object)
         && let Some((kind, payload)) = scalar.into_iter().next()
     {
@@ -38320,10 +38416,7 @@ fn const_eval_core_num_associated_const(llbc: &Llbc, def_id: u64) -> Option<Cons
         .and_then(serde_json::Value::as_u64)
     {
         llbc.dedup_body(id)?
-    } else if let Some(pair) = tyref
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
-    {
+    } else if let Some(pair) = tyref.get("Value").and_then(serde_json::Value::as_array) {
         pair.get(1)?
     } else {
         tyref
@@ -38400,6 +38493,9 @@ fn const_tuple_field_index(elem: &ProjectionElem) -> Option<u64> {
     if payload.len() != 2 {
         return None;
     }
+    if payload[0].is_null() {
+        return payload[1].as_u64();
+    }
     payload[0].as_object()?.get("Tuple")?;
     payload[1].as_u64()
 }
@@ -38431,7 +38527,10 @@ fn const_eval_unop(kind: &serde_json::Value, v: ConstLit) -> Option<ConstLit> {
 }
 
 fn const_cast_int(n: i64, target: &serde_json::Value) -> Option<i64> {
-    let (signed, width) = if let Some(w) = target.get("Int") {
+    let (signed, width) = if let Some(int) = target.get("Integer").and_then(|v| v.as_object()) {
+        let (side, width) = int.iter().next()?;
+        (side == "Signed", width.as_str()?)
+    } else if let Some(w) = target.get("Int") {
         (true, w.as_str()?)
     } else if let Some(w) = target.get("UInt") {
         (false, w.as_str()?)
@@ -38458,7 +38557,7 @@ fn const_cast_int(n: i64, target: &serde_json::Value) -> Option<i64> {
 
 /// Resolve a Charon type reference to its `Literal` payload
 /// (`{"Int": "I32"}` / `{"UInt": "U32"}` / …), following the
-/// `Deduplicated` / `HashConsedValue` indirections the same way
+/// `Deduplicated` / `Value` indirections the same way
 /// [`Lowering::tyref_literal_int_atom`] does.
 fn const_literal_ty<'t>(llbc: &'t Llbc, tyref: &'t TyRef) -> Option<&'t serde_json::Value> {
     let value = match tyref {
@@ -38661,15 +38760,23 @@ fn const_eval_binop(kind: &serde_json::Value, lhs: ConstLit, rhs: ConstLit) -> O
 ///   - `{kind: {Literal: {ByteStr: "..."}}}`
 ///   - `{kind: {FnDef: {kind: {Fun: {Regular: id}}, generics: ...}}}`
 fn decode_constant(llbc: &Llbc, value: &serde_json::Value) -> Result<DecodedConst, LowerError> {
-    let kind = value
-        .as_object()
-        .and_then(|m| m.get("kind"))
-        .and_then(|k| k.as_object())
-        .ok_or_else(|| {
-            LowerError::Unsupported(format!("Operand::Const value missing object kind: {value}"))
-        })?;
+    let peeled = peel_const_value(llbc, value);
+    let kind_val = if let Some(arr) = peeled.as_array() {
+        arr.first().unwrap_or(peeled)
+    } else {
+        peeled
+            .as_object()
+            .and_then(|m| m.get("kind"))
+            .unwrap_or(peeled)
+    };
+    let kind = kind_val.as_object().ok_or_else(|| {
+        LowerError::Unsupported(format!("Operand::Const value missing object kind: {value}"))
+    })?;
     if let Some(lit) = kind.get("Literal") {
         return decode_literal(lit);
+    }
+    if kind.get("Integer").is_some() || kind.get("Bool").is_some() || kind.get("Str").is_some() {
+        return decode_literal(kind_val);
     }
     // `Opaque "<reason>"` — Charon itself bailed on the constant.
     // Forward the reason so it ends up in the synthetic path; the
@@ -38727,7 +38834,14 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
     let lit_obj = lit
         .as_object()
         .ok_or_else(|| LowerError::Schema(format!("Literal not object: {lit}")))?;
-    if let Some(scalar_obj) = lit_obj.get("Scalar").and_then(Value::as_object) {
+    if let Some(flag) = lit_obj.get("Bool").and_then(Value::as_bool) {
+        return Ok(DecodedConst::Bool(flag));
+    }
+    if let Some(text) = lit_obj.get("Str").and_then(Value::as_str) {
+        return Ok(DecodedConst::Str(text.to_string()));
+    }
+    let scalar_src = lit_obj.get("Integer").or_else(|| lit_obj.get("Scalar"));
+    if let Some(scalar_obj) = scalar_src.and_then(Value::as_object) {
         for (k, payload) in scalar_obj {
             let arr = payload.as_array().ok_or_else(|| {
                 LowerError::Schema(format!("Scalar {k}: payload not array: {payload}"))
@@ -38804,8 +38918,82 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
 
 use serde_json::Value;
 
+fn peel_const_value<'a>(llbc: &'a Llbc, mut value: &'a serde_json::Value) -> &'a serde_json::Value {
+    for _ in 0..8 {
+        let Some(obj) = value.as_object() else {
+            break;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            if let Some(body) = llbc.dedup_const(id).or_else(|| llbc.dedup_body(id)) {
+                value = body;
+                continue;
+            }
+            break;
+        }
+        if let Some(body) = obj
+            .get("Value")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.get(1))
+        {
+            value = body;
+            continue;
+        }
+        break;
+    }
+    value
+}
+
+fn bool_if_from_arms(
+    arms: &[(serde_json::Value, u64)],
+    default: u64,
+    llbc: &Llbc,
+) -> Option<(u64, u64)> {
+    if arms.is_empty() {
+        return None;
+    }
+    let mut then_bb = None;
+    let mut else_bb = None;
+    for (scalar, bb) in arms {
+        let peeled = peel_const_value(llbc, scalar);
+        let kind = peeled
+            .as_array()
+            .and_then(|arr| arr.first())
+            .unwrap_or(peeled);
+        let flag = kind.get("Bool")?.as_bool()?;
+        if flag {
+            then_bb = Some(*bb);
+        } else {
+            else_bb = Some(*bb);
+        }
+    }
+    Some((then_bb.unwrap_or(default), else_bb.unwrap_or(default)))
+}
+
+fn scalar_from_arm(v: &serde_json::Value, llbc: &Llbc) -> Option<ConstValue> {
+    let peeled = peel_const_value(llbc, v);
+    let kind = peeled
+        .as_array()
+        .and_then(|arr| arr.first())
+        .unwrap_or(peeled);
+    if let Some(b) = kind.get("Bool").and_then(serde_json::Value::as_bool) {
+        return Some(ConstValue::Int(b as i64));
+    }
+    scalar_to_const_value(kind)
+}
+
 fn scalar_to_const_value(v: &serde_json::Value) -> Option<ConstValue> {
     let obj = v.as_object()?;
+    // `{Integer: {Signed|Unsigned: [ty, value]}}`
+    if let Some(int) = obj.get("Integer").and_then(Value::as_object) {
+        for (_k, payload) in int {
+            let arr = payload.as_array()?;
+            if arr.len() != 2 {
+                continue;
+            }
+            let n: i64 = scalar_value_to_i64(&arr[1])?;
+            return Some(ConstValue::Int(n));
+        }
+    }
     // `{Scalar: {Signed|Unsigned|Isize|Usize: [ty, value]}}`
     if let Some(scalar) = obj.get("Scalar").and_then(Value::as_object) {
         for (_k, payload) in scalar {
@@ -48548,7 +48736,7 @@ mod tests {
                     "type_decls": [{"def_id": 0, "item_meta": meta(&["fixture", "Capture"]), "kind": {"Struct": []}}],
                     "fun_decls": [], "global_decls": [], "trait_decls": traits,
                     "trait_impls": [{"impl_trait": {"id": 0, "generics": {"types": [
-                        {"HashConsedValue": [1, {"Adt": {"id": {"Adt": 0}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}}]}
+                        {"Value": [1, {"Adt": {"id": {"Adt": 0}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}}]}
                     ]}}}]
                 }
             });
@@ -48612,7 +48800,7 @@ mod tests {
             })
         };
         let adt = |def_id: u64, hash: u64| {
-            serde_json::json!({"HashConsedValue": [hash, {
+            serde_json::json!({"Value": [hash, {
                 "Adt": {
                     "id": {"Adt": def_id},
                     "generics": {
@@ -48739,7 +48927,7 @@ mod tests {
             })
         };
         let adt = |def_id: u64, hash: u64| {
-            serde_json::json!({"HashConsedValue": [hash, {
+            serde_json::json!({"Value": [hash, {
                 "Adt": {
                     "id": {"Adt": def_id},
                     "generics": {
@@ -48873,7 +49061,7 @@ mod tests {
             })
         };
         let adt = |def_id: u64, hash: u64| {
-            serde_json::json!({"HashConsedValue": [hash, {
+            serde_json::json!({"Value": [hash, {
                 "Adt": {
                     "id": {"Adt": def_id},
                     "generics": {
@@ -49447,7 +49635,7 @@ mod tests {
     #[test]
     fn a_hash_consed_trait_ref_wrapping_a_deduplicated_one_still_reads_dyn() {
         // Charon's two indirections nest: the reference arrives as
-        // `HashConsedValue: [id, {Deduplicated: n}]`. Peeling one of each in a
+        // `Value: [id, {Deduplicated: n}]`. Peeling one of each in a
         // fixed order leaves the inner `Deduplicated` standing, the `kind`
         // read misses, and a genuine trait-object call is declined — a
         // classification that would then depend on how the reference happened
@@ -49468,7 +49656,7 @@ mod tests {
             },
             "signature": {
                 "is_unsafe": false,
-                "inputs": [{"HashConsedValue": [9, {"kind": "Dyn"}]}],
+                "inputs": [{"Value": [9, {"kind": "Dyn"}]}],
                 "output": {"Tuple": []}
             },
             "body": "Missing"
@@ -49487,7 +49675,7 @@ mod tests {
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
         let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
-            "kind": {"Trait": [{"HashConsedValue": [7, {"Deduplicated": 9}]}, 0, 1]},
+            "kind": {"Trait": [{"Value": [7, {"Deduplicated": 9}]}, 0, 1]},
             "generics": {}
         }))
         .expect("fixture trait call parses");
@@ -51030,7 +51218,7 @@ mod tests {
             },
             "kind": {"Struct": [{
                 "name": null,
-                "ty": {"HashConsedValue": [7, {"Literal": {"Int": "I64"}}]},
+                "ty": {"Value": [7, {"Literal": {"Int": "I64"}}]},
                 "attr_info": null
             }]},
             "layout": [{
@@ -51057,7 +51245,7 @@ mod tests {
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
         let word_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
-            "HashConsedValue": [8, {
+            "Value": [8, {
                 "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
             }]
         }))
@@ -51087,12 +51275,12 @@ mod tests {
             "kind": {"Struct": [
                 {
                     "name": "depth",
-                    "ty": {"HashConsedValue": [7, {"Literal": {"UInt": "Usize"}}]},
+                    "ty": {"Value": [7, {"Literal": {"UInt": "Usize"}}]},
                     "attr_info": null
                 },
                 {
                     "name": "_not_send",
-                    "ty": {"HashConsedValue": [9, {"Adt": {"id": "Tuple", "generics": {"types": []}}}]},
+                    "ty": {"Value": [9, {"Adt": {"id": "Tuple", "generics": {"types": []}}}]},
                     "attr_info": null
                 }
             ]},
@@ -51120,7 +51308,7 @@ mod tests {
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
         let borrowed = serde_json::from_value::<super::TyRef>(serde_json::json!({
-            "HashConsedValue": [8, {
+            "Value": [8, {
                 "Ref": ["r", {
                     "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
                 }, "Shared"]
@@ -51361,7 +51549,7 @@ mod tests {
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
         let adt_ty = |def_id: u64, args: serde_json::Value| {
             serde_json::from_value::<super::TyRef>(serde_json::json!({
-                "HashConsedValue": [8, {
+                "Value": [8, {
                     "Adt": {"id": {"Adt": def_id}, "generics": {"types": args}}
                 }]
             }))
@@ -51443,7 +51631,7 @@ mod tests {
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
         let enum_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
-            "HashConsedValue": [8, {
+            "Value": [8, {
                 "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
             }]
         }))
@@ -51505,7 +51693,7 @@ mod tests {
         let defining = Llbc::from_slice(
             artifact(serde_json::json!({"Struct": [{
                 "name": null,
-                "ty": {"HashConsedValue": [7, {"Literal": {"Int": "I64"}}]},
+                "ty": {"Value": [7, {"Literal": {"Int": "I64"}}]},
                 "attr_info": null
             }]}))
             .to_string()
@@ -51528,7 +51716,7 @@ mod tests {
         )
         .unwrap();
         let linked_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
-            "HashConsedValue": [8, {
+            "Value": [8, {
                 "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
             }]
         }))
@@ -52846,7 +53034,7 @@ mod tests {
         let llbc = llbc_with_trait_impls(serde_json::json!([]));
         let ty = |v: serde_json::Value| {
             serde_json::from_value::<super::TyRef>(serde_json::json!({
-                "HashConsedValue": [0, v]
+                "Value": [0, v]
             }))
             .expect("fixture TyRef parses")
         };
@@ -52973,7 +53161,7 @@ mod tests {
 
     fn fixture_ty(v: serde_json::Value) -> TyRef {
         serde_json::from_value::<TyRef>(serde_json::json!({
-            "HashConsedValue": [0, v]
+            "Value": [0, v]
         }))
         .expect("fixture TyRef parses")
     }

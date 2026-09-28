@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 
-CHARON_VERSION_DEFAULT = "nightly-2026.05.29"
+CHARON_VERSION_DEFAULT = "nightly-2026.09.26"
 
 
 def repo_root() -> Path:
@@ -101,8 +101,10 @@ def main() -> None:
     root = repo_root()
     shared = Path(os.environ.get("PYRE_SHARED_BUILD", root.parent / ".pyre-build"))
     platform_key, asset, exe, from_source = platform_info()
+    # One directory per version, so worktrees that pin different Charon
+    # releases share the cache without replacing each other's binary.
     charon_dest = Path(
-        os.environ.get("CHARON_DEST", shared / "charon" / platform_key)
+        os.environ.get("CHARON_DEST", shared / "charon" / platform_key / version)
     )
 
     stamp = charon_dest / ".installed-version"

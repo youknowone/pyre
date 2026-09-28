@@ -23,12 +23,12 @@ Use the canonical fetcher:
 
 ```sh
 scripts/install-charon.py
-../.pyre-build/charon/<platform>/charon toolchain-path  # one-time nightly install (~1 min)
+../.pyre-build/charon/<platform>/<version>/charon toolchain-path  # one-time nightly install (~1 min)
 ```
 
-The script pins `CHARON_VERSION_DEFAULT="nightly-2026.05.29"` and installs
-to a shared cache at `../.pyre-build/charon/<platform>` by default, so sibling
-worktrees reuse the same Charon binary. Override with
+The script pins `CHARON_VERSION_DEFAULT="nightly-2026.09.26"` and installs
+to a shared cache at `../.pyre-build/charon/<platform>/<version>` by default, so
+sibling worktrees reuse one binary per pinned version. Override with
 `PYRE_SHARED_BUILD=/path/to/cache` or `CHARON_DEST=/path/to/bin`; use
 `CHARON_VERSION=nightly-YYYY.MM.DD scripts/install-charon.py` to bump.
 
@@ -49,7 +49,7 @@ nightly; it only needs the `.llbc` JSON.
 ../../scripts/install-charon.py
 
 # 1. regenerate the checked-in fixture, in place (run from this directory).
-#    <charon> is ../../../.pyre-build/charon/<platform>/charon by default —
+#    <charon> is ../../../.pyre-build/charon/<platform>/<version>/charon by default —
 #    the location `install-charon.py` writes to.
 <charon> cargo --ullbc --dest-file "$PWD/corpus.ullbc"
 
@@ -142,7 +142,7 @@ regeneration. Re-measure rather than subtract.
 
 - Types are **deduplicated globally** via `{"Deduplicated": <id>}` references
   into a parallel pool. Inline forms appear as
-  `{"HashConsedValue": [<id>, <ty>]}` for the first occurrence.
+  `{"Value": [<id>, <ty>]}` for the first occurrence.
 - `fun_decls` includes **opaque references** to functions defined in other
   crates (their bodies are `null`). In the corpus crate, **5 of 213
   `fun_decls` carry our local bodies**; the rest are pulled in by name from

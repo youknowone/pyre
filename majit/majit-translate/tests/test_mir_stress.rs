@@ -551,7 +551,7 @@ fn classify_uninitialised_local_rpo_vs_loop_carried() {
 
     for fd in llbc.iter_local_fns() {
         walked += 1;
-        if fd.is_global_initializer.is_some() {
+        if fd.global_initializer_id().is_some() {
             skipped_global_init += 1;
             continue;
         }
@@ -693,7 +693,7 @@ fn stmt_is_real_work(stmt: &majit_charon_reader::Statement) -> bool {
         | Ok(StmtKind::Assert(_)) => false,
         Ok(StmtKind::Assign(_, rv)) => !matches!(
             rv,
-            Rvalue::Use(_) | Rvalue::Ref { .. } | Rvalue::RawPtr { .. }
+            Rvalue::Use(_, _) | Rvalue::Ref { .. } | Rvalue::RawPtr { .. }
         ),
         // Unknown statement kind (SetDiscriminant, Deinit, …) — treat
         // as real work so we never under-count.

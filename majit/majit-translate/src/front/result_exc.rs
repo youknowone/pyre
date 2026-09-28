@@ -83,16 +83,13 @@ use crate::model::{
 };
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
-/// id}` indirections through the dedup table, `{"HashConsedValue":
+/// id}` indirections through the dedup table, `{"Value":
 /// [id, body]}` inline pairs, anything else as-is.
 fn ty_json_body<'l>(v: &'l serde_json::Value, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
     if let Some(id) = v.get("Deduplicated").and_then(serde_json::Value::as_u64) {
         return llbc.dedup_body(id);
     }
-    if let Some(arr) = v
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
-    {
+    if let Some(arr) = v.get("Value").and_then(serde_json::Value::as_array) {
         return arr.get(1);
     }
     Some(v)
@@ -100,7 +97,10 @@ fn ty_json_body<'l>(v: &'l serde_json::Value, llbc: &'l Llbc) -> Option<&'l serd
 
 /// `{"Adt": {"id": {"Adt": <id>}, …}}` → the TypeDecl's full name path.
 fn adt_path_of(v: &serde_json::Value, llbc: &Llbc) -> Option<String> {
-    let id = v.get("Adt")?.get("id")?.get("Adt")?.as_u64()?;
+    let id_val = v.get("Adt")?.get("id")?;
+    let id = id_val
+        .as_u64()
+        .or_else(|| id_val.get("Adt").and_then(serde_json::Value::as_u64))?;
     Some(llbc.type_by_id(id)?.item_meta.name_path())
 }
 
@@ -204,9 +204,7 @@ pub(crate) fn tyref_is_option_ref(ty: &TyRef, llbc: &Llbc) -> bool {
             }
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             v = &arr[1];

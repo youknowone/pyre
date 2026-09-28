@@ -36,7 +36,7 @@ use std::path::Path;
 pub struct Llbc {
     pub file: LlbcFile,
     /// `dedup_id → ADT def_id` index built from inline
-    /// `HashConsedValue: [id, body]` occurrences whose body decodes as
+    /// `Value: [id, body]` occurrences whose body decodes as
     /// `{"Adt": {"id": {"Adt": <def_id>}}}`.  Sorted by `dedup_id` for
     /// binary search.  Populated once at parse time.
     ///
@@ -50,7 +50,7 @@ pub struct Llbc {
     /// (`annotator/unaryop.rs:3587`).
     dedup_adt: Vec<(u64, u64)>,
     /// `dedup_id → body` index built from every inline
-    /// `HashConsedValue: [id, body]` occurrence in the raw LLBC JSON.
+    /// `Value: [id, body]` occurrence in the raw LLBC JSON.
     /// Sorted by `dedup_id` for binary search.  Populated once at
     /// parse time.
     ///
@@ -63,7 +63,11 @@ pub struct Llbc {
     /// fall back to `Ref` and downstream callers cannot distinguish
     /// `i64`-returning helpers from pointer-returning ones, defeating
     /// `fn_return_types`-based type checks.
-    dedup_body: Vec<(u64, DedupBody)>,
+    /// `(class, id, body)`. Dedup ids restart per serialized type, so a
+    /// type and a constant can share an id. Class 0 is a type, 1 a
+    /// constant `[kind, ty]`, 2 a span, 3 a trait ref, 4 a const-generic
+    /// expression (`Plus`, `Constant`, `Max`, …).
+    dedup_body: Vec<(u8, u64, DedupBody)>,
     /// Qualified transparent-type path → scalar register shape learned from
     /// another LLBC in the same linked translation input. Dependency LLBCs
     /// retain layout attributes but may expose the type body as `Opaque`; the
@@ -196,6 +200,11 @@ struct DedupBody {
 }
 
 impl DedupBody {
+    fn clone_raw(&self) -> Box<serde_json::value::RawValue> {
+        serde_json::value::RawValue::from_string(self.raw.get().to_owned())
+            .expect("dedup body is raw JSON")
+    }
+
     fn get(&self) -> Option<&serde_json::Value> {
         // A body that fails to re-parse cannot be projected by any
         // consumer, and every one of them already treats a missing id as
@@ -222,20 +231,35 @@ impl Llbc {
         // `serde_json::Value` of the whole document (which costs
         // ~26× the input bytes as an exploded node tree):
         //   1. `collect_dedup_bodies` scans the raw bytes for inline
-        //      `"HashConsedValue":[id, body]` occurrences, keeping only
+        //      `"Value":[id, body]` occurrences, keeping only
         //      each small `body`'s raw text and discarding the rest.
         //   2. `from_slice` streams the bytes straight into the typed
         //      `LlbcFile` without the intermediate Value.
         // Peak settles at the larger of {bytes + dedup bodies} and
         // {bytes + LlbcFile}.
         let mut dedup_adt: Vec<(u64, u64)> = Vec::new();
-        let mut dedup_body: Vec<(u64, DedupBody)> = Vec::new();
+        let mut dedup_body: Vec<(u8, u64, DedupBody)> = Vec::new();
+        // `Scalar` is the primitive type node. Readers still match the
+        // previous `Literal` / `Int` / `UInt` spelling. Constant values
+        // (`{"Scalar":[...]}`) stay as they are.
+        let normalized = normalize_scalar_types(bytes);
+        let bytes = normalized.as_ref();
         collect_dedup_bodies(bytes, &mut dedup_adt, &mut dedup_body);
         dedup_adt.sort_by_key(|&(id, _)| id);
         dedup_adt.dedup_by_key(|p| p.0);
-        dedup_body.sort_by_key(|p| p.0);
-        dedup_body.dedup_by_key(|p| p.0);
-        let file: LlbcFile = serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
+        dedup_body.sort_by_key(|p| (p.0, p.1));
+        dedup_body.dedup_by_key(|p| (p.0, p.1));
+        let const_rows = dedup_body
+            .iter()
+            .filter(|row| row.0 == 1)
+            .map(|row| (row.1, row.2.clone_raw()))
+            .collect();
+        let const_dedup = std::sync::Arc::new(crate::ullbc::ConstDedupTable::from_rows(const_rows));
+        let mut file: LlbcFile = serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
+        rewrite_layout_scalars(&mut file, &dedup_body);
+        for decl in file.translated.fun_decls.iter().flatten() {
+            decl.set_const_dedup(std::sync::Arc::clone(&const_dedup));
+        }
         Ok(Self {
             file,
             dedup_adt,
@@ -346,13 +370,28 @@ impl Llbc {
 
     /// Resolve a Charon `Deduplicated: <id>` reference to its
     /// underlying inline body (a `serde_json::Value` of the same
-    /// shape Charon emits inline for a `HashConsedValue: [id, body]`).
+    /// shape Charon emits inline for a `Value: [id, body]`).
     /// Returns `None` for ids whose inline form never appeared in
     /// this LLBC.  See the [`Self::dedup_body`] field doc for
     /// context.
     pub fn dedup_body(&self, id: u64) -> Option<&serde_json::Value> {
-        let i = self.dedup_body.binary_search_by_key(&id, |p| p.0).ok()?;
-        self.dedup_body[i].1.get()
+        self.dedup_class(0, id).or_else(|| {
+            let same: Vec<_> = self.dedup_body.iter().filter(|row| row.1 == id).collect();
+            (same.len() == 1).then(|| same[0].2.get()).flatten()
+        })
+    }
+
+    /// Constant body for a dedup id (`[kind, ty]`).
+    pub fn dedup_const(&self, id: u64) -> Option<&serde_json::Value> {
+        self.dedup_class(1, id)
+    }
+
+    pub fn dedup_class(&self, class: u8, id: u64) -> Option<&serde_json::Value> {
+        let i = self
+            .dedup_body
+            .binary_search_by_key(&(class, id), |p| (p.0, p.1))
+            .ok()?;
+        self.dedup_body[i].2.get()
     }
 
     /// Look up a local-crate function whose name ends with `::<name>`.
@@ -555,10 +594,64 @@ impl Llbc {
         rows.all(|row| row.value.target_pointer_size == width)
             .then_some(width)
     }
+
+    /// FunDecl id of a global's initializer. The value is a constant
+    /// `Call` of that function: `{"Value": [id, [{"Call": [fn_ptr, args]}, ty]]}`.
+    pub fn global_init_fun_id(&self, gd: &crate::ullbc::GlobalDecl) -> Option<u64> {
+        if let Some(id) = self.global_init_from_value(gd) {
+            return Some(id);
+        }
+        gd.rest.get("init").and_then(serde_json::Value::as_u64)
+    }
+
+    fn global_init_from_value(&self, gd: &crate::ullbc::GlobalDecl) -> Option<u64> {
+        let mut value = gd.rest.get("value")?;
+        loop {
+            let Some(obj) = value.as_object() else {
+                break;
+            };
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                match self.dedup_const(id).or_else(|| self.dedup_body(id)) {
+                    Some(body) => {
+                        value = body;
+                        continue;
+                    }
+                    None => return None,
+                }
+            }
+            if let Some(body) = obj
+                .get("Value")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| arr.get(1))
+            {
+                value = body;
+                continue;
+            }
+            break;
+        }
+        let kind = value
+            .as_array()
+            .and_then(|arr| arr.first())
+            .unwrap_or(value);
+        if let Some(call) = kind.get("Call").and_then(serde_json::Value::as_array) {
+            let fun = call.first()?.get("kind")?.get("Fun")?;
+            return fun.as_u64().or_else(|| fun.get("Regular")?.as_u64());
+        }
+        None
+    }
+
+    /// Resolved span data, following a deduplicated span body.
+    pub fn span_data(&self, span: &crate::ullbc::Span) -> crate::ullbc::SpanData {
+        span.resolve(|id| {
+            let body = self.dedup_class(2, id).or_else(|| self.dedup_body(id))?;
+            let data = body.get("data").unwrap_or(body);
+            serde_json::from_value(data.clone()).ok()
+        })
+    }
 }
 
 /// Scan the raw LLBC bytes for every inline
-/// `"HashConsedValue":[id, body]` occurrence, recording the first
+/// `"Value":[id, body]` occurrence, recording the first
 /// `body` seen per `id` into `bodies` (the generic dedup-id → body
 /// index) and, when the body decodes as `{"Adt": {"id": {"Adt":
 /// <def_id>}}}`, also into `adt` (the dedup-id → ADT def_id index for
@@ -575,29 +668,34 @@ impl Llbc {
 fn collect_dedup_bodies(
     bytes: &[u8],
     adt: &mut Vec<(u64, u64)>,
-    bodies: &mut Vec<(u64, DedupBody)>,
+    bodies: &mut Vec<(u8, u64, DedupBody)>,
 ) {
     // The artefact is UTF-8 JSON; on the off chance it is not, there are
-    // no HashConsedValue entries to find and the typed parse will fail
+    // no Value entries to find and the typed parse will fail
     // loudly downstream.
     let Ok(text) = std::str::from_utf8(bytes) else {
         return;
     };
-    const KEY: &str = "\"HashConsedValue\":";
-    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    const KEY: &str = "\"Value\":";
+    let mut seen: std::collections::HashSet<(u8, u64)> = std::collections::HashSet::new();
     for (off, _) in text.match_indices(KEY) {
         let val_start = off + KEY.len();
         // The value after the key is the `[id, body]` array; deserialize
         // exactly that one value (the deserializer stops at the array's
         // close, ignoring the trailing document).
         let mut de = serde_json::Deserializer::from_slice(&bytes[val_start..]);
-        if let Ok((id, raw)) = <(u64, Box<serde_json::value::RawValue>)>::deserialize(&mut de)
-            && seen.insert(id)
-        {
-            if let Some(def_id) = adt_def_id_from_ty_body(&raw) {
+        if let Ok((id, raw)) = <(u64, Box<serde_json::value::RawValue>)>::deserialize(&mut de) {
+            let class = dedup_body_class(raw.get());
+            if !seen.insert((class, id)) {
+                continue;
+            }
+            if class == 0
+                && let Some(def_id) = adt_def_id_from_ty_body(&raw)
+            {
                 adt.push((id, def_id));
             }
             bodies.push((
+                class,
                 id,
                 DedupBody {
                     raw,
@@ -606,6 +704,205 @@ fn collect_dedup_bodies(
             ));
         }
     }
+}
+
+/// Layout `size` / `align` / field offsets are `{chosen, guarantee}` nodes.
+/// `chosen` is a number or a const-generic `Deduplicated` id. Project it to
+/// the integer [`TypeLayout`] deserializes, leaving every other field as
+/// Charon wrote it.
+fn rewrite_layout_scalars(file: &mut LlbcFile, bodies: &[(u8, u64, DedupBody)]) {
+    for decl in file.translated.type_decls.iter_mut().flatten() {
+        let Some(raw) = decl.layout.as_ref() else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw.get()) else {
+            continue;
+        };
+        project_layout_chosen(&mut value, bodies);
+        if let Ok(text) = serde_json::to_string(&value)
+            && let Ok(raw) = serde_json::value::RawValue::from_string(text)
+        {
+            decl.layout = Some(raw);
+        }
+    }
+}
+
+fn project_layout_chosen(value: &mut serde_json::Value, bodies: &[(u8, u64, DedupBody)]) {
+    if let Some(scalar) = layout_chosen_scalar(value, bodies) {
+        *value = serde_json::Value::from(scalar);
+        return;
+    }
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                project_layout_chosen(item, bodies);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                project_layout_chosen(item, bodies);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn layout_chosen_scalar(value: &serde_json::Value, bodies: &[(u8, u64, DedupBody)]) -> Option<u64> {
+    let chosen = value.get("chosen")?;
+    layout_int(chosen, bodies)
+}
+
+fn layout_int(value: &serde_json::Value, bodies: &[(u8, u64, DedupBody)]) -> Option<u64> {
+    if let Some(n) = value.as_u64() {
+        return Some(n);
+    }
+    if let Some(text) = value.as_str() {
+        return text.parse().ok();
+    }
+    if let Some(id) = value
+        .get("Deduplicated")
+        .and_then(serde_json::Value::as_u64)
+    {
+        let body = dedup_stored(bodies, 4, id)
+            .or_else(|| dedup_stored(bodies, 1, id))?
+            .clone();
+        return layout_int(&body, bodies);
+    }
+    if let Some(body) = value
+        .get("Value")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+    {
+        return layout_int(body, bodies);
+    }
+    if let Some(body) = value.get("Constant") {
+        return layout_int(body, bodies);
+    }
+    if let Some(pair) = value.as_array() {
+        return layout_int(pair.first()?, bodies);
+    }
+    let int = value.get("Integer")?;
+    let payload = int
+        .get("Unsigned")
+        .or_else(|| int.get("Signed"))?
+        .as_array()?;
+    layout_int(payload.get(1)?, bodies)
+}
+
+fn dedup_stored<'a>(
+    bodies: &'a [(u8, u64, DedupBody)],
+    class: u8,
+    id: u64,
+) -> Option<&'a serde_json::Value> {
+    let index = bodies
+        .binary_search_by_key(&(class, id), |row| (row.0, row.1))
+        .ok()?;
+    bodies[index].2.get()
+}
+
+fn normalize_scalar_types(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !bytes.windows(9).any(|window| window == b"\"Scalar\":") {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let marker = b"{\"Scalar\":";
+    while index < bytes.len() {
+        if bytes[index..].starts_with(marker) {
+            let rest = &bytes[index + marker.len()..];
+            if let Some(written) = rewrite_scalar_type(rest) {
+                out.extend_from_slice(&written.0);
+                index += marker.len() + written.1;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// `(replacement, bytes of the payload consumed after {"Scalar":)`.
+fn rewrite_scalar_type(rest: &[u8]) -> Option<(Vec<u8>, usize)> {
+    if let Some(atom) = scalar_atom(rest, b"\"Bool\"}") {
+        return Some((b"{\"Literal\":\"Bool\"}".to_vec(), atom));
+    }
+    if let Some(atom) = scalar_atom(rest, b"\"Char\"}") {
+        return Some((b"{\"Literal\":\"Char\"}".to_vec(), atom));
+    }
+    if rest.starts_with(b"{\"Float\":") {
+        let end = rest.iter().position(|byte| *byte == b'}')? + 1;
+        let mut rewritten = b"{\"Literal\":".to_vec();
+        rewritten.extend_from_slice(&rest[..end]);
+        rewritten.push(b'}');
+        return Some((rewritten, end + 1));
+    }
+    let signed = b"{\"Integer\":{\"Signed\":";
+    let unsigned = b"{\"Integer\":{\"Unsigned\":";
+    let (prefix, label) = if rest.starts_with(signed) {
+        (signed.len(), "Int")
+    } else if rest.starts_with(unsigned) {
+        (unsigned.len(), "UInt")
+    } else {
+        return None;
+    };
+    let width_start = prefix;
+    if rest.get(width_start) != Some(&b'"') {
+        return None;
+    }
+    let width_end = rest[width_start + 1..]
+        .iter()
+        .position(|byte| *byte == b'"')?
+        + width_start
+        + 2;
+    // `{"Integer":{"Signed":"I64"}}}` — Signed, Integer, then the Scalar object.
+    if rest.get(width_end..width_end + 3) != Some(b"}}}") {
+        return None;
+    }
+    let mut rewritten = format!("{{\"Literal\":{{\"{label}\":").into_bytes();
+    rewritten.extend_from_slice(&rest[width_start..width_end]);
+    rewritten.extend_from_slice(b"}}");
+    Some((rewritten, width_end + 3))
+}
+
+fn scalar_atom(rest: &[u8], atom: &[u8]) -> Option<usize> {
+    rest.starts_with(atom).then_some(atom.len())
+}
+
+fn dedup_body_class(raw: &str) -> u8 {
+    let s = raw.trim_start();
+    if s.starts_with('[') {
+        // Constant `[kind, ty]`. Ids restart per serialized type, so this
+        // shares numbers with types and spans.
+        1
+    } else if s.starts_with("{\"data\"") {
+        2
+    } else if s.starts_with("{\"kind\"") || s.starts_with("{\"trait_decl_ref\"") {
+        3
+    } else if const_generic_body(s) {
+        // `Plus` / `Constant` / `Max` / … live in their own id space. Leaving
+        // them in class 0 lets the first object win and hides the `Adt` body
+        // that shares the id.
+        4
+    } else {
+        0
+    }
+}
+
+fn const_generic_body(raw: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "Constant",
+        "Plus",
+        "AtLeast",
+        "AlignTo",
+        "Max",
+        "Or",
+        "And",
+        "FromMetadata",
+        "ConstIsZero",
+    ];
+    KEYS.iter()
+        .any(|key| raw.starts_with(&format!("{{\"{key}\"")))
 }
 
 /// Project a type-expression body to its underlying ADT `def_id`,
@@ -623,16 +920,13 @@ fn adt_def_id_from_ty_body(raw: &serde_json::value::RawValue) -> Option<u64> {
     }
     #[derive(Deserialize)]
     struct Adt {
-        id: AdtId,
+        id: serde_json::Value,
     }
-    #[derive(Deserialize)]
-    struct AdtId {
-        #[serde(rename = "Adt")]
-        def_id: u64,
-    }
-    serde_json::from_str::<Body>(raw.get())
-        .ok()
-        .map(|b| b.adt.id.def_id)
+    let body = serde_json::from_str::<Body>(raw.get()).ok()?;
+    body.adt
+        .id
+        .as_u64()
+        .or_else(|| body.adt.id.get("Adt").and_then(serde_json::Value::as_u64))
 }
 
 /// Errors produced when loading / parsing a `.llbc` artefact.
@@ -673,6 +967,16 @@ mod tests {
                 "translated":{{"crate_name":"c","fun_decls":[],"files":{files}}}}}"#
         );
         Llbc::from_slice(doc.as_bytes()).expect("fixture parses")
+    }
+
+    #[test]
+    fn scalar_type_nodes_read_as_literal_ints() {
+        let raw = br#"{"Scalar":{"Integer":{"Signed":"I64"}}} {"Scalar":"Bool"} {"Scalar":[1,2]} {"Scalar":{"Float":"F32"}}"#;
+        let text = String::from_utf8(normalize_scalar_types(raw).into_owned()).unwrap();
+        assert_eq!(
+            text,
+            r#"{"Literal":{"Int":"I64"}} {"Literal":"Bool"} {"Scalar":[1,2]} {"Literal":{"Float":"F32"}}"#
+        );
     }
 
     #[test]

@@ -88,7 +88,11 @@ def charon_bin() -> Path:
     }.get((platform.system(), machine))
     if key is None:
         raise SystemExit(f"unsupported platform {platform.system()}/{machine}")
-    path = Path(os.environ.get("CHARON_DEST", shared / "charon" / key)) / "charon"
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from llbc_extract import pinned_charon_version
+
+    dest = shared / "charon" / key / pinned_charon_version()
+    path = Path(os.environ.get("CHARON_DEST", dest)) / "charon"
     if not path.exists():
         raise SystemExit(f"charon not installed at {path}\n  run: scripts/install-charon.py")
     return path

@@ -325,7 +325,7 @@ mod tests {
         let tombstoned = mir::tombstoned_leaves_of(&llbc);
         let mut eager: Vec<(String, _)> = Vec::new();
         for fd in llbc.iter_local_fns() {
-            if fd.unstructured().is_none() || fd.is_global_initializer.is_some() {
+            if fd.unstructured().is_none() || fd.global_initializer_id().is_some() {
                 continue;
             }
             if let Ok(g) = mir::lower_fun_decl_with_static_addrs_and_attrs(

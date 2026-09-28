@@ -62,8 +62,11 @@ fn loads_fixture_corpus() {
     // `replace_boxed_held`, `held_as_mut`, `replace_boxed_held_call`,
     // `replace_indexed_box`, `replace_indexed_box_call`,
     // `replace_boxed_dynlike`, `store_held_cell`, and the extra local
-    // bodies Charon emits beside those items. The measured count is 60.
-    assert_eq!(local_count, 60, "60 local fns expected");
+    // bodies Charon emits beside those items.
+    //
+    // - 1: the closure body is the `call_once` impl method; there is no
+    // second free function beside `bool_then_closure`.
+    assert_eq!(local_count, 59, "59 local fns expected");
 }
 
 #[test]
@@ -173,7 +176,7 @@ fn call_classify_covers_corpus() {
 
 #[test]
 fn dedup_body_resolves_inline_shape() {
-    // Every `HashConsedValue: [id, body]` occurrence must surface
+    // Every `Value: [id, body]` occurrence must surface
     // through `Llbc::dedup_body(id)` so MIR's TyRef projection can
     // resolve `Deduplicated` references.
     let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");

@@ -352,9 +352,7 @@ fn peel_ty<'a>(
             .map(|body| peel_ty(body, llbc, depth + 1))
             .unwrap_or(v);
     }
-    if let Some(arr) = obj
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
+    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
         && arr.len() == 2
     {
         return peel_ty(&arr[1], llbc, depth + 1);

@@ -89,9 +89,9 @@ The annotator/rtyper prepass and the `PYRE_RTYPER_VERBOSE` census read
 `majit-translate` changes take effect immediately, because the translator runs
 live over the frozen bodies.
 
-Charon is shared and pre-installed at `../.pyre-build/charon/<platform>/charon`
-(pinned `nightly-2026.05.29`), **not on `PATH`** — `which charon` finding nothing
-does not mean it is missing.
+Charon is shared and pre-installed at
+`../.pyre-build/charon/<platform>/<version>/charon` (pinned `nightly-2026.09.26`),
+**not on `PATH`** — `which charon` finding nothing does not mean it is missing.
 
 ```bash
 python3 scripts/install-charon.py    # idempotent, usually a no-op

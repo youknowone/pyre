@@ -373,7 +373,7 @@ fn use_operand(o: &Operand, out: &mut HashSet<u64>) {
 
 fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
     match r {
-        Rvalue::Use(o) | Rvalue::UnaryOp(_, o) => use_operand(o, out),
+        Rvalue::Use(o, _) | Rvalue::UnaryOp(_, o) => use_operand(o, out),
         Rvalue::BinaryOp(_, a, b) => {
             use_operand(a, out);
             use_operand(b, out);
@@ -388,15 +388,15 @@ fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
                 use_operand(o, out);
             }
         }
-        Rvalue::Discriminant(p) | Rvalue::Len(p) => {
+        Rvalue::Discriminant(p) | Rvalue::Len(p, _, _) => {
             if let Some(l) = place_local(p) {
                 out.insert(l);
             }
         }
-        Rvalue::Cast(_, o, _) | Rvalue::Repeat(o, _, _) | Rvalue::ShallowInitBox(o, _) => {
+        Rvalue::Cast(_, o, _) | Rvalue::Repeat(o, _, _, _) | Rvalue::ShallowInitBox(o, _) => {
             use_operand(o, out)
         }
-        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+        Rvalue::NullaryOp(_) | Rvalue::Unknown => {}
     }
 }
 
@@ -429,7 +429,7 @@ fn pin_src(r: &Rvalue) -> Option<PinSrc> {
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
             place_local(place).map(PinSrc::Alias)
         }
-        Rvalue::Use(o) | Rvalue::Cast(_, o, _) => one(o).map(PinSrc::Alias),
+        Rvalue::Use(o, _) | Rvalue::Cast(_, o, _) => one(o).map(PinSrc::Alias),
         _ => None,
     }
 }
@@ -1216,7 +1216,7 @@ pub fn scan(
                 .terminator
                 .span
                 .as_ref()
-                .map_or(&fd.item_meta.span.data, |s| &s.data);
+                .map_or_else(|| llbc.span_data(&fd.item_meta.span), |s| llbc.span_data(s));
             stats.stale_pin_reads.push(StalePinRead {
                 func_name: fd.item_meta.name_path(),
                 file: llbc.file_path(at.file_id).unwrap_or_default().to_string(),
@@ -1264,7 +1264,7 @@ pub fn scan(
                 .terminator
                 .span
                 .as_ref()
-                .map_or(&fd.item_meta.span.data, |s| &s.data);
+                .map_or_else(|| llbc.span_data(&fd.item_meta.span), |s| llbc.span_data(s));
             if !unbracketed.contains(&b) {
                 stats.withheld_under_a_bracket += 1;
                 // Withholding the call is right -- a bracket does dominate it
@@ -1383,7 +1383,7 @@ pub fn scan(
                 .terminator
                 .span
                 .as_ref()
-                .map_or(&fd.item_meta.span.data, |s| &s.data);
+                .map_or_else(|| llbc.span_data(&fd.item_meta.span), |s| llbc.span_data(s));
             findings.push(Finding {
                 func: id,
                 func_name: fd.item_meta.name_path(),
@@ -1419,7 +1419,7 @@ fn transfer_stmt(k: &StmtKind, live: &mut HashSet<u64>) {
                 live.insert(l);
             }
         }
-        StmtKind::Unknown => {}
+        StmtKind::Borrowck(_) | StmtKind::Unknown => {}
     }
 }
 
@@ -1523,7 +1523,10 @@ mod tests {
     #[test]
     fn a_pin_covers_every_local_the_value_is_spelled_by() {
         let mut defs = HashMap::new();
-        defs.insert(1, pin_src(&Rvalue::Use(mv(0))).expect("a use is an alias"));
+        defs.insert(
+            1,
+            pin_src(&Rvalue::Use(mv(0), serde_json::Value::Null)).expect("a use is an alias"),
+        );
         assert_eq!(chased(1, &defs), vec![0, 1]);
     }
 
@@ -1550,6 +1553,13 @@ mod tests {
     #[test]
     fn an_unmodelled_rvalue_yields_no_source_at_all() {
         assert!(pin_src(&Rvalue::Unknown).is_none());
-        assert!(pin_src(&Rvalue::Len(local(1))).is_none());
+        assert!(
+            pin_src(&Rvalue::Len(
+                local(1),
+                serde_json::Value::Null,
+                serde_json::Value::Null
+            ))
+            .is_none()
+        );
     }
 }

@@ -1450,12 +1450,30 @@ def prepend_msvc_link(env: dict[str, str]) -> None:
         )
 
 
+def pinned_charon_version() -> str:
+    """`CHARON_VERSION`, else the pin `install-charon.py` installs by default."""
+    version = os.environ.get("CHARON_VERSION")
+    if version:
+        return version
+    installer = Path(__file__).resolve().parent / "install-charon.py"
+    match = re.search(
+        r'^CHARON_VERSION_DEFAULT = "([^"]+)"$', installer.read_text(), re.MULTILINE
+    )
+    if match is None:
+        raise SystemExit(f"extract-llbc.py: no CHARON_VERSION_DEFAULT in {installer}")
+    return match.group(1)
+
+
 def charon_paths(charon_root: Path) -> tuple[str, Path, Path]:
     platform_key, charon_exe = platform_info()
     repo_parent = charon_root.parent
     shared = Path(os.environ.get("PYRE_SHARED_BUILD", repo_parent / ".pyre-build"))
+    # One directory per pinned version, so worktrees that pin different
+    # Charon releases share the cache without replacing each other's binary.
     charon_dest = Path(
-        os.environ.get("CHARON_DEST", shared / "charon" / platform_key)
+        os.environ.get(
+            "CHARON_DEST", shared / "charon" / platform_key / pinned_charon_version()
+        )
     )
     return platform_key, charon_dest, charon_dest / charon_exe
 
