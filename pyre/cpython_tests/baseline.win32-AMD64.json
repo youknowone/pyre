@@ -5,6 +5,30 @@
       "dynasm": "PASS",
       "reason": "the candidate locales _LocaleTests compares against are installed here, so localeconv() answers with known values and the module reports a result; a host carrying only the C locale reaches skipTest('no suitable locales') in every case and the shared SKIP is what it records"
     },
+    "test.test_asyncio": {
+      "dynasm": "FAIL",
+      "provenance": {
+        "dynasm": {
+          "binary": "pyre-dynasm.exe",
+          "jit": true,
+          "mode": "script",
+          "stdlib_version": "3.14.6"
+        }
+      },
+      "reason": "the package completes here in about three minutes rather than reaching the shared TIMEOUT, and one case fails: StreamTests.test_open_connection_happy_eyeball_refcycles asserts gc.get_referrers(exc) == [main_coro], but with the pure-Python Future and Task the exception's traceback keeps the Task.__wakeup and Future.result frames, whose `future`/`self` locals are the _OverlappedFuture holding exc. CPython 3.13 on this host reports the same extra referrer once _asyncio is blocked from import; PyPy provides no _asyncio"
+    },
+    "test.test_cmd_line_script": {
+      "dynasm": "PASS",
+      "provenance": {
+        "dynasm": {
+          "binary": "pyre-dynasm.exe",
+          "jit": true,
+          "mode": "script",
+          "stdlib_version": "3.14.6"
+        }
+      },
+      "reason": "the shared IMPORTERROR is another host's verdict and this one does not reproduce it: the module imports here and its 49 cases pass, one of them skipped"
+    },
     "test.test_eintr": {
       "dynasm": "SKIP",
       "reason": "EINTRTests is skipUnless(os.name == 'posix', 'only supported on Unix'), so every case in the module skips and none is left to report a result"
@@ -13,9 +37,33 @@
       "dynasm": "SKIP",
       "reason": "the skipUnless(os.name == 'posix') sits on the TestFileIOSignalInterrupt mixin that every concrete case class inherits from, so every case skips"
     },
+    "test.test_httpservers": {
+      "dynasm": "PASS",
+      "provenance": {
+        "dynasm": {
+          "binary": "pyre-dynasm.exe",
+          "jit": true,
+          "mode": "script",
+          "stdlib_version": "3.14.6"
+        }
+      },
+      "reason": "the shared IMPORTERROR is another host's verdict and this one does not reproduce it: the module imports here and its 92 cases pass, eight of them skipped"
+    },
     "test.test_import": {
       "dynasm": "FAIL",
       "reason": "ImportTests.test_dll_dependency_import is the module's only skipUnless(sys.platform == 'win32') case, and it reads importlib.util.find_spec('_sqlite3').origin: pyre ships no _sqlite3, so find_spec answers None. Not a platform difference in the import machinery -- a missing extension module the POSIX hosts never exercise"
+    },
+    "test.test_io": {
+      "dynasm": "PASS",
+      "provenance": {
+        "dynasm": {
+          "binary": "pyre-dynasm.exe",
+          "jit": true,
+          "mode": "script",
+          "stdlib_version": "3.14.6"
+        }
+      },
+      "reason": "the shared TIMEOUT is the ubuntu lane overrunning its per-module timeout; the module completes here in under a minute and passes"
     },
     "test.test_mmap": {
       "dynasm": "FAIL",
@@ -52,6 +100,18 @@
     "test.test_os": {
       "dynasm": "PASS",
       "reason": "the shared cell was recorded by a host where the module does not import; it imports here and 375 cases run, so this host records the pass separately"
+    },
+    "test.test_repl": {
+      "dynasm": "PASS",
+      "provenance": {
+        "dynasm": {
+          "binary": "pyre-dynasm.exe",
+          "jit": true,
+          "mode": "script",
+          "stdlib_version": "3.14.6"
+        }
+      },
+      "reason": "the shared FAIL is another host's verdict and this one does not reproduce it: its 18 cases pass here, four of them skipped"
     },
     "test.test_site": {
       "dynasm": "PASS",
