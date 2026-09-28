@@ -4599,28 +4599,52 @@ impl PyFrame {
     /// on the compiled loop's re-run; Gap 10 removed that path (inline-frame
     /// STORE_GLOBAL records as deferred IR, applied exactly once).
     fn build_snapshot_frame(&self, allocation: FrameLocalsArrayAllocation) -> PyFrame {
+        // `live_mut` reloads an opcode's frame after a safepoint. This
+        // snapshot is the same situation one step earlier: a minor may
+        // already have moved the frame, and `set_forwarding_address` then
+        // stores the survivor in the corpse's first payload word — which
+        // for `FixedObjectArray` is `len`. Reading that word as a length
+        // asks for an allocation the size of a heap address.
+        let frame_ptr =
+            pyre_object::gc_hook::try_gc_current_object_address(self as *const Self as *mut u8)
+                as *mut PyFrame;
+        let frame = unsafe { &*frame_ptr };
+        let locals_cells_stack_w = unsafe {
+            let raw = frame.locals_cells_stack_w as *mut u8;
+            let resolved = if raw.is_null() {
+                raw
+            } else {
+                pyre_object::gc_hook::try_gc_current_object_address(raw)
+            };
+            if resolved != raw {
+                // The live frame still names the nursery corpse. The next
+                // minor traces that field; write the survivor back first.
+                store_locals_cells_stack_w(frame_ptr, resolved as *mut FixedObjectArray);
+            }
+            let values = (*(resolved as *mut FixedObjectArray)).to_vec();
+            let array = alloc_frame_locals_array(values.len(), PY_NULL, allocation);
+            for (i, value) in values.into_iter().enumerate() {
+                let value = pyre_object::gc_hook::try_gc_current_object_address(value as *mut u8)
+                    as PyObjectRef;
+                (*array).items_mut_ptr().add(i).write(value);
+            }
+            remember_frame_locals_array(array);
+            array
+        };
         PyFrame {
             ob_header: frame_ob_header(),
-            pycode: self.pycode,
-            locals_cells_stack_w: unsafe {
-                let values = locals_w!(self).to_vec();
-                let array = alloc_frame_locals_array(values.len(), PY_NULL, allocation);
-                for (i, value) in values.into_iter().enumerate() {
-                    (*array).items_mut_ptr().add(i).write(value);
-                }
-                remember_frame_locals_array(array);
-                array
-            },
-            valuestackdepth: self.valuestackdepth,
-            last_instr: self.last_instr,
-            flags: self.flags,
-            failed_attr_cleanup: self.failed_attr_cleanup,
-            debugdata: unsafe { clone_debugdata_ptr(self.debugdata, allocation) },
-            vable_token: self.vable_token,
-            f_generator_wref: self.f_generator_wref,
-            w_yielding_from: self.w_yielding_from,
-            f_backref: self.f_backref,
-            w_builtin: self.w_builtin,
+            pycode: frame.pycode,
+            locals_cells_stack_w,
+            valuestackdepth: frame.valuestackdepth,
+            last_instr: frame.last_instr,
+            flags: frame.flags,
+            failed_attr_cleanup: frame.failed_attr_cleanup,
+            debugdata: unsafe { clone_debugdata_ptr(frame.debugdata, allocation) },
+            vable_token: frame.vable_token,
+            f_generator_wref: frame.f_generator_wref,
+            w_yielding_from: frame.w_yielding_from,
+            f_backref: frame.f_backref,
+            w_builtin: frame.w_builtin,
         }
     }
 

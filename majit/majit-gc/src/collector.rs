@@ -3759,7 +3759,14 @@ impl MiniMarkGC {
         // survive the clear, else the next `id_or_identityhash`
         // re-allocates a fresh shadow and the identity hash changes.
         if !self.nursery_objects_shadows.is_empty() {
+            // Keys first: clearing `GCFLAG_HAS_SHADOW` on a corpse must not
+            // run while the map is borrowed, and must not touch a forwarded
+            // header (`FORWARDED_MARKER` would stop comparing equal).
+            let shadow_keys: Vec<usize> = self.nursery_objects_shadows.keys().copied().collect();
             if self.surviving_pinned_objects.is_empty() {
+                for obj_addr in shadow_keys {
+                    self.forget_dropped_shadow_flag(obj_addr);
+                }
                 self.nursery_objects_shadows.clear();
             } else {
                 let mut new_shadows = AddressMap::default();
@@ -3776,6 +3783,11 @@ impl MiniMarkGC {
                         unsafe { (*header_of(shadow_addr)).set_flag(GcFlags::GCFLAG_VISITED) };
                     }
                     new_shadows.insert(obj_addr, shadow_addr);
+                }
+                for obj_addr in shadow_keys {
+                    if !new_shadows.contains_key(&obj_addr) {
+                        self.forget_dropped_shadow_flag(obj_addr);
+                    }
                 }
                 self.nursery_objects_shadows = new_shadows;
             }
@@ -5036,6 +5048,25 @@ impl MiniMarkGC {
         shadow
     }
 
+    /// Drop `GCFLAG_HAS_SHADOW` from a nursery header whose map entry is going
+    /// away and that was not forwarded.
+    ///
+    /// `record_pinned_object_with_shadow` keeps the entry for a surviving pin.
+    /// Every other key dies with this minor. `arena_reset` mode 0 does not
+    /// scrub the header, so the flag would otherwise outlive
+    /// `nursery_objects_shadows` and the next `id_or_identityhash` would hit
+    /// `_find_shadow`'s missing-shadow assert.
+    fn forget_dropped_shadow_flag(&self, obj_addr: usize) {
+        if !self.is_in_nursery(obj_addr) {
+            return;
+        }
+        let hdr = unsafe { header_of(obj_addr) };
+        if unsafe { (*hdr).is_forwarded() } {
+            return;
+        }
+        unsafe { (*hdr).clear_flag(GcFlags::GCFLAG_HAS_SHADOW) };
+    }
+
     /// minimark.py `id_or_identityhash(gcobj)`.
     /// Return a stable address usable as identity hash.  For nursery
     /// objects, returns the shadow's address (which is where the object
@@ -5043,10 +5074,34 @@ impl MiniMarkGC {
     /// objects, returns the object's own address (old-gen objects don't
     /// move in mark-sweep).
     pub fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
-        if self.is_valid_gc_object(obj_addr) && self.is_in_nursery(obj_addr) {
-            return self.find_shadow(obj_addr);
+        if !self.is_valid_gc_object(obj_addr) || !self.is_in_nursery(obj_addr) {
+            return obj_addr;
         }
-        obj_addr
+        // A caller that kept the pre-move address still names the nursery
+        // corpse. `set_forwarding_address` wrote the copy there, and for an
+        // object that had a shadow that copy *is* the shadow — the same
+        // address `id_or_identityhash` returned before the minor.
+        // `_find_shadow` asserts on a forwarded header; follow it first.
+        let hdr = unsafe { *header_of(obj_addr) };
+        if hdr.is_forwarded() {
+            let forwarded = unsafe { GcHeader::forwarding_address(header_of(obj_addr)) };
+            if self.is_in_nursery(forwarded) {
+                return self.find_shadow(forwarded);
+            }
+            return forwarded;
+        }
+        // `arena_reset` mode 0 leaves the old header in the unused gap
+        // `[nursery_free, nursery_top)`. A dead object that had taken
+        // `id_or_identityhash` still has `GCFLAG_HAS_SHADOW`, and the minor
+        // has already cleared `nursery_objects_shadows`. `_find_shadow`
+        // would then assert. Nothing live sits in that gap: the bump is
+        // `nursery_free`, and a pin is at or past `nursery_top`.
+        let free = self.nursery.free_ptr() as usize;
+        let top = self.nursery.top_ptr() as usize;
+        if obj_addr >= free && obj_addr < top {
+            return obj_addr;
+        }
+        self.find_shadow(obj_addr)
     }
 
     /// Copy a single nursery object to old gen.
@@ -5369,6 +5424,7 @@ impl MiniMarkGC {
                  nearest_header={}, \
                  child_nursery_offset={:#x}, child_gen={}, holder_gen={}, \
                  holder_tid_and_flags={:#x}, holder_in_remembered={}, \
+                 store_sites={:#x}, \
                  enclosing={}, extra_area={}, gc_state={:?}, minors={}, majors={})",
                 type_id,
                 obj_addr,
@@ -5395,6 +5451,7 @@ impl MiniMarkGC {
                 self.describe_generation(holder_addr),
                 holder_hdr_tid_and_flags,
                 self.old_objects_pointing_to_young.contains(&holder_addr),
+                crate::bh_probe_store_sites(holder_addr, slot_addr.saturating_sub(holder_addr),),
                 self.describe_enclosing_container(holder_addr, slot_addr, &holder_words),
                 crate::shadow_stack::current_extra_area(),
                 self.gc_state,
@@ -10801,6 +10858,35 @@ mod tests {
     /// (incminimark.py:1019), so a fixture that means to exercise them has to
     /// ask for an array that would really have been rawmalloced.
     const CARD_ARRAY_LEN: usize = 512;
+
+    /// A rooted nursery object that has taken `id_or_identityhash` is copied
+    /// into its shadow. After the minor drops `nursery_objects_shadows`, the
+    /// pre-move address is a forwarding stub (`arena_reset` mode 0) and
+    /// `id_or_identityhash` still answers the shadow. An unrooted peer keeps
+    /// `GCFLAG_HAS_SHADOW` on the leftover header; asking its id must not
+    /// assert in `_find_shadow`.
+    #[test]
+    fn id_after_minor_follows_the_shadow_and_skips_a_dead_header() {
+        let mut gc = test_gc(8192);
+        let tid = gc.register_type(TypeInfo::simple(24));
+        let mut live = gc.alloc_with_type(tid, 24);
+        let old_live = live.0;
+        let shadow = gc.id_or_identityhash(old_live);
+        assert_ne!(shadow, old_live);
+        unsafe { gc.add_root(&mut live) };
+
+        let dead = gc.alloc_with_type(tid, 24);
+        let _ = gc.id_or_identityhash(dead.0);
+
+        gc.do_collect_nursery();
+
+        assert_eq!(live.0, shadow);
+        assert!(!gc.is_in_nursery(live.0));
+        assert_eq!(gc.id_or_identityhash(old_live), shadow);
+        let dead_id = gc.id_or_identityhash(dead.0);
+        assert_eq!(dead_id, dead.0);
+        gc.remove_root(&mut live);
+    }
 
     /// Helper: create a GC with a small nursery for testing.
     fn test_gc(nursery_size: usize) -> MiniMarkGC {
