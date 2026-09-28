@@ -6718,7 +6718,6 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // The receiver, its type and the descriptor are read back from
             // their slots after each call below: a descriptor `__get__` and
             // the dict lookup can both run Python.
-            let live = |slot: usize| pyre_object::gc_roots::shadow_stack_get(slot);
             let descr_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_descr.unwrap_or(PY_NULL));
             // module.py descr_getattribute runs the normal lookup, then catches
@@ -6728,17 +6727,29 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // AttributeError; the bare `object.__getattribute__` slot
             // (`!call_getattr`) still propagates so `module_getattribute`'s own
             // `try`/`except` performs the routing.
-            if w_descr.is_some() && is_data_descr(live(descr_slot)) {
-                match get(live(descr_slot), live(obj_slot), live(w_type_slot)) {
+            if w_descr.is_some()
+                && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot))
+            {
+                match get(
+                    pyre_object::gc_roots::shadow_stack_get(descr_slot),
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    pyre_object::gc_roots::shadow_stack_get(w_type_slot),
+                ) {
                     Ok(Some(value)) => return Ok(value),
                     Ok(None) => {}
                     Err(e) if call_getattr && e.kind == PyErrorKind::AttributeError => {
-                        return module_getattr_fallback(live(obj_slot), name, e, suppress);
+                        return module_getattr_fallback(
+                            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                            name,
+                            e,
+                            suppress,
+                        );
                     }
                     Err(e) => return Err(e),
                 }
             }
-            let w_dict = pyre_object::w_module_get_w_dict(live(obj_slot));
+            let w_dict =
+                pyre_object::w_module_get_w_dict(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             if !w_dict.is_null()
                 && let Some(value) = finditem_str(w_dict, name)?
                 && !value.is_null()
@@ -6746,12 +6757,23 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                 return Ok(value);
             }
             if w_descr.is_some() {
-                match get(live(descr_slot), live(obj_slot), live(w_type_slot)) {
+                match get(
+                    pyre_object::gc_roots::shadow_stack_get(descr_slot),
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    pyre_object::gc_roots::shadow_stack_get(w_type_slot),
+                ) {
                     Ok(value) => {
-                        return Ok(value.unwrap_or(live(descr_slot)));
+                        return Ok(
+                            value.unwrap_or(pyre_object::gc_roots::shadow_stack_get(descr_slot))
+                        );
                     }
                     Err(e) if call_getattr && e.kind == PyErrorKind::AttributeError => {
-                        return module_getattr_fallback(live(obj_slot), name, e, suppress);
+                        return module_getattr_fallback(
+                            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                            name,
+                            e,
+                            suppress,
+                        );
                     }
                     Err(e) => return Err(e),
                 }
