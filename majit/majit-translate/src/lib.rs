@@ -204,6 +204,7 @@ fn build_semantic_program_via_active_frontend(
     static_addrs: HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
     explicit_llbc_paths: Option<&[&str]>,
+    funcobj_declarations: &call::FuncObjDeclarations,
     prof: &mut PhaseProfiler,
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
@@ -299,6 +300,7 @@ fn build_semantic_program_via_active_frontend(
                 static_addrs,
                 jitdriver_receiver_roots,
                 hints.clone(),
+                funcobj_declarations.clone(),
             );
             let mut merged = None;
             let mut seen_function_keys = std::collections::HashSet::new();
@@ -1075,6 +1077,13 @@ fn analyze_pipeline_from_module_paths(
     // `scripts/extract-llbc.py`), supplied explicitly by the consumer or
     // located via `MAJIT_MIR_FRONTEND_LLBC`.
     mark_phase!("known_statics + struct_field_attrs populated");
+    // The funcobjs the front end declares apart from `program.functions`,
+    // registered by `CallControl` on lookup. A clause specialization is
+    // another graph of its generic funcobj (`description.py
+    // FunctionDesc.cachedgraph(key)`), reached only from the call sites
+    // that name it: it is declared under that one path, with no alias
+    // spelling, class member or indirect-call family row of its own.
+    let funcobj_declarations = call::FuncObjDeclarations::default();
     // `rlib/jit.py`'s `hint` entry reads `classdesc.get_param('_virtualizable_')`
     // off the class before it mints `access_directly`. Pyre has no `ClassDesc`
     // at that point, so the declaration arrives with the config — and it is
@@ -1093,6 +1102,7 @@ fn analyze_pipeline_from_module_paths(
         static_addrs,
         &config.pipeline.transform.jitdriver_receiver_roots,
         explicit_llbc_paths,
+        &funcobj_declarations,
         &mut prof,
     );
     // Publish the `(bare struct leaf → defining crate-relative module
@@ -1137,24 +1147,6 @@ fn analyze_pipeline_from_module_paths(
     // the call sites that name it: it is declared under that one path, with
     // no alias spelling, class member or indirect-call family row of its
     // own.
-    let funcobj_declarations = call::FuncObjDeclarations::default();
-    let (spec_functions, functions): (Vec<_>, Vec<_>) = std::mem::take(&mut program.functions)
-        .into_iter()
-        .partition(|func| func.spec_path.is_some());
-    program.functions = functions;
-    for func in spec_functions {
-        funcobj_declarations.push(call::DeclaredFuncObj {
-            path: func
-                .spec_path
-                .clone()
-                .expect("a spec function names its path"),
-            graph: func.lazy_graph().clone(),
-            transform: call::GraphTransform {
-                return_type: func.return_type.clone(),
-                hints: func.hints.clone(),
-            },
-        });
-    }
     prof.note(|| {
         // Counts the bodies built so far; the note builds none.
         let built = || {

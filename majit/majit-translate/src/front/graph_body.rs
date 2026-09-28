@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use majit_charon_reader::Llbc;
 
+use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations};
 use crate::front::mir::{
     self, CrateLowering, CrateLoweringState, DeclBuildError, GraphStamp, LowerError,
 };
@@ -43,6 +44,9 @@ pub(crate) struct GraphBodySource {
 pub(crate) struct GraphBodyProvider {
     crates: Vec<Rc<ProvidedCrate>>,
     tables: Rc<ProviderTables>,
+    /// Where the funcobjs declared apart from a crate's program go: the
+    /// clause specializations.
+    declarations: FuncObjDeclarations,
 }
 
 /// What every crate's lowering reads besides its own artefact and state.
@@ -134,6 +138,7 @@ impl GraphBodyProvider {
         static_addrs: crate::HostStaticAddrs<'_>,
         jitdriver_receiver_roots: &[String],
         func_hints: HashMap<String, Vec<String>>,
+        declarations: FuncObjDeclarations,
     ) -> Self {
         let own = |rows: &[(&str, i64)]| -> Vec<(String, i64)> {
             rows.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
@@ -155,6 +160,7 @@ impl GraphBodyProvider {
         Self {
             crates: Vec::new(),
             tables: Rc::new(tables),
+            declarations,
         }
     }
 
@@ -173,7 +179,7 @@ impl GraphBodyProvider {
         let state =
             CrateLoweringState::new(&llbc, &paint_tombstones, self.tables.func_hints.clone());
         let krate = Rc::new(ProvidedCrate { llbc, state });
-        let mut functions = self.declare_crate(&krate, module_filter.as_ref());
+        let functions = self.declare_crate(&krate, module_filter.as_ref());
         // Every declared body is built here, in declaration order and
         // before the clause specializations those bodies queue. A body that
         // does not lower leaves its funcobj external.
@@ -186,8 +192,8 @@ impl GraphBodyProvider {
             let Some(spec) = self.declare_spec(&krate, req) else {
                 continue;
             };
-            spec.lazy_graph().get();
-            functions.push(spec);
+            spec.graph.get();
+            self.declarations.push(spec);
         }
         let mut program = krate.state.finish(functions);
         mir::harden_duplicate_leaf_metadata(
@@ -206,7 +212,7 @@ impl GraphBodyProvider {
         &self,
         krate: &Rc<ProvidedCrate>,
         req: crate::front::clause_spec::SpecRequest,
-    ) -> Option<SemanticFunction> {
+    ) -> Option<DeclaredFuncObj> {
         krate.lowering(&self.tables, |lowering| {
             let spec = lowering.declare_spec(req)?;
             let stamp = spec.header.graph_stamp();
@@ -216,7 +222,7 @@ impl GraphBodyProvider {
                 let graph = krate.lowering(&tables, |lowering| lowering.build_spec_body(&body))?;
                 Some(stamp_declared(&stamp, graph, &declared))
             });
-            Some(spec.into_semantic(graph))
+            Some(spec.into_declared(graph))
         })
     }
 
@@ -527,8 +533,12 @@ mod tests {
     #[test]
     fn provider_reproduces_the_eagerly_lowered_body() {
         let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
-        let mut provider =
-            GraphBodyProvider::new(crate::HostStaticAddrs::default(), &[], HashMap::new());
+        let mut provider = GraphBodyProvider::new(
+            crate::HostStaticAddrs::default(),
+            &[],
+            HashMap::new(),
+            FuncObjDeclarations::default(),
+        );
         let program = provider.lower_prelinked_crate(llbc, &[], &HashSet::new());
         let mut compared = 0;
         for f in &program.functions {
@@ -568,13 +578,17 @@ mod tests {
                 format!("{}::{}", f.module_path, f.name)
             }
         };
-        let unhinted =
-            GraphBodyProvider::new(crate::HostStaticAddrs::default(), &[], HashMap::new())
-                .lower_prelinked_crate(
-                    Llbc::load(CORPUS).expect("load corpus.ullbc"),
-                    &[],
-                    &HashSet::new(),
-                );
+        let unhinted = GraphBodyProvider::new(
+            crate::HostStaticAddrs::default(),
+            &[],
+            HashMap::new(),
+            FuncObjDeclarations::default(),
+        )
+        .lower_prelinked_crate(
+            Llbc::load(CORPUS).expect("load corpus.ullbc"),
+            &[],
+            &HashSet::new(),
+        );
         let target = unhinted
             .functions
             .iter()
@@ -582,12 +596,17 @@ mod tests {
             .map(fn_path)
             .expect("corpus has an unhinted funcobj");
         let hints = HashMap::from([(target.clone(), vec!["unroll_safe".to_string()])]);
-        let program = GraphBodyProvider::new(crate::HostStaticAddrs::default(), &[], hints)
-            .lower_prelinked_crate(
-                Llbc::load(CORPUS).expect("load corpus.ullbc"),
-                &[],
-                &HashSet::new(),
-            );
+        let program = GraphBodyProvider::new(
+            crate::HostStaticAddrs::default(),
+            &[],
+            hints,
+            FuncObjDeclarations::default(),
+        )
+        .lower_prelinked_crate(
+            Llbc::load(CORPUS).expect("load corpus.ullbc"),
+            &[],
+            &HashSet::new(),
+        );
         let f = program
             .functions
             .iter()

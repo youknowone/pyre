@@ -1448,13 +1448,18 @@ impl StoreCore {
     /// Register a declared funcobj without building its graph, carrying the
     /// attributes its decorators set. A declaration precedes every store
     /// pass, so its build catches up on all of them. Another alias of the
-    /// same funcobj folds its stamps onto the stored slot.
+    /// same funcobj folds its stamps onto the stored slot. A path already
+    /// declared keeps its first funcobj, as `FunctionDesc.cachedgraph`
+    /// returns the graph it built first for a key.
     fn declare(&self, declared: DeclaredFuncObj) {
         let DeclaredFuncObj {
             path,
             graph,
             transform,
         } = declared;
+        if self.path_to_key.borrow().contains_key(&path) {
+            return;
+        }
         let key = graph.graph_key();
         let mut attrs = FuncObjAttrs::from_decorator_hints(&transform.hints);
         let mut graphs = self.graphs.borrow_mut();

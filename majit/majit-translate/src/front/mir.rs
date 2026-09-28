@@ -1700,13 +1700,30 @@ impl DeclaredSpec {
         graph: crate::model::LazyGraph,
     ) -> crate::front::semantic::SemanticFunction {
         let mut lowered = self.header.into_semantic(graph);
-        lowered.spec_path = Some(crate::parse::CallPath::from_segments(
-            self.body.segments.iter().cloned(),
-        ));
         if self.dont_look_inside && !lowered.hints.iter().any(|hint| hint == "dont_look_inside") {
             lowered.hints.push("dont_look_inside".to_string());
         }
         lowered
+    }
+}
+
+impl DeclaredSpec {
+    /// The funcobj under the path the specialization's call sites name,
+    /// with the stamps its registration carries.
+    pub(crate) fn into_declared(
+        self,
+        graph: crate::model::LazyGraph,
+    ) -> crate::codewriter::call::DeclaredFuncObj {
+        let path = crate::parse::CallPath::from_segments(self.body.segments.iter().cloned());
+        let lowered = self.into_semantic(graph);
+        crate::codewriter::call::DeclaredFuncObj {
+            path,
+            graph: lowered.lazy_graph().clone(),
+            transform: crate::codewriter::call::GraphTransform {
+                return_type: lowered.return_type,
+                hints: lowered.hints,
+            },
+        }
     }
 }
 
@@ -2035,7 +2052,6 @@ impl SemanticFunctionHeader {
             trait_root: self.trait_root,
             trait_qualified: self.trait_qualified,
             returns_objectptr: self.returns_objectptr,
-            spec_path: None,
         }
     }
 }
