@@ -765,6 +765,20 @@ struct PeepSink<'sink, 'buf> {
     /// `i64::MIN` means the next push must store.
     gcmap_known: i64,
     gcmap_ctrl: Vec<GcmapCtrl>,
+    /// `gc_ll_descr.write_barrier_descr` as `_reload_frame_if_necessary`
+    /// reads it; `None` when the module has no collector barrier or no
+    /// collecting site.
+    frame_wb: Option<FrameWriteBarrier>,
+}
+
+/// The jitframe barrier operands: `wasm_jit_write_barrier`, its
+/// `(i64) -> i64` residual type, and the flag byte it tests.
+#[derive(Clone, Copy)]
+struct FrameWriteBarrier {
+    fn_ptr: i64,
+    type_idx: u32,
+    flag_byteofs: i32,
+    if_flag: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -821,6 +835,7 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
             gcmap_frame_local: 0,
             gcmap_known: i64::MIN,
             gcmap_ctrl: Vec::new(),
+            frame_wb: None,
         }
     }
 
@@ -2662,27 +2677,18 @@ fn emit_write_barrier(
     Ok(())
 }
 
-/// Publish Ref-home writes made since the preceding safepoint.  A live old
-/// JitFrame is scanned directly while it is on the shadow stack, but after a
-/// minor collection its remembered-state flag must be re-established before a
-/// later home store can survive the next collection.
-fn emit_jitframe_write_barrier(
-    sink: &mut PeepSink<'_, '_>,
-    residual_type_base: Option<u32>,
-    wb: &WriteBarrierHelpers,
-    gcmap_ptr: i64,
-    ca_reload_fn_ptr: i64,
-    jf_top_addr: Option<u32>,
-) -> Result<(), BackendError> {
-    let Some(base) = residual_type_base else {
-        return Err(BackendError::Unsupported(
-            "wasm codegen: jitframe write barrier has no residual call type".into(),
-        ));
+/// assembler.py `_reload_frame_if_necessary` tail:
+/// `_write_barrier_fastpath(mc, wbdescr, [ebp], array=False, is_frame=True)`.
+/// Local 0 was just reloaded; a frame the collection promoted has
+/// TRACK_YOUNG_PTRS set and joins the remembered set before the home stores
+/// that follow. Frames never use card marking. The helper cannot collect
+/// (`_build_wb_slowpath(for_frame=True)`), so no gcmap is pushed and the
+/// frame is not reloaded again. Off-GC frames reserve a zeroed header too
+/// (`alloc_off_gc_jitframe`), so their flag-byte read is valid.
+fn emit_frame_write_barrier(sink: &mut PeepSink<'_, '_>) {
+    let Some(wb) = sink.frame_wb else {
+        return;
     };
-    // aarch64/assembler.py _reload_frame_if_necessary invokes
-    // _write_barrier_fastpath(is_frame=True): frames never use card marking.
-    // Off-GC frames reserve a zeroed header too (alloc_off_gc_jitframe), so
-    // their flag-byte read is valid and does not enter the guarded helper.
     sink.local_get(0);
     sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_sub();
@@ -2696,16 +2702,10 @@ fn emit_jitframe_write_barrier(
     sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_sub();
     sink.i64_extend_i32_u();
-    emit_push_gcmap(sink, gcmap_ptr);
     sink.i32_const(wb.fn_ptr as i32);
-    sink.call_indirect(0, base + 1);
+    sink.call_indirect(0, wb.type_idx);
     sink.drop();
-    if gcmap_ptr != 0 {
-        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
-        emit_pop_gcmap(sink);
-    }
     sink.end();
-    Ok(())
 }
 
 /// Date a use at `at` unless it is an owner-defined value leaking into an
@@ -3034,12 +3034,14 @@ fn emit_reload_frame_if_necessary(
         // this does not need the residual direct-call type to be declared.
         emit_ca_reload_top(sink, top_addr);
         sink.local_set(0);
+        emit_frame_write_barrier(sink);
     } else if let Some(base) = residual_type_base.filter(|_| ca_reload_fn_ptr != 0) {
         sink.i32_const(ca_reload_fn_ptr as i32);
         sink.call_indirect(0, base);
         sink.i32_wrap_i64();
         sink.local_set(0);
         sink.sync_gcmap_frame();
+        emit_frame_write_barrier(sink);
     } else {
         // No shadow top and no reload helper: no active GC, or an embedder
         // that never pushed a JitFrame. Reloading from a shadow stack that
@@ -3060,6 +3062,7 @@ fn emit_reload_ca_frame_if_necessary(
         debug_assert!(residual_type_base.is_some());
         emit_ca_reload_top(sink, inline.jf_top_addr);
         sink.local_set(0);
+        emit_frame_write_barrier(sink);
     } else {
         emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, None);
     }
@@ -5386,14 +5389,9 @@ pub(crate) fn build_wasm_module_reporting_shortage(
                     .map(|_| 1),
             )
             .max();
-        // `emit_jitframe_write_barrier` is a generated one-argument helper,
-        // not a trace operation visible to the ordinary residual census.
-        let scanned = if num_ref_homes != 0
-            && analysis_ops
-                .iter()
-                .any(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2))
-            && analysis_ops.iter().any(|op| op.opcode.can_malloc())
-        {
+        // `emit_frame_write_barrier` after each frame reload calls the
+        // one-argument `wasm_jit_write_barrier`, which no trace operation names.
+        let scanned = if wb.fn_ptr != 0 && analysis_ops.iter().any(collecting_site) {
             Some(scanned.map_or(1, |arity| arity.max(1)))
         } else {
             scanned
@@ -6174,6 +6172,17 @@ fn build_function(
     if let Some(frame_local) = gcmap_frame_local {
         sink.gcmap_frame_local = frame_local;
     }
+    if wb.fn_ptr != 0
+        && ops.iter().any(collecting_site)
+        && let Some(base) = residual_type_base
+    {
+        sink.frame_wb = Some(FrameWriteBarrier {
+            fn_ptr: wb.fn_ptr,
+            type_idx: base + 1,
+            flag_byteofs: wb.flag_byteofs,
+            if_flag: wb.if_flag,
+        });
+    }
 
     // assembler.py `_check_frame_depth` at bridge / entry-bridge entry.
     // The depth is a constant of this module; the running length is the
@@ -6398,9 +6407,6 @@ fn build_function(
     let mut fused_guard_at: Option<usize> = None;
     let mut fused_condcall_at: Option<usize> = None;
     let mut skip_nursery_tid_store_at: Option<usize> = None;
-    let frame_can_escape = ops
-        .iter()
-        .any(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2));
     // `_finish_gcmap` is retained only for GUARD_NOT_FORCED_2
     // (`store_force_descr` / `genop_finish`). A leftover `jf_force_descr`
     // from the GUARD_NOT_FORCED that follows CALL_ASSEMBLER is not that map.
@@ -6442,16 +6448,6 @@ fn build_function(
         if skip_nursery_tid_store_at == Some(op_idx) {
             skip_nursery_tid_store_at = None;
             continue;
-        }
-        if frame_can_escape && ref_homes.len() != 0 && op.opcode.can_malloc() {
-            emit_jitframe_write_barrier(
-                &mut sink,
-                residual_type_base,
-                wb,
-                site_gcmap.get(op_idx).copied().unwrap_or(0),
-                ca.ca_reload_fn_ptr,
-                ca.jf_top_addr,
-            )?;
         }
         if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
             // End of the segment before label j (key-0 / earlier-label path).
@@ -9509,6 +9505,7 @@ fn build_function(
                 if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
                     emit_ca_reload_caller(&mut sink, inline.jf_top_addr);
                     sink.local_set(0);
+                    emit_frame_write_barrier(&mut sink);
                 } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
                     emit_push_site(&mut sink, &site_gcmap, op_idx);
@@ -9516,6 +9513,7 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.local_set(0);
                     sink.sync_gcmap_frame();
+                    emit_frame_write_barrier(&mut sink);
                 }
                 // The frame ABI carries every scalar result as i64 bits. Ref
                 // and Int use those bits directly; Float crosses the local

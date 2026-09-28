@@ -1444,11 +1444,39 @@ fn jitframe_barrier_checks_flags_and_reserves_arity_one_for_zero_argument_residu
     guard.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
-    let bytes = build_module_with_write_barrier_target(
-        &[InputArg::from_type_rc(Type::Ref, 0)],
-        &[call, guard, finish],
-        WB_TARGET,
-    );
+    // The barrier follows the frame reload, so the collector's reload
+    // helper must be configured (`gcrootmap and wbdescr`).
+    let mut ca = codegen::CaParams::default();
+    ca.ca_reload_fn_ptr = 1;
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: vec![InputArg::from_type_rc(Type::Ref, 0)],
+        ops: vec![call, guard, finish],
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(WB_TARGET, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::compact(5, 2, 0),
+        ca,
+    };
+    let (bytes, _, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs))
+        .expect("wasm codegen should succeed");
     assert_eq!(direct_write_barrier_call_count(&bytes, WB_TARGET as i32), 1);
     validate_wasm(&bytes);
     // _reload_frame_if_necessary's frame fastpath must guard the helper;
