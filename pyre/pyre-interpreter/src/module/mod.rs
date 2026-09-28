@@ -48,3 +48,5 @@ pub mod r#struct;
 pub mod sys;
 pub mod thread;
 pub mod time;
+#[cfg(windows)]
+pub mod winreg;

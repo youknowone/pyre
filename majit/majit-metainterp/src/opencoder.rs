@@ -338,7 +338,7 @@ where
         };
         for op in trace[start..end].iter().map(std::borrow::Borrow::borrow) {
             consider(op.pos().get());
-            for a in op.getarglist().iter() {
+            for a in op.args_slice().iter() {
                 consider(a.to_opref());
             }
             op.visit_failarg_oprefs(&mut consider);
@@ -1586,14 +1586,14 @@ pub struct Trace {
     rooted_refs: Vec<majit_gc::shadow_stack::OwnerRootGuard>,
     /// opencoder.py:483 self._refs_dict — caches addr → index into
     /// `_refs`. Cleared by `tracing_done`.
-    pub _refs_dict: indexmap::IndexMap<u64, u32>,
+    pub _refs_dict: crate::FxIndexMap<u64, u32>,
     /// opencoder.py:484 self._bigints — constant pool for big ints
     /// (> SMALL_INT_STOP). Indexed via `(idx << 1)` in TAGCONSTOTHER
     /// (bit 0 = 0 means bigint).
     pub _bigints: Vec<i64>,
     /// opencoder.py:485 self._bigints_dict — caches value → index.
     /// Cleared by `tracing_done`.
-    pub _bigints_dict: indexmap::IndexMap<i64, u32>,
+    pub _bigints_dict: crate::FxIndexMap<i64, u32>,
     /// opencoder.py:486 self._floats — constant pool for floats. Indexed
     /// via `(idx << 1) | 1` in TAGCONSTOTHER (bit 0 = 1 means float).
     pub _floats: Vec<u64>,
@@ -1698,9 +1698,9 @@ impl Trace {
                 refs
             },
             rooted_refs: Vec::with_capacity(32),
-            _refs_dict: indexmap::IndexMap::with_capacity(32),
+            _refs_dict: crate::FxIndexMap::with_capacity_and_hasher(32, Default::default()),
             _bigints: Vec::new(),
-            _bigints_dict: indexmap::IndexMap::new(),
+            _bigints_dict: crate::FxIndexMap::default(),
             _floats: Vec::new(),
             _snapshot_data: Vec::with_capacity(128),
             _snapshot_array_data: Vec::with_capacity(128),
@@ -3057,6 +3057,18 @@ impl Trace {
         deadranges
     }
 
+    /// `_refs[index]` at the address the GC holds now.
+    ///
+    /// `_refs` is a GC-traced list, so a read always sees the moved object.
+    /// The raw words here are refreshed only at the tracing GC boundary;
+    /// after tracing ends the owner root is the authoritative copy.
+    pub(crate) fn current_ref(&self, index: usize) -> u64 {
+        if index == 0 {
+            return 0;
+        }
+        self.rooted_refs[index - 1].get().0 as u64
+    }
+
     /// Rust adaptation: mirror pointer moves performed by the GC back
     /// into `_refs`. The owner roots hold the authoritative post-move
     /// pointer for each entry pushed by `_encode_ptr`; copy those
@@ -3602,7 +3614,7 @@ mod tests {
         let op0 = iter.next().unwrap();
         assert_eq!(op0.pos().get(), iop(104));
         assert_eq!(
-            op0.getarglist()
+            op0.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3611,7 +3623,7 @@ mod tests {
 
         let op1 = iter.next().unwrap();
         assert_eq!(
-            op1.getarglist()
+            op1.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3623,7 +3635,7 @@ mod tests {
         let finish = iter.next().unwrap();
         assert_eq!(
             finish
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -5103,7 +5115,7 @@ mod tests {
         assert_eq!(ops[0].opcode, OpCode::IntAdd);
         assert_eq!(
             ops[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

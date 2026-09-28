@@ -392,19 +392,24 @@ pub struct DeadFrameArtifacts {
 /// `compile.py` `class CompileData(object)`.
 ///
 /// `optimize_trace` is the compile.py method: write `MARK_TRACE`, run
-/// subclass `optimize()`, then `forget_optimization_info`. `logger_noopt`
-/// / `build_opt_chain` stay at the flattened call site in `pyjitpl.rs`
-/// because the optimizer borrows `MetaInterp`, backend state, constant
-/// pools, and snapshot side tables. Call sites still pass the same
-/// trace/runtime/resume/call-pure/opts state that RPython would store on
+/// `logger_noopt` when `log_noopt` is set, run subclass `optimize()`, then
+/// `forget_optimization_info`. `build_opt_chain` stays at the flattened call
+/// site in `pyjitpl.rs` because the optimizer borrows `MetaInterp`, backend
+/// state, constant pools, and snapshot side tables. Call sites still pass the
+/// same trace/runtime/resume/call-pure/opts state that RPython would store on
 /// the corresponding object.
 pub struct CompileData<'a> {
     pub trace: &'a TreeLoop,
+    /// compile.py `CompileData.log_noopt`; `UnrolledLoopData` clears it.
+    pub log_noopt: bool,
 }
 
 impl<'a> CompileData<'a> {
     pub fn new(trace: &'a TreeLoop) -> Self {
-        Self { trace }
+        Self {
+            trace,
+            log_noopt: true,
+        }
     }
 
     /// compile.py `CompileData.forget_optimization_info`:
@@ -416,11 +421,16 @@ impl<'a> CompileData<'a> {
     }
 
     /// compile.py `CompileData.optimize_trace`: `log_trace(MARK_TRACE)`,
-    /// run the subclass `optimize()` body, then `forget_optimization_info`.
-    pub fn optimize_trace<T, E>(
+    /// `logger_noopt.log_loop_from_trace` when `log_noopt` is set, run the
+    /// subclass `optimize()` body, then `forget_optimization_info`.
+    ///
+    /// `constants` is handed through to `optimize` so the noopt dump can read
+    /// it before the optimizer takes it mutably.
+    pub fn optimize_trace<V: std::fmt::Debug, C: majit_ir::resoperation::ConstLookup<V>, T, E>(
         &self,
         tid: u64,
-        optimize: impl FnOnce() -> Result<T, E>,
+        constants: &mut C,
+        optimize: impl FnOnce(&mut C) -> Result<T, E>,
     ) -> Result<T, E> {
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE,
@@ -428,7 +438,10 @@ impl<'a> CompileData<'a> {
             self.inputargs(),
             self.operations(),
         );
-        let result = optimize();
+        if self.log_noopt {
+            crate::logger::log_loop_from_trace(self.operations(), &*constants);
+        }
+        let result = optimize(constants);
         self.forget_optimization_info();
         result
     }
@@ -498,12 +511,14 @@ impl<'a> SimpleCompileData<'a> {
     }
 
     /// compile.py `CompileData.optimize_trace` + `SimpleCompileData.optimize`.
-    pub fn optimize_trace<T, E>(
+    pub fn optimize_trace<V: std::fmt::Debug, C: majit_ir::resoperation::ConstLookup<V>, T, E>(
         &self,
         tid: u64,
-        optimize: impl FnOnce(&Self) -> Result<T, E>,
+        constants: &mut C,
+        optimize: impl FnOnce(&Self, &mut C) -> Result<T, E>,
     ) -> Result<T, E> {
-        self.base.optimize_trace(tid, || optimize(self))
+        self.base
+            .optimize_trace(tid, constants, |constants| optimize(self, constants))
     }
 }
 
@@ -542,12 +557,14 @@ impl<'a> BridgeCompileData<'a> {
     }
 
     /// compile.py `CompileData.optimize_trace` + `BridgeCompileData.optimize`.
-    pub fn optimize_trace<T, E>(
+    pub fn optimize_trace<V: std::fmt::Debug, C: majit_ir::resoperation::ConstLookup<V>, T, E>(
         &self,
         tid: u64,
-        optimize: impl FnOnce(&Self) -> Result<T, E>,
+        constants: &mut C,
+        optimize: impl FnOnce(&Self, &mut C) -> Result<T, E>,
     ) -> Result<T, E> {
-        self.base.optimize_trace(tid, || optimize(self))
+        self.base
+            .optimize_trace(tid, constants, |constants| optimize(self, constants))
     }
 }
 
@@ -575,7 +592,10 @@ impl<'a> UnrolledLoopData<'a> {
         enable_opts: &'a [String],
     ) -> Self {
         Self {
-            base: CompileData::new(trace),
+            base: CompileData {
+                log_noopt: false,
+                ..CompileData::new(trace)
+            },
             celltoken,
             state,
             call_pure_results,
@@ -768,7 +788,7 @@ fn exit_types_for_guard_or_finish<A: AsRef<InputArg>>(
     }
     let finish_arg_type = |b: &Operand| -> Type { b.to_opref().ty().unwrap_or(Type::Int) };
     if is_finish {
-        out.extend(op.getarglist().iter().map(finish_arg_type));
+        out.extend(op.args_slice().iter().map(finish_arg_type));
         return out;
     }
     if let Some(fail_args) = op.guard_fail_args() {
@@ -816,11 +836,11 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
     pc: u64,
     frame_value_count_fn: Option<fn(i32, i32) -> usize>,
 ) -> (
-    indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
+    crate::FxIndexMap<u32, crate::resume::ResumeLayoutSummary>,
     crate::FxIndexMap<u32, StoredExitLayout>,
 ) {
-    let result: indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary> =
-        indexmap::IndexMap::new();
+    let result: crate::FxIndexMap<u32, crate::resume::ResumeLayoutSummary> =
+        crate::FxIndexMap::default();
     let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
     let mut fail_index = 0u32;
     // The driver-scoped override wins: a driver whose frames are numbered
@@ -1612,7 +1632,7 @@ pub(crate) fn enrich_resume_layout_with_frame_stack(
 }
 
 pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
-    terminal_exit_layouts: &mut indexmap::IndexMap<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut crate::FxIndexMap<usize, StoredExitLayout>,
     backend_layouts: &[TerminalExitLayout],
     ops: &[T],
 ) {
@@ -1761,7 +1781,7 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>, A: AsRef<InputA
     let fail_index = find_fail_index_for_exit_op(ops, op_index).unwrap_or(u32::MAX);
     let type_index = majit_ir::OpTypeIndex::new(inputargs, ops);
     let exit_types: ExitTypes = op
-        .getarglist()
+        .args_slice()
         .iter()
         .map(|opref| {
             // `OpRef::NONE` represents a null-ref placeholder per
@@ -1799,8 +1819,8 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>, A: AsRef<InputA
 pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
     inputargs: &[A],
     ops: &[T],
-) -> indexmap::IndexMap<usize, StoredExitLayout> {
-    let mut layouts: indexmap::IndexMap<usize, StoredExitLayout> = indexmap::IndexMap::new();
+) -> crate::FxIndexMap<usize, StoredExitLayout> {
+    let mut layouts: crate::FxIndexMap<usize, StoredExitLayout> = crate::FxIndexMap::default();
     for (op_index, op) in ops.iter().enumerate() {
         let op = op.as_ref();
         if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
@@ -1846,7 +1866,7 @@ pub(crate) fn normalize_closing_jump_args(
         return ops;
     };
 
-    let defined: indexmap::IndexSet<OpRef> = ops
+    let defined: crate::FxIndexSet<OpRef> = ops
         .iter()
         .filter(|op| op.result_type() != majit_ir::Type::Void && !op.pos().get().is_none())
         .map(|op| op.pos().get())
@@ -1994,190 +2014,59 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     vable_array_lengths: &[usize],
     entry_prefix_len: usize,
     index_of_virtualizable: usize,
-    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
+    _constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) {
-    // `compile.py:425-461` redirects each entry inputarg at its own
+    // `compile.py:425-461` redirects each stripped entry inputarg at its own
     // `_forwarded` slot — `box.set_forwarded(extra_ops[-1])` — and `emit_op`
     // walks those slots through `get_box_replacement` as it copies the body.
-    // The rewrite below is that walk over a function-local table instead,
-    // keyed by source `OpRef`.
-    //
-    // Not for want of the slots: `InputArg` carries one and `Operand` walks it.
-    // They are unobservable HERE. The ops name their arguments by flat `OpRef`
-    // rather than by shared inputarg identity, so a chain rooted at an
-    // inputarg box would have no reader. The table is dropped only after the
-    // rewrite is fully materialized into `ops`.
+    // The caller has already run `forget_optimization_info` over the ops and
+    // inputargs, so the only chains here are the ones this function writes.
     use majit_ir::{Op, OpCode, OpRef, descr::ArrayFlag};
 
-    // compile.py `box.set_forwarded` is Box identity, not a raw number.
-    // InputArg(n) and {Int,Ref}Op(n) share `OpRef::raw()`; a single vec
-    // keyed by raw remaps an inputarg onto a live pointer op and the
-    // frame onto an int local.
-    struct LocalForwarding {
-        inputargs: Vec<Option<Operand>>,
-        ops: Vec<Option<Operand>>,
-    }
-
-    impl LocalForwarding {
-        fn with_op_capacity(max_runtime_ref: u32) -> Self {
-            Self {
-                inputargs: Vec::new(),
-                ops: vec![None; (max_runtime_ref as usize).saturating_add(1)],
-            }
-        }
-
-        fn slot_mut(&mut self, source: OpRef) -> Option<&mut Option<Operand>> {
-            if source.is_none() || source.is_constant() {
-                return None;
-            }
-            let idx = Self::typed_index(source)?;
-            let bank = if source.is_input_arg() {
-                &mut self.inputargs
-            } else {
-                &mut self.ops
-            };
-            if idx >= bank.len() {
-                bank.resize(idx + 1, None);
-            }
-            Some(&mut bank[idx])
-        }
-
-        fn slot(&self, source: OpRef) -> Option<&Operand> {
-            if source.is_none() || source.is_constant() {
-                return None;
-            }
-            let idx = Self::typed_index(source)?;
-            let bank = if source.is_input_arg() {
-                &self.inputargs
-            } else {
-                &self.ops
-            };
-            bank.get(idx).and_then(|s| s.as_ref())
-        }
-
-        /// Keep Ref/Int/Float of the same raw id in distinct slots.
-        fn typed_index(source: OpRef) -> Option<usize> {
-            let tag = match source.ty()? {
-                Type::Ref => 0,
-                Type::Int => 1,
-                Type::Float => 2,
-                _ => return None,
-            };
-            Some((source.raw() as usize) * 3 + tag)
-        }
-    }
-
-    fn set_local_forwarded(forwarding: &mut LocalForwarding, source: OpRef, target: Operand) {
-        if let Some(slot) = forwarding.slot_mut(source) {
-            *slot = Some(target);
-        }
-    }
-
-    fn get_local_box_replacement(
-        forwarding: &LocalForwarding,
-        mut opref: OpRef,
-    ) -> Option<Operand> {
-        if opref.is_none() || opref.is_constant() {
-            return None;
-        }
-        let mut found = None;
-        loop {
-            match forwarding.slot(opref) {
-                Some(next) => {
-                    opref = next.to_opref();
-                    found = Some(next.clone());
-                }
-                None => return found,
-            }
-        }
-    }
-
-    /// `compile.py emit_op` / `get_box_replacement`: a residual body-LABEL
-    /// `RefOp` is a reminted virtualizable slot that still forwards to the
-    /// expanded inputarg Box. `OpRef::eq` is typed (`InputArgRef(n)` is
-    /// not `IntOp(n)`); match the replacement Box or the inputarg itself,
-    /// never a raw number across kinds.
-    ///
-    /// One walk for every slot: `slot_targets` is in slot order, and an
-    /// operand matched by two slots takes the later one.
-    fn forward_residual_args_sharing_inputarg(
-        ops: &[majit_ir::OpRc],
-        forwarding: &mut LocalForwarding,
-        slot_targets: &[(OpRef, Operand)],
-    ) {
-        let slot_of: std::collections::HashMap<OpRef, usize> = slot_targets
-            .iter()
-            .enumerate()
-            .filter(|(_, (old_opref, _))| old_opref.is_input_arg())
-            .map(|(slot, (old_opref, _))| (*old_opref, slot))
-            .collect();
-        if slot_of.is_empty() {
-            return;
-        }
-        let mut forward = |arg: &Operand| {
-            let own = arg.to_opref();
-            let via = arg.get_box_replacement(false).to_opref();
-            let slot = slot_of.get(&via).copied().max(slot_of.get(&own).copied());
-            if let Some(slot) = slot {
-                set_local_forwarded(forwarding, own, slot_targets[slot].1.clone());
-            }
+    /// `compile.py emit_op`: append `op` to `extra_ops`, first replacing
+    /// every argument by what it is forwarded to. An op whose arguments
+    /// change, and every guard, is appended as a copy that the original
+    /// forwards to; a guard's fail_args take `get_box_replacement(a, True)`.
+    /// The copy takes the original's position: the original leaves the
+    /// operation list, so the position still names exactly one producer.
+    fn emit_op(extra_ops: &mut Vec<majit_ir::OpRc>, op: &majit_ir::OpRc) {
+        let copy_of = || {
+            let copy = op.copy_and_change(op.opcode, None, None);
+            copy.pos().set(op.pos().get());
+            copy
         };
-        for op in ops {
-            op.with_arglist(|args| args.iter().for_each(&mut forward));
-            if let Some(fail_args) = op.guard_fail_args() {
-                fail_args.iter().for_each(&mut forward);
-            }
-        }
-    }
-
-    fn emit_forwarded_patch_op(
-        extra_ops: &mut Vec<majit_ir::OpRc>,
-        op: &Op,
-        forwarding: &mut LocalForwarding,
-        next_opref: &mut u32,
-    ) {
-        let mut emitted = op.clone();
-        let mut replaced = false;
-        // compile.py:414-418 `orig_op.set_forwarded(op)` — recorded after
-        // the emitted op is reference-counted below so the forwarding
-        // target is the producer object itself.
-        let mut forwarded_source: Option<OpRef> = None;
-
+        let mut copy: Option<Op> = None;
         for i in 0..op.num_args() {
             let orig_arg = op.arg(i);
-            if let Some(bound) = get_local_box_replacement(forwarding, orig_arg.to_opref()) {
-                if !replaced {
-                    emitted = op.copy_and_change(op.opcode, None, None);
-                    if op.result_type() != Type::Void && !op.pos().get().is_none() {
-                        let new_pos = OpRef::op_typed(*next_opref, op.result_type());
-                        *next_opref += 1;
-                        emitted.pos().set(new_pos);
-                        forwarded_source = Some(op.pos().get());
-                    }
-                    replaced = true;
-                }
-                emitted.setarg(i, bound);
+            let arg = orig_arg.get_box_replacement(false);
+            if arg != orig_arg {
+                copy.get_or_insert_with(copy_of).setarg(i, arg);
             }
         }
-
         if op.opcode.is_guard() {
-            if !replaced {
-                emitted = op.copy_and_change(op.opcode, None, None);
-            }
-            if let Some(fail_args) = emitted.fail_args_mut() {
+            let copy = copy.get_or_insert_with(copy_of);
+            if let Some(fail_args) = copy.fail_args_mut() {
                 for arg in fail_args.iter_mut() {
-                    if let Some(bound) = get_local_box_replacement(forwarding, arg.to_opref()) {
-                        *arg = bound;
-                    }
+                    *arg = arg.get_box_replacement(true);
                 }
             }
         }
-
-        let emitted = OpRc::new(emitted);
-        if let Some(source) = forwarded_source {
-            set_local_forwarded(forwarding, source, Operand::from_bound_op(&emitted));
+        match copy {
+            Some(copy) => {
+                let copy = OpRc::new(copy);
+                Operand::from_bound_op(op).set_forwarded_op(&copy);
+                extra_ops.push(copy);
+            }
+            None => extra_ops.push(op.clone()),
         }
-        extra_ops.push(emitted);
+    }
+
+    /// `box.set_forwarded(extra_ops[-1])`.
+    fn forward_to_last(box_: &InputArgRc, extra_ops: &[majit_ir::OpRc]) {
+        let last = extra_ops
+            .last()
+            .expect("emit_op appended the replacement op");
+        Operand::from_bound_inputarg(box_).set_forwarded_op(last);
     }
 
     assert!(
@@ -2189,14 +2078,13 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         return;
     }
 
-    let expanded_inputargs: Vec<majit_ir::InputArgRc> = inputargs.clone();
-
     // compile.py:429-430 — vable_box = inputargs[index_of_virtualizable].
+    let expanded_inputargs: Vec<majit_ir::InputArgRc> = std::mem::take(inputargs);
     let vable_box = Operand::from_bound_inputarg(&expanded_inputargs[index_of_virtualizable]);
 
     // compile.py keeps Box identities disjoint automatically; in the flat
-    // OpRef model we must allocate above every runtime ref already reachable
-    // from the trace so copied ops can stand in for `orig_op.set_forwarded(op)`.
+    // OpRef model the new field-load ops take positions above every runtime
+    // ref already reachable from the trace.
     let mut max_runtime_ref = 0u32;
     let mut consider = |opref: majit_ir::OpRef| {
         if !opref.is_none() && !opref.is_constant() {
@@ -2205,7 +2093,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     };
     for op in ops.iter() {
         consider(op.pos().get());
-        for b in op.getarglist().iter() {
+        for b in op.args_slice().iter() {
             consider(b.to_opref());
         }
         op.visit_failarg_oprefs(&mut consider);
@@ -2214,23 +2102,14 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         consider(ia.opref());
     }
     let mut next_opref = max_runtime_ref + 1;
+    fn fresh_pos(next_opref: &mut u32, tp: Type) -> OpRef {
+        let pos = OpRef::op_typed(*next_opref, tp);
+        *next_opref += 1;
+        pos
+    }
 
-    // Allocate fresh const indices above the existing max.
-    // Index-keyed pool namespace probe:
-    // raw u32 keys carry the constant-namespace bit directly, so use
-    // the bit-helpers rather than minting a typed `OpRef` solely
-    // for the namespace test.
-    let mut next_const_idx = constants
-        .keys()
-        .filter(|&&k| OpRef::raw_is_constant(k))
-        .map(|&k| OpRef::raw_const_index(k))
-        .max()
-        .map(|m| m + 1)
-        .unwrap_or(0);
-
-    let mut forwarding = LocalForwarding::with_op_capacity(max_runtime_ref);
-    let mut extra_ops: Vec<majit_ir::OpRc> = Vec::new();
-    let mut slot_targets: Vec<(OpRef, Operand)> = Vec::new();
+    let mut extra_ops: Vec<majit_ir::OpRc> =
+        Vec::with_capacity(ops.len() + expanded_inputargs.len() - entry_prefix_len);
     let mut i = entry_prefix_len;
 
     // compile.py:431-432 — i = jitdriver_sd.num_red_args; loop.inputargs =
@@ -2238,7 +2117,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // because the two entry models it can be in disagree about the number;
     // see the SOUNDNESS INVARIANT on this function for what the reconstruction
     // below is allowed to assume about the array lengths it bakes in.
-    inputargs.truncate(entry_prefix_len);
+    inputargs.extend_from_slice(&expanded_inputargs[..i]);
 
     // compile.py:433-440 — GETFIELD_GC per static field.
     let static_descrs = vinfo.static_field_descrs();
@@ -2259,18 +2138,11 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             Type::Float => OpCode::GetfieldGcF,
             Type::Void => panic!("virtualizable static field {fi} has Void type"),
         };
-        let old_opref =
-            OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp.get());
-        let new_opref = OpRef::op_typed(next_opref, field.field_type);
-        next_opref += 1;
         let mut op = Op::new(opcode, std::slice::from_ref(&vable_box));
-        op.pos().set(new_opref);
+        op.pos().set(fresh_pos(&mut next_opref, field.field_type));
         op.setdescr(descr);
-        let op = OpRc::new(op);
-        let target = Operand::from_bound_op(&op);
-        set_local_forwarded(&mut forwarding, old_opref, target.clone());
-        slot_targets.push((old_opref, target));
-        extra_ops.push(op);
+        emit_op(&mut extra_ops, &OpRc::new(op));
+        forward_to_last(&expanded_inputargs[i], &extra_ops);
         i += 1;
     }
 
@@ -2288,48 +2160,33 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         // a different trace and never reaches this entry. See the SOUNDNESS
         // INVARIANT on this function.
         let array_len = vable_array_lengths.get(ai).copied().unwrap_or(0);
-        assert!(
-            i + array_len <= expanded_inputargs.len(),
-            "array {ai} length {array_len} would overrun inputargs (i={i}, len={})",
-            expanded_inputargs.len()
-        );
         // GETFIELD_GC_R(vable_box, array_field_descr) → array pointer (Ref-typed).
-        let array_opref = OpRef::ref_op(next_opref);
-        next_opref += 1;
         let mut arr_load = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&vable_box));
-        arr_load.pos().set(array_opref);
+        arr_load.pos().set(fresh_pos(&mut next_opref, Type::Ref));
         arr_load.setdescr(array_field_descr.clone());
-        let arr_load = OpRc::new(arr_load);
-        let array_box = Operand::from_bound_op(&arr_load);
-        extra_ops.push(arr_load);
+        emit_op(&mut extra_ops, &OpRc::new(arr_load));
+        let array_box = Operand::from_bound_op(extra_ops.last().expect("emit_op appended arrayop"));
 
         let array_descr = vinfo
             .array_descrs
             .get(ai)
             .cloned()
             .expect("VirtualizableInfo.array_descrs must cover every array_field");
+        assert!(
+            i + array_len <= expanded_inputargs.len(),
+            "array {ai} length {array_len} would overrun inputargs (i={i}, len={})",
+            expanded_inputargs.len()
+        );
         let array_info = &vinfo.array_fields[ai];
-        let (item_opcode, item_descr, item_base) = match array_info.item_type {
-            Type::Int => (
-                OpCode::GetarrayitemGcI,
-                array_descr.clone(),
-                array_box.clone(),
-            ),
-            Type::Ref => (
-                OpCode::GetarrayitemGcR,
-                array_descr.clone(),
-                array_box.clone(),
-            ),
-            Type::Float => (
-                OpCode::GetarrayitemGcF,
-                array_descr.clone(),
-                array_box.clone(),
-            ),
+        let item_opcode = match array_info.item_type {
+            Type::Int => OpCode::GetarrayitemGcI,
+            Type::Ref => OpCode::GetarrayitemGcR,
+            Type::Float => OpCode::GetarrayitemGcF,
             Type::Void => panic!("virtualizable array {ai} has Void item_type"),
         };
         let (item_opcode, item_descr, item_base) = match array_info.storage {
             crate::virtualizable::VableArrayStorage::DirectPointer => {
-                (item_opcode, item_descr, item_base)
+                (item_opcode, array_descr, array_box)
             }
             crate::virtualizable::VableArrayStorage::EmbeddedArray { ptr_offset } => {
                 // TODO (heap layout divergence):
@@ -2346,19 +2203,17 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 // base-pointer indirection step is added. Convergence
                 // would require switching pyre's `FixedObjectArray` to
                 // RPython's flat GC-array layout — out of scope.
-                let ptr_opref = OpRef::int_op(next_opref);
-                next_opref += 1;
                 let mut ptr_load = Op::new(OpCode::GetfieldGcI, std::slice::from_ref(&array_box));
-                ptr_load.pos().set(ptr_opref);
+                ptr_load.pos().set(fresh_pos(&mut next_opref, Type::Int));
                 ptr_load.setdescr(majit_ir::descr::make_field_descr(
                     ptr_offset,
                     std::mem::size_of::<usize>(),
                     Type::Int,
                     ArrayFlag::Unsigned,
                 ));
-                let ptr_load = OpRc::new(ptr_load);
-                let ptr_box = Operand::from_bound_op(&ptr_load);
-                extra_ops.push(ptr_load);
+                emit_op(&mut extra_ops, &OpRc::new(ptr_load));
+                let ptr_box =
+                    Operand::from_bound_op(extra_ops.last().expect("emit_op appended ptr load"));
 
                 let raw_opcode = match array_info.item_type {
                     Type::Int => OpCode::GetarrayitemRawI,
@@ -2376,24 +2231,19 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         };
         for index in 0..array_len {
             // compile.py — ConstInt(index) for the array subscript.
-            // history.py ConstInt.value inline.
-            let const_opref = OpRef::const_int(index as i64);
-
-            let old_opref =
-                OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp.get());
-            let new_opref = OpRef::op_typed(next_opref, vinfo.array_fields[ai].item_type);
-            next_opref += 1;
             let mut elem_op = Op::new(
                 item_opcode,
-                &[item_base.clone(), Operand::from_opref(const_opref)],
+                &[
+                    item_base.clone(),
+                    Operand::from_opref(OpRef::const_int(index as i64)),
+                ],
             );
-            elem_op.pos().set(new_opref);
+            elem_op
+                .pos()
+                .set(fresh_pos(&mut next_opref, array_info.item_type));
             elem_op.setdescr(item_descr.clone());
-            let elem_op = OpRc::new(elem_op);
-            let target = Operand::from_bound_op(&elem_op);
-            set_local_forwarded(&mut forwarding, old_opref, target.clone());
-            slot_targets.push((old_opref, target));
-            extra_ops.push(elem_op);
+            emit_op(&mut extra_ops, &OpRc::new(elem_op));
+            forward_to_last(&expanded_inputargs[i], &extra_ops);
             i += 1;
         }
     }
@@ -2410,13 +2260,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         expanded_inputargs.len()
     );
 
-    forward_residual_args_sharing_inputarg(ops, &mut forwarding, &slot_targets);
-
-    // compile.py — emit_op walks the existing ops re-emitting
-    // each one with `get_box_replacement` applied to args + fail_args.
-    let original_ops = std::mem::take(ops);
-    for op in original_ops.iter() {
-        emit_forwarded_patch_op(&mut extra_ops, op, &mut forwarding, &mut next_opref);
+    // compile.py:459-460 — `for op in loop.operations: emit_op(extra_ops, op)`.
+    for op in std::mem::take(ops).iter() {
+        emit_op(&mut extra_ops, op);
     }
     *ops = extra_ops;
 }
@@ -2458,7 +2304,7 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit
 }
 
 pub(crate) fn enrich_guard_resume_layouts_for_trace<A: AsRef<InputArg>>(
-    _resume_layouts: &mut indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
+    _resume_layouts: &mut crate::FxIndexMap<u32, crate::resume::ResumeLayoutSummary>,
     exit_layouts: &mut crate::FxIndexMap<u32, StoredExitLayout>,
     trace_id: u64,
     inputargs: &[A],
@@ -2512,7 +2358,7 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
     backend: &mut dyn majit_backend::Backend,
     token: &majit_backend::JitCellToken,
     trace_id: u64,
-    terminal_exit_layouts: &mut indexmap::IndexMap<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut crate::FxIndexMap<usize, StoredExitLayout>,
 ) {
     for (&op_index, exit_layout) in terminal_exit_layouts.iter_mut() {
         let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {
@@ -2879,7 +2725,7 @@ mod tests {
         let jump_args = |ops: &[OpRc]| -> Vec<OpRef> {
             ops.iter()
                 .rfind(|op| op.opcode == OpCode::Jump)
-                .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+                .map(|op| op.args_slice().iter().map(|a| a.to_opref()).collect())
                 .unwrap()
         };
 
@@ -3212,16 +3058,16 @@ mod tests {
         // op0 produces a ResOp result at ref_op(10); the Label and getfield
         // consumers bind that result (from_bound_op) instead of a position-only
         // box, so patch_new_loop's forwarding rewrites them through op identity.
+        let mut inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
+        let ia = |k: usize| majit_ir::operand::Operand::from_bound_inputarg(&inputargs[k]);
         let op0: majit_ir::OpRc = {
-            let mut op = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, 1)]);
+            let mut op = Op::new(OpCode::SameAsR, &[ia(1)]);
             op.pos().set(OpRef::ref_op(10));
             OpRc::new(op)
         };
         let op0_result = majit_ir::operand::Operand::from_bound_op(&op0);
-        let op1: majit_ir::OpRc = OpRc::new(Op::new(
-            OpCode::Label,
-            &[rooted_inputarg_operand(Type::Ref, 0), op0_result.clone()],
-        ));
+        let op0_copy_source = op0.clone();
+        let op1: majit_ir::OpRc = OpRc::new(Op::new(OpCode::Label, &[ia(0), op0_result.clone()]));
         let op2: majit_ir::OpRc = {
             let mut op = Op::new(OpCode::GetfieldGcI, &[op0_result]);
             op.pos().set(OpRef::int_op(11));
@@ -3234,7 +3080,6 @@ mod tests {
             OpRc::new(op)
         };
         let mut ops: Vec<majit_ir::OpRc> = vec![op0, op1, op2];
-        let mut inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         patch_new_loop_to_load_virtualizable_fields(
@@ -3258,19 +3103,21 @@ mod tests {
         assert_eq!(ops[1].opcode, OpCode::SameAsR);
         assert_eq!(
             ops[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
             vec![vable_field]
         );
+        // The copy stands in for op0 at op0's own position.
         let forwarded_same_as = ops[1].pos().get();
-        assert_ne!(forwarded_same_as, OpRef::ref_op(10));
+        assert_eq!(forwarded_same_as, OpRef::ref_op(10));
+        assert!(!majit_ir::OpRc::ptr_eq(&ops[1], &op0_copy_source));
 
         assert_eq!(ops[2].opcode, OpCode::Label);
         assert_eq!(
             ops[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3280,7 +3127,7 @@ mod tests {
         assert_eq!(ops[3].opcode, OpCode::GetfieldGcI);
         assert_eq!(
             ops[3]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3302,19 +3149,18 @@ mod tests {
         );
         vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
 
-        let mut ops = vec![Op::new(
-            OpCode::Label,
-            &[
-                rooted_inputarg_operand(Type::Ref, 0),
-                rooted_inputarg_operand(Type::Ref, 1),
-                rooted_inputarg_operand(Type::Ref, 2),
-            ],
-        )];
         let mut inputargs = vec![
             InputArg::new_ref_rc(0),
             InputArg::new_ref_rc(1),
             InputArg::new_ref_rc(2),
         ];
+        let ops = vec![Op::new(
+            OpCode::Label,
+            &inputargs
+                .iter()
+                .map(majit_ir::operand::Operand::from_bound_inputarg)
+                .collect::<Vec<_>>(),
+        )];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
@@ -3337,7 +3183,7 @@ mod tests {
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcI);
         assert_eq!(
             ops[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3350,7 +3196,7 @@ mod tests {
         assert_eq!(ops[4].opcode, OpCode::Label);
         assert_eq!(
             ops[4]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3367,7 +3213,7 @@ mod tests {
     /// rewrite them to the GETARRAYITEM, not leave a producerless hole.
     #[test]
     fn test_patch_new_loop_rewrites_residual_label_refop_forwarded_to_inputarg() {
-        use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
+        use crate::history::test_support::rooted_resop_operand;
 
         let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
         vinfo.add_embedded_array_field(
@@ -3381,19 +3227,17 @@ mod tests {
         );
         vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
 
-        let slot = rooted_inputarg_operand(Type::Ref, 1);
+        let mut inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
         let reminted = rooted_resop_operand(Type::Ref, 85);
-        reminted.set_forwarded_inputarg(
-            &slot
-                .bound_inputarg()
-                .expect("rooted inputarg must carry its InputArgRc"),
-        );
+        reminted.set_forwarded_inputarg(&inputargs[1]);
 
         let mut ops: Vec<majit_ir::OpRc> = vec![OpRc::new(Op::new(
             OpCode::Label,
-            &[rooted_inputarg_operand(Type::Ref, 0), reminted],
+            &[
+                majit_ir::operand::Operand::from_bound_inputarg(&inputargs[0]),
+                reminted,
+            ],
         ))];
-        let mut inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         patch_new_loop_to_load_virtualizable_fields(
@@ -3417,7 +3261,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             label
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -3448,21 +3292,19 @@ mod tests {
         );
         vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
 
-        let ops = vec![Op::new(
-            OpCode::Label,
-            &[
-                rooted_inputarg_operand(Type::Int, 0),
-                rooted_inputarg_operand(Type::Ref, 1),
-                rooted_inputarg_operand(Type::Int, 2),
-                rooted_inputarg_operand(Type::Int, 3),
-            ],
-        )];
         let mut inputargs = vec![
             InputArg::new_int_rc(0),
             InputArg::new_ref_rc(1),
             InputArg::new_int_rc(2),
             InputArg::new_int_rc(3),
         ];
+        let ops = vec![Op::new(
+            OpCode::Label,
+            &inputargs
+                .iter()
+                .map(majit_ir::operand::Operand::from_bound_inputarg)
+                .collect::<Vec<_>>(),
+        )];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
 
@@ -3492,7 +3334,7 @@ mod tests {
         assert_eq!(ops[4].opcode, OpCode::Label);
         assert_eq!(
             ops[4]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

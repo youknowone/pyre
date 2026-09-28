@@ -352,9 +352,7 @@ fn peel_ty<'a>(
             .map(|body| peel_ty(body, llbc, depth + 1))
             .unwrap_or(v);
     }
-    if let Some(arr) = obj
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
+    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
         && arr.len() == 2
     {
         return peel_ty(&arr[1], llbc, depth + 1);
@@ -379,15 +377,16 @@ fn ref_pointee<'a>(node: &'a serde_json::Value, kind: &str) -> Option<&'a serde_
 }
 
 fn is_builtin(node: &serde_json::Value, name: &str) -> bool {
-    node.pointer("/Adt/id/Builtin")
-        .and_then(serde_json::Value::as_str)
+    node.get("Adt")
+        .and_then(crate::front::mir::type_decl_ref_builtin)
         == Some(name)
 }
 
 fn is_named_adt(node: &serde_json::Value, llbc: &majit_charon_reader::Llbc, path: &str) -> bool {
     let Some(id) = node
-        .pointer("/Adt/id/Adt")
-        .and_then(serde_json::Value::as_u64)
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .and_then(crate::front::mir::type_decl_ref_adt_id)
     else {
         return false;
     };
@@ -409,7 +408,7 @@ fn slice_elem<'a>(
     node: &'a serde_json::Value,
     llbc: &'a majit_charon_reader::Llbc,
 ) -> Option<&'a serde_json::Value> {
-    let elem = node.get("Slice")?;
+    let elem = node.get("Slice")?.as_array()?.first()?;
     Some(peel_ty(elem, llbc, 0))
 }
 

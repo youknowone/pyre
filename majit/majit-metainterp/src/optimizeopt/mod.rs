@@ -876,19 +876,13 @@ pub struct PendingGuardClassPostprocess {
     pub class_val: i64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum ImportedShortPureArg {
-    OpRef(OpRef),
-    /// Const arg with source OpRef for matching in force_preamble_op.
-    /// RPython: Const Box has identity; get_box_replacement returns itself.
-    Const(Value, OpRef),
-}
-
 #[derive(Clone, Debug)]
 pub struct ImportedShortPureOp {
     pub opcode: OpCode,
     pub descr: Option<DescrRef>,
-    pub args: Vec<ImportedShortPureArg>,
+    /// Exporting-phase boxes of the pure op (shortpreamble.py
+    /// `PureOp.produce_op`: `self.res`, or `self.orig_op` when invented).
+    pub args: Vec<majit_ir::operand::Operand>,
     pub result: OpRef,
     /// RPython: PreambleOp stored in pure cache. Used by force_op_from_preamble.
     pub pop: crate::optimizeopt::info::PreambleOp,
@@ -902,10 +896,9 @@ pub struct ImportedShortPureOp {
 impl ImportedShortPureOp {
     /// Construct with auto-generated PreambleOp from fields.
     ///
-    /// `ctx` binds the replay op's operands to their canonical producers
-    /// (`materialize_operand_at`) — shortpreamble.py seeds the replay
-    /// `preamble_op` with the SAME Box objects the body sees, so the
-    /// operands must carry producer identity, not a position-only echo.
+    /// `args` are the exporting phase's boxes. shortpreamble.py
+    /// `PureOp.produce_op` hands that op to the pure cache; the replay op
+    /// is built from those Operands directly.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
@@ -914,24 +907,13 @@ impl ImportedShortPureOp {
         ctx: &mut OptContext,
         opcode: OpCode,
         descr: Option<DescrRef>,
-        args: Vec<ImportedShortPureArg>,
+        args: Vec<majit_ir::operand::Operand>,
         result: OpRef,
         source: OpRef,
         invented_name: bool,
         same_as_source: Option<majit_ir::operand::Operand>,
     ) -> Self {
-        let replay_args: Vec<OpRef> = args
-            .iter()
-            .map(|a| match a {
-                ImportedShortPureArg::OpRef(r) => *r,
-                ImportedShortPureArg::Const(_, src) => *src,
-            })
-            .collect();
-        let replay_arg_boxes: Vec<Operand> = replay_args
-            .iter()
-            .map(|a| ctx.materialize_operand_at(*a))
-            .collect();
-        let mut replay = majit_ir::Op::new(opcode, &replay_arg_boxes);
+        let mut replay = majit_ir::Op::new(opcode, &args);
         // shortpreamble.py PureOp.produce_op constructs TWO distinct
         // RPython Op objects:
         //
@@ -1109,7 +1091,8 @@ pub struct OptContext {
     /// A Phase-2 lookup that followed a label arg to its Phase-1 producer
     /// would re-express a per-iteration value in terms of the PREAMBLE's
     /// entry value, which the loop header does not carry per-iteration.
-    pub emitted_operations: indexmap::IndexSet<majit_ir::operand::Operand>,
+    pub emitted_operations:
+        indexmap::IndexSet<majit_ir::operand::Operand, rustc_hash::FxBuildHasher>,
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -1206,10 +1189,6 @@ pub struct OptContext {
     /// forbids hash containers, so pyre uses a Vec-backed associative
     /// container with linear-scan lookup.
     pub const_infos: crate::FxIndexMap<usize, crate::optimizeopt::info::PtrInfo>,
-    /// Dedup imported short fact uses so the builder stays in first-use
-    /// order. PyPy uses dict-as-set; pyre uses a Vec with linear-scan
-    /// dedup (small per trace).
-    imported_short_preamble_used: Vec<OpRef>,
     /// `unroll.py` `self.optunroll.potential_extra_ops[op] = preamble_op` /
     /// `optimizer.py` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
     /// A keyed map, like the dict upstream keeps: insert, pop and `in` are
@@ -1232,7 +1211,8 @@ pub struct OptContext {
     /// `Rc::ptr_eq` key would silent-miss the pop. Re-keying to box identity
     /// is gated on the same short-preamble / InputArg identity unification
     /// that defers `resolve_operand_operand`'s InputArg arm (#9).
-    pub(crate) potential_extra_ops: indexmap::IndexMap<OpRef, crate::optimizeopt::info::PreambleOp>,
+    pub(crate) potential_extra_ops:
+        indexmap::IndexMap<Operand, crate::optimizeopt::info::PreambleOp>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
     active_short_preamble_producer:
@@ -1290,17 +1270,17 @@ pub struct OptContext {
     pub pending_for_guard: Vec<Op>,
     /// optimizer.py: pure_from_args1 parity — reverse-pure relationships
     /// registered by rewrite pass (CAST_*, CONVERT_*) and consumed by pure pass.
-    /// Each entry: (opcode, arg0, result, descr) meaning
-    /// pure((opcode, arg0), descr) = result. `descr` is `None` for
-    /// the common case (no descr); `Some(DescrRef)` matches upstream
-    /// `pure_from_args(rop.OPNUM, [arg], result, descr=op.getdescr())`
-    /// (e.g. virtualize.py:220 ARRAYLEN_GC keying on the array descr).
-    pub pending_pure_from_args: Vec<(OpCode, OpRef, OpRef, Option<majit_ir::DescrRef>)>,
+    /// Each entry: (opcode, key_arg, forwarded, descr). The register helpers
+    /// push `(opcode, key, forwarded, descr)` so OptPure's drain can call
+    /// `pure_from_args1(opcode, key, forwarded)`. `descr` is `None` for the
+    /// common case; `Some(DescrRef)` matches
+    /// `pure_from_args(opnum, [arg], result, descr=op.getdescr())`.
+    pub pending_pure_from_args: Vec<(OpCode, Operand, Operand, Option<majit_ir::DescrRef>)>,
     /// optimizer.py: pure_from_args2 parity — binary reverse-pure relationships
     /// registered by rewrite pass (INSTANCE_PTR_EQ/NE swapped-args). Consumed
-    /// by OptPure. Each entry: (opcode, arg0, arg1, result) meaning
-    /// pure(opcode, arg0, arg1) = result.
-    pub pending_pure_from_args2: Vec<(OpCode, OpRef, OpRef, OpRef)>,
+    /// by OptPure. Each entry: (opcode, arg0, arg1, forwarded) meaning
+    /// pure(opcode, arg0, arg1) forwards to `forwarded`.
+    pub pending_pure_from_args2: Vec<(OpCode, Operand, Operand, Operand)>,
     /// Live recent-ops ring. `OptPure` owns the allocation and publishes
     /// the handle; `OptRewrite.find_rewritable_bool` reads it the way
     /// `Optimization.get_pure_result` reads `optimizer.optpure`. Cleared
@@ -1405,9 +1385,9 @@ pub struct OptContext {
     // Vec-backed `get` is O(n), making the box-numbering O(n^2) on very
     // large traces, where it can dominate the whole compile time.
     // `IndexMap` keeps the same insertion-ordered `values()` semantics the
-    // earlier container guaranteed but resolves `get` in O(1).  Same O(1)
-    // acceleration rationale as `input_ops_index`; no PyPy counterpart
-    // (upstream keys producers on `box._forwarded`, not a positional map).
+    // earlier container guaranteed but resolves `get` in O(1).  No PyPy
+    // counterpart (upstream keys producers on `box._forwarded`, not a
+    // positional map).
     pub(crate) resop_refs: OpRefFxIndexMap<majit_ir::resoperation::OpRc>,
     /// Live synthetic stand-ins (mint_synthetic_resop / bind_input_resops
     /// products) that have NOT been superseded by an `emit` at their
@@ -1450,41 +1430,17 @@ pub struct OptContext {
     /// `rebuild_phase1_emit_ops_index`. Without it, `find_producer_op` scans
     /// the full cross-phase carry (tens of thousands of ops on a
     /// whole-program loop) per live
-    /// box of every Phase 2 guard, the dominant O(n^2) compile cost. Same
-    /// derived-index rationale as `input_ops_index` (no PyPy counterpart:
-    /// upstream keys producers on `box._forwarded`, not a positional map).
+    /// box of every Phase 2 guard, the dominant O(n^2) compile cost. No PyPy
+    /// counterpart: upstream keys producers on `box._forwarded`, not a
+    /// positional map.
     pub(crate) phase1_emit_ops_index: FxHashMap<OpRef, majit_ir::OpRc>,
     /// Recorder trace ops that carry the input operands' producer `Op`
-    /// (e.g. the `IntLt`/immutable `GetfieldGcI` operands of a recorded loop),
-    /// shared by `Rc` with the canonical stores but absent from
-    /// `new_operations` / `phase1_emit_ops` / `resop_refs`. Seeded at
-    /// optimizer setup from the recorder's `Rc<Op>` slice (`TreeLoop.ops`
-    /// at the loop-finish / simple-loop sites, or the Phase-2 threaded
-    /// `explicit_input_ops_seed`). `find_producer_op` consults this as the
-    /// lowest-priority store so a later emission at the same position always
-    /// wins.
+    /// (e.g. the `IntLt`/immutable `GetfieldGcI` operands of a recorded loop).
+    /// Seeded at optimizer setup from the recorder's `Rc<Op>` slice
+    /// (`TreeLoop.ops` at the loop-finish / simple-loop sites, or the Phase-2
+    /// threaded `explicit_input_ops_seed`). `ensure_inputarg_bindings` reads
+    /// the InputArg objects their operands carry.
     pub(crate) input_ops: Vec<majit_ir::OpRc>,
-    /// `pos -> producer` index over `input_ops`, mirroring the `rfind`
-    /// (last-occurrence-wins) lookup in `find_producer_op`. `input_ops` is
-    /// seeded once at optimizer setup and never mutated afterwards, so this
-    /// is rebuilt in lockstep with the seeding assignment via
-    /// `rebuild_input_ops_index`. Eliminates the O(n) scan of the full
-    /// recorder trace that `find_producer_op` otherwise performs on every
-    /// miss of the higher-priority stores (the dominant O(n^2) cost on very
-    /// large traces).
-    ///
-    /// No PyPy counterpart: upstream keys producer information on the box
-    /// itself (`box._forwarded` / `PtrInfo`, `optimizer.py`), so a
-    /// positional producer scan never exists there. Pyre's flat
-    /// `OpRef(u32)` has no such per-box slot, so `find_producer_op` scans
-    /// by position; this map is a pure O(1) acceleration of that scan, not
-    /// a new data model. Permitted under the AGENTS.md HashMap rule (3)
-    /// because it is a derived index — its sole invariant is that
-    /// `get(pos)` equals `input_ops.iter().rfind(|o| o.pos == pos)`
-    /// (last occurrence wins), enforced by rebuilding forward (a later
-    /// `insert` at the same key overwrites the earlier) and covered by
-    /// `input_ops_index_last_occurrence_wins`.
-    pub(crate) input_ops_index: FxHashMap<OpRef, majit_ir::OpRc>,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
@@ -2263,7 +2219,10 @@ impl OptContext {
                 estimated_ops,
                 Default::default(),
             ),
-            emitted_operations: indexmap::IndexSet::with_capacity(estimated_ops),
+            emitted_operations: indexmap::IndexSet::with_capacity_and_hasher(
+                estimated_ops,
+                rustc_hash::FxBuildHasher,
+            ),
             num_inputs: 0,
             inputarg_base: 0,
             next_pos: 0,
@@ -2277,7 +2236,6 @@ impl OptContext {
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
             const_infos: crate::FxIndexMap::default(),
-            imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: indexmap::IndexMap::new(),
             active_short_preamble_producer: None,
@@ -2335,7 +2293,6 @@ impl OptContext {
             phase1_emit_ops: Vec::new(),
             phase1_emit_ops_index: FxHashMap::default(),
             input_ops: Vec::with_capacity(estimated_ops),
-            input_ops_index: FxHashMap::with_capacity_and_hasher(estimated_ops, Default::default()),
             last_guard_idx: None,
             guard_chain_broken: false,
             last_seen_snapshot_pos: None,
@@ -2423,7 +2380,7 @@ impl OptContext {
         // (`inputarg_from_tp` / `history.inputargs`) so the mint below
         // does not create a second object for the same index.
         for op in &self.input_ops {
-            for arg in op.getarglist() {
+            for arg in op.args_slice() {
                 if let Some(ia) = arg.bound_inputarg() {
                     self.inputarg_refs.entry(ia.index).or_insert(ia);
                 }
@@ -2520,30 +2477,7 @@ impl OptContext {
         if let Some(op) = self.phase1_emit_ops_index.get(&opref).cloned() {
             return Some(op);
         }
-        if let Some(op) = self.resop_refs.get(&opref).cloned() {
-            return Some(op);
-        }
-        // Lowest-priority store: the recorder's input ops (seeded at setup
-        // from the recorder's `Rc<Op>` slice). Full-OpRef match (collision-safe)
-        // so a type-tagged value never aliases a different one at the same raw.
-        // Consulted last so any live emission / synthetic above wins.
-        //
-        // `input_ops_index` mirrors the `input_ops.iter().rfind(...)` scan
-        // (last-occurrence-wins) in O(1); `input_ops` is set once at setup so
-        // the index stays consistent for the OptContext's lifetime.
-        self.input_ops_index.get(&opref).cloned()
-    }
-
-    /// Rebuild `input_ops_index` from the current `input_ops`. Must be called
-    /// after the one-shot `input_ops` seeding assignment at optimizer setup.
-    /// Forward iteration with `insert` makes the last occurrence at each
-    /// position win, matching the `rfind` the index replaces.
-    pub(crate) fn rebuild_input_ops_index(&mut self) {
-        self.input_ops_index.clear();
-        self.input_ops_index.reserve(self.input_ops.len());
-        for op in &self.input_ops {
-            self.input_ops_index.insert(op.pos().get(), op.clone());
-        }
+        self.resop_refs.get(&opref).cloned()
     }
 
     /// Append an emitted op and mirror it into `new_operations_index` so
@@ -2562,18 +2496,6 @@ impl OptContext {
     pub(crate) fn replace_new_operation(&mut self, idx: usize, op: majit_ir::OpRc) {
         self.new_operations_index.insert(op.pos().get(), op.clone());
         self.new_operations[idx] = op;
-    }
-
-    /// The producer of `opref` among the ops emitted so far by this optimizer
-    /// run, or `None` when nothing at that position has been emitted.
-    /// Unlike [`Self::find_producer_op`] this consults only `new_operations`,
-    /// which is what optimizer.py `as_operation` tests
-    /// (`op in self._emittedoperations`).
-    pub(crate) fn producer_in_new_operations(&self, opref: OpRef) -> Option<majit_ir::OpRc> {
-        if opref.is_none() || opref.is_constant() {
-            return None;
-        }
-        self.new_operations_index.get(&opref).cloned()
     }
 
     /// Rebuild `new_operations_index` from the current `new_operations`.
@@ -2883,7 +2805,7 @@ impl OptContext {
             // keeps test fixtures that seed `inputarg_refs` separately
             // from per-call `bound_arg` mints.
             if self.inputarg_base != 0 {
-                for arg in op.getarglist() {
+                for arg in op.args_slice() {
                     if let Some(ia) = arg.bound_inputarg() {
                         self.inputarg_refs.insert(ia.index, ia);
                     }
@@ -2921,6 +2843,33 @@ impl OptContext {
         }
     }
 
+    /// `replace_op_with`: carry the terminal's `Info` onto `new_op`, then
+    /// `old.set_forwarded(new_op)`. `ptr_eq` skips a one-node cycle, including
+    /// when the terminal walk already landed on `new_op`.
+    pub(crate) fn link_replaced_producer(old: &majit_ir::OpRc, new_op: &majit_ir::OpRc) {
+        use majit_ir::forwarding::ForwardingHost;
+        if OpRc::ptr_eq(old, new_op) {
+            return;
+        }
+        let terminal = Operand::from_bound_op(old).get_box_replacement(false);
+        let Some(term_op) = terminal.bound_op() else {
+            return;
+        };
+        if OpRc::ptr_eq(&term_op, new_op) {
+            return;
+        }
+        let opinfo = term_op.get_forwarded();
+        if matches!(opinfo, majit_ir::forwarding::Forwarded::Info(_))
+            && matches!(
+                new_op.get_forwarded(),
+                majit_ir::forwarding::Forwarded::None
+            )
+        {
+            new_op.store_forwarded(opinfo);
+        }
+        term_op.set_forwarded_op(new_op);
+    }
+
     /// Construct an `OptContext` whose inputarg / fresh-OpRef numbering is
     /// shifted to start above a parent trace's high water mark.
     ///
@@ -2947,7 +2896,10 @@ impl OptContext {
                 estimated_ops,
                 Default::default(),
             ),
-            emitted_operations: indexmap::IndexSet::with_capacity(estimated_ops),
+            emitted_operations: indexmap::IndexSet::with_capacity_and_hasher(
+                estimated_ops,
+                rustc_hash::FxBuildHasher,
+            ),
             num_inputs: num_inputs as u32,
             inputarg_base,
             next_pos: start_next_pos,
@@ -2961,7 +2913,6 @@ impl OptContext {
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
             const_infos: crate::FxIndexMap::default(),
-            imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: indexmap::IndexMap::new(),
             active_short_preamble_producer: None,
@@ -3019,7 +2970,6 @@ impl OptContext {
             phase1_emit_ops: Vec::new(),
             phase1_emit_ops_index: FxHashMap::default(),
             input_ops: Vec::with_capacity(estimated_ops),
-            input_ops_index: FxHashMap::with_capacity_and_hasher(estimated_ops, Default::default()),
             last_guard_idx: None,
             guard_chain_broken: false,
             last_seen_snapshot_pos: None,
@@ -3066,7 +3016,6 @@ impl OptContext {
         self.imported_loop_invariant_results.clear();
         self.imported_short_preamble_builder = None;
         self.const_infos.clear();
-        self.imported_short_preamble_used.clear();
         self.potential_extra_ops.clear();
         self.active_short_preamble_producer = None;
         self.preview_short_state = None;
@@ -3112,8 +3061,6 @@ impl OptContext {
         self.phase1_emit_ops_index.clear();
         self.input_ops.clear();
         self.input_ops.reserve(estimated_ops);
-        self.input_ops_index.clear();
-        self.input_ops_index.reserve(estimated_ops);
         self.last_guard_idx = None;
         self.guard_chain_broken = false;
         self.last_seen_snapshot_pos = None;
@@ -3188,66 +3135,13 @@ impl OptContext {
         }
     }
 
-    /// Emit a boxed integer constant through the optimizer pipeline and return
-    /// the resulting OpRef.
-    pub fn emit_constant_int(&mut self, value: i64) -> OpRef {
-        let pos_ref = self.reserve_pos_typed(Type::Int);
-        // The SAME_AS source is the constant itself (`make_constant_box` below
-        // forwards the result to the same `Const`, so the op is a tautology
-        // `result = ConstInt(value)`). A constant operand binds directly; a
-        // position-only `from_opref(pos_ref)` self-reference would have no live
-        // producer and `from_opref` rejects it (#9).
-        let mut op = Op::new(
-            OpCode::SameAsI,
-            &[Operand::const_from_value(Value::Int(value))],
-        );
-        op.pos().set(pos_ref);
-        let opref = self.emit_extra(self.current_pass_idx, op);
-        let b = self.materialize_operand_at(opref);
-        self.make_constant_box(&b, Value::Int(value));
-        opref
-    }
-
-    /// Emit a boxed reference constant through the optimizer pipeline and
-    /// return the resulting OpRef.
-    pub fn emit_constant_ref(&mut self, value: GcRef) -> OpRef {
-        let pos_ref = self.reserve_pos_typed(Type::Ref);
-        // SAME_AS source is the constant ref itself; see `emit_constant_int`.
-        let mut op = Op::new(
-            OpCode::SameAsR,
-            &[Operand::const_from_value(Value::Ref(value))],
-        );
-        op.pos().set(pos_ref);
-        let opref = self.emit_extra(self.current_pass_idx, op);
-        let b = self.materialize_operand_at(opref);
-        self.make_constant_box(&b, Value::Ref(value));
-        opref
-    }
-
-    /// Emit a boxed float constant through the optimizer pipeline and return
-    /// the resulting OpRef.
-    pub fn emit_constant_float(&mut self, value: f64) -> OpRef {
-        let pos_ref = self.reserve_pos_typed(Type::Float);
-        // SAME_AS source is the constant float itself; see `emit_constant_int`.
-        let mut op = Op::new(
-            OpCode::SameAsF,
-            &[Operand::const_from_value(Value::Float(value))],
-        );
-        op.pos().set(pos_ref);
-        let opref = self.emit_extra(self.current_pass_idx, op);
-        let b = self.materialize_operand_at(opref);
-        self.make_constant_box(&b, Value::Float(value));
-        opref
-    }
-
     /// optimizer.py new_const_item(arraydescr) — default value for
-    /// the given item type. Uses emit_extra (downstream-only) so this is
-    /// safe to call during force_box / force_virtual.
+    /// the given item type.
     pub fn new_const_item(&mut self, item_type: Type) -> OpRef {
         match item_type {
-            Type::Int | Type::Void => self.emit_constant_int(0),
-            Type::Ref => self.emit_constant_ref(GcRef::NULL),
-            Type::Float => self.emit_constant_float(0.0),
+            Type::Int | Type::Void => self.make_constant_int(0),
+            Type::Ref => self.make_constant_ref(GcRef::NULL),
+            Type::Float => self.make_constant_float(0.0),
         }
     }
 
@@ -3586,10 +3480,39 @@ impl OptContext {
             }
         }
         Self::debug_assert_box_type_invariant(&op);
+        // Same live-synthetic hand-off as `emit`'s clone path. A pass-through
+        // `OpRc` is often the stand-in itself; the helper's `ptr_eq` guard
+        // leaves that producer unlinked to itself.
+        self.adopt_live_synthetic(&op);
         self.emitted_operations
             .insert(majit_ir::operand::Operand::from_bound_op(&op));
         self.push_new_operation(op);
         pos_ref
+    }
+
+    /// Move the `live_synthetics` stand-in at `op_rc`'s position onto the
+    /// producer about to be appended. Copies the stand-in's `_forwarded`
+    /// onto `op_rc`, then `synth.set_forwarded(op_rc)` when the two are
+    /// distinct objects (`replace_op_with`). A carried `Forwarded::Op` that
+    /// already names `op_rc` is left in place so the copy cannot close a
+    /// one-node cycle.
+    fn adopt_live_synthetic(&mut self, op_rc: &majit_ir::OpRc) {
+        let op_pos = op_rc.pos().get();
+        let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos) else {
+            return;
+        };
+        let carried = synth.forwarded().borrow().clone();
+        // An Op redirect is not info to carry. Copying it onto the producer
+        // closes a cycle when the redirect already names that producer, or
+        // names a box that forwards back to it.
+        let carried_is_op = matches!(carried, majit_ir::forwarding::Forwarded::Op(_));
+        if !carried_is_op {
+            *op_rc.forwarded().borrow_mut() = carried;
+        }
+        if !OpRc::ptr_eq(&synth, op_rc) {
+            use majit_ir::forwarding::ForwardingHost;
+            synth.set_forwarded_op(op_rc);
+        }
     }
 
     pub(crate) fn stamp_emitted_op(src: &Op, dst: &Op) {
@@ -3813,27 +3736,16 @@ impl OptContext {
         //
         // The synthetic stand-in registered for `op_pos` by `materialize_operand_at` /
         // `bind_input_resops` is the `live_synthetics` entry at this position.
-        // Migrate its `_forwarded` onto the real producer (resoperation.py
-        // `_forwarded` lives on the op) and drop it from `live_synthetics` so
-        // the superseded stand-in is not drained into `phase1_emit_ops`. Each
-        // `op_pos` has at most one live stand-in, so the position match is
-        // unambiguous. This is the sole carry-over path: the synthetic is the
-        // `_forwarded` host every `find_producer_op` reaches before this emit
-        // supersedes it.
-        if let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos) {
-            *op_rc.forwarded().borrow_mut() = synth.forwarded().borrow().clone();
-            // replace_op_with parity (optimizer.py): forward the superseded
-            // stand-in to the emitted producer. A consumer dispatched BEFORE
-            // this producer emitted (forward reference) bound its operand to
-            // `synth`; without this link its box-native walk freezes on the
-            // orphaned stand-in while the OpRef path resolves `op_rc`, so a
-            // later fold (e.g. GUARD_TRUE constant-folding the operand) lands
-            // on a different host and `resolve_operand_operand`'s witness diverges.
-            if !OpRc::ptr_eq(&synth, &op_rc) {
-                use majit_ir::forwarding::ForwardingHost;
-                synth.set_forwarded_op(&op_rc);
-            }
-        }
+        // `adopt_live_synthetic` migrates its `_forwarded` onto the real producer
+        // and drops it from `live_synthetics` so the superseded stand-in is not
+        // drained into `phase1_emit_ops`. Each `op_pos` has at most one live
+        // stand-in, so the position match is unambiguous. This is the sole
+        // carry-over path: the synthetic is the `_forwarded` host every
+        // `find_producer_op` reaches before this emit supersedes it.
+        // A consumer dispatched BEFORE this producer emitted (forward reference)
+        // bound its operand to `synth`; without this link its box-native walk
+        // freezes on the orphaned stand-in while the OpRef path resolves `op_rc`.
+        self.adopt_live_synthetic(&op_rc);
         // optimizer.py `self._emittedoperations[op] = None`.
         self.emitted_operations
             .insert(majit_ir::operand::Operand::from_bound_op(&op_rc));
@@ -3999,35 +3911,27 @@ impl OptContext {
             short_inputargs,
         );
         self.imported_short_preamble_builder = Some(builder);
-        self.imported_short_preamble_used.clear();
     }
 
-    /// shortpreamble.py ShortPreambleBuilder constructor parity.
+    /// shortpreamble.py `ShortPreambleBuilder.__init__` parity.
     ///
-    /// Reads `exported_state.short_boxes` (RPython `ExportedState.short_boxes`)
-    /// directly, classifying each `ProducedShortOp.preamble_op.args` as
-    /// Slot/Const/Produced at consume time and rebuilding the
-    /// `ShortPreambleBuilder` keyed by Phase 2 OpRefs.
-    ///
-    /// Replaces the legacy `_from_exported_ops` function which read the
-    /// `Vec<ExportedShortOp>` enum-serialization path. The new path
-    /// matches RPython literally — no intermediate enum, polymorphism via
-    /// `produce_op`-side data on `ProducedShortOp` itself.
+    /// Reads `exported_state.short_boxes` (`ExportedState.short_boxes`)
+    /// directly and rebuilds the `ShortPreambleBuilder` keyed by Phase 2
+    /// OpRefs. `short_args` is the builder's `label_args`.
     ///
     /// The Phase-2 result OpRef for each entry is read from `result_map`,
-    /// computed before this constructor just as RPython already has the
-    /// target `Box` identities before `ProducedShortOp.produce_op` runs.
-    /// Args are resolved via local `produced_results` (source pos →
-    /// resolved OpRef) and the caller-owned `imported_constants` map
-    /// (source const OpRef → seeded fresh slot), which is reused by the
-    /// following produce-op loop.
+    /// computed before this constructor just as the target `Box` identities
+    /// exist before `ProducedShortOp.produce_op` runs. Replay args stay the
+    /// exported `preamble_op` args (`rebind_arg` rewrites a dependency to the
+    /// replay op minted for it). A loop-invariant func that is not a constant
+    /// int declines the short preamble (`LoopInvariantOp.produce_op` reads
+    /// `self.res.getarg(0).getint()`).
     pub fn initialize_imported_short_preamble_builder_from_short_boxes(
         &mut self,
         short_args: &[OpRef],
         short_inputargs: &[OpRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
-        result_map: &indexmap::IndexMap<OpRef, OpRef>,
-        mut imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
+        result_map: &indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher>,
         exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
@@ -4092,9 +3996,10 @@ impl OptContext {
             }
         }
 
-        // `produced` (OpRef dual-key: source + result_opref) is internal
-        // scaffolding for `dep_or_materialize` below, which resolves a
-        // dependency arg by its replay position. `builder_entries` is the
+        // `produced` pairs each exported entry's position with the replay op
+        // minted for it, so `rebind_arg` below can rebind a dependency arg
+        // (which carries the exported entry's position) to that replay op.
+        // `builder_entries` is the
         // builder map: ONE entry per short box keyed by the Phase-1
         // carried res box (`produced_op.res`, the same Rc the produce loop
         // reads as `self.res`). The carried box is invariant to the
@@ -4103,7 +4008,6 @@ impl OptContext {
         let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
         let mut builder_entries: Vec<(majit_ir::operand::Operand, ProducedShortOp)> =
             Vec::with_capacity(short_boxes.len());
-        let mut produced_results: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
         // opcode is a Call get rewritten to the CallPure* equivalent so
         // the short preamble can replay the cached call without
@@ -4128,93 +4032,38 @@ impl OptContext {
                 majit_ir::Type::Void => OpCode::CallLoopinvariantN,
             }
         };
-        // shortpreamble.py `ShortBoxes.produce_arg` — classify an arg
-        // through the shared classifier, then collapse the Slot/Const/
-        // Produced variants down to the Phase-2 OpRef the builder needs.
-        // Sharing the classifier with `ProducedShortOp::produce_op` (which
-        // also dispatches via `classify_short_arg`) keeps the two consume
-        // sites locked to a single rule, mirroring RPython's single
-        // `produce_arg` path.
-        let resolve_arg = |arg: OpRef,
-                           ctx: &mut Self,
-                           produced_results: &indexmap::IndexMap<OpRef, OpRef>,
-                           imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>|
-         -> Option<OpRef> {
-            crate::optimizeopt::shortpreamble::classify_short_arg(
-                ctx,
-                arg,
-                short_inputargs,
-                short_args,
-                produced_results,
-                imported_constants,
-            )
-            .map(|cls| match cls {
-                crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
-                crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
-            })
-        };
-        // shortpreamble.py produce_arg object-carry: a dependency
-        // arg is the dep's replay op OBJECT (upstream returns
-        // `produced_short_boxes[op].preamble_op`). Bind dep args to the
-        // dep entry's replay Rc (the same dual-key dict the builder will
-        // hold — last insert wins, matching IndexMap overwrite), so
-        // `use_box` reads deps off the operand binding instead of a
-        // position-keyed side map. Slot / Const args keep the positional
-        // materialization.
-        // shortpreamble.py `ShortBoxes.produce_arg`: the producer's replay
-        // `preamble_op`, or None when the operand is not a produced short
-        // box. Last insert wins, matching IndexMap overwrite. An InputArg
-        // producer is not a replay (the renamed inputarg is the operand).
-        let produce_arg = |produced: &[(OpRef, ProducedShortOp)], arg: OpRef| -> Option<Operand> {
+        // shortpreamble.py `produce_arg`: an exported replay-op arg is a
+        // Const, a renamed short inputarg, or a dependency's replay op. The
+        // first two are carried unchanged; a dependency is rebound to the
+        // replay op this builder minted for it, so `use_box` appends that op
+        // rather than the exporting phase's producer.
+        let rebind_arg = |produced: &[(OpRef, ProducedShortOp)], arg: Operand| -> Operand {
+            let r = arg.to_opref();
+            if r.is_constant() {
+                return arg;
+            }
             produced
                 .iter()
                 .rev()
-                .find(|(k, dep)| *k == arg && dep.kind != PreambleOpKind::InputArg)
+                .find(|(k, _)| *k == r)
                 .map(|(_, dep)| Operand::from_bound_op(&dep.preamble_op))
+                .unwrap_or(arg)
         };
-        let dep_or_materialize =
-            |ctx: &mut Self, produced: &[(OpRef, ProducedShortOp)], r: OpRef| {
-                // shortpreamble.py:288 Const arm: the arg is the Const box
-                // itself — a const-folded entry carries an inline-Const
-                // pos/key, which must not bind to the replay op.
-                if r.is_constant() {
-                    return ctx.materialize_operand_at(r);
-                }
-                // InputArg producers are included: their replay SameAs is the
-                // operand. `produce_arg` skips those; heap receivers use it.
-                produced
-                    .iter()
-                    .rev()
-                    .find(|(k, _)| *k == r)
-                    .map(|(_, dep)| Operand::from_bound_op(&dep.preamble_op))
-                    .unwrap_or_else(|| ctx.materialize_operand_at(r))
-            };
 
         for (source, produced_op) in short_boxes {
             // Some ProducedShortOps (PreambleOpKind::Heap with non-getfield /
             // non-getarrayitem opcodes, or other non-emitting entries) have
             // no Phase-2 result. They are no-ops for the imported builder.
-            let result_opref = match result_map.get(source).copied() {
-                Some(r) => r,
-                None => continue,
-            };
+            if result_map.get(source).is_none() {
+                continue;
+            }
             match produced_op.kind {
                 PreambleOpKind::Pure => {
-                    let mut resolved_args = Vec::with_capacity(produced_op.preamble_op.num_args());
-                    for arg in produced_op.preamble_op.getarglist().iter() {
-                        let Some(resolved) = resolve_arg(
-                            arg.to_opref(),
-                            self,
-                            &produced_results,
-                            imported_constants,
-                        ) else {
-                            return false;
-                        };
-                        resolved_args.push(resolved);
-                    }
-                    let resolved_arg_boxes: Vec<Operand> = resolved_args
+                    let resolved_arg_boxes: Vec<Operand> = produced_op
+                        .preamble_op
+                        .args_slice()
                         .iter()
-                        .map(|a| dep_or_materialize(self, &produced, *a))
+                        .map(|a| rebind_arg(&produced, a.clone()))
                         .collect();
                     let mut op = Op::new(
                         pure_call_opcode(produced_op.preamble_op.opcode),
@@ -4235,13 +4084,12 @@ impl OptContext {
                         label_arg_idx: produced_op.label_arg_idx,
                     };
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
+                    // Exported args name either the entry or its replay op.
+                    let replay = produced_op.preamble_op.pos().get();
                     produced.push((*source, new_pop.clone()));
-                    if *source != result_opref {
-                        produced.push((result_opref, new_pop));
+                    if *source != replay {
+                        produced.push((replay, new_pop));
                     }
-                    // Short-preamble args name the replay op. The pure cache is
-                    // keyed separately from `source_op` (the body operation).
-                    produced_results.insert(*source, produced_op.preamble_op.pos().get());
                 }
                 PreambleOpKind::Heap => {
                     let result_type = produced_op.preamble_op.result_type();
@@ -4249,24 +4097,6 @@ impl OptContext {
                         Some(d) => d,
                         None => continue,
                     };
-                    let object_arg = produced_op.preamble_op.arg(0);
-                    // The receiver must still be bindable in this namespace —
-                    // a miss means the replay cannot be reconstructed and the
-                    // whole short preamble is declined. The emitted op keeps
-                    // `preamble_op`'s own receiver rather than this resolution,
-                    // because resolving it through `short_args` would collapse
-                    // the renamed short-inputarg and `source_op` identities
-                    // (see `obj_b` below).
-                    if resolve_arg(
-                        object_arg.to_opref(),
-                        self,
-                        &produced_results,
-                        imported_constants,
-                    )
-                    .is_none()
-                    {
-                        return false;
-                    }
                     let new_pop = match produced_op.preamble_op.opcode {
                         OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
                             let opcode = match result_type {
@@ -4275,21 +4105,15 @@ impl OptContext {
                                 majit_ir::Type::Float => OpCode::GetfieldGcF,
                                 majit_ir::Type::Void => return false,
                             };
-                            // shortpreamble.py HeapOp.add_op_to_short:
-                            // `preamble_arg = sb.produce_arg(sop.getarg(0))`
-                            // returns the producer's replay `preamble_op`.
-                            // A short-inputarg receiver stays the exported
-                            // operand (`source_op` keeps the original for
-                            // PtrInfo). A produced short-op receiver must be
-                            // that replay op: leaving the exporting position
-                            // (for example RefOp(72) of a CALL_PURE_R) makes
-                            // `inline_short_preamble` `_map_args` miss it,
-                            // because the replay result is registered under
-                            // the replay pos, not the exporting box. That
-                            // box can also be a loop-label `used_box`, which
-                            // is not a short inputarg.
-                            let obj_b = produce_arg(&produced, object_arg.to_opref())
-                                .unwrap_or_else(|| produced_op.preamble_op.arg(0));
+                            // shortpreamble.py:416-426 keeps the exported
+                            // `preamble_op` object on the builder. Its receiver
+                            // is the renamed short-inputarg (or replay result),
+                            // while `source_op` separately carries the original
+                            // receiver used by HeapOp.produce_op for PtrInfo.
+                            // Resolving this arg through `short_args` collapses
+                            // those identities and emits guards on an exporting-
+                            // phase box that a retrace cannot bind.
+                            let obj_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
                             let mut op = Op::new(opcode, &[obj_b]);
                             op.pos().set(produced_op.preamble_op.pos().get());
                             op.setdescr(descr);
@@ -4313,28 +4137,11 @@ impl OptContext {
                                 majit_ir::Type::Float => OpCode::GetarrayitemGcF,
                                 majit_ir::Type::Void => return false,
                             };
-                            // shortpreamble.py `g.getarg(1).getint()`:
-                            // pull the integer VALUE through the shared
-                            // `classify_short_arg` rule. `OpRef::raw()` is a
-                            // tagged trace position — not the constant value.
-                            // As with the receiver, this only decides whether
-                            // the index is bindable at all.
-                            let index_arg = produced_op.preamble_op.arg(1);
-                            if resolve_arg(
-                                index_arg.to_opref(),
-                                self,
-                                &produced_results,
-                                imported_constants,
-                            )
-                            .is_none()
-                            {
-                                return false;
-                            }
-                            let obj_b =
-                                produce_arg(&produced, produced_op.preamble_op.arg(0).to_opref())
-                                    .unwrap_or_else(|| produced_op.preamble_op.arg(0));
-                            let index_b = produce_arg(&produced, index_arg.to_opref())
-                                .unwrap_or_else(|| produced_op.preamble_op.arg(1));
+                            // shortpreamble.py `HeapOp.produce_op` reads
+                            // `g.getarg(1).getint()` from the original heap op.
+                            // The replay op keeps `preamble_op`'s own index arg.
+                            let obj_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
+                            let index_b = rebind_arg(&produced, produced_op.preamble_op.arg(1));
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos().set(produced_op.preamble_op.pos().get());
                             op.setdescr(descr);
@@ -4352,32 +4159,21 @@ impl OptContext {
                         _ => continue,
                     };
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
+                    // Exported args name either the entry or its replay op.
+                    let replay = produced_op.preamble_op.pos().get();
                     produced.push((*source, new_pop.clone()));
-                    if *source != result_opref {
-                        produced.push((result_opref, new_pop));
+                    if *source != replay {
+                        produced.push((replay, new_pop));
                     }
-                    // Short-preamble args name the replay op. The pure cache is
-                    // keyed separately from `source_op` (the body operation).
-                    produced_results.insert(*source, produced_op.preamble_op.pos().get());
                 }
                 PreambleOpKind::LoopInvariant => {
                     let result_type = produced_op.preamble_op.result_type();
-                    let Some(func_opref) = resolve_arg(
-                        produced_op.preamble_op.arg(0).to_opref(),
-                        self,
-                        &produced_results,
-                        imported_constants,
-                    ) else {
-                        return false;
-                    };
-                    if self
-                        .get_box_replacement_operand_opt(func_opref)
-                        .and_then(|cb| cb.const_int())
-                        .is_none()
-                    {
+                    // shortpreamble.py `LoopInvariantOp.produce_op` requires
+                    // `getarg(0).getint()`. Read it off the replay op's arg 0.
+                    if produced_op.preamble_op.arg(0).const_int().is_none() {
                         return false;
                     }
-                    let func_b = dep_or_materialize(self, &produced, func_opref);
+                    let func_b = rebind_arg(&produced, produced_op.preamble_op.arg(0));
                     let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
                     op.pos().set(produced_op.preamble_op.pos().get());
                     let res = self.materialize_operand_at(op.pos().get());
@@ -4391,24 +4187,19 @@ impl OptContext {
                         label_arg_idx: produced_op.label_arg_idx,
                     };
                     builder_entries.push((produced_op.res.clone(), new_pop.clone()));
+                    // Exported args name either the entry or its replay op.
+                    let replay = produced_op.preamble_op.pos().get();
                     produced.push((*source, new_pop.clone()));
-                    if *source != result_opref {
-                        produced.push((result_opref, new_pop));
+                    if *source != replay {
+                        produced.push((replay, new_pop));
                     }
-                    // Short-preamble args name the replay op. The pure cache is
-                    // keyed separately from `source_op` (the body operation).
-                    produced_results.insert(*source, produced_op.preamble_op.pos().get());
                 }
                 PreambleOpKind::InputArg | PreambleOpKind::Guard => {}
             }
         }
 
-        let mut builder = ShortPreambleBuilder::new(short_args, &builder_entries, short_inputargs);
-        for &opref in imported_constants.values() {
-            builder.note_known_constant(opref);
-        }
+        let builder = ShortPreambleBuilder::new(short_args, &builder_entries, short_inputargs);
         self.imported_short_preamble_builder = Some(builder);
-        self.imported_short_preamble_used.clear();
         true
     }
 
@@ -4419,7 +4210,7 @@ impl OptContext {
     pub fn force_op_from_preamble_op(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
-    ) -> OpRef {
+    ) -> Operand {
         let preamble_source = preamble_op.op.to_opref();
         // RPython `return preamble_op.op` returns the carried Box. In majit,
         // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()` —
@@ -4429,108 +4220,101 @@ impl OptContext {
         let result = resolved.to_opref();
         let result_type = preamble_op.preamble_op.result_type();
         let is_constant = resolved.const_value().is_some();
-        let first_use = !self.imported_short_preamble_used.contains(&preamble_source);
-        if first_use {
-            self.imported_short_preamble_used.push(preamble_source);
+        // unroll.py:32: use_box(op, preamble_op.preamble_op, self).
+        // RPython passes the preamble_op directly — no lookup miss possible.
+        // majit prefers the produced_short_boxes lookup (Phase-2 remapped pos)
+        // with fallback to info::PreambleOp.preamble_op.
+        let Some((arg_guards, result_guards)) =
+            self.collect_use_box_guards(&preamble_op.preamble_op)
+        else {
+            self.signal_invalid_loop("short preamble GC layout tid is unresolved");
+            return preamble_op.op.clone();
+        };
+        // unroll.py:28: assert self.short_preamble_producer is not None
+        if let Some(mut builder) = self.active_short_preamble_producer.take() {
+            builder.use_box(
+                preamble_source,
+                &preamble_op.preamble_op,
+                &arg_guards,
+                &result_guards,
+            );
+            self.active_short_preamble_producer = Some(builder);
+        } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
+            builder.use_box(
+                preamble_source,
+                &preamble_op.preamble_op,
+                &arg_guards,
+                &result_guards,
+            );
+            self.imported_short_preamble_builder = Some(builder);
+        } else {
+            unreachable!("force_op_from_preamble_op: no short_preamble_producer");
         }
-        if first_use {
-            // unroll.py:32: use_box(op, preamble_op.preamble_op, self).
-            // RPython passes the preamble_op directly — no lookup miss possible.
-            // majit prefers the produced_short_boxes lookup (Phase-2 remapped pos)
-            // with fallback to info::PreambleOp.preamble_op.
-            let Some((arg_guards, result_guards)) =
-                self.collect_use_box_guards(&preamble_op.preamble_op)
-            else {
-                self.signal_invalid_loop("short preamble GC layout tid is unresolved");
-                return preamble_source;
-            };
-            // unroll.py:28: assert self.short_preamble_producer is not None
-            if let Some(mut builder) = self.active_short_preamble_producer.take() {
-                builder.use_box(
-                    preamble_source,
-                    &preamble_op.preamble_op,
-                    &arg_guards,
-                    &result_guards,
-                );
-                self.active_short_preamble_producer = Some(builder);
-            } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
-                builder.use_box(
-                    preamble_source,
-                    &preamble_op.preamble_op,
-                    &arg_guards,
-                    &result_guards,
-                );
-                self.imported_short_preamble_builder = Some(builder);
-            } else {
-                unreachable!("force_op_from_preamble_op: no short_preamble_producer");
-            }
-            // shortpreamble.py:401-405: info = preamble_op.get_forwarded();
-            // preamble_op.set_forwarded(None);
-            // optimizer.setinfo_from_preamble(box, info, None)
-            //
-            // RPython reads `_forwarded` from the replay Op object
-            // (`preamble_op`), NOT from `preamble_op.op` (= self.res or
-            // the alt for invented). pyre's flat-OpRef equivalent is
-            // `pop.preamble_op.pos` — the OpRef the replay Op was
-            // constructed at by `ImportedShortPureOp::new`.
-            // For invented Pure that OpRef differs from `pop.op` (the
-            // alt) so the alt's `make_equal_to(...)` chain at
-            // `forwarded[pop.op]` does not collide with the replay's
-            // info at `forwarded[pop.preamble_op.pos]`.
-            if let Some(info) =
-                self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos().get())
-            {
-                self.setinfo_from_preamble_item_option(result, &info, None);
-            }
-            // `unroll.py setinfo_from_preamble` rebuilds an imported string as
-            // `StrPtrInfo(preamble_info.mode)` with no `lgtop`, so the peeled
-            // body re-derives the length from the box it actually holds.
-            // Upstream gets that for free: the body's box is a fresh `Box` with
-            // no `_forwarded`. pyre shares the Phase-1 res across the peel
-            // boundary (`produced_short_op`), so this import lands on a box that
-            // already carries the preamble's `StrPtrInfo`, and
-            // `setinfo_from_preamble`'s `get_forwarded() is not None` early
-            // return then skips the rebuild. Drop the stale length box here:
-            // kept, the body's `string_copy_parts` reuses the preamble's STRLEN
-            // result — a value no short-preamble replay produces — and
-            // `assemble_peeled_trace_with_jump_args` carries it on the loop
-            // LABEL as a tail arg that no bridge close can reproduce, which the
-            // backend rejects (`x86/regalloc.py consider_jump`
-            // `assert len(arglocs) == jump_op.numargs()`). A constant length is
-            // phase-independent, so it stays.
-            if let Some(resolved_box) = self.get_box_replacement_operand_opt(result)
-                && self
-                    .getptrinfo(&resolved_box)
-                    .and_then(|info| info.get_cached_lgtop())
-                    .is_some_and(|lgtop| !lgtop.is_constant())
-            {
-                self.with_ptr_info_mut(&resolved_box, |info| {
-                    if let PtrInfo::Str(si) = info {
-                        si.lgtop = None;
-                    }
-                });
-            }
-            // RPython PreambleOp carries Box.type intrinsically.
-            // the replay `result` OpRef is typed via the upstream factory
-            // (`op_typed`); priority 0 of `opref_type`
-            // resolves it from the variant tag without a side-table seed.
-            let _ = result_type;
-            // unroll.py:34-37: potential_extra_ops[op] = preamble_op
-            if !is_constant {
-                // unroll.py:29/37 keys by `preamble_op.op`, which is
-                // short_op.res: the exact Box returned to and held by the
-                // body. The replay result is deliberately a different Box.
-                let key = result;
-                if crate::optimizeopt::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] potential_extra_ops.insert key={key:?} source={preamble_source:?} result={result:?} invented={}",
-                        preamble_op.invented_name
-                    );
+        // shortpreamble.py:401-405: info = preamble_op.get_forwarded();
+        // preamble_op.set_forwarded(None);
+        // optimizer.setinfo_from_preamble(box, info, None)
+        //
+        // RPython reads `_forwarded` from the replay Op object
+        // (`preamble_op`), NOT from `preamble_op.op` (= self.res or
+        // the alt for invented). pyre's flat-OpRef equivalent is
+        // `pop.preamble_op.pos` — the OpRef the replay Op was
+        // constructed at by `ImportedShortPureOp::new`.
+        // For invented Pure that OpRef differs from `pop.op` (the
+        // alt) so the alt's `make_equal_to(...)` chain at
+        // `forwarded[pop.op]` does not collide with the replay's
+        // info at `forwarded[pop.preamble_op.pos]`.
+        if let Some(info) = self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos().get())
+        {
+            self.setinfo_from_preamble_item_option(&resolved, &info, None);
+        }
+        // `unroll.py setinfo_from_preamble` rebuilds an imported string as
+        // `StrPtrInfo(preamble_info.mode)` with no `lgtop`, so the peeled
+        // body re-derives the length from the box it actually holds.
+        // Upstream gets that for free: the body's box is a fresh `Box` with
+        // no `_forwarded`. pyre shares the Phase-1 res across the peel
+        // boundary (`produced_short_op`), so this import lands on a box that
+        // already carries the preamble's `StrPtrInfo`, and
+        // `setinfo_from_preamble`'s `get_forwarded() is not None` early
+        // return then skips the rebuild. Drop the stale length box here:
+        // kept, the body's `string_copy_parts` reuses the preamble's STRLEN
+        // result — a value no short-preamble replay produces — and
+        // `assemble_peeled_trace_with_jump_args` carries it on the loop
+        // LABEL as a tail arg that no bridge close can reproduce, which the
+        // backend rejects (`x86/regalloc.py consider_jump`
+        // `assert len(arglocs) == jump_op.numargs()`). A constant length is
+        // phase-independent, so it stays.
+        if let Some(resolved_box) = self.get_box_replacement_operand_opt(result)
+            && self
+                .getptrinfo(&resolved_box)
+                .and_then(|info| info.get_cached_lgtop())
+                .is_some_and(|lgtop| !lgtop.is_constant())
+        {
+            self.with_ptr_info_mut(&resolved_box, |info| {
+                if let PtrInfo::Str(si) = info {
+                    si.lgtop = None;
                 }
-                // `unroll.py:37` dict-assign semantics — overwrite if the
-                // key already exists, otherwise append.
-                self.potential_extra_ops.insert(key, preamble_op.clone());
+            });
+        }
+        // RPython PreambleOp carries Box.type intrinsically.
+        // the replay `result` OpRef is typed via the upstream factory
+        // (`op_typed`); priority 0 of `opref_type`
+        // resolves it from the variant tag without a side-table seed.
+        let _ = result_type;
+        // unroll.py:34-37: potential_extra_ops[op] = preamble_op
+        if !is_constant {
+            // unroll.py:29/37 keys by `preamble_op.op`, which is
+            // short_op.res: the exact Box returned to and held by the
+            // body. The replay result is deliberately a different Box.
+            let key = resolved.clone();
+            if crate::optimizeopt::majit_log_enabled() {
+                eprintln!(
+                    "[jit] potential_extra_ops.insert key={key:?} source={preamble_source:?} result={result:?} invented={}",
+                    preamble_op.invented_name
+                );
             }
+            // `unroll.py:37` dict-assign semantics — overwrite if the
+            // key already exists, otherwise append.
+            self.potential_extra_ops.insert(key, preamble_op.clone());
         }
         // unroll.py `return preamble_op.op`. RPython's `preamble_op.op`
         // equals `self.res` (shortpreamble.py:120 `op = self.res`); pyre's
@@ -4544,7 +4328,7 @@ impl OptContext {
         // `used_boxes` / `short_preamble_jump` / `extra_same_as` for the
         // imported short box.
         let _ = result;
-        preamble_source
+        preamble_op.op.clone()
     }
 
     /// shortpreamble.py:383-396,401-406: collect guards from the forwarded
@@ -4644,7 +4428,7 @@ impl OptContext {
             is_input: bool,
         }
         let mut arg_entries: Vec<ArgEntry> = Vec::new();
-        for arg_operand in preamble_op.getarglist().iter() {
+        for arg_operand in preamble_op.args_slice().iter() {
             let arg = arg_operand.to_opref();
             // Branch 1: shortpreamble.py:384 `isinstance(arg, Const): continue`.
             if arg.is_constant() || arg.is_none() {
@@ -5144,42 +4928,33 @@ impl OptContext {
 
     fn setinfo_from_preamble_item_option(
         &mut self,
-        op: OpRef,
+        op: &Operand,
         preamble_info: &crate::optimizeopt::info::OpInfo,
         exported_infos: Option<
             &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::info::OpInfo>,
         >,
     ) {
         use crate::optimizeopt::info::OpInfo;
-        let target = self.get_replacement_opref(op);
-        if self
-            .get_box_replacement_operand_opt(target)
-            .and_then(|cb| cb.const_value())
-            .is_some()
-        {
-            return;
-        }
-        if let Some(b) = self.get_box_replacement_operand_opt(op)
-            && self.has_forwarding(&b)
-        {
+        // optimizer.py `setinfo_from_preamble`: `op = get_box_replacement(op)`;
+        // `if op.get_forwarded() is not None: return`; `if isinstance(op,
+        // Const): return`.
+        let target = self.resolve_operand_operand(op);
+        if target.const_value().is_some() || self.has_forwarding(&target) {
             return;
         }
         match preamble_info {
             OpInfo::Ptr(rc) => {
                 // Pass the Rc handle (unroll.py:61 identity preservation).
-                let target_box = self.materialize_operand_at(target);
-                self.setinfo_from_preamble(&target_box, rc, exported_infos);
+                self.setinfo_from_preamble(&target, rc, exported_infos);
             }
             OpInfo::IntBound(bound) => {
                 let widened = bound.borrow().widen();
-                let target_box = self.materialize_operand_at(target);
-                self.with_intbound_mut(&target_box, |bm| {
+                self.with_intbound_mut(&target, |bm| {
                     let _ = bm.intersect(&widened);
                 });
             }
             OpInfo::FloatConstInfo(f) => {
-                let b = self.materialize_operand_at(target);
-                self.make_constant_box(&b, Value::Float(f.getconst()));
+                self.make_constant_box(&target, Value::Float(f.getconst()));
             }
             OpInfo::Unknown | OpInfo::EmptyInfo(_) => {}
         }
@@ -5188,24 +4963,24 @@ impl OptContext {
     /// `optimizer.py` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
     pub fn take_potential_extra_op(
         &mut self,
-        result: OpRef,
+        result: &Operand,
     ) -> Option<crate::optimizeopt::info::PreambleOp> {
-        self.potential_extra_ops.swap_remove(&result)
+        self.potential_extra_ops.swap_remove(result)
     }
 
     /// `unroll.py` `self.optunroll.potential_extra_ops[op] = preamble_op` —
     /// dict-assign semantics: overwrite if `key` exists, else append.
     pub fn set_potential_extra_op(
         &mut self,
-        key: OpRef,
+        key: Operand,
         preamble_op: crate::optimizeopt::info::PreambleOp,
     ) {
         self.potential_extra_ops.insert(key, preamble_op);
     }
 
     /// Dict-`in` parity for `potential_extra_ops`.
-    pub fn has_potential_extra_op(&self, key: OpRef) -> bool {
-        self.potential_extra_ops.contains_key(&key)
+    pub fn has_potential_extra_op(&self, key: &Operand) -> bool {
+        self.potential_extra_ops.contains_key(key)
     }
 
     pub fn activate_short_preamble_producer(
@@ -5284,54 +5059,53 @@ impl OptContext {
             .unwrap_or_default()
     }
 
-    /// optimizer.py: pure_from_args1 parity.
-    /// Register reverse-pure: pure(opcode, result) = arg0.
-    /// Consumed by OptPure at flush time.
-    pub fn register_pure_from_args1(&mut self, opcode: OpCode, result: OpRef, arg0: OpRef) {
+    /// `pure_from_args1(opnum, arg0, op)`: `key` is the pure op's arg,
+    /// `forwarded` is the box the synthetic op forwards to.
+    /// Consumed by OptPure before the next propagate.
+    pub fn register_pure_from_args1(&mut self, opcode: OpCode, key: Operand, forwarded: Operand) {
         self.pending_pure_from_args
-            .push((opcode, result, arg0, None));
+            .push((opcode, key, forwarded, None));
     }
 
-    /// optimizer.py: pure_from_args1 parity with explicit descr keying.
-    /// Mirrors upstream `pure_from_args(opnum, [arg], result, descr=...)`
-    /// — descr discriminates the pure cache slot so cross-descr
-    /// collisions (e.g. ARRAYLEN_GC across distinct array descrs at
-    /// virtualize.py:220) don't collapse onto the same key.
+    /// `pure_from_args(opnum, [arg], result, descr=...)`.
+    /// `descr` discriminates the pure cache slot so cross-descr
+    /// collisions (ARRAYLEN_GC across distinct array descrs) don't
+    /// collapse onto the same key.
     pub fn register_pure_from_args1_with_descr(
         &mut self,
         opcode: OpCode,
-        result: OpRef,
-        arg0: OpRef,
+        key: Operand,
+        forwarded: Operand,
         descr: majit_ir::DescrRef,
     ) {
         self.pending_pure_from_args
-            .push((opcode, result, arg0, Some(descr)));
+            .push((opcode, key, forwarded, Some(descr)));
     }
 
-    /// info.py:557 `pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))`
-    pub fn pure_from_args_arraylen(&mut self, array_ref: OpRef, length: i64) {
-        let len_ref = self.emit_constant_int(length);
-        self.register_pure_from_args1(OpCode::ArraylenGc, array_ref, len_ref);
+    /// `pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))`.
+    pub fn pure_from_args_arraylen(&mut self, array: Operand, length: i64) {
+        let len = Operand::const_from_value(Value::Int(length));
+        self.register_pure_from_args1(OpCode::ArraylenGc, array, len);
     }
 
     /// Probe the pure-op ring for `op`. Empty until `OptPure` publishes.
-    pub fn get_pure_result(&mut self, op: &Op) -> Option<OpRef> {
+    pub fn get_pure_result(&mut self, op: &Op) -> Option<Operand> {
         let table = self.pure_ops.clone()?;
         pure::shared_get_pure_result(&table, op, self)
     }
 
-    /// optimizer.py: pure_from_args2 parity.
-    /// Register binary reverse-pure: pure(opcode, arg0, arg1) = result.
-    /// Consumed by OptPure at flush time.
+    /// `pure_from_args2(opnum, arg0, arg1, op)`: `forwarded` is the box
+    /// the synthetic op forwards to. Consumed by OptPure before the next
+    /// propagate.
     pub fn register_pure_from_args2(
         &mut self,
         opcode: OpCode,
-        result: OpRef,
-        arg0: OpRef,
-        arg1: OpRef,
+        forwarded: Operand,
+        arg0: Operand,
+        arg1: Operand,
     ) {
         self.pending_pure_from_args2
-            .push((opcode, arg0, arg1, result));
+            .push((opcode, arg0, arg1, forwarded));
     }
 
     /// Grain's reds (`Vm`, frame, `Scope`) live on the thread stack and
@@ -5681,7 +5455,39 @@ impl OptContext {
         Operand::bound_from_opref(opref)
     }
 
-    /// "Box always exists" materializer (`resoperation.py AbstractResOpOrInputArg
+    /// Write receiver for `op.set_forwarded(info)` on an already
+    /// chain-resolved operand. A bound ResOp is its own host; its position is
+    /// made to resolve to it, since guard resume numbering reads by position.
+    /// Other operands go through `materialize_operand_at`. The `None`
+    /// sentinel passes through untouched.
+    pub(crate) fn materialize_write_host(&mut self, o: Operand) -> Operand {
+        let pos = o.to_opref();
+        if pos.is_none() {
+            return o;
+        }
+        let Some(op) = o.bound_op() else {
+            return self.materialize_operand_at(pos);
+        };
+        // `op.set_forwarded(info)` writes the chain terminal itself. A
+        // terminal its position does not resolve to becomes the position's
+        // producer, and an unforwarded stand-in registered there is
+        // forwarded to it, so position readers reach the same box.
+        match self.find_producer_op(pos) {
+            Some(p) if OpRc::ptr_eq(&p, &op) => {}
+            Some(p) => {
+                use majit_ir::forwarding::ForwardingHost;
+                if matches!(p.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
+                    p.set_forwarded_op(&op);
+                }
+            }
+            None => {
+                self.resop_refs.insert(pos, op);
+            }
+        }
+        o
+    }
+
+    /// "Box always exists" materializer (`resoperation.py:233-248
     /// AbstractResOpOrInputArg._forwarded`). Returns the canonical bound
     /// `_forwarded` host for `opref` as an [`Operand`] (`Op` / `InputArg`),
     /// minting a `SameAs*` synthetic into `resop_refs` when no producer is
@@ -5694,20 +5500,6 @@ impl OptContext {
     /// fixtures, short-preamble replay slots). The sentinel `OpRef::none()`
     /// has no operand (debug-asserted); resolve it with
     /// `resolve_to_operand` / `get_box_replacement_operand` instead.
-    /// Write-receiver form of [`materialize_operand_at`](Self::materialize_operand_at)
-    /// for a receiver that is already an [`Operand`]: returns its canonical
-    /// `_forwarded` host, registering a producer when the position has none.
-    /// A chain-resolved operand is not necessarily registered, and an
-    /// unregistered position later reaches guard resume numbering, where
-    /// `get_box_replacement_operand` has no producer to bind. The `None`
-    /// sentinel has no operand to mint, so it passes through untouched.
-    pub(crate) fn materialize_write_host(&mut self, o: Operand) -> Operand {
-        if o.to_opref().is_none() {
-            return o;
-        }
-        self.materialize_operand_at(o.to_opref())
-    }
-
     pub(crate) fn materialize_operand_at(&mut self, opref: OpRef) -> Operand {
         debug_assert!(
             !opref.is_none(),
@@ -5954,9 +5746,71 @@ impl OptContext {
         imported.is_constant().then_some(imported)
     }
 
+    /// Debug witness: `got` is the box `get_box_replacement` reached from a
+    /// caller-held operand, `probed` is that operand's position. When the
+    /// position has a producer, the two terminals are the same box.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_assert_operand_matches_positional(
+        &self,
+        got: &Operand,
+        probed: OpRef,
+        site: &str,
+    ) {
+        if probed.is_none() {
+            return;
+        }
+        if let Some(old) = self.get_box_replacement_operand_opt(probed) {
+            debug_assert!(
+                got.same_box(&old),
+                "{site} {probed:?}: new {:?} old {:?}",
+                got.to_opref(),
+                old.to_opref()
+            );
+        }
+    }
+
+    /// `get_box_replacement(op)`: walk the operand's own `_forwarded`
+    /// chain. A self-resolved InputArg in the peeled body keeps the
+    /// constant rejoin of `imported_inputarg_operand`. Debug builds check
+    /// the result against the positional resolver.
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
-        if let Some(resolved) = self.heal_arg_to_canonical(arg) {
-            return resolved;
+        if arg.is_constant() {
+            return arg.clone();
+        }
+        if !arg.is_resop() && !arg.is_inputarg() {
+            return self.get_box_replacement_operand(arg.to_opref());
+        }
+        let resolved = arg.get_box_replacement(false);
+        let resolved = if resolved.same_box(arg) && arg.is_inputarg() {
+            self.imported_inputarg_operand(arg).unwrap_or(resolved)
+        } else {
+            resolved
+        };
+        // An unregistered position has no positional answer: the old
+        // resolver fabricated a fresh box for it on every call.
+        #[cfg(debug_assertions)]
+        if self.resolve_to_operand(arg.to_opref()).is_some() {
+            let old = self.resolve_operand_operand_positional(arg);
+            debug_assert!(
+                resolved.same_box(&old),
+                "resolve_operand_operand {:?}: new {:?} old {:?}",
+                arg.to_opref(),
+                resolved.to_opref(),
+                old.to_opref()
+            );
+        }
+        resolved
+    }
+
+    #[cfg(debug_assertions)]
+    fn resolve_operand_operand_positional(&self, arg: &Operand) -> Operand {
+        // The canonical `heal_arg_to_canonical` would link to, read without
+        // writing `_forwarded`, so the witness leaves no trace in debug runs.
+        if arg.bound_op().is_some()
+            && matches!(arg.get_forwarded(), majit_ir::forwarding::Forwarded::None)
+            && let Some(canon) = self.get_box_replacement_operand_opt(arg.to_opref())
+        {
+            return canon;
         }
 
         // `Const.get_box_replacement()` is identity in resoperation.py: a
@@ -5988,82 +5842,31 @@ impl OptContext {
         }
     }
 
-    /// `Option`-returning native sibling of
-    /// [`resolve_operand_operand`](Self::resolve_operand_operand):
-    /// `None` when the operand is a NONE / unresolved position so callers can
-    /// supply their own unbound fallback (a sentinel arg box, a
-    /// `materialize_*` mint) instead of tripping the position-only panic in the
-    /// total `get_box_replacement_operand`.
+    /// `Option`-returning sibling of
+    /// [`resolve_operand_operand`](Self::resolve_operand_operand): `None`
+    /// only for the NONE sentinel or a position-only operand whose position
+    /// resolves to nothing, so callers can supply their own fallback.
     pub fn resolve_operand_operand_opt(&self, arg: &Operand) -> Option<Operand> {
-        if let Some(resolved) = self.heal_arg_to_canonical(arg) {
-            return Some(resolved);
+        if arg.is_constant() || arg.is_resop() || arg.is_inputarg() {
+            return Some(self.resolve_operand_operand(arg));
         }
-
-        if arg.is_constant() {
-            return Some(arg.clone());
-        }
-
-        // info.py `getptrinfo` starts with `get_box_replacement(op)`.
-        // Both result ops and input args carry that native `_forwarded`
-        // chain; consult it before the positional store fallback.
-        if arg.is_resop() || arg.is_inputarg() {
-            let resolved = arg.get_box_replacement(false);
-            if resolved.same_box(arg) {
-                if let Some(imported) = self.imported_inputarg_operand(arg) {
-                    return Some(imported);
-                }
-                // An unregistered InputArg keeps the old `None` contract so
-                // the dispatch-entry caller can materialize one canonical
-                // host for every occurrence of that position. Result ops
-                // already carry their canonical producer and are total here.
-                let fallback = (!arg.is_inputarg()).then_some(resolved);
-                self.get_box_replacement_operand_opt(arg.to_opref())
-                    .or(fallback)
-            } else {
-                Some(resolved)
-            }
-        } else {
-            self.get_box_replacement_operand_opt(arg.to_opref())
-        }
+        self.get_box_replacement_operand_opt(arg.to_opref())
     }
 
-    /// Box-canonicalization heal (#189). When a position's
-    /// canonical producer (the `find_producer_op` / OpRef-store resolution)
-    /// has received a forwarding — const-fold (`make_constant_box` /
-    /// `seed_constant`) or CSE (`make_equal_to`) — that did NOT route through
-    /// `emit`'s `live_synthetics` catch-up, the recorder input
-    /// op the operands carry at that position stays a DISTINCT, still-
-    /// unforwarded `Op`. A box-native walk from such an operand then freezes
-    /// on the unforwarded input op while the OpRef path resolves the canonical
-    /// (the witnessed `resolve_operand_operand` divergence). Link `input_op ->
-    /// canonical` here, the non-emitted analogue of `emit`'s synth->op_rc link,
-    /// so both paths agree.
+    /// Link an unforwarded ResOp `arg` to the producer registered at its
+    /// position (`arg.set_forwarded(canonical)`) and return that producer's
+    /// terminal; `None` when `arg` is unbound, already forwarded, or its
+    /// position has no producer.
     ///
-    /// Cycle-safe: only an UNFORWARDED bound ResOp whose store canonical is a
-    /// genuinely distinct `Op` is linked. Const and InputArg operands resolve
-    /// canonically already and are skipped.
+    /// The one caller is `export_state`'s short-preamble conversion: a
+    /// replay op's args are the dependencies' replay handles, which share a
+    /// position with the body producer and carry no forwarding of their own.
     ///
-    /// The cycle guard keys on the bound `Op` identity, NOT the position: a
-    /// position routinely carries TWO distinct `Op` objects — the recorder
-    /// input op the operands bind to, and the emitted/canonical op
-    /// `find_producer_op` returns (the host on which `heap`/`virtualize` set the
-    /// position's PtrInfo via `set_forwarded_info`). Both share the same
-    /// `to_opref()` (position), so a position-equality guard would skip exactly
-    /// this same-position duplication, leaving the operand's box-native walk
-    /// stranded on the info-less input op while the OpRef store path reaches the
-    /// info-bearing canonical. Linking those two distinct ops is the whole point
-    /// of the heal. But `get_box_replacement_operand_opt` can also re-resolve a
-    /// DIFFERENT `Operand` wrapping the SAME bound `Op` as `arg` (a store wrapper
-    /// vs the memoized operand); `same_box` (an `Rc::ptr_eq` on the producers)
-    /// catches that for an identical `Rc<Op>`, but the explicit `Rc::ptr_eq` on
-    /// the bound ops is kept as the cycle guard — without it `set_forwarded_op`
-    /// self-cycles (`arg.op -> arg.op`). The canonical is a
-    /// `get_box_replacement_operand` terminal (`Forwarded::None`/`Info`, never a
-    /// bound op chained on), so once a genuinely distinct op is linked no chain
-    /// cycle forms.
-    /// Return the terminal already found by the heal so the caller need not
-    /// perform the same positional lookup a second time.
-    fn heal_arg_to_canonical(&self, arg: &Operand) -> Option<Operand> {
+    /// The cycle guard compares the bound `Op`s: a store wrapper around the
+    /// same `Rc<Op>` as `arg` is returned without linking, since linking would
+    /// be a one-node self-cycle. The canonical is a terminal, so no chain
+    /// cycle forms once a distinct op is linked.
+    pub(crate) fn heal_arg_to_canonical(&self, arg: &Operand) -> Option<Operand> {
         if arg.bound_op().is_none() {
             return None;
         }
@@ -6185,9 +5988,7 @@ impl OptContext {
     /// operand-direct read — chain walks via
     /// `Operand::get_box_replacement` then queries `ptr_info().is_virtual()`.
     pub fn is_virtual(&self, op: &Operand) -> bool {
-        op.get_box_replacement(false)
-            .ptr_info()
-            .is_some_and(|p| p.is_virtual())
+        op.with_box_replacement(|b| b.ptr_info().is_some_and(|p| p.is_virtual()))
     }
 
     /// `info.py PtrInfo.is_nonnull` (base False) + subclass
@@ -6195,9 +5996,7 @@ impl OptContext {
     /// `PtrInfo` in its `_forwarded` Info slot. Chain walks via
     /// `Operand::get_box_replacement` then reads `ptr_info()`.
     pub fn is_nonnull(&self, op: &Operand) -> bool {
-        op.get_box_replacement(false)
-            .ptr_info()
-            .is_some_and(|p| p.is_nonnull())
+        op.with_box_replacement(|b| b.ptr_info().is_some_and(|p| p.is_nonnull()))
     }
 
     /// `optimizer.py getintbound(op)` read variant — returns an
@@ -6221,11 +6020,12 @@ impl OptContext {
         &self,
         op: &Operand,
     ) -> Option<crate::optimizeopt::intutils::IntBound> {
-        let resolved = op.get_box_replacement(false);
-        if let Some(Value::Int(v)) = resolved.const_value() {
-            return Some(crate::optimizeopt::intutils::IntBound::from_constant(v));
-        }
-        resolved.int_bound().map(|ib| ib.clone())
+        op.with_box_replacement(|resolved| {
+            if let Some(Value::Int(v)) = resolved.const_value() {
+                return Some(crate::optimizeopt::intutils::IntBound::from_constant(v));
+            }
+            resolved.int_bound().map(|ib| ib.clone())
+        })
     }
 
     /// `info.py op.get_forwarded()` + `isinstance(fw, PtrInfo)` —
@@ -7145,7 +6945,7 @@ impl OptContext {
             op.set_rd_resume_position(self.new_operations[idx].rd_resume_position());
             // bridgeopt.py parity: fail_arg_types carry the types the
             // serializer used when writing the class-knowledge bitfield in
-            // rd_numb (`box.type` on each live box). A
+            // rd_numb. A
             // shared guard's rd_numb encodes the donor's livebox type
             // layout, so the sharer must inherit fail_arg_types too —
             // otherwise `deserialize_optimizer_knowledge` (`bridgeopt.rs`)
@@ -7177,15 +6977,14 @@ impl OptContext {
             // Mirrors Optimizer.force_box contract: resolve replacement,
             // handle tracked preamble ops, force virtuals.
             if let Some(fa) = op.guard_fail_args() {
-                let fargs: smallvec::SmallVec<[OpRef; 8]> =
-                    fa.iter().map(|b| b.to_opref()).collect();
-                for farg in fargs {
+                let fargs: smallvec::SmallVec<[Operand; 8]> = fa.iter().cloned().collect();
+                for farg in &fargs {
                     if !farg.is_none() {
                         // regalloc.py:1206: Const objects skip forcing.
                         // Constant OpRefs may collide with virtual positions;
                         // forcing would corrupt the virtual's PtrInfo.
                         if self
-                            .get_box_replacement_operand_opt(farg)
+                            .get_box_replacement_operand_opt(farg.to_opref())
                             .and_then(|cb| cb.const_value())
                             .is_none()
                         {
@@ -7250,7 +7049,8 @@ impl OptContext {
     /// then force virtuals to concrete. Body refs route through the preamble
     /// source directly, so the prior reverse-lookup 3rd key is no longer
     /// needed.
-    fn force_box_inline(&mut self, opref: OpRef) -> OpRef {
+    pub(crate) fn force_box_inline(&mut self, op: &Operand) -> OpRef {
+        let opref = op.to_opref();
         if opref.is_constant() {
             return opref;
         }
@@ -7263,9 +7063,11 @@ impl OptContext {
         // const-resolved results — otherwise the Const reaches `used_boxes`
         // and the carried label slot trips `OpRef::raw()` in unroll.rs.
         if !resolved.is_constant() {
-            let tracked = self
-                .take_potential_extra_op(resolved)
-                .or_else(|| self.take_potential_extra_op(opref));
+            let tracked = match resolved_op.clone() {
+                Some(resolved_box) => self.take_potential_extra_op(&resolved_box),
+                None => None,
+            }
+            .or_else(|| self.take_potential_extra_op(op));
             if let Some(preamble_op) = tracked {
                 // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
                 // — the resolved Box itself is handed to the builder.
@@ -7886,7 +7688,7 @@ impl OptContext {
     /// of the preamble's entry box (e.g. int_add reassociation turning
     /// `loop_arg - 1` into `preamble_entry - 2`), a box the loop header
     /// does not carry per-iteration.
-    pub fn get_producing_op(&self, op: &Operand) -> Option<Op> {
+    pub fn get_producing_op(&self, op: &Operand) -> Option<majit_ir::OpRc> {
         // resoperation.py AbstractResOpOrInputArg `_forwarded` host: a box's producing op is its
         // bound op (set at emit, mod.rs bind_op before new_operations.push).
         // Walk the forwarding chain first (resoperation.py get_box_replacement) so the
@@ -7901,7 +7703,7 @@ impl OptContext {
         {
             return None;
         }
-        Some((*producer).clone())
+        Some(producer)
     }
 
     /// Number of emitted operations so far.
@@ -7928,19 +7730,20 @@ impl OptContext {
     /// ```
     pub fn get_constant_box(&self, op: &Operand) -> Option<Value> {
         // optimizer.py: box = get_box_replacement(box)
-        let resolved = op.get_box_replacement(false);
-        // optimizer.py:381-382: isinstance(box, Const) → return box
-        if let Some(v) = resolved.const_value() {
-            return Some(v);
-        }
-        // optimizer.py:383-386: box.type == 'i' + IntBound + is_constant
-        if resolved.type_() == majit_ir::Type::Int
-            && let Some(b) = resolved.int_bound()
-            && b.is_constant()
-        {
-            return Some(Value::Int(b.get_constant_int()));
-        }
-        None
+        op.with_box_replacement(|resolved| {
+            // optimizer.py:381-382: isinstance(box, Const) → return box
+            if let Some(v) = resolved.const_value() {
+                return Some(v);
+            }
+            // optimizer.py:383-386: box.type == 'i' + IntBound + is_constant
+            if resolved.type_() == majit_ir::Type::Int
+                && let Some(b) = resolved.int_bound()
+                && b.is_constant()
+            {
+                return Some(Value::Int(b.get_constant_int()));
+            }
+            None
+        })
     }
 
     pub fn get_constant_int_box(&self, op: &Operand) -> Option<i64> {
@@ -9430,17 +9233,12 @@ impl OptContext {
     /// callers don't need to special-case the constant arg0 path. The
     /// constant case lands on `const_infos[gcref]`; the regular case
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
-    pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
-        let value = self.materialize_operand_at(value);
-        let arg0 = self.resolve_operand_operand(&op.arg(0)).to_opref();
-        if arg0.is_constant()
-            || self
-                .get_box_replacement_operand_opt(arg0)
-                .and_then(|cb| cb.const_value())
-                .is_some()
-        {
+    pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: &Operand) {
+        let value = self.resolve_operand_operand(value);
+        let arg0 = self.resolve_operand_operand(&op.arg(0));
+        if arg0.const_value().is_some() {
             let parent_descr = op.with_field_descr(|fd| fd.get_parent_descr()).flatten();
-            if let Some(info) = self.get_const_info_mut(arg0, parent_descr.clone()) {
+            if let Some(info) = self.get_const_info_mut_box(&arg0, parent_descr.clone()) {
                 if let Some(parent) = parent_descr {
                     info.init_fields(parent, field_idx as usize);
                 }
@@ -9509,8 +9307,8 @@ impl OptContext {
     /// through `_get_array_info` (`get_const_info_array_mut`) for the
     /// constant arg0 path so the const_infos slot is created as
     /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
-    pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: OpRef) {
-        let value = self.materialize_operand_at(value);
+    pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: &Operand) {
+        let value = self.resolve_operand_operand(value);
         let arg0 = self.resolve_operand_operand(&op.arg(0));
         if arg0.is_constant() || arg0.const_value().is_some() {
             if let Some(descr) = op.getdescr()
@@ -10001,49 +9799,11 @@ pub(crate) fn seed_empty_guard_snapshots(ops: &[Op]) -> (Vec<Op>, SnapshotBoxes)
 }
 
 #[cfg(test)]
-mod input_ops_index_tests {
+mod opt_context_pos_tests {
     use super::*;
     use majit_ir::OpRef;
     use majit_ir::resoperation::{Op, OpCode};
     use std::rc::Rc;
-
-    fn op_at(pos: OpRef) -> majit_ir::OpRc {
-        let op = Op::new(OpCode::SameAsI, &[]);
-        op.pos().set(pos);
-        OpRc::new(op)
-    }
-
-    /// `input_ops_index` is a derived O(1) acceleration of
-    /// `input_ops.iter().rfind(|o| o.pos == pos)`. Its sole invariant is
-    /// that when two seeded producers share a position, the LATER one wins —
-    /// matching the `rfind` it replaces and `find_producer_op`'s "a later
-    /// emission at the same position always wins" priority. The forward
-    /// rebuild guarantees this because a later `insert` at the same key
-    /// overwrites the earlier.
-    #[test]
-    fn input_ops_index_last_occurrence_wins() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 0, 0, 0);
-        // A position outside any higher-priority store (new_operations,
-        // phase1_emit_ops, resop_refs are all empty here) so the lookup
-        // falls through to input_ops_index.
-        let pos = OpRef::int_op(100);
-        let first = op_at(pos);
-        let last = op_at(pos);
-        ctx.input_ops = vec![first.clone(), last.clone()];
-        ctx.rebuild_input_ops_index();
-
-        let producer = ctx
-            .find_producer_op(pos)
-            .expect("a producer must be found at the seeded position");
-        assert!(
-            OpRc::ptr_eq(&producer, &last),
-            "the last occurrence at a shared position must win"
-        );
-        assert!(
-            !OpRc::ptr_eq(&producer, &first),
-            "the earlier occurrence must be shadowed by the later one"
-        );
-    }
 
     /// `make_constant` stores an i32 ConstInt as `Forwarded::SmallConst`.
     /// `allocate_next_pos_raw` must treat that as a claimed position.
@@ -12115,7 +11875,7 @@ mod imported_short_preamble_fallback_tests {
             same_as_source: None,
         };
 
-        let forced = ctx.force_op_from_preamble_op(&pop);
+        let forced = ctx.force_op_from_preamble_op(&pop).to_opref();
         assert_eq!(forced, OpRef::int_op(41));
 
         let sp = ctx
@@ -12126,7 +11886,7 @@ mod imported_short_preamble_fallback_tests {
         assert_eq!(
             sp.ops[0]
                 .op
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

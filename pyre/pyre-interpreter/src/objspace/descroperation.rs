@@ -1914,19 +1914,23 @@ fn int_pow_negative(base: i64, exp: i64) -> Result<f64, PyError> {
 }
 
 unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let vb = RBigIntGcRoot::new(if is_long(b) {
-        w_long_get_value(b).translated_alias()
+    // Building either `rbigint` allocates a digit block (`fromint` ->
+    // `RBigInt::new` -> `Digits::new`), so it collects before the other operand
+    // is read.  Both operands stay on the shadow stack for the whole body and
+    // every read comes back out of its slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let a = || pyre_object::gc_roots::shadow_stack_get(base);
+    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let vb = RBigIntGcRoot::new(if is_long(b()) {
+        w_long_get_value(b()).translated_alias()
     } else {
-        BigInt::from(int_value(b))
+        BigInt::from(int_value(b()))
     });
     if vb.get_sign() < 0 {
         // longobject.py calls descr_float on both integer operands
         // before float pow.  RBigInt::tofloat raises on an out-of-range value;
         // do not silently pass the infinity sentinel from as_float onward.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-        let a = || pyre_object::gc_roots::shadow_stack_get(base);
-        let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
         reject_pow_operand_overflow(a())?;
         reject_pow_operand_overflow(b())?;
         let fa = as_float(a());
@@ -1940,16 +1944,16 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Ok(w_long_new(BigInt::from(1)));
     }
     // longobject.py:224-231: rbigint.pow handles arbitrary exponents.
-    let va = RBigIntGcRoot::new(if is_long(a) {
-        w_long_get_value(a).translated_alias()
+    let va = RBigIntGcRoot::new(if is_long(a()) {
+        w_long_get_value(a()).translated_alias()
     } else {
-        BigInt::from(int_value(a))
+        BigInt::from(int_value(a()))
     });
     // Both rbigint.int_pow(1) and rbigint.pow(ONERBIGINT) return the base
     // reference after the zero-base check. W_LongObject adds only a wrapper.
-    if is_long(a) && va.get_sign() != 0 && vb.int_eq(1) {
+    if is_long(a()) && va.get_sign() != 0 && vb.int_eq(1) {
         return Ok(pyre_object::longobject::w_long_from_raw(
-            w_long_get_raw_value(a),
+            w_long_get_raw_value(a()),
         ));
     }
     if va.get_sign() == 0 {
@@ -1965,8 +1969,8 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // longobject.py: `descr_pow` keeps a `W_IntObject` exponent
     // unwrapped (`exp_bigint` stays None) and calls `rbigint.int_pow`; only a
     // long exponent reaches `rbigint.pow`.
-    if is_int_like(b) {
-        return Ok(w_long_new(bigint_int_pow_nomod(&va, int_value(b))?));
+    if is_int_like(b()) {
+        return Ok(w_long_new(bigint_int_pow_nomod(&va, int_value(b()))?));
     }
     Ok(w_long_new(bigint_pow_nomod(&va, &vb)?))
 }

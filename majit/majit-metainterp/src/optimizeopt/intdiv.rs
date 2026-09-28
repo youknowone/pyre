@@ -58,11 +58,6 @@ fn full_mul_u64(a: u64, b: u64) -> (u64, u64) {
     (result as u64, (result >> 64) as u64)
 }
 
-/// Emit a constant integer into the optimization context.
-pub(crate) fn emit_constant_int(ctx: &mut OptContext, value: i64) -> OpRef {
-    ctx.make_constant_int(value)
-}
-
 /// RPython intdiv.py: emit an op through the pass chain.
 ///
 /// In RPython, intdiv returns a list of ops and the caller sends each
@@ -101,12 +96,12 @@ pub fn division_operations(
 ) -> OpRef {
     let (k, i) = magic_numbers(m);
 
-    let k_ref = emit_constant_int(ctx, k as i64);
-    let i_ref = emit_constant_int(ctx, i as i64);
+    let k_ref = ctx.make_constant_int(k as i64);
+    let i_ref = ctx.make_constant_int(i as i64);
 
     if !known_nonneg {
         // t = n >> 63
-        let shift63_ref = emit_constant_int(ctx, 63);
+        let shift63_ref = ctx.make_constant_int(63);
         let arg_n = ctx.materialize_operand_at(n_ref);
         let arg_shift63 = ctx.materialize_operand_at(shift63_ref);
         let t_ref = emit_op(
@@ -184,7 +179,7 @@ pub fn modulo_operations(
     let div_ref = division_operations(n_ref, m, known_nonneg, pass_idx, ctx);
 
     // product = div_result * m
-    let m_ref = emit_constant_int(ctx, m);
+    let m_ref = ctx.make_constant_int(m);
     let arg_div = ctx.materialize_operand_at(div_ref);
     let arg_m = ctx.materialize_operand_at(m_ref);
     let product_ref = emit_op(

@@ -21,12 +21,12 @@ fn zst_closure_and_then() -> Llbc {
     };
     let ident = |name: &str| json!({"Ident": [name, 0]});
     let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
-    let adt = |id| json!({"Adt": {"id": {"Adt": id}, "generics": generics}});
+    let adt = |id| json!({"Adt": {"id": id, "generics": generics}});
     let option_ty = json!({"Adt": {
-        "id": {"Adt": 0},
-        "generics": {"regions": [], "types": [{"Literal": {"Int": "I64"}}], "const_generics": [], "trait_refs": []}
+        "id": 0,
+        "generics": {"regions": [], "types": [{"Scalar": {"Integer": {"Signed": "I64"}}}], "const_generics": [], "trait_refs": []}
     }});
-    let word = json!({"Literal": {"Int": "I64"}});
+    let word = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let place = |id, ty: &Value| json!({"kind": {"Local": id}, "ty": ty});
     let closure_ty = adt(1);
     let layout = json!([{
@@ -35,7 +35,7 @@ fn zst_closure_and_then() -> Llbc {
     }]);
     let impl_seg = json!({"Impl": {"Ty": {
         "params": {"regions": [], "types": [], "const_generics": [], "trait_clauses": [], "regions_outlive": [], "types_outlive": [], "trait_type_constraints": []},
-        "skip_binder": {"HashConsedValue": [0, {"Adt": {"id": {"Adt": 0}, "generics": generics}}]},
+        "skip_binder": {"Value": [0, {"Adt": {"id": 0, "generics": generics}}]},
         "kind": "InherentImplBlock"
     }}});
     let file = json!({"charon_version": "0.1.201", "has_errors": false,
@@ -65,7 +65,7 @@ fn zst_closure_and_then() -> Llbc {
                         {"statements": [{"span": span, "kind": {"Assign": [place(2, &closure_ty),
                             {"Aggregate": [{"Adt": [1, null, null, generics]}, []]}]}}],
                          "terminator": {"span": span, "kind": {"Call": {
-                            "call": {"func": {"Regular": {"kind": {"Fun": {"Regular": 1}}, "generics": generics}},
+                            "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                 "args": [{"Move": place(1, &option_ty)}, {"Move": place(2, &closure_ty)}],
                                 "dest": place(0, &option_ty)},
                             "target": 1, "on_unwind": 2

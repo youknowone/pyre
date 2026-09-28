@@ -94,6 +94,12 @@ fn register_to_box_float(opref: OpRef, value: i64, unique_to_box: Option<&[u32]>
 /// `MetaInterp.framestack` keeps them alive.
 pub struct MIFrame {
     pub jitcode: Arc<JitCode>,
+    /// pyjitpl.py `MIFrame.setup`: `self.bytecode = jitcode.code`, the
+    /// code the opcode and operand readers index. It points into the body
+    /// of `jitcode`, which this frame's `Arc` keeps alive and which
+    /// `JitCode::set_body` writes only once; `new` and `setup_reused` set
+    /// it together with `jitcode`.
+    bytecode: *const [u8],
     pub pc: usize,
     pub code_cursor: usize,
     /// Bytecode position of the operation currently being executed.
@@ -194,8 +200,10 @@ impl MIFrame {
         let regs_and_consts_i = jitcode.num_regs_and_consts_i();
         let regs_and_consts_r = jitcode.num_regs_and_consts_r();
         let regs_and_consts_f = jitcode.num_regs_and_consts_f();
+        let bytecode: *const [u8] = jitcode.code.as_slice();
         Self {
             jitcode,
+            bytecode,
             pc,
             code_cursor: 0,
             last_opcode_position: pc,
@@ -298,6 +306,7 @@ impl MIFrame {
         let regs_and_consts_r = jitcode.num_regs_and_consts_r();
         let regs_and_consts_f = jitcode.num_regs_and_consts_f();
 
+        self.bytecode = jitcode.code.as_slice();
         self.jitcode = jitcode;
         self.pc = pc;
         self.code_cursor = 0;
@@ -333,8 +342,19 @@ impl MIFrame {
         }
     }
 
+    /// pyjitpl.py `MIFrame.bytecode`.
+    #[inline]
+    pub fn bytecode(&self) -> &[u8] {
+        debug_assert!(std::ptr::eq(self.bytecode, self.jitcode.code.as_slice()));
+        // SAFETY: `bytecode` points into `self.jitcode`'s body, which the
+        // `Arc` held in `self.jitcode` keeps alive and unchanged.
+        unsafe { &*self.bytecode }
+    }
+
     pub fn next_u8(&mut self) -> u8 {
-        read_u8(&self.jitcode.code, &mut self.code_cursor)
+        let code: *const [u8] = self.bytecode;
+        // SAFETY: as in `bytecode`.
+        read_u8(unsafe { &*code }, &mut self.code_cursor)
     }
 
     /// Read one register operand ([`crate::jitcode::JitcodeReg`]); register
@@ -345,7 +365,9 @@ impl MIFrame {
     }
 
     pub fn next_u16(&mut self) -> u16 {
-        read_u16(&self.jitcode.code, &mut self.code_cursor)
+        let code: *const [u8] = self.bytecode;
+        // SAFETY: as in `bytecode`.
+        read_u16(unsafe { &*code }, &mut self.code_cursor)
     }
 
     /// Peek a u16 at absolute position `pos` without advancing the
@@ -353,7 +375,7 @@ impl MIFrame {
     /// `BlackholeInterpreter::peek_u16_at` so trace dispatch can do the
     /// same dual-encoding auto-detect for vable opcodes.
     pub fn peek_u16_at(&self, pos: usize) -> Option<u16> {
-        let code = &self.jitcode.code;
+        let code = self.bytecode();
         if pos + 1 >= code.len() {
             return None;
         }
@@ -642,7 +664,7 @@ impl MIFrame {
     }
 
     pub fn finished(&self) -> bool {
-        self.code_cursor >= self.jitcode.code.len()
+        self.code_cursor >= self.bytecode().len()
     }
 
     /// pyjitpl.py `MIFrame.cleanup_registers()`.
@@ -1267,12 +1289,14 @@ impl MIFrame {
     pub fn replace_active_box_in_frame(&mut self, oldbox: OpRef, newbox: OpRef, oldbox_type: Type) {
         // All three banks are flat `Vec<Option<OpRef>>`; the shared replace
         // logic compares by OpRef value (pyre's flat-OpRef adaptation of
-        // pyjitpl.py `registers[i] is oldbox`).
-        let registers = match oldbox_type {
-            Type::Int => &mut self.int_regs,
-            Type::Float => &mut self.float_regs,
-            Type::Ref => &mut self.ref_regs,
-            // pyjitpl.py replace_active_box_in_frame `else: assert 0, oldbox` — RPython rejects
+        // pyjitpl.py `registers[i] is oldbox`). Only the working registers
+        // `[0, num_regs_X)` are scanned; the constants area above them
+        // holds Const boxes that are never `oldbox`.
+        let (count, registers) = match oldbox_type {
+            Type::Int => (self.jitcode.num_regs_i(), &mut self.int_regs),
+            Type::Float => (self.jitcode.num_regs_f(), &mut self.float_regs),
+            Type::Ref => (self.jitcode.num_regs_r(), &mut self.ref_regs),
+            // pyjitpl.py:236-244 `else: assert 0, oldbox` — RPython rejects
             // any box whose `type` attribute is not 'i' / 'r' / 'f'.
             // Mirroring that assertion strength keeps the contract: the
             // caller must resolve a typed Box; passing a Void-typed
@@ -1283,10 +1307,10 @@ impl MIFrame {
                  RPython parity rejects unknown/void box types (pyjitpl.py:236)"
             ),
         };
-        if registers.is_empty() {
+        if count == 0 {
             return;
         }
-        for slot in registers.iter_mut() {
+        for slot in &mut registers[..count] {
             if *slot == Some(oldbox) {
                 *slot = Some(newbox);
             }

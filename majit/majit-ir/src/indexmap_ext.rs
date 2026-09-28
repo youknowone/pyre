@@ -15,7 +15,9 @@ pub trait IndexMapExt<K, V> {
         V: Default;
 }
 
-impl<K: Eq + std::hash::Hash, V> IndexMapExt<K, V> for indexmap::IndexMap<K, V> {
+impl<K: Eq + std::hash::Hash, V, S: std::hash::BuildHasher> IndexMapExt<K, V>
+    for indexmap::IndexMap<K, V, S>
+{
     fn entry_or_insert_with<F: FnOnce() -> V>(&mut self, key: K, f: F) -> &mut V {
         self.entry(key).or_insert_with(f)
     }

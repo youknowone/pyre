@@ -418,7 +418,7 @@ fn front_graph_carries_no_synthesized_exception_edges() {
             .iter()
             .filter(|blk| {
                 matches!(
-                    blk.term(),
+                    blk.term(llbc),
                     Ok(TermKind::UnwindResume) | Ok(TermKind::Abort(_))
                 )
             })
@@ -1508,8 +1508,8 @@ fn a_borrowed_primitive_banks_by_its_container() {
     assert_eq!(
         payloads("range_start_index"),
         vec![
-            ("Bound::Included".to_string(), ValueType::Unsigned),
-            ("Bound::Excluded".to_string(), ValueType::Unsigned),
+            ("Bound<usize>::Included".to_string(), ValueType::Unsigned),
+            ("Bound<usize>::Excluded".to_string(), ValueType::Unsigned),
         ],
         "a `Bound` payload is an enum variant's too, though no `?` produces it",
     );

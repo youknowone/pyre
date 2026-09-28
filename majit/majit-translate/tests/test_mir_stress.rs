@@ -37,8 +37,8 @@ fn stress_path() -> Option<PathBuf> {
 /// `lower_terminator` edges: the normal target *and* `on_unwind` for
 /// `Call`/`Assert`/`Drop`; both arms of an `If`; every `SwitchInt` arm
 /// plus its default.
-fn block_succs(blk: &BasicBlock) -> Vec<usize> {
-    let ts: Vec<u64> = match blk.term() {
+fn block_succs(llbc: &Llbc, blk: &BasicBlock) -> Vec<usize> {
+    let ts: Vec<u64> = match blk.term(llbc) {
         Ok(TermKind::Goto { target }) => vec![target],
         Ok(TermKind::Call {
             target, on_unwind, ..
@@ -79,7 +79,10 @@ fn place_base_local(kind: &PlaceKind) -> Option<u64> {
 /// is traversed). Returns `(rpo_index, back_edges)` where
 /// `rpo_index[b]` is `b`'s position in reverse-postorder (lower = earlier)
 /// or `usize::MAX` if `b` is unreachable from block 0.
-fn rpo_and_back_edges(blocks: &[BasicBlock]) -> (Vec<usize>, BTreeSet<(usize, usize)>) {
+fn rpo_and_back_edges(
+    llbc: &Llbc,
+    blocks: &[BasicBlock],
+) -> (Vec<usize>, BTreeSet<(usize, usize)>) {
     let n = blocks.len();
     // Iterative DFS that records postorder and back-edges. `state`:
     // 0 = white (unvisited), 1 = grey (on stack), 2 = black (done).
@@ -94,7 +97,7 @@ fn rpo_and_back_edges(blocks: &[BasicBlock]) -> (Vec<usize>, BTreeSet<(usize, us
     state[0] = 1;
     stack.push((0, 0));
     while let Some(&(node, idx)) = stack.last() {
-        let succs = block_succs(&blocks[node]);
+        let succs = block_succs(llbc, &blocks[node]);
         if idx < succs.len() {
             stack.last_mut().unwrap().1 += 1;
             let s = succs[idx];
@@ -130,6 +133,7 @@ fn rpo_and_back_edges(blocks: &[BasicBlock]) -> (Vec<usize>, BTreeSet<(usize, us
 /// Can `from` reach `to` using only forward edges (i.e. never traversing
 /// a member of `back_edges`)? Plain BFS over the back-edge-pruned CFG.
 fn reaches_without_backedge(
+    llbc: &Llbc,
     blocks: &[BasicBlock],
     from: usize,
     to: usize,
@@ -144,7 +148,7 @@ fn reaches_without_backedge(
     seen[from] = true;
     queue.push_back(from);
     while let Some(b) = queue.pop_front() {
-        for s in block_succs(&blocks[b]) {
+        for s in block_succs(llbc, &blocks[b]) {
             if s >= n || back_edges.contains(&(b, s)) {
                 continue;
             }
@@ -213,6 +217,7 @@ impl UninitClass {
 /// classification grades a second copy and says nothing about the one that
 /// produced the tally.
 fn classify_uninit_read(
+    llbc: &Llbc,
     blocks: &[BasicBlock],
     read_bb: usize,
     local_n: u64,
@@ -244,7 +249,7 @@ fn classify_uninit_read(
         }
         // Call-terminator destination — the dominant binding site for
         // these failures (the local is the result of a fn call).
-        if let Ok(TermKind::Call { call, .. }) = blk.term() {
+        if let Ok(TermKind::Call { call, .. }) = blk.term(llbc) {
             match &call.dest.kind {
                 PlaceKind::Local(i) if *i == local_n => seeds = true,
                 PlaceKind::Projection(..) if place_base_local(&call.dest.kind) == Some(local_n) => {
@@ -264,7 +269,7 @@ fn classify_uninit_read(
     proj_assign_blocks.dedup();
 
     // (2)+(3) CFG: reverse-postorder + back-edge set from block 0.
-    let (rpo_index, back_edges) = rpo_and_back_edges(blocks);
+    let (rpo_index, back_edges) = rpo_and_back_edges(llbc, blocks);
 
     // Classify against the *binding* (direct) assign blocks.
     let read_rpo = rpo_index.get(read_bb).copied().unwrap_or(usize::MAX);
@@ -281,7 +286,7 @@ fn classify_uninit_read(
         if ab_rpo != usize::MAX && read_rpo != usize::MAX && ab_rpo < read_rpo {
             rpo_precedes = true;
         }
-        if reaches_without_backedge(blocks, ab, read_bb, &back_edges) {
+        if reaches_without_backedge(llbc, blocks, ab, read_bb, &back_edges) {
             forward_reaches = true;
         }
     }
@@ -420,7 +425,7 @@ fn arm_classifier(llbc: &Llbc) -> String {
         if blocks.len() < 2 {
             continue;
         }
-        let (rpo_index, _back_edges) = rpo_and_back_edges(blocks);
+        let (rpo_index, _back_edges) = rpo_and_back_edges(llbc, blocks);
 
         // Discovery only: find a block that directly binds SOME local, and
         // a block that follows it in reverse-postorder. The bucket itself
@@ -440,7 +445,7 @@ fn arm_classifier(llbc: &Llbc) -> String {
                 }
             }
             if bound.is_none() {
-                if let Ok(TermKind::Call { call, .. }) = blk.term() {
+                if let Ok(TermKind::Call { call, .. }) = blk.term(llbc) {
                     if let PlaceKind::Local(i) = &call.dest.kind {
                         bound = Some(*i);
                     }
@@ -461,7 +466,7 @@ fn arm_classifier(llbc: &Llbc) -> String {
 
         // POSITIVE arm: a read placed after its binding block in RPO must
         // bucket as forward-ref.
-        let (cls, detail) = classify_uninit_read(blocks, read_bb, local_n);
+        let (cls, detail) = classify_uninit_read(llbc, blocks, read_bb, local_n);
         assert_eq!(
             cls,
             UninitClass::ForwardRef,
@@ -472,7 +477,7 @@ fn arm_classifier(llbc: &Llbc) -> String {
 
         // NEGATIVE arm: a local nothing binds must NOT bucket as either
         // named class, or the positive arm above is not discriminating.
-        let (absent_cls, _) = classify_uninit_read(blocks, read_bb, u64::MAX);
+        let (absent_cls, _) = classify_uninit_read(llbc, blocks, read_bb, u64::MAX);
         assert_eq!(
             absent_cls,
             UninitClass::Unknown,
@@ -551,7 +556,7 @@ fn classify_uninitialised_local_rpo_vs_loop_carried() {
 
     for fd in llbc.iter_local_fns() {
         walked += 1;
-        if fd.is_global_initializer.is_some() {
+        if fd.is_global_initializer().is_some() {
             skipped_global_init += 1;
             continue;
         }
@@ -589,7 +594,7 @@ fn classify_uninitialised_local_rpo_vs_loop_carried() {
             continue;
         };
 
-        let (class, detail) = classify_uninit_read(&body.body, read_bb, local_n);
+        let (class, detail) = classify_uninit_read(&llbc, &body.body, read_bb, local_n);
         match class {
             UninitClass::ForwardRef => forward_ref += 1,
             UninitClass::LoopCarried => loop_carried += 1,
@@ -690,10 +695,11 @@ fn stmt_is_real_work(stmt: &majit_charon_reader::Statement) -> bool {
         Ok(StmtKind::StorageLive(_))
         | Ok(StmtKind::StorageDead(_))
         | Ok(StmtKind::PlaceMention(_))
-        | Ok(StmtKind::Assert(_)) => false,
+        | Ok(StmtKind::Assert(_))
+        | Ok(StmtKind::Borrowck(_)) => false,
         Ok(StmtKind::Assign(_, rv)) => !matches!(
             rv,
-            Rvalue::Use(_) | Rvalue::Ref { .. } | Rvalue::RawPtr { .. }
+            Rvalue::Use(_, _) | Rvalue::Ref { .. } | Rvalue::RawPtr { .. }
         ),
         // Unknown statement kind (SetDiscriminant, Deinit, …) — treat
         // as real work so we never under-count.
@@ -709,6 +715,7 @@ fn stmt_is_real_work(stmt: &majit_charon_reader::Statement) -> bool {
 /// work. Returns `(eventual_kind, did_real_work, drop_in_chain,
 /// chain_len)`.
 fn classify_unwind_chain(
+    llbc: &Llbc,
     blocks: &[BasicBlock],
     start_bb: usize,
 ) -> (&'static str, bool, bool, usize) {
@@ -732,7 +739,7 @@ fn classify_unwind_chain(
         if block.statements.iter().any(stmt_is_real_work) {
             did_real_work = true;
         }
-        match block.term() {
+        match block.term(llbc) {
             Ok(TermKind::UnwindResume) => {
                 return ("UnwindResume", did_real_work, drop_in_chain, hops);
             }
@@ -803,7 +810,7 @@ fn mir_on_unwind_target_taxonomy() {
         };
         let blocks = &body.body;
         for (bb_idx, block) in blocks.iter().enumerate() {
-            let (term_kind_label, on_unwind): (&'static str, u64) = match block.term() {
+            let (term_kind_label, on_unwind): (&'static str, u64) = match block.term(&llbc) {
                 Ok(TermKind::Call { on_unwind, .. }) => ("Call", on_unwind),
                 Ok(TermKind::Assert { on_unwind, .. }) => ("Assert", on_unwind),
                 Ok(TermKind::Drop { on_unwind, .. }) => ("Drop", on_unwind),
@@ -813,7 +820,7 @@ fn mir_on_unwind_target_taxonomy() {
             *tally.by_term_kind.entry(term_kind_label).or_default() += 1;
 
             let (eventual, did_work, drop_in_chain, chain_len) =
-                classify_unwind_chain(blocks, on_unwind as usize);
+                classify_unwind_chain(&llbc, blocks, on_unwind as usize);
             *tally.eventual.entry(eventual).or_default() += 1;
             *tally.chain_len_hist.entry(chain_len).or_default() += 1;
             // A `Drop` terminator's unwind edge IS the destructor-cleanup

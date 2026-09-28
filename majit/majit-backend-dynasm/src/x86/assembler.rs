@@ -898,7 +898,7 @@ pub struct Assembler386<'a> {
 
     // ── State tracking for code generation ──
     /// Maps OpRef → jitframe slot index.
-    opref_to_slot: IndexMap<OpRef, usize>,
+    opref_to_slot: IndexMap<OpRef, usize, rustc_hash::FxBuildHasher>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
     inputargs: &'a [InputArgRc],
     /// Trace operations — borrowed for `opref_type` lookups (reads
@@ -1194,7 +1194,7 @@ impl<'a> Assembler386<'a> {
             header_pc,
             input_types: Vec::new(),
             bridge_input_locs: None,
-            opref_to_slot: IndexMap::new(),
+            opref_to_slot: IndexMap::with_hasher(rustc_hash::FxBuildHasher),
             inputargs,
             operations,
             inputarg_pos,
@@ -4550,13 +4550,27 @@ impl<'a> Assembler386<'a> {
                         "CallMallocNurseryVarsizeFrame result_loc must be Loc::Reg, got {other:?}",
                     ),
                 };
-                let sv = sizeloc.value;
+                let mut sv = sizeloc.value;
                 let rv = result_reg.value;
-                // `MALLOC_NURSERY_CLOBBER` spills any live variable
-                // out of RCX/RDX before this op, so `sizeloc` is
-                // never in those registers and is disjoint from the
-                // ECX/EDX probe pair.  R11 (X86_64_SCRATCH_REG) loads
-                // the absolute nursery_free/nursery_top addresses.
+                // assembler.py malloc_cond_varsize_frame opens with
+                // `if sizeloc is ecx: MOV(edx, sizeloc); sizeloc = edx`,
+                // because ECX is about to take nursery_free (and is
+                // zeroed outright on the descriptor-less path below).
+                // The size really can arrive in ECX even though
+                // `MALLOC_NURSERY_CLOBBER` names it: llsupport/regalloc.py
+                // `spill_or_move_registers_before_call` drops a variable
+                // whose last use is the current operation out of the
+                // binding and frees its register *without moving the
+                // value*, and this operation is the size box's last use.
+                // A size already in EDX needs no move, since the `LEA`
+                // below reads EDX as its index before writing it — which
+                // is why upstream's EDX arm is a plain `ADD_rr`.
+                // R11 (X86_64_SCRATCH_REG) loads the absolute
+                // nursery_free/nursery_top addresses.
+                if sv == rx86::ECX {
+                    dynasm!(self.mc ; .arch x64 ; mov rdx, rcx);
+                    sv = rx86::EDX;
+                }
                 let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
                 let slow_path = self.mc.new_dynamic_label();
                 let done = self.mc.new_dynamic_label();
@@ -6538,7 +6552,7 @@ impl<'a> Assembler386<'a> {
             if ts.len() == expected_len {
                 SmallVec::from_slice(&ts)
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-                op.getarglist()
+                op.args_slice()
                     .iter()
                     .map(|opref| {
                         self.opref_type_at(opref.to_opref(), op_index)
@@ -6592,7 +6606,7 @@ impl<'a> Assembler386<'a> {
             // matches the caller's CALL_ASSEMBLER result kind (a Void
             // mismatch routes every return through the assembler helper
             // instead of the result-loading fast path).
-            op.getarglist()
+            op.args_slice()
                 .iter()
                 .map(|opref| {
                     self.opref_type_at(opref.to_opref(), op_index)
@@ -6714,7 +6728,7 @@ impl<'a> Assembler386<'a> {
     fn genop_finish(&mut self, op: &Op, fail_index: u32) {
         // compiler.rs parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
-        let finish_refs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let finish_refs: Vec<OpRef> = op.args_slice().iter().map(|a| a.to_opref()).collect();
         let fail_arg_types = if let Some(explicit) = op.get_fail_arg_types() {
             if explicit.len() == finish_refs.len() {
                 explicit.to_vec()

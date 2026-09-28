@@ -814,6 +814,15 @@ pub fn install_builtin_modules() {
     pyre_install_module!(posix);
     #[cfg(windows)]
     pyre_install_module!("nt"(posix));
+    // `_bootstrap_external` imports `winreg` unconditionally under
+    // `sys.platform == "win32"`, so on Windows it belongs to the same
+    // bootstrap set as `nt` and `_stat`: without it the import machinery — and
+    // therefore `site` — never comes up, and the interpreter runs the whole
+    // program through the native importer fallback instead. `winreg` is in
+    // `sys.builtin_module_names` on both CPython 3.14 and PyPy 8.0.0.
+    // `moduledef.py applevel_name = 'winreg'` over `pypy/module/_winreg`.
+    #[cfg(windows)]
+    pyre_install_module!(winreg);
     pyre_install_module!(_collections);
     pyre_install_module!(_ast);
     pyre_install_module!("_imp"(imp));
@@ -833,7 +842,7 @@ pub fn install_builtin_modules() {
 
     // Host-access modules — arbitrary FFI (`_ctypes`), real signals.
     // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp`, `errno`, `_stat`,
-    // `_pypy_generic_alias`, and the Windows host modules
+    // `_pypy_generic_alias`, and the Windows host modules other than `winreg`
     // live in `pyre-module`.  None of the host
     // ones belong to the mediated ll_os/ll_time surface, so the sandbox
     // interpreter omits them entirely: `import _ctypes` then raises

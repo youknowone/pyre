@@ -320,10 +320,10 @@ pub trait ForwardingHost {
 
 impl ForwardingHost for Op {
     fn get_forwarded(&self) -> Forwarded {
-        self.forwarded().borrow()
+        self.forwarded.borrow()
     }
     fn store_forwarded(&self, value: Forwarded) {
-        self.forwarded().set(value);
+        self.forwarded.set(value);
     }
     fn is_same_op(&self, op: &crate::resoperation::OpRc) -> bool {
         std::ptr::eq(self, crate::resoperation::OpRc::as_ptr(op))
@@ -475,54 +475,12 @@ const FW_SMALL_WIDE: u64 = 4;
 const FW_INFO_PTR: u64 = 5;
 const FW_INFO_BOUND: u64 = 6;
 const FW_INFO_OTHER: u64 = 7;
-/// Heap pointers are 48-bit. Bits 56-61 of an `IntBound` word may carry
-/// a small `_resint` stamp so optimizer restamp does not mint ThinStamp
-/// around forwarded-only.
+/// Heap pointers are 48-bit.
 const FWD_PTR_MASK: u64 = (1 << 48) - 1;
-const FWD_STAMP_SHIFT: u64 = 56;
-const FWD_STAMP_MASK: u64 = 0x3f;
 
 #[inline]
 fn fwd_ptr(w: u64) -> u64 {
     w & FWD_PTR_MASK & !FW_TAG
-}
-
-/// SmallConst identity lives in bits 35-63. Bits 56-61 may carry a
-/// small stamp, so a packed stamp keeps the id in bits 35-55 (21 bits).
-const SMALL_CONST_ID_STAMP_BITS: u64 = 21;
-
-#[inline]
-pub(crate) fn fwd_stamp(w: u64) -> u32 {
-    match w & FW_TAG {
-        FW_INFO_BOUND | FW_SMALL_CONST => ((w >> FWD_STAMP_SHIFT) & FWD_STAMP_MASK) as u32,
-        _ => 0,
-    }
-}
-
-#[inline]
-pub(crate) fn try_pack_fwd_stamp(packed: u64, stamp: u32) -> Option<u64> {
-    if stamp >= 64 {
-        return None;
-    }
-    match packed & FW_TAG {
-        FW_INFO_BOUND => Some((packed & FWD_PTR_MASK) | ((stamp as u64) << FWD_STAMP_SHIFT)),
-        FW_SMALL_CONST if packed >> 35 < (1 << SMALL_CONST_ID_STAMP_BITS) => {
-            let body = packed & ((1u64 << FWD_STAMP_SHIFT) - 1);
-            Some(body | ((stamp as u64) << FWD_STAMP_SHIFT))
-        }
-        _ => None,
-    }
-}
-
-#[inline]
-pub(crate) fn strip_fwd_stamp(w: u64) -> u64 {
-    match w & FW_TAG {
-        FW_OP | FW_INPUTARG | FW_CONST | FW_INFO_PTR | FW_INFO_BOUND | FW_INFO_OTHER => {
-            w & FWD_PTR_MASK
-        }
-        FW_SMALL_CONST => w & ((1u64 << FWD_STAMP_SHIFT) - 1),
-        _ => w,
-    }
 }
 
 pub(crate) fn pack_forwarded(v: Forwarded) -> u64 {
@@ -602,12 +560,7 @@ pub(crate) fn unpack_forwarded(w: u64) -> Forwarded {
         }
         FW_SMALL_CONST => {
             let val = ((w >> 3) as u32) as u64;
-            let stamp = (w >> FWD_STAMP_SHIFT) & FWD_STAMP_MASK;
-            let id = if stamp == 0 {
-                w >> 35
-            } else {
-                (w >> 35) & ((1 << SMALL_CONST_ID_STAMP_BITS) - 1)
-            };
+            let id = w >> 35;
             Forwarded::SmallConst((id << 32) | val)
         }
         FW_SMALL_WIDE => Forwarded::SmallWide(w >> 3),
@@ -658,12 +611,7 @@ pub(crate) fn classify_packed_forwarded(w: u64) -> PackedForwarded {
         FW_CONST => PackedForwarded::Const(fwd_ptr(w) as *const Cell<Value>),
         FW_SMALL_CONST => {
             let val = ((w >> 3) as u32) as u64;
-            let stamp = (w >> FWD_STAMP_SHIFT) & FWD_STAMP_MASK;
-            let id = if stamp == 0 {
-                w >> 35
-            } else {
-                (w >> 35) & ((1 << SMALL_CONST_ID_STAMP_BITS) - 1)
-            };
+            let id = w >> 35;
             PackedForwarded::SmallConst((id << 32) | val)
         }
         FW_SMALL_WIDE => PackedForwarded::SmallWide(w >> 3),

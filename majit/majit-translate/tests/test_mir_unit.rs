@@ -19,8 +19,8 @@ fn mem_forget_returns_a_defined_unit_value() {
         })
     };
     let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
-    let unit = json!({"Adt": {"id": "Tuple", "generics": generics}});
-    let word = json!({"Literal": {"UInt": "U64"}});
+    let unit = json!({"Adt": {"id": 0, "builtin": "Tuple", "generics": generics}});
+    let word = json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
     let place = |id, ty: &serde_json::Value| json!({"kind": {"Local": id}, "ty": ty});
     let file = json!({"charon_version": "0.1.201", "has_errors": false,
         "translated": {"crate_name": "fixture", "type_decls": [],
@@ -35,12 +35,12 @@ fn mem_forget_returns_a_defined_unit_value() {
                     ]},
                     "body": [
                         {"statements": [], "terminator": {"span": span, "kind": {"Call": {
-                            "call": {"func": {"Regular": {"kind": {"Fun": {"Regular": 1}}, "generics": generics}},
+                            "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                 "args": [{"Move": place(1, &word)}], "dest": place(2, &unit)},
                             "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "terminator": {"span": span, "kind": {"Call": {
-                            "call": {"func": {"Regular": {"kind": {"Fun": {"Regular": 2}}, "generics": generics}},
+                            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                                 "args": [{"Copy": place(2, &unit)}], "dest": place(0, &word)},
                             "target": 3, "on_unwind": 2
                         }}}},

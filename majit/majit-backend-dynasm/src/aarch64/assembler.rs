@@ -502,7 +502,7 @@ pub struct AssemblerARM64<'a> {
     /// of thousands of ops. The box→
     /// location map is a dict in the reference assembler; insertion order is
     /// preserved (no semantic change, only the lookup cost).
-    opref_to_slot: indexmap::IndexMap<OpRef, usize>,
+    opref_to_slot: indexmap::IndexMap<OpRef, usize, rustc_hash::FxBuildHasher>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
     inputargs: &'a [InputArgRc],
     /// Trace operations — borrowed for `opref_type` lookups (reads
@@ -553,7 +553,7 @@ pub struct AssemblerARM64<'a> {
     /// displacement to the recovery stub it binds that label to.  The earliest
     /// branch is the one that has to reach furthest, and a label with no entry
     /// was never branched to in the short form.
-    short_guard_branch_offsets: IndexMap<DynamicLabel, usize>,
+    short_guard_branch_offsets: IndexMap<DynamicLabel, usize, rustc_hash::FxBuildHasher>,
     /// `(branch offset, stub offset)` for every short guard branch whose stub
     /// landed outside `b.cond`'s forward reach.  Read by `check_guard_reach`.
     guard_reach_violations: Vec<(usize, usize)>,
@@ -564,7 +564,7 @@ pub struct AssemblerARM64<'a> {
 
     /// x86/assembler.py:93 target_tokens_currently_compiling parity.
     /// Keyed by descriptor pointer identity (PyPy uses Python `is`).
-    target_tokens_currently_compiling: IndexMap<usize, DynamicLabel>,
+    target_tokens_currently_compiling: IndexMap<usize, DynamicLabel, rustc_hash::FxBuildHasher>,
     compiled_target_tokens: Vec<majit_ir::DescrRef>,
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
@@ -799,7 +799,7 @@ impl<'a> AssemblerARM64<'a> {
             header_pc,
             input_types: Vec::new(),
             bridge_input_locs: None,
-            opref_to_slot: indexmap::IndexMap::new(),
+            opref_to_slot: indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher),
             inputargs,
             operations,
             inputarg_pos,
@@ -809,10 +809,10 @@ impl<'a> AssemblerARM64<'a> {
             guard_success_cc: None,
             pending_cmp_cc: None,
             long_guard_branch: false,
-            short_guard_branch_offsets: IndexMap::new(),
+            short_guard_branch_offsets: IndexMap::with_hasher(rustc_hash::FxBuildHasher),
             guard_reach_violations: Vec::new(),
             unrelocated_jump_target: None,
-            target_tokens_currently_compiling: IndexMap::new(),
+            target_tokens_currently_compiling: IndexMap::with_hasher(rustc_hash::FxBuildHasher),
             compiled_target_tokens: Vec::new(),
             vtable_offset,
             subclassrange_min_offset,
@@ -2132,7 +2132,7 @@ impl<'a> AssemblerARM64<'a> {
 
         // ── Run register allocator ──
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
-        if std::env::var_os("MAJIT_J2PLAN_LOG").is_some() {
+        if crate::majit_j2plan_log_enabled() {
             let plan = crate::j2plan::TracePlan::build(inputargs, ops);
             // Independent debug toggle — not gated by MAJIT_LOG.
             eprintln!("[dynasm:j2plan] {}", plan.summary());
@@ -3288,7 +3288,7 @@ impl<'a> AssemblerARM64<'a> {
                     // read exactly this field to choose their scratch
                     // register, and `loc_width` reads it for the width.
                     let arg_tp = op
-                        .getarglist()
+                        .args_slice()
                         .get(i)
                         .and_then(|arg| self.opref_type_at(arg.to_opref(), Some(op_index)))
                         .unwrap_or(Type::Int);
@@ -4924,11 +4924,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; =>fail_label);
 
         dynasm!(self.mc ; .arch aarch64 ; bl =>save_regs_label);
-        if std::env::var("MAJIT_TRACE_CALL_DIAG")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            == Some(self.trace_id)
-        {
+        if crate::trace_call_diag_id() == Some(self.trace_id) {
             let fail_index = guard_token
                 .fail_descr
                 .as_fail_descr()
@@ -5522,7 +5518,7 @@ impl<'a> AssemblerARM64<'a> {
             if ts.len() == expected_len {
                 SmallVec::from_slice(&ts)
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-                op.getarglist()
+                op.args_slice()
                     .iter()
                     .map(|opref| {
                         self.opref_type_at(opref.to_opref(), op_index)
@@ -5576,7 +5572,7 @@ impl<'a> AssemblerARM64<'a> {
             // matches the caller's CALL_ASSEMBLER result kind (a Void
             // mismatch routes every return through the assembler helper
             // instead of the result-loading fast path).
-            op.getarglist()
+            op.args_slice()
                 .iter()
                 .map(|opref| {
                     self.opref_type_at(opref.to_opref(), op_index)
@@ -5700,7 +5696,7 @@ impl<'a> AssemblerARM64<'a> {
     fn genop_finish(&mut self, op: &Op, _fail_index: u32) {
         // compiler.rs parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
-        let finish_refs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let finish_refs: Vec<OpRef> = op.args_slice().iter().map(|a| a.to_opref()).collect();
         let fail_arg_types = if let Some(explicit) = op.get_fail_arg_types() {
             if explicit.len() == finish_refs.len() {
                 explicit.to_vec()
@@ -6228,11 +6224,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.store_rax_to_result(op.pos().get());
             }
         }
-        if std::env::var("MAJIT_TRACE_CALL_DIAG")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            == Some(self.trace_id)
-        {
+        if crate::trace_call_diag_id() == Some(self.trace_id) {
             self.emit_push_all_volatile_regs();
             self.emit_mov_imm64(0, op.pos().get().raw() as i64);
             dynasm!(self.mc ; .arch aarch64 ; mov x1, x29);

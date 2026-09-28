@@ -301,7 +301,7 @@ impl NumbHeap {
     }
 }
 
-static NUMB_HEAP: std::sync::Mutex<NumbHeap> = std::sync::Mutex::new(NumbHeap::new());
+static NUMB_HEAP: parking_lot::Mutex<NumbHeap> = parking_lot::Mutex::new(NumbHeap::new());
 
 /// Handle for a `NUMBERING` buffer. Clone is a refcount bump.
 #[derive(Debug)]
@@ -321,10 +321,7 @@ unsafe impl Sync for NumberingRef {}
 impl NumberingRef {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         if bytes.len() <= NUMB_DATA {
-            let cell = NUMB_HEAP
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .alloc(bytes);
+            let cell = NUMB_HEAP.lock().alloc(bytes);
             Self {
                 inner: NumberingInner::Slab(std::ptr::NonNull::new(cell).expect("numb cell")),
             }
@@ -383,10 +380,7 @@ impl Drop for NumberingRef {
                     .fetch_sub(1, std::sync::atomic::Ordering::Release)
             };
             if prev == 1 {
-                NUMB_HEAP
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .release(ptr.as_ptr());
+                NUMB_HEAP.lock().release(ptr.as_ptr());
             }
         }
     }

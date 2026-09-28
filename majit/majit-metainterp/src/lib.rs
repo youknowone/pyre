@@ -430,13 +430,13 @@ pub fn is_bridge_walking() -> bool {
 /// A bound residual saw a walk-local `Vm` or index and did not run.
 /// The walker checks this after the call and aborts to the merge point.
 pub fn request_walk_abort() {
-    WALK_ABORT_REQUESTED.with(|cell| cell.set(true));
+    WALK_ABORT_REQUESTED.with(majit_backend::arm_walk_latch);
 }
 
 /// Consume a pending [`request_walk_abort`].
 #[must_use]
 pub fn take_walk_abort() -> bool {
-    WALK_ABORT_REQUESTED.with(|cell| cell.replace(false))
+    majit_backend::take_walk_latch(&WALK_ABORT_REQUESTED)
 }
 
 /// A bound residual already applied a heap effect on this walk.
@@ -2045,6 +2045,7 @@ fn guard_census_enabled() -> bool {
 /// lookups the guard-failure and optimizer paths make per event cost no
 /// hashing to speak of; the default `RandomState` (SipHash) does.
 pub(crate) type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
+pub(crate) type FxIndexSet<K> = indexmap::IndexSet<K, rustc_hash::FxBuildHasher>;
 
 pub fn guard_census_record(green_key: u64, trace_id: u64, fail_index: u32) {
     if !guard_census_enabled() {

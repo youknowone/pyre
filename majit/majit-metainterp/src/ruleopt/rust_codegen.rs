@@ -16,6 +16,7 @@ use crate::ruleopt::parse::{
 
 const OPS_WITH_OP_RC: &[&str] = &[
     "int_eq",
+    "int_ne",
     "int_add",
     "int_sub",
     "int_mul",
@@ -28,6 +29,7 @@ const OPS_WITH_OP_RC: &[&str] = &[
     "int_rshift",
     "uint_rshift",
     "int_is_true",
+    "int_is_zero",
     "int_force_ge_zero",
 ];
 
@@ -233,7 +235,7 @@ impl RustCodegen {
         );
         self.emit("");
         self.with_block(
-            "fn as_operation_b(b: &Operand, opcode: OpCode, ctx: &mut OptContext) -> Option<Op> {",
+            "fn as_operation_b(b: &Operand, opcode: OpCode, ctx: &mut OptContext) -> Option<majit_ir::OpRc> {",
             |this| {
                 this.emit("let op = ctx.get_producing_op(b)?;");
                 this.with_block("if op.opcode == opcode {", |this| this.emit("Some(op)"));
@@ -689,7 +691,9 @@ impl RustCodegen {
 
     fn emit_target_constant(&mut self, value: String, position: usize) {
         let suffix = Self::static_suffix(&self.method_opname);
-        self.emit(format!("self.make_constant_int(op, {value}, ctx);"));
+        self.emit(format!(
+            "self.make_constant_int(&Operand::from_bound_op(op_rc), {value}, ctx);"
+        ));
         self.emit(format!("fire(&RULE_FIRED_{suffix}, {position});"));
         self.emit("return OptimizationResult::Remove;");
     }

@@ -13499,9 +13499,17 @@ impl CodeWriter {
                                         if c.value == super::flow::ConstantValue::None
                                 )
                             {
-                                emit_load_fast_ref!(current_depth, idx, py_pc);
-                                let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                // `pyopcode.py` `LOAD_FAST` reads
+                                // `locals_cells_stack_w[varindex]` before the
+                                // null test. The read stays off the operand
+                                // stack; the push below is the `pushvalue`
+                                // and happens before the branch so the
+                                // not-taken arm resumes a slot this op
+                                // already wrote. Pushing only on the bound
+                                // arm leaves that slot live with no source
+                                // (`BranchGuardKeptSlotUnsourced`) and the
+                                // walk aborts after earlier stores.
+                                let value_value = emit_read_local_ref!(idx, py_pc);
                                 let truth = emit_graph_op_with_result(
                                     &mut graph,
                                     &current_block.block(),
@@ -13512,12 +13520,11 @@ impl CodeWriter {
                                 );
                                 current_block.block().borrow_mut().exitswitch =
                                     Some(super::flow::ExitSwitch::Value(truth.into()));
+                                // Bound arm keeps this push. The null arm pops
+                                // it before `_load_fast_failed`, so a failure
+                                // still raises with the pre-opcode stack.
+                                push_and_bump!(value_value.clone(), py_pc);
 
-                                // The result push belongs on each arm, not on
-                                // the switch block: a push before the branch
-                                // would publish a slot the raising arm never
-                                // pushed (`LOAD_FAST` pushes only on the
-                                // non-null path).
                                 // The dynamic null check splits the raising arm
                                 // explicitly (`emit_raise!`). Its successful
                                 // continuation cannot raise and must not
@@ -13575,7 +13582,6 @@ impl CodeWriter {
                                 current_block = bound_block;
                                 current_state = bound_state;
                                 current_depth = arm_depth;
-                                push_and_bump!(value_value, py_pc);
                                 mergeblock(
                                     code,
                                     &mut graph,
@@ -13594,10 +13600,14 @@ impl CodeWriter {
                                 );
 
                                 // `pyopcode.py` `_load_fast_failed` raises
-                                // before any push.
+                                // before any push. Drop the pre-branch
+                                // `pushvalue` so the handler sees the
+                                // pre-opcode stack.
                                 current_block = unbound_block;
                                 current_state = unbound_state;
                                 current_depth = arm_depth;
+                                emit_popvalue_ref!(current_depth, py_pc);
+                                let _ = current_state.stack.pop();
                                 emit_unbound_local_raise!(idx, py_pc);
                                 needs_fallthrough = false;
                             } else {
@@ -13609,9 +13619,7 @@ impl CodeWriter {
                                     .into();
                                 let name_idx_const: super::flow::FlowValue =
                                     super::flow::Constant::signed(idx as i64).into();
-                                emit_load_fast_ref!(current_depth, idx, py_pc);
-                                let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let value_value = emit_read_local_ref!(idx, py_pc);
                                 let result_value = emit_graph_op_with_result(
                                     &mut graph,
                                     &current_block.block(),

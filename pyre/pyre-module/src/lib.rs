@@ -123,8 +123,6 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("termios", module::termios::init);
-    #[cfg(windows)]
-    pyre_interpreter::importing::register_builtin_module("winreg", module::winreg::init);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("winsound", module::winsound::init);
     pyre_interpreter::importing::register_builtin_module("unicodedata", module::unicodedata::init);

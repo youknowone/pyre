@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 #[derive(Default)]
-pub(crate) struct AddressHasher {
+pub struct AddressHasher {
     hash: u64,
 }
 
@@ -62,8 +62,8 @@ impl Hasher for AddressHasher {
     }
 }
 
-pub(crate) type AddressMap<V> = HashMap<usize, V, BuildHasherDefault<AddressHasher>>;
-pub(crate) type AddressSet = HashSet<usize, BuildHasherDefault<AddressHasher>>;
+pub type AddressMap<V> = HashMap<usize, V, BuildHasherDefault<AddressHasher>>;
+pub type AddressSet = HashSet<usize, BuildHasherDefault<AddressHasher>>;
 
 #[cfg(test)]
 mod tests {

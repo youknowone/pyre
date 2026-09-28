@@ -25,7 +25,6 @@ type CallI64s = SmallVec<[i64; CALL_INLINE]>;
 type CallTypes = SmallVec<[Type; CALL_INLINE]>;
 type CallArgs = SmallVec<[JitCallArg; CALL_INLINE]>;
 type CallValues = SmallVec<[Value; CALL_INLINE]>;
-type CallTriples = SmallVec<[(OpRef, i64, Type); CALL_INLINE]>;
 
 /// `GcLLDescr_boehm.malloc_fixedsize` (`llmodel_alloc`).
 ///
@@ -11598,30 +11597,11 @@ where
         CallI64s,
         CallI64s,
     ) {
-        let mut values_i = CallTriples::with_capacity(args_i.len());
+        // pyjitpl.py `_build_allboxes`: one walk over the calldescr's
+        // argument classes, taking the next encoded register of that kind.
         let mut raw_i = CallI64s::with_capacity(args_i.len());
-        for &arg in args_i {
-            let value = self.read_call_arg(arg);
-            raw_i.push(value.1);
-            values_i.push(value);
-        }
-
-        let mut values_r = CallTriples::with_capacity(args_r.len());
         let mut raw_r = CallI64s::with_capacity(args_r.len());
-        for &arg in args_r {
-            let value = self.read_call_arg(arg);
-            raw_r.push(value.1);
-            values_r.push(value);
-        }
-
-        let mut values_f = CallTriples::with_capacity(args_f.len());
         let mut raw_f = CallI64s::with_capacity(args_f.len());
-        for &arg in args_f {
-            let value = self.read_call_arg(arg);
-            raw_f.push(value.1);
-            values_f.push(value);
-        }
-
         let mut next_i = 0usize;
         let mut next_r = 0usize;
         let mut next_f = 0usize;
@@ -11629,63 +11609,44 @@ where
         let mut concrete_args = CallI64s::with_capacity(arg_classes.len());
         let mut arg_types = CallTypes::with_capacity(arg_classes.len());
         for class in arg_classes.chars() {
-            let (arg, concrete, arg_type) = match class {
-                'i' | 'S' => {
-                    let value = values_i.get(next_i).copied().unwrap_or_else(|| {
-                        panic!(
-                            "BC_RESIDUAL_CALL_*_V calldescr arg_classes \
-                             expected int arg #{next_i}, only {} encoded",
-                            values_i.len()
-                        )
-                    });
-                    next_i += 1;
-                    value
-                }
-                'r' => {
-                    let value = values_r.get(next_r).copied().unwrap_or_else(|| {
-                        panic!(
-                            "BC_RESIDUAL_CALL_*_V calldescr arg_classes \
-                             expected ref arg #{next_r}, only {} encoded",
-                            values_r.len()
-                        )
-                    });
-                    next_r += 1;
-                    value
-                }
-                'f' | 'L' => {
-                    let value = values_f.get(next_f).copied().unwrap_or_else(|| {
-                        panic!(
-                            "BC_RESIDUAL_CALL_*_V calldescr arg_classes \
-                             expected float arg #{next_f}, only {} encoded",
-                            values_f.len()
-                        )
-                    });
-                    next_f += 1;
-                    value
-                }
+            let (bank, next, raw, kind) = match class {
+                'i' | 'S' => (args_i, &mut next_i, &mut raw_i, "int"),
+                'r' => (args_r, &mut next_r, &mut raw_r, "ref"),
+                'f' | 'L' => (args_f, &mut next_f, &mut raw_f, "float"),
                 other => panic!(
                     "BC_RESIDUAL_CALL_*_V calldescr has unsupported \
                      arg class {other:?}"
                 ),
             };
-            args.push(arg);
+            let arg = *bank.get(*next).unwrap_or_else(|| {
+                panic!(
+                    "BC_RESIDUAL_CALL_*_V calldescr arg_classes \
+                     expected {kind} arg #{}, only {} encoded",
+                    *next,
+                    bank.len()
+                )
+            });
+            *next += 1;
+            let (opref, concrete, arg_type) = self.read_call_arg(arg);
+            raw.push(concrete);
+            args.push(opref);
             concrete_args.push(concrete);
             arg_types.push(arg_type);
         }
 
         assert_eq!(
             next_i,
-            values_i.len(),
+            args_i.len(),
             "BC_RESIDUAL_CALL_*_V encoded extra int args not present in calldescr"
         );
         assert_eq!(
             next_r,
-            values_r.len(),
+            args_r.len(),
             "BC_RESIDUAL_CALL_*_V encoded extra ref args not present in calldescr"
         );
         assert_eq!(
             next_f,
-            values_f.len(),
+            args_f.len(),
             "BC_RESIDUAL_CALL_*_V encoded extra float args not present in calldescr"
         );
         (args, concrete_args, arg_types, raw_i, raw_r, raw_f)
