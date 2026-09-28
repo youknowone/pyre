@@ -420,6 +420,11 @@ fn main() {
             println!("   Option<PyObjectRef> type ids: {}", opt.len());
             gc_tys.extend(opt);
         }
+        if std::env::var("GC_SLICE_ARGS").is_ok() {
+            let slices = liveness::gc_slice_type_ids(&llbc);
+            println!("   &[PyObjectRef] type ids: {}", slices.len());
+            gc_tys.extend(slices);
+        }
         let push_root_ids: std::collections::HashSet<u64> = pin_ids.iter().copied().collect();
         let (found, stats) = liveness::scan(
             &llbc,

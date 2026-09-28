@@ -311,6 +311,19 @@ pub fn gc_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
     out
 }
 
+/// The type ids of `&[PyObjectRef]` in *this* artefact, read off
+/// `pin_roots`'s parameter.
+///
+/// A builtin receives its arguments as a native slice: a copy the collector
+/// does not rewrite, so an element read after a collecting call is the same
+/// stale word a bare local would be.
+pub fn gc_slice_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
+    llbc.iter_local_fns()
+        .filter(|fd| fd.item_meta.name_path().ends_with("gc_roots::pin_roots"))
+        .filter_map(|fd| fd.signature.inputs.last().and_then(ty_id))
+        .collect()
+}
+
 /// The type ids of `Option<PyObjectRef>` in *this* artefact.
 ///
 /// A GC pointer held as `Option<PyObjectRef>` goes stale across a collecting
@@ -806,6 +819,10 @@ pub fn scan(
         // `pin_roots(&[..])` lowers through.
         let mut defs: HashMap<u64, PinSrc> = HashMap::new();
         let mut defined: HashSet<u64> = HashSet::new();
+        // `_t = &mut _l`: a callee handed `_t` owns keeping `_l` current, the
+        // way `try_dispatch_binary_special` pins both operands and writes the
+        // live words back through its `&mut` parameters.
+        let mut mut_borrow_of: HashMap<u64, u64> = HashMap::new();
         for (b, blk) in body.body.iter().enumerate() {
             for st in &blk.statements {
                 let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
@@ -816,7 +833,14 @@ pub fn scan(
                 };
                 if !defined.insert(d) {
                     defs.remove(&d);
+                    mut_borrow_of.remove(&d);
                     continue;
+                }
+                if let Rvalue::Ref { place, kind, .. } = &rv
+                    && matches!(kind.as_str(), Some("Mut" | "TwoPhaseMut"))
+                    && let Some(l) = bare_local(place)
+                {
+                    mut_borrow_of.insert(d, l);
                 }
                 if let Some(src) = pin_src(&rv) {
                     defs.insert(d, src);
@@ -1300,6 +1324,15 @@ pub fn scan(
             }
             if let Some(d) = bare_local(&call.dest) {
                 after.remove(&d);
+            }
+            for a in &call.args {
+                let mut used: HashSet<u64> = HashSet::new();
+                use_operand(a, &mut used);
+                for t in used {
+                    if let Some(l) = mut_borrow_of.get(&t) {
+                        after.remove(l);
+                    }
+                }
             }
             after.retain(|l| gc_locals.contains_key(l));
             // One span answers every column below, and it is the
