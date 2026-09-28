@@ -2013,6 +2013,18 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let root_ec = sym.concrete_execution_context();
     let root_ec_box = sym.execution_context();
     let root_frame_box = sym.frame();
+    // The scope the guard left open, as `setup_bridge_sym` published it.  The
+    // sub-walk enters and leaves frames on the live `topframeref`, so a drain
+    // that hands the guard back to the blackhole restores this first: the
+    // blackhole resumes the innermost frame with its scope still open.
+    let _entry_topframeref_roots = pyre_object::gc_roots::push_roots();
+    let entry_topframeref_slot = (!root_ec.is_null()).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(
+            unsafe { (*root_ec).topframeref } as pyre_object::PyObjectRef
+        );
+        slot
+    });
     let recursive_carrier = carrier_contains_recursive_portal(w_code, carrier);
     if crate::jitcode_dispatch::p2_diag_enabled() {
         let pcs: Vec<usize> = carrier
@@ -2168,6 +2180,22 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let concrete_stack_end = recipe.valuestackdepth.min(recipe.concrete_r.len());
     let resumed_stack_concretes =
         &recipe.concrete_r[nlocals.min(concrete_stack_end)..concrete_stack_end];
+    // `_prepare_exception_resumption` / `finishframe_exception`: on an
+    // exception-guard bridge the deepest callee is the frame whose residual
+    // call raised, so it resumes on that exception rather than at its
+    // no-exception continuation -- entering its own handler, or popping to the
+    // shallower carrier frames when it has none.
+    let handler_entry = (ctx.is_bridge_trace
+        && ctx.bridge_source_is_exception_guard()
+        && !sym.last_exc_box().is_none()
+        && !sym.last_exc_value().is_null())
+    .then(|| crate::jitcode_dispatch::FrameHandlerEntry::Restored {
+        exc_concrete: sym.last_exc_value(),
+        catch_target: crate::jitcode_dispatch::find_catch_for_exc_resume(
+            callee_pjc.jitcode.code.as_slice(),
+            entry,
+        ),
+    });
     // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
     // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
     // `SubReturn` instead of the top-level `Finish` pyre's own-portal model
@@ -2202,6 +2230,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         } else {
             &[]
         },
+        handler_entry,
     );
     let deepest_got_exception = matches!(
         &walk,
@@ -2210,7 +2239,20 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             _
         )))
     );
-    crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, deepest_got_exception);
+    // `execute_frame`'s `finally: ec.leave(...)` runs once the frame has
+    // returned or raised.  Any other outcome leaves the frame unfinished, and
+    // the abort tail below hands it on still running.
+    let deepest_finished = deepest_got_exception
+        || matches!(
+            &walk,
+            Some(Ok((
+                crate::jitcode_dispatch::DispatchOutcome::SubReturn { .. },
+                _
+            )))
+        );
+    if deepest_finished {
+        crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, deepest_got_exception);
+    }
     // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
     // into the root's operand-stack result slot and walk the ROOT top-level to
     // compile the bridge (the recorded callee continuation + the root
@@ -2424,6 +2466,12 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // cursors back on the same condition.
         crate::jitcode_dispatch::fbw_store_journal_rollback();
         crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
+        if let Some(slot) = entry_topframeref_slot {
+            unsafe {
+                (*(root_ec as *mut pyre_interpreter::PyExecutionContext)).topframeref =
+                    pyre_object::gc_roots::shadow_stack_get(slot) as *mut pyre_interpreter::PyFrame;
+            }
+        }
     }
     // An inlined `TraceTooLong` is `SwitchToBlackhole(ABORT_TOO_LONG)` on
     // the outer walk (`full_body_walk_trace`). The carrier drain used to
