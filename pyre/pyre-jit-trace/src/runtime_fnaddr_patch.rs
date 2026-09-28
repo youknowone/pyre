@@ -201,9 +201,14 @@ static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
 ///
 /// `call.py` `getcalldescr` stores `llmemory.cast_ptr_to_adr(tgt_func)`,
 /// the raw funcptr, not the `ccall_*` wrapper. A translate-time miss is
-/// `symbolic_fnaddr_for_path` of that funcptr. `0` is left alone. Anything
-/// else that this process cannot map through `jit_trace_fnaddrs` panics
-/// with the path.
+/// `symbolic_fnaddr_for_path` of that funcptr. `0` is left alone.
+///
+/// A funcptr whose path this process does not link (a binary built without
+/// the module that declares it, e.g. the core or wasm runner) maps to
+/// [`call_release_gil_target_not_linked`]: its `ccall_*` wrapper is not
+/// linked either, so no jitcode here can reach the call, and a call that
+/// does reach it aborts.  An address with no recorded path at all is a
+/// translator/runtime mismatch and panics.
 pub fn rewrite_call_release_gil_target(effect_info: &mut majit_ir::EffectInfo) {
     let addr = effect_info.call_release_gil_target.0;
     if addr == 0 {
@@ -218,9 +223,7 @@ fn release_gil_runtime_addr(addr: u64) -> u64 {
         let path = symbolic_fnaddr_path(addr_i).unwrap_or_else(|| {
             panic!("call_release_gil_target {addr:#x} is a symbolic fnaddr with no recorded path")
         });
-        return runtime_addr_for_path(path).unwrap_or_else(|| {
-            panic!("call_release_gil_target path {path} is not in jit_trace_fnaddrs")
-        }) as u64;
+        return runtime_addr_for_path(path).map_or_else(not_linked_addr, |addr| addr as u64);
     }
     if let Some(&runtime) = FNADDR_CORRESPONDENCE.get(&addr_i) {
         return runtime as u64;
@@ -233,9 +236,18 @@ fn release_gil_runtime_addr(addr: u64) -> u64 {
     else {
         panic!("call_release_gil_target address {addr:#x} has no jit_trace_fnaddrs path");
     };
-    runtime_addr_for_path(&path).unwrap_or_else(|| {
-        panic!("call_release_gil_target path {path} is not in jit_trace_fnaddrs")
-    }) as u64
+    runtime_addr_for_path(&path).map_or_else(not_linked_addr, |addr| addr as u64)
+}
+
+fn not_linked_addr() -> u64 {
+    call_release_gil_target_not_linked as *const () as usize as u64
+}
+
+/// Stand-in target for a `CALL_RELEASE_GIL` funcptr that this binary does
+/// not link.
+extern "C" fn call_release_gil_target_not_linked() {
+    eprintln!("CALL_RELEASE_GIL reached a funcptr that is not linked into this binary");
+    std::process::abort();
 }
 
 fn runtime_addr_for_path(path: &str) -> Option<i64> {
