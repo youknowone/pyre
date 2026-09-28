@@ -179,10 +179,6 @@ fn the_x86_site_emits_nothing_until_invalidated() {
     let entry = token.ll_function_addr();
     assert_ne!(entry, 0);
     let before = unsafe { std::slice::from_raw_parts(entry as *const u8, 256).to_vec() };
-    assert!(
-        !before.windows(5).any(|w| w[0] == 0xE9),
-        "the unpatched trace has no JMP rel32 at the guard"
-    );
 
     backend.invalidate_loop(&token);
     let after = unsafe { std::slice::from_raw_parts(entry as *const u8, 256) };
@@ -190,6 +186,12 @@ fn the_x86_site_emits_nothing_until_invalidated() {
         .find(|&i| before[i] != after[i])
         .expect("invalidate_loop writes the branch");
     assert!(site + 5 <= before.len());
+    // Only the site itself is checked: an address immediate elsewhere in the
+    // window can contain an 0xE9 byte.
+    assert_ne!(
+        before[site], 0xE9,
+        "the unpatched trace has no JMP rel32 at the guard"
+    );
     assert_eq!(after[site], 0xE9, "invalidate_loop writes JMP rel32");
     assert_eq!(
         &before[site + 5..],
