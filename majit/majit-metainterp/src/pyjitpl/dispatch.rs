@@ -1562,6 +1562,11 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// because the previous arm's `BC_LOOP_HEADER` handler stamped it.
     /// Pyre's typed `i32` mirrors RPython's `int` (sentinel `-1`).
     seen_loop_header_for_jdindex: i32,
+    /// Runaway-trace backstop counters (`run_to_end` explains the bounds).
+    /// `run_one_step` advances them once per executed instruction.
+    walk_steps: u64,
+    walk_steps_since_growth: u64,
+    walk_last_num_ops: usize,
     marker: PhantomData<(S, R)>,
 }
 
@@ -2846,6 +2851,9 @@ where
             outer_program_pc: None,
             // pyjitpl.py:2882 / :2916 — sentinel "no loop_header seen yet".
             seen_loop_header_for_jdindex: -1,
+            walk_steps: 0,
+            walk_steps_since_growth: 0,
+            walk_last_num_ops: 0,
             marker: PhantomData,
         }
     }
@@ -3331,50 +3339,12 @@ where
         //     a non-productive spin never does).  Catches the cycle early.
         //   * `step_limit` — absolute cap for any other runaway.
         // `MAJIT_STALL_WINDOW` / `MAJIT_STEP_LIMIT` override for diagnosis.
-        let stall_window: u64 = crate::stall_window();
-        let step_limit: u64 = crate::step_limit();
-        let mut step_count: u64 = 0;
-        let mut last_num_ops = ctx.num_recorded_ops();
-        let mut steps_since_growth: u64 = 0;
+        // `run_one_step` executes many instructions per call, so it counts
+        // them itself (`count_walk_step`).
+        self.walk_steps = 0;
+        self.walk_steps_since_growth = 0;
+        self.walk_last_num_ops = ctx.num_recorded_ops();
         while !self.frames.is_empty() {
-            step_count += 1;
-            let n = ctx.num_recorded_ops();
-            if n > last_num_ops {
-                last_num_ops = n;
-                steps_since_growth = 0;
-            } else {
-                steps_since_growth += 1;
-            }
-            if steps_since_growth > stall_window || step_count > step_limit {
-                if crate::majit_log_enabled() {
-                    let why = if step_count > step_limit {
-                        "step limit"
-                    } else {
-                        "op-growth stall"
-                    };
-                    eprintln!(
-                        "[jit] trace_jitcode aborting ({why}): portal pc={portal_pc} jit pc={} steps={step_count} ops={n} (runaway trace)",
-                        self.frames.current_mut().pc
-                    );
-                }
-                sym.abort_portal_op();
-                return TraceAction::Abort;
-            }
-            if crate::optrace_enabled() {
-                let fr = self.frames.current_mut();
-                let cur = fr.code_cursor;
-                let anchor_pc = fr.pc;
-                let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
-                let name = fr.jitcode.name.clone();
-                eprintln!(
-                    "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
-                    self.frames.len(),
-                    cur,
-                    anchor_pc,
-                    opcode,
-                    name
-                );
-            }
             // Catch panics from BigInt overflow in runtime stack operations.
             // RPython doesn't have this issue (no BigInt); we abort the trace.
             let action = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3408,11 +3378,13 @@ where
                 {
                     // Every `Finish` return drains the framestack first.
                     eprintln!(
-                        "[interpret] run_to_end action={:?} steps={step_count} ops={} framestack drained",
+                        "[interpret] run_to_end action={:?} steps={} ops={} framestack drained",
                         action,
+                        self.walk_steps,
                         ctx.num_recorded_ops(),
                     );
                 } else if crate::majit_log_enabled() || crate::tldbg_enabled() {
+                    let steps = self.walk_steps;
                     let fr = self.frames.current_mut();
                     let last_op = fr
                         .jitcode
@@ -3427,7 +3399,7 @@ where
                         _ => "",
                     };
                     eprintln!(
-                        "[interpret] run_to_end action={:?} steps={step_count} ops={} cursor={} last_op=0x{last_op:02x} reason={why} jitcode={}",
+                        "[interpret] run_to_end action={:?} steps={steps} ops={} cursor={} last_op=0x{last_op:02x} reason={why} jitcode={}",
                         action,
                         ctx.num_recorded_ops(),
                         fr.code_cursor,
@@ -4011,11 +3983,110 @@ where
         );
     }
 
-    pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, _runtime: &R) -> TraceAction {
+    /// `pyjitpl.py` `MIFrame.run_one_step`: execute the frame forward,
+    /// leaving the loop only when the current frame changes (`ChangeFrame`,
+    /// a call or a return) or an instruction ends the trace. `live` and
+    /// `goto` advance the position in the loop itself.
+    ///
+    /// Two exits sit inside the loop because the checks they answer run once
+    /// per instruction: the runaway backstop (`count_walk_step`) and the
+    /// trace-length overflow `run_to_end` answers, which is left to that
+    /// caller.
+    pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
         self.install_replace_frames(ctx);
         // SAFETY: the guard is a local of this call and `ctx` is borrowed for
         // longer, so it is dropped while the `TraceCtx` it names is alive.
         let _clear = unsafe { ClearReplaceFrames::new(ctx) };
+        let depth = self.frames.len();
+        loop {
+            let Some(frame) = self.frames.frames.last_mut() else {
+                return TraceAction::Continue;
+            };
+            let pc = frame.code_cursor;
+            match frame.bytecode().get(pc).copied() {
+                Some(jitcode::insns::BC_LIVE) => {
+                    frame.code_cursor = pc + 3;
+                    continue;
+                }
+                Some(jitcode::insns::BC_JUMP) => {
+                    frame.code_cursor = frame
+                        .peek_u16_at(pc + 1)
+                        .expect("BC_JUMP target operand is truncated")
+                        as usize;
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(action) = self.count_walk_step(ctx) {
+                return action;
+            }
+            let action = self.execute_one_instruction(ctx, sym, runtime);
+            if !matches!(action, TraceAction::Continue)
+                || self.frames.len() != depth
+                || ctx.is_too_long()
+            {
+                return action;
+            }
+        }
+    }
+
+    /// Runaway backstop for a trace-recording walk; `run_to_end` documents
+    /// the two bounds. Returns the abort once either is exceeded.
+    fn count_walk_step(&mut self, ctx: &TraceCtx) -> Option<TraceAction> {
+        self.walk_steps += 1;
+        let n = ctx.num_recorded_ops();
+        if n > self.walk_last_num_ops {
+            self.walk_last_num_ops = n;
+            self.walk_steps_since_growth = 0;
+        } else {
+            self.walk_steps_since_growth += 1;
+        }
+        let step_limit = crate::step_limit();
+        if self.walk_steps_since_growth > crate::stall_window() || self.walk_steps > step_limit {
+            if crate::majit_log_enabled() {
+                let why = if self.walk_steps > step_limit {
+                    "step limit"
+                } else {
+                    "op-growth stall"
+                };
+                let portal_pc = self
+                    .outer_program_pc
+                    .unwrap_or_else(|| self.frames.current_mut().pc);
+                eprintln!(
+                    "[jit] trace_jitcode aborting ({why}): portal pc={portal_pc} jit pc={} steps={} ops={n} (runaway trace)",
+                    self.frames.current_mut().pc,
+                    self.walk_steps,
+                );
+            }
+            return Some(TraceAction::Abort);
+        }
+        if crate::optrace_enabled() {
+            let fr = self.frames.current_mut();
+            let cur = fr.code_cursor;
+            let anchor_pc = fr.pc;
+            let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
+            let name = fr.jitcode.name.clone();
+            eprintln!(
+                "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
+                self.frames.len(),
+                cur,
+                anchor_pc,
+                opcode,
+                name
+            );
+        }
+        None
+    }
+
+    /// One instruction of [`Self::run_one_step`]'s loop: pop a finished frame,
+    /// or decode and execute the instruction at the cursor.
+    #[inline(always)]
+    fn execute_one_instruction(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+    ) -> TraceAction {
         if crate::take_walk_abort() || majit_backend::take_null_mem_access() {
             ctx.symbolic_residual_abort = true;
             if crate::is_bridge_walking() || ctx.is_bridge_trace {
