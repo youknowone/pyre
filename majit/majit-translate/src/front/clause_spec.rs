@@ -1389,6 +1389,8 @@ mod tests {
         instance.push(
             json!({"Instantiated": {"params": {}, "skip_binder": args.clone(), "kind": "Other"}}),
         );
+        let mut sibling = instance.clone();
+        sibling[0] = json!({"Ident": ["sibling", 0]});
         let file = json!({
             "charon_version": "t",
             "has_errors": false,
@@ -1398,6 +1400,7 @@ mod tests {
                     decl(0, template, unstructured.clone()),
                     decl(1, Value::Array(instance.clone()), unstructured),
                     decl(2, Value::Array(instance), json!("Opaque")),
+                    decl(3, Value::Array(sibling), json!("Opaque")),
                 ],
                 "files": []
             }
@@ -1415,6 +1418,15 @@ mod tests {
         );
         // An instance with no body is the external declaration itself.
         assert_eq!(graph_name(2), "fixture::m::f");
+        assert_eq!(graph_name(3), "sibling::m::f");
+        // unless its crate is one of the local crates: that crate's own LLBC
+        // carries the body, registered under the same spec leaf.
+        crate::local_crates::with_local_crate_root("sibling", || {
+            assert_eq!(
+                graph_name(3),
+                format!("m::{}", spec_leaf("f", 3, &args, &llbc))
+            );
+        });
     }
 
     /// `&T` stays distinct from `T`.

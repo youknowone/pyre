@@ -3197,13 +3197,22 @@ pub(crate) fn graph_name_of(llbc: &Llbc, fd: &FunDecl) -> String {
 /// The leaf a Charon-monomorphized copy registers and is called under:
 /// [`crate::front::clause_spec::spec_leaf`] of its template leaf and its
 /// instance arguments.  `None` for an item Charon did not instantiate, and
-/// for an instance with no body in this LLBC: a foreign or std declaration
-/// is one external whatever it is instantiated at, so it keeps the template
-/// path, as an opaque callee does in `enqueue_spec`.
+/// for a bodyless instance of a foreign or std declaration: that is one
+/// external whatever it is instantiated at, so it keeps the template path, as
+/// an opaque callee does in `enqueue_spec`.  A bodyless instance of a local
+/// crate's item is the copy that crate's own LLBC carries a body for, so it
+/// takes the same leaf and a call across the crate boundary resolves to that
+/// copy.
 fn instance_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     let args = fd.item_meta.instantiation()?;
     if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
-        return None;
+        let sibling = fd.item_meta.name.first().is_some_and(|seg| {
+            matches!(seg, NameSeg::Ident { ident: (root, _) }
+                if crate::local_crates::is_local_crate_root(root))
+        });
+        if !sibling {
+            return None;
+        }
     }
     let name = fd.item_meta.name_path();
     let leaf = name.rsplit("::").next().unwrap_or(&name);
