@@ -707,7 +707,6 @@ pub struct TraceCtx {
     ///
     /// `None` outside the brief window between the dispatch-site stash
     /// and the jitdriver-side drain.
-    pub(crate) pending_switch_to_blackhole: Option<crate::pyjitpl::SwitchToBlackhole>,
     /// Framestack half of `pyjitpl.py MetaInterp.replace_box`.
     ///
     /// `_nonstandard_virtualizable` calls `self.metainterp.replace_box`
@@ -762,6 +761,10 @@ pub struct TraceCtx {
     /// `descr_arc.is_guard_exc()` and read by static bridge setup/walkers
     /// that only receive `TraceCtx`.
     pub(crate) bridge_source_is_exception_guard: bool,
+    /// `prepare_resume_from_failure` already recorded `RESTORE_EXCEPTION`
+    /// and `handle_possible_exception`. The walker must not emit that
+    /// sequence again, and must resume at the handler pc it was given.
+    pub(crate) bridge_exception_resume_prepared: bool,
     /// Set when a bridge-entry resume replay ran as the applying reader and
     /// met a write it could not apply. The trace then holds recorded writes
     /// whose heap half did not happen, so the entry that asked for that reader
@@ -1974,7 +1977,7 @@ impl TraceCtx {
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
             cpu: None,
-            pending_switch_to_blackhole: None,
+            bridge_exception_resume_prepared: false,
             replace_frames: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
@@ -2051,7 +2054,7 @@ impl TraceCtx {
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
             cpu: None,
-            pending_switch_to_blackhole: None,
+            bridge_exception_resume_prepared: false,
             replace_frames: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
@@ -2099,6 +2102,12 @@ impl TraceCtx {
     /// True only for bridge traces sourced from an exception guard descr.
     pub fn bridge_source_is_exception_guard(&self) -> bool {
         self.bridge_source_is_exception_guard
+    }
+
+    /// `prepare_resume_from_failure` already recorded the exception
+    /// resume ops. The walker resumes at the handler it was given.
+    pub fn bridge_exception_resume_prepared(&self) -> bool {
+        self.bridge_exception_resume_prepared
     }
 
     /// Get or create a constant OpRef for a given i64 value.

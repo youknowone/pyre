@@ -502,8 +502,13 @@ pub enum CompileOutcome {
     /// The caller may retry or continue tracing.
     Cancelled,
     /// Too many cancellations — abort and fall back to interpreter.
-    /// Equivalent to RPython's SwitchToBlackhole(ABORT_BAD_LOOP).
+    /// Equivalent to `SwitchToBlackhole(ABORT_BAD_LOOP)` from a cancel ceiling.
     Aborted,
+    /// `pyjitpl.py compile_loop` raises `SwitchToBlackhole` (the
+    /// `has_compiled_targets` arm uses `ABORT_BAD_LOOP`). Caught by
+    /// `_interpret` / `compile_and_run_once`, which calls
+    /// `run_blackhole_interp_to_cancel_tracing` once.
+    SwitchToBlackhole { reason: i32 },
 }
 
 struct SimpleCompileViews<'a> {
@@ -2477,16 +2482,6 @@ pub struct MetaInterp<M: Clone> {
     /// because the walk's draw was the peeled preamble.
     /// `None` outside single-pass or when compilation did not succeed.
     pub(crate) single_pass_compiled_key: Option<u64>,
-    /// Single-pass CRN/lazy handoff: the first matching back-edge after the
-    /// parity resume must enter the loop body LABEL rather than dispatch key 0,
-    /// because pyre's single-pass walker has already executed the peeled
-    /// preamble's side effects. This is consumed once by the matching compiled
-    /// back-edge. RPython grounding: `pyjitpl.py raise_continue_running_normally` returns to the
-    /// interpreter after successful compilation, while `compile.py:320-328`
-    /// keeps the peeled preamble before the body LABEL; the later assembler
-    /// entry corresponds to the TargetToken LABEL address, not replaying the
-    /// preamble.
-    pub(crate) single_pass_label_entry_key: Option<u64>,
     pub(crate) next_trace_id: u64,
     /// rjitlog.py `JitLogger.trace_id`. `start_new_trace` increments this
     /// even when the binary log is off.
@@ -2723,6 +2718,15 @@ pub struct MetaInterp<M: Clone> {
     /// `nullptr(OBJECT)` sentinel.
     pub last_exc_value: i64,
 
+    /// `pyjitpl.py _prepare_exception_resumption` result, held until
+    /// `prepare_resume_from_failure` records `RESTORE_EXCEPTION`.
+    /// `(exception, SAVE_EXC_CLASS op, SAVE_EXCEPTION op)`.
+    exc_resume: Option<(i64, OpRef, OpRef)>,
+    /// Exception grabbed from the failing deadframe, read by
+    /// `handle_guard_failure` when the bridge entry does not pass it
+    /// as its own argument.
+    pub pending_guard_exc: i64,
+
     /// pyjitpl.py:2405 `self.aborted_tracing_jitdriver = None`.
     ///
     /// Set by `aborted_tracing` (pyjitpl.py) when the trace
@@ -2782,7 +2786,7 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) interpret_framestack_for_abort: bool,
     /// `Counters.ABORT_*` from the interpret walk's `aborted_tracing`.
     /// `None` when that walk did not abort.
-    pub(crate) last_interpret_abort_reason: Option<i32>,
+    pub last_interpret_abort_reason: Option<i32>,
     /// Residual named by a `BailToInterpreter` from
     /// `run_pending_abort_blackhole`. The interpret portal panics on it;
     /// upstream's blackhole never returns.
@@ -4241,7 +4245,6 @@ impl<M: Clone> MetaInterp<M> {
             single_pass_compact_label_values: None,
             single_pass_full_live_values: None,
             single_pass_compiled_key: None,
-            single_pass_label_entry_key: None,
             next_trace_id: 1,
             jitlog_trace_id: 0,
             hooks: JitHooks::default(),
@@ -4284,6 +4287,8 @@ impl<M: Clone> MetaInterp<M> {
             current_call_id: 0,
             portal_trace_positions: Some(Vec::new()),
             last_exc_value: 0,
+            exc_resume: None,
+            pending_guard_exc: 0,
             aborted_tracing_jitdriver: None,
             active_jitdriver_sd: None,
             aborted_tracing_greenkey: None,
@@ -6893,6 +6898,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the caller as `topframeref`.
     pub fn run_blackhole_interp_to_cancel_tracing(
         &mut self,
+        stb: SwitchToBlackhole,
         builder: &mut crate::blackhole::BlackholeInterpBuilder,
         per_frame: Option<&[(i64, usize)]>,
         on_enter_level: Option<&dyn Fn(i64)>,
@@ -6912,18 +6918,10 @@ impl<M: Clone> MetaInterp<M> {
             .last_mut()
             .expect("live portal frame");
         top.pc = top.code_cursor;
-        let switch = ctx.pending_switch_to_blackhole.take();
-        let reason = switch.as_ref().map_or_else(
-            || {
-                if ctx.is_too_long() {
-                    crate::counters::ABORT_TOO_LONG
-                } else {
-                    crate::counters::ABORT_BAD_LOOP
-                }
-            },
-            |switch| switch.reason,
-        );
-        let raising_exception = switch.is_some_and(|switch| switch.raising_exception);
+        // `pyjitpl.py run_blackhole_interp_to_cancel_tracing(stb)` reads the
+        // caught `SwitchToBlackhole`, not a side slot.
+        let reason = stb.reason;
+        let raising_exception = stb.raising_exception;
         ctx.synchronize_virtualizable_after_guard_failure();
         let vable = ctx.virtualizable_heap_ptr().map_or(0, |ptr| ptr as i64);
         // `pyjitpl.py run_blackhole_interp_to_cancel_tracing` is
@@ -8128,8 +8126,12 @@ impl<M: Clone> MetaInterp<M> {
             // this `Aborted`. Tallying here as well would count one aborted
             // trace twice, and under the `Generic` catch-all besides.
             crate::mc_diag_bump(28); // compile_loop: has_compiled_targets giveup
-            self.pending_abort_reason = Some(counters::ABORT_BAD_LOOP);
-            return CompileOutcome::Aborted;
+            // `pyjitpl.py compile_loop`: raise SwitchToBlackhole(ABORT_BAD_LOOP).
+            // The catch is `_interpret` / `compile_and_run_once`, which runs
+            // `run_blackhole_interp_to_cancel_tracing` once.
+            return CompileOutcome::SwitchToBlackhole {
+                reason: counters::ABORT_BAD_LOOP,
+            };
         }
 
         // `unroll.py disable_retracing_if_max_retrace_guards` writes
@@ -11220,9 +11222,8 @@ impl<M: Clone> MetaInterp<M> {
                 (
                     ctx.collect_virtualizable_element_values(),
                     ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
-                    ctx.pending_switch_to_blackhole
-                        .as_ref()
-                        .is_some_and(|stb| stb.raising_exception),
+                    self.last_exc_value != 0
+                        && self.pending_abort_reason == Some(counters::ABORT_ESCAPE),
                 )
             })
             .unwrap_or((None, 0, false));
@@ -15070,7 +15071,9 @@ impl<M: Clone> MetaInterp<M> {
             // trace at all — a state upstream cannot be in, and one the
             // fall-through cannot serve because `compile_loop` needs the ctx.
             CompileOutcome::Cancelled if self.tracing.is_some() => BridgeCompileResult::Declined,
-            CompileOutcome::Cancelled | CompileOutcome::Aborted => BridgeCompileResult::Failed,
+            CompileOutcome::Cancelled
+            | CompileOutcome::Aborted
+            | CompileOutcome::SwitchToBlackhole { .. } => BridgeCompileResult::Failed,
         }
     }
 
@@ -17180,26 +17183,124 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.is_force_token_armed(GcRef(token as usize))
     }
 
-    /// Handle a guard failure: recover interpreter state using resume data.
+    /// `pyjitpl.py MetaInterp.handle_guard_failure`.
     ///
-    /// This is the central guard failure handler, equivalent to RPython's
-    /// `handle_guard_failure()` in pyjitpl.py.
-    ///
-    /// Returns `GuardRecovery` describing the recovered state.
-    /// Bridge-vs-blackhole is decided by the caller from `must_compile()`,
-    /// matching compile.py handle_fail flow.
+    /// The body is `start_retrace_from_guard` (history + resumekey), then
+    /// `_prepare_exception_resumption`. `prepare_resume_from_failure` and
+    /// `interpret` run once the framestack has been rebuilt.
     pub fn handle_guard_failure(
         &mut self,
+        descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
         green_key: u64,
+        trace_id: u64,
         fail_index: u32,
         fail_values: &[i64],
-        exception: ExceptionState,
-    ) -> Option<GuardRecovery> {
-        self.handle_guard_failure_with_savedata(green_key, fail_index, fail_values, None, exception)
+        guard_exc: i64,
+    ) -> Option<BridgeRetraceResult> {
+        let retrace =
+            self.start_retrace_from_guard(descr_arc, green_key, trace_id, fail_index, fail_values)?;
+        self.prepare_exception_resumption(guard_exc, retrace.is_exception_guard);
+        Some(retrace)
+    }
+
+    /// `pyjitpl.py MetaInterp._prepare_exception_resumption`.
+    ///
+    /// Records `SAVE_EXC_CLASS` + `SAVE_EXCEPTION` at the start of an
+    /// exception-guard bridge. The history must still be empty.
+    pub fn prepare_exception_resumption(&mut self, exception: i64, is_exc_guard: bool) {
+        if !is_exc_guard {
+            debug_assert_eq!(exception, 0);
+            self.exc_resume = None;
+            return;
+        }
+        let exc_class = if exception != 0 {
+            self.read_typeptr_from_exception(exception)
+        } else {
+            0
+        };
+        let Some(ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        let op1 = ctx.save_exc_class();
+        ctx.set_opref_concrete(op1, majit_ir::Value::Int(exc_class));
+        let op2 = ctx.save_exception();
+        if exception != 0 {
+            ctx.set_opref_concrete(
+                op2,
+                majit_ir::Value::Ref(majit_ir::GcRef(exception as usize)),
+            );
+        }
+        self.exc_resume = Some((exception, op1, op2));
+    }
+
+    /// `pyjitpl.py MetaInterp.prepare_resume_from_failure`.
+    ///
+    /// `RESTORE_EXCEPTION`, then `execute_ll_raised` / `clear_exception`,
+    /// then `handle_possible_exception` when the resumed frame's next
+    /// opcode is `catch_exception`. That is the exception path. A frame
+    /// whose jitcode catch sits behind the fallthrough is routed by the
+    /// bridge walker, which must not emit this sequence a second time
+    /// once `bridge_exception_resume_prepared` is set.
+    pub fn prepare_resume_from_failure(&mut self) {
+        let Some((exception, op1, op2)) = self.exc_resume.take() else {
+            return;
+        };
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.restore_exception(op1, op2);
+        }
+        if exception != 0 {
+            self.execute_ll_raised(exception, true);
+        } else {
+            self.clear_exception();
+        }
+        // The production walker records `GUARD_EXCEPTION` /
+        // `GUARD_NO_EXCEPTION` with a resume snapshot
+        // (`handle_possible_exception`). Emitting that guard here, before
+        // a resume position exists, stores `resume_pos == -1`.
+        let _ = exception;
+    }
+
+    fn framestack_has_immediate_catch(&self) -> bool {
+        let Some(frame) = self.framestack.frames.last() else {
+            return false;
+        };
+        let code = &frame.jitcode.code;
+        let mut position = if frame.pc != 0 || frame.code_cursor == 0 {
+            frame.pc
+        } else {
+            frame.code_cursor
+        };
+        if position < code.len() && code[position] == crate::jitcode::insns::BC_LIVE {
+            position += majit_jitcode::liveness::OFFSET_SIZE + 1;
+        }
+        position < code.len() && code[position] == crate::jitcode::insns::BC_CATCH_EXCEPTION
+    }
+
+    /// `pyjitpl.py MetaInterp.initialize_state_from_guard_failure`.
+    ///
+    /// Stack-critical rebuild. Callers that already rebuilt via
+    /// `rebuild_portal_framestack_from_resumedata` skip this.
+    pub fn initialize_state_from_guard_failure(&mut self) {
+        let _cc = crate::CriticalCodeGuard::enter();
+        self.portal_call_depth = -1;
+    }
+
+    /// `pyjitpl.py MetaInterp._handle_guard_failure`.
+    ///
+    /// `prepare_resume_from_failure` then `interpret`. `SwitchToBlackhole`
+    /// is the `TraceAction` the caller passes to
+    /// `run_blackhole_interp_to_cancel_tracing`.
+    pub fn _handle_guard_failure<S: crate::pyjitpl::JitCodeSym>(
+        &mut self,
+        sym: &mut S,
+        portal_pc: usize,
+    ) -> crate::TraceAction {
+        self.prepare_resume_from_failure();
+        self.interpret(sym, portal_pc)
     }
 
     /// `handle_guard_failure()` variant that also carries backend savedata.
-    pub fn handle_guard_failure_with_savedata(
+    pub fn recover_guard_state_with_savedata(
         &mut self,
         green_key: u64,
         fail_index: u32,
@@ -17210,7 +17311,7 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py: try_to_free_some_loops
         self.try_to_free_some_loops();
         let trace_id = self.compiled_loops.get(&green_key)?.root_trace_id;
-        self.handle_guard_failure_in_trace_with_savedata(
+        self.recover_guard_state(
             green_key,
             trace_id,
             fail_index,
@@ -17226,7 +17327,7 @@ impl<M: Clone> MetaInterp<M> {
     /// This is the trace-aware counterpart to `handle_guard_failure()`. Callers
     /// should use the `trace_id` reported by `run_compiled_detailed()` when the
     /// failing exit may come from a bridge.
-    pub fn handle_guard_failure_in_trace(
+    pub fn recover_guard_state_in_trace(
         &mut self,
         green_key: u64,
         trace_id: u64,
@@ -17235,7 +17336,7 @@ impl<M: Clone> MetaInterp<M> {
         typed_fail_values: Option<&[Value]>,
         exception: ExceptionState,
     ) -> Option<GuardRecovery> {
-        self.handle_guard_failure_in_trace_with_savedata(
+        self.recover_guard_state(
             green_key,
             trace_id,
             fail_index,
@@ -17246,9 +17347,9 @@ impl<M: Clone> MetaInterp<M> {
         )
     }
 
-    /// `handle_guard_failure_in_trace()` variant that also carries backend savedata.
+    /// `recover_guard_state_in_trace()` variant that also carries backend savedata.
     ///
-    pub fn handle_guard_failure_in_trace_with_savedata(
+    pub fn recover_guard_state(
         &mut self,
         green_key: u64,
         trace_id: u64,
@@ -17366,7 +17467,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Guard failure — recover
-        let recovery = self.handle_guard_failure_in_trace_with_savedata(
+        let recovery = self.recover_guard_state(
             green_key,
             trace_id,
             fail_index,
@@ -19358,7 +19459,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `SwitchToBlackhole(Counters.ABORT_BRIDGE)`.  The
                 // bridge FINISH path shares the same giveup reason as
                 // the root FINISH path.
-                CompileOutcome::Aborted => {
+                CompileOutcome::Aborted | CompileOutcome::SwitchToBlackhole { .. } => {
                     self.abort_trace_live(false);
                     crate::mc_diag_bump(49);
                     Err(SwitchToBlackhole::giveup())
@@ -23332,7 +23433,13 @@ mod metainterp_static_data_tests {
         assert_eq!(meta.framestack.current_mut().int_values[0], Some(41));
         let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
         assert_eq!(
-            meta.run_blackhole_interp_to_cancel_tracing(&mut builder, None, None, None),
+            meta.run_blackhole_interp_to_cancel_tracing(
+                SwitchToBlackhole::bad_loop(),
+                &mut builder,
+                None,
+                None,
+                None,
+            ),
             JitException::DoneWithThisFrameInt(142),
         );
         assert!(meta.framestack.is_empty());
@@ -23382,13 +23489,17 @@ mod metainterp_static_data_tests {
                 meta.interpret(&mut Sym, 0),
                 crate::TraceAction::Abort
             ));
-            meta.trace_ctx().unwrap().pending_switch_to_blackhole = Some(SwitchToBlackhole {
-                reason: counters::ABORT_ESCAPE,
-                raising_exception,
-            });
             let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
-            let outcome =
-                meta.run_blackhole_interp_to_cancel_tracing(&mut builder, None, None, None);
+            let outcome = meta.run_blackhole_interp_to_cancel_tracing(
+                SwitchToBlackhole {
+                    reason: counters::ABORT_ESCAPE,
+                    raising_exception,
+                },
+                &mut builder,
+                None,
+                None,
+                None,
+            );
             let exception = majit_ir::GcRef(0xfeed);
             assert_eq!(
                 outcome,
@@ -23460,6 +23571,7 @@ mod metainterp_static_data_tests {
         let per_frame = [(0x1000, 0), (0x2000, 0)];
         let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
         let _ = meta.run_blackhole_interp_to_cancel_tracing(
+            SwitchToBlackhole::bad_loop(),
             &mut builder,
             Some(&per_frame),
             Some(&on_enter),
@@ -25883,7 +25995,13 @@ mod metainterp_static_data_tests {
             assert!(meta.is_cross_loop_cut_key(CUT_KEY));
         };
 
-        for outcome in [CompileOutcome::Cancelled, CompileOutcome::Aborted] {
+        for outcome in [
+            CompileOutcome::Cancelled,
+            CompileOutcome::Aborted,
+            CompileOutcome::SwitchToBlackhole {
+                reason: counters::ABORT_BAD_LOOP,
+            },
+        ] {
             let (mut meta, _jc) = meta_with_recursive_portal();
             seeded(&mut meta);
             meta.retire_speculative_cut_key(outcome);
@@ -28236,7 +28354,7 @@ mod tests {
         };
 
         let recovery = meta
-            .handle_guard_failure_in_trace_with_savedata(
+            .recover_guard_state(
                 green_key,
                 trace_id,
                 fail_index,

@@ -3855,6 +3855,7 @@ pub fn trace_and_compile_from_bridge(
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp_mut().pending_guard_exc = guard_exc;
         driver.start_bridge_tracing(
             descr_arc,
             &mut jit_state,
@@ -3930,6 +3931,14 @@ pub fn trace_and_compile_from_bridge(
             }
             return BridgeResolution::ResumeBlackhole;
         }
+        // `pyjitpl.py _handle_guard_failure`: framestack is rebuilt, so
+        // `prepare_resume_from_failure` can record `RESTORE_EXCEPTION` and
+        // `handle_possible_exception` before `interpret`.
+        driver.meta_interp_mut().prepare_resume_from_failure();
+    }
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp_mut().prepare_resume_from_failure();
     }
     // `_prepare_exception_resumption` (pyjitpl.py) +
     // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception

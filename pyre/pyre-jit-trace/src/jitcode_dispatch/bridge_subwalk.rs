@@ -320,11 +320,17 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     } else {
         None
     };
-    if exc_edge_precondition && exc_edge_catch_target.is_none() {
+    if exc_edge_precondition
+        && exc_edge_catch_target.is_none()
+        && !trace_ctx.bridge_exception_resume_prepared()
+    {
         // Routed by `call_jit` with no `catch_exception` in this frame at all,
         // which the routing precondition above is supposed to exclude.  Abort
         // BEFORE any recording so the guard failure resumes via the blackhole,
         // exactly as an unrouted one does.
+        // `prepare_resume_from_failure` already emitted the guard and the
+        // caller resumed at the handler, so a missing catch here is that
+        // handler, not a fallthrough.
         return Err(DispatchError::ExcEdgeNoInFrameCatch { pc: position });
     }
     let exc_edge_concrete = sym.last_exc_value();
@@ -356,6 +362,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     }
 
     let result = {
+        let exception_resume_prepared = trace_ctx.bridge_exception_resume_prepared();
         let mut wc = WalkContext {
             frame_state: WalkFrameState::new(WalkFrameStateData {
                 callee_shadow: None,
@@ -452,7 +459,11 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // exception through, so the trace ends at bridge entry and the walk is
         // skipped entirely.
         let mut carrier_raise_escapes = false;
-        let walk_position = if let Some(catch_target) = exc_edge_catch_target {
+        let walk_position = if exception_resume_prepared {
+            // `prepare_resume_from_failure` recorded RESTORE_EXCEPTION and
+            // `handle_possible_exception`. Resume at the handler pc.
+            position
+        } else if let Some(catch_target) = exc_edge_catch_target {
             // RPython `pyjitpl.py _prepare_exception_resumption` exception-guard resumption, emitted
             // at the bridge-entry frame state so the GUARD_EXCEPTION captures a
             // fresh resume snapshot (the call-site prologue cannot — no frame is

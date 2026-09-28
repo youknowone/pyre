@@ -3490,58 +3490,19 @@ impl<S: JitState> JitDriver<S> {
             }
             return;
         }
-        self.meta.single_pass_label_entry_key = self.meta.single_pass_compiled_key.filter(|&key| {
-            let Some(dispatch_key) = self.meta.front_target_dispatch_key(key) else {
-                return false;
-            };
-            let Some(token) = self.meta.entry_procedure_token(key) else {
-                return false;
-            };
-            self.meta
-                .backend_supports_dispatch_key_entry_for(&token, dispatch_key)
-                && self.meta.has_compiled_loop(key)
-                && self.meta.loop_header_pc_for(key) != Some(0)
-        });
-        if portal_rca_enabled() {
-            eprintln!(
-                "[portal-rca][parity-crn-arm-label-entry] pending_key={:?}",
-                self.meta.single_pass_label_entry_key
-            );
-        }
+        // `raise_continue_running_normally` returns to the interpreter.
+        // The next entry is `maybe_compile_and_run` → `execute_assembler`
+        // on the procedure token, not a direct body-LABEL dispatch.
+        let _ = state;
     }
 
+    /// Body-LABEL dispatch is not a metainterp exit. `execute_assembler`
+    /// enters the procedure token.
     fn take_single_pass_label_entry_dispatch_key_for_back_edge(
         &mut self,
-        green_key: u64,
+        _green_key: u64,
     ) -> Option<u32> {
-        let pending_key = self.meta.single_pass_label_entry_key.take()?;
-        if pending_key != green_key {
-            if portal_rca_enabled() {
-                eprintln!(
-                    "[portal-rca][parity-crn-drop-label-entry] pending_key={pending_key} \
-                     back_edge_key={green_key}"
-                );
-            }
-            return None;
-        }
-        let dispatch_key = self
-            .meta
-            .front_target_dispatch_key(green_key)
-            .filter(|&key| {
-                self.meta
-                    .entry_procedure_token(green_key)
-                    .is_some_and(|token| {
-                        self.meta
-                            .backend_supports_dispatch_key_entry_for(&token, key)
-                    })
-            });
-        if portal_rca_enabled() {
-            eprintln!(
-                "[portal-rca][parity-crn-consume-label-entry] green_key={green_key} \
-                 dispatch_key={dispatch_key:?}"
-            );
-        }
-        dispatch_key
+        None
     }
 
     /// Single-pass cross-loop-cut resume: directly enter the loop the
@@ -3730,6 +3691,7 @@ impl<S: JitState> JitDriver<S> {
                     crate::CompileOutcome::Compiled { .. } => "Compiled",
                     crate::CompileOutcome::Cancelled => "Cancelled",
                     crate::CompileOutcome::Aborted => "Aborted",
+                    crate::CompileOutcome::SwitchToBlackhole { .. } => "SwitchToBlackhole",
                 }
             );
         }
@@ -4638,7 +4600,16 @@ impl<S: JitState> JitDriver<S> {
                                 // reaches begins a fresh session).
                             }
                             crate::CompileOutcome::Aborted => {
-                                // pyjitpl.py:3028 SwitchToBlackhole(ABORT_BAD_LOOP)
+                                self.meta.abort_trace(false);
+                            }
+                            crate::CompileOutcome::SwitchToBlackhole { reason } => {
+                                // `pyjitpl.py compile_loop` /
+                                // `_compile_and_run_once`: one
+                                // `run_blackhole_interp_to_cancel_tracing`.
+                                // The walker has no metainterp framestack here;
+                                // `abort_trace` is that catch's accounting and
+                                // hands the framestack to the portal blackhole.
+                                self.meta.stage_abort_reason(reason);
                                 self.meta.abort_trace(false);
                             }
                         }
@@ -4860,7 +4831,10 @@ impl<S: JitState> JitDriver<S> {
                                 // maintains the session↔tracing invariant.
                             }
                             crate::CompileOutcome::Aborted => {
-                                // pyjitpl.py:3028 SwitchToBlackhole
+                                self.meta.abort_trace(false);
+                            }
+                            crate::CompileOutcome::SwitchToBlackhole { reason } => {
+                                self.meta.stage_abort_reason(reason);
                                 self.meta.abort_trace(false);
                             }
                         }
@@ -5188,11 +5162,7 @@ impl<S: JitState> JitDriver<S> {
                     // legacy dispatch sites still put it on the trace context.
                     let pending_stb = match &action {
                         TraceAction::SwitchToBlackhole(stb) => Some(*stb),
-                        _ => self
-                            .meta
-                            .tracing
-                            .as_mut()
-                            .and_then(|t| t.pending_switch_to_blackhole.take()),
+                        _ => None,
                     };
                     // `history.py:37-43`: false unless the abort site raised at a
                     // point where `last_exc_value` still has to be raised
@@ -6458,9 +6428,6 @@ impl<S: JitState> JitDriver<S> {
         // ahead of the counter (`back_edge_internal` cites why). Empty
         // tables are O(1) and allocation-free: check emptiness first so a
         // never-compiled loop does not hash into them.
-        if self.meta.single_pass_label_entry_key.is_some() {
-            return None;
-        }
         if !self.meta.cut_compiled_keys.is_empty() {
             return None;
         }
@@ -6585,11 +6552,9 @@ impl<S: JitState> JitDriver<S> {
         // CloseLoop arm's pending LABEL entry is consumed on the next back
         // edge rather than ticking past it. The table is one `Option`; check
         // emptiness first so a never-armed loop does not enter the take.
-        let single_pass_dispatch_key = if self.meta.single_pass_label_entry_key.is_some() {
-            self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key)
-        } else {
-            None
-        };
+        // Assembler entry is the procedure token (`execute_assembler`),
+        // not a one-shot body-LABEL dispatch key.
+        let single_pass_dispatch_key: Option<u32> = None;
         if !state.can_trace() {
             return None;
         }
@@ -7807,11 +7772,7 @@ impl<S: JitState> JitDriver<S> {
             let _ = handled;
             return None;
         }
-        let single_pass_dispatch_key = if self.meta.single_pass_label_entry_key.is_some() {
-            self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key)
-        } else {
-            None
-        };
+        let single_pass_dispatch_key: Option<u32> = None;
         if !state.can_trace() {
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
@@ -7995,9 +7956,6 @@ impl<S: JitState> JitDriver<S> {
     #[inline]
     pub fn back_edge_warmth(&mut self, green_key_hash: u64, state: &S) -> BackEdgeWarmth {
         if self.meta.is_tracing() {
-            return BackEdgeWarmth::Full;
-        }
-        if self.meta.single_pass_label_entry_key.is_some() {
             return BackEdgeWarmth::Full;
         }
         if !self.meta.cut_compiled_keys.is_empty() {
@@ -9479,9 +9437,7 @@ impl<S: JitState> JitDriver<S> {
         if !state.can_trace() {
             return self.enter_compiled_cannot_trace();
         }
-        if self.meta.single_pass_label_entry_key.is_some()
-            || !self.meta.cut_compiled_keys.is_empty()
-        {
+        if !self.meta.cut_compiled_keys.is_empty() {
             return self
                 .enter_compiled_pending_label_or_cut(cell_key, token, target_pc, state, env);
         }
@@ -9903,10 +9859,7 @@ impl<S: JitState> JitDriver<S> {
                 }
                 // warmstate.py bound_reached: decay, then refuse a nearly
                 // full stack, then start the function-entry trace.
-                // Do not call `bound_reached` itself: that consumes
-                // `single_pass_label_entry_key` reserved for the next
-                // back edge. `force_start_tracing` republishes the
-                // frame decoder and leaves that handoff alone.
+                // `force_start_tracing` republishes the frame decoder.
                 self.meta.warm_state_mut().decay_counters();
                 if majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full() {
                     return None;
@@ -10497,12 +10450,18 @@ impl<S: JitState> JitDriver<S> {
             return false;
         };
 
-        let retrace = match self.meta.start_retrace_from_guard(
+        let guard_exc = if descr_arc.is_guard_exc() {
+            self.meta.pending_guard_exc
+        } else {
+            0
+        };
+        let retrace = match self.meta.handle_guard_failure(
             descr_arc.clone(),
             green_key,
             trace_id,
             fail_index,
             frontend_fail_values,
+            guard_exc,
         ) {
             Some(r) => r,
             None => return false,
@@ -11910,31 +11869,17 @@ mod tests {
         // LABEL handoff is only for the next back-edge after the parity resume.
         // If loop B is that next back-edge, loop A's handoff is stale and must
         // not survive until a later fresh loop-A entry.
-        driver.meta.single_pass_label_entry_key = Some(loop_a);
         assert!(
             driver
                 .back_edge_keyed(loop_b, 22, &mut state, &(), || {})
                 .is_none()
         );
-        assert_eq!(
-            driver.meta.single_pass_label_entry_key, None,
-            "an unrelated uncompiled back_edge must stale the one-shot loop-A label handoff",
-        );
-
-        // Cover the alternate back-edge entry used by callers that combine
-        // can-enter-JIT and compiled execution. Before the fix this path also
-        // missed uncompiled intervening loops because the old take helper only
-        // ran under has_compiled_loop/compiled execution.
-        driver.meta.single_pass_label_entry_key = Some(loop_a);
         assert!(
             driver
                 .back_edge_or_run_compiled_keyed(loop_b, 22, &mut state, &(), || {})
                 .is_none()
         );
-        assert_eq!(
-            driver.meta.single_pass_label_entry_key, None,
-            "back_edge_or_run_compiled must also clear stale handoffs before the compiled-loop gate",
-        );
+        let _ = loop_a;
     }
 
     #[test]
