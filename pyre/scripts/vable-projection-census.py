@@ -30,6 +30,7 @@ which is what makes a negative control cheap to run.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import platform
 import re
@@ -88,7 +89,16 @@ def charon_bin() -> Path:
     }.get((platform.system(), machine))
     if key is None:
         raise SystemExit(f"unsupported platform {platform.system()}/{machine}")
-    path = Path(os.environ.get("CHARON_DEST", shared / "charon" / key)) / "charon"
+    pin_path = ROOT / "scripts" / "install-charon.py"
+    spec = importlib.util.spec_from_file_location("install_charon", pin_path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"cannot load {pin_path}")
+    pin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pin)
+    version = os.environ.get("CHARON_VERSION", pin.CHARON_VERSION_DEFAULT)
+    path = Path(
+        os.environ.get("CHARON_DEST", pin.default_charon_dest(shared, key, version))
+    ) / "charon"
     if not path.exists():
         raise SystemExit(f"charon not installed at {path}\n  run: scripts/install-charon.py")
     return path

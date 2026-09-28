@@ -573,8 +573,8 @@ fn mk_fixture_llbc() -> String {
             "is_local": local
         })
     };
-    let i64_ty = json!({"Literal": {"Int": "I64"}});
-    let string_ty = json!({"Adt": {"id": {"Adt": 0}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}});
+    let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let string_ty = json!({"Adt": {"id": 0, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}});
     let tvar = json!({"TypeVar": {"Bound": [0, 0]}});
     let empty_g = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
     let impl_ref = |id: u64, ty: &serde_json::Value| json!({"kind": {"TraitImpl": {"id": id, "generics": {"regions": [], "types": [ty], "const_generics": [], "trait_refs": []}}}});
@@ -609,7 +609,7 @@ fn mk_fixture_llbc() -> String {
             "item_meta": meta(&["fixture", name], true),
             "signature": {"is_unsafe": false, "inputs": [], "output": ty},
             "body": body(ty, json!({"Regular": {
-                "kind": {"Fun": {"Regular": 3}},
+                "kind": {"Fun": 3},
                 "generics": {"regions": [], "types": [ty], "const_generics": [], "trait_refs": [impl_ref(impl_id, ty)]}
             }}))
         })
@@ -628,7 +628,7 @@ fn mk_fixture_llbc() -> String {
             "trait_type_constraints": []
         },
         "body": body(&tvar, json!({"Regular": {
-            "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0, 0]},
+            "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
             "generics": empty_g
         }}))
     });
@@ -650,7 +650,7 @@ fn mk_fixture_llbc() -> String {
                 "def_id": 0,
                 "item_meta": meta(&["alloc", "string", "String"], false),
                 "kind": "Opaque",
-                "src": "TopLevel"
+                "src": "Normal"
             }],
             "trait_decls": [{
                 "def_id": 0,
@@ -687,7 +687,7 @@ fn put_fixture_llbc() -> String {
         })
     };
     let empty_g = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
-    let unit = json!({"Adt": {"id": "Tuple", "generics": empty_g}});
+    let unit = json!({"Adt": {"id": 99, "builtin": "Tuple", "generics": empty_g}});
     let tvar = json!({"TypeVar": {"Bound": [0, 0]}});
     let slot_ty = json!({"Ref": {"region": "Erased", "ty": tvar, "kind": "Mut"}});
     let place = |id: u64, ty: &serde_json::Value| json!({"kind": {"Local": id}, "ty": ty});
@@ -739,7 +739,7 @@ fn put_fixture_llbc() -> String {
                 {"statements": [], "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
-                            "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0, 0]},
+                            "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
                             "generics": empty_g
                         }},
                         "args": [],
@@ -752,7 +752,7 @@ fn put_fixture_llbc() -> String {
                 {"statements": [], "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
-                            "kind": {"Fun": {"Regular": 2}},
+                            "kind": {"Fun": 2},
                             "generics": {"regions": [], "types": [tvar], "const_generics": [], "trait_refs": []}
                         }},
                         "args": [{"Copy": place(1, &slot_ty)}, {"Copy": place(2, &tvar)}],
@@ -773,7 +773,7 @@ fn put_fixture_llbc() -> String {
                 {"statements": [], "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
-                            "kind": {"Fun": {"Regular": 3}},
+                            "kind": {"Fun": 3},
                             "generics": {"regions": [], "types": [unit], "const_generics": [], "trait_refs": [impl_ref]}
                         }},
                         "args": [],
@@ -856,16 +856,16 @@ fn unit_field_fixture_llbc() -> String {
         })
     };
     let empty_g = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
-    let i64_ty = json!({"Literal": {"Int": "I64"}});
-    let unit = json!({"Adt": {"id": "Tuple", "generics": {"types": []}}});
-    let s_ty = json!({"Adt": {"id": {"Adt": 0}, "generics": empty_g}});
+    let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let unit = json!({"Adt": {"id": 99, "builtin": "Tuple", "generics": {"types": []}}});
+    let s_ty = json!({"Adt": {"id": 0, "generics": empty_g}});
     let s_ref = json!({"Ref": ["Erased", s_ty, "Mut"]});
     let place = |id: u64, ty: &serde_json::Value| json!({"kind": {"Local": id}, "ty": ty});
     let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| json!({"index": index, "name": name, "span": span, "ty": ty});
     let field_u = json!({
         "kind": {"Projection": [
             {"kind": {"Projection": [place(1, &s_ref), "Deref"]}, "ty": s_ty},
-            {"Field": [{"Adt": [0, null]}, 1]}
+            {"Field": [null, 1]}
         ]},
         "ty": unit
     });
@@ -908,7 +908,7 @@ fn unit_field_fixture_llbc() -> String {
                             ], "terminator": {"span": span, "kind": {"Call": {
                                 "call": {
                                     "func": {"Regular": {
-                                        "kind": {"Fun": {"Regular": 1}},
+                                        "kind": {"Fun": 1},
                                         "generics": empty_g
                                     }},
                                     "args": [{"Copy": place(2, &unit)}, {"Copy": place(3, &unit)}],
@@ -967,7 +967,7 @@ fn malloc_typed_fixture_llbc() -> String {
             "is_local": local
         })
     };
-    let i64_ty = json!({"Literal": {"Int": "I64"}});
+    let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let tvar = json!({"TypeVar": {"Bound": [0, 0]}});
     let empty_g = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
     let impl_ref = json!({
@@ -1006,7 +1006,7 @@ fn malloc_typed_fixture_llbc() -> String {
                 {"statements": [], "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
-                            "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0, 0]},
+                            "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
                             "generics": empty_g
                         }},
                         "args": [],
@@ -1019,7 +1019,7 @@ fn malloc_typed_fixture_llbc() -> String {
                 {"statements": [], "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
-                            "kind": {"Fun": {"Regular": 2}},
+                            "kind": {"Fun": 2},
                             "generics": {"regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": []}
                         }},
                         "args": [],
@@ -1040,7 +1040,7 @@ fn malloc_typed_fixture_llbc() -> String {
                 {"statements": [], "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
-                            "kind": {"Fun": {"Regular": 3}},
+                            "kind": {"Fun": 3},
                             "generics": {"regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": [impl_ref]}
                         }},
                         "args": [],

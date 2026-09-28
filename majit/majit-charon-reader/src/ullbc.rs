@@ -37,16 +37,12 @@ pub struct FunDecl {
     /// a `&T`-where-`T: Trait` parameter to its bound trait's name leaf.
     #[serde(default)]
     pub generics: Option<Value>,
-    /// Charon stamps this with the `GlobalDecl` id when the function
-    /// is a compiler-synthesised static / const initialiser body
-    /// (e.g. the body that constructs `static NONE_SINGLETON`'s
-    /// value).  Production lowering treats these as values rather
-    /// than call targets — they have no call sites in user code, and
-    /// their unwind paths use orphan exception slots that the
-    /// flowspace adapter cannot lift.  `None` for ordinary function
-    /// bodies.
+    /// Where the function comes from (`ItemSource`): `"Normal"`,
+    /// `{"TraitImpl": ..}`, `{"GlobalInitializer": {"id": <GlobalDecl id>,
+    /// ..}}`, …  Kept as raw `Value`; only
+    /// [`FunDecl::is_global_initializer`] projects it.
     #[serde(default)]
-    pub is_global_initializer: Option<u64>,
+    pub src: Option<Value>,
     /// `body` is `null` for opaque references and one of
     /// `{"Unstructured": {...}}`, `{"Structured": {...}}`, or
     /// `{"Error": {...}}` otherwise. Kept as the raw JSON text (not an
@@ -58,6 +54,22 @@ pub struct FunDecl {
 }
 
 impl FunDecl {
+    /// The `GlobalDecl` id when the function is a compiler-synthesised
+    /// static / const initialiser body (e.g. the body that constructs
+    /// `static NONE_SINGLETON`'s value), read from
+    /// `src: {"GlobalInitializer": {"id": ..}}`.  Production lowering
+    /// treats these as values rather than call targets — they have no
+    /// call sites in user code, and their unwind paths use orphan
+    /// exception slots that the flowspace adapter cannot lift.  `None`
+    /// for ordinary function bodies.
+    pub fn is_global_initializer(&self) -> Option<u64> {
+        self.src
+            .as_ref()?
+            .get("GlobalInitializer")?
+            .get("id")?
+            .as_u64()
+    }
+
     /// Return the `Unstructured` (basic-block CFG) body if present.
     pub fn unstructured(&self) -> Option<Unstructured> {
         #[derive(Deserialize)]
@@ -164,8 +176,8 @@ pub struct TypeDecl {
     #[serde(default)]
     pub layout: Option<Box<RawValue>>,
     /// Origin Charon recorded for this declaration. A compiler-generated
-    /// closure environment is the object `{"Closure": …}`; every other ADT
-    /// in the extracted corpus is the string `"TopLevel"`. Kept raw so an
+    /// closure environment is the object `{"Closure": …}`; an ordinary ADT
+    /// is the string `"Normal"`. Kept raw so an
     /// unmodelled origin cannot fail the load.
     #[serde(default)]
     pub src: Option<Value>,
@@ -181,9 +193,12 @@ pub struct TargetLayout {
 /// Resolved memory layout of a single concrete type for one target.
 #[derive(Debug, Deserialize)]
 pub struct TypeLayout {
-    #[serde(default)]
+    /// Byte size. Charon spells this as a bare integer or as
+    /// `{"chosen": <u64 | const expr>}`; a `Deduplicated` chosen value is
+    /// filled in by [`TypeDecl::layout_for_target`].
+    #[serde(default, deserialize_with = "de_layout_opt_u64")]
     pub size: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_layout_opt_u64")]
     pub align: Option<u64>,
     /// One entry per variant (a struct has a single entry). Carries the
     /// per-variant field byte offsets.
@@ -210,8 +225,9 @@ pub struct TypeRepr {
 pub struct VariantLayout {
     /// Byte offset of each field, indexed by the variant's field
     /// declaration order (matches [`VariantDecl::fields`] / a struct's
-    /// [`FieldDecl`] order).
-    #[serde(default)]
+    /// [`FieldDecl`] order). Each entry is a bare integer or
+    /// `{"chosen": <u64>}`.
+    #[serde(default, deserialize_with = "de_layout_offsets")]
     pub field_offsets: Vec<u64>,
     /// The writes that store this variant's tag, as
     /// `[[offset, {"Unsigned": ["U8", "<value>"]}], ...]`. Kept raw; read
@@ -239,10 +255,20 @@ impl TypeDecl {
     /// present (single-target extraction). Returns `None` when layout is
     /// absent, unparseable, or no entry matches — callers fall back to
     /// the heuristic layout provider.
-    pub fn layout_for_target(&self, target: &str) -> Option<TypeLayout> {
+    ///
+    /// `size` / `align` whose `chosen` value is a `Deduplicated` constant
+    /// are resolved through `llbc`'s const table.
+    pub fn layout_for_target(&self, llbc: &crate::Llbc, target: &str) -> Option<TypeLayout> {
         let raw = self.layout.as_ref()?;
         let entries: Vec<TargetLayout> = serde_json::from_str(raw.get()).ok()?;
-        select_target_layout(entries, target)
+        let mut layout = select_target_layout(entries, target)?;
+        if layout.size.is_none() {
+            layout.size = layout_measure(llbc, raw.get(), target, "size");
+        }
+        if layout.align.is_none() {
+            layout.align = layout_measure(llbc, raw.get(), target, "align");
+        }
+        Some(layout)
     }
 
     /// Whether every emitted target layout records `#[repr(transparent)]`.
@@ -275,6 +301,100 @@ fn select_target_layout(mut entries: Vec<TargetLayout>, target: &str) -> Option<
         return Some(entries.swap_remove(0).value);
     }
     None
+}
+
+/// A layout integer written inline: a bare `u64`, `{"chosen": <u64>}`, or a
+/// constant expression whose literal is `{"Integer": {"Unsigned"|"Signed":
+/// [width, decimal]}}`. A `Deduplicated` chosen value stays unresolved so
+/// [`layout_measure`] can read it from the const table.
+fn layout_u64_literal(v: &Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    if let Some(chosen) = v.get("chosen") {
+        if chosen.get("Deduplicated").is_some() {
+            return None;
+        }
+        return layout_u64_literal(chosen);
+    }
+    if let Some(body) = v
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|a| a.get(1))
+    {
+        return layout_u64_literal(body);
+    }
+    if let Some(constant) = v.get("Constant") {
+        return layout_u64_literal(constant);
+    }
+    if let Some(int) = v.get("Integer") {
+        let pair = int.get("Unsigned").or_else(|| int.get("Signed"))?;
+        return pair.get(1)?.as_str()?.parse().ok();
+    }
+    v.as_array()
+        .and_then(|a| a.first())
+        .and_then(layout_u64_literal)
+}
+
+fn de_layout_opt_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let value = Option::<Value>::deserialize(d)?;
+    Ok(value.as_ref().and_then(layout_u64_literal))
+}
+
+fn de_layout_offsets<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u64>, D::Error> {
+    let values = Vec::<Value>::deserialize(d)?;
+    values
+        .iter()
+        .map(|v| {
+            layout_u64_literal(v).ok_or_else(|| {
+                serde::de::Error::custom(format!("field offset is not a literal: {v}"))
+            })
+        })
+        .collect()
+}
+
+fn layout_measure(llbc: &crate::Llbc, raw: &str, target: &str, field: &str) -> Option<u64> {
+    let entries: Vec<Value> = serde_json::from_str(raw).ok()?;
+    let entry = entries
+        .iter()
+        .find(|e| e.get("key").and_then(Value::as_str) == Some(target))
+        .or_else(|| (entries.len() == 1).then(|| &entries[0]))?;
+    layout_u64_resolved(llbc, entry.get("value")?.get(field)?, 0)
+}
+
+fn layout_u64_resolved(llbc: &crate::Llbc, v: &Value, depth: u8) -> Option<u64> {
+    if depth > 24 {
+        return None;
+    }
+    if let Some(n) = layout_u64_literal(v) {
+        return Some(n);
+    }
+    if let Some(id) = v.get("Deduplicated").and_then(Value::as_u64) {
+        if let Some(body) = llbc.layout_scalar_body(id)
+            && let Some(n) = layout_u64_resolved(llbc, body, depth + 1)
+        {
+            return Some(n);
+        }
+        return llbc
+            .dedup_const_body(id)
+            .and_then(|body| layout_u64_resolved(llbc, body, depth + 1));
+    }
+    if let Some(chosen) = v.get("chosen") {
+        return layout_u64_resolved(llbc, chosen, depth + 1);
+    }
+    if let Some(body) = v
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|a| a.get(1))
+    {
+        return layout_u64_resolved(llbc, body, depth + 1);
+    }
+    if let Some(constant) = v.get("Constant") {
+        return layout_u64_resolved(llbc, constant, depth + 1);
+    }
+    v.as_array()
+        .and_then(|a| a.first())
+        .and_then(|b| layout_u64_resolved(llbc, b, depth + 1))
 }
 
 impl TypeLayout {
@@ -319,11 +439,11 @@ impl TypeLayout {
     /// Byte position of the discriminant tag (`discriminator.Branch.offset`).
     /// `None` for a single-variant type or a non-`Branch` discriminator.
     pub fn discriminant_offset(&self) -> Option<u64> {
-        self.discriminator
-            .as_ref()?
-            .get("Branch")?
-            .get("offset")?
-            .as_u64()
+        let offset = self.discriminator.as_ref()?.get("Branch")?.get("offset")?;
+        offset
+            .get("chosen")
+            .and_then(Value::as_u64)
+            .or_else(|| offset.as_u64())
     }
 
     /// Rust primitive spelling of a branching enum's physical tag.
@@ -397,12 +517,36 @@ pub enum TypeDeclKind {
     Unknown,
 }
 
+/// `name` is `None` for a positional field (tuple struct / tuple variant
+/// payload). Charon spells such a field `"_N"` with `is_positional: true`;
+/// the name is dropped here so a positional field and a named field that
+/// happens to be called `_0` stay distinct.
 #[derive(Debug, Deserialize)]
+#[serde(from = "RawFieldDecl")]
 pub struct FieldDecl {
     pub name: Option<String>,
     pub ty: TyRef,
-    #[serde(default)]
     pub attr_info: Option<AttrInfo>,
+}
+
+#[derive(Deserialize)]
+struct RawFieldDecl {
+    name: Option<String>,
+    #[serde(default)]
+    is_positional: bool,
+    ty: TyRef,
+    #[serde(default)]
+    attr_info: Option<AttrInfo>,
+}
+
+impl From<RawFieldDecl> for FieldDecl {
+    fn from(raw: RawFieldDecl) -> Self {
+        FieldDecl {
+            name: if raw.is_positional { None } else { raw.name },
+            ty: raw.ty,
+            attr_info: raw.attr_info,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,8 +555,8 @@ pub struct VariantDecl {
     #[serde(default)]
     pub fields: Vec<FieldDecl>,
     /// Charon-assigned discriminant, kept raw because its scalar width
-    /// varies by enum (`{"Scalar":{"Unsigned":["U8","128"]}}` for
-    /// `Instruction`, `{"Scalar":{"Signed":["Isize","0"]}}` for others).
+    /// varies by enum (`{"Unsigned":["U8","128"]}` for `Instruction`,
+    /// `{"Signed":["Isize","0"]}` for others).
     /// Read via [`VariantDecl::discriminant_i64`]; staying [`Value`]
     /// keeps deserialization total under the schema-drift policy.
     #[serde(default)]
@@ -420,14 +564,19 @@ pub struct VariantDecl {
 }
 
 impl VariantDecl {
-    /// Parse the discriminant to `i64` from the Charon
-    /// `{"Scalar":{"Signed"|"Unsigned":[width, decimal_string]}}` shape.
-    /// Returns `None` for an absent, non-scalar, or unparseable
-    /// discriminant rather than failing — callers that need the value
-    /// for an enum known to carry integer discriminants assert presence
-    /// at the use site.
+    /// Parse the discriminant to `i64`.
+    ///
+    /// Charon emits `{"Signed"|"Unsigned":[width, decimal_string]}`.
+    /// A bare integer is the same value. Returns `None` for an absent or
+    /// unparseable discriminant rather than failing — callers that need
+    /// the value for an enum known to carry integer discriminants assert
+    /// presence at the use site.
     pub fn discriminant_i64(&self) -> Option<i64> {
-        let scalar = self.discriminant.as_ref()?.get("Scalar")?;
+        let value = self.discriminant.as_ref()?;
+        if let Some(n) = value.as_i64() {
+            return Some(n);
+        }
+        let scalar = value.get("Scalar").unwrap_or(value);
         let pair = scalar.get("Unsigned").or_else(|| scalar.get("Signed"))?;
         pair.get(1)?.as_str()?.parse::<i64>().ok()
     }
@@ -440,12 +589,16 @@ impl VariantDecl {
 pub struct TraitDecl {
     pub def_id: u64,
     pub item_meta: ItemMeta,
+    /// `methods[i].skip_binder.name` is the method a `CallKind::Trait`
+    /// payload names by index. The payload no longer carries a fun-decl id.
+    #[serde(default)]
+    pub methods: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ItemMeta {
     pub name: Vec<NameSeg>,
-    pub span: Span,
+    pub span: SpanRef,
     pub source_text: Option<String>,
     pub attr_info: AttrInfo,
     #[serde(default)]
@@ -505,6 +658,10 @@ impl ItemMeta {
                     }
                 }
                 NameSeg::Other(v) => {
+                    if let Some(label) = builtin_path_label(v) {
+                        out.push_str(&label);
+                        continue;
+                    }
                     let label = v
                         .as_object()
                         .and_then(|m| m.keys().next().cloned())
@@ -524,6 +681,33 @@ impl ItemMeta {
 /// checks that special-case closures must accept both spellings.
 pub fn is_closure_leaf(leaf: &str) -> bool {
     leaf == "closure" || leaf.starts_with("closure#")
+}
+
+/// The segment label of a `PathElem::Builtin(kind, n)`, spelled
+/// `{"Builtin": [kind, n]}`.
+///
+/// - `Closure` renders as `closure` / `closure#N`, the leaf the field
+///   registry keys.
+/// - `DropGlue` renders as `drop_in_place`, the method of the drop-glue
+///   impl.
+/// - `VTable` renders as `{vtable}`, the leaf of a trait's vtable struct.
+///
+/// Other builtins stay on the `<Builtin>` label.
+pub fn builtin_path_label(seg: &Value) -> Option<String> {
+    let arr = seg.as_object()?.get("Builtin")?.as_array()?;
+    match arr.first().and_then(Value::as_str)? {
+        "Closure" => {
+            let n = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
+            Some(if n == 0 {
+                "closure".to_string()
+            } else {
+                format!("closure#{n}")
+            })
+        }
+        "DropGlue" => Some("drop_in_place".to_string()),
+        "VTable" => Some("{vtable}".to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,19 +730,60 @@ pub struct AttrInfo {
     pub public: bool,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Span {
-    pub data: SpanData,
+/// A span field. Inline bodies carry [`SpanData`]; `{"Deduplicated": id}`
+/// names a row in [`crate::Llbc`]'s span table. A missing id stays unresolved.
+#[derive(Debug, Clone)]
+pub enum SpanRef {
+    Inline(SpanData),
+    Deduplicated(u64),
 }
 
-#[derive(Debug, Deserialize)]
+impl<'de> Deserialize<'de> for SpanRef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        span_ref_from_value(&value)
+            .ok_or_else(|| serde::de::Error::custom(format!("span is not a span body: {value}")))
+    }
+}
+
+fn span_ref_from_value(value: &Value) -> Option<SpanRef> {
+    if let Some(data) = value.get("data") {
+        return serde_json::from_value(data.clone())
+            .ok()
+            .map(SpanRef::Inline);
+    }
+    if let Some(inner) = value.get("Untagged") {
+        return span_ref_from_value(inner);
+    }
+    if let Some(body) = value
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.get(1))
+    {
+        return span_ref_from_value(body);
+    }
+    let id = value.get("Deduplicated").and_then(Value::as_u64)?;
+    Some(SpanRef::Deduplicated(id))
+}
+
+/// `{"data": ...}` body of a hash-consed span. The id's other occurrences
+/// are `{"Deduplicated": id}`.
+pub(crate) fn span_data_from_body(raw: &RawValue) -> Option<SpanData> {
+    #[derive(Deserialize)]
+    struct Body {
+        data: SpanData,
+    }
+    serde_json::from_str::<Body>(raw.get()).ok().map(|b| b.data)
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SpanData {
     pub file_id: u64,
     pub beg: Loc,
     pub end: Loc,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Loc {
     pub line: u64,
     pub col: u64,
@@ -585,7 +810,7 @@ pub enum TyRef {
     },
     /// Inline value with hash-cons id.
     Inline {
-        #[serde(rename = "HashConsedValue")]
+        #[serde(rename = "Value")]
         value: (u64, Value),
     },
     /// Anything else (e.g. literal-int short forms).
@@ -613,7 +838,7 @@ impl TyRef {
 pub struct Unstructured {
     pub locals: Locals,
     pub body: Vec<BasicBlock>,
-    pub span: Span,
+    pub span: SpanRef,
 }
 
 #[derive(Debug, Deserialize)]
@@ -626,7 +851,7 @@ pub struct Locals {
 pub struct Local {
     pub index: u64,
     pub name: Option<String>,
-    pub span: Span,
+    pub span: SpanRef,
     pub ty: TyRef,
 }
 
@@ -648,23 +873,21 @@ impl BasicBlock {
     ///
     /// The projection is stored on the block. Every later call returns
     /// the same `Ok` value or the same `Err` string.
-    pub fn term(&self) -> Result<TermKind, String> {
-        self.term_cached().clone()
+    pub fn term(&self, llbc: &crate::Llbc) -> Result<TermKind, String> {
+        self.term_cached(llbc).clone()
     }
 
     /// Borrow the cached [`term`](Self::term) projection.
-    pub fn term_ref(&self) -> Result<&TermKind, &str> {
-        match self.term_cached() {
+    pub fn term_ref(&self, llbc: &crate::Llbc) -> Result<&TermKind, &str> {
+        match self.term_cached(llbc) {
             Ok(kind) => Ok(kind),
             Err(err) => Err(err.as_str()),
         }
     }
 
-    fn term_cached(&self) -> &Result<TermKind, String> {
-        self.term_cache.get_or_init(|| {
-            let kind = &self.terminator.kind;
-            serde_json::from_value(kind.clone()).map_err(|e| format!("{e}; raw kind: {kind}"))
-        })
+    fn term_cached(&self, llbc: &crate::Llbc) -> &Result<TermKind, String> {
+        self.term_cache
+            .get_or_init(|| decode_term_kind(&self.terminator.kind, llbc))
     }
 }
 
@@ -683,14 +906,14 @@ pub struct Terminator {
     /// should not cost the body its parse. Charon writes one on every
     /// terminator, so this is `Some` for an artefact it produced.
     #[serde(default)]
-    pub span: Option<Span>,
+    pub span: Option<SpanRef>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Statement {
     /// Raw statement-kind JSON.
     pub kind: Value,
-    pub span: Span,
+    pub span: SpanRef,
     /// First successful or failed projection of [`kind`](Self::kind).
     /// Later [`stmt_kind`](Self::stmt_kind) calls clone this value instead
     /// of parsing the raw JSON again.
@@ -733,6 +956,8 @@ pub enum StmtKind {
     StorageDead(u64),
     /// `place := rvalue`
     Assign(Place, Rvalue),
+    /// Borrow-checker fact. No runtime effect.
+    Borrowck(Value),
     /// `Assert { cond, expected, check_kind }` — inline assertion;
     /// failure terminator is the *terminator-level* `Assert` instead.
     Assert(AssertStmt),
@@ -798,7 +1023,8 @@ impl ProjectionElem {
 
 #[derive(Debug, Clone, Deserialize)]
 pub enum Rvalue {
-    Use(Operand),
+    /// Second value is `WithRetag` (`"Yes"` / `"No"`).
+    Use(Operand, Value),
     /// `BinaryOp(op, lhs, rhs)`. `op` is a tagged variant — primitive
     /// ops are atom strings (`"Add"`, `"Eq"`, …), wrap/overflow forms
     /// are objects (`{"Shr": "Wrap"}`, `{"Add": "Wrap"}`).
@@ -819,8 +1045,9 @@ pub enum Rvalue {
     Cast(Value, Operand, TyRef),
     /// `Len(place)` for slice / array length.
     Len(Place),
-    /// `Repeat(operand, elem_ty, count)` for `[v; N]` literals.
-    Repeat(Operand, TyRef, Value),
+    /// `Repeat(operand, elem_ty, count, trait_info)` for `[v; N]` literals.
+    /// The last value is the `Copy`/`Clone` witness Charon now records.
+    Repeat(Operand, TyRef, Value, Value),
     /// `ShallowInitBox(operand, target_ty)` — emitted by `Box::new_in`
     /// and friends to allocate the box and initialise its contents.
     ShallowInitBox(Operand, TyRef),
@@ -843,17 +1070,14 @@ pub enum Operand {
     Const(Value),
 }
 
-/// Regular `Fun` id carried by an `Operand::Const` whose kind is `FnDef`.
-///
-/// The constant schema is `kind.FnDef.kind.Fun.Regular`. Literals,
-/// `VTableRef`, and `TraitConst` are not function items and return `None`.
-pub fn const_fn_def_regular_id(value: &Value) -> Option<u64> {
-    value
-        .get("kind")?
+/// Regular `Fun` id carried by an `Operand::Const` whose kind is `FnDef`
+/// (`[{"FnDef": {"kind": {"Fun": id}, ..}}, ty]`). Literals, `VTableRef`,
+/// and `TraitConst` are not function items and return `None`.
+pub fn const_fn_def_regular_id(llbc: &crate::Llbc, value: &Value) -> Option<u64> {
+    llbc.const_expr_kind(value)?
         .get("FnDef")?
         .get("kind")?
         .get("Fun")?
-        .get("Regular")?
         .as_u64()
 }
 
@@ -892,6 +1116,76 @@ pub enum TermKind {
     },
     #[serde(other)]
     Unknown,
+}
+
+fn decode_term_kind(kind: &Value, llbc: &crate::Llbc) -> Result<TermKind, String> {
+    if let Some(sw) = kind.get("Switch")
+        && sw.get("data").is_some()
+    {
+        return decode_switch(sw, llbc).map_err(|e| format!("{e}; raw kind: {kind}"));
+    }
+    TermKind::deserialize(kind).map_err(|e| format!("{e}; raw kind: {kind}"))
+}
+
+/// `Switch { data: {scrutinee, branches, fallback}, branches }` decodes
+/// straight into [`TermKind::Switch`]. Arm constants may be
+/// `{"Deduplicated": id}` and are read from [`crate::Llbc::dedup_const_body`].
+fn decode_switch(sw: &Value, llbc: &crate::Llbc) -> Result<TermKind, String> {
+    let data = sw.get("data").ok_or("switch missing data")?;
+    let bbs = sw
+        .get("branches")
+        .and_then(Value::as_array)
+        .ok_or("switch missing block branches")?;
+    let discr_v = data
+        .get("scrutinee")
+        .and_then(|s| s.get("Value"))
+        .ok_or("switch missing scrutinee")?;
+    let discr = Operand::deserialize(discr_v).map_err(|e| e.to_string())?;
+    let arms = data
+        .get("branches")
+        .and_then(Value::as_array)
+        .ok_or("switch missing arms")?;
+    let fallback = data.get("fallback").and_then(Value::as_u64);
+    let bb_of = |id: u64| bbs.get(id as usize).and_then(Value::as_u64);
+    let mut decoded: Vec<(Value, u64, Option<bool>)> = Vec::new();
+    for arm in arms {
+        let pair = arm.as_array().ok_or("switch arm is not a pair")?;
+        let target = pair
+            .get(1)
+            .and_then(Value::as_u64)
+            .and_then(bb_of)
+            .ok_or("switch arm target")?;
+        let lit = llbc
+            .const_expr_literal(pair.first().ok_or("switch arm const")?)
+            .ok_or("switch arm const unresolved")?;
+        let flag = lit.get("Bool").and_then(Value::as_bool);
+        decoded.push((lit, target, flag));
+    }
+    let all_bool = !decoded.is_empty() && decoded.iter().all(|(_, _, flag)| flag.is_some());
+    let targets = if all_bool {
+        let mut then_bb = fallback.and_then(bb_of);
+        let mut else_bb = None;
+        for (_, target, flag) in &decoded {
+            if flag == &Some(true) {
+                then_bb = Some(*target);
+            } else {
+                else_bb = Some(*target);
+            }
+        }
+        let then_bb = then_bb.ok_or("bool switch missing then")?;
+        let else_bb = else_bb
+            .or_else(|| fallback.and_then(bb_of))
+            .ok_or("bool switch missing else")?;
+        SwitchTargets::If(then_bb, else_bb)
+    } else {
+        let default = fallback.and_then(bb_of).ok_or("switch missing fallback")?;
+        let arms = decoded
+            .into_iter()
+            .map(|(scalar, target, _)| (scalar, target))
+            .collect();
+        SwitchTargets::SwitchInt(Value::Null, arms, default)
+    };
+    Ok(TermKind::Switch { discr, targets })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -945,14 +1239,23 @@ pub enum CallKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum FunId {
+    /// `CallKind::Fun` carries the fun-decl id as a bare integer.
     Regular {
-        #[serde(rename = "Regular")]
         id: u64,
     },
     Other(Value),
+}
+
+impl<'de> Deserialize<'de> for FunId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        if let Some(id) = value.as_u64() {
+            return Ok(FunId::Regular { id });
+        }
+        Ok(FunId::Other(value))
+    }
 }
 
 impl CallFunc {
@@ -991,6 +1294,22 @@ pub enum CallClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A positional field loses its `_N` spelling; a named `_0` keeps it.
+    #[test]
+    fn positional_field_has_no_name() {
+        let ty = r#"{"Deduplicated": 0}"#;
+        let positional: FieldDecl = serde_json::from_str(&format!(
+            r#"{{"name": "_0", "is_positional": true, "ty": {ty}}}"#
+        ))
+        .unwrap();
+        assert_eq!(positional.name, None);
+        let named: FieldDecl = serde_json::from_str(&format!(
+            r#"{{"name": "_0", "is_positional": false, "ty": {ty}}}"#
+        ))
+        .unwrap();
+        assert_eq!(named.name.as_deref(), Some("_0"));
+    }
 
     /// A struct's field offsets are the single `variant_layouts[0]` entry.
     #[test]

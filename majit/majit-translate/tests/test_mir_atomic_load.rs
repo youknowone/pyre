@@ -17,9 +17,12 @@ fn fixture(ordering: Option<&str>) -> Llbc {
         })
     };
     let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
-    let adt = |id| json!({"Adt": {"id": {"Adt": id}, "generics": generics}});
-    let word = json!({"Literal": {"UInt": "U64"}});
-    let receiver = json!({"Ref": ["Erased", adt(0), "Shared"]});
+    let adt = |id| json!({"Adt": {"id": id, "generics": generics}});
+    let word = json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    // `AtomicU64` is the alias `Atomic<u64>`.
+    let atomic = json!({"Adt": {"id": 0, "generics":
+        {"regions": [], "types": [word], "const_generics": [], "trait_refs": []}}});
+    let receiver = json!({"Ref": ["Erased", atomic, "Shared"]});
     let place = |id, ty: &Value| json!({"kind": {"Local": id}, "ty": ty});
     let variants = ["Relaxed", "Acquire", "SeqCst", "Release", "AcqRel"];
     let statements = ordering
@@ -32,7 +35,7 @@ fn fixture(ordering: Option<&str>) -> Llbc {
     let file = json!({"charon_version": "0.1.201", "has_errors": false,
         "translated": {"crate_name": "fixture",
             "type_decls": [
-                {"def_id": 0, "item_meta": meta(&["core", "sync", "atomic", "AtomicU64"]), "kind": "Opaque"},
+                {"def_id": 0, "item_meta": meta(&["core", "sync", "atomic", "Atomic"]), "kind": "Opaque"},
                 {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "Ordering"]),
                  "kind": {"Enum": variants.iter().enumerate().map(|(i, name)| json!({
                     "name": name, "fields": [],
@@ -52,7 +55,7 @@ fn fixture(ordering: Option<&str>) -> Llbc {
                     ]},
                     "body": [
                         {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
-                            "call": {"func": {"Regular": {"kind": {"Fun": {"Regular": 1}}, "generics": generics}},
+                            "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                 "args": [{"Copy": place(1, &receiver)}, {"Copy": place(2, &adt(1))}],
                                 "dest": place(0, &word)}, "target": 1, "on_unwind": 2
                         }}}},
@@ -60,7 +63,7 @@ fn fixture(ordering: Option<&str>) -> Llbc {
                         {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
                     ]
                  }}},
-                {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "AtomicU64", "load"]),
+                {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "Atomic", "load"]),
                  "signature": {"is_unsafe": false, "inputs": [receiver, adt(1)], "output": word}, "body": "Opaque"}
             ], "global_decls": [], "trait_decls": [], "trait_impls": []
         }

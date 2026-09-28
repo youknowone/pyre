@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -26,6 +27,17 @@ import time
 import typing
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
+
+
+def install_charon():
+    """`scripts/install-charon.py`, the single owner of the Charon pin and layout."""
+    path = Path(__file__).resolve().parent / "install-charon.py"
+    spec = importlib.util.spec_from_file_location("install_charon", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"extract-llbc.py: cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # Domain separator for the bytes hashed by the repository fingerprints. Bump this
@@ -172,12 +184,10 @@ def expand_features(arg: str, cargo_features: str) -> str:
 
 
 def crate_flags(spec: CrateSpec, cargo_features: str) -> list[str]:
-    # Charon's rustc is the 1.95 nightly it pins (2026-02-22). rustpython-ruff
-    # 0.16.5 declares rust-version 1.96; the crates still compile on 1.95.
-    return [
-        "--ignore-rust-version",
-        *[expand_features(arg, cargo_features) for arg in spec.cargo_args],
-    ]
+    # Charon's rustc is the nightly-2026-09-17 toolchain (1.100.0-nightly).
+    # That is newer than every rust-version this workspace's crates declare,
+    # so cargo does not need `--ignore-rust-version`.
+    return [expand_features(arg, cargo_features) for arg in spec.cargo_args]
 
 
 def charon_crate_flags(spec: CrateSpec, cargo_features: str) -> list[str]:
@@ -1454,8 +1464,12 @@ def charon_paths(charon_root: Path) -> tuple[str, Path, Path]:
     platform_key, charon_exe = platform_info()
     repo_parent = charon_root.parent
     shared = Path(os.environ.get("PYRE_SHARED_BUILD", repo_parent / ".pyre-build"))
+    pin = install_charon()
+    version = os.environ.get("CHARON_VERSION", pin.CHARON_VERSION_DEFAULT)
     charon_dest = Path(
-        os.environ.get("CHARON_DEST", shared / "charon" / platform_key)
+        os.environ.get(
+            "CHARON_DEST", pin.default_charon_dest(shared, platform_key, version)
+        )
     )
     return platform_key, charon_dest, charon_dest / charon_exe
 

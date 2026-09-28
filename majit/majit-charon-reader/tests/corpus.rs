@@ -62,8 +62,15 @@ fn loads_fixture_corpus() {
     // `replace_boxed_held`, `held_as_mut`, `replace_boxed_held_call`,
     // `replace_indexed_box`, `replace_indexed_box_call`,
     // `replace_boxed_dynlike`, `store_held_cell`, and the extra local
-    // bodies Charon emits beside those items. The measured count is 60.
-    assert_eq!(local_count, 60, "60 local fns expected");
+    // bodies Charon emits beside those items.
+    //
+    // Charon nightly-2026.09.26 no longer emits
+    // `bool_then_closure::closure::<Impl>::drop_in_place` as its own local
+    // item. The closure env is not a separate `closure` path; its body is
+    // `bool_then_closure::<Impl>::call_once`. That drop glue was a local fn
+    // on nightly-2026.05.29, and it is absent from the artefact rather than
+    // dropped by the reader. The measured count is 59.
+    assert_eq!(local_count, 59, "59 local fns expected");
 }
 
 #[test]
@@ -85,7 +92,7 @@ fn every_corpus_function_decodes() {
                 );
             }
             let term = bb
-                .term()
+                .term(&llbc)
                 .unwrap_or_else(|e| panic!("terminator decode failed in {name} bb{bb_idx}: {e}"));
             assert!(
                 !matches!(term, TermKind::Unknown),
@@ -108,13 +115,13 @@ fn straight_line_add_shape() {
     // bb0 should end in an overflow Assert (AddChecked + Assert).
     let bb0 = &u.body[0];
     assert!(
-        matches!(bb0.term().unwrap(), TermKind::Assert { .. }),
+        matches!(bb0.term(&llbc).unwrap(), TermKind::Assert { .. }),
         "bb0 terminator was not Assert",
     );
 
     // bb4 should be the return block.
     let bb4 = &u.body[4];
-    assert!(matches!(bb4.term().unwrap(), TermKind::Return));
+    assert!(matches!(bb4.term(&llbc).unwrap(), TermKind::Return));
 }
 
 #[test]
@@ -126,7 +133,7 @@ fn branch_loop_sum_has_switch_int_and_switch_if() {
     let mut saw_switch_int = false;
     let mut saw_switch_if = false;
     for bb in &u.body {
-        if let Ok(TermKind::Switch { targets, .. }) = bb.term() {
+        if let Ok(TermKind::Switch { targets, .. }) = bb.term(&llbc) {
             match targets {
                 majit_charon_reader::ullbc::SwitchTargets::If(..) => saw_switch_if = true,
                 majit_charon_reader::ullbc::SwitchTargets::SwitchInt(..) => saw_switch_int = true,
@@ -146,7 +153,7 @@ fn call_classify_covers_corpus() {
     for fd in llbc.iter_local_fns() {
         let Some(u) = fd.unstructured() else { continue };
         for bb in &u.body {
-            if let Ok(TermKind::Call { call, .. }) = bb.term() {
+            if let Ok(TermKind::Call { call, .. }) = bb.term(&llbc) {
                 let label = match call.func.classify() {
                     CallClass::Direct => "direct",
                     CallClass::Trait => "trait",
@@ -173,7 +180,7 @@ fn call_classify_covers_corpus() {
 
 #[test]
 fn dedup_body_resolves_inline_shape() {
-    // Every `HashConsedValue: [id, body]` occurrence must surface
+    // Every `Value: [id, body]` occurrence must surface
     // through `Llbc::dedup_body(id)` so MIR's TyRef projection can
     // resolve `Deduplicated` references.
     let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");

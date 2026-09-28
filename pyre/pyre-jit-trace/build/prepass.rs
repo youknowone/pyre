@@ -351,6 +351,50 @@ fn analysis_llbc_paths(repo_root: &str) -> Vec<String> {
 /// `scripts/extract-llbc.py --fingerprint` returns before `extract` runs and
 /// only performs a `cargo metadata` walk plus `git ls-files`, so it starts no
 /// nested build and takes no target-directory lock.
+/// The pin and the `<platform>/<version>` layout live in
+/// `scripts/install-charon.py` (`CHARON_VERSION_DEFAULT`,
+/// `default_charon_dest`). This only checks that binary so a missing-LLBC
+/// error can omit the install step when it is already there.
+fn charon_install_present(repo_root: &std::path::Path) -> bool {
+    let pin = repo_root.join("scripts").join("install-charon.py");
+    let Ok(text) = std::fs::read_to_string(&pin) else {
+        return false;
+    };
+    let Some(version) = text.lines().find_map(|line| {
+        let line = line.trim();
+        let rest = line.strip_prefix("CHARON_VERSION_DEFAULT = ")?;
+        Some(rest.trim_matches('"').to_string())
+    }) else {
+        return false;
+    };
+    let version = std::env::var("CHARON_VERSION").unwrap_or(version);
+    if let Some(dest) = std::env::var_os("CHARON_DEST") {
+        return std::path::PathBuf::from(dest)
+            .join(charon_exe_name())
+            .exists();
+    }
+    let Some(platform) = platform_key(std::env::consts::OS, std::env::consts::ARCH) else {
+        return false;
+    };
+    let shared = std::env::var_os("PYRE_SHARED_BUILD")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| repo_root.join("..").join(".pyre-build"));
+    shared
+        .join("charon")
+        .join(platform)
+        .join(version)
+        .join(charon_exe_name())
+        .exists()
+}
+
+fn charon_exe_name() -> &'static str {
+    if std::env::consts::OS == "windows" {
+        "charon.exe"
+    } else {
+        "charon"
+    }
+}
+
 fn preflight_llbc_or_fail() {
     // Explicit override: trust it and let the translator validate the
     // individual paths (its loader panics per-file with the bad path).
@@ -388,11 +432,7 @@ fn preflight_llbc_or_fail() {
         return;
     }
 
-    let charon_present = repo_root
-        .join("build")
-        .join("charon")
-        .join("charon")
-        .exists();
+    let charon_present = charon_install_present(&repo_root);
 
     // `cargo::error=` lines (no embedded newlines) surface in Cargo's
     // error summary on modern Cargo and fail the build on their own; the

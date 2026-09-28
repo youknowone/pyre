@@ -93,7 +93,7 @@ pub(crate) fn is_checked_arith_target(target: &CallTarget) -> bool {
         && checked_arith_ovf_opname(leaf).is_some()
 }
 
-/// `true` for the signed width atoms (`{"Literal": {"Int": _}}`) whose
+/// `true` for the signed width atoms (`{"Scalar": {"Integer": {"Signed": _}}}`) whose
 /// overflow bound is the one `add_ovf` / `sub_ovf` / `mul_ovf` test.
 ///
 /// Charon spells every inherent integer impl as `<Impl>`, so

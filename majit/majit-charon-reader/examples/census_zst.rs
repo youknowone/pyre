@@ -64,7 +64,9 @@ fn main() {
 
     for td in llbc.file.translated.type_decls.iter().flatten() {
         total += 1;
-        let is_zero_sized = td.layout_for_target("").is_some_and(|l| l.size == Some(0));
+        let is_zero_sized = td
+            .layout_for_target(&llbc, "")
+            .is_some_and(|l| l.size == Some(0));
         if !is_zero_sized {
             continue;
         }
@@ -103,7 +105,8 @@ fn main() {
         .iter()
         .flatten()
         .filter(|td| {
-            td.layout_for_target("").is_some_and(|l| l.size == Some(0))
+            td.layout_for_target(&llbc, "")
+                .is_some_and(|l| l.size == Some(0))
                 && !type_decl_is_fieldless_enum(td)
         })
         .map(|td| td.def_id)

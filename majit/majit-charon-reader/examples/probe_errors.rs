@@ -22,7 +22,7 @@ fn main() {
                     samples.entry(key).or_insert_with(|| short_sample(&st.kind));
                 }
             }
-            if let Err(e) = bb.term() {
+            if let Err(e) = bb.term(&llbc) {
                 let raw = bb.terminator.kind.clone();
                 let outer = outer_key(&raw);
                 let key = format!("[term:{outer}] {}", msg(&e));

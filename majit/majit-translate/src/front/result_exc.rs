@@ -79,28 +79,26 @@ use majit_charon_reader::ullbc::TyRef;
 
 use crate::flowspace::model::Variable;
 use crate::model::{
-    BlockId, CallFuncPtr, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
+    BlockId, CallFuncPtr, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind,
+    SpaceOperation, ValueType,
 };
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
-/// id}` indirections through the dedup table, `{"HashConsedValue":
+/// id}` indirections through the dedup table, `{"Value":
 /// [id, body]}` inline pairs, anything else as-is.
 fn ty_json_body<'l>(v: &'l serde_json::Value, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
     if let Some(id) = v.get("Deduplicated").and_then(serde_json::Value::as_u64) {
         return llbc.dedup_body(id);
     }
-    if let Some(arr) = v
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
-    {
+    if let Some(arr) = v.get("Value").and_then(serde_json::Value::as_array) {
         return arr.get(1);
     }
     Some(v)
 }
 
-/// `{"Adt": {"id": {"Adt": <id>}, …}}` → the TypeDecl's full name path.
+/// `{"Adt": {"id": <id>, …}}` → the TypeDecl's full name path.
 fn adt_path_of(v: &serde_json::Value, llbc: &Llbc) -> Option<String> {
-    let id = v.get("Adt")?.get("id")?.get("Adt")?.as_u64()?;
+    let id = crate::front::mir::type_decl_ref_adt_id(v.get("Adt")?.as_object()?)?;
     Some(llbc.type_by_id(id)?.item_meta.name_path())
 }
 
@@ -204,9 +202,7 @@ pub(crate) fn tyref_is_option_ref(ty: &TyRef, llbc: &Llbc) -> bool {
             }
             continue;
         }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             v = &arr[1];
@@ -917,6 +913,32 @@ fn count_var_uses(graph: &FunctionGraph, var: &Variable) -> UseCounts {
 /// a new `OpKind` variant is a compile error here until its operands are
 /// declared, keeping the pass fail-closed.  Producer / constant / marker
 /// kinds carry no operand `Variable` and return empty.
+pub(crate) fn from_residual_arg_is_payload(
+    ops: &[SpaceOperation],
+    args: &[LinkArg],
+    payload: &Variable,
+) -> bool {
+    match args {
+        [LinkArg::Value(arg)] if arg == payload => true,
+        [LinkArg::Value(arg)] => pure_copy_index(ops, payload, arg).is_some(),
+        _ => false,
+    }
+}
+
+pub(crate) fn pure_copy_index(
+    ops: &[SpaceOperation],
+    src: &Variable,
+    dst: &Variable,
+) -> Option<usize> {
+    ops.iter().enumerate().find_map(|(i, op)| {
+        if op.result.as_ref() != Some(dst) {
+            return None;
+        }
+        let reads = op_operand_vars(&op.kind);
+        (reads.len() == 1 && reads.first() == Some(src)).then_some(i)
+    })
+}
+
 pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
     let extend_all = |dst: &mut Vec<Variable>, lists: &[&Vec<Variable>]| {
         for list in lists {
@@ -4184,7 +4206,7 @@ fn verify_break_arm_is_reraise(
             target: CallTarget::Method { name: m, .. },
             args,
             ..
-        } if m == "from_residual" && args.as_slice() == std::slice::from_ref(&payload_var) => {
+        } if m == "from_residual" && from_residual_arg_is_payload(ops, args, &payload_var) => {
             op.result.clone().map(|r| (i, r))
         }
         _ => None,
@@ -4197,13 +4219,14 @@ fn verify_break_arm_is_reraise(
     };
     // Only the `__pos_0` read and the `from_residual` call may carry an
     // effect; any other side-effecting op would be dropped by the rewrite.
-    assert_block_pure_besides(
-        graph,
-        e_block,
-        &[pos0_idx, from_residual_idx],
-        "break arm",
-        name,
-    )?;
+    let mut recognized = vec![pos0_idx, from_residual_idx];
+    if let Some(idx) = ops.iter().enumerate().find_map(|(i, op)| {
+        let reads = op_operand_vars(&op.kind);
+        (reads.len() == 1 && reads.first() == Some(&payload_var) && i != pos0_idx).then_some(i)
+    }) {
+        recognized.push(idx);
+    }
+    assert_block_pure_besides(graph, e_block, &recognized, "break arm", name)?;
     verify_forwards_to_returnblock_general(graph, e_block, &residual_result)
 }
 
@@ -4827,7 +4850,7 @@ mod carrier_tests {
     /// `Adt` type value naming `def_id` with the given type arguments.
     fn adt(def_id: usize, args: &[String]) -> String {
         format!(
-            r#"{{"Adt":{{"id":{{"Adt":{def_id}}},"generics":{{"regions":[],
+            r#"{{"Adt":{{"id":{def_id},"generics":{{"regions":[],
                "types":[{}],"const_generics":[],"trait_refs":[]}}}}}}"#,
             args.join(",")
         )

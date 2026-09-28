@@ -60,12 +60,13 @@ fn main() {
                     Ok(StmtKind::Assign(..)) => "Assign",
                     Ok(StmtKind::Assert(..)) => "Assert (stmt)",
                     Ok(StmtKind::PlaceMention(_)) => "PlaceMention",
+                    Ok(StmtKind::Borrowck(_)) => "Borrowck",
                     Ok(StmtKind::Unknown) => "Unknown",
                     Err(_) => "DecodeError",
                 };
                 *stmt_kinds.entry(label).or_default() += 1;
             }
-            let term_label = match bb.term() {
+            let term_label = match bb.term(&llbc) {
                 Ok(TermKind::Return) => "Return",
                 Ok(TermKind::UnwindResume) => "UnwindResume",
                 Ok(TermKind::Abort(_)) => "Abort",

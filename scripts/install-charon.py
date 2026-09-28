@@ -15,7 +15,17 @@ from pathlib import Path
 from typing import Optional
 
 
-CHARON_VERSION_DEFAULT = "nightly-2026.05.29"
+CHARON_VERSION_DEFAULT = "nightly-2026.09.26"
+
+
+def default_charon_dest(shared: Path, platform_key: str, version: str) -> Path:
+    """Versioned install dir. Sibling worktrees pin other tags beside this one."""
+    return shared / "charon" / platform_key / version
+
+
+def default_charon_src(shared: Path, platform_key: str, version: str) -> Path:
+    """Versioned source checkout. An explicit `CHARON_SRC` replaces this whole path."""
+    return shared / "charon-src" / platform_key / version
 
 
 def repo_root() -> Path:
@@ -102,7 +112,9 @@ def main() -> None:
     shared = Path(os.environ.get("PYRE_SHARED_BUILD", root.parent / ".pyre-build"))
     platform_key, asset, exe, from_source = platform_info()
     charon_dest = Path(
-        os.environ.get("CHARON_DEST", shared / "charon" / platform_key)
+        os.environ.get(
+            "CHARON_DEST", default_charon_dest(shared, platform_key, version)
+        )
     )
 
     stamp = charon_dest / ".installed-version"
@@ -118,7 +130,9 @@ def main() -> None:
 
     if from_source:
         charon_src = Path(
-            os.environ.get("CHARON_SRC", shared / "charon-src" / platform_key)
+            os.environ.get(
+                "CHARON_SRC", default_charon_src(shared, platform_key, version)
+            )
         )
         if (charon_src / ".git").is_dir():
             print(f"updating {charon_src} to {version}")

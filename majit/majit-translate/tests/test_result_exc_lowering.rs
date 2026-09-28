@@ -781,7 +781,8 @@ fn list_append_underflow_keeps_its_unfused_materialisation() {
 }
 
 /// Family C: the dual-gate slot on always-`Err` `__new__` wrappers is
-/// the `Result::Ok.__pos_0` extract, not the returnblock inputarg.
+/// the `Result<*mut PyObject,PyError>::Ok.__pos_0` extract, not the
+/// returnblock inputarg.
 /// The annotator never follows that arm (`links_followed`).  Indices
 /// move when the wrapper changes crates, so the test looks for the
 /// field rather than a frozen var number.
@@ -797,7 +798,8 @@ fn wrap_new_always_err_ok_payload_is_result_fieldread() {
             block.operations.iter().find_map(|op| match &op.kind {
                 OpKind::FieldRead { field, .. }
                     if field.name == "__pos_0"
-                        && field.owner_root.as_deref() == Some("Result::Ok") =>
+                        && field.owner_root.as_deref()
+                            == Some("Result<*mut PyObject,PyError>::Ok") =>
                 {
                     Some(field)
                 }

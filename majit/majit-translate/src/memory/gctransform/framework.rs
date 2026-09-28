@@ -306,11 +306,11 @@ pub struct OpaqueCensus {
 /// The discriminant of a `CallKind::Trait` payload's trait reference.
 pub fn trait_ref_kind(llbc: &majit_charon_reader::Llbc, tref: &serde_json::Value) -> String {
     let body = if let Some(id) = tref.get("Deduplicated").and_then(|x| x.as_u64()) {
-        match llbc.dedup_body(id) {
+        match llbc.dedup_trait_body(id) {
             Some(b) => b,
             None => return "unresolved-dedup".into(),
         }
-    } else if let Some(inline) = tref.pointer("/HashConsedValue/1") {
+    } else if let Some(inline) = tref.pointer("/Value/1") {
         inline
     } else {
         return "no-body".into();
@@ -742,7 +742,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
                 if let Ok(StmtKind::Assign(p, rv)) = st.stmt_kind()
                     && let Some(l) = root(&p)
                 {
-                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = &rv
+                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rv
                         && let PlaceKind::Projection(_, elem) = &src.kind
                     {
                         projected.insert(l, elem.label());
@@ -750,7 +750,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
                     defs.insert(l, rv);
                 }
             }
-            if let Ok(TermKind::Call { call, .. }) = bb.term()
+            if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
                 && let Some(l) = root(&call.dest)
                 && let CallFunc::Regular(reg) = &call.func
                 && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
@@ -763,7 +763,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
             }
         }
         for bb in &body.body {
-            let Ok(TermKind::Call { call, .. }) = bb.term() else {
+            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
                 continue;
             };
             let CallFunc::Dynamic(op) = &call.func else {
@@ -789,7 +789,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
                             "<- no definition".to_string()
                         };
                     }
-                    Some(Rvalue::Use(o) | Rvalue::Cast(_, o, _)) => {
+                    Some(Rvalue::Use(o, _) | Rvalue::Cast(_, o, _)) => {
                         if let Some(nl) = op_local(o) {
                             cur = Some(nl);
                             continue;
@@ -825,7 +825,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
 fn rvalue_label(r: &majit_charon_reader::ullbc::Rvalue) -> &'static str {
     use majit_charon_reader::ullbc::Rvalue as R;
     match r {
-        R::Use(_) => "Use",
+        R::Use(..) => "Use",
         R::BinaryOp(..) => "BinaryOp",
         R::UnaryOp(..) => "UnaryOp",
         R::Ref { .. } => "Ref",
@@ -881,7 +881,13 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
         // stamps the same line, while two items collapsing onto one spelling
         // are written at two different lines.
         let key = if name.contains('<') {
-            format!("{name}@{}", fd.item_meta.span.data.beg.line)
+            format!(
+                "{name}@{}",
+                llbc.span_data(&fd.item_meta.span)
+                    .expect("item span missing from the artefact")
+                    .beg
+                    .line
+            )
         } else {
             name.clone()
         };
@@ -892,7 +898,7 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
             continue;
         };
         for bb in &body.body {
-            let Ok(TermKind::Call { call, .. }) = bb.term() else {
+            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
                 continue;
             };
             match &call.func {

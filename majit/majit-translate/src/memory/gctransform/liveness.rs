@@ -373,7 +373,7 @@ fn use_operand(o: &Operand, out: &mut HashSet<u64>) {
 
 fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
     match r {
-        Rvalue::Use(o) | Rvalue::UnaryOp(_, o) => use_operand(o, out),
+        Rvalue::Use(o, _) | Rvalue::UnaryOp(_, o) => use_operand(o, out),
         Rvalue::BinaryOp(_, a, b) => {
             use_operand(a, out);
             use_operand(b, out);
@@ -393,7 +393,7 @@ fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
                 out.insert(l);
             }
         }
-        Rvalue::Cast(_, o, _) | Rvalue::Repeat(o, _, _) | Rvalue::ShallowInitBox(o, _) => {
+        Rvalue::Cast(_, o, _) | Rvalue::Repeat(o, _, _, _) | Rvalue::ShallowInitBox(o, _) => {
             use_operand(o, out)
         }
         Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
@@ -429,7 +429,7 @@ fn pin_src(r: &Rvalue) -> Option<PinSrc> {
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
             place_local(place).map(PinSrc::Alias)
         }
-        Rvalue::Use(o) | Rvalue::Cast(_, o, _) => one(o).map(PinSrc::Alias),
+        Rvalue::Use(o, _) | Rvalue::Cast(_, o, _) => one(o).map(PinSrc::Alias),
         _ => None,
     }
 }
@@ -570,7 +570,7 @@ pub fn scan(
 
         stats.bodies_scanned += 1;
         let n = body.body.len();
-        let terms: Vec<Option<TermKind>> = body.body.iter().map(|b| b.term().ok()).collect();
+        let terms: Vec<Option<TermKind>> = body.body.iter().map(|b| b.term(llbc).ok()).collect();
         let unparsed_terms = terms
             .iter()
             .any(|t| t.is_none() || matches!(t, Some(TermKind::Unknown)));
@@ -1138,7 +1138,7 @@ pub fn scan(
         // body is in the set for every call the body makes.
         let mut movable_args: HashSet<u64> = HashSet::new();
         for other in &body.body {
-            let Ok(TermKind::Call { call: c2, .. }) = other.term() else {
+            let Ok(TermKind::Call { call: c2, .. }) = other.term(llbc) else {
                 continue;
             };
             let CallFunc::Regular(r2) = &c2.func else {
@@ -1212,11 +1212,7 @@ pub fn scan(
             let mut locals: Vec<String> = still.iter().map(|l| gc_locals[l].clone()).collect();
             locals.sort();
             movable.sort();
-            let at = body.body[b]
-                .terminator
-                .span
-                .as_ref()
-                .map_or(&fd.item_meta.span.data, |s| &s.data);
+            let at = term_span(llbc, &body.body[b].terminator.span, &fd.item_meta.span);
             stats.stale_pin_reads.push(StalePinRead {
                 func_name: fd.item_meta.name_path(),
                 file: llbc.file_path(at.file_id).unwrap_or_default().to_string(),
@@ -1260,11 +1256,7 @@ pub fn scan(
             // terminator's own: the call being reported *is* the terminator,
             // so the block's last statement names a line that runs after it.
             // A terminator with no span at all falls back to the function's.
-            let at = bb
-                .terminator
-                .span
-                .as_ref()
-                .map_or(&fd.item_meta.span.data, |s| &s.data);
+            let at = term_span(llbc, &bb.terminator.span, &fd.item_meta.span);
             if !unbracketed.contains(&b) {
                 stats.withheld_under_a_bracket += 1;
                 // Withholding the call is right -- a bracket does dominate it
@@ -1379,11 +1371,7 @@ pub fn scan(
             // own: the call being reported *is* the terminator, so the
             // block's last statement names a line that runs after it.
             // A terminator with no span at all falls back to the function's.
-            let at = bb
-                .terminator
-                .span
-                .as_ref()
-                .map_or(&fd.item_meta.span.data, |s| &s.data);
+            let at = term_span(llbc, &bb.terminator.span, &fd.item_meta.span);
             findings.push(Finding {
                 func: id,
                 func_name: fd.item_meta.name_path(),
@@ -1419,8 +1407,21 @@ fn transfer_stmt(k: &StmtKind, live: &mut HashSet<u64>) {
                 live.insert(l);
             }
         }
-        StmtKind::Unknown => {}
+        StmtKind::Borrowck(_) | StmtKind::Unknown => {}
     }
+}
+
+fn term_span<'a>(
+    llbc: &'a majit_charon_reader::Llbc,
+    term: &'a Option<majit_charon_reader::ullbc::SpanRef>,
+    item: &'a majit_charon_reader::ullbc::SpanRef,
+) -> &'a majit_charon_reader::ullbc::SpanData {
+    let chosen = match term {
+        Some(span) => span,
+        None => item,
+    };
+    llbc.span_data(chosen)
+        .expect("span id is not in the artefact span table")
 }
 
 fn transfer_term(t: &TermKind, live: &mut HashSet<u64>) {
@@ -1523,7 +1524,10 @@ mod tests {
     #[test]
     fn a_pin_covers_every_local_the_value_is_spelled_by() {
         let mut defs = HashMap::new();
-        defs.insert(1, pin_src(&Rvalue::Use(mv(0))).expect("a use is an alias"));
+        defs.insert(
+            1,
+            pin_src(&Rvalue::Use(mv(0), serde_json::Value::Null)).expect("a use is an alias"),
+        );
         assert_eq!(chased(1, &defs), vec![0, 1]);
     }
 

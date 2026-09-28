@@ -36,8 +36,8 @@ use std::path::Path;
 pub struct Llbc {
     pub file: LlbcFile,
     /// `dedup_id → ADT def_id` index built from inline
-    /// `HashConsedValue: [id, body]` occurrences whose body decodes as
-    /// `{"Adt": {"id": {"Adt": <def_id>}}}`.  Sorted by `dedup_id` for
+    /// `Value: [id, body]` occurrences whose body decodes as
+    /// `{"Adt": {"id": <def_id>}}`.  Sorted by `dedup_id` for
     /// binary search.  Populated once at parse time.
     ///
     /// Consumed by `front::mir::Lowering` to resolve a Charon `Impl`
@@ -50,7 +50,7 @@ pub struct Llbc {
     /// (`annotator/unaryop.rs:3587`).
     dedup_adt: Vec<(u64, u64)>,
     /// `dedup_id → body` index built from every inline
-    /// `HashConsedValue: [id, body]` occurrence in the raw LLBC JSON.
+    /// `Value: [id, body]` occurrence in the raw LLBC JSON.
     /// Sorted by `dedup_id` for binary search.  Populated once at
     /// parse time.
     ///
@@ -64,6 +64,17 @@ pub struct Llbc {
     /// `i64`-returning helpers from pointer-returning ones, defeating
     /// `fn_return_types`-based type checks.
     dedup_body: Vec<(u64, DedupBody)>,
+    /// Trait-ref bodies. Their hash-cons ids restart at zero, independently
+    /// of type ids, so they cannot share [`Self::dedup_body`].
+    dedup_trait: Vec<(u64, DedupBody)>,
+    /// Constant expressions `[literal, ty]`. Their ids are not type ids.
+    dedup_const: Vec<(u64, DedupBody)>,
+    /// Layout scalars `{"Constant": {"Value": [id, [literal, ty]]}}`.
+    /// Their ids restart independently of MIR constant expressions.
+    dedup_layout: Vec<(u64, DedupBody)>,
+    /// Hash-consed span id → inline [`ullbc::SpanData`]. Built in the same
+    /// scan as [`Self::dedup_body`]. A missing id is not a span.
+    span_bodies: Vec<(u64, ullbc::SpanData)>,
     /// Qualified transparent-type path → scalar register shape learned from
     /// another LLBC in the same linked translation input. Dependency LLBCs
     /// retain layout attributes but may expose the type body as `Opaque`; the
@@ -222,7 +233,7 @@ impl Llbc {
         // `serde_json::Value` of the whole document (which costs
         // ~26× the input bytes as an exploded node tree):
         //   1. `collect_dedup_bodies` scans the raw bytes for inline
-        //      `"HashConsedValue":[id, body]` occurrences, keeping only
+        //      `"Value":[id, body]` type occurrences, keeping only
         //      each small `body`'s raw text and discarding the rest.
         //   2. `from_slice` streams the bytes straight into the typed
         //      `LlbcFile` without the intermediate Value.
@@ -230,16 +241,40 @@ impl Llbc {
         // {bytes + LlbcFile}.
         let mut dedup_adt: Vec<(u64, u64)> = Vec::new();
         let mut dedup_body: Vec<(u64, DedupBody)> = Vec::new();
-        collect_dedup_bodies(bytes, &mut dedup_adt, &mut dedup_body);
+        let mut dedup_trait: Vec<(u64, DedupBody)> = Vec::new();
+        let mut dedup_const: Vec<(u64, DedupBody)> = Vec::new();
+        let mut dedup_layout: Vec<(u64, DedupBody)> = Vec::new();
+        let mut span_bodies: Vec<(u64, ullbc::SpanData)> = Vec::new();
+        collect_dedup_bodies(
+            bytes,
+            &mut dedup_adt,
+            &mut dedup_body,
+            &mut dedup_trait,
+            &mut dedup_const,
+            &mut dedup_layout,
+            &mut span_bodies,
+        );
         dedup_adt.sort_by_key(|&(id, _)| id);
         dedup_adt.dedup_by_key(|p| p.0);
         dedup_body.sort_by_key(|p| p.0);
         dedup_body.dedup_by_key(|p| p.0);
+        dedup_trait.sort_by_key(|p| p.0);
+        dedup_trait.dedup_by_key(|p| p.0);
+        dedup_const.sort_by_key(|p| p.0);
+        dedup_const.dedup_by_key(|p| p.0);
+        dedup_layout.sort_by_key(|p| p.0);
+        dedup_layout.dedup_by_key(|p| p.0);
+        span_bodies.sort_by_key(|p| p.0);
+        span_bodies.dedup_by_key(|p| p.0);
         let file: LlbcFile = serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
         Ok(Self {
             file,
             dedup_adt,
             dedup_body,
+            dedup_trait,
+            dedup_const,
+            dedup_layout,
+            span_bodies,
             transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
             foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
             eval_hook_graphs: parking_lot::RwLock::new(Vec::new()),
@@ -346,13 +381,85 @@ impl Llbc {
 
     /// Resolve a Charon `Deduplicated: <id>` reference to its
     /// underlying inline body (a `serde_json::Value` of the same
-    /// shape Charon emits inline for a `HashConsedValue: [id, body]`).
+    /// shape Charon emits inline for a `Value: [id, body]`).
     /// Returns `None` for ids whose inline form never appeared in
     /// this LLBC.  See the [`Self::dedup_body`] field doc for
     /// context.
     pub fn dedup_body(&self, id: u64) -> Option<&serde_json::Value> {
         let i = self.dedup_body.binary_search_by_key(&id, |p| p.0).ok()?;
         self.dedup_body[i].1.get()
+    }
+
+    /// A trait-ref body stored under its own hash-cons id space.
+    pub fn dedup_trait_body(&self, id: u64) -> Option<&serde_json::Value> {
+        let i = self.dedup_trait.binary_search_by_key(&id, |p| p.0).ok()?;
+        self.dedup_trait[i].1.get()
+    }
+
+    pub fn dedup_const_body(&self, id: u64) -> Option<&serde_json::Value> {
+        let i = self.dedup_const.binary_search_by_key(&id, |p| p.0).ok()?;
+        self.dedup_const[i].1.get()
+    }
+
+    /// The `ConstantExprKind` of a `ConstantExpr`. The expression is
+    /// `[kind, ty]`, spelled inline, as `{"Value": [id, [kind, ty]]}` at its
+    /// first occurrence, or as `{"Deduplicated": id}` afterwards.
+    pub fn const_expr_kind(&self, expr: &serde_json::Value) -> Option<serde_json::Value> {
+        self.const_expr_body(expr)?.first().cloned()
+    }
+
+    /// The `ty` of a `ConstantExpr`, the second half of its `[kind, ty]`.
+    pub fn const_expr_ty<'a>(
+        &'a self,
+        expr: &'a serde_json::Value,
+    ) -> Option<&'a serde_json::Value> {
+        self.const_expr_body(expr)?.get(1)
+    }
+
+    fn const_expr_body<'a>(
+        &'a self,
+        expr: &'a serde_json::Value,
+    ) -> Option<&'a Vec<serde_json::Value>> {
+        let body = if let Some(pair) = expr.get("Value").and_then(serde_json::Value::as_array) {
+            pair.get(1)?
+        } else if let Some(id) = expr.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            self.dedup_const_body(id)?
+        } else {
+            expr
+        };
+        body.as_array()
+    }
+
+    /// The literal of a `ConstantExpr` in `Literal` form: an `Integer` kind
+    /// becomes `{"Scalar": ...}`; `Bool` / `Char` / `Float` / `Str` /
+    /// `ByteStr` are already literals. `None` for any other kind.
+    pub fn const_expr_literal(&self, expr: &serde_json::Value) -> Option<serde_json::Value> {
+        let kind = self.const_expr_kind(expr)?;
+        if let Some(int) = kind.get("Integer") {
+            return Some(serde_json::json!({ "Scalar": int }));
+        }
+        ["Bool", "Char", "Float", "Str", "ByteStr"]
+            .iter()
+            .any(|lit| kind.get(*lit).is_some())
+            .then_some(kind)
+    }
+
+    /// A layout scalar `{"Constant": ...}`. Its ids are not MIR const ids.
+    pub fn layout_scalar_body(&self, id: u64) -> Option<&serde_json::Value> {
+        let i = self.dedup_layout.binary_search_by_key(&id, |p| p.0).ok()?;
+        self.dedup_layout[i].1.get()
+    }
+
+    /// Resolve `span`. [`ullbc::SpanRef::Deduplicated`] reads the span table
+    /// built at load; an id that never appeared inline is `None`.
+    pub fn span_data<'a>(&'a self, span: &'a ullbc::SpanRef) -> Option<&'a ullbc::SpanData> {
+        match span {
+            ullbc::SpanRef::Inline(data) => Some(data),
+            ullbc::SpanRef::Deduplicated(id) => {
+                let i = self.span_bodies.binary_search_by_key(id, |p| p.0).ok()?;
+                Some(&self.span_bodies[i].1)
+            }
+        }
     }
 
     /// Look up a local-crate function whose name ends with `::<name>`.
@@ -558,11 +665,11 @@ impl Llbc {
 }
 
 /// Scan the raw LLBC bytes for every inline
-/// `"HashConsedValue":[id, body]` occurrence, recording the first
+/// `"Value":[id, body]` occurrence, recording the first
 /// `body` seen per `id` into `bodies` (the generic dedup-id → body
-/// index) and, when the body decodes as `{"Adt": {"id": {"Adt":
-/// <def_id>}}}`, also into `adt` (the dedup-id → ADT def_id index for
-/// fast Adt resolution).  Used during [`Llbc::from_slice`].
+/// index) and, when the body decodes as a nominal `{"Adt": {"id":
+/// <def_id>, "builtin": null}}`, also into `adt` (the dedup-id → ADT def_id
+/// index for fast Adt resolution).  Used during [`Llbc::from_slice`].
 ///
 /// Operating on the raw bytes — rather than a fully materialised
 /// `serde_json::Value` of the whole document — keeps peak memory at the
@@ -576,41 +683,157 @@ fn collect_dedup_bodies(
     bytes: &[u8],
     adt: &mut Vec<(u64, u64)>,
     bodies: &mut Vec<(u64, DedupBody)>,
+    traits: &mut Vec<(u64, DedupBody)>,
+    consts: &mut Vec<(u64, DedupBody)>,
+    layouts: &mut Vec<(u64, DedupBody)>,
+    spans: &mut Vec<(u64, ullbc::SpanData)>,
 ) {
     // The artefact is UTF-8 JSON; on the off chance it is not, there are
-    // no HashConsedValue entries to find and the typed parse will fail
+    // no Value entries to find and the typed parse will fail
     // loudly downstream.
     let Ok(text) = std::str::from_utf8(bytes) else {
         return;
     };
-    const KEY: &str = "\"HashConsedValue\":";
+    // `SerDedup::Value` is the wrapper for every hash-consed value, so the
+    // key is shared by types, trait refs, constants, and spans. Each kind
+    // numbers its ids from zero, so the tables stay separate.
+    const KEY: &str = "\"Value\":";
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut seen_trait: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut seen_const: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut seen_layout: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut seen_span: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for (off, _) in text.match_indices(KEY) {
         let val_start = off + KEY.len();
         // The value after the key is the `[id, body]` array; deserialize
         // exactly that one value (the deserializer stops at the array's
         // close, ignoring the trailing document).
         let mut de = serde_json::Deserializer::from_slice(&bytes[val_start..]);
-        if let Ok((id, raw)) = <(u64, Box<serde_json::value::RawValue>)>::deserialize(&mut de)
-            && seen.insert(id)
-        {
-            if let Some(def_id) = adt_def_id_from_ty_body(&raw) {
-                adt.push((id, def_id));
+        let Ok((id, raw)) = <(u64, Box<serde_json::value::RawValue>)>::deserialize(&mut de) else {
+            continue;
+        };
+        match classify_value_body(&raw) {
+            ValueBody::Ty => {
+                if seen.insert(id) {
+                    if let Some(def_id) = adt_def_id_from_ty_body(&raw) {
+                        adt.push((id, def_id));
+                    }
+                    bodies.push((
+                        id,
+                        DedupBody {
+                            raw,
+                            parsed: std::sync::OnceLock::new(),
+                        },
+                    ));
+                }
             }
-            bodies.push((
-                id,
-                DedupBody {
-                    raw,
-                    parsed: std::sync::OnceLock::new(),
-                },
-            ));
+            ValueBody::Trait => {
+                if seen_trait.insert(id) {
+                    traits.push((
+                        id,
+                        DedupBody {
+                            raw,
+                            parsed: std::sync::OnceLock::new(),
+                        },
+                    ));
+                }
+            }
+            ValueBody::Const => {
+                if seen_const.insert(id) {
+                    consts.push((
+                        id,
+                        DedupBody {
+                            raw,
+                            parsed: std::sync::OnceLock::new(),
+                        },
+                    ));
+                }
+            }
+            ValueBody::Layout => {
+                if seen_layout.insert(id) {
+                    layouts.push((
+                        id,
+                        DedupBody {
+                            raw,
+                            parsed: std::sync::OnceLock::new(),
+                        },
+                    ));
+                }
+            }
+            ValueBody::Span => {
+                if seen_span.insert(id)
+                    && let Some(data) = ullbc::span_data_from_body(&raw)
+                {
+                    spans.push((id, data));
+                }
+            }
+            ValueBody::Other => {}
         }
     }
 }
 
+enum ValueBody {
+    Ty,
+    Trait,
+    Const,
+    /// `{"Constant": ...}` layout scalar. Ids restart apart from const exprs.
+    Layout,
+    Span,
+    Other,
+}
+
+/// One probe of the body's first key. An array body is a constant
+/// expression (`[literal, ty]`, including `Str` / `ByteStr` / `FnDef` /
+/// `Global` and the other const kinds). A layout scalar is the object
+/// `{"Constant": {"Value": [id, [literal, ty]]}}` and uses its own id
+/// space. An object body is otherwise a type, a trait ref (`"kind"`),
+/// or a span (`"data"`).
+fn classify_value_body(raw: &serde_json::value::RawValue) -> ValueBody {
+    const TY_KINDS: &[&str] = &[
+        "Scalar",
+        "Array",
+        "Slice",
+        "Adt",
+        "Ref",
+        "RawPtr",
+        "FnDef",
+        "FnPtr",
+        "DynTrait",
+        "Pattern",
+        "Never",
+        "TypeVar",
+        "TraitType",
+        "PtrMetadata",
+    ];
+    let text = raw.get().trim_start();
+    let Some(first) = text.as_bytes().first().copied() else {
+        return ValueBody::Other;
+    };
+    if first == b'[' {
+        return ValueBody::Const;
+    }
+    if first != b'{' {
+        return ValueBody::Other;
+    }
+    match first_json_key(text) {
+        Some("data") => ValueBody::Span,
+        Some("kind") => ValueBody::Trait,
+        Some("Constant") => ValueBody::Layout,
+        Some(key) if TY_KINDS.contains(&key) => ValueBody::Ty,
+        _ => ValueBody::Other,
+    }
+}
+
+fn first_json_key(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix('{')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
 /// Project a type-expression body to its underlying ADT `def_id`,
-/// when the body has shape `{"Adt": {"id": {"Adt": <def_id>}}}`.
-/// Returns `None` for non-ADT bodies (`Literal`, `Ref`, `Tuple`, …).
+/// when the body has shape `{"Adt": {"id": <def_id>, "builtin": …}}`.
+/// Returns `None` for non-ADT bodies (`Scalar`, `Ref`, …).
 ///
 /// Reads the raw text through a narrow typed projection rather than a
 /// `Value` tree: this runs once per hash-consed id at load time, and
@@ -621,18 +844,18 @@ fn adt_def_id_from_ty_body(raw: &serde_json::value::RawValue) -> Option<u64> {
         #[serde(rename = "Adt")]
         adt: Adt,
     }
+    /// `builtin` is non-null for the tuple / `str` / `Box` decls, which
+    /// have no nominal owner.
     #[derive(Deserialize)]
     struct Adt {
-        id: AdtId,
-    }
-    #[derive(Deserialize)]
-    struct AdtId {
-        #[serde(rename = "Adt")]
-        def_id: u64,
+        id: u64,
+        #[serde(default)]
+        builtin: Option<serde::de::IgnoredAny>,
     }
     serde_json::from_str::<Body>(raw.get())
         .ok()
-        .map(|b| b.adt.id.def_id)
+        .filter(|b| b.adt.builtin.is_none())
+        .map(|b| b.adt.id)
 }
 
 /// Errors produced when loading / parsing a `.llbc` artefact.
@@ -713,6 +936,82 @@ mod tests {
         // string has to be tried first or this row reads as unnamed.
         let l = llbc(r#"[{"id":0,"name":"bare.rs"}]"#);
         assert_eq!(l.file_path(0), Some("bare.rs"));
+    }
+
+    #[test]
+    fn dedup_switch_arms_decode_bool_if_and_int_scalar() {
+        let span = serde_json::json!({"Untagged": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}, "generated_from_span": null}});
+        let meta = |name: &str| {
+            serde_json::json!({
+                "name": [{"Ident": [name, 0]}],
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            })
+        };
+        let ret = serde_json::json!({"statements": [], "terminator": {"kind": "Return"}});
+        let fun = |id: u64, name: &str, term: serde_json::Value, extra: Vec<serde_json::Value>| {
+            let mut body =
+                vec![serde_json::json!({"statements": [], "terminator": {"kind": term}})];
+            body.extend(extra);
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": meta(name),
+                "signature": {"is_unsafe": false, "inputs": [], "output": {"Deduplicated": 0}},
+                "body": {"Unstructured": {"span": span, "locals": {"arg_count": 0, "locals": []}, "body": body}}
+            })
+        };
+        let scrut = serde_json::json!({"Value": {"Copy": {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}}}});
+        let bool_term = serde_json::json!({"Switch": {"data": {
+            "scrutinee": scrut,
+            "branches": [[{"Deduplicated": 7}, 0], [{"Deduplicated": 8}, 1]],
+            "fallback": 1
+        }, "branches": [1, 2]}});
+        let int_term = serde_json::json!({"Switch": {"data": {
+            "scrutinee": scrut,
+            "branches": [[{"Deduplicated": 9}, 0], [{"Deduplicated": 10}, 1]],
+            "fallback": 2
+        }, "branches": [1, 2, 3]}});
+        let doc = serde_json::json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {"crate_name": "c", "fun_decls": [
+                fun(0, "bool_switch", bool_term, vec![ret.clone(), ret.clone()]),
+                fun(1, "int_switch", int_term, vec![ret.clone(), ret.clone(), ret])
+            ]},
+            "pad": [
+                {"Value": [7, [{"Bool": true}, {"Deduplicated": 0}]]},
+                {"Value": [8, [{"Bool": false}, {"Deduplicated": 0}]]},
+                {"Value": [9, [{"Integer": {"Signed": ["Isize", "0"]}}, {"Deduplicated": 0}]]},
+                {"Value": [10, [{"Integer": {"Signed": ["Isize", "1"]}}, {"Deduplicated": 0}]]},
+                {"Value": [4, {"data": {"file_id": 0, "beg": {"line": 4, "col": 1}, "end": {"line": 4, "col": 2}}, "generated_from_span": null}]}
+            ]
+        });
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let llbc = Llbc::from_slice(&bytes).expect("fixture");
+        let bool_fn = llbc.fn_by_id(0).unwrap().unstructured().unwrap();
+        match bool_fn.body[0].term(&llbc).unwrap() {
+            ullbc::TermKind::Switch { targets, .. } => match targets {
+                ullbc::SwitchTargets::If(1, 2) => {}
+                other => panic!("bool arm was not If: {other:?}"),
+            },
+            other => panic!("bool switch: {other:?}"),
+        }
+        let int_fn = llbc.fn_by_id(1).unwrap().unstructured().unwrap();
+        match int_fn.body[0].term(&llbc).unwrap() {
+            ullbc::TermKind::Switch { targets, .. } => match targets {
+                ullbc::SwitchTargets::SwitchInt(_, arms, 3) => {
+                    assert_eq!(arms.len(), 2);
+                    assert!(arms[0].0.get("Scalar").is_some());
+                }
+                other => panic!("int arm was not SwitchInt: {other:?}"),
+            },
+            other => panic!("int switch: {other:?}"),
+        }
+        let missing = ullbc::SpanRef::Deduplicated(99);
+        assert!(llbc.span_data(&missing).is_none());
+        let present = ullbc::SpanRef::Deduplicated(4);
+        assert_eq!(llbc.span_data(&present).unwrap().beg.line, 4);
     }
 
     #[test]
