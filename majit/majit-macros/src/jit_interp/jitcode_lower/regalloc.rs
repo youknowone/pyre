@@ -505,6 +505,8 @@ fn non_register_positions(method: &str) -> &'static [usize] {
         | "vable_setarrayitem_ref_with_base"
         | "vable_setarrayitem_float_with_base" => &[1],
         _ if method.starts_with("inline_call") => &[0],
+        // `(fn_idx, value_reg, typed_args, dst)`: the destination is a register.
+        "conditional_call_value_ir_i_typed_args" | "conditional_call_value_ir_r_typed_args" => &[0],
         _ if method.starts_with("residual_call")
             || method.starts_with("call_")
             || method.starts_with("conditional_call")
@@ -870,6 +872,34 @@ mod tests {
         assert!(
             emitted.contains("vable_setfield_int_with_base (0u16 , 5u16 , 0u16)"),
             "field index 5 must stay, src must be recolored: {emitted}"
+        );
+    }
+
+    /// `conditional_call_value_ir_{i,r}_typed_args(fn_idx, value, args, dst)`
+    /// carries its destination register in the position the other call
+    /// builders use for effect info, so that position is recolored here.
+    #[test]
+    fn a_conditional_call_value_destination_is_recolored() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.emit_op(
+            OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(5)]),
+            quote! { __builder.load_const_i_value(5u16, 41i64); },
+        );
+        lowerer.emit_op(
+            OpMeta::linear(OpKind::Aux, vec![Register::int(5)], vec![Register::int(7)]),
+            quote! { __builder.conditional_call_value_ir_i_typed_args(3u16, 5u16, &[], 7u16); },
+        );
+        lowerer.emit_op(
+            OpMeta::terminal(vec![Register::int(7)]),
+            quote! { __builder.int_return(7u16); },
+        );
+
+        compact_registers(&mut lowerer, RegisterCounts::default(), None);
+
+        let emitted = lowerer.statements[1].to_string();
+        assert!(
+            emitted.contains("conditional_call_value_ir_i_typed_args (3u16 , 0u16 , & [] , 0u16)"),
+            "fn index 3 must stay, value and dst must be recolored: {emitted}"
         );
     }
 
