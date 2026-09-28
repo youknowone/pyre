@@ -1507,11 +1507,8 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
 /// (`ctx.registers_*`) are still in scope.  `call_jit_pc` is the CALL op's
 /// jitcode pc in the caller.  Returns a named decline reason
 /// when the caller frame is not snapshot-able for this first slice: missing
-/// liveness / resume tables, a CLOSURE callee at a CALL inside a try-block
-/// whose `except` handler does NOT rejoin a loop (it reads caller cells the
-/// handler cleanup clears, see
-/// [`decline_inline_caller_frame_for_catch_marker`]), or no result on the
-/// operand stack at the return point.
+/// liveness / resume tables, or no result on the operand stack at the return
+/// point.
 ///
 /// The caller resumes at the CALL's return point (fallthrough) with the
 /// not-yet-produced call-result slot nulled — `get_list_of_active_boxes(
@@ -1534,60 +1531,40 @@ fn unavail(site: &'static str) -> InlineCallerFrameDecline {
     InlineCallerFrameDecline::Unavailable
 }
 
+/// Decline a closure inline only when the CALL's handler returns out of the
+/// frame. A handler that rejoins the loop, or that only clears an
+/// `except ... as` cell and reraises, still inlines: the cell read is the
+/// residual `w_cell_get` once `CellFamily.ever_mutated` is set
+/// (`nestedscope.py Cell.set` / `Cell.get`).
+///
+/// The returning case stays declined for the traceback: delivering the
+/// inlined callee's raise to such a handler drops the catching frame's
+/// traceback node, so `exception_traceback_frame_lineno` reports the raising
+/// frame twice.
 pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     after_residual_call_resume: Option<usize>,
     caller_jitcode: &[u8],
     callee_has_freevars: bool,
 ) -> Result<(), InlineCallerFrameDecline> {
-    let Some(resume_pos) = after_residual_call_resume else {
-        // Not a try-block CALL — nothing to route on a raise.
-        return Ok(());
-    };
-    // A closure callee reads its captured values out of the cells the caller
-    // frame owns, and inside a try-block one of those cells is the `except E as
-    // e` binding, which the handler's implicit cleanup stores `None` into and
-    // then clears.  Inlining such a callee here reads that cell as `None`
-    // (`bench/synth/exception_as_cell_cleanup`).  A callee with no free
-    // variables cannot reach a caller cell at all, so the decline below is not
-    // needed for it.
     if !callee_has_freevars {
         return Ok(());
     }
-    // The CALL is inside a try-block.  Inline it when its exception handler
-    // rejoins a loop (the exc-edge-bridgeable shape): the paused caller frame
-    // resumes at the CALL fallthrough on the no-raise path, and on a raise the
-    // catch handler runs in the blackhole — bit-exact — while a hot raise bridges
-    // into the enclosing loop via the carrier-boundary delivery
-    // (`drive_bridge_carrier_walk`'s `finishframe_exception`).
-    //
-    // The rejoin test is a TRACEBACK constraint here, not a bridgeability one:
-    // the exc-edge router itself no longer needs it (`bridge_subwalk.rs` routes
-    // on the catch alone, as `pyjitpl.py` does).  Inlining a caller
-    // whose handler returns out of the frame instead makes
-    // `exception_traceback_frame_lineno` report the raising frame twice, once at
-    // the wrong lineno — the catching frame's traceback node is dropped when the
-    // inlined callee's raise is delivered.  Keep the decline until that is
-    // fixed; both backends reproduce it.
-    //
-    // `resume_pos` is the CALL's post-call `live/`; the `catch_exception/L` for
-    // the enclosing try sits right after it (`finishframe_exception` lookahead),
-    // so read the handler target forward from there.
-    //
-    // `after_residual_call_resume_for_jitcode_pc` answers through a
-    // predecessor tier as well as an exact one, so a `Some` is not on its own
-    // proof that THIS call sits in a try-block: a call that carries no marker
-    // of its own resolves to the nearest preceding one.  The `catch_exception`
-    // lookahead is what settles it, and when it finds nothing there is no
-    // handler to rewrite a caller cell and nothing to decline for.
+    let Some(resume_pos) = after_residual_call_resume else {
+        return Ok(());
+    };
     let Some(catch_target) =
         crate::jitcode_dispatch::try_catch_exception_at(caller_jitcode, resume_pos)
     else {
         return Ok(());
     };
-    if crate::jitcode_dispatch::exc_handler_rejoins_loop(caller_jitcode, catch_target) {
-        return Ok(());
+    match crate::jitcode_dispatch::exc_handler_shape(caller_jitcode, catch_target) {
+        crate::jitcode_dispatch::ExcHandlerShape::Returns => {
+            Err(InlineCallerFrameDecline::TryBlockCatchMarker)
+        }
+        crate::jitcode_dispatch::ExcHandlerShape::Rejoins
+        | crate::jitcode_dispatch::ExcHandlerShape::Reraise
+        | crate::jitcode_dispatch::ExcHandlerShape::Unproven => Ok(()),
     }
-    Err(InlineCallerFrameDecline::TryBlockCatchMarker)
 }
 
 pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
@@ -2362,10 +2339,6 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
             crate::jitcode_runtime::decode_op_at(jc.payload.jitcode.code.as_slice(), call_jit_pc)
                 .and_then(|op| op.argcodes.chars().last())
                 .is_some_and(|bank| bank == 'v');
-        // A CALL inside a try-block: inline it only when its exception handler
-        // rejoins the loop (the exc-edge-bridgeable shape); otherwise decline so
-        // the residual path handles the raise via its after-residual catch
-        // marker without a per-iteration deopt.
         decline_inline_caller_frame_for_catch_marker(
             jc.payload
                 .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
@@ -2580,14 +2553,9 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         crate::jitcode_runtime::decode_op_at(pjc.jitcode.code.as_slice(), call_jit_pc)
             .and_then(|op| op.argcodes.chars().last())
             .is_some_and(|bank| bank == 'v');
-    let after_residual_call_resume = pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc);
-    // A CALL inside a try-block at inline depth ≥2: the rejoin-loop lift is
-    // scoped to the top-level caller (`compute_inline_caller_frame`) for now, so
-    // pass an empty jitcode here — a nested try-block CALL keeps declining
-    // (its catch-marker resume is not yet routed through the deeper snapshot).
     decline_inline_caller_frame_for_catch_marker(
-        after_residual_call_resume,
-        &[],
+        pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc),
+        pjc.jitcode.code.as_slice(),
         callee_has_freevars,
     )?;
     let legacy_fallthrough_py_pc = || unsafe {

@@ -7343,10 +7343,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let precomputed_parent_frame =
         match compute_inline_caller_frame(ctx, op.pc, !callee_code.freevars.is_empty()) {
             Ok(parent) => parent,
-            Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {
-                return resolved_inline_decline(op.pc, line!());
-            }
-            Err(InlineCallerFrameDecline::Unavailable) => {
+            Err(InlineCallerFrameDecline::TryBlockCatchMarker)
+            | Err(InlineCallerFrameDecline::Unavailable) => {
                 return resolved_inline_decline(op.pc, line!());
             }
         };

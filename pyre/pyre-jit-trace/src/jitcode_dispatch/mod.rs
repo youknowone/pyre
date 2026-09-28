@@ -4621,35 +4621,29 @@ fn label_operand_offset(key: &str) -> Option<usize> {
     None
 }
 
-/// Does the `except` handler at `catch_target` flow back into this frame's loop
-/// (reaching a `jit_merge_point` back-edge), rather than returning out of the
-/// frame (`*_return`)?
-///
-/// Sole caller: [`decline_inline_caller_frame_for_catch_marker`].  The
-/// exception-edge bridge router itself does NOT consult this — it routes on the
-/// `catch_exception` alone, the way `finishframe_exception`
-/// (`pyjitpl.py`) does, and a handler that returns out of the frame is
-/// `finishframe`'s ordinary case (`pyjitpl.py`).
-///
-/// What the predicate still gates is INLINING a CLOSURE callee at a caller's
-/// in-try CALL.  A non-rejoining handler is an `except E as e` body, and the
-/// callee's free variables resolve through cells that body's implicit cleanup
-/// stores `None` into and then clears; the inlined read answers `None`
-/// (`synth/exception_as_cell_cleanup`, dynasm).  A callee with no free
-/// variables cannot reach a caller cell and is inlined either way.
-///
-/// Bounded forward reachability from `catch_target`, following `goto`/
-/// `goto_if_not` successors: `true` as soon as any path reaches a
-/// `jit_merge_point`; `false` if every reachable path terminates at a `*_return`
-/// (or the scan hits an un-followed control op / the bound, which conservatively
-/// declines).
-pub(crate) fn exc_handler_rejoins_loop(code: &[u8], catch_target: usize) -> bool {
+/// How the `except` handler at a `catch_exception` target leaves the frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExcHandlerShape {
+    /// Reaches `jit_merge_point`.
+    Rejoins,
+    /// A path returns out of the frame (`*_return`).
+    Returns,
+    /// Clears state and `reraise`s, and no path returns.
+    Reraise,
+    /// Switch, budget, or a scan that proved neither.
+    Unproven,
+}
+
+/// Bounded forward reachability from `catch_target`.
+pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerShape {
     let mut visited = std::collections::HashSet::new();
     let mut work = vec![catch_target];
     let mut budget = 4096usize;
+    let mut saw_return = false;
+    let mut saw_reraise = false;
     while let Some(pc) = work.pop() {
         if budget == 0 {
-            return false;
+            return ExcHandlerShape::Unproven;
         }
         budget -= 1;
         if !visited.insert(pc) {
@@ -4659,35 +4653,39 @@ pub(crate) fn exc_handler_rejoins_loop(code: &[u8], catch_target: usize) -> bool
             continue;
         };
         if op.key.starts_with("jit_merge_point") {
-            return true;
+            return ExcHandlerShape::Rejoins;
         }
         if matches!(
             op.key,
             "ref_return/r" | "int_return/i" | "float_return/f" | "void_return/"
         ) {
-            // Frame-return terminal on this path; do not enqueue successors.
+            saw_return = true;
+            continue;
+        }
+        if op.key.starts_with("reraise") {
+            saw_reraise = true;
             continue;
         }
         match op.key {
             "goto/L" => work.push(read_label(code, &op, 0)),
             // Every member of the family spells its label as the FINAL
             // operand (`iL`, `iiL`, `rL`, `rrL`, `ffL`), so the operand index
-            // is one less than the argcode count -- 1 for the plain `iL` this
-            // used to hard-code.  Naming a single key here left a fused
-            // branch's taken arm off the worklist, which this walk reads as
-            // "that block is unreachable" rather than as a decline.
+            // is one less than the argcode count.
             key if key.starts_with("goto_if_not") && op.argcodes.ends_with('L') => {
                 work.push(read_label(code, &op, op.argcodes.len() - 1));
                 work.push(op.next_pc);
             }
-            key if key.starts_with("switch") => {
-                // Multi-target dispatch not followed; leave this path un-proven
-                // (routing declines unless another path rejoins the loop).
-            }
+            key if key.starts_with("switch") => return ExcHandlerShape::Unproven,
             _ => work.push(op.next_pc),
         }
     }
-    false
+    if saw_return {
+        ExcHandlerShape::Returns
+    } else if saw_reraise {
+        ExcHandlerShape::Reraise
+    } else {
+        ExcHandlerShape::Unproven
+    }
 }
 
 /// True when a path reachable from `position` reads the walker's active
