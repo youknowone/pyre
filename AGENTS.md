@@ -293,7 +293,7 @@ them out:
 
 ```bash
 export CHARON_TARGET_DIR=$HOME/Projects/.pyre-build/charon-target-<worktree>
-pyre/scripts/build-jit-core.sh           # extract the 4 core crates, release pyre-dynasm without pyre-module
+pyre/scripts/build-jit-core.sh           # extract the 4 core crates, pyre-dynasm without pyre-module (`jit-core` profile)
 pyre/scripts/build-jit-core.sh --check   # same extraction, `cargo check` only
 python3 pyre/check.py --backend cranelift   # check.py's cranelift leg is the core build
 cargo test -p pyre-jit --no-default-features --features dynasm,prepass
@@ -309,10 +309,15 @@ cargo test -p pyre-jit --no-default-features --features dynasm,prepass
   without it, whatever its backend. Never exempt a backend
   (`skip-backends=`) for a module it lacks: whether the module is there is a
   property of the build, not of the backend.
-- **`build-jit-core.sh` writes `target/release/pyre-dynasm`**, the path
-  `check.py`'s dynasm leg builds *with* `pyre-module`. `--build no --backend
-  dynasm` after the script measures the core binary, with the same
-  `requires-modules` skips as the cranelift leg.
+- **`build-jit-core.sh` writes `target/jit-core/pyre-dynasm`** under the
+  `jit-core` cargo profile (release optimisation, no LTO, 16 incremental
+  codegen units), so its timings are not the product's. `python3
+  pyre/check.py --build no --backend dynasm target/jit-core/pyre-dynasm`
+  measures it, with the same `requires-modules` skips as the cranelift leg.
+  JIT counters (`.jitstats`) are comparable; wall-clock ratios are not.
+  `synth/foriter_setadd_call_consuming_body` reports a jit-stats change
+  there: without `_heapq` it runs the pure-Python `heapq`, which only its
+  cranelift baseline records.
 - The core loop does not replace the full gate below. When the full gate is
   due (see "How much to verify"), it is the product `cargo test` and a bare
   `python3 pyre/check.py`, not their core variants.
