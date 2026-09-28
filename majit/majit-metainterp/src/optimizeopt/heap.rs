@@ -5736,7 +5736,7 @@ mod tests {
     fn arrayitem_key_rejects_a_negative_constant_index() {
         let d = descr(0);
         let idx = OpRef::int_op(50);
-        let op = Op::with_descr(
+        let mut op = Op::with_descr(
             OpCode::GetarrayitemGcPureI,
             &[
                 rooted_resop_operand(Type::Int, 100),
@@ -5746,6 +5746,8 @@ mod tests {
         );
         let mut ctx = OptContext::new(1);
         let b = ctx.materialize_operand_at(idx);
+        // The index argument is the box the constant is attached to.
+        op.setarg(1, b.clone());
         ctx.make_constant_box(&b, majit_ir::Value::Int(-1));
         assert!(OptHeap::arrayitem_key(&op, &mut ctx).is_none());
     }
