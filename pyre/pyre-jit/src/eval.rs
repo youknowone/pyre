@@ -7030,6 +7030,12 @@ fn drive_portal_metatrace(
                 }
             };
             let outcome = meta.run_blackhole_interp_to_cancel_tracing(
+                majit_metainterp::SwitchToBlackhole {
+                    reason: meta
+                        .last_interpret_abort_reason
+                        .unwrap_or(majit_metainterp::counters::ABORT_BAD_LOOP),
+                    raising_exception: meta.last_exc_value != 0,
+                },
                 &mut builder,
                 Some(per_frame.as_slice()),
                 Some(&set_topframeref as &dyn Fn(i64)),

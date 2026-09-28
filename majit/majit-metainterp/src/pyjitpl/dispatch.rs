@@ -1778,9 +1778,7 @@ where
             // abort reason + `raising_exception` flag on TraceCtx so
             // jitdriver-side `aborted_tracing(stb.reason)` fires with
             // `ABORT_ESCAPE` instead of the generic too-long fallback.
-            ctx.pending_switch_to_blackhole =
-                Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
-            TraceAction::Abort
+            TraceAction::SwitchToBlackhole(crate::pyjitpl::SwitchToBlackhole::abort_escape())
         } else {
             // pyjitpl.py `generate_guard(rop.GUARD_NOT_FORCED)` runs the
             // recorded guard through `capture_resumedata(resumepc,
@@ -8149,9 +8147,9 @@ where
                     // the generic too-long fallback.
                     let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     if exc != 0 {
-                        ctx.pending_switch_to_blackhole =
-                            Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
-                        return TraceAction::Abort;
+                        return TraceAction::SwitchToBlackhole(
+                            crate::pyjitpl::SwitchToBlackhole::abort_escape(),
+                        );
                     }
                 } else {
                     // `pyjitpl.py do_residual_call`'s `OS_LIBFFI_CALL` hook answers
@@ -8504,9 +8502,9 @@ where
                     // above.
                     let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     if exc != 0 {
-                        ctx.pending_switch_to_blackhole =
-                            Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
-                        return TraceAction::Abort;
+                        return TraceAction::SwitchToBlackhole(
+                            crate::pyjitpl::SwitchToBlackhole::abort_escape(),
+                        );
                     }
                     let _ = dst;
                 } else {
@@ -8863,9 +8861,9 @@ where
                     // above.
                     let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     if exc != 0 {
-                        ctx.pending_switch_to_blackhole =
-                            Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
-                        return TraceAction::Abort;
+                        return TraceAction::SwitchToBlackhole(
+                            crate::pyjitpl::SwitchToBlackhole::abort_escape(),
+                        );
                     }
                     let _ = dst;
                 } else {
@@ -9170,9 +9168,9 @@ where
                     // above.
                     let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     if exc != 0 {
-                        ctx.pending_switch_to_blackhole =
-                            Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
-                        return TraceAction::Abort;
+                        return TraceAction::SwitchToBlackhole(
+                            crate::pyjitpl::SwitchToBlackhole::abort_escape(),
+                        );
                     }
                     let _ = dst;
                 } else {
