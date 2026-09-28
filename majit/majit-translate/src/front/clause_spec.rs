@@ -633,13 +633,15 @@ fn indirect_body(v: &Value, llbc: &Llbc, space: Space) -> Option<Value> {
 }
 
 /// The hash-cons table a `Deduplicated` id indexes. Charon numbers types,
-/// trait refs and constants independently, so an id is read in the table
-/// of the position it occupies.
+/// trait refs, constants and spans independently, so an id is read in the
+/// table of the position it occupies.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Space {
     Ty,
     TraitRef,
     Const,
+    /// A source span. It names no type, so its id is never resolved.
+    Span,
 }
 
 impl Space {
@@ -648,12 +650,17 @@ impl Space {
             Space::Ty => llbc.dedup_body(id),
             Space::TraitRef => llbc.dedup_trait_body(id),
             Space::Const => llbc.dedup_const_body(id),
+            Space::Span => None,
         }
     }
 
     /// Space of the value stored under `key` in an object of this space.
     fn field(self, key: &str) -> Space {
+        if self == Space::Span {
+            return self;
+        }
         match key {
+            "span" | "generated_from_span" => Space::Span,
             "ty" | "types" | "inputs" | "output" => Space::Ty,
             // `generics.trait_refs`, an impl's `implied_trait_refs`, and the
             // `[trait_ref, ..]` payloads of a trait call, a parent clause,
@@ -668,6 +675,9 @@ impl Space {
     /// Space of the `index`-th element of an array stored under `key`
     /// (`None` for an array that is itself a resolved hash-cons body).
     fn element(self, key: Option<&str>, index: usize) -> Space {
+        if self == Space::Span {
+            return self;
+        }
         match key {
             // `{"Array": [elem_ty, len_const, ..]}`.
             Some("Array") => {
@@ -1458,6 +1468,64 @@ mod tests {
         }
         assert_eq!(llbc.dedup_body(11), Some(&shared));
         assert!(value_has_depth0_type_var(&shared) && value_has_depth0_clause(&shared));
+    }
+
+    /// A span is hash-consed in a table of its own. A span id equal to a
+    /// type id whose body holds a depth-0 variable stays a span in the copy.
+    #[test]
+    fn span_id_is_not_read_as_a_type_id() {
+        let span_body = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}, "generated_from_span": null});
+        let span = json!({"Deduplicated": 11});
+        let wrapper = json!({"Adt": {"id": 0, "generics": {"regions": [], "types": [{"TypeVar": {"Bound": [0, 0]}}], "const_generics": [], "trait_refs": []}}});
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let body = json!({
+            "Unstructured": {
+                "span": {"Value": [11, span_body]},
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [{"index": 0, "name": null, "span": span, "ty": {"Value": [11, wrapper]}}]
+                },
+                "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}}]
+            }
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["f", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {"is_unsafe": false, "inputs": [], "output": {"Deduplicated": 11}},
+                    "body": body
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        assert!(contains_depth0_var(
+            llbc.dedup_body(11).expect("type 11"),
+            &llbc,
+            Space::Ty,
+            None,
+            0
+        ));
+        let fd = llbc.fn_by_id(0).expect("f");
+        let copied = substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[])
+            .expect("a span id resolved as a type breaks the copy");
+        let majit_charon_reader::ullbc::TyRef::Other(local_ty) = &copied.locals.locals[0].ty else {
+            panic!("wrapper survived in {:?}", copied.locals.locals[0].ty);
+        };
+        assert!(
+            !value_has_depth0_type_var(local_ty),
+            "type var survived: {local_ty}"
+        );
     }
 
     fn value_has_depth0_type_var(v: &Value) -> bool {
