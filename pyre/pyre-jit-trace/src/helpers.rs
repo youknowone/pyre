@@ -2039,7 +2039,7 @@ mod tests {
     #[test]
     fn test_container_helpers_dispatch_expected_runtime_shapes() {
         let result = jit_build_tuple_2(w_int_new(3), w_int_new(5));
-        let tuple = result as PyObjectRef;
+        let tuple = result;
         unsafe {
             assert!(is_tuple(tuple));
             assert_eq!(w_int_get_value(w_tuple_getitem(tuple, 0).unwrap()), 3);
@@ -2054,7 +2054,7 @@ mod tests {
         }
 
         let result = jit_build_map_2(w_int_new(1), w_int_new(10), w_int_new(2), w_int_new(20));
-        let dict = result as PyObjectRef;
+        let dict = result;
         unsafe {
             assert!(is_dict(dict));
             assert_eq!(w_int_get_value(w_dict_getitem(dict, 1).unwrap()), 10);

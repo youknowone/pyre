@@ -289,12 +289,6 @@ pub fn jit_w_tuple1(item: PyObjectRef) -> PyObjectRef {
     w_tuple_new(vec![item])
 }
 
-/// Word-ABI residual of a 3-tuple, for the same reason as [`jit_w_tuple1`].
-#[majit_macros::dont_look_inside]
-pub fn jit_w_tuple3(a: PyObjectRef, b: PyObjectRef, c: PyObjectRef) -> PyObjectRef {
-    w_tuple_new(vec![a, b, c])
-}
-
 /// Allocate the array-backed `W_TupleObject` directly, bypassing
 /// arity-2 specialisation. Useful for tests and call sites that need
 /// the canonical layout.

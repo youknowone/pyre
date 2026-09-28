@@ -966,7 +966,7 @@ pub fn publish_roots(roots: &[PyObjectRef]) -> usize {
 /// offset 0 (`bh_newtuple_from_array`). The executor passes that word, not a
 /// fat `(ptr, len)` pair.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub extern "C" fn publish_roots_jit_abi(array: i64) -> i64 {
+pub extern "C" fn publish_roots_jit_abi(array: *const crate::object_array::GcTypedArray) -> i64 {
     let items = gcarray_ref_items(array);
     publish_roots(&items) as i64
 }
@@ -980,8 +980,7 @@ pub extern "C" fn pin_roots_jit_abi(array: i64) -> i64 {
 }
 
 /// Copy the items of a length-prefixed ref `GcTypedArray` word.
-pub fn gcarray_ref_items(array: i64) -> Vec<PyObjectRef> {
-    let arr = array as *const crate::object_array::GcTypedArray;
+pub fn gcarray_ref_items(arr: *const crate::object_array::GcTypedArray) -> Vec<PyObjectRef> {
     let len = crate::object_array::gcarray_len(arr);
     let mut items = Vec::with_capacity(len);
     for index in 0..len {

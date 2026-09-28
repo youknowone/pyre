@@ -376,7 +376,7 @@ macro_rules! define_known_function_call_helper {
 
 macro_rules! define_flat_ref_helper {
     ($inner:ident, $name:ident $(, $arg:ident)*) => {
-        pub extern "C" fn $name($($arg: PyObjectRef),*) -> i64 {
+        pub extern "C" fn $name($($arg: PyObjectRef),*) -> PyObjectRef {
             $inner(&[$($arg),*])
         }
     };
@@ -664,9 +664,11 @@ pub fn compare_op_from_tag(tag: i64) -> Option<ComparisonOperator> {
 ///
 /// The items argument is a length-prefixed `GcTypedArray` (`bh_newlist_from_array`).
 #[majit_macros::dont_look_inside]
-pub extern "C" fn build_list_from_refs_jit_abi(array: i64) -> i64 {
+pub extern "C" fn build_list_from_refs_jit_abi(
+    array: *const pyre_object::object_array::GcTypedArray,
+) -> PyObjectRef {
     let items = pyre_object::gc_roots::gcarray_ref_items(array);
-    build_list_from_refs(&items) as i64
+    build_list_from_refs(&items)
 }
 
 pub fn build_list_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
@@ -685,9 +687,11 @@ pub fn build_list_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
 ///
 /// Same length-prefixed array word as [`build_list_from_refs_jit_abi`].
 #[majit_macros::dont_look_inside]
-pub extern "C" fn build_tuple_from_refs_jit_abi(array: i64) -> i64 {
+pub extern "C" fn build_tuple_from_refs_jit_abi(
+    array: *const pyre_object::object_array::GcTypedArray,
+) -> PyObjectRef {
     let items = pyre_object::gc_roots::gcarray_ref_items(array);
-    build_tuple_from_refs(&items) as i64
+    build_tuple_from_refs(&items)
 }
 
 pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
@@ -1026,38 +1030,38 @@ pub fn binary_slice_values(
     }
 }
 
-fn build_list_from_args(args: &[PyObjectRef]) -> i64 {
-    build_list_from_refs(args) as i64
+fn build_list_from_args(args: &[PyObjectRef]) -> PyObjectRef {
+    build_list_from_refs(args)
 }
 
-fn build_tuple_from_args(args: &[PyObjectRef]) -> i64 {
-    build_tuple_from_refs(args) as i64
+fn build_tuple_from_args(args: &[PyObjectRef]) -> PyObjectRef {
+    build_tuple_from_refs(args)
 }
 
-fn build_map_from_args(args: &[PyObjectRef]) -> i64 {
+fn build_map_from_args(args: &[PyObjectRef]) -> PyObjectRef {
     // Legacy fixed-arity BUILD_MAP residual reached only on the blackhole /
     // deopt path (the codewriter lowers BUILD_MAP through the array-based
     // `bh_build_map_from_array`).  An unhashable key raises; signal it through
     // `BH_LAST_EXC_VALUE` and return PY_NULL, like the other blackhole-only
     // residuals.
     match build_map_from_refs(args) {
-        Ok(dict) => dict as i64,
+        Ok(dict) => dict,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-            PY_NULL as i64
+            PY_NULL
         }
     }
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_build_list_0() -> i64 {
-    w_list_new(vec![]) as i64
+pub extern "C" fn jit_build_list_0() -> PyObjectRef {
+    w_list_new(vec![])
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_build_tuple_0() -> i64 {
-    w_tuple_new(vec![]) as i64
+pub extern "C" fn jit_build_tuple_0() -> PyObjectRef {
+    w_tuple_new(vec![])
 }
 
 define_flat_ref_helper!(build_list_from_args, jit_build_list_1, arg0);
