@@ -1138,13 +1138,13 @@ impl GraphSlot {
     }
 
     /// The funcobj attributes to write to without building the graph: the
-    /// built graph's, or the pending [`FuncObjAttrs`] of an unbuilt one.
-    /// `None` when the build produced no graph.
-    fn attrs_mut(&mut self) -> Option<AttrsMut<'_>> {
+    /// built graph's, or the [`FuncObjAttrs`] of an unbuilt one. A funcobj
+    /// whose build produced no graph is external, and its [`FuncObjAttrs`]
+    /// stay its attributes.
+    fn attrs_mut(&mut self) -> AttrsMut<'_> {
         match self.graph.get_mut() {
-            Some(Some(built)) => Some(AttrsMut::Graph(std::rc::Rc::make_mut(&mut built.graph))),
-            Some(None) => None,
-            None => Some(AttrsMut::Pending(&mut self.attrs)),
+            Some(Some(built)) => AttrsMut::Graph(std::rc::Rc::make_mut(&mut built.graph)),
+            Some(None) | None => AttrsMut::Pending(&mut self.attrs),
         }
     }
 }
@@ -1364,9 +1364,7 @@ impl GraphStore {
                     hints: transform.hints,
                     return_type: transform.return_type,
                 };
-                if let Some(target) = slot.attrs_mut() {
-                    target.fold(&attrs);
-                }
+                slot.attrs_mut().fold(&attrs);
             }
             Some(_) => {
                 let Some(built) = graph.get() else {
@@ -1402,7 +1400,18 @@ impl GraphStore {
     /// graph.
     pub(crate) fn func_mut(&mut self, path: &CallPath) -> Option<&mut crate::model::FuncEffects> {
         let key = self.path_to_key.get(path)?;
-        Some(self.graphs.get_mut(key)?.attrs_mut()?.func())
+        Some(self.graphs.get_mut(key)?.attrs_mut().func())
+    }
+
+    /// The attributes of the funcobj `path` names when its build produced
+    /// no graph: it is an external funcobj, and what was written onto it
+    /// before and after the build is its record. Builds the graph.
+    pub(crate) fn external_func(&self, path: &CallPath) -> Option<&crate::model::FuncEffects> {
+        let slot = self.graphs.get(self.path_to_key.get(path)?)?;
+        if slot.building.get() || self.slot_graph(slot).is_some() {
+            return None;
+        }
+        Some(&slot.attrs.func)
     }
 
     /// Add `hints` to the funcobj `path` names without building its graph.
@@ -1410,8 +1419,8 @@ impl GraphStore {
         let Some(key) = self.path_to_key.get(path) else {
             return;
         };
-        if let Some(target) = self.graphs.get_mut(key).and_then(GraphSlot::attrs_mut) {
-            target.merge_hints(hints);
+        if let Some(slot) = self.graphs.get_mut(key) {
+            slot.attrs_mut().merge_hints(hints);
         }
     }
 
@@ -4058,6 +4067,15 @@ impl CallControl {
         self.function_graphs
             .get(path)
             .map(|g| &g.func)
+            .or_else(|| self.external_funcobj(path))
+    }
+
+    /// The external funcobj `path` names, for a target with no graph: a
+    /// registered funcobj whose build produced none, or a graph-less
+    /// record the `mark_*` setters created.
+    fn external_funcobj(&self, path: &CallPath) -> Option<&crate::model::FuncEffects> {
+        self.function_graphs
+            .external_func(path)
             .or_else(|| self.external_funcobjs.get(path))
     }
 
@@ -7031,8 +7049,7 @@ impl CallControl {
             .get(path)
             .is_some_and(|graph| graph.func.cannot_raise_assertion)
             || self
-                .external_funcobjs
-                .get(path)
+                .external_funcobj(path)
                 .is_some_and(|effects| effects.cannot_raise_assertion)
     }
 
@@ -7211,7 +7228,9 @@ impl CallControl {
     }
 
     /// RPython: collectanalyze.py — `funcobj.random_effects_on_gcobjs`.
-    /// Mark an external target as having random GC effects.
+    /// Mark a target as having random GC effects. The analyzers read it in
+    /// their `analyze_external_call` arm only, so it speaks for a target
+    /// with no graph.
     pub fn mark_external_gc_effects(&mut self, path: CallPath) {
         self.func_effects_mut(&path).random_effects_on_gcobjs = true;
     }
@@ -7357,7 +7376,7 @@ impl CallControl {
                                 .insert(segmented.clone());
                             let bucket = if self.function_graphs.contains_key(&path) {
                                 &mut census.with_graph
-                            } else if self.external_funcobjs.contains_key(&path) {
+                            } else if self.external_funcobj(&path).is_some() {
                                 &mut census.declared_external
                             } else {
                                 &mut census.unknown
@@ -7476,8 +7495,7 @@ impl CallControl {
             // `canraise.py analyze_external_call`: getattr(fnobj, 'canraise', True)
             None => {
                 return self
-                    .external_funcobjs
-                    .get(path)
+                    .external_funcobj(path)
                     .map(|funcobj| funcobj.canraise)
                     .unwrap_or(true);
             }
@@ -7643,8 +7661,7 @@ impl CallControl {
                 // RPython: analyze_external_call → bottom_result (False)
                 // unless funcobj.random_effects_on_gcobjs → True.
                 return self
-                    .external_funcobjs
-                    .get(path)
+                    .external_funcobj(path)
                     .is_some_and(|f| f.random_effects_on_gcobjs);
             }
         };
@@ -7727,8 +7744,7 @@ impl CallControl {
                 // `random_effects_on_gcobjs` external is a witness.
                 let reached = witness == EffectWitness::RandomEffects
                     && self
-                        .external_funcobjs
-                        .get(path)
+                        .external_funcobj(path)
                         .is_some_and(|funcobj| funcobj.random_effects_on_gcobjs);
                 if reached {
                     chain.push(format!("{name} is external with random_effects_on_gcobjs"));
@@ -7906,8 +7922,7 @@ impl CallControl {
                 // `RandomEffectsAnalyzer.analyze_simple_operation` does
                 // (effectinfo.py).
                 return self
-                    .external_funcobjs
-                    .get(path)
+                    .external_funcobj(path)
                     .is_some_and(|f| f.random_effects_on_gcobjs || f.canmallocgc);
             }
         };
@@ -13998,6 +14013,28 @@ mod tests {
         let graph = cc.function_graphs.get(&path).expect("registered graph");
         assert!(graph.func.elidable);
         assert_eq!(graph.hints, ["elidable", "unroll_safe"]);
+    }
+
+    /// A funcobj whose build produces no graph is external, and the marks
+    /// written onto it before and after the build are its record.
+    #[test]
+    fn a_funcobj_whose_build_fails_keeps_its_marks_as_the_external_record() {
+        let path = CallPath::from_segments(["opaque"]);
+        let mut cc = CallControl::new();
+        cc.function_graphs
+            .insert_deferred(path.clone(), (None, "opaque".to_string()), || None);
+        cc.mark_external_gc_effects(path.clone());
+        assert!(cc.function_graphs.get(&path).is_none());
+        cc.mark_cannot_collect(path.clone());
+        assert!(!cc.external_funcobjs.contains_key(&path));
+        let effects = cc.func_effects(&path).expect("the external funcobj");
+        assert!(effects.random_effects_on_gcobjs);
+        assert!(effects.cannot_collect);
+        assert!(cc.analyze_random_effects(
+            &path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls()
+        ));
     }
 
     /// Alias registrations of one funcobj share one slot and build its

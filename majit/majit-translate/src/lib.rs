@@ -2231,11 +2231,10 @@ fn analyze_pipeline_from_module_paths(
                     "not_in_trace" => {
                         call_control.mark_oopspec(p.clone(), "jit.not_in_trace".to_string());
                     }
-                    // RPython: random_effects_on_gcobjs is on external funcobj only.
-                    // Only register for paths WITHOUT a graph (external functions).
-                    "gc_effects" if !call_control.function_graphs().contains_key(p) => {
-                        call_control.mark_external_gc_effects(p.clone());
-                    }
+                    // `random_effects_on_gcobjs` is read off the funcobj by
+                    // `analyze_external_call` alone, so it only speaks for a
+                    // path that ends up with no graph.
+                    "gc_effects" => call_control.mark_external_gc_effects(p.clone()),
                     _ => {}
                 }
             }
