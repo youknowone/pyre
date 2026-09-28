@@ -183,6 +183,22 @@ pub(crate) unsafe fn deque_slot_del(obj: PyObjectRef, index: usize) -> bool {
     unsafe { pyre_object::slots::slot_del(slots, index) }
 }
 
+/// The prologue of `_find_or_count` (interp_deque.py): `lock =
+/// self.getlock()`, then the walk.  Pins the receiver, its lock and the
+/// needle into the caller's open bracket before `getlock` -- which allocates
+/// the lock token, and whose stripe may block, a safepoint -- and the
+/// snapshot the walk reads after it.  Answers `(own_base, items_base,
+/// items_len)`: `own_base` holds the receiver, `own_base + 1` the lock and
+/// `own_base + 2` the needle.
+fn pin_find_or_count(self_obj: PyObjectRef, x: PyObjectRef) -> (usize, usize, usize) {
+    let own_base = pyre_object::gc_roots::pin_roots(&[self_obj, PY_NULL, x]);
+    let lock = getlock(pyre_object::gc_roots::shadow_stack_get(own_base));
+    pyre_object::gc_roots::shadow_stack_set(own_base + 1, lock);
+    let items = snapshot(pyre_object::gc_roots::shadow_stack_get(own_base));
+    let items_base = pyre_object::gc_roots::pin_roots(&items);
+    (own_base, items_base, items.len())
+}
+
 /// Snapshot the backing list into a `Vec`.
 ///
 /// The walk reads `leftblock`/`leftindex`/`len` and then follows `rightlink`,
@@ -190,21 +206,6 @@ pub(crate) unsafe fn deque_slot_del(obj: PyObjectRef, index: usize) -> bool {
 /// with one reads endpoints belonging to two different chains and can reach a
 /// `PY_NULL` link. The stripe is reentrant, so the `store`/`append_right`
 /// nesting below costs nothing.
-/// Publish `pinned`, the needle and the snapshot as one livevar set, then
-/// normalize once. Sequential `pin_root` / `pin_roots` would query after the
-/// first write and leave the rest invisible to a foreign collection.
-fn publish_needle_and_snapshot(
-    pinned: &[PyObjectRef],
-    x: PyObjectRef,
-    items: &[PyObjectRef],
-) -> (usize, usize, usize) {
-    let pinned_base = pyre_object::gc_roots::publish_roots(pinned);
-    let x_slot = pyre_object::gc_roots::publish_roots(&[x]);
-    let items_base = pyre_object::gc_roots::publish_roots(items);
-    pyre_object::gc_roots::normalize_roots(pinned_base, pinned.len() + 1 + items.len());
-    (pinned_base, x_slot, items_base)
-}
-
 fn snapshot(self_obj: PyObjectRef) -> Vec<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
@@ -1142,13 +1143,11 @@ impl W_Deque {
     }
     fn count(&mut self, x: PyObjectRef) -> Result<i64, crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
-        let lock = getlock(self_obj);
-        let items = snapshot(self_obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let (own_base, x_slot, items_base) =
-            publish_needle_and_snapshot(&[self_obj, lock], x, &items);
+        let (own_base, items_base, items_len) = pin_find_or_count(self_obj, x);
+        let x_slot = own_base + 2;
         let mut n = 0i64;
-        for i in 0..items.len() {
+        for i in 0..items_len {
             let equal = crate::baseobjspace::eq_w(
                 pyre_object::gc_roots::shadow_stack_get(items_base + i),
                 pyre_object::gc_roots::shadow_stack_get(x_slot),
@@ -1165,13 +1164,11 @@ impl W_Deque {
     }
     fn remove(&mut self, x: PyObjectRef) -> Result<(), crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
-        let items = snapshot(self_obj);
-        let lock = getlock(self_obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let (own_base, x_slot, items_base) =
-            publish_needle_and_snapshot(&[self_obj, lock], x, &items);
+        let (own_base, items_base, items_len) = pin_find_or_count(self_obj, x);
+        let x_slot = own_base + 2;
         let mut pos = None;
-        for i in 0..items.len() {
+        for i in 0..items_len {
             let equal = crate::baseobjspace::eq_w(
                 pyre_object::gc_roots::shadow_stack_get(items_base + i),
                 pyre_object::gc_roots::shadow_stack_get(x_slot),
@@ -1210,7 +1207,7 @@ impl W_Deque {
                         "deque mutated during iteration",
                     ));
                 }
-                let mut items: Vec<PyObjectRef> = (0..items.len())
+                let mut items: Vec<PyObjectRef> = (0..items_len)
                     .map(|i| pyre_object::gc_roots::shadow_stack_get(items_base + i))
                     .collect();
                 items.remove(pos);
@@ -1224,12 +1221,10 @@ impl W_Deque {
     }
     fn __contains__(&mut self, x: PyObjectRef) -> Result<bool, crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
-        let lock = getlock(self_obj);
-        let items = snapshot(self_obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let (own_base, x_slot, items_base) =
-            publish_needle_and_snapshot(&[self_obj, lock], x, &items);
-        for i in 0..items.len() {
+        let (own_base, items_base, items_len) = pin_find_or_count(self_obj, x);
+        let x_slot = own_base + 2;
+        for i in 0..items_len {
             let equal = crate::baseobjspace::eq_w(
                 pyre_object::gc_roots::shadow_stack_get(items_base + i),
                 pyre_object::gc_roots::shadow_stack_get(x_slot),
