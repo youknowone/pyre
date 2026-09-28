@@ -15,17 +15,23 @@ fn shm_open(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
             "shm_open() requires (path, flags[, mode])",
         ));
     }
+    let w_path = args[0];
+    let mut w_flags = args[1];
+    let mut w_mode = args.get(2).copied().unwrap_or(PY_NULL);
     let name = unsafe {
-        if !is_str(args[0]) {
+        if !is_str(w_path) {
             return Err(pyre_interpreter::PyError::type_error(
                 "shm_open: path must be a string",
             ));
         }
-        pyre_interpreter::baseobjspace::str_utf8_w(args[0])?.to_string()
+        pyre_object::with_roots!(w_flags, w_mode =>
+            pyre_interpreter::baseobjspace::str_utf8_w(w_path)
+        )?
+        .to_string()
     };
-    let flags = (unsafe { w_int_get_value(args[1]) }) as libc::c_int;
+    let flags = (unsafe { w_int_get_value(w_flags) }) as libc::c_int;
     let mode = if args.len() >= 3 {
-        (unsafe { w_int_get_value(args[2]) }) as libc::c_uint
+        (unsafe { w_int_get_value(w_mode) }) as libc::c_uint
     } else {
         0o600
     };

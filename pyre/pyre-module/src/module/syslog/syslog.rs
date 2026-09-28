@@ -20,11 +20,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::make_builtin_function("openlog", |args| {
             #[cfg(all(unix, feature = "host_env"))]
             {
+                // `args` is the gateway's native copy; a collection in
+                // `str_utf8_w` does not forward it.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let args_base = _roots.pin_roots(args);
                 let ident = match args.first() {
-                    Some(&a) if unsafe { pyre_object::is_str(a) } => {
+                    Some(_) if unsafe { pyre_object::is_str(_roots.get(args_base)) } => {
                         // openlog(3) keeps a C string, so the ident ends at
                         // the first NUL.
-                        let ident = pyre_interpreter::baseobjspace::str_utf8_w(a)?;
+                        let ident =
+                            pyre_interpreter::baseobjspace::str_utf8_w(_roots.get(args_base))?;
                         let ident = ident.split_once('\0').map_or(ident, |(s, _)| s);
                         std::ffi::CString::new(ident)
                             .ok()
@@ -32,23 +37,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     }
                     _ => None,
                 };
-                if args
-                    .iter()
-                    .skip(1)
-                    .any(|&a| !unsafe { pyre_object::is_int(a) })
-                {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "openlog(): logoption and facility must be integers",
-                    ));
+                for index in 1..args.len() {
+                    if !unsafe { pyre_object::is_int(_roots.get(args_base + index)) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "openlog(): logoption and facility must be integers",
+                        ));
+                    }
                 }
-                let logoption = args
-                    .get(1)
-                    .map(|&a| unsafe { pyre_object::w_int_get_value(a) } as i32)
-                    .unwrap_or(0);
-                let facility = args
-                    .get(2)
-                    .map(|&a| unsafe { pyre_object::w_int_get_value(a) } as i32)
-                    .unwrap_or(libc::LOG_USER);
+                let logoption = if args.len() > 1 {
+                    unsafe { pyre_object::w_int_get_value(_roots.get(args_base + 1)) as i32 }
+                } else {
+                    0
+                };
+                let facility = if args.len() > 2 {
+                    unsafe { pyre_object::w_int_get_value(_roots.get(args_base + 2)) as i32 }
+                } else {
+                    libc::LOG_USER
+                };
                 rustpython_host_env::syslog::openlog(ident, logoption, facility);
                 SYSLOG_OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(pyre_object::w_none())

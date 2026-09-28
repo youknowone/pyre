@@ -122,12 +122,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     "tcsetattr() requires 3 arguments",
                 ));
             }
-            let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+            let w_fd = args[0];
+            let mut w_when = args[1];
+            let mut attrs = args[2];
+            let fd = pyre_object::with_roots!(w_when, attrs =>
+                pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+            )?;
             // `@unwrap_spec(when=int)`.
-            let when = pyre_interpreter::baseobjspace::int_w(args[1])? as i32;
+            let when =
+                pyre_object::with_roots!(attrs => pyre_interpreter::baseobjspace::int_w(w_when))?
+                    as i32;
             // interp_termios.py:24-27 — arg 3 must be a 7-element list,
             // unpacked via space.unpackiterable.
-            let attrs = args[2];
             if !unsafe { pyre_object::is_list(attrs) }
                 || unsafe { pyre_object::w_list_len(attrs) } != 7
             {
@@ -206,9 +212,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                         "tcsendbreak() requires 2 arguments",
                     ));
                 }
-                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+                let w_fd = args[0];
+                let mut w_duration = args[1];
+                let fd = pyre_object::with_roots!(w_duration =>
+                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+                )?;
                 // `@unwrap_spec(duration=int)`.
-                let dur = pyre_interpreter::baseobjspace::int_w(args[1])? as i32;
+                let dur = pyre_interpreter::baseobjspace::int_w(w_duration)? as i32;
                 host_termios::tcsendbreak(fd, dur)
                     .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
                 Ok(pyre_object::w_none())
@@ -244,9 +254,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 if args.len() < 2 {
                     return Err(pyre_interpreter::PyError::type_error("tcflush() requires 2 arguments"));
                 }
-                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+                let w_fd = args[0];
+                let mut w_queue = args[1];
+                let fd = pyre_object::with_roots!(w_queue =>
+                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+                )?;
                 // `@unwrap_spec(queue=int)`.
-                let q = pyre_interpreter::baseobjspace::int_w(args[1])? as i32;
+                let q = pyre_interpreter::baseobjspace::int_w(w_queue)? as i32;
                 host_termios::tcflush(fd, q)
                     .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
                 Ok(pyre_object::w_none())
@@ -264,9 +278,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 if args.len() < 2 {
                     return Err(pyre_interpreter::PyError::type_error("tcflow() requires 2 arguments"));
                 }
-                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+                let w_fd = args[0];
+                let mut w_action = args[1];
+                let fd = pyre_object::with_roots!(w_action =>
+                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+                )?;
                 // `@unwrap_spec(action=int)`.
-                let action = pyre_interpreter::baseobjspace::int_w(args[1])? as i32;
+                let action = pyre_interpreter::baseobjspace::int_w(w_action)? as i32;
                 host_termios::tcflow(fd, action)
                     .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
                 Ok(pyre_object::w_none())
@@ -311,11 +329,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                         "tcsetwinsize() requires 2 arguments",
                     ));
                 }
-                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+                let w_fd = args[0];
+                let mut w_winsize = args[1];
+                let fd = pyre_object::with_roots!(w_winsize =>
+                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+                )?;
                 // `interp_termios.py:110-114` — argument 2 must be a
                 // 2-sequence (any iterable); a length mismatch (ValueError
                 // from unpackiterable) is reported as a TypeError.
-                let winsz = pyre_interpreter::baseobjspace::unpackiterable(args[1], 2).map_err(|e| {
+                let winsz = pyre_interpreter::baseobjspace::unpackiterable(w_winsize, 2).map_err(|e| {
                     if e.kind == pyre_interpreter::PyErrorKind::ValueError {
                         pyre_interpreter::PyError::type_error("tcsetwinsize: argument 2 must be a 2-sequence")
                     } else {

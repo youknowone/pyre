@@ -375,13 +375,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // are usually lists, whose header moves, so reading the second
                 // and third out of the slice after the first was collected
                 // hands `unpackiterable` a pre-move address.  Pin them here and
-                // read each back at its own call.
+                // read each back at its own call.  All four are published
+                // before the first forwarding query.
                 let arg_roots = pyre_object::gc_roots::push_roots();
-                let args_base = arg_roots.base();
-                let _ = arg_roots.pin_root(args[0]);
-                let _ = arg_roots.pin_root(args[1]);
-                let _ = arg_roots.pin_root(args[2]);
-                let _ = arg_roots.pin_root(args.get(3).copied().unwrap_or(pyre_object::PY_NULL));
+                let args_base = arg_roots.pin_roots(&[
+                    args[0],
+                    args[1],
+                    args[2],
+                    args.get(3).copied().unwrap_or(pyre_object::PY_NULL),
+                ]);
                 let rfds = collect_fds(arg_roots.get(args_base))?;
                 let wfds = collect_fds(arg_roots.get(args_base + 1))?;
                 let xfds = collect_fds(arg_roots.get(args_base + 2))?;
