@@ -1353,6 +1353,7 @@ impl PyError {
         w_filename2: PyObjectRef,
     ) -> Self {
         Self::os_error_from_parts(
+            None,
             errno,
             None,
             Self::clean_strerror(errno),
@@ -1372,9 +1373,38 @@ impl PyError {
         w_filename: PyObjectRef,
         w_filename2: PyObjectRef,
     ) -> Self {
+        Self::os_error_win32_from_parts(None, winerror, w_filename, w_filename2)
+    }
+
+    /// `PyErr_SetExcFromWindowsErr(exc, winerror)` for an `exc` the caller
+    /// names, which keeps that class instead of the one the errno would pick.
+    #[cfg(windows)]
+    pub fn os_error_win32_with_class(class_name: &'static str, winerror: i32) -> Self {
+        Self::os_error_win32_from_parts(
+            Some(class_name),
+            winerror,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        )
+    }
+
+    #[cfg(windows)]
+    fn os_error_win32_from_parts(
+        class_name: Option<&'static str>,
+        winerror: i32,
+        w_filename: PyObjectRef,
+        w_filename2: PyObjectRef,
+    ) -> Self {
         let errno = crate::builtins::winerror_to_errno(winerror as i64) as i32;
         let strerror = Self::win32_strerror(winerror);
-        Self::os_error_from_parts(errno, Some(winerror), strerror, w_filename, w_filename2)
+        Self::os_error_from_parts(
+            class_name,
+            errno,
+            Some(winerror),
+            strerror,
+            w_filename,
+            w_filename2,
+        )
     }
 
     /// The message a Win32 error code names, with the trailing newline and
@@ -1394,15 +1424,19 @@ impl PyError {
     }
 
     /// The body both syscall constructors share.  `winerror` is `None` off
-    /// Windows, where no code but the errno exists.
+    /// Windows, where no code but the errno exists.  `class_name` is an
+    /// OSError subclass the caller raises explicitly; `None` picks the class
+    /// from the errno, as constructing plain `OSError` does.
     fn os_error_from_parts(
+        class_name: Option<&'static str>,
         errno: i32,
         winerror: Option<i32>,
         strerror: String,
         w_filename: PyObjectRef,
         w_filename2: PyObjectRef,
     ) -> Self {
-        let subclass = crate::builtins::os_error_errno_subclass(errno as i64);
+        let subclass =
+            class_name.or_else(|| crate::builtins::os_error_errno_subclass(errno as i64));
         // The dedicated FileNotFoundError kind carries its own str/repr; the
         // other errno subclasses share OSError's and differ only by class.
         let (kind, exc_kind) = if matches!(subclass, Some("FileNotFoundError")) {

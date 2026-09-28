@@ -158,8 +158,22 @@ fn u32_w(obj: PyObjectRef) -> Result<u32, pyre_interpreter::PyError> {
     pyre_interpreter::baseobjspace::c_uint_w(obj)
 }
 
+/// `_winapi.py RaiseFromWindowsErr`: the two connection failures raise their
+/// own OSError subclasses, which the errno the code maps to would not pick.
 fn win32_err_code(code: u32) -> pyre_interpreter::PyError {
-    pyre_interpreter::PyError::os_error_win32_syscall2(code as i32, PY_NULL, PY_NULL)
+    use windows_sys::Win32::Foundation::{ERROR_CONNECTION_ABORTED, ERROR_CONNECTION_REFUSED};
+    let class_name = match code {
+        ERROR_CONNECTION_REFUSED => "ConnectionRefusedError",
+        ERROR_CONNECTION_ABORTED => "ConnectionAbortedError",
+        _ => {
+            return pyre_interpreter::PyError::os_error_win32_syscall2(
+                code as i32,
+                PY_NULL,
+                PY_NULL,
+            );
+        }
+    };
+    pyre_interpreter::PyError::os_error_win32_with_class(class_name, code as i32)
 }
 
 fn win32_err(err: std::io::Error) -> pyre_interpreter::PyError {
