@@ -148,17 +148,17 @@ fn build_bh_jitdrivers_sd(
 
 /// Pick the `bh.virtualizable_info` pointer to seed at a guard-failure deopt, or
 /// null to leave it unset. A non-null vinfo lets the blackhole run a mid-body
-/// vable-array op (e.g. the `int_*_jump_if_ovf` overflow guard on a `[int; virt]`
-/// state field). Seed when the machine is a state-field one (no `vable_token`
-/// field) whose `bh_clear_vable_token` is inert so a non-null vinfo cannot
-/// corrupt its non-GC `state` struct. A real heap virtualizable (e.g. PyFrame)
-/// is left with null vinfo to preserve its existing resume contract.
+/// vable op (`getfield_vable_*`, or the `int_*_jump_if_ovf` overflow guard on
+/// a `[int; virt]` state field). `blackhole.py` `clear_vable_token` is a no-op
+/// while the token word is zero, and forces the frame when a compiled loop
+/// left one, which is what a deopt of that loop has to do before it reads
+/// the fields.
 fn seed_deopt_vinfo_ptr(
     vinfo: Option<&std::sync::Arc<crate::virtualizable::VirtualizableInfo>>,
 ) -> *const crate::virtualizable::VirtualizableInfo {
     match vinfo {
-        Some(info) if !info.has_vable_token() => std::sync::Arc::as_ptr(info),
-        _ => std::ptr::null(),
+        Some(info) => std::sync::Arc::as_ptr(info),
+        None => std::ptr::null(),
     }
 }
 
@@ -1945,6 +1945,21 @@ struct EntryScratch {
     vable_lengths: Vec<usize>,
 }
 
+impl EntryScratch {
+    /// Drop the previous entry's typed buffers.
+    ///
+    /// `execute_assembler`'s raw path writes only the unspecialized red words,
+    /// so [`JitDriver::take_entry_scratch_raw`] leaves these alone. A fill of
+    /// `live_values`, `types`, `vable_boxes` or `vable_lengths` clears them
+    /// first; `raw` is not touched here.
+    fn clear_typed(&mut self) {
+        self.live_values.clear();
+        self.types.clear();
+        self.vable_boxes.clear();
+        self.vable_lengths.clear();
+    }
+}
+
 thread_local! {
     /// Per-thread publication of the currently-installed state-field JIT's
     /// flat jitcode registry + packed liveness, read by the stateless global
@@ -2130,6 +2145,28 @@ enum SteadyCompiledEntry {
     NeedsInternal,
     /// This call is finished. `None` is a decline, `Some` a resume pc.
     Done(Option<usize>),
+}
+
+/// Answer of [`JitDriver::function_entry_runner`].
+///
+/// `warmspot.py ll_portal_runner` calls `maybe_compile_and_run` before the
+/// portal body. `warmstate.py execute_assembler` returns a
+/// `DoneWithThisFrameDescrInt` / `DoneWithThisFrameDescrRef` result straight
+/// out of that runner. [`FunctionEntryRunner::Finished`] is that word (an
+/// int, or a ref address stored as `i64`). [`FunctionEntryRunner::Resume`]
+/// and [`FunctionEntryRunner::Run`] still enter the portal body; those arms
+/// keep the finish latch the inline door drains.
+pub enum FunctionEntryRunner {
+    Finished(i64),
+    Resume(usize),
+    Run,
+}
+
+fn map_runner_resume(resume: Option<usize>) -> FunctionEntryRunner {
+    match resume {
+        Some(pc) => FunctionEntryRunner::Resume(pc),
+        None => FunctionEntryRunner::Run,
+    }
 }
 
 /// `warmstate.py` `maybe_compile_and_run` before it builds assembler args.
@@ -2806,6 +2843,17 @@ impl<S: JitState> JitDriver<S> {
         self.meta.backend_mut().set_vtable_offset(offset);
     }
 
+    /// `AbstractLLCPU.subclassrange_min_offset`, beside [`Self::set_vtable_offset`].
+    pub fn set_subclassrange_min_offset(&mut self, offset: Option<usize>) {
+        majit_backend::set_cpu_subclassrange_min_offset(offset);
+        #[cfg(all(
+            feature = "dynasm",
+            not(feature = "cranelift"),
+            not(target_arch = "wasm32")
+        ))]
+        self.meta.backend_mut().set_subclassrange_min_offset(offset);
+    }
+
     /// PyPy JitDriver(is_recursive=True).
     /// Enables max_unroll_recursion for recursive portal calls.
     pub fn set_is_recursive(&mut self, value: bool) {
@@ -3114,8 +3162,8 @@ impl<S: JitState> JitDriver<S> {
                 // that lowered the source post-loop epilogue has already run it
                 // here, so the value IS the portal's result; leaving it unread
                 // makes the hook break and native Rust run that suffix a second
-                // time.  Void and Ref carry no scalar and leave the latch
-                // empty, which is the same break as before.
+                // time.  Void carries no scalar and leaves the latch empty.
+                // Ref publishes `Value::Ref`, the same latch Int and Float use.
                 match &outcome {
                     crate::jitexc::JitException::DoneWithThisFrameInt(v) => {
                         self.meta.single_pass_finish_values =
@@ -3124,6 +3172,10 @@ impl<S: JitState> JitDriver<S> {
                     crate::jitexc::JitException::DoneWithThisFrameFloat(v) => {
                         self.meta.single_pass_finish_values =
                             Some(core::iter::once(Value::Float(*v)).collect());
+                    }
+                    crate::jitexc::JitException::DoneWithThisFrameRef(v) => {
+                        self.meta.single_pass_finish_values =
+                            Some(core::iter::once(Value::Ref(*v)).collect());
                     }
                     _ => {}
                 }
@@ -3214,6 +3266,18 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    /// Ref FINISH result produced by a single-pass tracing walk.
+    ///
+    /// `compile.py DoneWithThisFrameDescrRef`: the address
+    /// `warmstate.py execute_assembler` returns for a REF portal.
+    pub fn take_single_pass_finish_ref(&mut self) -> Option<usize> {
+        let values = self.meta.single_pass_finish_values.take()?;
+        match values.first() {
+            Some(Value::Ref(v)) => Some(v.as_usize()),
+            _ => None,
+        }
+    }
+
     /// Float FINISH result produced by a single-pass tracing walk.
     pub fn take_single_pass_finish_float(&mut self) -> Option<f64> {
         let values = self.meta.single_pass_finish_values.take()?;
@@ -3263,6 +3327,20 @@ impl<S: JitState> JitDriver<S> {
         match values.first() {
             Some(Value::Int(v)) => Some(*v),
             Some(Value::Float(v)) => Some(v.to_bits() as i64),
+            _ => None,
+        }
+    }
+
+    /// [`Self::take_back_edge_finish`] projected onto one ref address — the
+    /// return shape of a `*mut T` / `*const T` `#[jit_interp]` portal.
+    /// `DoneWithThisFrameDescrRef.get_result` is that address.
+    pub fn take_back_edge_finish_ref(&mut self) -> Option<usize> {
+        if let Some(value) = self.meta.back_edge_finish_word.take() {
+            return Some(value as usize);
+        }
+        let values = self.meta.back_edge_finish.take()?;
+        match values.first() {
+            Some(Value::Ref(v)) => Some(v.as_usize()),
             _ => None,
         }
     }
@@ -6852,19 +6930,22 @@ impl<S: JitState> JitDriver<S> {
                 hook(green_key, target_pc);
             }
 
-            // `warmstate.py execute_assembler` tests the returned descr
-            // (`isinstance(fail_descr, DoneWithThisFrameDescrInt)`), then
-            // `get_int_value(deadframe, 0)`. Dispatch key 0 is the ordinary
-            // token entry. A direct LABEL entry keeps the general result.
-            // The driver's `result_type` field is not that test: it stays at
-            // its default unless a caller assigns it, while the trace stamps
-            // `jf_descr` from the result box.
+            // `warmstate.py execute_assembler` reads `jitdriver_sd.result_type`
+            // and returns `DoneWithThisFrameDescrInt` / `DoneWithThisFrameDescrRef`
+            // `get_result`. Dispatch key 0 is the ordinary token entry. A
+            // direct LABEL entry keeps the general result. Int (and every
+            // non-ref kind) stays on `poll_raw_int_finish`.
             let polled_raw_int = selected_dispatch_key == 0;
             if polled_raw_int {
-                if let Some(value) =
+                let finished = if self.meta.result_type == Type::Ref {
+                    self.meta
+                        .poll_raw_ref_finish(&procedure_token, green_key, live_values)
+                        .map(|addr| addr as i64)
+                } else {
                     self.meta
                         .poll_raw_int_finish(&procedure_token, green_key, live_values)
-                {
+                };
+                if let Some(value) = finished {
                     self.entry_scratch_out(scratch);
                     self.meta.back_edge_finish = None;
                     self.meta.back_edge_finish_word = Some(value);
@@ -7406,9 +7487,10 @@ impl<S: JitState> JitDriver<S> {
                 //     The overflow-guard deopt (`int_*_jump_if_ovf` on the
                 //     `[int; virt]` regs) is the first path to run a blackhole
                 //     vable-array op on such a machine.
-                // A real heap virtualizable (`token_offset > 0`, e.g.
-                // PyFrame) keeps its existing null-vinfo resume contract.
-                // The identity pointer must be co-seeded because the GC-root
+                // A heap virtualizable is seeded as well: a guard that fails
+                // before a later `getfield_vable_*` has to resolve that
+                // descr. `clear_vable_token` is a no-op while the token is
+                // zero. The identity pointer must be co-seeded because the GC-root
                 // walk (`resume_mainloop`) dereferences `virtualizable_ptr`
                 // whenever `virtualizable_info` is non-null.
                 let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
@@ -8085,6 +8167,19 @@ impl<S: JitState> JitDriver<S> {
         scratch.types.clear();
         scratch.vable_boxes.clear();
         scratch.vable_lengths.clear();
+        scratch
+    }
+
+    /// [`Self::take_entry_scratch`] for the raw red path of
+    /// `execute_assembler`.
+    ///
+    /// `maybe_compile_and_run` unspecializes reds into one word buffer and
+    /// `func_execute_token` reads that buffer. Only `raw` is cleared. A caller
+    /// that fills `live_values`, `types`, `vable_boxes` or `vable_lengths`
+    /// clears those first via [`EntryScratch::clear_typed`].
+    fn take_entry_scratch_raw(&mut self) -> Box<EntryScratch> {
+        let mut scratch = self.entry_scratch.take().unwrap_or_default();
+        scratch.raw.clear();
         scratch
     }
 
@@ -9239,23 +9334,66 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) -> Option<usize> {
+        match self.function_entry_runner(green_key_hash, make_green_key, target_pc, state, env) {
+            FunctionEntryRunner::Finished(value) => {
+                self.meta.back_edge_finish_word = Some(value);
+                Some(target_pc)
+            }
+            FunctionEntryRunner::Resume(pc) => Some(pc),
+            FunctionEntryRunner::Run => None,
+        }
+    }
+
+    /// `warmspot.py ll_portal_runner`: the door in front of the portal body.
+    ///
+    /// Same decisions as [`Self::function_entry_structured`]. The raw compiled
+    /// fast path (`warmstate.py execute_assembler`,
+    /// `DoneWithThisFrameDescrInt` / `DoneWithThisFrameDescrRef`) returns
+    /// [`FunctionEntryRunner::Finished`] and does not write
+    /// `back_edge_finish_word`. Tracing, blackhole, the general case and the
+    /// typed entry still publish that latch; the runner drains it the way the
+    /// inline door does.
+    #[inline]
+    pub fn function_entry_runner(
+        &mut self,
+        green_key_hash: u64,
+        make_green_key: impl Fn() -> GreenKey,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> FunctionEntryRunner {
         if std::mem::replace(&mut self.function_entry_suppressed, false) {
-            return None;
+            return FunctionEntryRunner::Run;
         }
         if self.meta.is_tracing() {
-            return None;
+            return FunctionEntryRunner::Run;
         }
-        match self.enter_compiled_function_entry(green_key_hash, target_pc, state, env) {
-            SteadyCompiledEntry::Done(resume) => return resume,
+        // The raw fast path writes the word here instead of
+        // `back_edge_finish_word`, so `execute_assembler`'s register return
+        // shape stays intact (`Done(Option<usize>)` still fits one word).
+        let mut direct_word = None;
+        let entry = self.enter_compiled_function_entry(
+            green_key_hash,
+            target_pc,
+            state,
+            env,
+            &mut direct_word,
+        );
+        if let Some(value) = direct_word {
+            return FunctionEntryRunner::Finished(value);
+        }
+        match entry {
+            SteadyCompiledEntry::Done(Some(pc)) => return FunctionEntryRunner::Resume(pc),
+            SteadyCompiledEntry::Done(None) => return FunctionEntryRunner::Run,
             SteadyCompiledEntry::NeedsInternal => {
-                return self.function_entry_internal(
+                return map_runner_resume(self.function_entry_internal(
                     green_key_hash,
                     make_green_key,
                     target_pc,
                     state,
                     env,
                     false,
-                );
+                ));
             }
             SteadyCompiledEntry::Miss => {}
         }
@@ -9266,9 +9404,16 @@ impl<S: JitState> JitDriver<S> {
             state,
             env,
         ) {
-            return handled;
+            return map_runner_resume(handled);
         }
-        self.function_entry_internal(green_key_hash, make_green_key, target_pc, state, env, false)
+        map_runner_resume(self.function_entry_internal(
+            green_key_hash,
+            make_green_key,
+            target_pc,
+            state,
+            env,
+            false,
+        ))
     }
 
     /// Sole compiled cell for `hash`, when no confirm hook is installed.
@@ -9318,27 +9463,129 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
+        direct_word: &mut Option<i64>,
     ) -> SteadyCompiledEntry {
         let Some((cell_key, token)) = self.compiled_function_token(green_key_hash) else {
             return SteadyCompiledEntry::Miss;
         };
         if !state.can_trace() {
-            return SteadyCompiledEntry::Done(None);
+            return self.enter_compiled_cannot_trace();
         }
         if self.meta.single_pass_label_entry_key.is_some()
             || !self.meta.cut_compiled_keys.is_empty()
         {
-            return SteadyCompiledEntry::Done(self.back_edge_resolved(
-                cell_key,
-                token,
-                target_pc,
-                state,
-                env,
-                || {},
-            ));
+            return self
+                .enter_compiled_pending_label_or_cut(cell_key, token, target_pc, state, env);
         }
-        let mut scratch = self.take_entry_scratch();
-        let compatible = {
+        let mut scratch = self.take_entry_scratch_raw();
+        // `warmstate.py maybe_compile_and_run` unspecializes reds to words and
+        // `llmodel.py execute_token` stores them by the token's kinds. A state
+        // that cannot produce the words takes the typed entry below.
+        let raw_entry = state.fill_entry_raw_reds(&mut scratch.raw);
+        if !raw_entry {
+            return self
+                .enter_compiled_typed_entry(cell_key, token, target_pc, state, env, scratch);
+        }
+        // `execute_assembler` receives the unspecialized reds.
+        // `patch_new_loop_to_load_virtualizable_fields` truncates the
+        // loop's inputargs to that prefix, so a patched entry's
+        // `inputarg_types` match the reds already filled. A longer list was
+        // not patched and still needs the extension in `back_edge_resolved`,
+        // which reads typed reds.
+        let have = scratch.raw.len();
+        if token.inputarg_types().len() > have {
+            return self
+                .enter_compiled_unpatched_reds(cell_key, token, target_pc, state, env, scratch);
+        }
+        // `warmstate.py execute_assembler`: `if vinfo is not None:
+        // virtualizable = args[index_of_virtualizable];
+        // vinfo.clear_vable_token(virtualizable)`. Nothing else — no
+        // descriptor walk, no field export.
+        self.clear_entry_vable_token_raw(&scratch.raw);
+        if self.meta.hooks.on_compiled_entry.is_some() {
+            self.enter_compiled_entry_hook(cell_key, target_pc);
+        }
+        // `warmstate.py execute_assembler` selects the poll from
+        // `jitdriver_sd.result_type`. Int portals keep `poll_raw_int_finish_raw`.
+        let finished = if self.meta.result_type == Type::Ref {
+            self.meta
+                .poll_raw_ref_finish_raw(&token, cell_key, &scratch.raw)
+                .map(|addr| addr as i64)
+        } else {
+            self.meta
+                .poll_raw_int_finish_raw(&token, cell_key, &scratch.raw)
+        };
+        if let Some(value) = finished {
+            self.entry_scratch_out(scratch);
+            self.meta.back_edge_finish = None;
+            // `ll_portal_runner` returns `execute_assembler`'s fast-path word
+            // without the latch.
+            *direct_word = Some(value);
+            return SteadyCompiledEntry::Done(None);
+        }
+        self.enter_compiled_general_case(cell_key, target_pc, state, env, scratch)
+    }
+
+    /// `can_trace` declined the compiled entry. The interpreter continues.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_cannot_trace(&mut self) -> SteadyCompiledEntry {
+        SteadyCompiledEntry::Done(None)
+    }
+
+    /// `hooks.on_compiled_entry`, when one is installed.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_entry_hook(&self, cell_key: u64, target_pc: usize) {
+        if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
+            hook(cell_key, target_pc);
+        }
+    }
+
+    /// Pending label or cross-loop cut: `maybe_compile_and_run` cannot enter
+    /// the raw token, so the call goes through `back_edge_resolved`.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_pending_label_or_cut(
+        &mut self,
+        cell_key: u64,
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> SteadyCompiledEntry {
+        SteadyCompiledEntry::Done(self.back_edge_resolved(
+            cell_key,
+            token,
+            target_pc,
+            state,
+            env,
+            || {},
+        ))
+    }
+
+    /// Typed reds: `fill_entry_raw_reds` declined, so `execute_assembler`'s
+    /// word path does not apply. Meta is read only when the reds or
+    /// `is_compatible` need it; then the same `clear_vable_token`, hook,
+    /// `poll_raw_int_finish` and finish latches as the raw path.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_typed_entry(
+        &mut self,
+        cell_key: u64,
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        mut scratch: Box<EntryScratch>,
+    ) -> SteadyCompiledEntry {
+        scratch.clear_typed();
+        // `execute_assembler` does not look up `CompiledEntry`. The cell
+        // already holds the procedure token. Meta is only for a state whose
+        // reds or `is_compatible` actually read it.
+        let compatible = if state.fill_entry_reds_without_meta(&mut scratch.live_values) {
+            true
+        } else {
             let Some(meta) = self.meta.get_compiled_meta(cell_key) else {
                 self.entry_scratch_out(scratch);
                 return SteadyCompiledEntry::NeedsInternal;
@@ -9359,14 +9606,12 @@ impl<S: JitState> JitDriver<S> {
             self.meta.invalidate_loop(cell_key);
             return SteadyCompiledEntry::Done(None);
         }
-        // `execute_assembler` receives the unspecialized reds.
-        // `patch_new_loop_to_load_virtualizable_fields` truncates the
-        // loop's inputargs to that prefix, so a patched entry's
-        // `inputarg_types` match the reds already in `live_values`. A
-        // longer list was not patched and still needs the extension in
-        // `back_edge_resolved`.
-        let need = token.inputarg_types().len();
-        if need > scratch.live_values.len() {
+        // Same inputarg-length test as the raw path. This arm did not fill
+        // raw words, so `have` is the typed red count. A longer
+        // `inputarg_types` list was not patched and falls back to
+        // `back_edge_resolved` without a second red fill.
+        let have = scratch.live_values.len();
+        if token.inputarg_types().len() > have {
             self.entry_scratch_out(scratch);
             return SteadyCompiledEntry::Done(self.back_edge_resolved(
                 cell_key,
@@ -9377,23 +9622,71 @@ impl<S: JitState> JitDriver<S> {
                 || {},
             ));
         }
-        // `warmstate.py execute_assembler`: `if vinfo is not None:
-        // virtualizable = args[index_of_virtualizable];
-        // vinfo.clear_vable_token(virtualizable)`. Nothing else — no
-        // descriptor walk, no field export.
         self.clear_entry_vable_token(&scratch.live_values);
         if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
             hook(cell_key, target_pc);
         }
-        if let Some(value) = self
-            .meta
-            .poll_raw_int_finish(&token, cell_key, &scratch.live_values)
-        {
+        let finished = if self.meta.result_type == Type::Ref {
+            self.meta
+                .poll_raw_ref_finish(&token, cell_key, &scratch.live_values)
+                .map(|addr| addr as i64)
+        } else {
+            self.meta
+                .poll_raw_int_finish(&token, cell_key, &scratch.live_values)
+        };
+        if let Some(value) = finished {
             self.entry_scratch_out(scratch);
             self.meta.back_edge_finish = None;
             self.meta.back_edge_finish_word = Some(value);
             return SteadyCompiledEntry::Done(Some(target_pc));
         }
+        self.enter_compiled_general_case(cell_key, target_pc, state, env, scratch)
+    }
+
+    /// `inputarg_types` is longer than the unspecialized reds.
+    ///
+    /// The loop was not patched down to that prefix, so
+    /// `back_edge_resolved` extends the typed reds. The discarded fill is
+    /// the same call the raw arm made before handing the token on.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_unpatched_reds(
+        &mut self,
+        cell_key: u64,
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        mut scratch: Box<EntryScratch>,
+    ) -> SteadyCompiledEntry {
+        scratch.clear_typed();
+        let _ = state.fill_entry_reds_without_meta(&mut scratch.live_values);
+        self.entry_scratch_out(scratch);
+        SteadyCompiledEntry::Done(self.back_edge_resolved(
+            cell_key,
+            token,
+            target_pc,
+            state,
+            env,
+            || {},
+        ))
+    }
+
+    /// `poll_raw_int_finish` / `poll_raw_int_finish_raw` returned `None`.
+    ///
+    /// The trace already ran; `raw_int_fallback` holds the general-case
+    /// result. `execute_assembler` then takes `handle_fail` via
+    /// `consume_compiled_entry_result`.
+    #[cold]
+    #[inline(never)]
+    fn enter_compiled_general_case(
+        &mut self,
+        cell_key: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        scratch: Box<EntryScratch>,
+    ) -> SteadyCompiledEntry {
         let result = self
             .meta
             .raw_int_fallback
@@ -9443,6 +9736,56 @@ impl<S: JitState> JitDriver<S> {
         }
         unsafe {
             crate::virtualizable::bh_clear_vable_token(info, *addr as *mut u8);
+        }
+    }
+
+    /// [`Self::clear_entry_vable_token`] for an `unspecialize_value` word.
+    ///
+    /// The word at `index_of_virtualizable` is the virtualizable address
+    /// (`warmstate.py execute_assembler` `args[index_of_virtualizable]`).
+    ///
+    /// A zero `vable_token` is the steady entry (`virtualizable.py
+    /// clear_vable_token`). Forcing a live token is
+    /// [`Self::force_entry_vable_token_raw`].
+    #[inline]
+    fn clear_entry_vable_token_raw(&self, raw: &[i64]) {
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            return;
+        };
+        let index = descriptor.index_of_virtualizable;
+        if index < 0 {
+            return;
+        }
+        let Some(info) = self.meta.virtualizable_info() else {
+            return;
+        };
+        let Some(&word) = raw.get(index as usize) else {
+            return;
+        };
+        if word == 0 || !info.has_vable_token() {
+            return;
+        }
+        let token = unsafe {
+            let obj = word as usize as *mut u8;
+            *(obj.add(info.token_offset) as *const usize)
+        };
+        if token == 0 {
+            return;
+        }
+        self.force_entry_vable_token_raw(info, word as usize as *mut u8);
+    }
+
+    /// `virtualizable.py clear_vable_token` when the token is live:
+    /// `force_now`, then the token is clear.
+    #[cold]
+    #[inline(never)]
+    fn force_entry_vable_token_raw(
+        &self,
+        info: &crate::virtualizable::VirtualizableInfo,
+        obj: *mut u8,
+    ) {
+        unsafe {
+            crate::virtualizable::bh_clear_vable_token(info, obj);
         }
     }
 
@@ -10659,7 +11002,7 @@ mod tests {
     // must be seeded so a mid-body vable-array op — the `int_*_jump_if_ovf` overflow
     // guard on a `[int; virt]` field — resolves its vinfo during resume instead of
     // panicking. A real heap virtualizable (e.g. PyFrame) keeps the prior
-    // null-vinfo resume contract unless the portal-inline experiment is on.
+    // seeded too, so a later `getfield_vable_*` in that resume can run.
     #[test]
     fn seed_deopt_vinfo_ptr_seeds_state_field_and_skips_heap_virtualizable() {
         use crate::virtualizable::VirtualizableInfo;
@@ -10676,12 +11019,13 @@ mod tests {
         // No vinfo available → null.
         assert!(seed_deopt_vinfo_ptr(None).is_null());
 
-        // token_offset > 0 → null, so a real heap virtualizable keeps its
-        // existing null-vinfo resume contract.
+        // A heap virtualizable is seeded too: a guard that fails before a
+        // later `getfield_vable_*` otherwise resumes with a null vinfo.
         let heap_vable = std::sync::Arc::new(VirtualizableInfo::new(8));
-        assert!(
-            seed_deopt_vinfo_ptr(Some(&heap_vable)).is_null(),
-            "a token_offset>0 heap virtualizable must keep the null-vinfo contract",
+        assert_eq!(
+            seed_deopt_vinfo_ptr(Some(&heap_vable)),
+            std::sync::Arc::as_ptr(&heap_vable),
+            "a heap virtualizable deopt must seed vinfo so getfield_vable can run",
         );
     }
 

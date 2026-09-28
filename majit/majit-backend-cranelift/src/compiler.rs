@@ -1473,8 +1473,8 @@ fn with_cranelift_gc_required<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R
 }
 
 fn set_cranelift_active_gc(gc: Option<Box<dyn GcAllocator>>) {
-    if gc.is_some() {
-        majit_gc::note_gc_box_installed();
+    if let Some(gc) = gc.as_ref() {
+        majit_gc::note_gc_box_installed(gc.has_gcrootmap());
     }
     gc_box::store(gc);
 }
@@ -1918,6 +1918,12 @@ fn gc_write_barrier_via_active_runtime(obj: GcRef) {
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
 /// fallback blocks during the L1/L2 stepping-stone window.
 fn id_or_identityhash_via_active_runtime(addr: usize) -> usize {
+    // `boehm.py` `ll_identityhash`: `h = ~cast_adr_to_int(addr)`
+    // (`gct_gc_id` is `int_invert`). `GcLLDescr_boehm.gcrootmap` is `None`,
+    // which is `!collector_installed`.
+    if !majit_gc::collector_installed() {
+        return !addr;
+    }
     // A box whose borrow is already held by an in-progress alloc answers with
     // the raw `addr`, not with the singleton's id: this is a top-level op, so
     // the busy borrow means the box is mid-allocation, not that it is absent.
@@ -9564,6 +9570,7 @@ impl CraneliftBackend {
             malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
             standard_array_basesize: std::mem::size_of::<usize>(),
             standard_array_length_ofs: 0,
+            headerless_fixedsize: false,
             // rewrite.py:673 — read compiled_loop_token._ll_initial_locs and
             // rewrite.py:669 — ptr2int(compiled_loop_token.frame_info),
             // both sourced directly from the CLT Arc on the target
@@ -14268,6 +14275,13 @@ impl CraneliftBackend {
                         // requires a configured `cpu.gc_ll_descr`.
                         return Err(missing_gc_runtime(op.opcode));
                     }
+                }
+                // This backend does not install a headerless allocator.
+                OpCode::CallMallocNurseryVarsizeHeaderless => {
+                    return Err(BackendError::Unsupported(format!(
+                        "opcode {:?} has no backend lowering",
+                        OpCode::CallMallocNurseryVarsizeHeaderless
+                    )));
                 }
                 OpCode::CallMallocNurseryVarsize => {
                     if !cranelift_gc_active() {

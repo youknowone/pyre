@@ -529,9 +529,33 @@ where
                 self._untag(a.to_opref())
             });
         }
-        let res = match src.getdescr() {
-            Some(d) => majit_ir::Op::with_descr(src.opcode, &args, d),
-            None => majit_ir::Op::new(src.opcode, &args),
+        // opencoder.py `TraceIterator.next`: `if rop.is_guard(opnum): descr = None`
+        // and `res.rd_resume_position = descr_index`. A guard's
+        // `ResumeGuardDescr` is invented at emit (`invent_fail_descr_for_op`).
+        // Copying the recorded descr makes phase 2 call `resume.py`
+        // `ResumeDataVirtualAdder.finish` on the descr phase 1 already
+        // numbered. A foriter marker is not a resume payload: re-mint it on
+        // a fresh descr so failure routing keeps the key.
+        let res = if src.opcode.is_guard() {
+            let op = majit_ir::Op::new(src.opcode, &args);
+            if let Some(d) = src.getdescr() {
+                if let Some(key) = d.range_foriter_green_key() {
+                    op.setdescr(crate::compile::make_resume_guard_descr_range_foriter(key));
+                } else if let Some(key) = d.instance_next_foriter_green_key() {
+                    op.setdescr(
+                        crate::compile::make_resume_guard_descr_instance_next_foriter(
+                            Some(src.opcode),
+                            key,
+                        ),
+                    );
+                }
+            }
+            op
+        } else {
+            match src.getdescr() {
+                Some(d) => majit_ir::Op::with_descr(src.opcode, &args, d),
+                None => majit_ir::Op::new(src.opcode, &args),
+            }
         };
         // history.py FrontendOp `_resint`/`_resfloat`/`_resref` ride on
         // the recorded box. The byte-stream iterator never sees them;

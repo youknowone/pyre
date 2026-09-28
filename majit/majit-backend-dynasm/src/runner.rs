@@ -11,6 +11,7 @@ use majit_backend::deadframe::{ExitDescr, JitFrameDeadFrame};
 use majit_backend::jitframe::{
     HostHeapGc, check_jitframe_descr, jitframe_is_gc_object, jitframe_write_barrier,
     malloc_entry_jitframe, malloc_host_jitframe, malloc_jitframe, malloc_jitframe_no_collect,
+    reuse_off_gc_jitframe,
 };
 use majit_backend::libc_deadframe::{LibcJitFrameDeadFrame, free_jitframe_chain};
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
@@ -310,7 +311,78 @@ fn with_gc_ll_descr<R>(f: impl FnOnce(&mut dyn majit_gc::GcAllocator) -> R) -> R
     f(&mut HostHeapGc)
 }
 
+/// Logging and dump gates, read once per process. Each flag is itself a
+/// cached env lookup; OR-ing them on every entry was five loads for a
+/// steady run where every one is false.
+#[inline]
+fn exec_diag_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        crate::majit_log_enabled()
+            || crate::majit_dump_enabled()
+            || crate::dynasm_exec_diag_enabled()
+            || majit_ir::debug::have_debug_prints()
+            || crate::gc_freelist_diag_enabled()
+    });
+    *ENABLED
+}
+
+/// Release the host frame `DoneWithThisFrameDescrInt` just finished.
+///
+/// A single frame with nothing forwarded is parked on the token
+/// (`llmodel.py execute_token` does not free). A chain, or a slot that
+/// already holds a frame, is freed: those blocks are still referenced
+/// or are a second live frame.
+/// Slot 0 of a `DoneWithThisFrameDescrInt` frame. `get_int_value(deadframe, 0)`.
+#[inline(always)]
+fn done_int_slot0(tip: *mut JitFrame) -> i64 {
+    unsafe { crate::llmodel::get_int_value_direct(tip, 0) as i64 }
+}
+
+/// Slot 0 of a `DoneWithThisFrameDescrRef` frame. `get_ref_value(deadframe, 0)`.
+#[inline(always)]
+fn done_ref_slot0(tip: *mut JitFrame) -> usize {
+    unsafe { crate::llmodel::get_ref_value_direct(tip, 0) }
+}
+
+#[inline]
+fn release_done_int_frame(token: &JitCellToken, head: *mut JitFrame, tip: *mut JitFrame) {
+    let single = tip == head && unsafe { (*head).jf_forward.is_null() };
+    if single && token.park_entry_frame(head) {
+        return;
+    }
+    unsafe { free_jitframe_chain(head) };
+}
+
 type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard; 4]>;
+
+/// Arguments of one `llmodel.py execute_token` call.
+///
+/// `Typed` is the `Value` vector the general entry still carries. `Raw` is
+/// the `unspecialize_value` words `warmstate.py maybe_compile_and_run` built;
+/// the no-collector store writes each word with `set_int_value`.
+#[derive(Copy, Clone)]
+enum EntryWords<'a> {
+    Typed(&'a [Value]),
+    Raw(&'a [i64]),
+}
+
+impl std::fmt::Debug for EntryWords<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Typed(args) => std::fmt::Debug::fmt(args, f),
+            Self::Raw(args) => std::fmt::Debug::fmt(args, f),
+        }
+    }
+}
+
+impl EntryWords<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Typed(args) => args.len(),
+            Self::Raw(args) => args.len(),
+        }
+    }
+}
 
 /// The frame `make_execute_token` returns, before it is wrapped as a deadframe.
 struct RanFrame {
@@ -464,7 +536,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     // nursery is not the singleton's, so the process-wide published range can
     // no longer stand in for `is_nursery_object`.
     majit_gc::disarm_published_nursery();
-    majit_gc::note_gc_box_installed();
+    majit_gc::note_gc_box_installed(gc.has_gcrootmap());
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     check_jitframe_descr(gc.as_ref());
     gc_box::store(gc);
@@ -617,19 +689,18 @@ pub(crate) fn new_via_gc_enabled() -> bool {
     NEW_VIA_GC.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `GcLLDescr_boehm.malloc_fixedsize`: zeroed storage from the published
-/// function, or `None` when [`majit_gc::set_malloc_fixedsize`] is unset.
+/// `GcLLDescr_boehm.malloc_fixedsize`: storage from the published function,
+/// or `None` when [`majit_gc::set_malloc_fixedsize`] is unset.
+///
+/// `GC_malloc` returns zero-filled bytes (`malloc_zero_filled`). The caller
+/// does not clear the block again.
 pub(crate) fn call_malloc_fixedsize(size: usize) -> Option<*mut u8> {
     let addr = majit_gc::malloc_fixedsize_addr();
     if addr == 0 {
         return None;
     }
     let malloc: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(addr) };
-    let ptr = malloc(size);
-    if !ptr.is_null() {
-        unsafe { libc::memset(ptr.cast(), 0, size) };
-    }
-    Some(ptr)
+    Some(malloc(size))
 }
 
 /// Address `genop_new_with_vtable` calls: the Boehm hook when published,
@@ -1147,6 +1218,11 @@ fn dynasm_gc_write_barrier_managed(obj: GcRef) {
 }
 
 fn dynasm_id_or_identityhash(addr: usize) -> usize {
+    // `boehm.py` `ll_identityhash`: `h = ~cast_adr_to_int(addr)`.
+    // `GcLLDescr_boehm.gcrootmap` is `None`, which is `!collector_installed`.
+    if !majit_gc::collector_installed() {
+        return !addr;
+    }
     // A box whose borrow is already held by an in-progress alloc answers with
     // the raw `addr`, not with the singleton's id: this is a top-level op, so
     // the busy borrow means the box is mid-allocation, not that it is absent.
@@ -1396,6 +1472,33 @@ fn dynasm_alloc_varsize_typed_and_set_len(
     )
 }
 
+fn dynasm_fixedsize_hook_varsize(
+    base_size: usize,
+    item_size: usize,
+    length_ofs: usize,
+    length: usize,
+) -> Option<u64> {
+    let addr = majit_gc::malloc_fixedsize_addr();
+    if addr == 0 {
+        return None;
+    }
+    let Some(var_bytes) = item_size.checked_mul(length) else {
+        return Some(0);
+    };
+    let Some(payload_size) = base_size.checked_add(var_bytes) else {
+        return Some(0);
+    };
+    let func: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(addr) };
+    let ptr = func(payload_size.max(1));
+    if ptr.is_null() {
+        return Some(0);
+    }
+    unsafe {
+        *ptr.add(length_ofs).cast::<usize>() = length;
+    }
+    Some(ptr as u64)
+}
+
 fn dynasm_alloc_varsize_typed_and_set_len_maybe_clear(
     type_id: u32,
     base_size: usize,
@@ -1423,6 +1526,14 @@ fn dynasm_alloc_varsize_typed_and_set_len_maybe_clear(
         }
     });
     result.unwrap_or_else(|| {
+        // `GcLLDescr.malloc_fixedsize` when the portal published one
+        // (`set_malloc_fixedsize`). The block is the caller's heap, not a
+        // libc array: length is still stamped at `lendescr`.
+        if let Some(hooked) =
+            dynasm_fixedsize_hook_varsize(base_size, item_size, length_ofs, length)
+        {
+            return hooked;
+        }
         let raw = dynasm_raw_varsize_alloc_typed_and_set_len(
             type_id, base_size, item_size, length_ofs, length,
         );
@@ -1792,6 +1903,10 @@ pub struct DynasmBackend {
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
+    /// `llmodel.py` `AbstractLLCPU.subclassrange_min_offset`, from
+    /// `rclass.OBJECT_VTABLE`. Byte offset of `subclassrange_min` inside
+    /// the class object. `None` until the portal configures it.
+    subclassrange_min_offset: Option<usize>,
     /// `compile.py:665` `setattr(cpu, name, descr)` per-cpu attachments,
     /// held in a heap-pinned `Arc<CpuDescrCell>` so the
     /// pointer baked into the CALL_ASSEMBLER helper call site
@@ -1806,6 +1921,9 @@ pub struct DynasmBackend {
     /// singleton is attached. The entry compares `jf_descr` to this word;
     /// `descr_attachments`' lock is not taken on that path.
     done_int_cell: std::sync::atomic::AtomicUsize,
+    /// Cell address of `done_with_this_frame_descr_ref`. Same role as
+    /// [`Self::done_int_cell`] for `compile.py DoneWithThisFrameDescrRef`.
+    done_ref_cell: std::sync::atomic::AtomicUsize,
     /// Arch-specific per-CPU state PyPy keeps on `Assembler386` /
     /// `AssemblerARM64` (e.g. `self.malloc_slowpath`,
     /// `self.propagate_exception_path` at `assembler.py:63,344` and
@@ -1911,8 +2029,10 @@ impl DynasmBackend {
             next_header_pc: 0,
             constants: majit_ir::ConstMap::default(),
             vtable_offset: None,
+            subclassrange_min_offset: None,
             descr_attachments: Arc::new(crate::guard::CpuDescrCell::default()),
             done_int_cell: std::sync::atomic::AtomicUsize::new(0),
+            done_ref_cell: std::sync::atomic::AtomicUsize::new(0),
             arch_cpu_ext: ArchCpuExt::new(asm_memory_manager),
         }
     }
@@ -2111,6 +2231,7 @@ impl DynasmBackend {
                 gc.nursery_top_addr(),
                 gc.max_nursery_object_size(),
                 gc.get_write_barrier_descr(),
+                gc.headerless_fixedsize(),
             )
         });
         // gc.py `get_ll_description(gcdescr)`: `gcdescr is None`
@@ -2122,8 +2243,8 @@ impl DynasmBackend {
         // `max_nursery_size: 0`; `write_barrier_descr = None`, gc.py:156);
         // this flag carries the other two, below.
         let is_boehm = collector.is_none();
-        let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr) =
-            collector.unwrap_or((0, 0, 0, None));
+        let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr, headerless_fixedsize) =
+            collector.unwrap_or((0, 0, 0, None, false));
         majit_gc::rewrite::GcRewriterImpl {
             nursery_free_addr,
             nursery_top_addr,
@@ -2213,6 +2334,7 @@ impl DynasmBackend {
             malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
             standard_array_basesize: std::mem::size_of::<usize>(),
             standard_array_length_ofs: 0,
+            headerless_fixedsize,
         }
     }
 
@@ -2280,6 +2402,13 @@ impl DynasmBackend {
     /// llmodel.py:64-69 self.vtable_offset configuration.
     pub fn set_vtable_offset(&mut self, offset: Option<usize>) {
         self.vtable_offset = offset;
+    }
+
+    /// `AbstractLLCPU.subclassrange_min_offset`. Published for
+    /// `optimizer.py` `_check_subclass` as well as this CPU's assembler.
+    pub fn set_subclassrange_min_offset(&mut self, offset: Option<usize>) {
+        self.subclassrange_min_offset = offset;
+        majit_backend::set_cpu_subclassrange_min_offset(offset);
     }
 
     /// llsupport/gc.py GcLLDescr_framework
@@ -2528,11 +2657,19 @@ impl DynasmBackend {
     /// compiled buffer is only for the debug dumps, which are off on a
     /// steady run.
     fn run_compiled_frame(&self, token: &JitCellToken, args: &[Value]) -> RanFrame {
-        let diag = crate::majit_log_enabled()
-            || crate::majit_dump_enabled()
-            || crate::dynasm_exec_diag_enabled()
-            || majit_ir::debug::have_debug_prints()
-            || crate::gc_freelist_diag_enabled();
+        self.run_compiled_entry(token, EntryWords::Typed(args))
+    }
+
+    /// [`Self::run_compiled_frame`] for `unspecialize_value` words when no
+    /// collector is installed. The caller converts to `Value`s first when
+    /// `majit_gc::collector_installed()` is set, so this store never roots.
+    fn run_compiled_frame_raw(&self, token: &JitCellToken, args: &[i64]) -> RanFrame {
+        debug_assert!(!majit_gc::collector_installed());
+        self.run_compiled_entry(token, EntryWords::Raw(args))
+    }
+
+    fn run_compiled_entry(&self, token: &JitCellToken, args: EntryWords<'_>) -> RanFrame {
+        let diag = exec_diag_enabled();
         let compiled = diag.then(|| Self::get_compiled(token));
         let entry = match compiled {
             Some(code) => code.entry_ptr(),
@@ -2564,64 +2701,94 @@ impl DynasmBackend {
         // by construction, so every input slot fits.  Assert it (release):
         // dropping the `.max(64)` cushion removes the silent-OOB mask, so a
         // depth/arg mismatch must surface loudly instead of corrupting.
+        let n_args = args.len();
         assert!(
-            num_slots >= Self::input_slot(args.len()),
+            num_slots >= Self::input_slot(n_args),
             "execute_token: frame depth {num_slots} < input top {} for {} args",
-            Self::input_slot(args.len()),
-            args.len()
+            Self::input_slot(n_args),
+            n_args
         );
         let frame_bytes = JitFrame::alloc_size(num_slots);
         // No collector: `malloc_jitframe` is a host block and the input refs
-        // are not forwarded. Skip the empty root vector.
-        let (jf_ptr, gc_object, arg_roots) = if majit_gc::collector_installed() {
-            let (ptr, gc_object, roots) = alloc_entry_jitframe(frame_bytes, args);
-            (ptr, gc_object, Some(roots))
-        } else {
-            (malloc_host_jitframe(frame_bytes), false, None)
+        // are not forwarded. Skip the empty root vector. The steady
+        // finish-with-an-int case reuses the token's parked frame
+        // (`llmodel.py execute_token` bump) instead of a TLS free list.
+        // `EntryWords::Raw` is only used on that path: a collector converts
+        // the words back to `Value`s and takes `EntryWords::Typed`.
+        let (jf_ptr, gc_object, arg_roots) = match args {
+            EntryWords::Typed(values) if majit_gc::collector_installed() => {
+                let (ptr, gc_object, roots) = alloc_entry_jitframe(frame_bytes, values);
+                (ptr, gc_object, Some(roots))
+            }
+            _ => {
+                if let Some(ptr) = token.take_entry_frame(frame_bytes) {
+                    unsafe { reuse_off_gc_jitframe(ptr) };
+                    (ptr, false, None)
+                } else {
+                    (malloc_host_jitframe(frame_bytes), false, None)
+                }
+            }
         };
         unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
 
-        let mut ref_index = 0;
-        for (i, arg) in args.iter().enumerate() {
-            let raw = match arg {
-                Value::Int(v) => *v,
-                Value::Ref(r) => {
-                    let current = match arg_roots.as_ref() {
-                        Some(roots) => roots.get(ref_index).map_or(*r, |root| root.get()),
-                        None => *r,
+        match args {
+            EntryWords::Typed(values) => {
+                let mut ref_index = 0;
+                for (i, arg) in values.iter().enumerate() {
+                    let raw = match arg {
+                        Value::Int(v) => *v,
+                        Value::Ref(r) => {
+                            let current = match arg_roots.as_ref() {
+                                Some(roots) => roots.get(ref_index).map_or(*r, |root| root.get()),
+                                None => *r,
+                            };
+                            ref_index += 1;
+                            current.0 as i64
+                        }
+                        Value::Float(f) => f.to_bits() as i64,
+                        Value::Void => 0,
                     };
-                    ref_index += 1;
-                    current.0 as i64
+                    unsafe {
+                        crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), raw as isize)
+                    };
                 }
-                Value::Float(f) => f.to_bits() as i64,
-                Value::Void => 0,
-            };
-            unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), raw as isize) };
+            }
+            // `llmodel.py execute_token`: each word is already the frame slot.
+            EntryWords::Raw(words) => {
+                for (i, &word) in words.iter().enumerate() {
+                    unsafe {
+                        crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), word as isize)
+                    };
+                }
+            }
         }
         // These roots exist only to span the collecting frame allocation.
         // Once the forwarded refs are in the frame, keeping their owner-root
         // slots through compiled execution would add them to every GC scan.
         drop(arg_roots);
 
-        if majit_ir::debug::have_debug_prints() {
+        // Each flag is folded into `diag`. A steady run takes the one
+        // false test and does not call into the loggers.
+        if diag && majit_ir::debug::have_debug_prints() {
             let _s = majit_ir::debug::scope("jit-running");
-            for (i, arg) in args.iter().enumerate() {
+            for i in 0..n_args {
                 let raw = unsafe {
                     crate::llmodel::get_int_value_direct(jf_ptr, Self::input_slot(i)) as i64
                 };
-                majit_ir::debug::debug_print(&format!(
-                    "  arg[{i}] = {:#018x} ({arg:?})",
-                    raw as u64
-                ));
+                let rendered = match args {
+                    EntryWords::Typed(values) => format!("{raw:#018x} ({:?})", values[i]),
+                    EntryWords::Raw(words) => format!("{raw:#018x} ({:?})", words[i]),
+                };
+                majit_ir::debug::debug_print(&format!("  arg[{i}] = {rendered}"));
             }
             majit_ir::debug::debug_print(&format!(
                 "execute_token: entry={entry:?} jf_ptr={jf_ptr:?} num_args={} num_slots={num_slots} code_len={}",
-                args.len(),
+                n_args,
                 compiled.unwrap().buffer.len()
             ));
         }
 
-        if crate::majit_dump_enabled() {
+        if diag && crate::majit_dump_enabled() {
             // Independent debug toggle — MAJIT_DUMP must produce output
             // regardless of whether MAJIT_LOG is set, so emit via plain
             // eprintln (debug_print would silently no-op without
@@ -2651,7 +2818,7 @@ impl DynasmBackend {
         }
 
         // Debug: verify bridge patches are visible
-        if crate::majit_log_enabled() {
+        if diag && crate::majit_log_enabled() {
             for descr in compiled.unwrap().fail_descrs.iter() {
                 if let Some(fd) = descr.as_fail_descr() {
                     let bridge_addr =
@@ -2676,7 +2843,7 @@ impl DynasmBackend {
         // manual push_jf/pop_jf_to around the call.
         let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
-        if crate::dynasm_exec_diag_enabled() {
+        if diag && crate::dynasm_exec_diag_enabled() {
             let compiled = compiled.unwrap();
             eprintln!(
                 "[dynasm-exec] trace={} header={} entry={entry:p} len={} args={args:?}",
@@ -2685,17 +2852,17 @@ impl DynasmBackend {
                 compiled.buffer.len(),
             );
         }
-        if crate::gc_freelist_diag_enabled() {
+        if diag && crate::gc_freelist_diag_enabled() {
             let trace_id = compiled.unwrap().trace_id;
             debug_validate_oldgen_freeblocks(format_args!("before trace {trace_id}"));
         }
         let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
-        if crate::gc_freelist_diag_enabled() {
+        if diag && crate::gc_freelist_diag_enabled() {
             let trace_id = compiled.unwrap().trace_id;
             debug_validate_oldgen_freeblocks(format_args!("after trace {trace_id}"));
         }
 
-        if crate::majit_log_enabled() {
+        if diag && crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] execute_token returned: result_jf={:?} (expected={:?}) same={}",
                 result_jf,
@@ -2744,16 +2911,197 @@ impl DynasmBackend {
         }
     }
 
+    /// `DoneWithThisFrameDescr*.get_result` on a frame `make_execute_token`
+    /// just returned.
+    ///
+    /// `release_under_collector` is the int rule: a host frame is freed even
+    /// when a collector is installed. A ref finish passes false, so the frame
+    /// stays the root until the caller has read the pointer. A collector
+    /// frame (`gc_object`) is always the deadframe either way.
+    #[inline(always)]
+    fn done_word_from_ran<T>(
+        &self,
+        token: &JitCellToken,
+        ran: RanFrame,
+        release_under_collector: bool,
+        is_done: fn(&Self, usize) -> bool,
+        read: fn(*mut JitFrame) -> T,
+    ) -> Result<T, DeadFrame> {
+        let host_finish =
+            !ran.gc_object && (release_under_collector || !majit_gc::collector_installed());
+        if host_finish {
+            let descr_raw = unsafe { crate::llmodel::get_latest_descr(ran.tip) };
+            if is_done(self, descr_raw) {
+                // Slot 0. That descr's `rd_locs` stays empty (`set_rd_locs`
+                // is resume-guard only), so the word `genop_finish` stored
+                // is `jf_frame[0]`.
+                let value = unsafe { read(JitFrame::resolve(ran.tip)) };
+                release_done_int_frame(token, ran.head, ran.tip);
+                return Ok(value);
+            }
+        }
+        Err(self.deadframe_from_run(token, ran))
+    }
+
+    /// `DoneWithThisFrameDescrInt.get_result` on a frame
+    /// `make_execute_token` just returned. A collector frame, or any other
+    /// descr, becomes the deadframe the general path reads.
+    fn done_int_from_ran(&self, token: &JitCellToken, ran: RanFrame) -> Result<i64, DeadFrame> {
+        self.done_word_from_ran(token, ran, true, Self::finish_is_done_int, done_int_slot0)
+    }
+
+    /// Collector and diag entries keep the layered `execute_token` path.
+    /// The value rebuild and the raw-frame run are shared; the finish call
+    /// is the int or ref sibling.
+    #[inline(always)]
+    fn execute_token_done_raw_general<T>(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+        on_collector: fn(&Self, &JitCellToken, &[Value]) -> Result<T, DeadFrame>,
+        on_ran: fn(&Self, &JitCellToken, RanFrame) -> Result<T, DeadFrame>,
+    ) -> Result<T, DeadFrame> {
+        if majit_gc::collector_installed() {
+            let kinds = token.inputarg_types();
+            let values: smallvec::SmallVec<[Value; 8]> = args
+                .iter()
+                .enumerate()
+                .map(|(i, &word)| {
+                    let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                    majit_backend::value_from_unspecialized_word(word, kind)
+                })
+                .collect();
+            return on_collector(self, token, &values);
+        }
+        let ran = self.run_compiled_frame_raw(token, args);
+        on_ran(self, token, ran)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn execute_token_done_int_raw_general(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<i64, DeadFrame> {
+        self.execute_token_done_raw_general(
+            token,
+            args,
+            Self::execute_token_done_int,
+            Self::done_int_from_ran,
+        )
+    }
+
+    /// Any exit other than `DoneWithThisFrameDescrInt` builds the deadframe.
+    #[cold]
+    #[inline(never)]
+    fn raw_entry_deadframe(
+        &self,
+        token: &JitCellToken,
+        head: *mut JitFrame,
+        tip: *mut JitFrame,
+        num_slots: usize,
+    ) -> DeadFrame {
+        let ran = RanFrame {
+            head,
+            tip,
+            gc_object: false,
+            num_slots,
+        };
+        self.deadframe_from_run(token, ran)
+    }
+
     /// `jf_descr` equals the `DoneWithThisFrameDescrInt` cell
     /// `set_done_with_this_frame_descr_int` published.
     ///
     /// `compile.py make_and_attach_done_descrs` attaches that singleton
     /// before any compiled code runs, so the exit is one compare.
+    ///
+    /// `#[inline(always)]`: the raw finish path compares `jf_descr` on every
+    /// return. Taking this function's address for the shared cold body must
+    /// not turn that compare into a call.
+    #[inline(always)]
     fn finish_is_done_int(&self, descr_raw: usize) -> bool {
         let cached = self
             .done_int_cell
             .load(std::sync::atomic::Ordering::Acquire);
         descr_raw != 0 && descr_raw == cached
+    }
+
+    /// `jf_descr` equals the `DoneWithThisFrameDescrRef` cell
+    /// `set_done_with_this_frame_descr_ref` published.
+    #[inline(always)]
+    fn finish_is_done_ref(&self, descr_raw: usize) -> bool {
+        let cached = self
+            .done_ref_cell
+            .load(std::sync::atomic::Ordering::Acquire);
+        descr_raw != 0 && descr_raw == cached
+    }
+
+    /// `DoneWithThisFrameDescrRef.get_result` on a frame
+    /// `make_execute_token` just returned. A collector frame stays a
+    /// deadframe so the caller reads the ref while the frame still holds it.
+    fn done_ref_from_ran(&self, token: &JitCellToken, ran: RanFrame) -> Result<usize, DeadFrame> {
+        self.done_word_from_ran(token, ran, false, Self::finish_is_done_ref, done_ref_slot0)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn execute_token_done_ref_raw_general(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<usize, DeadFrame> {
+        self.execute_token_done_raw_general(
+            token,
+            args,
+            Self::execute_token_done_ref,
+            Self::done_ref_from_ran,
+        )
+    }
+
+    /// Host-frame entry for a raw finish. Allocate, store `args`, call the
+    /// token, and return `(head, tip, num_slots, jf_descr)`.
+    ///
+    /// `llmodel.py execute_token`. Both raw finish paths read slot 0 of
+    /// `tip` afterwards.
+    #[inline(always)]
+    fn run_done_raw_entry(
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> (*mut JitFrame, *mut JitFrame, usize, usize) {
+        let entry = token.ll_function_addr() as *const u8;
+        let clt = unsafe { &*token.compiled_loop_token_ptr() };
+        let (fi_ptr, num_slots) = {
+            let info = unsafe { &*clt.frame_info.data_ptr() };
+            (
+                info as *const majit_backend::JitFrameInfo,
+                info.depth() as usize,
+            )
+        };
+        assert!(
+            num_slots >= Self::input_slot(args.len()),
+            "execute_token: frame depth {num_slots} < input top {} for {} args",
+            Self::input_slot(args.len()),
+            args.len()
+        );
+        let frame_bytes = JitFrame::alloc_size(num_slots);
+        let jf_ptr = match token.take_entry_frame(frame_bytes) {
+            Some(p) => {
+                unsafe { reuse_off_gc_jitframe(p) };
+                p
+            }
+            None => malloc_host_jitframe(frame_bytes),
+        };
+        unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
+        for (i, &word) in args.iter().enumerate() {
+            unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), word as isize) };
+        }
+        let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
+            unsafe { std::mem::transmute(entry) };
+        let tip = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
+        let descr_raw = unsafe { crate::llmodel::get_latest_descr(tip) };
+        (jf_ptr, tip, num_slots, descr_raw)
     }
 
     /// Cell address published by `set_done_with_this_frame_descr_int`.
@@ -2855,6 +3203,7 @@ impl Backend for DynasmBackend {
             header_pc,
             const_pool,
             self.vtable_offset,
+            self.subclassrange_min_offset,
             typeid_table,
             guard_gc_type_info,
             subclass_range_table,
@@ -2987,6 +3336,13 @@ impl Backend for DynasmBackend {
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
             .update(|a| a.done_with_this_frame_descr_ref = Some(descr));
+        let ptr = self
+            .descr_attachments
+            .read()
+            .descr_ptrs()
+            .done_with_this_frame_descr_ref;
+        self.done_ref_cell
+            .store(ptr, std::sync::atomic::Ordering::Release);
     }
     fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
@@ -3117,6 +3473,7 @@ impl Backend for DynasmBackend {
             0,
             const_pool,
             self.vtable_offset,
+            self.subclassrange_min_offset,
             typeid_table,
             guard_gc_type_info,
             subclass_range_table,
@@ -3285,20 +3642,61 @@ impl Backend for DynasmBackend {
         args: &[Value],
     ) -> Result<i64, DeadFrame> {
         let ran = self.run_compiled_frame(token, args);
-        if !ran.gc_object {
-            let descr_raw = unsafe { crate::llmodel::get_latest_descr(ran.tip) };
-            if self.finish_is_done_int(descr_raw) {
-                // `DoneWithThisFrameDescrInt.get_result` →
-                // `get_int_value(deadframe, 0)`. Empty `rd_locs` is slot 0,
-                // where `genop_finish` stored the word; a stamped table wins.
-                let descr = unsafe { ExitDescr::from_cell(descr_raw) };
-                let value =
-                    unsafe { crate::llmodel::get_int_value(ran.tip, descr.as_fail_descr(), 0) };
-                unsafe { free_jitframe_chain(ran.head) };
-                return Ok(value);
-            }
+        self.done_int_from_ran(token, ran)
+    }
+
+    /// `llmodel.py execute_token` allocates the frame, stores the words, and
+    /// calls. `warmstate.py execute_assembler` reads `get_latest_descr` and,
+    /// for `DoneWithThisFrameDescrInt`, returns `get_result` (slot 0).
+    #[inline]
+    fn execute_token_done_int_raw(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<i64, DeadFrame> {
+        if majit_gc::collector_installed() || exec_diag_enabled() {
+            return self.execute_token_done_int_raw_general(token, args);
         }
-        Err(self.deadframe_from_run(token, ran))
+        let (jf_ptr, tip, num_slots, descr_raw) = Self::run_done_raw_entry(token, args);
+        if self.finish_is_done_int(descr_raw) {
+            let value = done_int_slot0(unsafe { JitFrame::resolve(tip) });
+            release_done_int_frame(token, jf_ptr, tip);
+            return Ok(value);
+        }
+        Err(self.raw_entry_deadframe(token, jf_ptr, tip, num_slots))
+    }
+
+    /// `warmstate.py execute_assembler` ref fast path. A collector frame is
+    /// not freed here: [`Self::done_ref_from_ran`] returns it as a deadframe
+    /// so the caller still holds the ref.
+    fn execute_token_done_ref(
+        &self,
+        token: &JitCellToken,
+        args: &[Value],
+    ) -> Result<usize, DeadFrame> {
+        let ran = self.run_compiled_frame(token, args);
+        self.done_ref_from_ran(token, ran)
+    }
+
+    /// Same B1 shape as [`Backend::execute_token_done_int_raw`]: inline hot
+    /// path, cold general fallback when a collector is installed or exec diag
+    /// is on. Slot 0 is `get_ref_value_direct`.
+    #[inline]
+    fn execute_token_done_ref_raw(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<usize, DeadFrame> {
+        if majit_gc::collector_installed() || exec_diag_enabled() {
+            return self.execute_token_done_ref_raw_general(token, args);
+        }
+        let (jf_ptr, tip, num_slots, descr_raw) = Self::run_done_raw_entry(token, args);
+        if self.finish_is_done_ref(descr_raw) {
+            let value = done_ref_slot0(unsafe { JitFrame::resolve(tip) });
+            release_done_int_frame(token, jf_ptr, tip);
+            return Ok(value);
+        }
+        Err(self.raw_entry_deadframe(token, jf_ptr, tip, num_slots))
     }
 
     /// Override execute_token_ints_raw to return the FULL jitframe
@@ -4295,14 +4693,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn id_or_identityhash_without_collector_returns_addr() {
+    fn id_or_identityhash_without_collector_returns_bitwise_not() {
         std::thread::spawn(|| {
             assert!(!gc_box::present());
             let marker = 0usize;
             let addr = &marker as *const usize as usize;
             let got = dynasm_id_or_identityhash(addr);
+            // `boehm.py` `ll_identityhash`: `h = ~cast_adr_to_int(addr)`.
             if !majit_gc::gc_sync::is_initialized() {
-                assert_eq!(got, addr);
+                assert_eq!(got, !addr);
             }
         })
         .join()

@@ -134,6 +134,10 @@ impl<'c> Lowerer<'c> {
                     (config.ref_fields.contains_key(&key), size, signed, check)
                 }
             };
+            // `descr.py` `get_type_flag`: an `f64` field is the float flag,
+            // so the write-set descr matches the getfield descr.
+            let is_float =
+                config.array_fields.get(&key).is_none() && config.float_fields.contains(&key);
             fields.push(quote! {
                 {
                     #__fcheck
@@ -143,6 +147,7 @@ impl<'c> Lowerer<'c> {
                         stringify!(#field),
                         #__fsize,
                         #__fsigned,
+                        #is_float,
                     )
                 }
             });
@@ -2129,6 +2134,19 @@ impl<'c> Lowerer<'c> {
                         },
                     );
                 }
+                crate::jit_interp::CallPolicyKind::AllocRef => {
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let throwaway_reg = self.alloc_reg();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
+                        quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #throwaway_reg, majit_metainterp::can_raise_effect_info());
+                        },
+                    );
+                }
                 crate::jit_interp::CallPolicyKind::NurseryAllocRef => {
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let throwaway_reg = self.alloc_reg();
@@ -2802,5 +2820,40 @@ mod continue_target_tests {
         );
         assert!(lowerer.statements.is_empty());
         assert!(lowerer.op_metadata.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod residual_write_float_tests {
+    use super::*;
+
+    /// `descr.py` `get_type_flag`: an `f64` residual-write field is
+    /// `is_float: true`, matching the getfield descr.
+    #[test]
+    fn residual_write_float_field_sets_is_float() {
+        let floatval = crate::jit_interp::IntFieldEntry {
+            struct_type: syn::parse_quote!(Num),
+            field: syn::parse_quote!(floatval),
+            int_type: syn::parse_quote!(f64),
+        };
+        let mut config =
+            LowererConfig::inline_helper(&[], &[], &[floatval], &[], &[], &[], &[], &[]);
+        config.residual_writes.push((
+            vec!["bump".to_string()],
+            syn::parse_quote!(Num),
+            syn::parse_quote!(floatval),
+            false,
+        ));
+        let lowerer = Lowerer::new(Some(&config));
+        let func: syn::Expr = syn::parse_quote!(bump);
+        let tokens = lowerer
+            .residual_write_effect_info_tokens(&func, true)
+            .expect("write set")
+            .to_string();
+        assert!(
+            tokens.contains("true"),
+            "f64 write-set field must carry is_float: {tokens}"
+        );
+        assert!(tokens.contains("floatval"), "{tokens}");
     }
 }

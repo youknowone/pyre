@@ -22,6 +22,45 @@ use std::collections::HashSet;
 
 use crate::{GcRewriter, WriteBarrierDescr};
 
+fn boehm_malloc_fn() -> Option<usize> {
+    let addr = crate::malloc_fixedsize_addr();
+    if addr == 0 { None } else { Some(addr) }
+}
+
+fn boehm_malloc_fixedsize_descr() -> DescrRef {
+    use std::sync::{Arc, OnceLock};
+    static DESCR: OnceLock<DescrRef> = OnceLock::new();
+    DESCR
+        .get_or_init(|| {
+            Arc::new(majit_ir::descr::SimpleCallDescr::new(
+                0x5000_0011,
+                vec![Type::Int],
+                Type::Ref,
+                false,
+                std::mem::size_of::<usize>(),
+                majit_ir::EffectInfo::MOST_GENERAL,
+            ))
+        })
+        .clone()
+}
+
+fn boehm_malloc_array_descr() -> DescrRef {
+    use std::sync::{Arc, OnceLock};
+    static DESCR: OnceLock<DescrRef> = OnceLock::new();
+    DESCR
+        .get_or_init(|| {
+            Arc::new(majit_ir::descr::SimpleCallDescr::new(
+                0x5000_0012,
+                vec![Type::Int, Type::Int, Type::Int, Type::Int],
+                Type::Ref,
+                false,
+                std::mem::size_of::<usize>(),
+                majit_ir::EffectInfo::MOST_GENERAL,
+            ))
+        })
+        .clone()
+}
+
 fn mk_op(opcode: OpCode, args: &[Operand]) -> Op {
     Op::new(opcode, args)
 }
@@ -378,6 +417,10 @@ pub struct GcRewriterImpl {
     /// emits explicit NULL-pointer stores at flush time
     /// (rewrite.py:761-766).
     pub malloc_zero_filled: bool,
+    /// [`crate::GcAllocator::headerless_fixedsize`]: bump the payload
+    /// itself. `gen_malloc_nursery` emits `CallMallocNurseryHeaderless`
+    /// and does not stamp a tid.
+    pub headerless_fixedsize: bool,
     /// llsupport/gc.py `self.memcpy_fn = memcpy_fn` cast to a Signed
     /// integer via `cast_ptr_to_adr` + `cast_adr_to_int`
     /// (rewrite.py:1046-1047). Embedded as a ConstInt into the lowered
@@ -1331,6 +1374,32 @@ impl GcRewriterImpl {
             .as_size_descr()
             .expect("NEW descr must be SizeDescr");
 
+        if self.headerless_fixedsize {
+            // `gen_malloc_nursery` batches consecutive bumps. The size is
+            // the payload: no `GcHeader`, no tid store. A size the nursery
+            // declines goes to `malloc_fixedsize` at the same raw size.
+            let size = round_up(descr.size());
+            let result_pos = op.pos().get();
+            let obj_ref = if descr.non_moving() {
+                self.gen_malloc_fixedsize(size, descr.type_id(), true, result_pos, st)
+            } else if let Some(r) = self.gen_malloc_nursery(size, result_pos, st) {
+                r
+            } else {
+                self.gen_malloc_fixedsize(size, descr.type_id(), false, result_pos, st)
+            };
+            st.record_result_mapping(result_pos, obj_ref.clone());
+            if op.opcode == OpCode::NewWithVtable {
+                if let Some(vtable_fd_ref) = self.fielddescr_vtable.as_ref() {
+                    let vtable = descr.vtable();
+                    if vtable != 0 {
+                        self.gen_initialize_vtable(obj_ref.clone(), vtable, vtable_fd_ref, st);
+                    }
+                }
+            }
+            self.clear_gc_fields(descr, obj_ref, st);
+            return;
+        }
+
         if descr.headerless() {
             let size = round_up(descr.size());
             let result_pos = op.pos().get();
@@ -1361,6 +1430,14 @@ impl GcRewriterImpl {
                 )
             };
             st.record_result_mapping(result_pos, obj_ref.clone());
+            if op.opcode == OpCode::NewWithVtable {
+                if let Some(vtable_fd_ref) = self.fielddescr_vtable.as_ref() {
+                    let vtable = descr.vtable();
+                    if vtable != 0 {
+                        self.gen_initialize_vtable(obj_ref.clone(), vtable, vtable_fd_ref, st);
+                    }
+                }
+            }
             self.clear_gc_fields(descr, obj_ref, st);
             return;
         }
@@ -1555,7 +1632,11 @@ impl GcRewriterImpl {
             // bytes (handle_new_fixedsize line 836); upstream's basesize
             // already includes the header offset.  Add HDR_SIZE here so
             // the bump-pointer alloc covers the same span.
-            let s = crate::header::GcHeader::SIZE + total_size as usize;
+            let s = if self.headerless_fixedsize {
+                total_size as usize
+            } else {
+                crate::header::GcHeader::SIZE + total_size as usize
+            };
             let nursery_ref = if non_moving {
                 None
             } else {
@@ -1564,7 +1645,9 @@ impl GcRewriterImpl {
             if let Some(r) = nursery_ref {
                 // rewrite.py:569-572 path #2 — constant-size nursery.
                 st.record_result_mapping(op.pos().get(), r.clone());
-                self.gen_initialize_tid(r.clone(), descr.type_id(), st);
+                if !self.headerless_fixedsize {
+                    self.gen_initialize_tid(r.clone(), descr.type_id(), st);
+                }
                 if let Some(len_descr) = descr.len_descr() {
                     self.gen_initialize_len(r.clone(), v_length.clone(), len_descr, st);
                 }
@@ -1785,10 +1868,14 @@ impl GcRewriterImpl {
         st.emitting_an_operation_that_can_collect();
         let kind_ref = st.const_int(kind);
         let itemsize_ref = st.const_int(ad.item_size() as i64);
-        let varsize_op = mk_op(
-            OpCode::CallMallocNurseryVarsize,
-            &[kind_ref, itemsize_ref, v_length],
-        );
+        // Headerless: same args and descr, no `GcHeader` in the bump.
+        // `CallMallocNurseryVarsize` still stamps a tid before the payload.
+        let opcode = if self.headerless_fixedsize {
+            OpCode::CallMallocNurseryVarsizeHeaderless
+        } else {
+            OpCode::CallMallocNurseryVarsize
+        };
+        let varsize_op = mk_op(opcode, &[kind_ref, itemsize_ref, v_length]);
         varsize_op.setdescr(arraydescr);
         // rewrite.py:863-866, said out loud because the fixed-size sibling
         // does the opposite and the difference is one absent call:
@@ -1832,6 +1919,27 @@ impl GcRewriterImpl {
         result_pos: OpRef,
         st: &mut RewriteState<'_>,
     ) -> Operand {
+        // rewrite.py `gen_boehm_malloc_array` when `malloc_fn_ptr` is published.
+        if boehm_malloc_fn().is_some() {
+            let ad = arraydescr
+                .as_array_descr()
+                .expect("gen_malloc_array descr must be ArrayDescr");
+            let len_descr = ad.len_descr();
+            let length_ofs = len_descr.map_or(self.standard_array_length_ofs, |fd| fd.offset());
+            let fn_ref = st.const_int(crate::boehm_malloc_array as *const () as usize as i64);
+            return self.gen_call_malloc_gc(
+                &[
+                    fn_ref,
+                    st.const_int(ad.base_size() as i64),
+                    v_num_elem,
+                    st.const_int(ad.item_size() as i64),
+                    st.const_int(length_ofs as i64),
+                ],
+                result_pos,
+                boehm_malloc_array_descr(),
+                st,
+            );
+        }
         let ad = arraydescr
             .as_array_descr()
             .expect("gen_malloc_array descr must be ArrayDescr");
@@ -1943,6 +2051,19 @@ impl GcRewriterImpl {
         result_pos: OpRef,
         st: &mut RewriteState<'_>,
     ) -> Operand {
+        // rewrite.py `gen_malloc_fixedsize` Boehm arm: `CALL_R(malloc_fn_ptr, size)`.
+        if let Some(addr) = boehm_malloc_fn() {
+            let fn_ref = st.const_int(addr as i64);
+            let size_ref = st.const_int(size as i64);
+            let result = self.gen_call_malloc_gc(
+                &[fn_ref, size_ref],
+                result_pos,
+                boehm_malloc_fixedsize_descr(),
+                st,
+            );
+            st.remember_wb(&result);
+            return result;
+        }
         debug_assert_eq!(
             size & (std::mem::size_of::<usize>() - 1),
             0,
@@ -3014,16 +3135,19 @@ impl GcRewriterImpl {
                 // `copy_nursery_object` / `find_shadow` then panic on.
                 // Nursery-only: the first CallMallocNursery result can
                 // be an old-gen slow path whose TRACK_YOUNG_PTRS
-                // gen_initialize_tid must keep.
-                let flags_byteofs = (crate::header::FLAG_SHIFT / 8) as i64;
-                let flags_ofs =
-                    st.const_int(-(crate::header::GcHeader::SIZE as i64) + flags_byteofs);
-                let zero = st.const_int(0);
-                let flags_size = st.const_int((crate::header::TYPE_ID_BITS / 8) as i64);
-                st.emit(mk_op(
-                    OpCode::GcStore,
-                    &[r.clone(), flags_ofs, zero, flags_size],
-                ));
+                // gen_initialize_tid must keep. Headerless objects have
+                // no flags word in front of the payload.
+                if !self.headerless_fixedsize {
+                    let flags_byteofs = (crate::header::FLAG_SHIFT / 8) as i64;
+                    let flags_ofs =
+                        st.const_int(-(crate::header::GcHeader::SIZE as i64) + flags_byteofs);
+                    let zero = st.const_int(0);
+                    let flags_size = st.const_int((crate::header::TYPE_ID_BITS / 8) as i64);
+                    st.emit(mk_op(
+                        OpCode::GcStore,
+                        &[r.clone(), flags_ofs, zero, flags_size],
+                    ));
+                }
                 st.previous_size = size;
                 st.last_malloced_ref = r.clone();
                 st.remember_wb(&r);
@@ -3031,10 +3155,16 @@ impl GcRewriterImpl {
             }
         }
 
-        // rewrite.py:903: CALL_MALLOC_NURSERY(ConstInt(size))
+        // rewrite.py:903: CALL_MALLOC_NURSERY(ConstInt(size)). A
+        // headerless descr emits the raw-bump form of the same op.
         st.emitting_an_operation_that_can_collect();
         let size_ref = st.const_int(size as i64);
-        let op = mk_op(OpCode::CallMallocNursery, &[size_ref]);
+        let malloc_opcode = if self.headerless_fixedsize {
+            OpCode::CallMallocNurseryHeaderless
+        } else {
+            OpCode::CallMallocNursery
+        };
+        let op = mk_op(malloc_opcode, &[size_ref]);
         let r = st.emit_result(op, result_pos);
         st.pending_malloc_idx = Some(st.out.len() - 1);
         st.pending_malloc_total = size;
@@ -3995,6 +4125,7 @@ mod tests {
             malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
             standard_array_basesize: TEST_STANDARD_ARRAY_BASESIZE,
             standard_array_length_ofs: TEST_STANDARD_ARRAY_LENGTH_OFS,
+            headerless_fixedsize: false,
         }
     }
 
@@ -4412,6 +4543,32 @@ mod tests {
             .unwrap();
         // rewrite.py:858: [ConstInt(kind), ConstInt(itemsize), v_length]
         assert_eq!(varsize.arg(2).to_opref(), length_ref);
+    }
+
+    /// Headerless nurseries use `CallMallocNurseryVarsizeHeaderless`:
+    /// the same length/itemsize args, and no `GcHeader` in the bump.
+    #[test]
+    fn test_headerless_new_array_uses_headerless_varsize() {
+        let mut rw = make_rewriter();
+        rw.headerless_fixedsize = true;
+        let length_ref = OpRef::int_op(100);
+        let ops = vec![Op::with_descr(
+            OpCode::NewArray,
+            &[ro(length_ref)],
+            array_descr_int(),
+        )];
+        let result = rw.rewrite_ops(&ops);
+        assert!(
+            result
+                .iter()
+                .any(|o| o.opcode == OpCode::CallMallocNurseryVarsizeHeaderless),
+            "headerless NEW_ARRAY must emit CallMallocNurseryVarsizeHeaderless, got {result:?}"
+        );
+        assert!(
+            !result
+                .iter()
+                .any(|o| o.opcode == OpCode::CallMallocNurseryVarsize)
+        );
     }
 
     #[test]
@@ -6095,6 +6252,7 @@ mod tests {
             malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
             standard_array_basesize: TEST_STANDARD_ARRAY_BASESIZE,
             standard_array_length_ofs: TEST_STANDARD_ARRAY_LENGTH_OFS,
+            headerless_fixedsize: false,
         }
     }
 

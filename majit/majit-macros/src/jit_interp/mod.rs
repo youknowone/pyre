@@ -584,13 +584,21 @@ pub struct IntFieldEntry {
 impl IntFieldEntry {
     /// `descr.py get_type_flag(FIELDTYPE)` — the signed/unsigned half,
     /// read off the declared Rust type.
+    /// `f64` is `lltype.Float`, not an integer field.
+    pub(crate) fn is_float(&self) -> bool {
+        self.int_type == "f64"
+    }
+
     pub(crate) fn is_signed(&self) -> syn::Result<bool> {
         match self.int_type.to_string().as_str() {
             "i8" | "i16" | "i32" | "i64" | "isize" => Ok(true),
             "u8" | "u16" | "u32" | "u64" | "usize" | "bool" => Ok(false),
+            // `lltype.Float` (`descr.py` `get_type_flag` `FLAG_FLOAT`).
+            // Signedness does not apply; the lowerer emits `getfield_gc_f`.
+            "f64" => Ok(false),
             other => Err(syn::Error::new_spanned(
                 &self.int_type,
-                format!("int_fields: `{other}` is not an integer type"),
+                format!("int_fields: `{other}` is not an integer or f64 type"),
             )),
         }
     }
@@ -647,6 +655,11 @@ pub(crate) enum CallPolicyKind {
     /// nursery bump. Result is a
     /// real escaping Ref — no virtualization.
     NurseryAllocRef,
+    /// Fresh allocation that is not a fixed-size nursery bump. Empty write
+    /// sets (`can_raise_effect_info`, `analyze_external_call` `bottom_result`)
+    /// so the call does not flush cached fields, and the compiled code still
+    /// enters the function.
+    AllocRef,
     ResidualRefWrapped,
     /// `EF_CANNOT_RAISE` for ref-returning residual helpers.
     /// Mirrors `ResidualIntCannotRaiseWrapped`; the unwrapped variant
@@ -730,6 +743,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "elidable_int_or_memerror_wrapped" => CallPolicyKind::ElidableIntOrMemerrorWrapped,
         "residual_ref" => CallPolicyKind::ResidualRef,
         "nursery_alloc_ref" => CallPolicyKind::NurseryAllocRef,
+        "alloc_ref" => CallPolicyKind::AllocRef,
         "residual_ref_wrapped" => CallPolicyKind::ResidualRefWrapped,
         "residual_ref_cannot_raise_wrapped" => CallPolicyKind::ResidualRefCannotRaiseWrapped,
         "may_force_ref_wrapped" => CallPolicyKind::MayForceRefWrapped,
@@ -2803,7 +2817,13 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
         .into_iter()
         .map(|(name, _, _)| syn::parse_quote!(#name))
         .collect();
-    let body = if trace {
+    // `warmspot.py ll_portal_runner` is a function in front of the portal
+    // body. The split is only sound when the door can run from the parameters
+    // alone and the traced loop is the body's first statement: any local the
+    // door reads is created inside the body, and the inline door stays there.
+    let runner_shape =
+        trace && finish_return.is_some() && portal_runner_shape(&func.sig, &block, &config.greens);
+    let (body_stmts, runner_door) = if trace {
         rewrite_body(
             &block,
             &merge_fn_name,
@@ -2813,19 +2833,200 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
             &config.green_type_tags,
             config.recursive_entry.as_ref(),
             finish_return.as_ref(),
+            !runner_shape,
         )
     } else {
         let mut block = block;
         rewrite_recursive_portal_calls(&mut block, config.recursive_entry.as_ref());
-        quote!(#block)
+        (block.stmts, None)
     };
 
+    if runner_shape {
+        let door = runner_door.expect("portal runner shape has a function-entry door");
+        let finish = finish_return
+            .as_ref()
+            .expect("portal runner shape has a finish projection");
+        emit_portal_runner(vis, sig, attrs, &body_stmts, door, finish)
+    } else {
+        quote! {
+            #(#attrs)*
+            #vis #sig {
+                #(#body_stmts)*
+            }
+        }
+    }
+}
+
+/// `ll_portal_runner` in front of `__<name>_portal`. The original name,
+/// attributes and visibility stay on the runner. Registrations
+/// (`__dispatch_jitcode_*`, the jitcode name, `__merge_*` / `__trace_*`)
+/// keep that same identifier; the body is only the call target.
+fn emit_portal_runner(
+    vis: &syn::Visibility,
+    sig: &syn::Signature,
+    attrs: &[syn::Attribute],
+    body_stmts: &[syn::Stmt],
+    door: RunnerDoor,
+    finish: &FinishReturn,
+) -> TokenStream {
+    let portal_ident = quote::format_ident!("__{}_portal", sig.ident);
+    let mut portal_sig = sig.clone();
+    portal_sig.ident = portal_ident.clone();
+    let params = fn_param_idents(sig).expect("portal runner parameters are plain idents");
+    let pc_ident = bare_ident(&door.pc).expect("portal runner pc is a parameter");
+    let run_args: Vec<TokenStream> = params.iter().map(|id| quote! { #id }).collect();
+    let resume_args: Vec<TokenStream> = params
+        .iter()
+        .map(|id| {
+            if id == &pc_ident {
+                quote! { __resume_pc }
+            } else {
+                quote! { #id }
+            }
+        })
+        .collect();
+    let direct = finish.return_finished_word();
+    let drain = finish.drain(&door.driver);
+    let single_pass_drain = finish.drain_single_pass(&door.driver);
+    let epilogue = &body_stmts[1..];
+    let key = &door.key;
+    let driver = &door.driver;
+    let pc = &door.pc;
+    let state = &door.state;
+    let env = &door.env;
     quote! {
         #(#attrs)*
         #vis #sig {
-            #body
+            // `warmspot.py ll_portal_runner`: maybe_compile_and_run, and on
+            // `execute_assembler`'s DoneWithThisFrame fast path return without
+            // entering the portal body.
+            {
+                let (__green_hash, __make_key) = #key;
+                match #driver.function_entry_runner(
+                    __green_hash,
+                    __make_key,
+                    #pc,
+                    &mut #state,
+                    #env,
+                ) {
+                    majit_metainterp::FunctionEntryRunner::Finished(__finish_word) => {
+                        #direct
+                    }
+                    majit_metainterp::FunctionEntryRunner::Resume(__resume_pc) => {
+                        #drain
+                        // A guard-resume bridge that reaches the portal return
+                        // publishes on the single-pass latch and reports
+                        // `usize::MAX`. `warmspot.py ll_portal_runner` returns
+                        // `DoneWithThisFrameRef.result` whether
+                        // `execute_assembler`, `blackhole.py
+                        // _done_with_this_frame`, or `pyjitpl.py
+                        // MetaInterp.compile_done_with_this_frame` raised it.
+                        if #driver.take_single_pass_finish() {
+                            #single_pass_drain
+                        }
+                        if __resume_pc != usize::MAX {
+                            return #portal_ident(#(#resume_args),*);
+                        }
+                    }
+                    majit_metainterp::FunctionEntryRunner::Run => {
+                        #drain
+                        return #portal_ident(#(#run_args),*);
+                    }
+                }
+            }
+            #(#epilogue)*
+        }
+
+        #[inline(never)]
+        #[allow(non_snake_case)]
+        #portal_sig {
+            #(#body_stmts)*
         }
     }
+}
+
+struct RunnerDoor {
+    key: TokenStream,
+    driver: Expr,
+    pc: Expr,
+    state: Expr,
+    env: Expr,
+}
+
+fn fn_param_idents(sig: &syn::Signature) -> Option<Vec<Ident>> {
+    let mut out = Vec::new();
+    for arg in &sig.inputs {
+        let syn::FnArg::Typed(pat) = arg else {
+            return None;
+        };
+        let syn::Pat::Ident(id) = &*pat.pat else {
+            return None;
+        };
+        out.push(id.ident.clone());
+    }
+    Some(out)
+}
+
+fn bare_ident(expr: &Expr) -> Option<Ident> {
+    match expr {
+        Expr::Path(path)
+            if path.qself.is_none()
+                && path.attrs.is_empty()
+                && path.path.segments.len() == 1
+                && path.path.segments[0].arguments.is_none() =>
+        {
+            Some(path.path.segments[0].ident.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Root ident of a door operand: the parameter, or the parameter under `*` / `&`.
+fn expr_root_ident(expr: &Expr) -> Option<Ident> {
+    match expr {
+        Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+            expr_root_ident(&unary.expr)
+        }
+        Expr::Reference(reference) => expr_root_ident(&reference.expr),
+        _ => bare_ident(expr),
+    }
+}
+
+/// The traced loop is the body's first statement, and driver/pc/state/env are
+/// parameters, so `ll_portal_runner` can run before the portal body.
+fn portal_runner_shape(sig: &syn::Signature, block: &syn::Block, greens: &[Expr]) -> bool {
+    if greens.is_empty() {
+        return false;
+    }
+    if traced_loop_stmt_index(&block.stmts) != Some(0) {
+        return false;
+    }
+    let Some(params) = fn_param_idents(sig) else {
+        return false;
+    };
+    let scan = scan_single_pass_close(block);
+    let Some(args) = scan.first_state else {
+        return false;
+    };
+    let driver = args
+        .driver
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(driver));
+    let env = args
+        .env
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(program));
+    let pc = args.pc.clone().unwrap_or_else(|| syn::parse_quote!(pc));
+    let Some(state) = args.state.clone() else {
+        return false;
+    };
+    let is_param = |expr: &Expr| {
+        expr_root_ident(expr).is_some_and(|id| params.iter().any(|param| param == &id))
+    };
+    is_param(&driver)
+        && is_param(&env)
+        && is_param(&state)
+        && bare_ident(&pc).is_some_and(|id| params.iter().any(|param| param == &id))
 }
 
 /// How a compiled run that ended in FINISH is returned from the portal.
@@ -2841,6 +3042,9 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
 enum FinishReturnKind {
     Int,
     Float,
+    /// `*mut T` / `*const T`. `warmstate.py execute_assembler` returns
+    /// `DoneWithThisFrameDescrRef.get_result` for this portal.
+    Ref,
 }
 
 #[derive(Clone)]
@@ -2859,6 +3063,14 @@ fn finish_return_for(output: &syn::ReturnType) -> Option<FinishReturn> {
     let syn::ReturnType::Type(_, ty) = output else {
         return None;
     };
+    // A raw pointer is a ref finish. The portal must spell `*mut T` or
+    // `*const T`: a type alias is a path, and this macro cannot see through it.
+    if let syn::Type::Ptr(_) = ty.as_ref() {
+        return Some(FinishReturn {
+            kind: FinishReturnKind::Ref,
+            cast_to: Some(ty.as_ref().clone()),
+        });
+    }
     let syn::Type::Path(type_path) = ty.as_ref() else {
         return None;
     };
@@ -2894,6 +3106,7 @@ impl FinishReturn {
         let take = match self.kind {
             FinishReturnKind::Int => quote! { take_back_edge_finish_int },
             FinishReturnKind::Float => quote! { take_back_edge_finish_float },
+            FinishReturnKind::Ref => quote! { take_back_edge_finish_ref },
         };
         let returned = match &self.cast_to {
             Some(ty) => quote! { __finish_value as #ty },
@@ -2913,6 +3126,7 @@ impl FinishReturn {
         let take = match self.kind {
             FinishReturnKind::Int => quote! { take_single_pass_finish_int },
             FinishReturnKind::Float => quote! { take_single_pass_finish_float },
+            FinishReturnKind::Ref => quote! { take_single_pass_finish_ref },
         };
         let returned = match &self.cast_to {
             Some(ty) => quote! { __finish_value as #ty },
@@ -2921,6 +3135,29 @@ impl FinishReturn {
         quote! {
             if let Some(__finish_value) = #driver_expr.#take() {
                 return #returned;
+            }
+        }
+    }
+
+    /// `execute_assembler`'s fast path, returned from `ll_portal_runner`
+    /// without the finish latch. `__finish_word` is the `i64` the raw poll
+    /// produced (an int, or a ref address).
+    fn return_finished_word(&self) -> TokenStream {
+        match self.kind {
+            FinishReturnKind::Int => match &self.cast_to {
+                Some(ty) => quote! { return __finish_word as #ty; },
+                None => quote! { return __finish_word; },
+            },
+            FinishReturnKind::Float => match &self.cast_to {
+                Some(ty) => quote! { return (f64::from_bits(__finish_word as u64)) as #ty; },
+                None => quote! { return f64::from_bits(__finish_word as u64); },
+            },
+            FinishReturnKind::Ref => {
+                let ty = self
+                    .cast_to
+                    .clone()
+                    .expect("a ref finish carries the portal's pointer type");
+                quote! { return (__finish_word as usize) as #ty; }
             }
         }
     }
@@ -3078,7 +3315,8 @@ fn rewrite_body(
     default_green_type_tags: &[Option<green_type_tag::GreenTypeTag>],
     recursive_entry: Option<&Path>,
     finish_return: Option<&FinishReturn>,
-) -> TokenStream {
+    insert_entry_door: bool,
+) -> (Vec<syn::Stmt>, Option<RunnerDoor>) {
     use syn::visit_mut::VisitMut;
 
     struct CanEnterJitArgs {
@@ -3881,6 +4119,7 @@ fn rewrite_body(
     // before the interpreter loop. Only the `; state` form has a live state
     // handle to extract reds from, which is what compiled entry and
     // force_start_tracing both need.
+    let mut runner_door = None;
     let entry_door = if let Some(args) = scan.first_state {
         let driver = args
             .driver
@@ -3895,6 +4134,12 @@ fn rewrite_body(
         let finish_drain = finish_return
             .map(|finish_return| finish_return.drain(&driver))
             .unwrap_or_default();
+        // Same emission as the back edge: `; state` is what sets the latch.
+        // With no finish projection the body is empty, and the take still
+        // clears the flag so a later merge point does not observe it.
+        let single_pass_drain = finish_return
+            .map(|finish_return| finish_return.drain_single_pass(&driver))
+            .unwrap_or_default();
         match green_key_expr(&pc, &pc, default_greens, default_green_type_tags) {
             // The block is the condition of `if #door { loop }`. A finished
             // frame reports `usize::MAX` and has no bytecode pc; assigning
@@ -3902,27 +4147,50 @@ fn rewrite_body(
             // program. Skipping the loop leaves the status the run already
             // stored for the function's own epilogue. A real resume pc still
             // enters the loop there.
-            Some(key) => quote! {
-                {
-                    let (__green_hash, __make_key) = #key;
-                    let __run_dispatch = match #driver.function_entry_structured(
-                        __green_hash,
-                        __make_key,
-                        #pc,
-                        &mut #state,
-                        #env,
-                    ) {
-                        Some(__resume) if __resume == usize::MAX => false,
-                        Some(__resume) => {
-                            #pc = __resume;
-                            true
+            Some(key) => {
+                runner_door = Some(RunnerDoor {
+                    key: key.clone(),
+                    driver: driver.clone(),
+                    pc: pc.clone(),
+                    state: state.clone(),
+                    env: env.clone(),
+                });
+                if insert_entry_door {
+                    quote! {
+                        {
+                            let (__green_hash, __make_key) = #key;
+                            let __run_dispatch = match #driver.function_entry_structured(
+                                __green_hash,
+                                __make_key,
+                                #pc,
+                                &mut #state,
+                                #env,
+                            ) {
+                                Some(__resume) if __resume == usize::MAX => false,
+                                Some(__resume) => {
+                                    #pc = __resume;
+                                    true
+                                }
+                                None => true,
+                            };
+                            #finish_drain
+                            // `warmspot.py ll_portal_runner` returns
+                            // `DoneWithThisFrameRef.result` from
+                            // `execute_assembler`, `blackhole.py
+                            // _done_with_this_frame`, or `pyjitpl.py
+                            // MetaInterp.compile_done_with_this_frame`. The
+                            // bridge walk publishes that result on the
+                            // single-pass latch and reports `usize::MAX`.
+                            if #driver.take_single_pass_finish() {
+                                #single_pass_drain
+                            }
+                            __run_dispatch
                         }
-                        None => true,
-                    };
-                    #finish_drain
-                    __run_dispatch
+                    }
+                } else {
+                    quote! {}
                 }
-            },
+            }
             None => quote! {},
         }
     } else {
@@ -3930,7 +4198,7 @@ fn rewrite_body(
     };
 
     let stmts = insert_before_traced_loop(cloned_block.stmts, entry_door, traced_loop_at);
-    quote! { #(#stmts)* }
+    (stmts, runner_door)
 }
 
 /// `ll_portal_runner` sits after driver/pc/state exist and immediately
@@ -4801,6 +5069,62 @@ mod tests {
             pc_at < door_at && driver_at < door_at && state_at < door_at,
             "the door must sit after driver/pc/state are bound. Expansion was:\n{expanded}"
         );
+        assert!(
+            !expanded.contains("__mainloop_portal"),
+            "locals before the loop keep the inline door. Expansion was:\n{expanded}"
+        );
+    }
+
+    /// Loop first, and driver/pc/state/env are parameters: `ll_portal_runner`
+    /// is its own function and the body is `__mainloop_portal`.
+    #[test]
+    fn function_entry_door_splits_into_a_runner_when_the_loop_is_the_first_statement() {
+        let config: JitInterpConfig = syn::parse2(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [pc, program],
+            state_fields = { acc: int },
+        })
+        .expect("fixture attribute must parse");
+        let func: ItemFn = parse_quote! {
+            fn mainloop(
+                mut driver: &mut majit_metainterp::JitDriver<S>,
+                program: &Bytecode,
+                state: &mut S,
+                mut pc: usize,
+            ) -> i64 {
+                loop {
+                    jit_merge_point!(driver, program, pc; *state);
+                    let op = program[pc];
+                    pc += 1;
+                    match op {
+                        0 => { state.acc += 1; }
+                        _ => break,
+                    }
+                }
+                state.acc
+            }
+        };
+        let expanded = transform_jit_interp(config, func).to_string();
+        assert!(
+            expanded.contains("function_entry_runner"),
+            "the runner calls the direct door. Expansion was:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("__mainloop_portal"),
+            "the body keeps a portal function. Expansion was:\n{expanded}"
+        );
+        assert!(
+            !expanded.contains("function_entry_structured"),
+            "the split removes the inline door. Expansion was:\n{expanded}"
+        );
+        let runner_at = expanded.find("fn mainloop").expect("runner");
+        let portal_at = expanded.find("fn __mainloop_portal").expect("portal");
+        let door_at = expanded.find("function_entry_runner").expect("door");
+        assert!(
+            runner_at < door_at && door_at < portal_at,
+            "the door runs in the runner, before the portal body. Expansion was:\n{expanded}"
+        );
     }
 
     #[test]
@@ -4844,5 +5168,97 @@ mod tests {
             setup_at < door_at,
             "the door must sit after a setup loop, not before it. Expansion was:\n{expanded}"
         );
+    }
+
+    /// A `*mut T` portal's function-entry door drains the bridge walk's
+    /// single-pass finish, not only the back-edge latch. The take sits after
+    /// the entry call and before the loop's own back edge.
+    #[test]
+    fn pointer_portal_door_drains_single_pass_finish() {
+        fn assert_drain_before_back_edge(expanded: &str, entry_call: &str) {
+            let entry_at = expanded
+                .find(entry_call)
+                .unwrap_or_else(|| panic!("missing {entry_call}. Expansion was:\n{expanded}"));
+            let back_edge_at = expanded[entry_at..]
+                .find("back_edge_structured")
+                .map(|at| entry_at + at)
+                .unwrap_or(expanded.len());
+            let door = &expanded[entry_at..back_edge_at];
+            let flag_at = door.find("take_single_pass_finish").unwrap_or_else(|| {
+                panic!(
+                    "{entry_call} door must take the single-pass flag before \
+                     the back edge. Door was:\n{door}"
+                )
+            });
+            let after_flag = flag_at + "take_single_pass_finish".len();
+            assert!(
+                !door[after_flag..].starts_with("_"),
+                "the flag take must be its own call. Door was:\n{door}"
+            );
+            assert!(
+                door[after_flag..].contains("take_single_pass_finish_ref"),
+                "{entry_call} door must drain the ref finish. Door was:\n{door}"
+            );
+        }
+
+        let inline_config: JitInterpConfig = syn::parse2(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [pc, program],
+            state_fields = { acc: int },
+        })
+        .expect("fixture attribute must parse");
+        let inline: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> *mut u8 {
+                let mut driver: majit_metainterp::JitDriver<S> =
+                    majit_metainterp::JitDriver::new(threshold);
+                let mut pc: usize = 0;
+                let mut state = S { acc: 0 };
+                while pc < program.len() {
+                    jit_merge_point!(driver, program, pc; state);
+                    let op = program[pc];
+                    pc += 1;
+                    match op {
+                        0 => { state.acc += 1; }
+                        _ => break,
+                    }
+                }
+                std::ptr::null_mut()
+            }
+        };
+        let inline_expanded = transform_jit_interp(inline_config, inline).to_string();
+        assert_drain_before_back_edge(&inline_expanded, "function_entry_structured");
+
+        let runner_config: JitInterpConfig = syn::parse2(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [pc, program],
+            state_fields = { acc: int },
+        })
+        .expect("fixture attribute must parse");
+        let runner: ItemFn = parse_quote! {
+            fn mainloop(
+                mut driver: &mut majit_metainterp::JitDriver<S>,
+                program: &Bytecode,
+                state: &mut S,
+                mut pc: usize,
+            ) -> *mut u8 {
+                loop {
+                    jit_merge_point!(driver, program, pc; *state);
+                    let op = program[pc];
+                    pc += 1;
+                    match op {
+                        0 => { state.acc += 1; }
+                        _ => break,
+                    }
+                }
+                std::ptr::null_mut()
+            }
+        };
+        let runner_expanded = transform_jit_interp(runner_config, runner).to_string();
+        let portal_at = runner_expanded
+            .find("fn __mainloop_portal")
+            .expect("portal function");
+        assert_drain_before_back_edge(&runner_expanded[..portal_at], "function_entry_runner");
     }
 }

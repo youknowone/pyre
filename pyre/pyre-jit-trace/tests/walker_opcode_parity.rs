@@ -251,10 +251,10 @@ const MAJIT_ONLY: &[&str] = &[
 const PYRE_ONLY: &[&str] = &[
     // The walker's own abort marker.
     "abort/>r",
-    // The float and pure array reads.
+    // The float array reads. `getarrayitem_gc_r_pure/rid>r` left this list
+    // when majit's tracer gained the pure array-read arms.
     "getarrayitem_gc_f/rid>f",
     "getarrayitem_gc_f_pure/rid>f",
-    "getarrayitem_gc_r_pure/rid>r",
     // Constant-length form. The register-length `new_array_clear/id>r`
     // is decoded by both tracers.
     "new_array_clear/cd>r",

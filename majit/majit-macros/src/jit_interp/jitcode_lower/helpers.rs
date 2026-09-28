@@ -517,32 +517,62 @@ pub(super) fn expr_is_unsigned_int(expr: &Expr) -> bool {
     }
 }
 
-fn type_is_raw_pointer(ty: &Type) -> bool {
+pub(super) fn type_is_raw_pointer(ty: &Type) -> bool {
     matches!(ty, Type::Ptr(_))
+}
+
+/// A call whose every argument is a literal. Its address is fixed when the
+/// jitcode is built (`jtransform.py` constant pointer, `rewrite_op_cast_pointer`).
+pub(super) fn expr_is_literal_call(expr: &Expr) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    call.args.iter().all(|arg| matches!(arg, Expr::Lit(_)))
 }
 
 /// `jtransform.py` `_rewrite_equality`'s `not arg.value` test for a
 /// pointer: the operand is still a source expression, so the null
 /// spellings RPython would have as `Constant(nullptr)` are recognised
-/// here. `ptr::null` / `ptr::null_mut` (any path prefix, optional
-/// turbofish) and `0 as *mut T` / `0 as *const T`.
+/// here. `core::ptr::null` / `std::ptr::null_mut` / `ptr::null`
+/// (optional turbofish) and `0 as *mut T` / `0 as *const T`.
 pub(super) fn expr_is_null_ptr(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(paren) => expr_is_null_ptr(&paren.expr),
         Expr::Group(group) => expr_is_null_ptr(&group.expr),
-        Expr::Call(call) if call.args.is_empty() => {
-            match &*call.func {
-                Expr::Path(path) => path.path.segments.last().is_some_and(|seg| {
-                    matches!(seg.ident.to_string().as_str(), "null" | "null_mut")
-                }),
-                _ => false,
-            }
-        }
+        Expr::Call(call) => call_is_null_ptr(call),
         Expr::Cast(cast) => {
             int_literal_value(&cast.expr) == Some(0) && type_is_raw_pointer(&cast.ty)
         }
         _ => false,
     }
+}
+
+/// `core::ptr::null` / `null_mut`, `std::ptr::null` / `null_mut`, and
+/// `ptr::null` / `null_mut`. Any other path is an ordinary call.
+/// Optional turbofish, no arguments.
+pub(crate) fn call_is_null_ptr(call: &syn::ExprCall) -> bool {
+    if !call.args.is_empty() {
+        return false;
+    }
+    let Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    let owned: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect();
+    let segments: Vec<&str> = owned.iter().map(String::as_str).collect();
+    matches!(
+        segments.as_slice(),
+        ["core", "ptr", "null"]
+            | ["core", "ptr", "null_mut"]
+            | ["std", "ptr", "null"]
+            | ["std", "ptr", "null_mut"]
+            | ["ptr", "null"]
+            | ["ptr", "null_mut"]
+    )
 }
 
 /// `x.is_null()` — the Rust spelling of RPython `ptr_iszero`.
@@ -678,11 +708,12 @@ pub(crate) fn helper_policy_path(expr: &Expr) -> Option<Path> {
 
 /// Emit the int-binop recording call for `dst = lhs <op> rhs`.
 ///
-/// `jtransform.py` `rewrite_op_int_floordiv` / `rewrite_op_int_mod` are
-/// `_do_builtin_call`, which residual-calls `support.py`
-/// `_ll_2_int_floordiv` / `_ll_2_int_mod` (C-truncating). Rust `/` and
-/// `%` are the same truncation. `int.py_div` / `int.py_mod` are a
-/// different rewrite (`_handle_int_special`) for Python-floor `//`.
+/// Rust `/` and `%` are C-truncating, so they record `support.py`
+/// `_ll_2_int_floordiv` / `_ll_2_int_mod`. Those two are in
+/// `inline_calls_to`: the assembler emits the inlined body (`int.py_div`
+/// / `int.py_mod` plus the truncation adjustment), not a residual call.
+/// `int.py_div` / `int.py_mod` alone are `_handle_int_special` for
+/// Python-floor `//` and `%`.
 pub(super) fn binop_i_emit_tokens(
     dst: u16,
     opcode: &Ident,

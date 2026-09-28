@@ -1336,7 +1336,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
-    majit_gc::note_gc_box_installed();
+    majit_gc::note_gc_box_installed(gc.has_gcrootmap());
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     let (generation, installed) = gc_box::store(gc);
     if installed {
@@ -1446,6 +1446,7 @@ fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
             majit_ir::OpCode::CallMallocNursery
                 | majit_ir::OpCode::CallMallocNurseryHeaderless
                 | majit_ir::OpCode::CallMallocNurseryVarsize
+                | majit_ir::OpCode::CallMallocNurseryVarsizeHeaderless
                 | majit_ir::OpCode::CallMallocNurseryVarsizeFrame
         )
     });
@@ -1661,6 +1662,11 @@ fn wasm_total_memory_pressure() -> isize {
 /// collection moves it out of the nursery. Mirrors dynasm's
 /// `dynasm_id_or_identityhash`.
 fn wasm_id_or_identityhash(addr: usize) -> usize {
+    // `GcLLDescr_boehm` (`gcrootmap is None`): the collector does not move
+    // objects, so the identity is the address and the GC is not consulted.
+    if !majit_gc::collector_installed() {
+        return addr;
+    }
     with_wasm_active_gc_mut(|gc| gc.id_or_identityhash(addr)).unwrap_or(addr)
 }
 
@@ -2320,6 +2326,7 @@ pub fn gc_rewriter() -> majit_gc::rewrite::GcRewriterImpl {
         malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
         standard_array_basesize: std::mem::size_of::<usize>(),
         standard_array_length_ofs: 0,
+        headerless_fixedsize: false,
     }
 }
 

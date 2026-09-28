@@ -19601,21 +19601,17 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
         ctx.trace_ctx
             .set_opref_concrete(raw_len, Value::Int(pyre_object::seq_index_to_i64(len)));
         let matches_arm = if concrete_continues {
-            let zero = ctx.trace_ctx.const_int(0);
-            let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
-            ctx.trace_ctx
-                .set_opref_concrete(nonnegative, Value::Int((index >= 0) as i64));
+            // W_FastTupleIterObject.descr_next reads `tupleitems[index]` and
+            // stops on IndexError. `ll_getitem_nonneg` already treats the
+            // index as nonneg, so there is no lower-bound test.
+            // `baseobjspace::next`'s tuple-iter arm matches that: it yields
+            // when `w_tuple_getitem` returns Some.
             let in_bounds = ctx
                 .trace_ctx
                 .record_op(OpCode::IntLt, &[raw_index, raw_len]);
             ctx.trace_ctx
                 .set_opref_concrete(in_bounds, Value::Int((index < len) as i64));
-            let matches = ctx
-                .trace_ctx
-                .record_op(OpCode::IntAnd, &[nonnegative, in_bounds]);
-            ctx.trace_ctx
-                .set_opref_concrete(matches, Value::Int((index >= 0 && index < len) as i64));
-            matches
+            in_bounds
         } else {
             let matches = ctx
                 .trace_ctx

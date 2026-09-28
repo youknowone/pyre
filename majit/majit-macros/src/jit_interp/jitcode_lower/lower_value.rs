@@ -6,7 +6,8 @@ use super::*;
 /// paths gives two different token streams.
 ///
 /// Descriptor/layout identities instead use [`struct_type_id_tokens`], which
-/// emits the runtime `TypeId`-based identity helper. The same id keys the
+/// emits `__majit_struct_type_id::<T>()` (resolved `type_name`, hashed like
+/// `BhSizeSpec.type_id`). The same id keys the
 /// builder's `struct_size_specs` cache so each
 /// `setfield_gc_*` resolves its field's parent SizeDescr + `index_in_parent`
 /// (`descr.py`).  Distinct struct paths collide only at `DefaultHasher`'s
@@ -34,16 +35,19 @@ pub(super) fn struct_type_id(path: &syn::Path, is_gc_managed: bool) -> u64 {
 
 /// Emit the runtime lltype-identity surrogate for `path`.
 ///
-/// RPython's `descr.py:get_size_descr()` is keyed by the lltype `STRUCT`
-/// object, not by a textual spelling in an individual graph. `TypeId` gives
-/// the corresponding process-local Rust type identity, so an inline helper
-/// using `super::linkedlist::Stack` and a caller using its fully qualified
-/// spelling share the same field descr cache key.
+/// `descr.py` `get_size_descr` is keyed by the lltype `STRUCT` object, not
+/// by a textual spelling in an individual graph. Every non-generic spelling
+/// emits `__majit_struct_type_id::<#path>`, whose body hashes
+/// `core::any::type_name::<T>()` — rustc resolves `crate::` / `self::` /
+/// `super::` / `use` / re-exports to one definition — through the same
+/// function the graph codewriter uses for `BhSizeSpec.type_id`.
 ///
-/// `TypeId::of` requires a `'static` type. A path with generic arguments can
-/// name a non-static type parameter and cannot be proven static by this proc
-/// macro, so preserve the legacy path hash for that conservative fallback.
-/// Concrete JIT structs use the runtime identity path.
+/// A path with generic arguments can name a type parameter this proc macro
+/// cannot prove `'static`, so `type_name::<#path>()` is not emitted there.
+/// The legacy token hash stays. It does not alias a non-generic spelling:
+/// `quote!(#path)` inserts spaces (`Foo < T >`) and `type_name` does not, so
+/// the two hashes are of different strings. A 64-bit collision is the same
+/// residual `path_hash` already accepts between distinct structs.
 pub(super) fn struct_type_id_tokens(path: &syn::Path, is_gc_managed: bool) -> TokenStream {
     let has_generic_args = path
         .segments
@@ -52,46 +56,6 @@ pub(super) fn struct_type_id_tokens(path: &syn::Path, is_gc_managed: bool) -> To
     if has_generic_args {
         let legacy = struct_type_id(path, is_gc_managed);
         quote! { #legacy }
-    } else if path.segments.len() > 1 {
-        let first = path
-            .segments
-            .first()
-            .map(|segment| segment.ident.to_string())
-            .unwrap_or_default();
-        if matches!(first.as_str(), "crate" | "self" | "super") {
-            let type_path = path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect::<Vec<_>>()
-                .join("::");
-            return quote! {
-                majit_metainterp::__majit_struct_type_id_path(
-                    module_path!(),
-                    #type_path,
-                    #is_gc_managed,
-                )
-            };
-        }
-        // A fully qualified external Rust path carries its defining crate as
-        // the first segment. Charon's module origin drops that crate boundary,
-        // so hash the remaining definition path exactly as the graph
-        // codewriter does for `BhSizeSpec.type_id`.
-        let definition_path = path
-            .segments
-            .iter()
-            .skip(1)
-            .map(|segment| segment.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::");
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        definition_path.hash(&mut hasher);
-        if !is_gc_managed {
-            "raw".hash(&mut hasher);
-        }
-        let type_id = hasher.finish();
-        quote! { #type_id }
     } else {
         quote! { majit_metainterp::__majit_struct_type_id::<#path>(#is_gc_managed) }
     }
@@ -194,6 +158,21 @@ impl<'c> Lowerer<'c> {
         // RPython jtransform.py handle_recursive_call — recursive_portal_call!(driver, greens...)
         if let Some(binding) = self.lower_recursive_portal_call(expr) {
             return Some(binding);
+        }
+        // `jtransform.py` `_rewrite_equality` recognises `Constant(nullptr)`.
+        // The same constant is a value here, not only a compare operand.
+        if expr_is_null_ptr(expr) {
+            let reg = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(OpKind::LoadConstR, vec![], vec![Register::ref_(reg)]),
+                quote! { __builder.load_const_r_value(#reg, 0i64); },
+            );
+            return Some(Binding {
+                reg,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+                struct_type: None,
+            });
         }
 
         match expr {
@@ -317,6 +296,22 @@ impl<'c> Lowerer<'c> {
             Expr::Cast(ExprCast { expr, ty, .. })
                 if !is_supported_int_cast(ty) && !is_supported_float_type(ty) =>
             {
+                // `jtransform.py` `rewrite_op_cast_pointer`: a literal call
+                // cast to a raw pointer is a prebuilt address, read when the
+                // jitcode is built.
+                if type_is_raw_pointer(ty) && expr_is_literal_call(expr) {
+                    let reg = self.alloc_reg();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::LoadConstR, vec![], vec![Register::ref_(reg)]),
+                        quote! { __builder.load_const_r_value(#reg, (#expr as #ty) as i64); },
+                    );
+                    return Some(Binding {
+                        reg,
+                        kind: BindingKind::Ref,
+                        depends_on_stack: false,
+                        struct_type: struct_pointee_of_pointer(ty),
+                    });
+                }
                 let binding = self.lower_value_expr(expr)?;
                 match binding.kind {
                     BindingKind::Ref => {
@@ -735,14 +730,85 @@ impl<'c> Lowerer<'c> {
         inner_segs == base_segs || inner_segs.last() == base_segs.last()
     }
 
+    /// This struct is the header of an `Elem in Header` array
+    /// (`array_fields`), so a literal of it is `malloc_varsize`.
+    ///
+    /// Returns the header path the descr is built from (basesize =
+    /// `offset_of!(Header, items)`, lendescr = the header's length field).
+    fn varsize_header(&self, struct_path: &syn::Path) -> Option<syn::Path> {
+        let config = self.config?;
+        let segs = super::canonical_path_segments(struct_path);
+        let last = segs.last()?;
+        config
+            .array_headers
+            .values()
+            .find(|header| {
+                let header_segs = super::canonical_path_segments(header);
+                header_segs == segs || header_segs.last() == Some(last)
+            })
+            .cloned()
+    }
+
+    /// `jtransform.py` `rewrite_op_malloc_varsize`: pointer elements and a
+    /// zeroed block are `new_array_clear`; a non-pointer block that is not
+    /// zeroed is `new_array`. The length argument is the header's length
+    /// field (`descr.py` `get_field_arraylen_descr`).
+    fn emit_varsize_array(
+        &mut self,
+        struct_path: &syn::Path,
+        header: &syn::Path,
+        fields: &[(syn::Path, syn::Member, Binding)],
+        depends_on_stack: bool,
+    ) -> Option<Binding> {
+        let config = self.config?;
+        let len_name = super::lower_vable::varsize_length_field_name(config, header)?;
+        let length = fields.iter().find(|(_, member, value)| {
+            named_member(member).as_deref() == Some(len_name.as_str())
+                && matches!(value.kind, BindingKind::Int)
+        })?;
+        let length_reg = length.2.reg;
+        let pointer_items = super::lower_vable::header_items_are_pointers(config, header);
+        // `rewrite_op_malloc_varsize`: a pointer or struct element is
+        // `new_array_clear`. A primitive element is `new_array` unless the
+        // malloc asked for `zero` (the empty `items: []` of a pointer
+        // block is the clear arm above).
+        let result_reg = self.alloc_reg();
+        let descr = super::lower_vable::gc_varsize_descr_tokens(config, header);
+        let op_tokens = if pointer_items {
+            quote! {
+                let __descr_idx = #descr;
+                __builder.new_array_clear(#result_reg, #length_reg, __descr_idx);
+            }
+        } else {
+            quote! {
+                let __descr_idx = #descr;
+                __builder.new_array(#result_reg, #length_reg, __descr_idx);
+            }
+        };
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::New,
+                vec![Register::int(length_reg)],
+                vec![Register::ref_(result_reg)],
+            ),
+            op_tokens,
+        );
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Ref,
+            depends_on_stack,
+            struct_type: Some(struct_path.clone()),
+        })
+    }
+
     /// Lower a struct literal `Path { f0: v0, f1: v1, .. }` to a JIT
     /// allocation plus per-field stores: `new` (size from `size_of`) then
     /// `setfield_gc_<kind>` at each field's `offset_of`.  Mirrors
-    /// `jtransform.py` malloc + setfield rewrite; the optimizer's
-    /// virtualize pass folds the New away when the struct does not escape.
+    /// `jtransform.py` `rewrite_op_malloc` + `rewrite_op_setfield`; the
+    /// optimizer's virtualize pass folds the New away when the struct does
+    /// not escape. A float field is `setfield_gc_f` (`getkind` `f`).
     /// Returns the result ref binding, or `None` (helper falls back to a
-    /// residual call) for struct-update base syntax or float fields, which
-    /// the bytecode field-op path does not express yet.
+    /// residual call) for struct-update base syntax.
     fn lower_struct_value(&mut self, s: &syn::ExprStruct) -> Option<Binding> {
         if s.rest.is_some() {
             return None;
@@ -776,6 +842,7 @@ impl<'c> Lowerer<'c> {
         let mut vtable: Option<TokenStream> = None;
         let mut value_fields: Vec<(syn::Path, syn::Member, Binding)> = Vec::new();
         let mut depends_on_stack = false;
+        let varsize = self.varsize_header(struct_path);
         for (owner, member, expr) in &flat {
             if Self::is_typeptr_member(member)
                 && let Some(tokens) = Self::const_vtable_tokens(expr)
@@ -786,14 +853,20 @@ impl<'c> Lowerer<'c> {
                 vtable = Some(tokens);
                 continue;
             }
-            let value = self.lower_value_expr(expr)?;
-            if matches!(value.kind, BindingKind::Float) {
-                return None;
+            // The inlined `items` array is the varsize payload, not a
+            // field store. `rewrite_op_malloc_varsize` consumes the
+            // length and emits `new_array` / `new_array_clear`.
+            if varsize.is_some() && named_member(member).as_deref() == Some("items") {
+                continue;
             }
+            let value = self.lower_value_expr(expr)?;
             depends_on_stack |= value.depends_on_stack;
             value_fields.push((owner.clone(), member.clone(), value));
         }
         let fields = value_fields;
+        if let Some(header) = varsize {
+            return self.emit_varsize_array(struct_path, &header, &fields, depends_on_stack);
+        }
         // Same id a later `getfield` mints (`struct_gc_kind_is_managed`), so
         // the virtual's slot and the read name one descriptor.
         let gc_managed = self
@@ -811,6 +884,9 @@ impl<'c> Lowerer<'c> {
             .iter()
             .map(|(owner, member, value)| {
                 let is_ref = matches!(value.kind, BindingKind::Ref);
+                // `descr.py` `get_type_flag`: the value's kind is the field's
+                // lltype. A float binding is `FLOAT` at registration.
+                let is_float = matches!(value.kind, BindingKind::Float);
                 // `rewrite_op_malloc` + `rewrite_op_setfield` register
                 // each field through `fielddescrof`, which reads width
                 // and signedness from FIELDTYPE. Use the same
@@ -843,6 +919,7 @@ impl<'c> Lowerer<'c> {
                         stringify!(#member),
                         #size,
                         #signed,
+                        #is_float,
                     )
                 }}
             })
@@ -920,7 +997,21 @@ impl<'c> Lowerer<'c> {
                         );
                     },
                 ),
-                BindingKind::Float => unreachable!("float fields rejected above"),
+                // `jtransform.py` `rewrite_op_setfield`: `kind = getkind(RESULT)[0]`
+                // is `f`, so the store is `setfield_gc_f`. The layout entry
+                // already named this field `FLOAT` (`descr.py` `get_type_flag`).
+                BindingKind::Float => (
+                    vec![Register::ref_(result_reg), Register::float(value_reg)],
+                    quote! {
+                        __builder.setfield_gc_f(
+                            #result_reg,
+                            #value_reg,
+                            ::core::mem::offset_of!(#owner, #member),
+                            #type_id,
+                            stringify!(#member),
+                        );
+                    },
+                ),
             };
             self.emit_op(OpMeta::linear(OpKind::SetfieldGc, reads, vec![]), tokens);
         }
@@ -972,13 +1063,16 @@ impl<'c> Lowerer<'c> {
     /// considered equal to arg0, so the LHS aliases the RHS binding
     /// (`x = promote(y)` makes `x` read from y's register).
     /// Reassign a local variable that already has a binding: `pc = expr`.
-    /// Lowers the RHS via `lower_value_expr` and rebinds the LHS name to
-    /// the new register. RPython parity: the flat dispatch's
-    /// `pc = target; continue` updates the JitCode's pc register in-place
-    /// (`flatten.py` emits a goto to the bytecode label, not an SSA rename,
-    /// but majit's binding model is SSA-like — rebinding the name achieves
-    /// the same effect because subsequent reads of `pc` pick up the new
-    /// register).
+    /// Lowers the RHS via `lower_value_expr`. On a straight-line lowerer the
+    /// name is rebound to the RHS register. Across a join (`join_merge`,
+    /// from `FlowContext.mergeblock`) the enclosing register is the one
+    /// variable, so the RHS is moved into it (`GraphFlattener.insert_renamings`)
+    /// and the name keeps that register.
+    /// RPython parity: the flat dispatch's `pc = target; continue` updates
+    /// the JitCode's pc register in-place (`flatten.py` emits a goto to the
+    /// bytecode label, not an SSA rename, but majit's binding model is
+    /// SSA-like — rebinding the name achieves the same effect because
+    /// subsequent reads of `pc` pick up the new register).
     pub(super) fn lower_local_reassign(&mut self, expr: &Expr) -> Option<()> {
         let Expr::Assign(assign) = expr else {
             return None;
@@ -993,7 +1087,48 @@ impl<'c> Lowerer<'c> {
         if lhs_ident == "pc" && !self.pc_pinned {
             return None;
         }
+        let lhs = self.bindings.get(&lhs_ident)?.clone();
+        // Still the enclosing binding, not a `let` that shadowed it. The
+        // join reads this register; a kind change has no single link
+        // argument (`FrameState.union`).
+        let merges = self.join_merge.get(&lhs_ident).copied() == Some(lhs.reg);
+        // Same refusal as `lower_local_update`: a green is a caller local
+        // threaded through the merge point, and writing this body's register
+        // would not carry the value back. Refuse before the RHS emits.
+        if merges
+            && let Some(config) = self.config
+            && super::lower_stmt::green_idents(config).contains(&lhs_ident)
+        {
+            return None;
+        }
         let binding = self.lower_value_expr(&assign.right)?;
+        if merges {
+            if lhs.kind != binding.kind {
+                return None;
+            }
+            if lhs.reg != binding.reg {
+                let dst = lhs.reg;
+                let src = binding.reg;
+                let (op_kind, tokens) = match binding.kind {
+                    BindingKind::Int => (OpKind::MoveI, quote! { __builder.move_i(#dst, #src); }),
+                    BindingKind::Ref => (OpKind::MoveR, quote! { __builder.move_r(#dst, #src); }),
+                    BindingKind::Float => (OpKind::MoveF, quote! { __builder.move_f(#dst, #src); }),
+                };
+                let register = Register::new(binding.kind, dst);
+                self.emit_op(
+                    OpMeta::linear(
+                        op_kind,
+                        vec![Register::from_binding(&binding)],
+                        vec![register],
+                    ),
+                    tokens,
+                );
+            }
+            let mut kept = lhs;
+            kept.struct_type = binding.struct_type;
+            self.bindings.insert(lhs_ident, kept);
+            return Some(());
+        }
         self.bindings.insert(lhs_ident, binding);
         Some(())
     }
@@ -1587,6 +1722,31 @@ impl<'c> Lowerer<'c> {
                     // This arm returns early (to attach `struct_type`), so it
                     // cannot fall through to that shared emission and must emit
                     // the marker itself.
+                    if post_live_after_call {
+                        self.emit_op(
+                            OpMeta::live_marker(),
+                            quote! { let _ = __builder.live_placeholder(); },
+                        );
+                    }
+                    return Some(Binding {
+                        reg,
+                        kind: BindingKind::Ref,
+                        depends_on_stack: false,
+                        struct_type: self.declared_return_struct(func),
+                    });
+                }
+                crate::jit_interp::CallPolicyKind::AllocRef => {
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let reg = self.alloc_reg();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
+                        quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #reg, majit_metainterp::can_raise_effect_info());
+                        },
+                    );
                     if post_live_after_call {
                         self.emit_op(
                             OpMeta::live_marker(),
@@ -2267,7 +2427,7 @@ impl<'c> Lowerer<'c> {
     /// `jtransform.py` `_rewrite_equality` via `rewrite_op_ptr_eq` /
     /// `rewrite_op_ptr_ne`: a comparison against the null pointer is the
     /// unary `ptr_iszero` / `ptr_nonzero`. The null operand is recognised
-    /// on the source tree because `null_mut()` is not a lowerable value.
+    /// on the source tree; the value lowerer also emits `Constant(nullptr)`.
     fn lower_ptr_equality_against_null(&mut self, expr: &ExprBinary) -> Option<Binding> {
         let left_null = expr_is_null_ptr(&expr.left);
         let right_null = expr_is_null_ptr(&expr.right);
@@ -2353,9 +2513,13 @@ impl<'c> Lowerer<'c> {
                 block: expr_if.then_branch.clone(),
             }))?;
         let (else_seq, else_binding) = self.lower_branch_value_expr(else_expr)?;
-        if !matches!(then_binding.kind, BindingKind::Int)
-            || !matches!(else_binding.kind, BindingKind::Int)
-        {
+        let int_branch = matches!(then_binding.kind, BindingKind::Int)
+            && matches!(else_binding.kind, BindingKind::Int);
+        // `jtransform.py` `rewrite_op_same_as`: both arms are refs, joined by
+        // a ref copy. A static ref on the taken arm stays a constant.
+        let ref_branch = matches!(then_binding.kind, BindingKind::Ref)
+            && matches!(else_binding.kind, BindingKind::Ref);
+        if !int_branch && !ref_branch {
             return None;
         }
         let then_reg = then_binding.reg;
@@ -2372,34 +2536,68 @@ impl<'c> Lowerer<'c> {
         );
         self.emit_lowered_condition_guard(&cond, &else_label);
         self.append_lowered_sequence(then_seq);
-        self.emit_op(
-            OpMeta::linear(
-                OpKind::MoveI,
-                vec![Register::int(then_reg)],
-                vec![Register::int(result_reg)],
-            ),
-            quote! { __builder.move_i(#result_reg, #then_reg); },
-        );
+        if int_branch {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::MoveI,
+                    vec![Register::int(then_reg)],
+                    vec![Register::int(result_reg)],
+                ),
+                quote! { __builder.move_i(#result_reg, #then_reg); },
+            );
+        } else {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::MoveR,
+                    vec![Register::ref_(then_reg)],
+                    vec![Register::ref_(result_reg)],
+                ),
+                quote! { __builder.move_r(#result_reg, #then_reg); },
+            );
+        }
         self.emit_jump(&end_label);
         self.emit_label_def(&else_label);
         self.append_lowered_sequence(else_seq);
-        self.emit_op(
-            OpMeta::linear(
-                OpKind::MoveI,
-                vec![Register::int(else_reg)],
-                vec![Register::int(result_reg)],
-            ),
-            quote! { __builder.move_i(#result_reg, #else_reg); },
-        );
+        if int_branch {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::MoveI,
+                    vec![Register::int(else_reg)],
+                    vec![Register::int(result_reg)],
+                ),
+                quote! { __builder.move_i(#result_reg, #else_reg); },
+            );
+        } else {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::MoveR,
+                    vec![Register::ref_(else_reg)],
+                    vec![Register::ref_(result_reg)],
+                ),
+                quote! { __builder.move_r(#result_reg, #else_reg); },
+            );
+        }
         self.emit_label_def(&end_label);
 
+        let struct_type = if ref_branch {
+            match (&then_binding.struct_type, &else_binding.struct_type) {
+                (Some(a), Some(b)) if a == b => Some(a.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
         Some(Binding {
             reg: result_reg,
-            kind: BindingKind::Int,
+            kind: if int_branch {
+                BindingKind::Int
+            } else {
+                BindingKind::Ref
+            },
             depends_on_stack: cond_depends_on_stack
                 || then_binding.depends_on_stack
                 || else_binding.depends_on_stack,
-            struct_type: None,
+            struct_type,
         })
     }
 
@@ -3057,6 +3255,7 @@ impl<'c> Lowerer<'c> {
             in_dispatch_arm_body: self.in_dispatch_arm_body,
             dispatch_loop_label: self.dispatch_loop_label.clone(),
             pc_pinned: self.pc_pinned,
+            join_merge: self.enclosing_join_merge(),
             // Never inherited: a nested block statement is not the arm body's
             // tail, so a `return` inside it must be rejected, not lowered.
             inline_arm_tail_stmt: false,
@@ -3100,6 +3299,7 @@ impl<'c> Lowerer<'c> {
             in_dispatch_arm_body: self.in_dispatch_arm_body,
             dispatch_loop_label: self.dispatch_loop_label.clone(),
             pc_pinned: self.pc_pinned,
+            join_merge: self.enclosing_join_merge(),
             // Never inherited: a branch arm's value expression is not the arm
             // body's tail, so a `return` inside it must be rejected.
             inline_arm_tail_stmt: false,
@@ -3153,6 +3353,32 @@ mod tests {
             depends_on_stack: false,
             struct_type: None,
         }
+    }
+
+    #[test]
+    fn non_generic_spellings_emit_the_resolved_type_id_helper() {
+        for path in ["crate::a::X", "self::X", "super::a::X", "X", "reexport::X"] {
+            let parsed: syn::Path = syn::parse_str(path).unwrap();
+            let emitted = struct_type_id_tokens(&parsed, true).to_string();
+            assert!(
+                emitted.contains("__majit_struct_type_id"),
+                "{path} -> {emitted}"
+            );
+            assert!(
+                !emitted.contains("struct_type_id_path"),
+                "{path} -> {emitted}"
+            );
+            assert!(
+                emitted.contains(&path.replace("::", " :: ")),
+                "{path} -> {emitted}"
+            );
+        }
+        let generic: syn::Path = syn::parse_str("Foo<Bar>").unwrap();
+        let emitted = struct_type_id_tokens(&generic, true).to_string();
+        assert!(
+            !emitted.contains("__majit_struct_type_id"),
+            "generic fallback must stay a token hash, got {emitted}"
+        );
     }
 
     #[test]
@@ -3366,6 +3592,98 @@ mod tests {
         assert!(emitted.contains("setfield_gc_r"));
         assert!(emitted.contains("offset_of"));
         assert!(emitted.contains("size_of"));
+    }
+
+    fn varsize_config(element: &str) -> LowererConfig {
+        let element_type: syn::Path = syn::parse_str(element).unwrap();
+        let items = crate::jit_interp::ArrayFieldEntry {
+            struct_type: syn::parse_quote!(Items),
+            field: syn::parse_quote!(items),
+            element_type,
+            header: Some(syn::parse_quote!(Items)),
+        };
+        let capacity = crate::jit_interp::IntFieldEntry {
+            struct_type: syn::parse_quote!(Items),
+            field: syn::parse_quote!(capacity),
+            int_type: syn::parse_quote!(i64),
+        };
+        LowererConfig::inline_helper(&[], &[items], &[capacity], &[], &[], &[], &[], &[])
+    }
+
+    #[test]
+    fn pointer_varsize_literal_lowers_to_new_array_clear() {
+        // `rewrite_op_malloc_varsize`: pointer elements are `new_array_clear`.
+        // The descr carries the header's item offset and length offset
+        // (`get_array_descr`).
+        let config = varsize_config("Cell");
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer
+            .bindings
+            .insert("n".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr = syn::parse_str("Items { capacity: n, items: [] }").unwrap();
+        let result = lowerer.lower_value_expr(&expr).expect("varsize lowers");
+        assert!(matches!(result.kind, BindingKind::Ref));
+        assert!(result.struct_type.is_some());
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            emitted.contains("new_array_clear"),
+            "pointer varsize must be new_array_clear, got {emitted}"
+        );
+        assert!(emitted.contains("add_gc_varsize_array_descr"));
+        assert!(!emitted.contains("new_struct"));
+    }
+
+    #[test]
+    fn int_varsize_literal_lowers_to_new_array() {
+        // A primitive element is `new_array`, not `new_array_clear`.
+        let config = varsize_config("i64");
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer
+            .bindings
+            .insert("n".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr = syn::parse_str("Items { capacity: n, items: [] }").unwrap();
+        lowerer.lower_value_expr(&expr).expect("varsize lowers");
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            emitted.contains("new_array"),
+            "int varsize must be new_array, got {emitted}"
+        );
+        assert!(
+            !emitted.contains("new_array_clear"),
+            "int varsize must not clear, got {emitted}"
+        );
+    }
+
+    #[test]
+    fn struct_literal_float_field_lowers_to_setfield_gc_f() {
+        // `jtransform.py` `rewrite_op_setfield` with `getkind` `f`.
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("f".to_string(), binding(1, BindingKind::Float));
+        let expr: Expr = syn::parse_str("Num { floatval: f }").expect("parse struct literal");
+        let result = lowerer.lower_value_expr(&expr).expect("struct lowers");
+        assert!(matches!(result.kind, BindingKind::Ref));
+        assert_eq!(
+            lowerer.op_metadata[1].reads,
+            vec![Register::ref_(result.reg), Register::float(1)]
+        );
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(!emitted.contains("retag_struct_field_float"));
+        assert!(emitted.contains("setfield_gc_f"));
+        assert!(emitted.contains("true"));
     }
 
     #[test]
@@ -3772,6 +4090,72 @@ mod tests {
             });
             assert!(out.is_some());
             assert!(emitted(&lowerer).contains("PtrNe"));
+        }
+
+        #[test]
+        fn null_mut_as_a_value_is_a_null_ref_constant() {
+            let mut lowerer = Lowerer::new(None);
+            let expr: Expr = syn::parse_str("core::ptr::null_mut()").expect("parse");
+            let out = lowerer.lower_value_expr(&expr);
+            assert!(out.is_some(), "null_mut() is Constant(nullptr)");
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("load_const_r_value") && text.contains("0i64"),
+                "assignment/return RHS must be a null ref, got:\n{text}"
+            );
+        }
+
+        #[test]
+        fn std_ptr_null_as_a_value_is_a_null_ref_constant() {
+            let mut lowerer = Lowerer::new(None);
+            let expr: Expr = syn::parse_str("std::ptr::null()").expect("parse");
+            let out = lowerer.lower_value_expr(&expr);
+            assert!(out.is_some());
+            assert!(emitted(&lowerer).contains("load_const_r_value"));
+        }
+
+        #[test]
+        fn foo_null_is_an_ordinary_call() {
+            let mut lowerer = Lowerer::new(None);
+            let expr: Expr = syn::parse_str("foo::null()").expect("parse");
+            let _ = lowerer.lower_value_expr(&expr);
+            let text = emitted(&lowerer);
+            assert!(
+                !text.contains("load_const_r_value"),
+                "foo::null() must stay a call, got:\n{text}"
+            );
+        }
+
+        #[test]
+        fn assigning_null_mut_stores_the_null_ref() {
+            let mut lowerer = Lowerer::new(None);
+            lowerer.next_reg = 1;
+            lowerer.bindings.insert("p".into(), ref_binding(0, None));
+            let stmt: syn::Stmt = syn::parse_str("p = core::ptr::null_mut();").expect("parse");
+            assert!(lowerer.lower_stmt(&stmt).is_some());
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("load_const_r_value") && text.contains("0i64"),
+                "assignment RHS must lower, got:\n{text}"
+            );
+            assert_eq!(
+                lowerer.bindings.get("p").map(|b| b.reg),
+                Some(1),
+                "the local must take the null ref register"
+            );
+        }
+
+        #[test]
+        fn returning_null_mut_is_a_null_ref_return() {
+            let mut lowerer = Lowerer::new(None);
+            lowerer.inline_arm_tail_stmt = true;
+            let stmt: syn::Stmt = syn::parse_str("return core::ptr::null_mut();").expect("parse");
+            assert!(lowerer.lower_stmt(&stmt).is_some());
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("load_const_r_value") && text.contains("ref_return"),
+                "return value must lower, got:\n{text}"
+            );
         }
 
         #[test]

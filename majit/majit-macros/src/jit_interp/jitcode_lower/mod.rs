@@ -21,8 +21,8 @@ pub(crate) use api::{
 #[allow(unused_imports)]
 pub use api::{try_generate_jitcode_body, try_generate_jitcode_body_with_config};
 pub(crate) use dispatch::{is_can_enter_jit_macro, is_jit_merge_point_macro, lower_dispatch_body};
-pub(crate) use helpers::classify_param_type;
 pub(super) use helpers::helper_policy_path;
+pub(crate) use helpers::{call_is_null_ptr, classify_param_type};
 
 // Re-export submodule items for sibling-submodule access via `use super::*`.
 // These appear unused in mod.rs itself but are consumed by submodules and tests.
@@ -37,16 +37,17 @@ mod reexports {
     };
     pub(super) use super::helpers::{
         binding_kind_for_inline_policy, binop_f_emit_tokens, binop_i_emit_tokens,
-        binop_is_symmetric, block_has_loop_control, expr_has_loop_control, expr_is_null_ptr,
-        expr_is_ptr_is_null_method, expr_is_unsigned_int, extract_block_tail_int,
-        extract_bool_branch_values, extract_branch_int, extract_pat_switch_case_tokens,
-        extract_pat_value_tokens, extract_stmts, inline_call_tokens, inline_call_tokens_void,
-        inline_float_arg_tokens, inline_int_arg_tokens, inline_prebuild_path,
-        inline_ref_arg_tokens, inline_shared_path, int_arg_regs, int_literal_value,
-        is_lowercase_binding_pat, is_supported_float_type, is_supported_int_cast,
-        is_supported_ref_type, is_word_width_int, jit_arg_kind_tokens, mirrored_compare_binop,
-        opcode_for_assign_binop, opcode_for_assign_binop_f, opcode_for_binop, opcode_for_binop_f,
-        opcode_for_compare_f, stmt_has_loop_control, type_is_unsigned_int, typed_call_arg_tokens,
+        binop_is_symmetric, block_has_loop_control, call_is_null_ptr, expr_has_loop_control,
+        expr_is_literal_call, expr_is_null_ptr, expr_is_ptr_is_null_method, expr_is_unsigned_int,
+        extract_block_tail_int, extract_bool_branch_values, extract_branch_int,
+        extract_pat_switch_case_tokens, extract_pat_value_tokens, extract_stmts,
+        inline_call_tokens, inline_call_tokens_void, inline_float_arg_tokens,
+        inline_int_arg_tokens, inline_prebuild_path, inline_ref_arg_tokens, inline_shared_path,
+        int_arg_regs, int_literal_value, is_lowercase_binding_pat, is_supported_float_type,
+        is_supported_int_cast, is_supported_ref_type, is_word_width_int, jit_arg_kind_tokens,
+        mirrored_compare_binop, opcode_for_assign_binop, opcode_for_assign_binop_f,
+        opcode_for_binop, opcode_for_binop_f, opcode_for_compare_f, stmt_has_loop_control,
+        type_is_raw_pointer, type_is_unsigned_int, typed_call_arg_tokens,
         word_result_addr_for_kind, word_result_addr_tokens, word_void_addr_tokens,
     };
     pub(super) use super::liveness::{
@@ -244,6 +245,10 @@ pub struct LowererConfig {
     /// width and signedness with the struct layout instead of the machine-word
     /// default, which is what makes `descr.is_integer_bounded()` true for it.
     pub(super) int_fields: HashMap<String, (Ident, bool)>,
+    /// `int_fields` entries whose type is `f64`. Key = `"StructType::field"`.
+    /// A read is `getfield_gc_f` and the layout flag is `FLAG_FLOAT`
+    /// (`descr.py` `get_type_flag`).
+    pub(super) float_fields: HashSet<String>,
     /// `"StructType::field"` keys some access site asked about while lowering.
     ///
     /// A declared key that never appears here matched no access, so it emitted
@@ -569,6 +574,7 @@ pub(super) fn call_policy_effect_slot(
         | K::ResidualIntWrapped
         | K::ResidualRef
         | K::NurseryAllocRef
+        | K::AllocRef
         | K::ResidualRefWrapped
         | K::ResidualFloatWrapped => Some(CondCallEffectSlot::CanRaise),
 
@@ -688,6 +694,7 @@ pub(super) fn call_policy_result_kind(
 
         K::ResidualRef
         | K::NurseryAllocRef
+        | K::AllocRef
         | K::ResidualRefWrapped
         | K::ResidualRefCannotRaiseWrapped
         | K::MayForceRefWrapped
@@ -956,25 +963,37 @@ pub(super) fn inferred_record_known_result_policy_check(result_kind: BindingKind
 }
 
 /// Build the `int_fields` lookup: key = `"StructLastSegment::field"`.
+fn field_entry_key(struct_type: &syn::Path, field: &Ident) -> String {
+    let struct_name = struct_type
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    format!("{}::{}", struct_name, field)
+}
+
 fn int_fields_map(
     int_fields: &[crate::jit_interp::IntFieldEntry],
 ) -> HashMap<String, (Ident, bool)> {
     int_fields
         .iter()
+        .filter(|entry| !entry.is_float())
         .map(|entry| {
-            let struct_name = entry
-                .struct_type
-                .segments
-                .last()
-                .map(|s| s.ident.to_string())
-                .unwrap_or_default();
-            let key = format!("{}::{}", struct_name, entry.field);
+            let key = field_entry_key(&entry.struct_type, &entry.field);
             // Validated at parse time.
             (
                 key,
                 (entry.int_type.clone(), entry.is_signed().unwrap_or(true)),
             )
         })
+        .collect()
+}
+
+fn float_fields_set(int_fields: &[crate::jit_interp::IntFieldEntry]) -> HashSet<String> {
+    int_fields
+        .iter()
+        .filter(|entry| entry.is_float())
+        .map(|entry| field_entry_key(&entry.struct_type, &entry.field))
         .collect()
 }
 
@@ -1082,6 +1101,7 @@ impl LowererConfig {
             array_fields: array_fields_map,
             array_headers: array_headers_map,
             int_fields: int_fields_map(int_fields),
+            float_fields: float_fields_set(int_fields),
             consulted_field_keys: Default::default(),
             call_returns: HashMap::new(),
             headerless_structs: headerless_structs
@@ -1279,6 +1299,11 @@ impl LowererConfig {
         // discards the entry), compiling a config that does not do what it
         // declares.  Reject the typo at expansion time instead.
         for entry in residual_writes {
+            // `@ Struct` names the layout itself. A state ref-scalar is only
+            // required when the struct has to be recovered from one.
+            if entry.struct_type.is_some() {
+                continue;
+            }
             let name = entry.ref_scalar.to_string();
             assert!(
                 state_ref_scalars.contains_key(&name),
@@ -1386,6 +1411,7 @@ impl LowererConfig {
             array_fields: array_fields_map,
             array_headers: array_headers_map,
             int_fields: int_fields_map(int_fields),
+            float_fields: float_fields_set(int_fields),
             consulted_field_keys: Default::default(),
             call_returns: call_returns
                 .iter()
@@ -1496,7 +1522,8 @@ impl LowererConfig {
     /// first field already occupies for the same object.
     ///
     /// Returns `(entries, witness)`. `entries` are `(offset, is_ref, name,
-    /// size, signed)` tuples in the shape the layout registration takes;
+    /// size, signed, is_float)` tuples in the shape the layout registration
+    /// takes;
     /// offsets are relative to the OUTER struct. Empty when the struct embeds
     /// no declared base, which is the case for every struct unless a caller
     /// declares one.
@@ -1540,7 +1567,7 @@ impl LowererConfig {
             let outer_to_base = quote! {
                 (#base_offset + ::core::mem::offset_of!(#current, #base_field))
             };
-            for (field, is_ref, size, signed) in self.declared_fields_of(base) {
+            for (field, is_ref, size, signed, is_float) in self.declared_fields_of(base) {
                 entries.push(quote! {
                     (
                         #outer_to_base + ::core::mem::offset_of!(#base, #field),
@@ -1548,6 +1575,7 @@ impl LowererConfig {
                         stringify!(#field),
                         #size,
                         #signed,
+                        #is_float,
                     )
                 });
             }
@@ -1573,7 +1601,7 @@ impl LowererConfig {
     fn declared_fields_of(
         &self,
         struct_path: &syn::Path,
-    ) -> Vec<(syn::Ident, bool, TokenStream, TokenStream)> {
+    ) -> Vec<(syn::Ident, bool, TokenStream, TokenStream, bool)> {
         let Some(last) = struct_path.segments.last() else {
             return Vec::new();
         };
@@ -1583,6 +1611,7 @@ impl LowererConfig {
             .keys()
             .map(|key| (key, true))
             .chain(self.int_fields.keys().map(|key| (key, false)))
+            .chain(self.float_fields.iter().map(|key| (key, false)))
             .chain(self.array_fields.keys().map(|key| (key, true)))
             .filter_map(|(key, is_ref)| key.strip_prefix(&prefix).map(|field| (field, is_ref)))
             .collect();
@@ -1596,9 +1625,13 @@ impl LowererConfig {
                 // reports its own type's width, an array field the pointer it
                 // reaches its buffer through, and anything else the eight-byte
                 // scalar an undeclared field defaults to.
+                let is_float = self.float_fields.contains(&key);
                 let (size, signed) = match self.int_fields.get(&key) {
                     Some((ty, signed)) => {
                         (quote! { ::core::mem::size_of::<#ty>() }, quote! { #signed })
+                    }
+                    None if is_float => {
+                        (quote! { ::core::mem::size_of::<f64>() }, quote! { false })
                     }
                     None if self.array_fields.contains_key(&key) => {
                         (quote! { ::core::mem::size_of::<usize>() }, quote! { false })
@@ -1610,6 +1643,7 @@ impl LowererConfig {
                     is_ref,
                     size,
                     signed,
+                    is_float,
                 )
             })
             .collect()
@@ -1625,6 +1659,7 @@ impl LowererConfig {
         let key = format!("{}::{}", struct_name.ident, field);
         self.ref_fields.contains_key(&key)
             || self.int_fields.contains_key(&key)
+            || self.float_fields.contains(&key)
             || self.array_fields.contains_key(&key)
     }
 }
@@ -2175,6 +2210,49 @@ impl LoweredSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `@ Struct` is the layout. The name before the dot is not a state field.
+    #[test]
+    fn residual_writes_at_struct_does_not_need_a_state_ref_scalar() {
+        let state_type = syn::parse_quote!(State);
+        let env_type = syn::parse_quote!(Env);
+        let entry = crate::jit_interp::ResidualWriteEntry {
+            ref_scalar: syn::parse_quote!(col),
+            field: syn::parse_quote!(data),
+            struct_type: Some(syn::parse_quote!(W_IntColumn)),
+            writes_elements: true,
+            helpers: vec![syn::parse_quote!(append_cell)],
+        };
+        let config = LowererConfig::new(
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &state_type,
+            &env_type,
+            &[entry],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(config.residual_writes.len(), 1);
+        assert_eq!(config.residual_writes[0].0, vec!["append_cell".to_string()]);
+        assert!(config.residual_writes[0].3);
+    }
 
     #[test]
     fn pointer_cast_temporaries_are_colored_with_their_builder_operands() {
@@ -2753,6 +2831,53 @@ mod tests {
             depends_on_stack: false,
             struct_type: None,
         }
+    }
+
+    /// `_immutable_fields_ = ['items[*]']` (`rewrite_op_getarrayitem`) emits
+    /// `getarrayitem_gc_r_pure`. The choice is the struct's
+    /// `__MAJIT_IMMUTABLE_FIELDS`, not a CEL-specific opcode.
+    #[test]
+    fn immutable_array_item_emits_getarrayitem_gc_pure() {
+        let func = parse_fn(
+            r#"
+            fn load(tup: *mut Tup, i: i64) -> *mut CelObject {
+                tup.items[i]
+            }
+            "#,
+        );
+        let array_fields = [crate::jit_interp::ArrayFieldEntry {
+            struct_type: syn::parse_quote!(Tup),
+            field: syn::parse_quote!(items),
+            element_type: syn::parse_quote!(CelRef),
+            header: Some(syn::parse_quote!(Block)),
+        }];
+        let int_fields = [crate::jit_interp::IntFieldEntry {
+            struct_type: syn::parse_quote!(Block),
+            field: syn::parse_quote!(capacity),
+            int_type: syn::parse_quote!(usize),
+        }];
+        let helper = generate_inline_helper_jitcode_with_calls(
+            &func,
+            &[],
+            &[(syn::parse_quote!(tup), syn::parse_quote!(Tup))],
+            &[],
+            &array_fields,
+            &int_fields,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("jit_inline lowering should succeed")
+        .expect("helper should lower");
+        let body = helper.body.to_string();
+        assert!(
+            body.contains("getarrayitem_gc_r_pure"),
+            "immutable array item must be getarrayitem_gc_pure: {body}"
+        );
+        assert!(body.contains("__MAJIT_IMMUTABLE_FIELDS"), "{body}");
+        assert!(body.contains("items[*]"), "{body}");
     }
 
     fn parse_fn(code: &str) -> ItemFn {

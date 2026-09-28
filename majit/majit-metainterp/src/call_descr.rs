@@ -556,7 +556,11 @@ pub enum EffectInfoSlot {
     /// `#[dont_look_inside]` policy bytes, whose upstream counterpart is
     /// a `@dont_look_inside` function the write analyzer still walks. It
     /// is not the "nothing was analyzed" answer: that one is
-    /// [`EffectInfoSlot::Unanalyzed`].
+    /// [`EffectInfoSlot::Unanalyzed`]. No analyzer walks a macro helper's
+    /// body, so `residual_call_*_canonical_via_target` promotes this slot
+    /// to `MOST_GENERAL` (`JitCodeBuilder::residual_effect_info_for_target`);
+    /// a helper that raises or writes nothing is declared with a precise
+    /// policy (`residual_*_cannot_raise`, `residual_writes`) instead.
     #[default]
     CanRaise,
     /// `EF_RANDOM_EFFECTS` / [`EffectInfo::MOST_GENERAL`] — the

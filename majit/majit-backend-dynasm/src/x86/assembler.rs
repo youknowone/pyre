@@ -932,6 +932,9 @@ pub struct Assembler386<'a> {
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
     vtable_offset: Option<usize>,
+    /// `AbstractLLCPU.subclassrange_min_offset`. `None` keeps the
+    /// TYPE_INFO arm of `genop_guard_guard_subclass`.
+    subclassrange_min_offset: Option<usize>,
     /// llsupport/gc.py get_typeid_from_classptr_if_gcremovetypeptr vtable→typeid table, materialized by the runner
     /// via gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr. Used by
     /// the gcremovetypeptr branch of `_cmp_guard_class`.
@@ -1166,6 +1169,7 @@ impl<'a> Assembler386<'a> {
         header_pc: u64,
         constants: majit_ir::ConstMap<majit_ir::Const>,
         vtable_offset: Option<usize>,
+        subclassrange_min_offset: Option<usize>,
         classptr_to_typeid: IndexMap<i64, u32>,
         guard_gc_type_info: Option<GuardGcTypeInfo>,
         classptr_to_subclass_range: IndexMap<i64, (i64, i64)>,
@@ -1202,6 +1206,7 @@ impl<'a> Assembler386<'a> {
             compiled_target_tokens: Vec::new(),
             unrelocated_jump_target: None,
             vtable_offset,
+            subclassrange_min_offset,
             classptr_to_typeid,
             guard_gc_type_info,
             classptr_to_subclass_range,
@@ -4647,7 +4652,10 @@ impl<'a> Assembler386<'a> {
             }
             // x86/assembler.py malloc_cond_varsize parity
             // arglocs = [lengthloc, imm(itemsize), imm(kind)]
-            OpCode::CallMallocNurseryVarsize => {
+            OpCode::CallMallocNurseryVarsize | OpCode::CallMallocNurseryVarsizeHeaderless => {
+                // Headerless allocators have no `GcHeader` and do not collect
+                // on overflow. Cranelift and wasm do not install one.
+                let headerless = op.opcode == OpCode::CallMallocNurseryVarsizeHeaderless;
                 let (base_size, type_id) = op
                     .with_array_descr(|ad| (ad.base_size(), ad.type_id()))
                     .expect("CallMallocNurseryVarsize requires an ArrayDescr");
@@ -4670,16 +4678,25 @@ impl<'a> Assembler386<'a> {
                 let slow_path = self.mc.new_dynamic_label();
                 let done = self.mc.new_dynamic_label();
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                let header_size = majit_gc::header::GcHeader::SIZE as i64;
+                let header_size = if headerless {
+                    0
+                } else {
+                    majit_gc::header::GcHeader::SIZE as i64
+                };
                 let word = std::mem::size_of::<usize>();
                 // `consider_call_malloc_nursery_varsize` passes this value
                 // directly as `maxlength`; the following nursery-top check
                 // rejects a scaled size that is still too large.
-                let max_length = max_young.saturating_sub(2 * word);
+                let max_length = if headerless {
+                    max_young.saturating_sub(base_size as usize)
+                } else {
+                    max_young.saturating_sub(2 * word)
+                };
                 debug_assert!(itemsize > 0);
                 debug_assert!(
-                    base_size as usize + majit_gc::header::GcHeader::SIZE
-                        >= majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE
+                    headerless
+                        || base_size as usize + majit_gc::header::GcHeader::SIZE
+                            >= majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE
                 );
                 if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
                     dynasm!(self.mc ; .arch x64 ; jmp =>slow_path);
@@ -4731,17 +4748,59 @@ impl<'a> Assembler386<'a> {
                     );
                     rx86::mov_ri(&mut self.mc, scratch, nf_addr as i64);
                     rx86::mov_mr(&mut self.mc, (scratch, 0), rx86::EDX);
-                    rx86::mov_ri(&mut self.mc, scratch, type_id);
-                    dynasm!(self.mc ; .arch x64
-                                            ; mov [rcx], Rq(scratch)
-                    );
-                    rx86::add_ri(&mut self.mc, rx86::ECX, header_size as i32);
+                    if !headerless {
+                        rx86::mov_ri(&mut self.mc, scratch, type_id);
+                        dynasm!(self.mc ; .arch x64
+                                                ; mov [rcx], Rq(scratch)
+                        );
+                        rx86::add_ri(&mut self.mc, rx86::ECX, header_size as i32);
+                    }
                     dynasm!(self.mc ; .arch x64
                                             ; jmp =>done
 
                     );
                 }
                 dynasm!(self.mc ; .arch x64 ; =>slow_path);
+                if headerless {
+                    match arglocs.first() {
+                        Some(Loc::Reg(len_r)) => {
+                            dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(len_r.value));
+                        }
+                        Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
+                            dynasm!(self.mc ; .arch x64 ; mov rdx, QWORD len_i.value);
+                        }
+                        Some(Loc::Frame(len_f)) => {
+                            dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + len_f.ebp_loc.value]);
+                        }
+                        Some(Loc::Ebp(len_e)) => {
+                            dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + len_e.value]);
+                        }
+                        other => panic!(
+                            "CallMallocNurseryVarsizeHeaderless length is not a value: {other:?}"
+                        ),
+                    }
+                    let helper_addr = self.malloc_slowpath_headerless as i64;
+                    let call_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                    dynasm!(self.mc ; .arch x64
+                        ; imul rdx, rdx, itemsize as i32
+                        ; add rdx, (base_size + 7) as i32
+                        ; and rdx, -8
+                        ; xor ecx, ecx
+                        ; mov Rq(call_scratch), QWORD helper_addr
+                        ; call Rq(call_scratch)
+                    );
+                    self.emit_propagate_exception_if_zero(crate::regloc::ECX.value);
+                    let Some(Loc::Reg(r)) = result_loc else {
+                        panic!(
+                            "CallMallocNurseryVarsizeHeaderless result_loc must be a register; got {result_loc:?}"
+                        );
+                    };
+                    if r.value != crate::regloc::ECX.value {
+                        let rv = r.value;
+                        dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rcx);
+                    }
+                    dynasm!(self.mc ; .arch x64 ; jmp =>done);
+                }
                 // x86/assembler.py:254 `_push_all_regs_to_jitframe` — the
                 // helper below can collect, and unlike the fixed-size path it
                 // is called directly rather than through the trampoline that
@@ -5279,6 +5338,33 @@ impl<'a> Assembler386<'a> {
 
     /// x86/assembler.py `genop_guard_guard_subclass`.
     fn emit_guard_subclass(&mut self, obj_loc: &Loc, class_loc: &Loc, tmp_loc: &Loc) {
+        // `cpu.vtable_offset` is set and no TYPE_INFO table is installed.
+        // `offset2` is `cpu.subclassrange_min_offset`; `check_min` /
+        // `check_max` are `vtable_ptr.subclassrange_min/max`.
+        if self.guard_gc_type_info.is_none()
+            && let (Some(vtable_offset), Some(range_off)) =
+                (self.vtable_offset, self.subclassrange_min_offset)
+        {
+            let (Loc::Reg(obj), Loc::Immed(classptr) | Loc::ImmedFloat(classptr), Loc::Reg(tmp)) =
+                (obj_loc, class_loc, tmp_loc)
+            else {
+                panic!(
+                    "GUARD_SUBCLASS expects [Reg object, Immed classptr, Reg tmp] \
+                     like x86/assembler.py:1947"
+                );
+            };
+            let (check_min, check_max) =
+                majit_backend::read_vtable_subclass_range(classptr.value, range_off);
+            let offset = vtable_offset as i32;
+            let offset2 = range_off as i32;
+            dynasm!(self.mc ; .arch x64
+                ; mov Rq(tmp.value), [Rq(obj.value) + offset]
+                ; mov Rq(tmp.value), [Rq(tmp.value) + offset2]
+            );
+            self.emit_sub_imm64(tmp.value, check_min);
+            self.emit_cmp_imm64(tmp.value, check_max - check_min);
+            return;
+        }
         let info = self.require_guard_gc_type_info("GUARD_SUBCLASS");
         let (Loc::Reg(obj), Loc::Immed(classptr) | Loc::ImmedFloat(classptr), Loc::Reg(tmp)) =
             (obj_loc, class_loc, tmp_loc)
@@ -8597,15 +8683,20 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_int_arg_from_imm(0, obj_size);
         rx86::mov_ri(&mut self.mc, rx86::EAX, malloc_ptr);
         self.emit_abi_call_rax();
-        self.emit_abi_int_arg_from_reg(0, 0);
-        self.emit_abi_int_arg_from_imm(1, 0);
-        self.emit_abi_int_arg_from_imm(2, obj_size);
-        dynasm!(self.mc ; .arch x64
-        ; push rax
-        );
-        rx86::mov_ri(&mut self.mc, rx86::EAX, libc::memset as *const () as i64);
-        self.emit_abi_call_rax_after_one_push();
-        dynasm!(self.mc ; .arch x64 ; pop rax);
+        // `GcLLDescr_boehm.malloc_fixedsize` is `GC_malloc`
+        // (`malloc_zero_filled`). A raw `malloc` is not, so only that
+        // fallback is cleared here — never both.
+        if crate::runner::malloc_fixedsize_or(0) == 0 {
+            self.emit_abi_int_arg_from_reg(0, 0);
+            self.emit_abi_int_arg_from_imm(1, 0);
+            self.emit_abi_int_arg_from_imm(2, obj_size);
+            dynasm!(self.mc ; .arch x64
+            ; push rax
+            );
+            rx86::mov_ri(&mut self.mc, rx86::EAX, libc::memset as *const () as i64);
+            self.emit_abi_call_rax_after_one_push();
+            dynasm!(self.mc ; .arch x64 ; pop rax);
+        }
         // Write vtable at offset 0 (`GcLLDescr_boehm`, fielddescr_vtable at 0).
         if vtable != 0 {
             rx86::mov_ri(&mut self.mc, rx86::ECX, vtable);

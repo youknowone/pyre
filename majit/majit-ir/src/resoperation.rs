@@ -4726,6 +4726,8 @@ pub enum OpCode {
     CallMallocNursery,
     CallMallocNurseryHeaderless,
     CallMallocNurseryVarsize,
+    /// Headerless `CALL_MALLOC_NURSERY_VARSIZE`: payload base, no `GcHeader`.
+    CallMallocNurseryVarsizeHeaderless,
     CallMallocNurseryVarsizeFrame,
     RecordKnownResult,
 
@@ -5833,6 +5835,7 @@ static OPWITHDESCR: [bool; OPCODE_COUNT] = {
         CallPureF,
         CallPureN,
         CallMallocNurseryVarsize,
+        CallMallocNurseryVarsizeHeaderless,
         ThreadlocalrefGet,
         RecordKnownResult
     );
@@ -6065,6 +6068,7 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         CallMallocNursery,
         CallMallocNurseryHeaderless,
         CallMallocNurseryVarsize,
+        CallMallocNurseryVarsizeHeaderless,
         CallMallocNurseryVarsizeFrame,
         SaveException
     );
@@ -6312,6 +6316,7 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         CallMallocNursery,
         CallMallocNurseryHeaderless,
         CallMallocNurseryVarsize,
+        CallMallocNurseryVarsizeHeaderless,
         CallMallocNurseryVarsizeFrame,
         RecordKnownResult,
         IntAddOvf,
@@ -7032,6 +7037,7 @@ mod tests {
             OpCode::CallPureF,
             OpCode::CallPureN,
             OpCode::CallMallocNurseryVarsize,
+            OpCode::CallMallocNurseryVarsizeHeaderless,
             OpCode::RecordKnownResult,
         ];
         for op in &variadic_ops {
@@ -7161,6 +7167,7 @@ mod tests {
             OpCode::CallMallocNursery,
             OpCode::CallMallocNurseryHeaderless,
             OpCode::CallMallocNurseryVarsize,
+            OpCode::CallMallocNurseryVarsizeHeaderless,
             OpCode::CallMallocNurseryVarsizeFrame,
             OpCode::SaveException,
         ];

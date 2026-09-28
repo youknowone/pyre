@@ -667,7 +667,7 @@ impl JitCodeBuilder {
         size: usize,
         type_id: u64,
         headerless: bool,
-        fields: &[(usize, bool, &str, usize, bool)],
+        fields: &[(usize, bool, &str, usize, bool, bool)],
         immutable_fields: &str,
     ) {
         self.touch_ref_reg(dest);
@@ -717,7 +717,7 @@ impl JitCodeBuilder {
         vtable: usize,
         headerless: bool,
         is_gc_managed: bool,
-        fields: &[(usize, bool, &str, usize, bool)],
+        fields: &[(usize, bool, &str, usize, bool, bool)],
         immutable_fields: &str,
     ) {
         self.touch_ref_reg(dest);
@@ -775,7 +775,7 @@ impl JitCodeBuilder {
         type_id: u64,
         is_gc_managed: bool,
         headerless: bool,
-        fields: &[(usize, bool, &str, usize, bool)],
+        fields: &[(usize, bool, &str, usize, bool, bool)],
         immutable_fields: &str,
     ) {
         crate::note_struct_layout_registration(fields.len());
@@ -876,7 +876,14 @@ impl JitCodeBuilder {
     fn record_layout_conflicts(
         existing: &BhSizeSpec,
         type_id: u64,
-        (offset, is_ref, name, decl_size, decl_signed): (usize, bool, &str, usize, bool),
+        (offset, is_ref, name, decl_size, decl_signed, is_float): (
+            usize,
+            bool,
+            &str,
+            usize,
+            bool,
+            bool,
+        ),
     ) -> bool {
         let mut at_offset = existing
             .all_fielddescrs
@@ -898,10 +905,12 @@ impl JitCodeBuilder {
             is_ref,
             size: if is_ref {
                 scalar_size(majit_ir::value::Type::Ref)
+            } else if is_float {
+                scalar_size(majit_ir::value::Type::Float)
             } else {
                 decl_size
             },
-            signed: !is_ref && decl_signed,
+            signed: !is_ref && !is_float && decl_signed,
         };
         let describe = |ef: &BhFieldSpec| crate::StructLayoutField {
             name: ef.name.clone(),
@@ -1000,58 +1009,66 @@ impl JitCodeBuilder {
     }
 
     fn field_specs_from_layout(
-        fields: &[(usize, bool, &str, usize, bool)],
+        fields: &[(usize, bool, &str, usize, bool, bool)],
         ranks: &[(String, ImmutableRank)],
     ) -> Vec<BhFieldSpec> {
-        let mut ordered: Vec<(usize, bool, &str, usize, bool)> = fields.to_vec();
-        ordered.sort_by_key(|&(offset, _, _, _, _)| offset);
+        let mut ordered: Vec<(usize, bool, &str, usize, bool, bool)> = fields.to_vec();
+        ordered.sort_by_key(|&(offset, _, _, _, _, _)| offset);
         ordered
             .iter()
             .enumerate()
-            .map(|(idx, &(offset, is_ref, name, decl_size, decl_signed))| {
-                // descr.py `get_type_flag(FIELDTYPE)`: a pointer field
-                // is FLAG_POINTER; an integer field is FLAG_SIGNED or
-                // FLAG_UNSIGNED by its own type and carries its own width.
-                // The emit site supplies both for an integer field; a ref field
-                // is a pointer word by construction.
-                let (field_type, field_size, field_flag, is_field_signed) = if is_ref {
-                    (
-                        majit_ir::value::Type::Ref,
-                        scalar_size(majit_ir::value::Type::Ref),
-                        majit_ir::descr::ArrayFlag::Pointer,
-                        false,
-                    )
-                } else {
-                    let flag = if decl_signed {
-                        majit_ir::descr::ArrayFlag::Signed
+            .map(
+                |(idx, &(offset, is_ref, name, decl_size, decl_signed, is_float))| {
+                    // descr.py `get_field_descr` reads FIELDTYPE once and
+                    // `get_type_flag` picks the flag: pointer, FLOAT, signed, or
+                    // unsigned. The emit site supplies that kind; nothing retags
+                    // the descr afterwards.
+                    let (field_type, field_size, field_flag, is_field_signed) = if is_ref {
+                        (
+                            majit_ir::value::Type::Ref,
+                            scalar_size(majit_ir::value::Type::Ref),
+                            majit_ir::descr::ArrayFlag::Pointer,
+                            false,
+                        )
+                    } else if is_float {
+                        (
+                            majit_ir::value::Type::Float,
+                            scalar_size(majit_ir::value::Type::Float),
+                            majit_ir::descr::ArrayFlag::Float,
+                            false,
+                        )
                     } else {
-                        majit_ir::descr::ArrayFlag::Unsigned
+                        let flag = if decl_signed {
+                            majit_ir::descr::ArrayFlag::Signed
+                        } else {
+                            majit_ir::descr::ArrayFlag::Unsigned
+                        };
+                        (majit_ir::value::Type::Int, decl_size, flag, decl_signed)
                     };
-                    (majit_ir::value::Type::Int, decl_size, flag, decl_signed)
-                };
-                BhFieldSpec {
-                    // descr.py:656 SimpleFieldDescr id is unset until the
-                    // runtime DescrCache mints one; index_in_parent carries
-                    // the structural slot the optimizer indexes by.
-                    index: u32::MAX,
-                    field_key: name.to_string(),
-                    name: name.to_string(),
-                    offset,
-                    field_size,
-                    field_type,
-                    field_flag,
-                    is_field_signed,
-                    is_immutable: Self::rank_of(ranks, name)
-                        .is_some_and(ImmutableRank::is_immutable),
-                    is_quasi_immutable: Self::rank_of(ranks, name)
-                        .is_some_and(ImmutableRank::is_quasi_immutable),
-                    index_in_parent: idx,
-                    // The emit-site layout table names fields but declares no
-                    // header row, so the rebuilding side falls back to the
-                    // name.
-                    is_class_word: None,
-                }
-            })
+                    BhFieldSpec {
+                        // descr.py:656 SimpleFieldDescr id is unset until the
+                        // runtime DescrCache mints one; index_in_parent carries
+                        // the structural slot the optimizer indexes by.
+                        index: u32::MAX,
+                        field_key: name.to_string(),
+                        name: name.to_string(),
+                        offset,
+                        field_size,
+                        field_type,
+                        field_flag,
+                        is_field_signed,
+                        is_immutable: Self::rank_of(ranks, name)
+                            .is_some_and(ImmutableRank::is_immutable),
+                        is_quasi_immutable: Self::rank_of(ranks, name)
+                            .is_some_and(ImmutableRank::is_quasi_immutable),
+                        index_in_parent: idx,
+                        // The emit-site layout table names fields but declares no
+                        // header row, so the rebuilding side falls back to the
+                        // name.
+                        is_class_word: None,
+                    }
+                },
+            )
             .collect()
     }
 
@@ -1249,6 +1266,29 @@ impl JitCodeBuilder {
         self.push_u16(descr);
     }
 
+    /// Emit `setfield_gc_f/rfd` (`jtransform.py` `rewrite_op_setfield`:
+    /// `kind = getkind(RESULT)[0]` is `f`, so the op is `setfield_gc_f`).
+    ///
+    /// The field's `FLOAT` flag is fixed when `register_struct_layout` builds
+    /// the descr (`descr.py` `get_field_descr` / `get_type_flag`).
+    pub fn setfield_gc_f(
+        &mut self,
+        struct_reg: u16,
+        value_reg: u16,
+        offset: usize,
+        type_id: u64,
+        field_name: &str,
+    ) {
+        self.touch_ref_reg(struct_reg);
+        self.touch_float_reg(value_reg);
+        let descr =
+            self.add_struct_field_descr(offset, majit_ir::value::Type::Float, type_id, field_name);
+        self.write_insn("setfield_gc_f/rfd");
+        self.push_reg_u8(struct_reg, "setfield_gc_f struct");
+        self.push_reg_u8(value_reg, "setfield_gc_f value");
+        self.push_u16(descr);
+    }
+
     /// `c`-argcode form of [`Self::setfield_gc_i`] —
     /// `assembler.py emit_const(allow_short=True)` writes a small
     /// ConstInt value (-128..127) inline as one signed byte (`setfield_gc_i`
@@ -1363,6 +1403,29 @@ impl JitCodeBuilder {
         self.push_reg_u8(struct_reg, "getfield_gc_r struct");
         self.push_u16(descr);
         self.push_reg_u8(dest, "getfield_gc_r result");
+    }
+
+    /// Emit `getfield_gc_f/rd>f` (`jtransform.py` `rewrite_op_getfield`:
+    /// `getkind` of a `lltype.Float` field is `f`).
+    ///
+    /// Pair of [`Self::setfield_gc_f`]. Both intern the field descr as
+    /// `Type::Float` (`descr.py` `get_type_flag` `FLAG_FLOAT`).
+    pub fn getfield_gc_f(
+        &mut self,
+        dest: u16,
+        struct_reg: u16,
+        offset: usize,
+        type_id: u64,
+        field_name: &str,
+    ) {
+        self.touch_ref_reg(struct_reg);
+        self.touch_float_reg(dest);
+        let descr =
+            self.add_struct_field_descr(offset, majit_ir::value::Type::Float, type_id, field_name);
+        self.write_insn("getfield_gc_f/rd>f");
+        self.push_reg_u8(struct_reg, "getfield_gc_f struct");
+        self.push_u16(descr);
+        self.push_reg_u8(dest, "getfield_gc_f result");
     }
 
     pub fn vable_getfield_int_with_base(&mut self, dest: u16, vable_reg: u16, field_idx: u16) {
@@ -2074,6 +2137,68 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "getarrayitem_gc_r dst");
     }
 
+    /// Load an f64 element (`blackhole.py` `bhimpl_getarrayitem_gc_f`).
+    ///
+    /// `jtransform.py` `rewrite_op_getarrayitem` picks `getarrayitem_gc_f`
+    /// when the array's item type is `lltype.Float`. The descr is
+    /// [`Self::add_raw_float_array_descr`].
+    pub fn getarrayitem_gc_f(&mut self, dst: u16, array_reg: u16, index_reg: u16, descr_idx: u16) {
+        self.touch_ref_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_float_reg(dst);
+        self.write_insn("getarrayitem_gc_f/rid>f");
+        self.push_reg_u8(array_reg, "getarrayitem_gc_f array");
+        self.push_reg_u8(index_reg, "getarrayitem_gc_f index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_gc_f dst");
+    }
+
+    /// Always-pure spelling of [`Self::getarrayitem_gc_f`].
+    ///
+    /// `jtransform.py` `rewrite_op_getarrayitem` appends `_pure` when
+    /// `ARRAY._immutable_field(None)`, before choosing the kind, so an
+    /// immutable float array is `getarrayitem_gc_f_pure`.
+    pub fn getarrayitem_gc_f_pure(
+        &mut self,
+        dst: u16,
+        array_reg: u16,
+        index_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_ref_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_float_reg(dst);
+        self.write_insn("getarrayitem_gc_f_pure/rid>f");
+        self.push_reg_u8(array_reg, "getarrayitem_gc_f_pure array");
+        self.push_reg_u8(index_reg, "getarrayitem_gc_f_pure index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_gc_f_pure dst");
+    }
+
+    /// Always-pure spelling of [`Self::getarrayitem_gc_r`].
+    ///
+    /// `jtransform.py` `rewrite_op_getarrayitem` appends `_pure` when
+    /// `ARRAY._immutable_field(None)` (`_immutable_fields_ = ['x[*]']`).
+    /// `blackhole.py` aliases the pure handler onto the plain read; the
+    /// recorded opcode is `GetarrayitemGcPureR`, which
+    /// `OpHelpers.is_always_pure` admits.
+    pub fn getarrayitem_gc_r_pure(
+        &mut self,
+        dst: u16,
+        array_reg: u16,
+        index_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_ref_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_ref_reg(dst);
+        self.write_insn("getarrayitem_gc_r_pure/rid>r");
+        self.push_reg_u8(array_reg, "getarrayitem_gc_r_pure array");
+        self.push_reg_u8(index_reg, "getarrayitem_gc_r_pure index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_gc_r_pure dst");
+    }
+
     /// Add the array descriptor for a byte-element array to the descrs pool.
     ///
     /// Returns the descr index to pass as `descr_idx` to `getarrayitem_gc_i`.
@@ -2312,6 +2437,104 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "new_array_clear dst");
     }
 
+    /// `new_array/id>r` (`blackhole.py` `bhimpl_new_array`).
+    ///
+    /// `jtransform.py` `rewrite_op_malloc_varsize` emits this when the
+    /// element is not a pointer or struct and the malloc is not `zero`.
+    /// Encoding matches [`Self::new_array_clear`]: length register, array
+    /// descr, destination ref.
+    pub fn new_array(&mut self, dst: u16, length_reg: u16, descr_idx: u16) {
+        self.touch_int_reg_or_pool_slot(length_reg);
+        self.touch_ref_reg(dst);
+        self.write_insn("new_array/id>r");
+        self.push_reg_u8(length_reg, "new_array length");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "new_array dst");
+    }
+
+    /// `arraylen_gc/rd>i` (`blackhole.py` `bhimpl_arraylen_gc`).
+    ///
+    /// The length word is the descr's `lendescr` (`descr.py`
+    /// `get_field_arraylen_descr`), not a separate struct field.
+    pub fn arraylen_gc(&mut self, dst: u16, array_reg: u16, descr_idx: u16) {
+        self.touch_ref_reg(array_reg);
+        self.touch_int_reg_or_pool_slot(dst);
+        self.write_insn("arraylen_gc/rd>i");
+        self.push_reg_u8(array_reg, "arraylen_gc array");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "arraylen_gc dst");
+    }
+
+    /// Array descr for `malloc_varsize` of a `GcArray`, including one
+    /// inlined after a header (`descr.py` `get_array_descr`).
+    ///
+    /// `base_size` is the offset of element 0 (`offset_of!(Header, items)`
+    /// for the `Elem in Header` shape). `len_offset` is the length word
+    /// (`get_field_arraylen_descr`). `is_gc_managed` stays false: the
+    /// pointer addresses the payload, and a `GUARD_GC_TYPE` would read a
+    /// header the concrete block does not carry in front of that pointer.
+    /// `type_id` is still stamped so the allocator can write a type word
+    /// ahead of the payload (`bh_new_array`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_gc_varsize_array_descr(
+        &mut self,
+        base_size: usize,
+        len_offset: usize,
+        itemsize: usize,
+        is_array_of_pointers: bool,
+        is_item_signed: bool,
+        type_id: u64,
+    ) -> u16 {
+        let item_type = if is_array_of_pointers {
+            majit_ir::value::Type::Ref
+        } else {
+            majit_ir::value::Type::Int
+        };
+        self.add_array_descr(CanonicalBhDescr::Array {
+            base_size,
+            itemsize,
+            len_offset: Some(len_offset),
+            type_id,
+            gc_type_id: 0,
+            item_type,
+            is_array_of_pointers,
+            is_array_of_structs: false,
+            is_item_signed,
+            is_gc_managed: false,
+            ei_index: u32::MAX,
+            array_type_id: None,
+            interior_fields: Vec::new(),
+        })
+    }
+
+    /// Float-item form of [`Self::add_gc_varsize_array_descr`].
+    ///
+    /// `jtransform.py` `rewrite_op_getarrayitem` / `getkind(ARRAY.OF)` selects
+    /// the float opcode for an `f64` element in a header. `itemsize` is
+    /// `sizeof(f64)` (`symbolic.py` `get_array_token`).
+    pub fn add_gc_varsize_float_array_descr(
+        &mut self,
+        base_size: usize,
+        len_offset: usize,
+        type_id: u64,
+    ) -> u16 {
+        self.add_array_descr(CanonicalBhDescr::Array {
+            base_size,
+            itemsize: std::mem::size_of::<f64>(),
+            len_offset: Some(len_offset),
+            type_id,
+            gc_type_id: 0,
+            item_type: majit_ir::value::Type::Float,
+            is_array_of_pointers: false,
+            is_array_of_structs: false,
+            is_item_signed: false,
+            is_gc_managed: false,
+            ei_index: u32::MAX,
+            array_type_id: None,
+            interior_fields: Vec::new(),
+        })
+    }
+
     /// Emit `newlist_clear/idddd>r` (`handler_newlist_clear`,
     /// `blackhole.py:1173-1180`): the compound resizable-list allocation
     /// `do_resizable_newlist_clear` emits.  ONE opcode carrying the
@@ -2353,12 +2576,14 @@ impl JitCodeBuilder {
                     "length",
                     scalar_size(majit_ir::value::Type::Int),
                     true,
+                    false,
                 ),
                 (
                     items_offset,
                     true,
                     "items",
                     scalar_size(majit_ir::value::Type::Ref),
+                    false,
                     false,
                 ),
             ],
@@ -2506,6 +2731,28 @@ impl JitCodeBuilder {
         self.push_reg_u8(array_reg, "setarrayitem_gc_r array");
         self.push_reg_u8(index_reg, "setarrayitem_gc_r index");
         self.push_reg_u8(value_reg, "setarrayitem_gc_r value");
+        self.push_u16(descr_idx);
+    }
+
+    /// Store an f64 element (`blackhole.py` `bhimpl_setarrayitem_gc_f`).
+    ///
+    /// Store counterpart of [`Self::getarrayitem_gc_f`]. `jtransform.py`
+    /// `rewrite_op_setarrayitem` emits this when the item type is
+    /// `lltype.Float`.
+    pub fn setarrayitem_gc_f(
+        &mut self,
+        array_reg: u16,
+        index_reg: u16,
+        value_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_ref_reg(array_reg);
+        self.touch_int_reg_or_pool_slot(index_reg);
+        self.touch_float_reg(value_reg);
+        self.write_insn("setarrayitem_gc_f/rifd");
+        self.push_reg_u8(array_reg, "setarrayitem_gc_f array");
+        self.push_reg_u8(index_reg, "setarrayitem_gc_f index");
+        self.push_reg_u8(value_reg, "setarrayitem_gc_f value");
         self.push_u16(descr_idx);
     }
 
@@ -2673,32 +2920,70 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
-    /// `jtransform.py` `rewrite_op_int_floordiv = _do_builtin_call`:
-    /// residual `_ll_2_int_floordiv` (C-truncating). Rust `/` is the same
-    /// truncation. This is **not** `int.py_div` (`ll_int_py_div`, Python
-    /// floor) — that oopspec is `_handle_int_special` for `//`.
-    /// `lloperation.py` marks `int_floordiv` `canfold=True`; zero is a
-    /// caller precondition, matching `emit_int_mod_or_floordiv_residual`.
+    /// `support.py` `_ll_2_int_floordiv`, inlined because `int_floordiv` is
+    /// in `inline_calls_to`. The body is Python-floor `int.py_div` plus the
+    /// branch-free truncation adjustment:
+    /// `r + (((x ^ y) >> (LONG_BIT - 1)) & (p != x))` with `p = r * y`.
+    /// A zero divisor still panics inside `ll_int_py_div`, the same
+    /// precondition as `blackhole::_ll_2_int_floordiv`.
     pub fn record_int_floordiv(&mut self, dst: u16, lhs: u16, rhs: u16) {
-        self.record_int_py_helper(
-            dst,
-            lhs,
-            rhs,
-            crate::blackhole::_ll_2_int_floordiv as *const (),
-            crate::call_descr::cannot_raise_effect_info(),
-        );
+        self.touch_reg(lhs);
+        self.touch_reg(rhs);
+        self.touch_reg(dst);
+        // `support.py` `_ll_2_int_floordiv`: LONG_BIT - 1 on a 64-bit Signed.
+        let kshift = 63i64;
+        let base = self.alloc_int_temps(6);
+        let r = base;
+        let p = base + 1;
+        let xor = base + 2;
+        let shifted = base + 3;
+        let cmp = base + 4;
+        let k = base + 5;
+        self.load_const_i_value(k, kshift);
+        self.record_int_py_div(r, lhs, rhs);
+        self.record_binop_i(p, OpCode::IntMul, r, rhs);
+        self.record_binop_i(xor, OpCode::IntXor, lhs, rhs);
+        self.record_binop_i(shifted, OpCode::IntRshift, xor, k);
+        self.record_binop_i(cmp, OpCode::IntNe, p, lhs);
+        self.record_binop_i(shifted, OpCode::IntAnd, shifted, cmp);
+        self.record_binop_i(dst, OpCode::IntAdd, r, shifted);
     }
 
-    /// `jtransform.py` `rewrite_op_int_mod = _do_builtin_call`: residual
-    /// `_ll_2_int_mod` (C-truncating remainder). See [`Self::record_int_floordiv`].
+    /// `support.py` `_ll_2_int_mod`, inlined because `int_mod` is in
+    /// `inline_calls_to`:
+    /// `r -= y & (((x ^ y) & (r | -r)) >> (LONG_BIT - 1))`
+    /// with `r = int.py_mod(x, y)`. See [`Self::record_int_floordiv`].
     pub fn record_int_mod(&mut self, dst: u16, lhs: u16, rhs: u16) {
-        self.record_int_py_helper(
-            dst,
-            lhs,
-            rhs,
-            crate::blackhole::_ll_2_int_mod as *const (),
-            crate::call_descr::cannot_raise_effect_info(),
-        );
+        self.touch_reg(lhs);
+        self.touch_reg(rhs);
+        self.touch_reg(dst);
+        let kshift = 63i64;
+        let base = self.alloc_int_temps(5);
+        let r = base;
+        let folded = base + 1;
+        let xor = base + 2;
+        let shifted = base + 3;
+        let k = base + 4;
+        self.load_const_i_value(k, kshift);
+        self.record_int_py_mod(r, lhs, rhs);
+        self.record_unary_i(folded, OpCode::IntNeg, r);
+        self.record_binop_i(folded, OpCode::IntOr, r, folded);
+        self.record_binop_i(xor, OpCode::IntXor, lhs, rhs);
+        self.record_binop_i(shifted, OpCode::IntAnd, xor, folded);
+        self.record_binop_i(shifted, OpCode::IntRshift, shifted, k);
+        self.record_binop_i(shifted, OpCode::IntAnd, rhs, shifted);
+        self.record_binop_i(dst, OpCode::IntSub, r, shifted);
+    }
+
+    /// Fresh int registers above every register already touched, including
+    /// the operands of the instruction about to expand. Dead once that
+    /// instruction's result is written; later ops may reuse the numbers.
+    fn alloc_int_temps(&mut self, n: u16) -> u16 {
+        let base = self.num_regs_i;
+        for i in 0..n {
+            self.touch_reg(base.saturating_add(i));
+        }
+        base
     }
 
     /// `jtransform.py` `_handle_int_special` `int.py_div` → residual
@@ -4156,17 +4441,40 @@ impl JitCodeBuilder {
     ///
     /// The producer already stamped its classification onto the
     /// `JitCallTarget` (`add_call_target_with_save_err` /
-    /// `add_fn_ptr_with_slot`), so the residual descr reads that slot
-    /// instead of inventing a row here: a hand-classified
-    /// `#[dont_look_inside]` helper keeps `EF_CAN_RAISE`, while a helper
-    /// registered as [`crate::call_descr::EffectInfoSlot::Unanalyzed`]
-    /// keeps `MOST_GENERAL`. A `fn_ptr_idx` that is not a call target is
-    /// left to the `_with_effect_info` sibling's own panic.
+    /// `add_fn_ptr_with_slot`). `cond_call` / `record_known_result` read
+    /// that slot here. An unanalyzed `residual_call_*` does not: see
+    /// [`Self::residual_effect_info_for_target`]. A `fn_ptr_idx` that is
+    /// not a call target is left to the `_with_effect_info` sibling's
+    /// own panic.
     fn effect_info_for_target(&self, fn_ptr_idx: u16) -> majit_ir::descr::EffectInfo {
         match self.descrs.get(fn_ptr_idx as usize) {
             Some(RuntimeBhDescr::Call(target)) => {
                 crate::call_descr::effect_info_for_slot(target.effect_info_slot)
             }
+            _ => crate::call_descr::default_effect_info(),
+        }
+    }
+
+    /// Effect info for `residual_call_*_canonical_via_target`.
+    ///
+    /// A macro helper has no graph. `graphanalyze.py`
+    /// `GraphAnalyzer.analyze` returns the top result when the callee has
+    /// no `graph` (`AttributeError` on `funcobj.graph`). `CanRaise` is that
+    /// top (`EffectInfo::MOST_GENERAL`). A precise slot stays on
+    /// `effect_info_for_slot`. Callers that already pass an effect info
+    /// (`residual_writes`, `nursery_alloc`) use the `_with_effect_info`
+    /// siblings and never reach this helper. `cond_call` keeps
+    /// [`Self::effect_info_for_target`]: `MOST_GENERAL` forces virtuals,
+    /// which `jtransform.py _rewrite_op_cond_call` rejects.
+    fn residual_effect_info_for_target(&self, fn_ptr_idx: u16) -> majit_ir::descr::EffectInfo {
+        match self.descrs.get(fn_ptr_idx as usize) {
+            Some(RuntimeBhDescr::Call(target)) => match target.effect_info_slot {
+                crate::call_descr::EffectInfoSlot::CanRaise
+                | crate::call_descr::EffectInfoSlot::Unanalyzed => {
+                    crate::call_descr::default_effect_info()
+                }
+                slot => crate::call_descr::effect_info_for_slot(slot),
+            },
             _ => crate::call_descr::default_effect_info(),
         }
     }
@@ -4177,13 +4485,11 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
     ) {
         // pyjitpl.py do_residual_call invalidates the heapcache from
-        // descriptor effects before recording the call, so the descr must
-        // carry the callee's own classification —
-        // `effect_info_for_target`. `check_can_raise()`
-        // (`effectinfo.py extraeffect > EF_CANNOT_RAISE`) holds for
-        // every row it can return, so the walker keeps emitting
-        // `GUARD_NO_EXCEPTION`.
-        let effect_info = self.effect_info_for_target(fn_ptr_idx);
+        // descriptor effects before recording the call. An unanalyzed
+        // residual is `EF_RANDOM_EFFECTS` (`residual_effect_info_for_target`);
+        // `check_can_raise()` holds for that row, so the walker keeps
+        // emitting `GUARD_NO_EXCEPTION`.
+        let effect_info = self.residual_effect_info_for_target(fn_ptr_idx);
         self.residual_call_void_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
@@ -4638,7 +4944,7 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        let effect_info = self.effect_info_for_target(fn_ptr_idx);
+        let effect_info = self.residual_effect_info_for_target(fn_ptr_idx);
         self.residual_call_int_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
@@ -4680,7 +4986,7 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        let effect_info = self.effect_info_for_target(fn_ptr_idx);
+        let effect_info = self.residual_effect_info_for_target(fn_ptr_idx);
         self.residual_call_ref_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
@@ -4792,7 +5098,7 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        let effect_info = self.effect_info_for_target(fn_ptr_idx);
+        let effect_info = self.residual_effect_info_for_target(fn_ptr_idx);
         self.residual_call_float_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
@@ -7233,10 +7539,24 @@ mod tests {
         const TID: u64 = 0x5747_5F49_4458;
         let mut builder = JitCodeBuilder::new();
         // Site 1 registers only the HIGH offset, so the mint ranks it 0.
-        builder.register_struct_layout(24, TID, false, false, &[(16, false, "hi", 8, true)], "");
+        builder.register_struct_layout(
+            24,
+            TID,
+            false,
+            false,
+            &[(16, false, "hi", 8, true, false)],
+            "",
+        );
         builder.getfield_gc_i(0, 1, 16, TID, "hi");
         // Site 2 registers the LOW offset; the merge re-indexes to {8→0, 16→1}.
-        builder.register_struct_layout(24, TID, false, false, &[(8, false, "lo", 8, true)], "");
+        builder.register_struct_layout(
+            24,
+            TID,
+            false,
+            false,
+            &[(8, false, "lo", 8, true, false)],
+            "",
+        );
         builder.getfield_gc_i(2, 1, 8, TID, "lo");
         let jitcode = builder.finish();
 
@@ -7286,7 +7606,14 @@ mod tests {
     fn field_descr_runtime_entry_reuses_one_optimizer_identity() {
         const TID: u64 = 0x5254_4649_454c_44;
         let mut builder = JitCodeBuilder::new();
-        builder.register_struct_layout(16, TID, false, false, &[(8, false, "value", 8, true)], "");
+        builder.register_struct_layout(
+            16,
+            TID,
+            false,
+            false,
+            &[(8, false, "value", 8, true, false)],
+            "",
+        );
         builder.getfield_gc_i(0, 1, 8, TID, "value");
         let jitcode = builder.finish();
         let entry = jitcode
@@ -7333,7 +7660,10 @@ mod tests {
                 TID,
                 false,
                 false,
-                &[(8, false, "agg", 8, true), (8, true, "leaf", 8, false)],
+                &[
+                    (8, false, "agg", 8, true, false),
+                    (8, true, "leaf", 8, false, false),
+                ],
                 "",
             );
             builder.getfield_gc_i(0, 1, 8, TID, name);
@@ -7386,9 +7716,9 @@ mod tests {
     #[test]
     fn a_named_field_resolves_by_name_through_an_ambiguous_offset() {
         let fields = [
-            (0, false, "head", 8, false),
-            (8, false, "agg", 8, true),
-            (8, true, "leaf", 8, false),
+            (0, false, "head", 8, false, false),
+            (8, false, "agg", 8, true, false),
+            (8, true, "leaf", 8, false, false),
         ];
         assert_eq!(
             super::field_slot_in(

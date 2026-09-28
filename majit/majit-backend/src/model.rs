@@ -10,8 +10,39 @@
 //! threads a single trait object instead of an N-tuple of `fn` pointers.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::operand::Operand;
+
+/// `llmodel.py` `AbstractLLCPU.subclassrange_min_offset`, beside
+/// `vtable_offset`. `usize::MAX` means the CPU has not been configured.
+static CPU_SUBCLASSRANGE_MIN_OFFSET: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Publish `cpu.subclassrange_min_offset`. The optimizer's
+/// `_check_subclass` and the assembler read the same value.
+pub fn set_cpu_subclassrange_min_offset(offset: Option<usize>) {
+    CPU_SUBCLASSRANGE_MIN_OFFSET.store(offset.unwrap_or(usize::MAX), Ordering::Release);
+}
+
+/// `None` when [`set_cpu_subclassrange_min_offset`] has not been called.
+pub fn cpu_subclassrange_min_offset() -> Option<usize> {
+    match CPU_SUBCLASSRANGE_MIN_OFFSET.load(Ordering::Acquire) {
+        usize::MAX => None,
+        offset => Some(offset),
+    }
+}
+
+/// `vtable_ptr.subclassrange_min` / `subclassrange_max`. The two `Signed`
+/// fields are adjacent (`rclass.OBJECT_VTABLE`); `min_offset` is the first.
+pub fn read_vtable_subclass_range(classptr: i64, min_offset: usize) -> (i64, i64) {
+    if classptr == 0 {
+        return (0, 0);
+    }
+    unsafe {
+        let ptr = (classptr as usize).wrapping_add(min_offset) as *const i64;
+        (ptr.read_unaligned(), ptr.add(1).read_unaligned())
+    }
+}
 use majit_ir::{ArrayDescr, FieldDescr, GcRef, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

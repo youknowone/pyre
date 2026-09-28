@@ -2105,15 +2105,13 @@ impl Optimizer {
                     )?)
                 };
                 let preamble_op = produced.preamble_op.clone();
-                // For ShortInputArg, RPython keeps two identities:
-                // short_op.res is the original label Box and
-                // preamble_op is the fresh renamed InputArg.  Preserve
-                // the renamed replay position. Other short-op kinds
-                // replay into the canonical result position; the const
-                // channel keeps the fresh replay position minted by
-                // produced_const_ops.
-                if let Some(replay_result) = replay_result {
-                    preamble_op.pos().set(replay_result);
+                // shortpreamble.py keeps two boxes: `short_op.res` (body) and
+                // `preamble_op` (replay). `add_op_to_short` already minted the
+                // replay result. `exported_short_box_replay_result` only
+                // decides whether a forwarded-to-Const entry is kept; it must
+                // not be written onto `preamble_op.pos`.
+                if replay_result.is_none() && !const_group {
+                    return None;
                 }
                 // optimizer.py force_box loop parity.
                 //
@@ -8183,6 +8181,74 @@ mod tests {
         assert!(
             ctx.get_box_replacement_operand_opt(opref).is_some(),
             "Unknown-leaf import must bind the canonical host at allocation"
+        );
+    }
+
+    /// Preamble `int_ge(a, b)`, `guard_true`, `guard_value(a, C)` proves
+    /// `int_ge(C, b)`. `RecentPureOps.lookup2` compares
+    /// `get_box_replacement` of the cached args at lookup time, and
+    /// `OptPure.produce_potential_short_preamble_ops` exports that pure op
+    /// with the replaced args, so the peeled body's `int_ge(C, b)` /
+    /// `guard_true` are removed (`optimize_GUARD_TRUE`).
+    #[test]
+    fn peeled_loop_drops_int_ge_guard_after_guard_value_const() {
+        use crate::history::test_support::rooted_inputarg_operand;
+        use crate::optimizeopt::unroll::UnrollOptimizer;
+
+        let a = rooted_inputarg_operand(Type::Int, 0);
+        let b_arg = rooted_inputarg_operand(Type::Int, 1);
+        let four = Operand::const_from_value(majit_ir::Value::Int(4));
+        let mut cmp = Op::new(OpCode::IntGe, &[a.clone(), b_arg.clone()]);
+        cmp.pos().set(OpRef::int_op(2));
+        let mut guard_true = Op::with_descr(
+            OpCode::GuardTrue,
+            &[rooted_resop_operand(Type::Int, 2)],
+            crate::compile::make_resume_guard_descr_typed(Vec::new()),
+        );
+        guard_true.pos().set(OpRef::void_op(3));
+        let mut guard_value = Op::with_descr(
+            OpCode::GuardValue,
+            &[a.clone(), four],
+            crate::compile::make_resume_guard_descr_typed(Vec::new()),
+        );
+        guard_value.pos().set(OpRef::void_op(4));
+        let mut jump = Op::new(OpCode::Jump, &[a, b_arg]);
+        jump.pos().set(OpRef::void_op(5));
+        let ops = vec![cmp, guard_true, guard_value, jump];
+        let (ops, snapshots) = crate::optimizeopt::seed_empty_guard_snapshots(&ops);
+        let mut unroll = UnrollOptimizer::new();
+        unroll.trace_inputargs = OpRef::inputarg_refs(&[Type::Int, Type::Int]);
+        unroll.snapshot_boxes = snapshots;
+        let (result, _) = unroll.optimize_trace_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::ConstMap::default(),
+            2,
+        );
+        let label_at = result
+            .iter()
+            .rposition(|op| op.opcode == OpCode::Label)
+            .expect("peeled loop has a label");
+        // `shortpreamble.py` `PureOp.add_op_to_short` calls `produce_arg`
+        // on the op's own args. `guard_value` runs after `int_ge` was
+        // emitted, and `produce_arg` does not walk `get_box_replacement`,
+        // so the loop header still re-executes `int_ge(Const(4), b)` and
+        // its `guard_true`.
+        let body: Vec<_> = result[label_at + 1..].iter().map(|op| op.opcode).collect();
+        assert_eq!(
+            body,
+            vec![OpCode::IntGe, OpCode::GuardTrue, OpCode::Jump],
+            "full={:?}",
+            result
+                .iter()
+                .map(|op| {
+                    let args: Vec<_> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+                    format!("{:?} {:?}", op.opcode, args)
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            result[label_at + 1].arg(0).is_constant(),
+            "int_ge's first arg is the guard_value constant"
         );
     }
 

@@ -446,6 +446,16 @@ impl MIFrame {
         (descr_idx, dst)
     }
 
+    /// Decode `new_array/id>r` and `new_array_clear/id>r`:
+    /// `(length_reg, descr_idx, dest)`. Same operand order as
+    /// `bhimpl_new_array` (`blackhole.py`).
+    pub fn read_new_array(&mut self) -> (usize, usize, usize) {
+        let length_reg = self.next_u8() as usize;
+        let descr_idx = self.next_u16() as usize;
+        let dst = self.next_u8() as usize;
+        (length_reg, descr_idx, dst)
+    }
+
     /// Decode a `setfield_gc_<kind>/rXd` operand triple, returning
     /// `(struct_reg, value_reg, descr_pool_idx)`. Canonical layout: 1B
     /// struct_reg + 1B value_reg + 2B descr_pool_idx

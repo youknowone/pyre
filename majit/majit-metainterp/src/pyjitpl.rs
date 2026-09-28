@@ -5603,6 +5603,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Prefers the trace-bound `active_jitdriver_sd`; falls back to
     /// scanning `jitdrivers_sd` for callers that read this before any
     /// trace has started (warmspot init, host-side queries).
+    #[inline]
     pub fn virtualizable_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
         if let Some(idx) = self.active_jitdriver_sd
             && let Some(jd) = self.staticdata.jitdrivers_sd.get(idx)
@@ -13608,6 +13609,87 @@ impl<M: Clone> MetaInterp<M> {
         match self
             .backend
             .execute_token_done_int(procedure_token, live_values)
+        {
+            Ok(value) => {
+                Self::finish_compiled_run_io();
+                Some(value)
+            }
+            Err(frame) => {
+                let result = self.consume_executed_frame(green_key, None, frame);
+                self.raw_int_fallback = Some(result);
+                None
+            }
+        }
+    }
+
+    /// [`Self::poll_raw_int_finish`] for `unspecialize_value` words.
+    ///
+    /// `llmodel.py execute_token` writes each word by `token.inputarg_types()`;
+    /// [`Backend::execute_token_done_int_raw`] is that store.
+    #[inline]
+    pub fn poll_raw_int_finish_raw(
+        &mut self,
+        procedure_token: &std::sync::Arc<JitCellToken>,
+        green_key: u64,
+        raw_reds: &[i64],
+    ) -> Option<i64> {
+        Self::prepare_compiled_run_io();
+        match self
+            .backend
+            .execute_token_done_int_raw(procedure_token, raw_reds)
+        {
+            Ok(value) => {
+                Self::finish_compiled_run_io();
+                Some(value)
+            }
+            Err(frame) => {
+                let result = self.consume_executed_frame(green_key, None, frame);
+                self.raw_int_fallback = Some(result);
+                None
+            }
+        }
+    }
+
+    /// `warmstate.py execute_assembler` ref fast path.
+    ///
+    /// `Some` is `compile.py DoneWithThisFrameDescrRef.get_result`: slot 0,
+    /// frame released, no `CompileResult`. `None` means the trace already ran
+    /// and [`Self::raw_int_fallback`] holds the general-case result.
+    pub fn poll_raw_ref_finish(
+        &mut self,
+        procedure_token: &std::sync::Arc<JitCellToken>,
+        green_key: u64,
+        live_values: &[Value],
+    ) -> Option<usize> {
+        Self::prepare_compiled_run_io();
+        match self
+            .backend
+            .execute_token_done_ref(procedure_token, live_values)
+        {
+            Ok(value) => {
+                Self::finish_compiled_run_io();
+                Some(value)
+            }
+            Err(frame) => {
+                let result = self.consume_executed_frame(green_key, None, frame);
+                self.raw_int_fallback = Some(result);
+                None
+            }
+        }
+    }
+
+    /// [`Self::poll_raw_ref_finish`] for `unspecialize_value` words.
+    #[inline]
+    pub fn poll_raw_ref_finish_raw(
+        &mut self,
+        procedure_token: &std::sync::Arc<JitCellToken>,
+        green_key: u64,
+        raw_reds: &[i64],
+    ) -> Option<usize> {
+        Self::prepare_compiled_run_io();
+        match self
+            .backend
+            .execute_token_done_ref_raw(procedure_token, raw_reds)
         {
             Ok(value) => {
                 Self::finish_compiled_run_io();

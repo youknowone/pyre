@@ -295,6 +295,27 @@ pub trait JitState: Sized {
         out.extend(self.extract_live_values(meta));
     }
 
+    /// Fill compiled-entry reds without `compiled_loops`.
+    ///
+    /// `execute_assembler` receives reds the caller already unboxed. It does
+    /// not look up a side table of compiled metadata. Returns `true` only
+    /// when `is_compatible` does not read meta and the reds do not either,
+    /// so the entry can skip `IndexMap::get` of `CompiledEntry`. The default
+    /// is the meta path.
+    fn fill_entry_reds_without_meta(&self, out: &mut Vec<Value>) -> bool {
+        let _ = out;
+        false
+    }
+
+    /// `warmstate.py maybe_compile_and_run`: the reds as `unspecialize_value`
+    /// words, in inputarg order. `false` when the state cannot produce them
+    /// without the compiled meta (same condition as
+    /// `fill_entry_reds_without_meta`).
+    fn fill_entry_raw_reds(&self, out: &mut Vec<i64>) -> bool {
+        let _ = out;
+        false
+    }
+
     /// Append-to-buffer form of [`Self::extract_live`], for
     /// [`Self::extract_live_values_into`] implementations.
     fn extract_live_into(&self, meta: &Self::Meta, out: &mut Vec<i64>) {

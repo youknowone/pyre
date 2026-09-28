@@ -719,6 +719,76 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
 }
 
 #[test]
+fn guard_subclass_vtable_range_without_type_info() {
+    #[repr(C)]
+    struct Class {
+        subclassrange_min: i64,
+        subclassrange_max: i64,
+    }
+    #[repr(C)]
+    struct Obj {
+        typeptr: *const Class,
+    }
+    let parent = Class {
+        subclassrange_min: 0,
+        subclassrange_max: 4,
+    };
+    let child = Class {
+        subclassrange_min: 2,
+        subclassrange_max: 3,
+    };
+    let other = Class {
+        subclassrange_min: 10,
+        subclassrange_max: 11,
+    };
+    let mut child_obj = Obj { typeptr: &child };
+    let mut other_obj = Obj { typeptr: &other };
+
+    let prev = majit_backend::cpu_subclassrange_min_offset();
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    backend.set_vtable_offset(Some(0));
+    backend.set_subclassrange_min_offset(Some(0));
+
+    let const_parent = OpRef::const_int(&parent as *const Class as i64);
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let i0 = inputargs[0].opref();
+    let guard_subclass = Op::new(OpCode::GuardSubclass, &[rb(i0), rb(const_parent)]);
+    guard_subclass.pos().set(OpRef::void_op(1));
+    guard_subclass.set_fail_arg_types(vec![Type::Ref]);
+    guard_subclass.setfailargs(vec![rb(i0)].into());
+    let finish_op = Op::new(OpCode::Finish, &[]);
+    finish_op.pos().set(OpRef::void_op(2));
+    finish_op.set_fail_arg_types(vec![]);
+    finish_op.setfailargs(vec![].into());
+    let ops_rc: Vec<OpRc> = vec![guard_subclass, finish_op]
+        .into_iter()
+        .map(OpRc::new)
+        .collect();
+
+    let pass = JitCellToken::new(90);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &pass);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+    let child_ref = GcRef(&mut child_obj as *mut Obj as usize);
+    let frame = backend.execute_token(&pass, &[Value::Ref(child_ref)]);
+    assert!(
+        backend.get_latest_descr(&frame).is_finish(),
+        "a subclass must pass GUARD_SUBCLASS"
+    );
+
+    let fail = JitCellToken::new(91);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &fail);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+    let other_ref = GcRef(&mut other_obj as *mut Obj as usize);
+    let frame = backend.execute_token(&fail, &[Value::Ref(other_ref)]);
+    assert!(
+        !backend.get_latest_descr(&frame).is_finish(),
+        "an unrelated class must fail GUARD_SUBCLASS"
+    );
+    backend.set_subclassrange_min_offset(prev);
+}
+
+#[test]
 fn test_exception_guards_use_dynasm_emit() {
     let _guard = EXCEPTION_TEST_LOCK.lock();
     majit_backend_dynasm::jit_exc_clear();

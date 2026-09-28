@@ -27,6 +27,20 @@ type CallArgs = SmallVec<[JitCallArg; CALL_INLINE]>;
 type CallValues = SmallVec<[Value; CALL_INLINE]>;
 type CallTriples = SmallVec<[(OpRef, i64, Type); CALL_INLINE]>;
 
+/// `GcLLDescr_boehm.malloc_fixedsize` (`llmodel_alloc`).
+///
+/// `Some` when the host published the hook, including a null OOM result.
+/// `None` leaves the caller on its raw allocator. `GC_malloc` is already
+/// zero-filled, and `call_malloc_fixedsize` does not clear a second time.
+fn host_malloc_fixedsize(size: usize) -> Option<*mut u8> {
+    let addr = majit_gc::malloc_fixedsize_addr();
+    if addr == 0 {
+        return None;
+    }
+    let malloc: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(addr) };
+    Some(malloc(size))
+}
+
 /// Which recorded op [`JitCodeMachine::publish_last_guard_resume_snapshot`]
 /// points at the snapshot it just captured.
 #[derive(Clone, Copy)]
@@ -566,7 +580,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
 )]
 pub fn residual_write_effect_info(
-    layouts: &[(usize, u64, bool, &[(usize, bool, &str, usize, bool)])],
+    layouts: &[(usize, u64, bool, &[(usize, bool, &str, usize, bool, bool)])],
     arrays: &[(usize, bool)],
     can_raise: bool,
 ) -> majit_ir::EffectInfo {
@@ -574,47 +588,56 @@ pub fn residual_write_effect_info(
     // `index_in_parent` is the stable by-offset rank, scalar = one machine word.
     let mut fds = Vec::new();
     for &(struct_size, type_id, is_gc_managed, fields) in layouts {
-        let mut ordered: Vec<(usize, bool, &str, usize, bool)> = fields.to_vec();
-        ordered.sort_by_key(|&(offset, _, _, _, _)| offset);
+        let mut ordered: Vec<(usize, bool, &str, usize, bool, bool)> = fields.to_vec();
+        ordered.sort_by_key(|&(offset, _, _, _, _, _)| offset);
         let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = ordered
             .iter()
             .enumerate()
-            .map(|(idx, &(offset, is_ref, name, decl_size, decl_signed))| {
-                let (field_type, field_size, flag) = if is_ref {
-                    (
-                        majit_ir::value::Type::Ref,
-                        jitcode::scalar_size(majit_ir::value::Type::Ref),
-                        majit_ir::descr::ArrayFlag::Pointer,
-                    )
-                } else {
-                    let flag = if decl_signed {
-                        majit_ir::descr::ArrayFlag::Signed
+            .map(
+                |(idx, &(offset, is_ref, name, decl_size, decl_signed, is_float))| {
+                    // Same split as `field_specs_from_layout`: `get_type_flag`.
+                    let (field_type, field_size, flag) = if is_ref {
+                        (
+                            majit_ir::value::Type::Ref,
+                            jitcode::scalar_size(majit_ir::value::Type::Ref),
+                            majit_ir::descr::ArrayFlag::Pointer,
+                        )
+                    } else if is_float {
+                        (
+                            majit_ir::value::Type::Float,
+                            jitcode::scalar_size(majit_ir::value::Type::Float),
+                            majit_ir::descr::ArrayFlag::Float,
+                        )
                     } else {
-                        majit_ir::descr::ArrayFlag::Unsigned
+                        let flag = if decl_signed {
+                            majit_ir::descr::ArrayFlag::Signed
+                        } else {
+                            majit_ir::descr::ArrayFlag::Unsigned
+                        };
+                        (majit_ir::value::Type::Int, decl_size, flag)
                     };
-                    (majit_ir::value::Type::Int, decl_size, flag)
-                };
-                majit_ir::descr::SimpleFieldDescrSpec {
-                    index: u32::MAX,
-                    field_key: name.to_string(),
-                    // The layout table names fields but declares no header
-                    // row, so the descr infers from the name.
-                    is_class_word: None,
-                    name: name.to_string(),
-                    offset,
-                    // Same width rule as the `field_specs_from_layout` twin
-                    // this mirrors: a `Ref` field is one target word (4 on
-                    // wasm32); an `Int` field is its declared storage, which is
-                    // a machine word unless the emit site named it narrower.
-                    field_size,
-                    field_type,
-                    is_immutable: false,
-                    is_quasi_immutable: false,
-                    flag,
-                    virtualizable: false,
-                    index_in_parent: idx,
-                }
-            })
+                    majit_ir::descr::SimpleFieldDescrSpec {
+                        index: u32::MAX,
+                        field_key: name.to_string(),
+                        // The layout table names fields but declares no header
+                        // row, so the descr infers from the name.
+                        is_class_word: None,
+                        name: name.to_string(),
+                        offset,
+                        // Same width rule as the `field_specs_from_layout` twin
+                        // this mirrors: a `Ref` field is one target word (4 on
+                        // wasm32); an `Int` field is its declared storage, which is
+                        // a machine word unless the emit site named it narrower.
+                        field_size,
+                        field_type,
+                        is_immutable: false,
+                        is_quasi_immutable: false,
+                        flag,
+                        virtualizable: false,
+                        index_in_parent: idx,
+                    }
+                },
+            )
             .collect();
         majit_ir::descr::make_simple_descr_group_keyed(
             u32::MAX,
@@ -626,7 +649,7 @@ pub fn residual_write_effect_info(
             &specs,
         );
         let struct_key = majit_ir::descr::LLType::Struct(type_id);
-        fds.extend(fields.iter().map(|(_, _, write_field, _, _)| {
+        fds.extend(fields.iter().map(|(_, _, write_field, _, _, _)| {
             majit_ir::descr::gc_cache()
                 .lock()
                 ._cache_field
@@ -4441,6 +4464,11 @@ where
                 };
                 let ptr = if gc_ptr != 0 {
                     gc_ptr as i64
+                } else if let Some(ptr) = host_malloc_fixedsize(size) {
+                    // `GcLLDescr_boehm.malloc_fixedsize`, same arm as
+                    // `llmodel_alloc` / `bh_new_with_vtable`. A raw
+                    // `alloc_zeroed` block is not in the heap that hook owns.
+                    ptr as i64
                 } else {
                     let layout = std::alloc::Layout::from_size_align(size, 8)
                         .expect("BC_NEW: invalid struct layout");
@@ -5414,7 +5442,8 @@ where
             // re-read during the observer concrete replay returns the same
             // pointer — no `record_observed_*` queue is needed (none exists
             // for getarrayitem).
-            jitcode::insns::BC_GETARRAYITEM_GC_R_RID => {
+            jitcode::insns::BC_GETARRAYITEM_GC_R_RID
+            | jitcode::insns::BC_GETARRAYITEM_GC_R_PURE => {
                 let (array_reg, index_reg, descr_idx, dst) = {
                     let frame = self.frames.current_mut();
                     let array_reg = frame.next_reg() as usize;
@@ -5440,67 +5469,82 @@ where
                         descr.as_array_descr().expect("GC ref array descriptor"),
                     )
                     .0 as i64;
-                let (opref, reg_concrete) = if let Some(cached) = cached {
-                    ctx.profiler().count_ops(
-                        OpCode::GetarrayitemGcR,
-                        crate::pyjitpl::counters::HEAPCACHED_OPS,
-                    );
-                    // `_do_getarrayitem_gc_any`'s `typ == 'r'` arm compares the
-                    // freshly executed load against the cached box's
-                    // `tobox.getref_base()`. Same structure as the int/float
-                    // arm above: a mismatch records a fallback op whose result
-                    // is discarded, asserts in debug, and still answers with
-                    // the stale cached box.
-                    let expected = match ctx.box_value(cached) {
-                        Some(Value::Ref(majit_ir::GcRef(p))) => Some(p as i64),
-                        _ => None,
-                    };
-                    let stale = matches!(expected, Some(exp) if exp != concrete);
-                    if stale {
-                        ctx.heapcache_invalidate_caches_varargs(
-                            OpCode::GetarrayitemGcR,
-                            None,
-                            &[array_opref, index_opref],
-                        );
-                        ctx.profiler()
-                            .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
-                        let _ = ctx.record_op_with_descr(
-                            OpCode::GetarrayitemGcR,
-                            &[array_opref, index_opref],
-                            descr,
-                        );
-                        debug_assert!(
-                            false,
-                            "GetarrayitemGcR sanity check failed: \
-                             cached={expected:?} concrete={concrete}",
-                        );
-                    }
-                    let reg_concrete = if stale {
-                        expected.expect("stale only set when expected is Some")
-                    } else {
-                        concrete
-                    };
-                    (cached, reg_concrete)
+                // `getarrayitem_gc_r_pure` records `GetarrayitemGcPureR`
+                // (`rewrite_op_getarrayitem` `_pure`). An all-constant read
+                // folds here, the same way `BC_GETARRAYITEM_GC_I_PURE` does:
+                // the pure opcode is what licenses it, and the live pointer
+                // is already in hand so `protect_speculative_array` is not
+                // asked to classify a block that has no GC type header.
+                let pure = bytecode == jitcode::insns::BC_GETARRAYITEM_GC_R_PURE;
+                let opcode = if pure {
+                    OpCode::GetarrayitemGcPureR
                 } else {
-                    ctx.profiler()
-                        .count_ops(OpCode::GetarrayitemGcR, crate::counters::OPS);
-                    ctx.profiler()
-                        .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
-                    let opref = ctx.record_op_with_descr(
-                        OpCode::GetarrayitemGcR,
-                        &[array_opref, index_opref],
-                        descr,
-                    );
-                    ctx.set_opref_concrete(opref, Value::Ref(majit_ir::GcRef(concrete as usize)));
-                    ctx.heapcache_getarrayitem_now_known(
-                        array_opref,
-                        index_opref,
-                        descr_index,
-                        opref,
-                    );
-                    (opref, concrete)
+                    OpCode::GetarrayitemGcR
                 };
-                self.set_ref_reg(dst, Some(opref), Some(reg_concrete));
+                if pure && array_opref.is_constant() && index_opref.is_constant() {
+                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
+                    let opref = ctx.const_ref(concrete);
+                    self.set_ref_reg(dst, Some(opref), Some(concrete));
+                } else {
+                    let (opref, reg_concrete) = if let Some(cached) = cached {
+                        ctx.profiler()
+                            .count_ops(opcode, crate::pyjitpl::counters::HEAPCACHED_OPS);
+                        // `_do_getarrayitem_gc_any`'s `typ == 'r'` arm compares the
+                        // freshly executed load against the cached box's
+                        // `tobox.getref_base()`. Same structure as the int/float
+                        // arm above: a mismatch records a fallback op whose result
+                        // is discarded, asserts in debug, and still answers with
+                        // the stale cached box.
+                        let expected = match ctx.box_value(cached) {
+                            Some(Value::Ref(majit_ir::GcRef(p))) => Some(p as i64),
+                            _ => None,
+                        };
+                        let stale = matches!(expected, Some(exp) if exp != concrete);
+                        if stale {
+                            ctx.heapcache_invalidate_caches_varargs(
+                                opcode,
+                                None,
+                                &[array_opref, index_opref],
+                            );
+                            ctx.profiler()
+                                .count_ops(opcode, crate::counters::RECORDED_OPS);
+                            let _ = ctx.record_op_with_descr(
+                                opcode,
+                                &[array_opref, index_opref],
+                                descr,
+                            );
+                            debug_assert!(
+                                false,
+                                "GetarrayitemGcR sanity check failed: \
+                             cached={expected:?} concrete={concrete}",
+                            );
+                        }
+                        let reg_concrete = if stale {
+                            expected.expect("stale only set when expected is Some")
+                        } else {
+                            concrete
+                        };
+                        (cached, reg_concrete)
+                    } else {
+                        ctx.profiler().count_ops(opcode, crate::counters::OPS);
+                        ctx.profiler()
+                            .count_ops(opcode, crate::counters::RECORDED_OPS);
+                        let opref =
+                            ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
+                        ctx.set_opref_concrete(
+                            opref,
+                            Value::Ref(majit_ir::GcRef(concrete as usize)),
+                        );
+                        ctx.heapcache_getarrayitem_now_known(
+                            array_opref,
+                            index_opref,
+                            descr_index,
+                            opref,
+                        );
+                        (opref, concrete)
+                    };
+                    self.set_ref_reg(dst, Some(opref), Some(reg_concrete));
+                }
             }
             // blackhole.py:1350-1358 bhimpl_setarrayitem_gc_{i,r,f}: record
             // SetarrayitemGc (a single op-kind whose descr carries the item
@@ -10922,91 +10966,98 @@ where
                 self.log_bytecode_abort("BC_ABORT_PERMANENT");
                 return TraceAction::AbortPermanent;
             }
-            // `opimpl_new_array` / `opimpl_new_array_clear`: one
-            // `_opimpl_new_array` parameterised by opnum. The codewriter
-            // emits both into a dispatched JitCode (`new_array/id>r`,
-            // `new_array_clear/id>r`). The `cd>r` const-length form is
-            // decoded by the string-key walker; this dispatcher reads
-            // a length register.
+            // `jtransform.py` `rewrite_op_malloc_varsize` → `new_array` /
+            // `new_array_clear`. A `#[jit_inline]` varsize literal emits the
+            // byte; record `OpCode::NewArray{,Clear}` so `optimize_NEW_ARRAY`
+            // can keep the block virtual, and allocate the live payload the
+            // rest of this trace reads (`bhimpl_new_array{,_clear}`).
             jitcode::insns::BC_NEW_ARRAY | jitcode::insns::BC_NEW_ARRAY_CLEAR => {
                 let clear = bytecode == jitcode::insns::BC_NEW_ARRAY_CLEAR;
-                let (length_reg, descr_idx, dest, base_size, itemsize, len_offset, type_id) = {
+                let (length_reg, array_descr_idx, dest) = {
                     let frame = self.frames.current_mut();
-                    let length_reg = frame.next_u8() as usize;
-                    let descr_idx = frame.next_u16() as usize;
-                    let dest = frame.next_u8() as usize;
-                    let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
-                        panic!("BC_NEW_ARRAY: descrs[{descr_idx}] is not a BhDescr entry")
+                    frame.read_new_array()
+                };
+                let (array_base_size, array_itemsize, array_len_offset, array_type_id) = {
+                    let frame = self.frames.current_mut();
+                    let bh = frame.runtime_bh_descr(array_descr_idx).unwrap_or_else(|| {
+                        panic!("BC_NEW_ARRAY: descrs[{array_descr_idx}] is not a BhDescr entry")
                     });
                     let (base_size, itemsize, _signed) = bh.unpack_arraydescr_size();
                     (
-                        length_reg,
-                        descr_idx,
-                        dest,
                         base_size,
                         itemsize,
                         bh.array_len_offset(),
                         bh.resolve_gc_tid(),
                     )
                 };
-                let Some(array_descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+                let Some(array_descr) = self.dispatch_array_descr_ref(ctx, array_descr_idx) else {
                     return TraceAction::Abort;
                 };
                 let (length_opref, length_val) = self.read_int_reg(length_reg);
                 let length_count =
                     usize::try_from(length_val).expect("BC_NEW_ARRAY: negative array length");
-                let payload = itemsize
+                let array_payload = array_itemsize
                     .checked_mul(length_count)
-                    .and_then(|var| base_size.checked_add(var))
-                    .expect("BC_NEW_ARRAY: size overflow")
-                    .max(1);
-                let gc_ptr = if type_id != 0 {
-                    majit_gc::alloc_oldgen_typed(type_id, payload).0
+                    .and_then(|var| array_base_size.checked_add(var))
+                    .expect("BC_NEW_ARRAY: array size overflow");
+                let array_payload = array_payload.max(1);
+                // Same no-collect rule as `BC_NEW`: the register bank is not
+                // a root set. Old-gen is non-moving; an untyped descr falls
+                // through to the host allocator, which still zeroes when
+                // `clear` is set and writes the length word.
+                let array_gc_ptr = if array_type_id != 0 {
+                    majit_gc::alloc_oldgen_typed(array_type_id, array_payload).0
                 } else {
                     0
                 };
-                // A typed descr (`type_id != 0`) has a GC header and
-                // tracing layout. `alloc_oldgen_typed` returning 0 is a
-                // failed allocation; raw storage would drop both. Abort
-                // the trace. The raw fallback stays only for an untyped
-                // descr (`type_id == 0`).
-                let array_ptr = if gc_ptr != 0 {
-                    gc_ptr as i64
-                } else if type_id != 0 {
+                // Under an installed collector a typed descr
+                // (`array_type_id != 0`) has a GC header and a tracing layout;
+                // `alloc_oldgen_typed` returning 0 is a failed allocation, and
+                // host storage would drop both. Abort the trace. With no
+                // collector nothing traces the block: a published
+                // `malloc_fixedsize` (`GcLLDescr_boehm.malloc_fn_ptr`) or the
+                // host allocator owns it.
+                let array_ptr = if array_gc_ptr != 0 {
+                    array_gc_ptr as i64
+                } else if array_type_id != 0 && majit_gc::collector_installed() {
                     return TraceAction::Abort;
+                } else if let Some(ptr) = host_malloc_fixedsize(array_payload) {
+                    ptr as i64
                 } else {
-                    let layout = std::alloc::Layout::from_size_align(payload, 8)
+                    let layout = std::alloc::Layout::from_size_align(array_payload, 8)
                         .expect("BC_NEW_ARRAY: invalid array layout");
-                    unsafe {
-                        if clear {
-                            std::alloc::alloc_zeroed(layout) as i64
-                        } else {
-                            std::alloc::alloc(layout) as i64
+                    unsafe { std::alloc::alloc_zeroed(layout) as i64 }
+                };
+                if array_ptr != 0 {
+                    if clear {
+                        unsafe {
+                            std::ptr::write_bytes(array_ptr as *mut u8, 0, array_payload);
                         }
                     }
-                };
-                if array_ptr != 0
-                    && let Some(len_ofs) = len_offset
-                {
-                    unsafe { *((array_ptr as *mut u8).add(len_ofs) as *mut i64) = length_val };
+                    if let Some(len_ofs) = array_len_offset {
+                        unsafe {
+                            *((array_ptr as *mut u8).add(len_ofs) as *mut usize) =
+                                length_val as usize;
+                        }
+                    }
                 }
-                let opcode = if clear {
+                let kind = if clear {
                     OpCode::NewArrayClear
                 } else {
                     OpCode::NewArray
                 };
-                ctx.profiler().count_ops(opcode, crate::counters::OPS);
+                ctx.profiler().count_ops(kind, crate::counters::OPS);
                 ctx.profiler()
-                    .count_ops(opcode, crate::counters::RECORDED_OPS);
-                let abox = if clear {
+                    .count_ops(kind, crate::counters::RECORDED_OPS);
+                let abox_op = if clear {
                     ctx.record_new_array_clear(length_opref, array_descr)
                 } else {
                     ctx.record_new_array(length_opref, array_descr)
                 };
-                ctx.set_opref_concrete(abox, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
+                ctx.set_opref_concrete(abox_op, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
                 ctx.heap_cache_mut()
-                    .new_array(abox, length_opref, length_opref.is_constant());
-                self.set_ref_reg(dest, Some(abox), Some(array_ptr));
+                    .new_array(abox_op, length_opref, length_opref.is_constant());
+                self.set_ref_reg(dest, Some(abox_op), Some(array_ptr));
             }
             jitcode::insns::BC_NEWLIST_CLEAR => {
                 // opimpl_newlist_clear (pyjitpl.py): decompose ONE
@@ -11108,6 +11159,8 @@ where
                 };
                 let struct_ptr = if struct_gc_ptr != 0 {
                     struct_gc_ptr as i64
+                } else if let Some(ptr) = host_malloc_fixedsize(struct_size) {
+                    ptr as i64
                 } else {
                     let layout = std::alloc::Layout::from_size_align(struct_size, 8)
                         .expect("BC_NEWLIST_CLEAR: invalid list-header layout");
@@ -11168,6 +11221,8 @@ where
                 };
                 let array_ptr = if array_gc_ptr != 0 {
                     array_gc_ptr as i64
+                } else if let Some(ptr) = host_malloc_fixedsize(array_payload) {
+                    ptr as i64
                 } else {
                     let layout = std::alloc::Layout::from_size_align(array_payload, 8)
                         .expect("BC_NEWLIST_CLEAR: invalid items-block layout");
@@ -15312,7 +15367,10 @@ mod tests {
             16,
             0xCD,
             false,
-            &[(0, false, "value", 8, true), (8, true, "next", 8, false)],
+            &[
+                (0, false, "value", 8, true, false),
+                (8, true, "next", 8, false, false),
+            ],
             "",
         ); // ref reg 0 = Node*
         builder.load_const_i_value(0, 99); // int reg 0 = 99
@@ -15398,8 +15456,8 @@ mod tests {
             0xCE,
             false,
             &[
-                (0, false, "cached_value", 8, true),
-                (8, true, "cached_next", 8, false),
+                (0, false, "cached_value", 8, true, false),
+                (8, true, "cached_next", 8, false, false),
             ],
             "",
         );
@@ -15438,8 +15496,8 @@ mod tests {
             0xD1,
             false,
             &[
-                (0, false, "hc_size", 8, true),
-                (8, true, "hc_buf", 8, false),
+                (0, false, "hc_size", 8, true, false),
+                (8, true, "hc_buf", 8, false, false),
             ],
             "",
         );
@@ -15478,7 +15536,10 @@ mod tests {
             16,
             0xCD,
             false,
-            &[(0, false, "value", 8, true), (8, true, "next", 8, false)],
+            &[
+                (0, false, "value", 8, true, false),
+                (8, true, "next", 8, false, false),
+            ],
             "",
         );
         builder.load_const_i_value(0, 99);
@@ -15520,7 +15581,10 @@ mod tests {
             16,
             0xCE,
             false,
-            &[(0, false, "value", 8, true), (8, true, "next", 8, false)],
+            &[
+                (0, false, "value", 8, true, false),
+                (8, true, "next", 8, false, false),
+            ],
             "",
         );
         builder.setfield_gc_i_c(0, -7, 0, 0xCE, "value"); // Node.value = -7 (inline const)

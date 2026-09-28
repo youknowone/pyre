@@ -322,6 +322,37 @@ fn zero_off_gc_frame_prefix(base: *mut u8) {
     unsafe { std::ptr::write_bytes(base.add(OFF_GC_SIZE_SLOT), 0, n) };
 }
 
+/// Payload bytes of an [`alloc_off_gc_jitframe`] block (the `size_bytes`
+/// argument, not the prefixed total).
+///
+/// # Safety
+/// `frame` must come from [`alloc_off_gc_jitframe`].
+pub unsafe fn off_gc_payload_size(frame: *mut JitFrame) -> usize {
+    unsafe {
+        let base = (frame as *mut u8).sub(OFF_GC_PREFIX);
+        let total = *(base as *const u64) as usize;
+        total - OFF_GC_PREFIX
+    }
+}
+
+/// Prepare a frame [`alloc_off_gc_jitframe`] already returned for another
+/// `execute_token`. Clears the header word and the fixed `JITFRAME` fields.
+///
+/// `llmodel.py` `execute_token` allocates a fresh zero-filled frame
+/// (`malloc_jitframe`) for every entry. Reusing one here leaves the previous
+/// entry's spill slots in place; they are unobservable because no collector
+/// scans an off-GC frame and compiled code writes a slot before it reads it.
+///
+/// # Safety
+/// `frame` must come from [`alloc_off_gc_jitframe`] and must not be reachable
+/// from compiled code, a deadframe, or the shadow stack.
+pub unsafe fn reuse_off_gc_jitframe(frame: *mut JitFrame) {
+    unsafe {
+        let base = (frame as *mut u8).sub(OFF_GC_PREFIX);
+        zero_off_gc_frame_prefix(base);
+    }
+}
+
 /// Release a frame from [`alloc_off_gc_jitframe`].
 ///
 /// The frame pointer is not the block base — the size slot and the header word

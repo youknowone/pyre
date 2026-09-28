@@ -661,7 +661,10 @@ fn expr_has_pre_merge_effect(expr: &syn::Expr, reject_macros: bool) -> bool {
             self.hit = true;
         }
         fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-            if !expr_is_tracing_hint_call(&node.func) {
+            // A null constant is not a call (`jtransform.py` `Constant(nullptr)`).
+            if !crate::jit_interp::jitcode_lower::call_is_null_ptr(node)
+                && !expr_is_tracing_hint_call(&node.func)
+            {
                 self.hit = true;
             }
             syn::visit::visit_expr_call(self, node);

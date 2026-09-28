@@ -3090,7 +3090,7 @@ impl<'a> RegAlloc<'a> {
             OpCode::CallMallocNurseryVarsizeFrame => {
                 self.consider_call_malloc_nursery_varsize_frame_j2(dst, args, i, output);
             }
-            OpCode::CallMallocNurseryVarsize => {
+            OpCode::CallMallocNurseryVarsize | OpCode::CallMallocNurseryVarsizeHeaderless => {
                 self.consider_call_malloc_nursery_varsize_j2(dst, args, i, output);
             }
             OpCode::CheckMemoryError => self.consider_check_memory_error_j2(args, i, output),
@@ -3620,7 +3620,7 @@ impl<'a> RegAlloc<'a> {
             OpCode::CallMallocNurseryVarsizeFrame => {
                 self.consider_call_malloc_nursery_varsize_frame(op, i, output);
             }
-            OpCode::CallMallocNurseryVarsize => {
+            OpCode::CallMallocNurseryVarsize | OpCode::CallMallocNurseryVarsizeHeaderless => {
                 self.consider_call_malloc_nursery_varsize(op, i, output);
             }
             OpCode::CheckMemoryError => {

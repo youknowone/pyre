@@ -63,7 +63,7 @@ pub use value::{
     CallArgWord, CallResultWord, Const, FAILARGS_LIMIT, GREEN_INLINE, GREEN_UHASH_MULT,
     GREEN_UHASH_SEED, GcRef, GreenAsI64, GreenKey, GreenType, InputArg, InputArgRc, JitDriverVar,
     RefCurrentFn, RefReleaseFn, RefRetainFn, RetainedGreens, SharedConstPool, StrEqFn, StrHashFn,
-    Type, Value, VarKind, equal_whatever, green_type_to_ir, green_uhash_step, make_str_slot,
-    pypyjit_greenkey, pypyjit_greenkey_uhash, set_ref_hash_resolver, set_ref_resolver,
-    set_str_resolver, set_unicode_resolver,
+    Type, Value, VarKind, equal_whatever, gc_id_or_identityhash, green_type_to_ir,
+    green_uhash_step, make_str_slot, pypyjit_greenkey, pypyjit_greenkey_uhash,
+    set_gc_id_or_identityhash, set_ref_resolver, set_str_resolver, set_unicode_resolver,
 };

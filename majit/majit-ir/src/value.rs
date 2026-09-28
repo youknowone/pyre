@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::cell::Cell;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 /// The type of a value in the JIT IR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -908,12 +909,10 @@ pub fn set_unicode_resolver(eq: StrEqFn, hash: StrHashFn) {
 pub type RefRetainFn = fn(i64) -> usize;
 pub type RefCurrentFn = fn(usize) -> i64;
 pub type RefReleaseFn = fn(usize);
-pub type RefHashFn = fn(i64) -> u64;
 
 static REF_RETAIN: std::sync::OnceLock<RefRetainFn> = std::sync::OnceLock::new();
 static REF_CURRENT: std::sync::OnceLock<RefCurrentFn> = std::sync::OnceLock::new();
 static REF_RELEASE: std::sync::OnceLock<RefReleaseFn> = std::sync::OnceLock::new();
-static REF_HASH: std::sync::OnceLock<RefHashFn> = std::sync::OnceLock::new();
 
 /// Frontend-registered `Ref` green ownership hooks.  Same init-once contract
 /// as [`set_str_resolver`].  Register at JitDriver startup, before any cell
@@ -924,14 +923,38 @@ pub fn set_ref_resolver(retain: RefRetainFn, current: RefCurrentFn, release: Ref
     let _ = REF_RELEASE.set(release);
 }
 
-/// Runtime implementation of RPython's `lltype.identityhash` for generic GC
-/// pointer greens.  The GC owns this operation: in minimark it gives nursery
-/// objects a stable shadow address and applies `mangle_hash`, while old-gen
-/// objects use their non-moving address.  Frontends without a moving GC may
-/// leave this unset and retain the raw-address fallback used before the hook
-/// existed.
-pub fn set_ref_hash_resolver(hash: RefHashFn) {
-    let _ = REF_HASH.set(hash);
+/// `lltype.identityhash` for a generic GC pointer (`warmstate.py hash_whatever`).
+///
+/// The GC transformer turns that call into the collector's `identityhash`
+/// (`boehm.py ll_identityhash`, `minimark.py identityhash`). Installable and
+/// clearable. Unset means the address.
+pub type GcIdOrIdentityHashFn = fn(usize) -> usize;
+
+static GC_ID_OR_IDENTITYHASH: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Install or clear the process-global `identityhash` hook.
+#[inline]
+pub fn set_gc_id_or_identityhash(hook: Option<GcIdOrIdentityHashFn>) {
+    let raw: *mut () = match hook {
+        None => std::ptr::null_mut(),
+        Some(f) => {
+            // `f` is a bare fn pointer, pointer-sized. Store those bits.
+            unsafe { std::mem::transmute_copy::<GcIdOrIdentityHashFn, *mut ()>(&f) }
+        }
+    };
+    GC_ID_OR_IDENTITYHASH.store(raw, Ordering::Release);
+}
+
+/// The installed `identityhash`, or `addr` when the slot is clear.
+#[inline]
+pub fn gc_id_or_identityhash(addr: usize) -> usize {
+    let p = GC_ID_OR_IDENTITYHASH.load(Ordering::Acquire);
+    if p.is_null() {
+        addr
+    } else {
+        let f: GcIdOrIdentityHashFn = unsafe { std::mem::transmute_copy(&p) };
+        f(addr)
+    }
 }
 
 /// OPEN POLICY FORK — the one place that decides what an unregistered
@@ -1305,13 +1328,14 @@ pub fn hash_whatever(tp: GreenType, value: i64) -> u64 {
             None => hash_whatever_missing_unicode(),
         },
         GreenType::Ref => {
-            // warmstate.py `hash_whatever`: identityhash(x) or 0.  The
-            // identity hash is a GC operation, not the pointer bits: minimark
-            // gives a nursery object a shadow before hashing it.
+            // warmstate.py `hash_whatever`: `lltype.identityhash(x)` or 0.
+            // `minimark.py identityhash` applies `support.py mangle_hash`,
+            // `i ^ (i >> 4)`, to the move-stable address.
             if value == 0 {
                 0
             } else {
-                REF_HASH.get().map_or(value as u64, |hash| hash(value))
+                let identity = gc_id_or_identityhash(value as usize) as u64;
+                identity ^ (identity >> 4)
             }
         }
         GreenType::Float => {

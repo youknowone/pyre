@@ -135,6 +135,9 @@ pub use finish_descrs::{
 };
 pub use jitframe::JitFrameInfo;
 pub use llmodel::{FailArgSource, get_int_value, get_int_value_direct};
+pub use model::{
+    cpu_subclassrange_min_offset, read_vtable_subclass_range, set_cpu_subclassrange_min_offset,
+};
 pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{
     BridgeDispatchCells, ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK,
@@ -1529,6 +1532,14 @@ pub struct JitCellToken {
     /// the F.6 retirement plan — the per-target descr identity is the
     /// part PyPy parity care about for `has_compiled_targets`.
     pub target_tokens: parking_lot::Mutex<Vec<majit_ir::DescrRef>>,
+    /// One off-GC frame parked after `DoneWithThisFrameDescrInt`.
+    ///
+    /// `llmodel.py execute_token` bump-allocates out of the nursery and never
+    /// frees. With no collector the frame is a host block; the steady
+    /// finish-with-an-int entry takes this slot instead of a thread-local
+    /// free list. A frame a deadframe or a guard-failure resume still names
+    /// is not stored here, so it cannot be handed out again.
+    entry_frame: AtomicPtr<crate::jitframe::JitFrame>,
 }
 
 impl JitCellToken {
@@ -1605,7 +1616,67 @@ impl JitCellToken {
             // empty-Vec equivalent so `has_target_tokens` is one
             // `is_empty()` check away.
             target_tokens: parking_lot::Mutex::new(Vec::new()),
+            entry_frame: AtomicPtr::new(std::ptr::null_mut()),
         }
+    }
+
+    /// Take the parked off-GC frame when it is at least `size_bytes`.
+    ///
+    /// `None` allocates. A block that is too small is released here so the
+    /// next finish can park the larger one. The slot is empty after this
+    /// returns until [`Self::park_entry_frame`].
+    #[inline]
+    pub fn take_entry_frame(&self, size_bytes: usize) -> Option<*mut crate::jitframe::JitFrame> {
+        let frame = self
+            .entry_frame
+            .swap(std::ptr::null_mut(), Ordering::Acquire);
+        if frame.is_null() {
+            return None;
+        }
+        // Caller has already established that no collector is installed.
+        // A parked frame is an unregistered host block; handing it out
+        // under a collector would skip `register_libc_jitframe`.
+        let usable = unsafe { crate::jitframe::off_gc_payload_size(frame) } >= size_bytes;
+        if !usable {
+            unsafe { crate::jitframe::free_off_gc_jitframe(frame) };
+            return None;
+        }
+        #[cfg(debug_assertions)]
+        {
+            majit_gc::shadow_stack::note_unregistered_host_jitframe();
+            if majit_gc::collector_installed() {
+                majit_gc::shadow_stack::register_libc_jitframe(frame as usize);
+                majit_gc::shadow_stack::release_unregistered_host_jitframe();
+            }
+        }
+        Some(frame)
+    }
+
+    /// Park `frame` for the next finish-with-an-int entry on this token.
+    ///
+    /// `false` means the slot is already occupied; the caller still owns
+    /// `frame` and must release it. A frame that is still referenced is
+    /// simply not passed here.
+    ///
+    /// The parked block is idle, so the host-frame note taken by
+    /// `malloc_host_jitframe` is dropped here — the same release
+    /// `free_jitframe_chain` does before a block may be reused.
+    #[inline]
+    pub fn park_entry_frame(&self, frame: *mut crate::jitframe::JitFrame) -> bool {
+        let parked = self
+            .entry_frame
+            .compare_exchange(
+                std::ptr::null_mut(),
+                frame,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok();
+        if parked {
+            #[cfg(debug_assertions)]
+            crate::jitframe::release_malloc_host_jitframe(frame);
+        }
+        parked
     }
 
     /// Clone the current `compiled_loop_token` handle out of its `Mutex`.
@@ -1727,6 +1798,7 @@ impl JitCellToken {
     }
 
     /// Check whether this loop has been invalidated.
+    #[inline]
     pub fn is_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
     }
@@ -2049,6 +2121,13 @@ impl majit_ir::QuasiImmutLoopToken for LoopInvalidation {
 
 impl Drop for JitCellToken {
     fn drop(&mut self) {
+        let parked = self
+            .entry_frame
+            .swap(std::ptr::null_mut(), Ordering::Acquire);
+        if !parked.is_null() {
+            // `park_entry_frame` already dropped the host-frame note.
+            unsafe { crate::jitframe::free_off_gc_jitframe(parked) };
+        }
         // `model.CompiledLoopToken` owns both invalidate_positions and the
         // code they name. Our thread-safe registry projection shares only the
         // former; detach it before Rust drops compiled/asmmemmgr_blocks.
@@ -2961,6 +3040,17 @@ fn checked_unicode_char(value: i64) -> u32 {
     value as u32
 }
 
+/// One `unspecialize_value` word, tagged by `llmodel.py execute_token`'s
+/// `kinds` entry.
+pub fn value_from_unspecialized_word(word: i64, kind: Type) -> Value {
+    match kind {
+        Type::Ref => Value::Ref(GcRef(word as usize)),
+        Type::Float => Value::Float(f64::from_bits(word as u64)),
+        Type::Void => Value::Void,
+        Type::Int => Value::Int(word),
+    }
+}
+
 /// The backend trait — implemented by Cranelift (or other code generators).
 ///
 /// Mirrors rpython/jit/backend/model.py AbstractCPU.
@@ -3234,6 +3324,92 @@ pub trait Backend: Send {
             return Ok(value);
         }
         Err(frame)
+    }
+
+    /// `llmodel.py make_execute_token` / `execute_token`: `args` are the
+    /// `unspecialize_value` words `warmstate.py maybe_compile_and_run` built,
+    /// stored by `token.inputarg_types()` (`set_int_value` / `set_ref_value` /
+    /// `set_float_value`). The default rebuilds those `Value`s — at most eight
+    /// stay on the stack — and calls [`Backend::execute_token_done_int`].
+    fn execute_token_done_int_raw(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<i64, DeadFrame> {
+        let kinds = token.inputarg_types();
+        let n = args.len();
+        let mut stack = [Value::Void; 8];
+        if n <= stack.len() {
+            for (i, slot) in stack[..n].iter_mut().enumerate() {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                *slot = value_from_unspecialized_word(args[i], kind);
+            }
+            return self.execute_token_done_int(token, &stack[..n]);
+        }
+        let values: Vec<Value> = (0..n)
+            .map(|i| {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                value_from_unspecialized_word(args[i], kind)
+            })
+            .collect();
+        self.execute_token_done_int(token, &values)
+    }
+
+    /// `warmstate.py execute_assembler` when `result_type == REF` and the
+    /// fail descr is `compile.py DoneWithThisFrameDescrRef`:
+    /// `get_ref_value(deadframe, 0)`, then the frame is released. `Err` is
+    /// every other exit and still owns the deadframe.
+    ///
+    /// With a collector installed the ref stays rooted — the frame, or an
+    /// owner root taken from it — until this function has copied the address
+    /// out. The frame is not freed first.
+    fn execute_token_done_ref(
+        &self,
+        token: &JitCellToken,
+        args: &[Value],
+    ) -> Result<usize, DeadFrame> {
+        let frame = self.execute_token(token, args);
+        let descr = self.get_latest_descr(&frame);
+        let ref_finish = descr.is_finish()
+            && !descr.is_exit_frame_with_exception()
+            && descr.fail_arg_types() == [Type::Ref];
+        if !ref_finish {
+            return Err(frame);
+        }
+        let value = self.get_ref_value(&frame, 0);
+        if majit_gc::collector_installed() {
+            let root = majit_gc::shadow_stack::OwnerRootGuard::new(value);
+            drop(frame);
+            return Ok(root.get().as_usize());
+        }
+        Ok(value.as_usize())
+    }
+
+    /// [`Backend::execute_token_done_int_raw`] for a ref portal. The words are
+    /// still `unspecialize_value` input args; the result is the address
+    /// `DoneWithThisFrameDescrRef.get_result` returns.
+    fn execute_token_done_ref_raw(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<usize, DeadFrame> {
+        let kinds = token.inputarg_types();
+        let n = args.len();
+        let mut stack = [Value::Void; 8];
+        if n <= stack.len() {
+            for (i, slot) in stack[..n].iter_mut().enumerate() {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                *slot = value_from_unspecialized_word(args[i], kind);
+            }
+            return self.execute_token_done_ref(token, &stack[..n]);
+        }
+        let values: Vec<Value> = (0..n)
+            .map(|i| {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                value_from_unspecialized_word(args[i], kind)
+            })
+            .collect();
+        self.execute_token_done_ref(token, &values)
     }
 
     /// Execute compiled code starting at a backend-specific dispatch key.

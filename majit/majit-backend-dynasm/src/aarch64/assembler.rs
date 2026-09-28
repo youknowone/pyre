@@ -569,6 +569,9 @@ pub struct AssemblerARM64<'a> {
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
     vtable_offset: Option<usize>,
+    /// `AbstractLLCPU.subclassrange_min_offset`. `None` keeps the
+    /// TYPE_INFO arm of `emit_op_guard_subclass`.
+    subclassrange_min_offset: Option<usize>,
     /// llsupport/gc.py get_typeid_from_classptr_if_gcremovetypeptr vtable→typeid table, materialized by the runner
     /// via gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr. Used by
     /// the gcremovetypeptr branch of `_cmp_guard_class`.
@@ -771,6 +774,7 @@ impl<'a> AssemblerARM64<'a> {
         header_pc: u64,
         constants: majit_ir::ConstMap<majit_ir::Const>,
         vtable_offset: Option<usize>,
+        subclassrange_min_offset: Option<usize>,
         classptr_to_typeid: IndexMap<i64, u32>,
         guard_gc_type_info: Option<GuardGcTypeInfo>,
         classptr_to_subclass_range: IndexMap<i64, (i64, i64)>,
@@ -811,6 +815,7 @@ impl<'a> AssemblerARM64<'a> {
             target_tokens_currently_compiling: IndexMap::new(),
             compiled_target_tokens: Vec::new(),
             vtable_offset,
+            subclassrange_min_offset,
             classptr_to_typeid,
             guard_gc_type_info,
             classptr_to_subclass_range,
@@ -3664,7 +3669,10 @@ impl<'a> AssemblerARM64<'a> {
             }
             // aarch64/assembler.py malloc_cond_varsize
             // arglocs = [lengthloc, imm(itemsize), imm(kind)]
-            OpCode::CallMallocNurseryVarsize => {
+            OpCode::CallMallocNurseryVarsize | OpCode::CallMallocNurseryVarsizeHeaderless => {
+                // Headerless allocators have no `GcHeader` and do not collect
+                // on the overflow path. Cranelift and wasm do not install one.
+                let headerless = op.opcode == OpCode::CallMallocNurseryVarsizeHeaderless;
                 let (base_size, type_id) = op
                     .with_array_descr(|ad| (ad.base_size(), ad.type_id()))
                     .expect("CallMallocNurseryVarsize requires an ArrayDescr");
@@ -3688,12 +3696,21 @@ impl<'a> AssemblerARM64<'a> {
                 // `maxlength = (max_size_of_young_obj - WORD * 2) / itemsize`.
                 // The compare below is against the item count, not the byte
                 // bound x86's precheck uses.
-                let max_length = max_young.saturating_sub(2 * word) / itemsize as usize;
-                let header_size = majit_gc::header::GcHeader::SIZE as i64;
+                let header_size = if headerless {
+                    0
+                } else {
+                    majit_gc::header::GcHeader::SIZE as i64
+                };
+                let max_length = if headerless {
+                    max_young.saturating_sub(base_size as usize) / itemsize as usize
+                } else {
+                    max_young.saturating_sub(2 * word) / itemsize as usize
+                };
                 debug_assert!(itemsize > 0);
                 debug_assert!(
-                    base_size as usize + majit_gc::header::GcHeader::SIZE
-                        >= majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE
+                    headerless
+                        || base_size as usize + majit_gc::header::GcHeader::SIZE
+                            >= majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE
                 );
                 if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
                     dynasm!(self.mc ; .arch aarch64 ; b =>slow_path);
@@ -3737,14 +3754,57 @@ impl<'a> AssemblerARM64<'a> {
                     );
                     self.emit_mov_imm64(16, nf_addr as i64);
                     dynasm!(self.mc ; .arch aarch64 ; str x1, [x16]);
-                    self.emit_mov_imm64(16, type_id);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; str x16, [x0]
-                        ; add x0, x0, header_size as u32
-                        ; b =>done
-                    );
+                    if headerless {
+                        dynasm!(self.mc ; .arch aarch64 ; b =>done);
+                    } else {
+                        self.emit_mov_imm64(16, type_id);
+                        dynasm!(self.mc ; .arch aarch64
+                            ; str x16, [x0]
+                            ; add x0, x0, header_size as u32
+                            ; b =>done
+                        );
+                    }
                 }
                 dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
+                if headerless {
+                    // Overflow opens a segment and returns the block base.
+                    // No collection, so the headered varsize helper is not used.
+                    match arglocs.first() {
+                        Some(Loc::Reg(len_r)) => {
+                            dynasm!(self.mc ; .arch aarch64 ; mov x1, X(len_r.value));
+                        }
+                        Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
+                            self.emit_mov_imm64(1, len_i.value);
+                        }
+                        Some(Loc::Frame(len_f)) => self.emit_ldr_fp(1, len_f.ebp_loc.value),
+                        Some(Loc::Ebp(len_e)) => self.emit_ldr_fp(1, len_e.value),
+                        other => panic!(
+                            "CallMallocNurseryVarsizeHeaderless length is not a value: {other:?}"
+                        ),
+                    }
+                    self.emit_mov_imm64(16, itemsize);
+                    dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x16);
+                    self.emit_mov_imm64(16, base_size + 7);
+                    dynasm!(self.mc ; .arch aarch64 ; add x1, x1, x16);
+                    self.emit_mov_imm64(16, -8);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; and x0, x1, x16
+                    );
+                    self.emit_mov_imm64(
+                        2,
+                        crate::runner::dynasm_nursery_slowpath_headerless as *const () as i64,
+                    );
+                    self.emit_malloc_slowpath_helper_call(2);
+                    self.reload_frame_if_necessary();
+                    self.emit_propagate_memory_error_if_null(0);
+                    if let Some(Loc::Reg(r)) = result_loc
+                        && r.value != 0
+                    {
+                        let rv = r.value;
+                        dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
+                    }
+                    dynasm!(self.mc ; .arch aarch64 ; b =>done);
+                }
                 // assembler.py:254 `_push_all_regs_to_jitframe` — the helper
                 // below can collect, and `emit_malloc_slowpath_helper_call`
                 // only saves the volatiles to the *stack*, where the
@@ -4236,6 +4296,35 @@ impl<'a> AssemblerARM64<'a> {
 
     /// aarch64/opassembler.py `emit_op_guard_subclass`.
     fn emit_guard_subclass(&mut self, obj_loc: &Loc, class_loc: &Loc) {
+        // `cpu.vtable_offset` is set and no TYPE_INFO table is installed.
+        // `offset2` is `cpu.subclassrange_min_offset`; `check_min` /
+        // `check_max` are `vtable_ptr.subclassrange_min/max`.
+        if self.guard_gc_type_info.is_none()
+            && let (Some(vtable_offset), Some(range_off)) =
+                (self.vtable_offset, self.subclassrange_min_offset)
+        {
+            let (Loc::Reg(obj), Loc::Immed(classptr) | Loc::ImmedFloat(classptr)) =
+                (obj_loc, class_loc)
+            else {
+                panic!(
+                    "GUARD_SUBCLASS expects [Reg object, Immed classptr] \
+                     like aarch64/opassembler.py:667"
+                );
+            };
+            let (check_min, check_max) =
+                majit_backend::read_vtable_subclass_range(classptr.value, range_off);
+            let offset = vtable_offset as u32;
+            let offset2 = range_off as u32;
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x16, [X(obj.value), offset]
+                ; ldr x16, [x16, offset2]
+            );
+            self.emit_mov_imm64(17, check_min);
+            dynasm!(self.mc ; .arch aarch64 ; sub x16, x16, x17);
+            self.emit_mov_imm64(17, check_max - check_min);
+            dynasm!(self.mc ; .arch aarch64 ; cmp x16, x17);
+            return;
+        }
         let info = self.require_guard_gc_type_info("GUARD_SUBCLASS");
         let (Loc::Reg(obj), Loc::Immed(classptr) | Loc::ImmedFloat(classptr)) =
             (obj_loc, class_loc)
@@ -7009,7 +7098,12 @@ impl<'a> AssemblerARM64<'a> {
             crate::runner::malloc_fixedsize_or(Self::new_alloc_fn_addr()),
         );
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
-        self.inline_memzero(obj_size);
+        // `GcLLDescr_boehm.malloc_fixedsize` is `GC_malloc`
+        // (`malloc_zero_filled`). A raw `malloc` is not, so only that
+        // fallback is cleared here — never both.
+        if crate::runner::malloc_fixedsize_or(0) == 0 {
+            self.inline_memzero(obj_size);
+        }
         if vtable != 0 {
             self.emit_mov_imm64(1, vtable);
             dynasm!(self.mc ; .arch aarch64 ; str x1, [x0]);

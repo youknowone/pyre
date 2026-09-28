@@ -2051,6 +2051,148 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         } else {
             quote! {}
         };
+    // No flattened-array length check and the extract override ignores
+    // meta, so the steady entry does not probe `compiled_loops`.
+    let steady_entry_without_meta = compat_checks.is_empty()
+        && (num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0);
+    let fill_entry_reds_without_meta_override: TokenStream = if steady_entry_without_meta {
+        quote! {
+            fn fill_entry_reds_without_meta(
+                &self,
+                out: &mut ::std::vec::Vec<majit_ir::Value>,
+            ) -> bool {
+                #(#extract_live_value_scalar_parts)*
+                #(#extract_live_value_array_parts)*
+                #extract_live_value_vable_identity_part
+                #(#extract_live_value_ref_scalar_parts)*
+                #(#extract_live_value_float_scalar_parts)*
+                true
+            }
+        }
+    } else {
+        quote! {}
+    };
+    // Same words as `fill_entry_reds_without_meta`, as `unspecialize_value`
+    // results: Int is the value, Ref is the address, Float is `to_bits()`.
+    // Static runs are one `extend_from_slice`; a flattened array's length is
+    // read off the state, so those elements stay a loop.
+    let raw_int_words: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { self.#fname as i64 }
+        })
+        .collect();
+    let raw_array_pushes: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                for elem in &self.#fname {
+                    out.push(*elem as i64);
+                }
+            }
+        })
+        .collect();
+    let raw_vable_word: TokenStream = if has_vable_identity {
+        quote! { self as *const Self as i64, }
+    } else {
+        quote! {}
+    };
+    let raw_ref_words: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { self.#fname as i64 }
+        })
+        .collect();
+    let raw_float_words: Vec<TokenStream> = float_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { (self.#fname as f64).to_bits() as i64 }
+        })
+        .collect();
+    let fill_entry_raw_static_prefix: TokenStream = if scalars.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            out.extend_from_slice(&[
+                #(#raw_int_words,)*
+            ]);
+        }
+    };
+    let fill_entry_raw_static_suffix: TokenStream =
+        if !has_vable_identity && ref_scalars.is_empty() && float_scalars.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                out.extend_from_slice(&[
+                    #raw_vable_word
+                    #(#raw_ref_words,)*
+                    #(#raw_float_words,)*
+                ]);
+            }
+        };
+    let fill_entry_raw_reds_override: TokenStream = if steady_entry_without_meta {
+        if arrays.is_empty() {
+            // A separate `extend_from_slice` of a fixed word list lowers to a
+            // handful of stores when this function is outlined. Inlined into
+            // `enter_compiled_function_entry` that call becomes
+            // `Vec::extend_from_slice`'s memmove. Spell the spare-capacity
+            // arm as stores so the inline form keeps the outlined fast path.
+            let raw_vable_expr: TokenStream = if has_vable_identity {
+                quote! { self as *const Self as i64 }
+            } else {
+                quote! {}
+            };
+            let raw_words: Vec<TokenStream> = raw_int_words
+                .iter()
+                .cloned()
+                .chain(has_vable_identity.then(|| raw_vable_expr))
+                .chain(raw_ref_words.iter().cloned())
+                .chain(raw_float_words.iter().cloned())
+                .collect();
+            let raw_count = raw_words.len();
+            let raw_writes: Vec<TokenStream> = raw_words
+                .iter()
+                .enumerate()
+                .map(|(index, word)| {
+                    quote! { __dst.add(#index).write(#word); }
+                })
+                .collect();
+            quote! {
+                #[inline]
+                fn fill_entry_raw_reds(&self, out: &mut ::std::vec::Vec<i64>) -> bool {
+                    let __len = out.len();
+                    if out.capacity().wrapping_sub(__len) >= #raw_count {
+                        unsafe {
+                            let __dst = out.as_mut_ptr().add(__len);
+                            #(#raw_writes)*
+                            out.set_len(__len + #raw_count);
+                        }
+                    } else {
+                        out.extend_from_slice(&[
+                            #(#raw_words),*
+                        ]);
+                    }
+                    true
+                }
+            }
+        } else {
+            quote! {
+                #[inline]
+                fn fill_entry_raw_reds(&self, out: &mut ::std::vec::Vec<i64>) -> bool {
+                    #fill_entry_raw_static_prefix
+                    #(#raw_array_pushes)*
+                    #fill_entry_raw_static_suffix
+                    true
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
     let live_value_types_override: TokenStream =
         if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
             quote! {
@@ -3120,6 +3262,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             #live_value_types_override
 
             #extract_live_values_into_override
+            #fill_entry_reds_without_meta_override
+            #fill_entry_raw_reds_override
 
             fn create_sym(meta: &#meta_ty, header_pc: usize) -> #sym_ty {
                 let mut __offset: usize = 0;

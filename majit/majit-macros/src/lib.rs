@@ -216,6 +216,8 @@ fn rewrite_jit_inline_ref_param_fields(
         // field holds the buffer BASE POINTER, so an indexed access derefs
         // through it rather than reading the field itself.
         array_field_elems: HashMap<String, syn::Path>,
+        // `ElementType in Header`: element 0 is `Header.items`, not `*field`.
+        array_headers: HashMap<String, syn::Path>,
         struct_allocs: HashMap<Vec<String>, syn::Path>,
         // Outer struct segments -> (base field, base path); empty unless a
         // caller declares a leading substructure.
@@ -257,10 +259,19 @@ fn rewrite_jit_inline_ref_param_fields(
             )
         }
 
-        fn array_field_elem(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+        fn array_field_key(struct_path: &syn::Path, field_name: &str) -> Option<String> {
             let struct_last = struct_path.segments.last()?.ident.to_string();
-            let key = format!("{}::{}", struct_last, field_name);
+            Some(format!("{}::{}", struct_last, field_name))
+        }
+
+        fn array_field_elem(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+            let key = Self::array_field_key(struct_path, field_name)?;
             self.array_field_elems.get(&key).cloned()
+        }
+
+        fn array_header(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+            let key = Self::array_field_key(struct_path, field_name)?;
+            self.array_headers.get(&key).cloned()
         }
 
         fn record_ref_field_local(&mut self, local: &syn::Local) {
@@ -285,6 +296,39 @@ fn rewrite_jit_inline_ref_param_fields(
                     .insert(pat_ident.ident.to_string(), pointee);
             }
         }
+
+        // `let col = p as *mut Struct` keeps the pointee the array rewrite
+        // indexes. `jtransform.py` `rewrite_op_cast_pointer` is `same_as`;
+        // the concrete body still has to name the struct to dereference it.
+        fn record_pointer_cast_local(&mut self, local: &syn::Local) {
+            let Some(init) = &local.init else {
+                return;
+            };
+            let syn::Expr::Cast(cast) = &*init.expr else {
+                return;
+            };
+            let syn::Type::Ptr(ptr) = &*cast.ty else {
+                return;
+            };
+            let syn::Type::Path(path) = ptr.elem.as_ref() else {
+                return;
+            };
+            let Some(last) = path.path.segments.last() else {
+                return;
+            };
+            if !last
+                .ident
+                .to_string()
+                .starts_with(|c: char| c.is_ascii_uppercase())
+            {
+                return;
+            }
+            let syn::Pat::Ident(pat_ident) = &local.pat else {
+                return;
+            };
+            self.local_ref_types
+                .insert(pat_ident.ident.to_string(), path.path.clone());
+        }
     }
 
     impl VisitMut for InlineRefFieldRewriter {
@@ -293,8 +337,9 @@ fn rewrite_jit_inline_ref_param_fields(
             // `let x = StructType { f0: v0, f1: v1 }` where StructType is
             // in `struct_allocs` → `let x = allocator_func(v0, v1)`. This
             // must run before `record_ref_field_local`/the default visitor
-            // descend, so `x` stays a plain (non-ref) local bound to the
-            // allocator call's usize result rather than a ref-field local.
+            // descend. The allocator returns `*mut Struct`, so `x` is that
+            // pointer: record the pointee or a later `x.field` / `x.field[i]`
+            // cannot see the layout.
             if let syn::Stmt::Local(local) = stmt
                 && let Some(init) = &mut local.init
                 && let syn::Expr::Struct(s) = &*init.expr
@@ -308,6 +353,10 @@ fn rewrite_jit_inline_ref_param_fields(
                 if let Some(alloc_func) = self.struct_allocs.get(&segs).cloned() {
                     let field_args: Vec<syn::Expr> =
                         s.fields.iter().map(|f| f.expr.clone()).collect();
+                    if let syn::Pat::Ident(pat_ident) = &local.pat {
+                        self.local_ref_types
+                            .insert(pat_ident.ident.to_string(), s.path.clone());
+                    }
                     *init.expr = syn::parse_quote! {
                         #alloc_func(#(#field_args),*)
                     };
@@ -315,11 +364,39 @@ fn rewrite_jit_inline_ref_param_fields(
             }
             if let syn::Stmt::Local(local) = stmt {
                 self.record_ref_field_local(local);
+                self.record_pointer_cast_local(local);
             }
             syn::visit_mut::visit_stmt_mut(self, stmt);
         }
 
         fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+            // Nested `struct_allocs` literals (`items: CelItemsBlock { .. }`
+            // inside `W_ListObject { .. }`) rewrite to the concrete
+            // allocator too. Visit fields first so an inner literal is
+            // already a call when it becomes an argument.
+            if let syn::Expr::Struct(struct_expr) = expr {
+                let segs: Vec<String> = struct_expr
+                    .path
+                    .segments
+                    .iter()
+                    .map(|seg| seg.ident.to_string())
+                    .collect();
+                let alloc_func = self.struct_allocs.get(&segs).cloned();
+                syn::visit_mut::visit_expr_mut(self, expr);
+                if let Some(alloc_func) = alloc_func
+                    && let syn::Expr::Struct(struct_expr) = expr
+                {
+                    let field_args: Vec<syn::Expr> = struct_expr
+                        .fields
+                        .iter()
+                        .map(|field| field.expr.clone())
+                        .collect();
+                    *expr = syn::parse_quote! {
+                        #alloc_func(#(#field_args),*)
+                    };
+                }
+                return;
+            }
             // Array element WRITE: `<base>.<array_field>[<idx>] = <rhs>`.
             // Must precede the plain-field arms: the field itself holds the
             // buffer BASE POINTER, so letting the default visitor rewrite
@@ -343,6 +420,11 @@ fn rewrite_jit_inline_ref_param_fields(
             {
                 let base = (*field.base).clone();
                 let member = field.member.clone();
+                let member_name = member_id.to_string();
+                let header = self.array_header(&struct_path, &member_name);
+                let element = self
+                    .array_field_elem(&struct_path, &member_name)
+                    .expect("array field element");
                 let mut idx = (*index_expr.index).clone();
                 let mut rhs = (*assign.right).clone();
                 self.visit_expr_mut(&mut idx);
@@ -350,16 +432,40 @@ fn rewrite_jit_inline_ref_param_fields(
                 // The assigned value is evaluated before the assignee place,
                 // so an index or RHS with side effects must not be reordered:
                 // `base.data[next_index()] = compute_value()` runs
-                // `compute_value()` first.
-                *expr = syn::parse_quote! {
-                    {
-                        let __majit_arr_val = #rhs;
-                        let __majit_arr_obj = #base;
-                        let __majit_arr_idx = #idx;
-                        unsafe {
-                            *((*(__majit_arr_obj as *mut #struct_path))
-                                .#member
-                                .add(__majit_arr_idx as usize)) = __majit_arr_val;
+                // `compute_value()` first. A header array's field addresses
+                // the block, and element 0 is `header.items` — the same
+                // concrete shape `jit_interp` emits for `ElementType in Header`.
+                *expr = if let Some(header) = header {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_val = #rhs;
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                let __majit_arr_block = core::mem::transmute::<
+                                    _,
+                                    *mut #header,
+                                >(
+                                    (*(__majit_arr_obj as *const #struct_path)).#member,
+                                );
+                                let __majit_arr_items = (__majit_arr_block as *mut u8).add(
+                                    core::mem::offset_of!(#header, items),
+                                ) as *mut #element;
+                                *__majit_arr_items.add(__majit_arr_idx as usize) = __majit_arr_val;
+                            }
+                        }
+                    }
+                } else {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_val = #rhs;
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                *((*(__majit_arr_obj as *mut #struct_path))
+                                    .#member
+                                    .add(__majit_arr_idx as usize)) = __majit_arr_val;
+                            }
                         }
                     }
                 };
@@ -378,16 +484,42 @@ fn rewrite_jit_inline_ref_param_fields(
             {
                 let base = (*field.base).clone();
                 let member = field.member.clone();
+                let member_name = member_id.to_string();
+                let header = self.array_header(&struct_path, &member_name);
+                let element = self
+                    .array_field_elem(&struct_path, &member_name)
+                    .expect("array field element");
                 let mut idx = (*index_expr.index).clone();
                 self.visit_expr_mut(&mut idx);
-                *expr = syn::parse_quote! {
-                    {
-                        let __majit_arr_obj = #base;
-                        let __majit_arr_idx = #idx;
-                        unsafe {
-                            *((*(__majit_arr_obj as *const #struct_path))
-                                .#member
-                                .add(__majit_arr_idx as usize))
+                *expr = if let Some(header) = header {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                let __majit_arr_block = core::mem::transmute::<
+                                    _,
+                                    *mut #header,
+                                >(
+                                    (*(__majit_arr_obj as *const #struct_path)).#member,
+                                );
+                                let __majit_arr_items = (__majit_arr_block as *mut u8).add(
+                                    core::mem::offset_of!(#header, items),
+                                ) as *mut #element;
+                                *__majit_arr_items.add(__majit_arr_idx as usize)
+                            }
+                        }
+                    }
+                } else {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                *((*(__majit_arr_obj as *const #struct_path))
+                                    .#member
+                                    .add(__majit_arr_idx as usize))
+                            }
                         }
                     }
                 };
@@ -502,6 +634,14 @@ fn rewrite_jit_inline_ref_param_fields(
                     format!("{}::{}", struct_last, entry.field),
                     entry.element_type.clone(),
                 )
+            })
+            .collect(),
+        array_headers: array_fields
+            .iter()
+            .filter_map(|entry| {
+                let header = entry.header.clone()?;
+                let struct_last = entry.struct_type.segments.last()?.ident.to_string();
+                Some((format!("{}::{}", struct_last, entry.field), header))
             })
             .collect(),
         struct_allocs: struct_allocs_map,

@@ -188,7 +188,11 @@ impl<'c> Lowerer<'c> {
         }
         impl<'ast> Visit<'ast> for CallProbe {
             fn visit_expr_call(&mut self, c: &'ast ExprCall) {
-                self.hit = true;
+                // `ptr::null` / `ptr::null_mut` is `Constant(nullptr)`, not a
+                // call whose side effect would have to abort the arm.
+                if !super::call_is_null_ptr(c) {
+                    self.hit = true;
+                }
                 syn::visit::visit_expr_call(self, c);
             }
             fn visit_expr_method_call(&mut self, c: &'ast ExprMethodCall) {
