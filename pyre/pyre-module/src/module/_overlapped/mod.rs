@@ -447,21 +447,33 @@ fn overlapped_getresult(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
         Some(w) => pyre_interpreter::baseobjspace::is_true(w)?,
         None => false,
     };
-    let mut state = native(obj)?.lock();
-    match state.kind {
-        OverlappedType::None => {
-            return Err(pyre_interpreter::PyError::value_error(
-                "operation not yet attempted",
-            ));
+    let record = native(obj)?;
+    // The wait runs with the GIL released, as `Overlapped_getresult` wraps
+    // `GetOverlappedResult` in `Py_BEGIN_ALLOW_THREADS`, and with the record's
+    // lock dropped: `cancel`, the one call that can end the operation early,
+    // takes that lock.  The record is owned by the object and never moves.
+    let (handle, overlapped) = {
+        let state = record.lock();
+        match state.kind {
+            OverlappedType::None => {
+                return Err(pyre_interpreter::PyError::value_error(
+                    "operation not yet attempted",
+                ));
+            }
+            OverlappedType::NotStarted => {
+                return Err(pyre_interpreter::PyError::value_error(
+                    "operation failed to start",
+                ));
+            }
+            _ => {}
         }
-        OverlappedType::NotStarted => {
-            return Err(pyre_interpreter::PyError::value_error(
-                "operation failed to start",
-            ));
-        }
-        _ => {}
-    }
-    let result = host_overlapped::get_overlapped_result(state.handle, &state.overlapped, wait);
+        (state.handle, std::ptr::addr_of!(state.overlapped))
+    };
+    let result = {
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
+        host_overlapped::get_overlapped_result(handle, unsafe { &*overlapped }, wait)
+    };
+    let mut state = record.lock();
     let transferred = result.transferred as usize;
     state.error = result.error;
     let broken_pipe_ok = matches!(
@@ -978,7 +990,11 @@ pub unsafe fn w_overlapped_dealloc(obj: PyObjectRef) {
 
 fn connect_pipe(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let address = pyre_interpreter::baseobjspace::text_w(arg(args, 0, "ConnectPipe")?)?;
-    host_overlapped::connect_pipe(address)
+    let handle = {
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
+        host_overlapped::connect_pipe(address)
+    };
+    handle
         .map(|handle| w_uintptr(handle as usize))
         .map_err(win32_err)
 }
@@ -995,12 +1011,15 @@ fn create_iocp(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
 }
 
 fn get_queued_completion_status(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
-    match host_overlapped::get_queued_completion_status(
-        isize_w(arg(args, 0, "GetQueuedCompletionStatus")?)?,
-        u32_w(arg(args, 1, "GetQueuedCompletionStatus")?)?,
-    )
-    .map_err(win32_err)?
-    {
+    let port = isize_w(arg(args, 0, "GetQueuedCompletionStatus")?)?;
+    let msecs = u32_w(arg(args, 1, "GetQueuedCompletionStatus")?)?;
+    // The wait is where an event loop sleeps, so the other threads -- the
+    // ones `call_soon_threadsafe` wakes it from -- run meanwhile.
+    let status = {
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
+        host_overlapped::get_queued_completion_status(port, msecs)
+    };
+    match status.map_err(win32_err)? {
         host_overlapped::WaitResult::Timeout => Ok(pyre_object::w_none()),
         host_overlapped::WaitResult::Queued(status) => {
             let mut fields = pyre_object::gc_roots::RootedItems::new();
@@ -1042,11 +1061,14 @@ fn unregister_wait(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
 }
 
 fn unregister_wait_ex(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
-    host_overlapped::unregister_wait_ex(
-        isize_w(arg(args, 0, "UnregisterWaitEx")?)?,
-        isize_w(arg(args, 1, "UnregisterWaitEx")?)?,
-    )
-    .map_err(win32_err)?;
+    let wait_handle = isize_w(arg(args, 0, "UnregisterWaitEx")?)?;
+    let event = isize_w(arg(args, 1, "UnregisterWaitEx")?)?;
+    // An event handle makes the call wait for the running callbacks.
+    let unregistered = {
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
+        host_overlapped::unregister_wait_ex(wait_handle, event)
+    };
+    unregistered.map_err(win32_err)?;
     Ok(pyre_object::w_none())
 }
 
