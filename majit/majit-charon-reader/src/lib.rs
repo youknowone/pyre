@@ -844,17 +844,18 @@ fn adt_def_id_from_ty_body(raw: &serde_json::value::RawValue) -> Option<u64> {
         #[serde(rename = "Adt")]
         adt: Adt,
     }
-    /// `builtin` is non-null for the tuple / `str` / `Box` decls, which
-    /// have no nominal owner.
+    /// `builtin` is non-null for the tuple / `str` / `Box` decls. Tuple
+    /// and `str` have no nominal owner; `Box` is the nominal
+    /// `alloc::boxed::Box`.
     #[derive(Deserialize)]
     struct Adt {
         id: u64,
         #[serde(default)]
-        builtin: Option<serde::de::IgnoredAny>,
+        builtin: Option<String>,
     }
     serde_json::from_str::<Body>(raw.get())
         .ok()
-        .filter(|b| b.adt.builtin.is_none())
+        .filter(|b| matches!(b.adt.builtin.as_deref(), None | Some("Box")))
         .map(|b| b.adt.id)
 }
 

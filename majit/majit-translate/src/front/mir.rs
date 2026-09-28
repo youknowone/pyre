@@ -31484,26 +31484,12 @@ fn resolve_tyexpr_to_adt_def_id_free(llbc: &Llbc, ty: &serde_json::Value) -> Opt
     if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
         && let Some(body) = arr.get(1)
     {
-        return nominal_adt_def_id(body);
+        return adt_node_def_id(body);
     }
     if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-        return llbc
-            .dedup_to_adt_def_id(id)
-            .or_else(|| llbc.dedup_body(id).and_then(nominal_adt_def_id));
+        return llbc.dedup_to_adt_def_id(id);
     }
     None
-}
-
-/// The `def_id` of a type body that names a declaration by path: a
-/// user/std ADT, or the `Box` lang item, whose builtin decl still carries
-/// the nominal path `alloc::boxed::Box` (an `impl<T> Box<T>` block's
-/// `Self`).  Tuple and `str` decls have no nominal path.
-fn nominal_adt_def_id(body: &serde_json::Value) -> Option<u64> {
-    let tref = body.as_object()?.get("Adt")?.as_object()?;
-    match tref.get("builtin").and_then(serde_json::Value::as_str) {
-        None | Some("Box") => tref.get("id")?.as_u64(),
-        Some(_) => None,
-    }
 }
 
 /// Canonicalise a Charon `BinaryOp` tag (PascalCase + JSON-tagged
@@ -34084,15 +34070,18 @@ fn adt_node_def_id(node: &serde_json::Value) -> Option<u64> {
 }
 
 /// The def id of a nominal ADT `TypeDeclRef` (`{"id": N, "generics": ..,
-/// "builtin": null}`). Tuples, `str` and `Box` are type decls too, tagged by
-/// a non-null `builtin`; they have no nominal owner and answer `None`.
+/// "builtin": null}`). Tuples and `str` are type decls too, tagged by a
+/// non-null `builtin`; they have no nominal owner and answer `None`. `Box`
+/// is tagged as well but its decl is the nominal `alloc::boxed::Box`, the
+/// owner of `impl<T> Box<T>` and `impl Clone for Box<T>`, so it answers
+/// its id.
 pub(crate) fn type_decl_ref_adt_id(
     tref: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<u64> {
-    if tref.get("builtin").is_some_and(|b| !b.is_null()) {
-        return None;
+    match tref.get("builtin").and_then(serde_json::Value::as_str) {
+        None | Some("Box") => tref.get("id")?.as_u64(),
+        Some(_) => None,
     }
-    tref.get("id")?.as_u64()
 }
 
 /// The `builtin` tag of a `TypeDeclRef`: `"Tuple"`, `"Str"` or `"Box"`.
