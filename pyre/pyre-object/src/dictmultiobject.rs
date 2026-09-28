@@ -4421,7 +4421,7 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
         if !w_module_dict_is_object_strategy(obj) {
             crate::with_roots!(obj, value => w_module_dict_switch_to_object_strategy(obj));
         }
-        let object_key = crate::with_roots!(obj, value => object_key_for_checked(key)?);
+        let object_key = crate::with_roots!(obj, value => object_key_for_checked(key))?;
         if let Some(result) = callback_free_dict_op!({
             let entries = w_module_dict_object_storage_mut(obj);
             match entries.index_of(&object_key) {
@@ -4470,7 +4470,7 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
     if strategy.strategy_kind() != StrategyKind::Object {
         crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
     }
-    let object_key = crate::with_roots!(obj, value => object_key_for_checked(key)?);
+    let object_key = crate::with_roots!(obj, value => object_key_for_checked(key))?;
     if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);

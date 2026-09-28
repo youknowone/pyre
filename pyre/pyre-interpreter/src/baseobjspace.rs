@@ -5163,7 +5163,7 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
         // Each `__index__` can collect; restore the receiver (and the
         // assigned value) so the later `w_bytearray_len` / store hit the
         // forwarded header.
-        let indexed = pyre_object::with_roots!(obj, index, value => space_index(index)?);
+        let indexed = pyre_object::with_roots!(obj, index, value => space_index(index))?;
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -5187,7 +5187,7 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     let v = if is_int(value) {
         w_int_get_value(value)
     } else {
-        let indexed = pyre_object::with_roots!(obj, value => space_index(value)?);
+        let indexed = pyre_object::with_roots!(obj, value => space_index(value))?;
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -5322,7 +5322,7 @@ unsafe fn setitem_bytearray_slice(
     let mut obj = obj;
     let mut index = index;
     let mut value = value;
-    let sequence2 = pyre_object::with_roots!(obj, index, value => bytearray_assign_source(value)?);
+    let sequence2 = pyre_object::with_roots!(obj, index, value => bytearray_assign_source(value))?;
     let (rs, rp, st) = pyre_object::with_roots!(obj, index => {
         crate::sliceobject::slice_unpack(
             w_slice_get_start(index),
