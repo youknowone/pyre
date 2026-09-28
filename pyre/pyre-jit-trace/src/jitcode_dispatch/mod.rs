@@ -420,6 +420,22 @@ impl<'a> RawDescrPool<'a> {
         }
     }
 
+    /// Name of the jitcode an `inline_call` operand's `jitcode_index()`
+    /// names.  A per-fn pool numbers its own slots, so the index is an
+    /// `ALL_JITCODES` index only under the global pool; reading a per-fn
+    /// slot number through `get_jitcode_ref_by_index` names an unrelated
+    /// jitcode.
+    pub(crate) fn inline_callee_name(self, jitcode_index: usize) -> Option<&'a str> {
+        match self {
+            Self::Global => crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index)
+                .map(|jc| jc.name.as_str()),
+            Self::PerFn(descrs) => descrs
+                .get(jitcode_index)
+                .and_then(|descr| descr.as_jitcode())
+                .map(|jc| jc.name()),
+        }
+    }
+
     fn runtime_jitcode_at(
         self,
         idx: usize,
@@ -10272,11 +10288,10 @@ fn walker_guard_class<Sym: WalkSym>(
 
 /// Guard the fixed-layout mapdict-carrier representation, the receiver type's
 /// live Python class, live version tag, and the exact map shape used by the
-/// mapdict attribute folds.  Native builtin subclasses share their `ob_type`
-/// with exact builtin values, so the Python class guard is what proves that a
-/// later receiver still has the wide user layout before either mapdict field
-/// is read. The promoted map identity then pins its storage coordinates
-/// (mapdict.py).
+/// mapdict attribute folds.  The layout guard proves that a later receiver
+/// still has the wide user layout before either mapdict field is read, and
+/// the Python class guard which subclass it is. The promoted map identity then
+/// pins its storage coordinates (mapdict.py).
 fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10308,11 +10323,10 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     }
 
     // `typedef.py _getusercls` gives a builtin user subclass a generated payload
-    // containing MapdictStorageMixin. pyre represents that generated payload
-    // with a distinct GC type id but retains the builtin `ob_type`, so
-    // GuardClass alone cannot separate (for example) W_IntObjectUser from the
-    // shorter W_IntObject. Pin `w_class` before loading `map` at the user
-    // offset; an exact builtin or a different subclass exits first.
+    // containing MapdictStorageMixin, and the GuardClass above already
+    // separates it from the shorter builtin payload. Every Python subclass of
+    // one builtin shares that generated class, so pin `w_class` before loading
+    // `map`; a different subclass exits first.
     walker_guard_exact_w_class(ctx, op_pc, obj, w_type)?;
 
     // The instance map pins the storage layout, but class mutation can change
@@ -10368,6 +10382,10 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
 /// This is the argument [`walker_numeric_builtin_class`] already makes for
 /// `bool`, stated for a receiver whose class is not known at codegen time.
 ///
+/// A builtin with a `_getusercls` class (`PyType.user_subclass`) needs none of
+/// the three: its subclass instances carry that class as their typeptr, so the
+/// builtin's own typeptr already names the canonical class.
+///
 /// # Safety
 /// `ob_type` must be null or a live `PyType`, and `w_type` a live type object.
 unsafe fn walker_payload_determines_w_class(
@@ -10378,9 +10396,10 @@ unsafe fn walker_payload_determines_w_class(
         return false;
     }
     unsafe {
-        !pyre_object::typeobject::w_type_get_acceptable_as_base_class(w_type)
-            && !pyre_object::typeobject::w_type_is_cpython_heaptype(w_type)
-            && std::ptr::eq(pyre_object::pyobject::get_instantiate(&*ob_type), w_type)
+        std::ptr::eq(pyre_object::pyobject::get_instantiate(&*ob_type), w_type)
+            && (!(*ob_type).user_subclass.is_null()
+                || (!pyre_object::typeobject::w_type_get_acceptable_as_base_class(w_type)
+                    && !pyre_object::typeobject::w_type_is_cpython_heaptype(w_type)))
     }
 }
 
@@ -10949,6 +10968,23 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
         && std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
     {
         return Ok(());
+    }
+    // A builtin whose user subclass instances carry their own typeptr
+    // (`typedef.py _getusercls`) is proven exact by its typeptr: `GuardClass`
+    // is the whole proof and the class word is never read.
+    if let Some(concrete) = walker_concrete_ref_object(ctx, obj)
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete))
+    {
+        let ob_type = unsafe { (*concrete).ob_type };
+        if !unsafe { (*ob_type).user_subclass }.is_null()
+            && std::ptr::eq(
+                pyre_object::pyobject::get_instantiate(unsafe { &*ob_type }),
+                expected_typeobj,
+            )
+        {
+            return walker_guard_class(ctx, op_pc, obj, ob_type as i64);
+        }
     }
     // Every predicate that admits one of these folds — `is_exact_builtin_instance`,
     // `is_plain_int1`, [`walker_exact_builtin_class`] — treats a null `w_class` as a

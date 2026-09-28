@@ -3541,6 +3541,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
     num_regs_r: usize,
     constants_r: &[majit_jitcode::codewriter::jitcode::ConstSlotR],
     callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
     method_form_deferred_helpers: bool,
 ) -> CalleeReplayScan {
     replay_safety_dump_body(body_code, callee_descr_refs);
@@ -4145,6 +4146,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                 num_regs_i,
                 constants_i,
                 callee_descr_refs,
+                callee_pool,
             ) {
                 Some(SpecializedBinop::Numeric) => {
                     dst_exact_numeric = true;

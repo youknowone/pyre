@@ -6096,6 +6096,7 @@ pub(crate) fn inline_call_specialized_plain_numeric_binop(
     num_regs_i: usize,
     constants_i: &[i64],
     callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
 ) -> Option<SpecializedBinop> {
     if !d.opname.starts_with("inline_call_ir_r") {
         return None;
@@ -6135,7 +6136,11 @@ pub(crate) fn inline_call_specialized_plain_numeric_binop(
     // declines a body the walker will specialize.
     let tag = match int_concretes.first() {
         Some(ConcreteValue::Int(tag)) => *tag,
-        _ => super::specialize::binary_op_tag_for_helper_index(sub_index?, &int_concretes)?,
+        _ => super::specialize::binary_op_tag_for_helper_index(
+            callee_pool,
+            sub_index?,
+            &int_concretes,
+        )?,
     };
     use pyre_interpreter::bytecode::BinaryOperator;
     match pyre_interpreter::runtime_ops::binary_op_from_tag(tag) {

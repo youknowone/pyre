@@ -526,6 +526,8 @@ pub unsafe fn ensure_type_terminator(w_type: PyObjectRef) -> *const u8 {
 unsafe fn is_generated_user_layout_family(obj: PyObjectRef) -> bool {
     unsafe {
         pyre_object::is_int(obj)
+            || pyre_object::is_float(obj)
+            || pyre_object::is_complex(obj)
             || pyre_object::is_str(obj)
             || (pyre_object::is_tuple(obj)
                 && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj))
@@ -538,7 +540,7 @@ unsafe fn is_generated_user_layout_family(obj: PyObjectRef) -> bool {
 /// records that mixin; `mapdict.py` never names zlib / `_lsprof` /
 /// `_queue` / `_ssl`. Ordinary `W_ObjectObject` instances share
 /// `INSTANCE_TYPE`, which carries the same bit. The generated
-/// tuple/int/str user layouts append the mixin after the builtin
+/// tuple/int/float/complex/str user layouts append the mixin after the builtin
 /// payload (`typedef.py` `_getusercls`) and are identified by those
 /// user type ids.
 ///
@@ -560,13 +562,15 @@ pub unsafe fn has_mapdict_layout(obj: PyObjectRef) -> bool {
     }
     let type_id = unsafe { (*majit_gc::header::header_of(obj as usize)).type_id() };
     type_id == pyre_object::intobject::W_INT_USER_GC_TYPE_ID
+        || type_id == pyre_object::floatobject::W_FLOAT_USER_GC_TYPE_ID
+        || type_id == pyre_object::complexobject::W_COMPLEX_USER_GC_TYPE_ID
         || type_id == pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID
         || type_id == pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID
 }
 
 /// Whether attribute access for `obj` routes through mapdict storage. This is
 /// the physical [`has_mapdict_layout`] test plus the owning class's `hasdict`
-/// flag for generated tuple/int/str user layouts.
+/// flag for generated tuple/int/float/complex/str user layouts.
 ///
 /// # Safety
 /// `obj` must be null or a live object reference.
@@ -853,7 +857,7 @@ pub unsafe fn instance_del_weakref_slot(obj: PyObjectRef) {
 #[majit_macros::dont_look_inside]
 pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectRef> {
     assert!(
-        unsafe { has_mapdict_storage(obj) },
+        unsafe { has_mapdict_layout(obj) },
         "W_Root.getslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);
@@ -879,7 +883,7 @@ pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectR
 #[majit_macros::dont_look_inside]
 pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRef) {
     assert!(
-        unsafe { has_mapdict_storage(obj) },
+        unsafe { has_mapdict_layout(obj) },
         "W_Root.setslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);
@@ -905,7 +909,7 @@ pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRe
 #[majit_macros::dont_look_inside]
 pub unsafe fn delslotvalue(obj: PyObjectRef, slotindex: u32) -> bool {
     assert!(
-        unsafe { has_mapdict_storage(obj) },
+        unsafe { has_mapdict_layout(obj) },
         "W_Root.delslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);
@@ -3454,6 +3458,24 @@ impl MapdictCarrier {
         let obj = self.obj;
         if unsafe { pyre_object::is_int(obj) } {
             let user = obj as *mut pyre_object::intobject::W_IntObjectUser;
+            return unsafe {
+                (
+                    std::ptr::addr_of_mut!((*user).map),
+                    std::ptr::addr_of_mut!((*user).storage),
+                )
+            };
+        }
+        if unsafe { pyre_object::is_float(obj) } {
+            let user = obj as *mut pyre_object::floatobject::W_FloatObjectUser;
+            return unsafe {
+                (
+                    std::ptr::addr_of_mut!((*user).map),
+                    std::ptr::addr_of_mut!((*user).storage),
+                )
+            };
+        }
+        if unsafe { pyre_object::is_complex(obj) } {
+            let user = obj as *mut pyre_object::complexobject::W_ComplexObjectUser;
             return unsafe {
                 (
                     std::ptr::addr_of_mut!((*user).map),

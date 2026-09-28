@@ -3756,7 +3756,8 @@ fn callee_body_commits_nothing(w_code: *const ()) -> bool {
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
         return false;
     };
-    let Some((descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code) else {
+    let Some((descr_refs, perfn_descrs, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
+    else {
         return false;
     };
     matches!(
@@ -3768,6 +3769,7 @@ fn callee_body_commits_nothing(w_code: *const ()) -> bool {
             body.num_regs_r,
             body.constants_r,
             &descr_refs,
+            RawDescrPool::PerFn(perfn_descrs),
             false,
         )
         .verdict(),
@@ -6853,6 +6855,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             body.num_regs_r,
             body.constants_r,
             callee_descr_refs,
+            RawDescrPool::PerFn(callee_perfn_descrs),
             method_form,
         );
         let safety = scan.verdict();
@@ -7149,6 +7152,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 body.num_regs_r,
                 body.constants_r,
                 callee_descr_refs,
+                RawDescrPool::PerFn(callee_perfn_descrs),
                 false,
             ))
         } else {
@@ -12721,7 +12725,9 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
         decline!(V::NoResumeEntry)
     };
     census.ops_to_yield = generator_resume_op_scan(body.code);
-    if let Some((descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_pycode) {
+    if let Some((descr_refs, perfn_descrs, _)) =
+        crate::state::sub_jitcode_descr_pool_for_code(w_pycode)
+    {
         let scan = fbw_callee_body_replay_scan(
             body.code,
             &[],
@@ -12730,6 +12736,7 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
             body.num_regs_r,
             body.constants_r,
             &descr_refs,
+            RawDescrPool::PerFn(perfn_descrs),
             false,
         );
         census.replay = Some(GeneratorResumeReplay {
@@ -14692,8 +14699,11 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             // do not re-enter `binary_value_from_tag`, which inlines
             // `add` and recurses.
             if ref_args.len() == 2
-                && let Some(op_tag) =
-                    super::specialize::binary_op_tag_for_helper_index(sub_index, int_arg_concretes)
+                && let Some(op_tag) = super::specialize::binary_op_tag_for_helper_index(
+                    ctx.raw_descrs,
+                    sub_index,
+                    int_arg_concretes,
+                )
                 && let Some((dst_bank, dst, _)) = call_opcode_result_dst(code, pc)
                 && dst_bank == 'r'
             {
@@ -16085,7 +16095,8 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         && args.len() == 2
         && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
             .is_some_and(|jc| jc.code.as_ptr() == sub_body.code.as_ptr())
-        && let Some(op_tag) = super::specialize::binary_op_tag_for_helper_index(sub_index, &[])
+        && let Some(op_tag) =
+            super::specialize::binary_op_tag_for_helper_index(ctx.raw_descrs, sub_index, &[])
     {
         let dst = code[op.pc + 1 + 2 + arg_width] as usize;
         let write_boxed = |ctx: &mut WalkContext<'_, '_, Sym>, boxed: OpRef| {
@@ -16478,16 +16489,17 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // Inplace tags (`a += i`) lower as a named `inplace_add` body, not
     // `binary_value_from_tag`.  Without the I-list / helper-name tag
     // those calls never reached `try_emit_exact_int_binop`.
-    let is_binary_from_tag = ctx
-        .raw_descrs
-        .runtime_jitcode_at(descr_index)
-        .is_some_and(|jc| super::specialize::jitcode_name_is_binary_value_from_tag(jc.name()))
-        || super::specialize::jitcode_is_binary_value_from_tag(sub_index, &sub_body);
+    let is_binary_from_tag =
+        super::specialize::jitcode_is_binary_value_from_tag(ctx.raw_descrs, sub_index, &sub_body);
     let op_tag = match int_arg_concretes.first() {
         Some(ConcreteValue::Int(tag)) if is_binary_from_tag => Some(*tag),
         Some(ConcreteValue::Int(tag)) if inplace_int_arith_tag(*tag) => Some(*tag),
-        _ => super::specialize::binary_op_tag_for_helper_index(sub_index, &int_arg_concretes)
-            .filter(|&tag| inplace_int_arith_tag(tag)),
+        _ => super::specialize::binary_op_tag_for_helper_index(
+            ctx.raw_descrs,
+            sub_index,
+            &int_arg_concretes,
+        )
+        .filter(|&tag| inplace_int_arith_tag(tag)),
     };
     // Residual BINARY_OP records the raising arm before dest-write
     // (`try_walker_specialize_binary_op_int_zero_div`).  Flatten lands
@@ -16503,7 +16515,11 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // such gate.
     let zero_div_tag = match int_arg_concretes.first() {
         Some(ConcreteValue::Int(tag)) if is_binary_from_tag => Some(*tag),
-        _ => super::specialize::binary_op_tag_for_helper_index(sub_index, &int_arg_concretes),
+        _ => super::specialize::binary_op_tag_for_helper_index(
+            ctx.raw_descrs,
+            sub_index,
+            &int_arg_concretes,
+        ),
     };
     if dst_bank == 'r'
         && ref_args.len() == 2

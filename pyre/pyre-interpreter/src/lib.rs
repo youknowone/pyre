@@ -1205,18 +1205,18 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(162, typed::<crate::pycode::W_LineIterObject>()),
         subclass_range_alias(163, typed::<crate::pycode::W_PositionsIterObject>()),
         subclass_range_alias(164, typed::<crate::pycode::W_BranchesIterObject>()),
-        // Native-only posix aliases 170 and 171 preserve `build_gc`'s rclass
-        // registration order after the `_getusercls` layouts (167-169).
+        // Native-only posix aliases 172 and 173 preserve `build_gc`'s rclass
+        // registration order after the `_getusercls` layouts (167-171).
         // `scandir` has no seam on wasm32, so neither type exists there.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(170, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(172, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(171, typed::<crate::module::posix::W_ScandirIterator>()),
+        subclass_range_alias(173, typed::<crate::module::posix::W_ScandirIterator>()),
         // PEP 528's raw console stream closes the interpreter's classes on
         // Windows.  It is subclassable and therefore participates in the same
         // rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(172, typed::<crate::module::_io::W_WindowsConsoleIO>()),
+        subclass_range_alias(174, typed::<crate::module::_io::W_WindowsConsoleIO>()),
     ];
     aliases.extend(module_subclass_range_aliases());
     aliases
@@ -1232,11 +1232,11 @@ const WINDOWS_CONSOLE_IO: bool = cfg!(all(windows, feature = "host_env", not(fea
 /// not depend on which modules are linked; the module classes follow in the
 /// order [`module_gc_types`] lists them.
 pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
-    170
-} else if WINDOWS_CONSOLE_IO {
-    173
-} else {
     172
+} else if WINDOWS_CONSOLE_IO {
+    175
+} else {
+    174
 };
 
 /// The GC classes of builtin modules, in `build_gc` order: those of this

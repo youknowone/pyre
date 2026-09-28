@@ -674,7 +674,7 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
     let mut unicode = W_UnicodeObjectUser {
         base: W_UnicodeObject {
             ob_header: PyObject {
-                ob_type: &STR_TYPE as *const PyType,
+                ob_type: &crate::pyobject::STR_USER_TYPE as *const PyType,
                 w_class: crate::gc_roots::shadow_stack_get(class_slot),
             },
             value: crate::gc_roots::shadow_stack_get(value_slot) as *mut UnicodeValueStorage,
@@ -1323,7 +1323,7 @@ pub unsafe fn w_str_codepoint_at(obj: PyObjectRef, index: usize) -> Option<CodeP
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_str(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &STR_TYPE) }
+    unsafe { py_type_check(obj, &STR_TYPE) || py_type_check(obj, &crate::pyobject::STR_USER_TYPE) }
 }
 
 #[majit_macros::elidable]
@@ -1821,6 +1821,23 @@ pub fn int_str_text(v: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `typedef.py _getusercls(W_UnicodeObject)`: a str subclass instance
+    /// carries `STR_USER_TYPE` and is not an exact str by typeptr.
+    #[test]
+    fn str_subclass_instance_carries_user_typeptr() {
+        let w_class = crate::w_type_new("StrSub", PY_NULL, std::ptr::null_mut());
+        let obj = w_str_subclass_from_wtf8(Wtf8Buf::from("abc"), w_class);
+        unsafe {
+            assert!(std::ptr::eq(
+                (*obj).ob_type,
+                &crate::pyobject::STR_USER_TYPE
+            ));
+            assert!(is_str(obj));
+            assert!(!crate::pyobject::is_exact_type(obj, &STR_TYPE));
+            assert_eq!(w_str_get_wtf8(obj), "abc");
+        }
+    }
 
     #[test]
     fn test_str_create_and_read() {

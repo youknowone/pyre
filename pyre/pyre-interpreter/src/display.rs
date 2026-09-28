@@ -540,9 +540,10 @@ unsafe fn builtin_leaf_repr_string(
 }
 
 /// Dispatch a user-defined `__repr__`/`__str__` override for a builtin leaf
-/// subclass instance.  `int`/`float`/`str`/... keep `ob_type` at the
-/// canonical storage type and carry the Python class in `w_class`, so the
-/// `ob_type`-keyed formatters ignore a subclass override.  Returns `Some`
+/// subclass instance.  `int`/`float`/`str`/... user subclasses carry a
+/// `_getusercls` typeptr. Callers pass `layout_base` of that typeptr, so
+/// the formatters below see the builtin storage type and would ignore a
+/// subclass override.  Returns `Some`
 /// only when the dunder resolves above `object` (whose inherited default
 /// must fall through to the builtin formatting instead of re-entering).
 /// `builtin_subclass_dunder` returning the raw `str` result object so a
@@ -554,6 +555,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
     name: &str,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     unsafe {
+        let tp = pyre_object::pyobject::layout_base(tp);
         let is_leaf = std::ptr::eq(tp, &INT_TYPE as *const PyType)
             || std::ptr::eq(tp, &LONG_TYPE as *const PyType)
             || std::ptr::eq(tp, &FLOAT_TYPE as *const PyType)
@@ -877,7 +879,9 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let mut obj = obj;
-        let tp = (*obj).ob_type;
+        // The formatting below is keyed on the payload layout, which a
+        // `_getusercls` class shares with the builtin it was made from.
+        let tp = pyre_object::pyobject::layout_base((*obj).ob_type);
         // A builtin leaf subclass keeps `ob_type` at the canonical storage
         // type but carries the Python class in `w_class`; dispatch its
         // `__repr__` override before the `ob_type`-keyed formatting below.
@@ -1404,7 +1408,9 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
         if obj.is_null() {
             return Ok(Wtf8Buf::from_string("NULL".to_string()));
         }
-        let tp = (*obj).ob_type;
+        // Keyed on the payload layout, which a `_getusercls` class shares
+        // with the builtin it was made from.
+        let tp = pyre_object::pyobject::layout_base((*obj).ob_type);
         // For strings, return the value directly (no quotes).
         if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
             if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__str__")? {

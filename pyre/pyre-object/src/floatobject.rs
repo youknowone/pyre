@@ -10,21 +10,30 @@ use crate::pyobject::*;
 pub struct W_FloatObject {
     pub ob_header: PyObject,
     pub floatval: f64,
-    /// Native-subclass mapdict owner. Exact floats keep this null.
-    pub w_dict: PyObjectRef,
-    /// Native-subclass `__slots__` storage indexed by `Member.index`.
-    pub w_slots: PyObjectRef,
+}
+
+/// The translated user-subclass layout selected by `typedef.py _getusercls`.
+/// `W_FloatObject` remains the base payload; `MapdictStorageMixin` contributes
+/// its fields only to the generated user class.
+#[repr(C)]
+pub struct W_FloatObjectUser {
+    pub base: W_FloatObject,
+    pub map: usize,
+    pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 /// Field offset of `floatval` within `W_FloatObject`, for JIT field access.
 pub const FLOAT_FLOATVAL_OFFSET: usize = std::mem::offset_of!(W_FloatObject, floatval);
-pub const FLOAT_W_DICT_OFFSET: usize = std::mem::offset_of!(W_FloatObject, w_dict);
-pub const FLOAT_W_SLOTS_OFFSET: usize = std::mem::offset_of!(W_FloatObject, w_slots);
 
 /// GC type id assigned to `W_FloatObject` at JitDriver init time.
 /// Held as a constant here (rather than runtime-queried) so the
 /// allocation hook can reach it without a back-channel.
 pub const W_FLOAT_GC_TYPE_ID: u32 = 2;
+/// User-subclass float layout (`typedef.py` `_getusercls`). Unconditional,
+/// so its tid sits with the other closed ids (170) ahead of the
+/// target-gated tail.
+pub const W_FLOAT_USER_GC_TYPE_ID: u32 = 170;
+pub const W_FLOAT_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_FloatObjectUser>();
 
 /// Fixed payload size for `W_FloatObject`, mirroring `info.fixedsize`
 /// in `framework.py:811`.
@@ -35,6 +44,14 @@ impl crate::lltype::GcType for W_FloatObject {
         W_FLOAT_GC_TYPE_ID
     }
     const SIZE: usize = W_FLOAT_OBJECT_SIZE;
+}
+
+impl crate::lltype::GcType for W_FloatObjectUser {
+    #[inline(always)]
+    fn type_id() -> u32 {
+        W_FLOAT_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_FLOAT_USER_OBJECT_SIZE;
 }
 
 /// Allocate a new W_FloatObject on the heap.
@@ -89,8 +106,6 @@ pub fn newfloat(value: f64) -> PyObjectRef {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: value,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
     }) as PyObjectRef
 }
 
@@ -109,8 +124,6 @@ pub fn w_float_gc_alloc(value: f64) -> *mut PyObject {
         (*p).ob_header.ob_type = &FLOAT_TYPE as *const PyType;
         (*p).ob_header.w_class = get_instantiate(&FLOAT_TYPE);
         (*p).floatval = value;
-        (*p).w_dict = PY_NULL;
-        (*p).w_slots = PY_NULL;
     }
     raw as PyObjectRef
 }
@@ -138,21 +151,26 @@ pub extern "C" fn w_float_gc_alloc_word(value: f64) -> i64 {
 /// instance would never die and its `__del__` would never run. See
 /// [`crate::intobject::w_int_subclass_new`].
 pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
-    let obj = W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    let obj = W_FloatObjectUser {
+        base: W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &crate::pyobject::FLOAT_USER_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: value,
         },
-        floatval: value,
-        w_dict: PY_NULL,
-        w_slots: PY_NULL,
+        map: 0,
+        storage: std::ptr::null_mut(),
     };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
+        W_FLOAT_USER_GC_TYPE_ID,
+        std::mem::size_of::<W_FloatObjectUser>(),
+    );
     if raw.is_null() {
         crate::lltype::malloc_typed(obj) as PyObjectRef
     } else {
         unsafe {
-            std::ptr::write(raw as *mut W_FloatObject, obj);
+            std::ptr::write(raw as *mut W_FloatObjectUser, obj);
         }
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
@@ -173,46 +191,6 @@ pub unsafe fn w_float_get_value(obj: PyObjectRef) -> f64 {
     unsafe { (*(obj as *const W_FloatObject)).floatval }
 }
 
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_float_getdict(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_FloatObject)).w_dict }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_float_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
-    unsafe { (*(obj as *mut W_FloatObject)).w_dict = w_dict };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-}
-
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_float_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    let slots = unsafe { (*(obj as *const W_FloatObject)).w_slots };
-    unsafe { crate::slots::slot_get(slots, index) }
-}
-
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_float_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    crate::slot_set_direct!(obj, index, value, W_FloatObject, w_slots)
-}
-
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_float_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    let slots = unsafe { (*(obj as *const W_FloatObject)).w_slots };
-    unsafe { crate::slots::slot_del(slots, index) }
-}
-
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_w_float_new(value_bits: i64) -> i64 {
     let value = f64::from_bits(value_bits as u64);
@@ -222,6 +200,21 @@ pub extern "C" fn jit_w_float_new(value_bits: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `typedef.py _getusercls(W_FloatObject)`: exact floats keep the bare
+    /// `floatval` payload and a subclass instance is `W_FloatObjectUser`
+    /// carrying `FLOAT_USER_TYPE`.
+    #[test]
+    fn float_subclass_instance_carries_user_typeptr() {
+        assert_eq!(W_FLOAT_OBJECT_SIZE, std::mem::size_of::<PyObject>() + 8);
+        let obj = w_float_subclass_new(2.5);
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &FLOAT_USER_TYPE));
+            assert!(is_float(obj));
+            assert!(!is_exact_type(obj, &FLOAT_TYPE));
+            assert_eq!(w_float_get_value(obj), 2.5);
+        }
+    }
 
     // GC-flavored allocations (`malloc_typed`) are leaked in these
     // tests; `Box::from_raw` is unsound once

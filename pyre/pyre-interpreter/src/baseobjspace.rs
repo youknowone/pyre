@@ -5908,50 +5908,6 @@ pub fn getdict(obj: PyObjectRef) -> PyResult {
             return Ok(w_dict);
         }
     }
-    if unsafe { pyre_object::is_float(obj) } {
-        let Some(w_type) = crate::typedef::r#type(obj) else {
-            return Ok(PY_NULL);
-        };
-        if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
-            let existing = unsafe { pyre_object::floatobject::w_float_getdict(obj) };
-            if !existing.is_null() {
-                return Ok(existing);
-            }
-            let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            let w_dict = pyre_object::w_dict_new();
-            unsafe {
-                pyre_object::floatobject::w_float_setdict(
-                    pyre_object::gc_roots::shadow_stack_get(root_base),
-                    w_dict,
-                )
-            };
-            return Ok(w_dict);
-        }
-    }
-    if unsafe { pyre_object::is_complex(obj) } {
-        let Some(w_type) = crate::typedef::r#type(obj) else {
-            return Ok(PY_NULL);
-        };
-        if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
-            let existing = unsafe { pyre_object::complexobject::w_complex_getdict(obj) };
-            if !existing.is_null() {
-                return Ok(existing);
-            }
-            let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            let w_dict = pyre_object::w_dict_new();
-            unsafe {
-                pyre_object::complexobject::w_complex_setdict(
-                    pyre_object::gc_roots::shadow_stack_get(root_base),
-                    w_dict,
-                )
-            };
-            return Ok(w_dict);
-        }
-    }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
         let Some(w_type) = crate::typedef::r#type(obj) else {
             return Ok(PY_NULL);
@@ -6016,12 +5972,6 @@ pub(crate) fn native_slot_get(
             pyre_object::bytearrayobject::w_bytearray_slot_get(obj, index as usize)
         });
     }
-    if unsafe { pyre_object::is_float(obj) } {
-        return Ok(unsafe { pyre_object::floatobject::w_float_slot_get(obj, index as usize) });
-    }
-    if unsafe { pyre_object::is_complex(obj) } {
-        return Ok(unsafe { pyre_object::complexobject::w_complex_slot_get(obj, index as usize) });
-    }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
         return Ok(unsafe { pyre_object::interp_array::w_array_slot_get(obj, index as usize) });
     }
@@ -6061,14 +6011,6 @@ pub(crate) fn native_slot_set(
     }
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
         unsafe { pyre_object::bytearrayobject::w_bytearray_slot_set(obj, index as usize, value) };
-        return Ok(true);
-    }
-    if unsafe { pyre_object::is_float(obj) } {
-        unsafe { pyre_object::floatobject::w_float_slot_set(obj, index as usize, value) };
-        return Ok(true);
-    }
-    if unsafe { pyre_object::is_complex(obj) } {
-        unsafe { pyre_object::complexobject::w_complex_slot_set(obj, index as usize, value) };
         return Ok(true);
     }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
@@ -6111,12 +6053,6 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
         return Ok(unsafe {
             pyre_object::bytearrayobject::w_bytearray_slot_del(obj, index as usize)
         });
-    }
-    if unsafe { pyre_object::is_float(obj) } {
-        return Ok(unsafe { pyre_object::floatobject::w_float_slot_del(obj, index as usize) });
-    }
-    if unsafe { pyre_object::is_complex(obj) } {
-        return Ok(unsafe { pyre_object::complexobject::w_complex_slot_del(obj, index as usize) });
     }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
         return Ok(unsafe { pyre_object::interp_array::w_array_slot_del(obj, index as usize) });
@@ -6202,16 +6138,6 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
         require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::bytearrayobject::w_bytearray_setdict(obj, w_dict) };
-        return Ok(());
-    }
-    if unsafe { pyre_object::is_float(obj) } {
-        require_dict_for_setdict(w_dict)?;
-        unsafe { pyre_object::floatobject::w_float_setdict(obj, w_dict) };
-        return Ok(());
-    }
-    if unsafe { pyre_object::is_complex(obj) } {
-        require_dict_for_setdict(w_dict)?;
-        unsafe { pyre_object::complexobject::w_complex_setdict(obj, w_dict) };
         return Ok(());
     }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
@@ -13586,7 +13512,7 @@ pub(crate) unsafe fn get(
         }
         // typedef.py:511: w_result = w_obj.getslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
-        let found = if is_instance(obj) {
+        let found = if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
             crate::objspace::std::mapdict::getslotvalue(obj, index)
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
@@ -13682,7 +13608,7 @@ unsafe fn set(
         }
         // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
         let index = pyre_object::w_member_get_index(descr);
-        if is_instance(obj) {
+        if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
             crate::objspace::std::mapdict::setslotvalue(obj, index, value);
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
@@ -13743,7 +13669,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
         }
         // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
-        let removed = if is_instance(obj) {
+        let removed = if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
             crate::objspace::std::mapdict::delslotvalue(obj, index)
         } else {
             // Native-layout subclass instance — slot backed by __dict__.

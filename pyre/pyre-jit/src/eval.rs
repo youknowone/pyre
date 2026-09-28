@@ -1746,23 +1746,17 @@ fn build_gc() -> Box<MiniMarkGC> {
     // gc.py:642). They are NewWithVtable allocation targets so the
     // payload size must be the actual struct size, and they sit one
     // level below the OBJECT root (`int.__bases__ == (object,)`,
-    // `float.__bases__ == (object,)`). W_IntObject is a pure leaf;
-    // W_FloatObject additionally traces `w_class`/`w_dict`/`w_slots`, the last
-    // handing slot-value ownership to the list's custom tracer, so it registers
-    // with the gc-pointer offsets below.
+    // `float.__bases__ == (object,)`). Both are pure leaves: a user
+    // subclass is `W_*ObjectUser` and traces its mapdict `storage`
+    // separately. `w_class` is the root's inherited edge.
     let w_int_tid = gc.register_type(TypeInfo::object_subclass(
         std::mem::size_of::<W_IntObject>(),
         object_tid,
     ));
     debug_assert_eq!(w_int_tid, W_INT_GC_TYPE_ID);
-    let w_float_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+    let w_float_tid = gc.register_type(TypeInfo::object_subclass(
         std::mem::size_of::<W_FloatObject>(),
         object_tid,
-        vec![
-            pyre_object::pyobject::W_CLASS_OFFSET,
-            pyre_object::floatobject::FLOAT_W_DICT_OFFSET,
-            pyre_object::floatobject::FLOAT_W_SLOTS_OFFSET,
-        ],
     ));
     debug_assert_eq!(w_float_tid, W_FLOAT_GC_TYPE_ID);
     // jitframe.py — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
@@ -3023,22 +3017,17 @@ fn build_gc() -> Box<MiniMarkGC> {
         w_object_object_tid,
         pyre_object::objectobject::W_OBJECT_OBJECT_GC_TYPE_ID,
     );
-    // W_ComplexObject carries two f64s after the `PyObject` header plus
-    // three traced edges — `w_class`, `w_dict`, and the `w_slots` list
-    // whose custom tracer owns the slot values — mirroring W_FloatObject.
+    // W_ComplexObject carries two f64s after the `PyObject` header.
+    // A user subclass is `W_ComplexObjectUser` and traces its mapdict
+    // `storage` separately; `w_class` is the root's inherited edge.
     // Registered immediately after the last hardcoded-constant tid
     // (W_ObjectObject = 53) so its fixed id 54 precedes the auto-numbered
     // `#[pyre_class]` / per-ExcKind tids registered below.  Bound to
     // `COMPLEX_TYPE` so the collector reads the correct size + trace when a
     // managed container holds a complex.
-    let w_complex_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+    let w_complex_tid = gc.register_type(TypeInfo::object_subclass(
         std::mem::size_of::<pyre_object::complexobject::W_ComplexObject>(),
         object_tid,
-        vec![
-            pyre_object::pyobject::W_CLASS_OFFSET,
-            pyre_object::complexobject::COMPLEX_W_DICT_OFFSET,
-            pyre_object::complexobject::COMPLEX_W_SLOTS_OFFSET,
-        ],
     ));
     debug_assert_eq!(
         w_complex_tid,
@@ -3971,35 +3960,95 @@ fn build_gc() -> Box<MiniMarkGC> {
     // every target, so they close the ungated block with the range
     // iterators (185-187) instead of sitting in the target-gated tail
     // whose ids move (windows +3 vs darwin).
-    let int_user_tid = gc.register_type(
-        TypeInfo::with_custom_trace(
-            pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
-            int_object_custom_trace,
-        )
-        .object_layout_without_subclass_range(),
-    );
+    let int_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
+        w_int_tid,
+        int_object_custom_trace,
+    ));
     debug_assert_eq!(int_user_tid, pyre_object::intobject::W_INT_USER_GC_TYPE_ID);
-    let unicode_user_tid = gc.register_type(
-        TypeInfo::with_custom_trace(
-            pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
-            unicode_user_object_custom_trace,
-        )
-        .object_layout_without_subclass_range(),
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::INT_USER_TYPE as *const _ as usize,
+        int_user_tid,
     );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::INT_USER_TYPE as *const _ as usize,
+        int_user_tid,
+    );
+    let unicode_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
+        w_str_tid,
+        unicode_user_object_custom_trace,
+    ));
     debug_assert_eq!(
         unicode_user_tid,
         pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID
     );
-    let tuple_user_tid = gc.register_type(
-        TypeInfo::with_custom_trace(
-            pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
-            tuple_user_object_custom_trace,
-        )
-        .object_layout_without_subclass_range(),
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::STR_USER_TYPE as *const _ as usize,
+        unicode_user_tid,
     );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::STR_USER_TYPE as *const _ as usize,
+        unicode_user_tid,
+    );
+    let tuple_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
+        w_tuple_tid,
+        tuple_user_object_custom_trace,
+    ));
     debug_assert_eq!(
         tuple_user_tid,
         pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::TUPLE_USER_TYPE as *const _ as usize,
+        tuple_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::TUPLE_USER_TYPE as *const _ as usize,
+        tuple_user_tid,
+    );
+    // `int_object_custom_trace` walks `w_class` plus mapdict `storage`
+    // through `MapdictCarrier`, so the same trace covers every
+    // `_getusercls` layout whose only extra edge is that storage.
+    let float_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::floatobject::W_FLOAT_USER_OBJECT_SIZE,
+        w_float_tid,
+        int_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        float_user_tid,
+        pyre_object::floatobject::W_FLOAT_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::FLOAT_USER_TYPE as *const _ as usize,
+        float_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::FLOAT_USER_TYPE as *const _ as usize,
+        float_user_tid,
+    );
+    let complex_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::complexobject::W_COMPLEX_USER_OBJECT_SIZE,
+        w_complex_tid,
+        int_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        complex_user_tid,
+        pyre_object::complexobject::W_COMPLEX_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::COMPLEX_USER_TYPE as *const _ as usize,
+        complex_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::COMPLEX_USER_TYPE as *const _ as usize,
+        complex_user_tid,
     );
 
     // Register `posix.DirEntry`'s four inline GC edges and

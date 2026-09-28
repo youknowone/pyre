@@ -6512,17 +6512,19 @@ fn is_w_compares_by_value(tp: *const pyre_object::pyobject::PyType) -> bool {
 ///   * Same box — `baseobjspace::is_w` answers at its opening `ptr::eq`
 ///     whatever the class, so the result is the constant `True`/`False`.
 ///     No op and no guard: this is the `b1 is b2` fast check itself.
-///   * Distinct boxes whose layouts both keep the default `is_w` — no
-///     value-comparison branch can fire, so `is_w` again reduces to that
-///     `ptr::eq`.  A `GuardClass` per operand pins the layout, then
-///     `ptr_eq`/`ptr_ne` replaces the may-force `compare_fn` and the
+///   * Distinct boxes where `w_two`'s layout keeps the default `is_w` —
+///     `W_Root.is_w` is `self is w_other`, so the answer is that `ptr::eq`
+///     whatever `w_one` is.  One `GuardClass` on `w_two` pins the dispatch
+///     (`w_one` is not guarded: the default `is_w` never reads its class),
+///     then `ptr_eq`/`ptr_ne` replaces the may-force `compare_fn` and the
 ///     `GuardNotForced` behind it.
 ///
-/// Declining on a value-comparing layout is what keeps the second tier
-/// sound: `GuardClass` pins `ob_type`, and an `int` subclass instance
+/// Declining on a value-comparing `w_two` layout is what keeps the second
+/// tier sound: `GuardClass` pins `ob_type`, and an `int` subclass instance
 /// shares `INT_TYPE` with a plain `int` while answering the exact-type gate
 /// differently, so the layout alone cannot separate them.  A tagged
-/// immediate is declined outright — it carries no `ob_type` to guard.
+/// immediate `w_two` is declined outright — it carries no `ob_type` to
+/// guard.
 pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -6556,19 +6558,11 @@ pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
     if lhs_obj.is_null() || rhs_obj.is_null() {
         return Ok(None);
     }
-    if pyre_object::tagged_int::CAN_BE_TAGGED
-        && (pyre_object::tagged_int::is_tagged_int(lhs_obj)
-            || pyre_object::tagged_int::is_tagged_int(rhs_obj))
-    {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(rhs_obj) {
         return Ok(None);
     }
-    let (lhs_type, rhs_type) = unsafe {
-        (
-            (*(lhs_obj as *const pyre_object::pyobject::PyObject)).ob_type,
-            (*(rhs_obj as *const pyre_object::pyobject::PyObject)).ob_type,
-        )
-    };
-    if is_w_compares_by_value(lhs_type) || is_w_compares_by_value(rhs_type) {
+    let rhs_type = unsafe { (*(rhs_obj as *const pyre_object::pyobject::PyObject)).ob_type };
+    if is_w_compares_by_value(rhs_type) {
         return Ok(None);
     }
     // The layout test above is the proof that `is_w` reduces to `ptr::eq`
@@ -6580,18 +6574,15 @@ pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
     }
 
     // commit to the fold: emit IR (no further declines)
-    for (operand, operand_type) in [(lhs, lhs_type), (rhs, rhs_type)] {
-        if operand.is_constant() || ctx.trace_ctx.heap_cache().is_class_known(operand) {
-            continue;
-        }
-        let type_addr = operand_type as usize as i64;
+    if !rhs.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(rhs) {
+        let type_addr = rhs_type as usize as i64;
         let type_const = ctx.trace_ctx.const_int(type_addr);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[operand, type_const], 0);
+            .record_guard(OpCode::GuardClass, &[rhs, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(operand, type_addr);
+            .class_now_known(rhs, type_addr);
     }
     let cmp = if invert { OpCode::PtrNe } else { OpCode::PtrEq };
     let truth = ctx.trace_ctx.record_op(cmp, &[lhs, rhs]);
@@ -7061,9 +7052,8 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     //     SPECIALISED_TUPLE_{II,FF,OO} variants).  Specialised tuples store
     //     `value0`/`value1` inline with no `wrappeditems` block, so a
     //     `getfield(wrappeditems)` on one yields garbage.
-    //   * `w_class == canonical tuple` — a tuple SUBCLASS instance shares the
-    //     payload `ob_type == &TUPLE_TYPE` but retags `w_class` and may
-    //     override `__getitem__`; `baseobjspace::getitem` honours that
+    //   * `w_class == canonical tuple` — a tuple SUBCLASS instance carries
+    //     `TUPLE_USER_TYPE` and may override `__getitem__`; `baseobjspace::getitem` honours that
     //     override (subclass_special_override) so the pure `wrappeditems[i]`
     //     load must NOT be taken for it.
     // A failing gate falls to the generic residual.  The paired runtime
@@ -8460,16 +8450,19 @@ pub(crate) fn jitcode_name_is_binary_value_from_tag(name: &str) -> bool {
 /// check then skipped descent so a declined sub-walk residualized
 /// `CallMayForce` (`binary_value_from_tag`) on fib bridges.
 pub(crate) fn jitcode_is_binary_value_from_tag(
+    pool: super::RawDescrPool<'_>,
     sub_index: usize,
     sub_body: &super::SubJitCodeBody,
 ) -> bool {
-    if crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
-        .is_some_and(|jc| jitcode_name_is_binary_value_from_tag(&jc.name))
+    if pool
+        .inline_callee_name(sub_index)
+        .is_some_and(jitcode_name_is_binary_value_from_tag)
     {
         return true;
     }
     crate::jitcode_runtime::pathed_jitcode_cached(BINARY_OP_DESCENT.path).is_some_and(|jc| {
-        jc.index() == sub_index || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
+        (matches!(pool, super::RawDescrPool::Global) && jc.index() == sub_index)
+            || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
     })
 }
 
@@ -8478,12 +8471,11 @@ pub(crate) fn jitcode_is_binary_value_from_tag(
 /// stamp the helper resume word still emits `int_add` instead of
 /// `CallMayForce` (`binary_value_from_tag`).
 pub(crate) fn binary_op_tag_for_helper_index(
+    pool: super::RawDescrPool<'_>,
     sub_index: usize,
     int_concretes: &[ConcreteValue],
 ) -> Option<i64> {
-    let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)?
-        .name
-        .as_str();
+    let name = pool.inline_callee_name(sub_index)?;
     if jitcode_name_is_binary_value_from_tag(name) {
         return match int_concretes.first() {
             Some(ConcreteValue::Int(tag)) => Some(*tag),
@@ -19073,12 +19065,12 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         let elem = unsafe { pyre_object::w_float_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Float(elem));
-        // A float SUBCLASS instance shares `ob_type == &FLOAT_TYPE` (so it
-        // passes the unbox guard) but retags `w_class`;
-        // `FloatListStrategy.is_correct_type` rejects it, so the interpreter
-        // switches the list to Object storage instead of writing raw f64.
-        // Pin the canonical class the same way the list operand is pinned
-        // above, so such an instance side-exits to the generic residual.
+        // A float subclass instance is `W_FloatObjectUser` (`FLOAT_USER_TYPE`),
+        // so the `FLOAT_TYPE` unbox guard already rejects it.
+        // `FloatListStrategy.is_correct_type` also rejects a retagged
+        // `w_class`. Pin the canonical class the same way the list operand
+        // is pinned above, so such an instance side-exits to the generic
+        // residual.
         walker_guard_exact_w_class(
             ctx,
             op_pc,

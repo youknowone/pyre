@@ -36,7 +36,9 @@ use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
     "subclassrange_min",
     "subclassrange_max",
     "name",
-    "instantiate"
+    "instantiate",
+    "user_subclass",
+    "user_base"
 )]
 pub struct PyType {
     pub subclassrange_min: AtomicI64,
@@ -55,6 +57,17 @@ pub struct PyType {
     /// The bit lives on the typeptr, the RPython class, not on a
     /// caller-side type whitelist.
     pub has_mapdict_mixin: bool,
+    /// `typedef.py get_unique_interplevel_subclass(space, cls)` answered
+    /// ahead of time: the class every user subclass instance of this
+    /// builtin carries as its typeptr (`_unique_subclass_cache[cls]`).  Null
+    /// for a class whose user subclasses do not have one yet.  Since every
+    /// user subclass instance carries that typeptr, an object whose typeptr
+    /// is this class is an exact instance.
+    pub user_subclass: *const PyType,
+    /// The builtin class a `_getusercls` class was made from: its instances
+    /// share that class's typedef and payload layout.  Null for every other
+    /// class.
+    pub user_base: *const PyType,
 }
 
 /// Common header for all Python objects.
@@ -145,7 +158,39 @@ const fn new_pytype_kind(name: &'static str, has_mapdict_mixin: bool) -> PyType 
         name,
         instantiate: AtomicPtr::new(std::ptr::null_mut()),
         has_mapdict_mixin,
+        user_subclass: std::ptr::null(),
+        user_base: std::ptr::null(),
     }
+}
+
+/// [`new_pytype`] for a builtin whose user subclass instances carry
+/// `user_subclass` as their typeptr (`typedef.py _getusercls`).
+pub const fn new_pytype_with_user_subclass(
+    name: &'static str,
+    user_subclass: &'static PyType,
+) -> PyType {
+    let mut tp = new_pytype_kind(name, false);
+    tp.user_subclass = user_subclass;
+    tp
+}
+
+/// The `_getusercls` class made from `base`: it imports
+/// `MapdictStorageMixin` after `base`'s payload.
+pub const fn new_user_pytype(name: &'static str, base: &'static PyType) -> PyType {
+    let mut tp = new_pytype_kind(name, true);
+    tp.user_base = base;
+    tp
+}
+
+/// The builtin class whose typedef and payload layout `tp` uses: `tp`'s
+/// `user_base` for a `_getusercls` class, `tp` itself otherwise.
+///
+/// # Safety
+/// `tp` must point at a live `PyType`.
+#[inline]
+pub unsafe fn layout_base(tp: *const PyType) -> *const PyType {
+    let base = unsafe { (*tp).user_base };
+    if base.is_null() { tp } else { base }
 }
 
 /// rclass.py:739-743 parity — cache the W_TypeObject on the PyType
@@ -187,9 +232,11 @@ pub unsafe fn pytype_has_mapdict_mixin(obj: PyObjectRef) -> bool {
 /// True when `obj`'s Python class is exactly the builtin type for its
 /// layout — i.e. NOT a user subclass.
 ///
-/// A user subclass of a builtin keeps the builtin `ob_type` (and therefore
-/// the builtin struct layout and the `is_int` / `is_list` / … layout
-/// predicates) while `w_class` is retagged to the subclass type object
+/// A user subclass instance of `int`, `float`, `complex`, `str` or `tuple` carries the builtin's
+/// `_getusercls` class as its typeptr, which alone decides exactness. A user
+/// subclass of any other builtin keeps the builtin `ob_type` (and therefore
+/// the builtin struct layout and the `is_list` / … layout predicates) while
+/// `w_class` is retagged to the subclass type object
 /// (`typedef::subclass_to_tag`).  The type-specific fast paths in
 /// `space.is_true` / `eq_w` / `len` / `getitem` / … assume the receiver's
 /// Python class IS the builtin (no overridable special method); for a
@@ -216,7 +263,22 @@ pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
+    if unsafe { typeptr_is_exact_builtin(obj) } {
+        return true;
+    }
     unsafe { class_word_is_exact_builtin(obj, (*obj).w_class) }
+}
+
+/// A builtin with a `_getusercls` class (`typedef.py`
+/// `get_unique_interplevel_subclass`) stamps that class as the typeptr of
+/// every user subclass instance, so its own typeptr proves exactness and
+/// the class word need not be read.  `false` means "not decided here".
+///
+/// # Safety
+/// `obj` must be a valid non-null, untagged `PyObjectRef`.
+#[inline]
+pub unsafe fn typeptr_is_exact_builtin(obj: PyObjectRef) -> bool {
+    unsafe { !(*(*obj).ob_type).user_subclass.is_null() }
 }
 
 /// The tail of [`is_exact_builtin_instance`] for a non-null `obj` whose
@@ -274,6 +336,11 @@ pub unsafe fn is_exact_type(obj: PyObjectRef, tp: &PyType) -> bool {
         return false;
     }
     unsafe {
+        // For a builtin with a `_getusercls` class, its own typeptr proves
+        // exactness: every user subclass instance carries the user class.
+        if !tp.user_subclass.is_null() && std::ptr::eq((*obj).ob_type, tp as *const PyType) {
+            return true;
+        }
         let w_class = (*obj).w_class;
         if w_class.is_null() {
             std::ptr::eq((*obj).ob_type, tp as *const PyType)
@@ -304,13 +371,23 @@ const _: () = {
     );
 };
 
-pub static INT_TYPE: PyType = new_pytype("int");
+pub static INT_TYPE: PyType = new_pytype_with_user_subclass("int", &INT_USER_TYPE);
+/// `W_IntObjectUser` (`typedef.py _getusercls(W_IntObject)`).
+pub static INT_USER_TYPE: PyType = new_user_pytype("int", &INT_TYPE);
 pub static BOOL_TYPE: PyType = new_pytype("bool");
-pub static FLOAT_TYPE: PyType = new_pytype("float");
-pub static COMPLEX_TYPE: PyType = new_pytype("complex");
-pub static STR_TYPE: PyType = new_pytype("str");
+pub static FLOAT_TYPE: PyType = new_pytype_with_user_subclass("float", &FLOAT_USER_TYPE);
+/// `W_FloatObjectUser` (`typedef.py _getusercls(W_FloatObject)`).
+pub static FLOAT_USER_TYPE: PyType = new_user_pytype("float", &FLOAT_TYPE);
+pub static COMPLEX_TYPE: PyType = new_pytype_with_user_subclass("complex", &COMPLEX_USER_TYPE);
+/// `W_ComplexObjectUser` (`typedef.py _getusercls(W_ComplexObject)`).
+pub static COMPLEX_USER_TYPE: PyType = new_user_pytype("complex", &COMPLEX_TYPE);
+pub static STR_TYPE: PyType = new_pytype_with_user_subclass("str", &STR_USER_TYPE);
+/// `W_UnicodeObjectUser` (`typedef.py _getusercls(W_UnicodeObject)`).
+pub static STR_USER_TYPE: PyType = new_user_pytype("str", &STR_TYPE);
 pub static LIST_TYPE: PyType = new_pytype("list");
-pub static TUPLE_TYPE: PyType = new_pytype("tuple");
+pub static TUPLE_TYPE: PyType = new_pytype_with_user_subclass("tuple", &TUPLE_USER_TYPE);
+/// `W_TupleObjectUser` (`typedef.py _getusercls(W_TupleObject)`).
+pub static TUPLE_USER_TYPE: PyType = new_user_pytype("tuple", &TUPLE_TYPE);
 pub static DICT_TYPE: PyType = new_pytype("dict");
 pub static LONG_TYPE: PyType = new_pytype("int");
 pub static NONE_TYPE: PyType = new_pytype("NoneType");
@@ -708,19 +785,25 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (165, Some(0)),
     (166, Some(0)),
-    // 167-169 are `typedef.py` `_getusercls` layouts (int/str/tuple user).
-    // They have no rclass vtable of their own (`object_layout_without_subclass_range`).
-    // Native-only type IDs 170 and 171 represent `posix.DirEntry` and
+    // 167-171 are `typedef.py` `_getusercls` layouts
+    // (int/str/tuple/float/complex user), each an rclass subclass of the
+    // builtin it was made from.
+    (167, Some(1)),
+    (168, Some(34)),
+    (169, Some(8)),
+    (170, Some(2)),
+    (171, Some(54)),
+    // Native-only type IDs 172 and 173 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (170, Some(0)),
+    (172, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (171, Some(0)),
+    (173, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (172, Some(0)),
+    (174, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1255,6 +1338,11 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         // every target.
         subclass_range_alias(165, typed::<crate::functional::W_IntRangeStepOneIterator>()),
         subclass_range_alias(166, typed::<crate::functional::W_IntRangeOneArgIterator>()),
+        subclass_range_alias(167, &INT_USER_TYPE),
+        subclass_range_alias(168, &STR_USER_TYPE),
+        subclass_range_alias(169, &TUPLE_USER_TYPE),
+        subclass_range_alias(170, &FLOAT_USER_TYPE),
+        subclass_range_alias(171, &COMPLEX_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
@@ -1437,7 +1525,11 @@ pub unsafe fn is_int(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return true;
     }
-    unsafe { py_type_check(obj, &INT_TYPE) || py_type_check(obj, &BOOL_TYPE) }
+    unsafe {
+        py_type_check(obj, &INT_TYPE)
+            || py_type_check(obj, &BOOL_TYPE)
+            || py_type_check(obj, &INT_USER_TYPE)
+    }
 }
 
 #[inline]
@@ -1453,7 +1545,7 @@ pub unsafe fn is_bool(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_float(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &FLOAT_TYPE) }
+    unsafe { py_type_check(obj, &FLOAT_TYPE) || py_type_check(obj, &FLOAT_USER_TYPE) }
 }
 
 #[inline]
@@ -1461,7 +1553,7 @@ pub unsafe fn is_float(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_complex(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &COMPLEX_TYPE) }
+    unsafe { py_type_check(obj, &COMPLEX_TYPE) || py_type_check(obj, &COMPLEX_USER_TYPE) }
 }
 
 #[inline]
@@ -1505,6 +1597,7 @@ pub unsafe fn is_tuple(obj: PyObjectRef) -> bool {
     };
     unsafe {
         py_type_check(obj, &TUPLE_TYPE)
+            || py_type_check(obj, &TUPLE_USER_TYPE)
             || py_type_check(obj, &SPECIALISED_TUPLE_II_TYPE)
             || py_type_check(obj, &SPECIALISED_TUPLE_FF_TYPE)
             || py_type_check(obj, &SPECIALISED_TUPLE_OO_TYPE)
@@ -1628,6 +1721,9 @@ fn int_operand_is_long(obj: PyObjectRef) -> bool {
 /// `W_FloatObject.is_w`, `W_AbstractTupleObject.is_w`,
 /// `W_AbstractBytesObject.is_w`, `W_UnicodeObject.is_w`, and
 /// `W_FrozensetObject.is_w`.
+///
+/// The dispatch is on `w_two`, as `w_two.is_w(space, w_one)` is: every gate
+/// reads `w_two`'s type first, so `x is CONST` never reads `x`'s class.
 pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
     if std::ptr::eq(w_one, w_two) {
         return true;
@@ -1648,8 +1744,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
     // `ptr::eq` above (identical bit patterns); an immediate and a boxed
     // int of the same value fall here and compare equal by value.
     unsafe {
-        if crate::pyobject::is_exact_type(w_one, &crate::pyobject::INT_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::pyobject::INT_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::INT_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::INT_TYPE)
         {
             return abstract_int_is_w(w_one, w_two);
         }
@@ -1662,8 +1758,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // CPython 3.14 gives NaNs pointer identity; unlike finite floats they
         // stay boxed (`cpython_differences.rst`, "Object Identity of Primitive
         // Values, `is` and `id`").
-        if crate::pyobject::is_exact_type(w_one, &crate::pyobject::FLOAT_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::pyobject::FLOAT_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::FLOAT_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::FLOAT_TYPE)
         {
             let one = crate::floatobject::w_float_get_value(w_one);
             let two = crate::floatobject::w_float_get_value(w_two);
@@ -1680,8 +1776,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // subclasses keep pointer identity through the exact-type gate. The
         // specialised arity-2 tuples carry the canonical `tuple` w_class, so
         // they pass the gate but are never empty (length 2).
-        if crate::pyobject::is_exact_type(w_one, &crate::pyobject::TUPLE_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::pyobject::TUPLE_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::TUPLE_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::TUPLE_TYPE)
         {
             return crate::tupleobject::w_tuple_len(w_one) == 0
                 && crate::tupleobject::w_tuple_len(w_two) == 0;
@@ -1692,8 +1788,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // so distinct wrappers may deliberately share that backing block.
         // `len(s2) == 0` returns `len(s1) == 0`; `len(s2) == 1`
         // (unique-ified) returns `len(s1) == 1 && s1[0] == s2[0]`.
-        if crate::pyobject::is_exact_type(w_one, &crate::bytesobject::BYTES_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::bytesobject::BYTES_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::bytesobject::BYTES_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::bytesobject::BYTES_TYPE)
         {
             let len1 = crate::bytesobject::w_bytes_len(w_one);
             let len2 = crate::bytesobject::w_bytes_len(w_two);
@@ -1715,8 +1811,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // `str` subclasses keep pointer identity through the exact-type gate.
         // `s1 is s2` is `ptr::eq` on the two `STR` payloads and `s1 == s2`
         // is `ll_streq` on them, as the rtyped upstream body calls it.
-        if crate::pyobject::is_exact_type(w_one, &crate::pyobject::STR_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::pyobject::STR_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::STR_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::STR_TYPE)
         {
             let s1 = crate::unicodeobject::w_str_storage(w_one);
             let s2 = crate::unicodeobject::w_str_storage(w_two);
@@ -1730,8 +1826,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // unique-ified". The mutable `set` carries a distinct type tag and
         // does not override `is_w`, so the `FROZENSET_TYPE` gate excludes
         // it; `frozenset` subclasses are excluded too.
-        if crate::pyobject::is_exact_type(w_one, &crate::setobject::FROZENSET_TYPE)
-            && crate::pyobject::is_exact_type(w_two, &crate::setobject::FROZENSET_TYPE)
+        if crate::pyobject::is_exact_type(w_two, &crate::setobject::FROZENSET_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::setobject::FROZENSET_TYPE)
         {
             return crate::setobject::w_set_len(w_one) == 0
                 && crate::setobject::w_set_len(w_two) == 0;

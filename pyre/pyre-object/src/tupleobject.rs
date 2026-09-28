@@ -356,8 +356,15 @@ fn w_tuple_new_array_backed_impl(
 
     // The only allocations that may collect: the type's lazy instantiate
     // map and the tuple header. Both run while every item is pinned.
+    // `_getusercls(W_TupleObject)` is its own class: the user layout carries
+    // it as the typeptr.
+    let ob_type: *const PyType = if user_layout {
+        &crate::pyobject::TUPLE_USER_TYPE
+    } else {
+        &TUPLE_TYPE
+    };
     let header = || PyObject {
-        ob_type: &TUPLE_TYPE as *const PyType,
+        ob_type,
         w_class: crate::gc_roots::shadow_stack_get(class_slot),
     };
     let (type_id, object_size) = if user_layout {
@@ -632,7 +639,9 @@ pub unsafe fn w_tuple_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRe
 #[inline]
 unsafe fn w_tuple_getitem_known(obj: PyObjectRef, idx: usize) -> PyObjectRef {
     let ob_type = (*obj).ob_type;
-    if std::ptr::eq(ob_type, &TUPLE_TYPE) {
+    if std::ptr::eq(ob_type, &TUPLE_TYPE)
+        || std::ptr::eq(ob_type, &crate::pyobject::TUPLE_USER_TYPE)
+    {
         let tuple = &*(obj as *const W_TupleObject);
         let base = items_block_items_base(tuple.wrappeditems);
         *base.add(idx)
@@ -683,7 +692,10 @@ pub unsafe fn w_tuple_len(obj: PyObjectRef) -> usize {
     {
         return 2;
     }
-    debug_assert!(std::ptr::eq(ob_type, &TUPLE_TYPE));
+    debug_assert!(
+        std::ptr::eq(ob_type, &TUPLE_TYPE)
+            || std::ptr::eq(ob_type, &crate::pyobject::TUPLE_USER_TYPE)
+    );
     let tuple = &*(obj as *const W_TupleObject);
     items_block_capacity(tuple.wrappeditems)
 }
@@ -709,7 +721,9 @@ pub fn unroll_condition(obj: PyObjectRef) -> bool {
 /// `obj` must point to a valid tuple of any of the four variants.
 pub unsafe fn w_tuple_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
     let n = w_tuple_len(obj);
-    if std::ptr::eq((*obj).ob_type, &TUPLE_TYPE) {
+    if std::ptr::eq((*obj).ob_type, &TUPLE_TYPE)
+        || std::ptr::eq((*obj).ob_type, &crate::pyobject::TUPLE_USER_TYPE)
+    {
         // Fast path: shared backing array, just copy the slice.
         let tuple = &*(obj as *const W_TupleObject);
         let base = items_block_items_base(tuple.wrappeditems);
@@ -742,6 +756,29 @@ pub extern "C" fn jit_tuple_getitem(tuple: i64, index: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::intobject::w_int_new;
+
+    /// `typedef.py _getusercls(W_TupleObject)`: a tuple subclass instance
+    /// carries `TUPLE_USER_TYPE`, keeps the array-backed payload, and is not
+    /// an exact tuple by typeptr.
+    #[test]
+    fn tuple_subclass_instance_carries_user_typeptr() {
+        let w_class = crate::w_type_new("TupleSub", PY_NULL, std::ptr::null_mut());
+        let tup = w_tuple_subclass_new_array_backed(vec![w_int_new(4), w_int_new(5)], w_class);
+        unsafe {
+            assert!(std::ptr::eq(
+                (*tup).ob_type,
+                &crate::pyobject::TUPLE_USER_TYPE
+            ));
+            assert!(is_tuple(tup));
+            assert!(!crate::pyobject::is_exact_type(tup, &TUPLE_TYPE));
+            assert_eq!(w_tuple_len(tup), 2);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_tuple_getitem(tup, 1).unwrap()),
+                5
+            );
+            assert_eq!(w_tuple_items_copy_as_vec(tup).len(), 2);
+        }
+    }
 
     #[test]
     fn test_tuple_create_and_access() {
