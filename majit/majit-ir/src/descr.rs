@@ -515,17 +515,27 @@ pub fn register_struct_ids(table: std::collections::HashMap<String, Option<Struc
     *guard = table;
 }
 
+/// `raw` without its leading reference / raw-pointer markers: each of
+/// `*const `, `*mut `, `&mut `, `&` repeated, in that order, then trimmed.
+fn strip_pointer_markers(raw: &str) -> &str {
+    fn strip_repeated<'a>(mut s: &'a str, prefix: &str) -> &'a str {
+        while let Some(rest) = s.strip_prefix(prefix) {
+            s = rest;
+        }
+        s
+    }
+    let s = strip_repeated(raw, "*const ");
+    let s = strip_repeated(s, "*mut ");
+    let s = strip_repeated(s, "&mut ");
+    strip_repeated(s, "&").trim()
+}
+
 /// Look up the canonical [`StructId`] for a struct / enum-variant name in
 /// any spelling, stripping a leading reference / raw-pointer marker first
 /// (`&T` / `&mut T` / `*const T` / `*mut T` → `T`).  Returns `None` when
 /// the name is unknown or its bare leaf is cross-module-ambiguous.
 pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
-    let s = raw
-        .trim_start_matches("*const ")
-        .trim_start_matches("*mut ")
-        .trim_start_matches("&mut ")
-        .trim_start_matches('&')
-        .trim();
+    let s = strip_pointer_markers(raw);
     let guard = STRUCT_ID_BY_NAME.lock();
     if let Some(id) = guard.get(s).copied().flatten() {
         return Some(id);
@@ -548,12 +558,7 @@ pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
 /// class/template and uses this lookup; physical layouts use
 /// [`struct_id_for_name`] instead.
 pub fn struct_template_id_for_name(raw: &str) -> Option<StructId> {
-    let s = raw
-        .trim_start_matches("*const ")
-        .trim_start_matches("*mut ")
-        .trim_start_matches("&mut ")
-        .trim_start_matches('&')
-        .trim();
+    let s = strip_pointer_markers(raw);
     let template = if is_shaped_tuple_name(s) || is_shaped_array_name(s) {
         std::borrow::Cow::Borrowed(s)
     } else {
