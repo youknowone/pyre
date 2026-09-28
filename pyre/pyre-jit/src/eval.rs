@@ -994,9 +994,9 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     // `sstorage` (`setobject.py`). The box traces its own entries
     // (`set_items_storage_custom_trace`). A no-GC-hook fallback allocation
     // is not collector-owned.
-    if !set.items.is_null() && pyre_object::gc_hook::try_gc_owns_object(set.items as *mut u8) {
-        let items_slot = std::ptr::addr_of_mut!(set.items);
-        f(items_slot as *mut majit_ir::GcRef);
+    if !set.sstorage.is_null() && pyre_object::gc_hook::try_gc_owns_object(set.sstorage) {
+        let storage_slot = std::ptr::addr_of_mut!(set.sstorage);
+        f(storage_slot as *mut majit_ir::GcRef);
     }
 }
 
@@ -2371,8 +2371,8 @@ fn build_gc() -> Box<MiniMarkGC> {
         w_dict_tid,
     );
     pytype_to_tid.insert(&pyre_object::DICT_TYPE as *const _ as usize, w_dict_tid);
-    // W_SetObject carries `items: *mut SetItemsStorage`. The trace forwards
-    // `w_class` and that pointer; the box tid traces the keys. Both `set`
+    // W_SetObject carries `sstorage: *mut u8` (the SetItemsStorage box). The
+    // trace forwards `w_class` and that pointer; the box tid traces the keys. Both `set`
     // and `frozenset` PyTypes share this Rust struct/tid.
     let w_set_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         std::mem::size_of::<pyre_object::setobject::W_SetObject>(),
@@ -3991,7 +3991,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_module_gc_types(&mut gc, &mut pytype_to_tid);
     // setobject.py stores the copied r_dict behind `sstorage`;
     // rordereddict.py makes that table a GcStruct("dicttable") the collector
-    // traces itself. `set_object_custom_trace` only greys the `items` slot.
+    // traces itself. `set_object_custom_trace` only greys the `sstorage` slot.
     // Keep this runtime id at the absolute registration tail.
     register_traced_storage_box::<pyre_object::setobject::SetItemsStorage>(
         &mut gc,

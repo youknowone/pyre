@@ -1633,9 +1633,21 @@ static W_SET_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         &pyre_object::setobject::SET_TYPE as *const _ as usize,
         &[
             (
-                "items",
-                std::mem::offset_of!(pyre_object::setobject::W_SetObject, items),
-                std::mem::size_of::<*mut pyre_object::setobject::SetItemsStorage>(),
+                "sstorage",
+                std::mem::offset_of!(pyre_object::setobject::W_SetObject, sstorage),
+                std::mem::size_of::<*mut u8>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            // `W_BaseSetObject.strategy`. Keyed by the field name and typed as
+            // the analyzer types `&'static SetStrategyRef` (an instance), so the
+            // residual calls whose EffectInfo writes it resolve their member.
+            (
+                "sstrategy",
+                std::mem::offset_of!(pyre_object::setobject::W_SetObject, sstrategy),
+                std::mem::size_of::<usize>(),
                 Type::Ref,
                 false,
                 false,
@@ -4942,7 +4954,8 @@ pub fn bytearray_length_descr() -> DescrRef {
 /// `W_SetObject.len` — the count `setobject.py`'s `length` answers with,
 /// reached there through the strategy. Mutable; see [`W_SET_DESCR_GROUP`].
 pub fn set_len_descr() -> DescrRef {
-    field_descr_from_group(&W_SET_DESCR_GROUP, 1)
+    // `sstorage`, `sstrategy`, then `len`.
+    field_descr_from_group(&W_SET_DESCR_GROUP, 2)
 }
 
 pub fn str_len_descr() -> DescrRef {
