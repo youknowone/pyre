@@ -530,6 +530,22 @@ impl RootScope {
         base
     }
 
+    /// One-word residual ABI for [`Self::publish`], the
+    /// [`publish_roots_jit_abi`] twin.
+    #[majit_macros::dont_look_inside_cannot_raise]
+    pub extern "C" fn publish_jit_abi(&self, array: i64) -> i64 {
+        let items = gcarray_ref_items(array);
+        self.publish(&items) as i64
+    }
+
+    /// One-word residual ABI for [`Self::pin_roots`], the
+    /// [`publish_roots_jit_abi`] twin.
+    #[majit_macros::dont_look_inside_cannot_raise]
+    pub extern "C" fn pin_roots_jit_abi(&self, array: i64) -> i64 {
+        let items = gcarray_ref_items(array);
+        self.pin_roots(&items) as i64
+    }
+
     /// Scope-local [`normalize_roots`] on this thread's root-stack cell.
     #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
@@ -944,6 +960,14 @@ pub fn publish_roots(roots: &[PyObjectRef]) -> usize {
 pub extern "C" fn publish_roots_jit_abi(array: i64) -> i64 {
     let items = gcarray_ref_items(array);
     publish_roots(&items) as i64
+}
+
+/// One-word residual ABI for [`pin_roots`], the [`publish_roots_jit_abi`]
+/// twin.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn pin_roots_jit_abi(array: i64) -> i64 {
+    let items = gcarray_ref_items(array);
+    pin_roots(&items) as i64
 }
 
 /// Copy the items of a length-prefixed ref `GcTypedArray` word.
