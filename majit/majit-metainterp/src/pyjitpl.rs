@@ -18837,27 +18837,28 @@ impl<M: Clone> MetaInterp<M> {
             for (section_i, section) in frames.iter().enumerate() {
                 // resume.py `rebuild_from_resumedata`:
                 // `jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`.
-                // A missing index is an indexing error. Do not substitute
-                // `mainjitcode`.
-                let pos = usize::try_from(section.jitcode_index).unwrap_or_else(|_| {
-                    panic!(
-                        "rebuild_from_resumedata: jitcodes[{}] index error",
-                        section.jitcode_index
-                    )
-                });
-                let jitcode = jitcodes.jitcodes.get(pos).cloned().unwrap_or_else(|| {
-                    panic!(
-                        "rebuild_from_resumedata: jitcodes[{pos}] index error (len {})",
-                        jitcodes.jitcodes.len()
-                    )
-                });
-                // `frame_value_count_at` counts boxes on the materialized
-                // body; a skeleton at the same index decodes no `-live-`.
-                // The index itself must already exist.
-                let jitcode = materialized
-                    .get(section_i)
-                    .and_then(|slot| slot.clone())
-                    .unwrap_or(jitcode);
+                // The caller's materialized body for this section is that
+                // jitcode (`frame_value_count_at` counts boxes on it; a
+                // skeleton at the same index decodes no `-live-`). Without
+                // one, a missing index is an indexing error; do not
+                // substitute `mainjitcode`.
+                let jitcode = match materialized.get(section_i).and_then(|slot| slot.clone()) {
+                    Some(jitcode) => jitcode,
+                    None => {
+                        let pos = usize::try_from(section.jitcode_index).unwrap_or_else(|_| {
+                            panic!(
+                                "rebuild_from_resumedata: jitcodes[{}] index error",
+                                section.jitcode_index
+                            )
+                        });
+                        jitcodes.jitcodes.get(pos).cloned().unwrap_or_else(|| {
+                            panic!(
+                                "rebuild_from_resumedata: jitcodes[{pos}] index error (len {})",
+                                jitcodes.jitcodes.len()
+                            )
+                        })
+                    }
+                };
                 // resume.py `read_jitcode_pos_pc` stores `frame.pc`.
                 // `capture_resumedata` leaves that pc alone when `resumepc < 0`,
                 // so the stored word is never negative. Pyre can still put
@@ -18986,11 +18987,16 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 }
             }
-            // resume.py `rebuild_from_resumedata` calls
-            // `f.handle_rvmprof_enter_on_resume()` after `consume_boxes`.
-            let op_rvmprof_code = staticdata.op_rvmprof_code;
-            let op_live_insn = staticdata.op_live;
-            self.framestack.frames[i].handle_rvmprof_enter_on_resume(op_live_insn, op_rvmprof_code);
+        }
+        // resume.py `rebuild_from_resumedata` calls
+        // `f.handle_rvmprof_enter_on_resume()` after each `consume_boxes`.
+        // Upstream never abandons a rebuild halfway; this one can return
+        // `false` above and then resumes through `blackhole_from_resumedata`,
+        // which emits its own enter. The hooks therefore run only once every
+        // section has been consumed.
+        for i in 0..n {
+            self.framestack.frames[i]
+                .handle_rvmprof_enter_on_resume(staticdata.op_live, staticdata.op_rvmprof_code);
         }
         true
     }
@@ -22987,8 +22993,15 @@ mod portal_resume_rebuild_tests {
 
     #[test]
     fn resume_on_rvmprof_enter_emits_jit_rvmprof_code_zero() {
+        struct HookReset;
+        impl Drop for HookReset {
+            fn drop(&mut self) {
+                majit_rlib::rvmprof::cintf::set_hook(None);
+            }
+        }
         RVMPROF_LEAVING.store(-1, Ordering::SeqCst);
         RVMPROF_UID.store(-1, Ordering::SeqCst);
+        let _reset = HookReset;
         majit_rlib::rvmprof::cintf::set_hook(Some(hook));
 
         let mut meta = MetaInterp::<()>::new(0);
@@ -23016,8 +23029,6 @@ mod portal_resume_rebuild_tests {
         assert_eq!(meta.framestack.frames[0].int_values[1], Some(42));
         assert_eq!(RVMPROF_LEAVING.load(Ordering::SeqCst), 0);
         assert_eq!(RVMPROF_UID.load(Ordering::SeqCst), 42);
-
-        majit_rlib::rvmprof::cintf::set_hook(None);
     }
 }
 
