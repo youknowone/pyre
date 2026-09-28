@@ -7728,6 +7728,72 @@ fn op_writes_jitframe_output_slot(op: &Op) -> bool {
     )
 }
 
+/// One bridge spliced into a loop by a merged recompile
+/// (`assembler.py patch_jump_for_descr`). `start_op` is the bridge's first
+/// op. `source_guard_descr` is `descr_identity` of the guard the bridge
+/// attaches to; the rewritten op index is resolved after the GC rewrite,
+/// which inserts ops and shifts pre-rewrite indices.
+#[derive(Clone)]
+struct MergeSegment {
+    start_op: usize,
+    source_guard_descr: usize,
+}
+
+/// `do_compile` merge mode. `None` at every existing caller keeps today's
+/// separate functions. `trace_id` is the loop's id: the merged function does
+/// not allocate one.
+struct MergePlan {
+    trace_id: u64,
+    segments: Vec<MergeSegment>,
+}
+
+fn op_in_merge_segment(op_idx: usize, segments: &[MergeSegment]) -> bool {
+    segments.iter().any(|segment| op_idx >= segment.start_op)
+}
+
+/// A JUMP back to a LABEL of this function.
+///
+/// Loop jumps keep the `descr.index()` + arity rule. A jump that lives in a
+/// merged bridge segment matches a LABEL by `descr_identity` (Arc pointer
+/// identity) and equal arity: `index()` is not unique across target tokens.
+fn jump_is_local(
+    op: &Op,
+    ops: &[Op],
+    label_arity_by_descr: &IndexMap<u32, usize>,
+    bridge_jump: bool,
+) -> bool {
+    if op.opcode != OpCode::Jump {
+        return false;
+    }
+    let Some(descr) = op.getdescr() else {
+        return false;
+    };
+    if bridge_jump {
+        let id = majit_ir::descr_identity(&descr);
+        return ops.iter().any(|label| {
+            label.opcode == OpCode::Label
+                && label.num_args() == op.num_args()
+                && label
+                    .getdescr()
+                    .is_some_and(|label_descr| majit_ir::descr_identity(&label_descr) == id)
+        });
+    }
+    label_arity_by_descr
+        .get(&descr.index())
+        .is_some_and(|&arity| arity == op.num_args())
+}
+
+fn jump_is_external(
+    op: &Op,
+    ops: &[Op],
+    label_arity_by_descr: &IndexMap<u32, usize>,
+    bridge_jump: bool,
+) -> bool {
+    op.opcode == OpCode::Jump
+        && op.has_descr()
+        && !jump_is_local(op, ops, label_arity_by_descr, bridge_jump)
+}
+
 /// Per-exit flags for skipping a positional fail-arg store.
 ///
 /// Walks the trace once. A segment starts at the bridge entry (no LABEL yet)
@@ -7749,6 +7815,7 @@ fn record_entry_resident_failargs(
     max_output_slots: usize,
     guaranteed_frame_depth: i64,
     guard_infos: &mut [GuardInfo],
+    merge_segments: &[MergeSegment],
 ) -> Vec<(usize, Vec<bool>)> {
     let num_inputs = inputargs.len();
     let label_arity_by_descr: IndexMap<u32, usize> = ops
@@ -7760,7 +7827,7 @@ fn record_entry_resident_failargs(
     // `index()` names a LABEL of the same arity. `index()` is not unique
     // within a trace, so every LABEL sharing it counts as targeted.
     let mut jump_targets: Vec<u32> = Vec::new();
-    for op in ops {
+    for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode != OpCode::Jump {
             continue;
         }
@@ -7768,9 +7835,12 @@ fn record_entry_resident_failargs(
             continue;
         };
         let index = descr.index();
-        let local = label_arity_by_descr
-            .get(&index)
-            .is_some_and(|&arity| arity == op.num_args());
+        let local = jump_is_local(
+            op,
+            ops,
+            &label_arity_by_descr,
+            op_in_merge_segment(op_idx, merge_segments),
+        );
         if local && !jump_targets.contains(&index) {
             jump_targets.push(index);
         }
@@ -7798,6 +7868,14 @@ fn record_entry_resident_failargs(
     let mut fallthrough_seeds: Vec<(usize, Vec<bool>)> = Vec::new();
 
     for (op_idx, op) in ops.iter().enumerate() {
+        // A merged bridge is not reached from the function entry, so nothing
+        // the entry loaded is resident at its first op.
+        if merge_segments
+            .iter()
+            .any(|segment| segment.start_op == op_idx)
+        {
+            live = false;
+        }
         if op.opcode == OpCode::Label {
             let args = op.getarglist();
             let targeted = implicit_loop_label == Some(Some(op_idx))
@@ -7859,13 +7937,12 @@ fn record_entry_resident_failargs(
 
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
-        let is_external_jump = op.opcode == OpCode::Jump
-            && op
-                .getdescr()
-                .is_some_and(|d| match label_arity_by_descr.get(&d.index()) {
-                    None => true,
-                    Some(&arity) => arity != op.num_args(),
-                });
+        let is_external_jump = jump_is_external(
+            op,
+            ops,
+            &label_arity_by_descr,
+            op_in_merge_segment(op_idx, merge_segments),
+        );
         if is_guard || is_finish || is_external_jump {
             let info = &mut guard_infos[info_idx];
             info.guaranteed_frame_depth = guaranteed_frame_depth;
@@ -7919,7 +7996,18 @@ fn emit_guard_exit(
     call_conv: cranelift_codegen::isa::CallConv,
     failure_recovery: &mut FailureRecovery,
     fail_descrs: &[DescrRef],
+    merge_targets: &[(usize, cranelift_codegen::ir::Block)],
 ) {
+    // Merged recompile (`assembler.py patch_jump_for_descr`): the source
+    // guard's failure edge is a local jump to the bridge's first block.
+    // The caller already consumed this `GuardInfo`, so later exits stay paired.
+    if let Some((_, block)) = merge_targets
+        .iter()
+        .find(|(source_op, _)| *source_op == info.source_op_index)
+    {
+        builder.ins().jump(*block, &[]);
+        return;
+    }
     // _push_all_regs_to_frame / save_into_mem parity:
     // store fail_args to jf_frame[slot]
     //
@@ -8256,6 +8344,11 @@ pub struct MergedGeneration {
     /// Leaked `[length, data...]` pointers from `allocate_gcmap`.
     pub gcmap_allocs: Vec<i64>,
     pub fail_descr_cells: Vec<Arc<[Box<majit_ir::FailDescrCell>]>>,
+    /// Reference-constant table baked by `LoadFromGcTable`, when the merged
+    /// function has one.
+    pub gc_table: Option<Arc<majit_gc::GcTable>>,
+    /// Descr attachments the merged function's slow paths bake by address.
+    pub cpu_attachments: Option<CpuDescrHandle>,
 }
 
 /// `assembler.py must_save_exception`: true for `GUARD_EXCEPTION`,
@@ -8378,9 +8471,11 @@ fn snapshot_trace_ops(ops: &[OpRc]) -> Vec<Op> {
     out
 }
 
-fn retained_merge_source(trace_id: u64, inputargs: &[InputArgRc], ops: &[OpRc]) -> MergeSource {
+/// The trace id is assigned by `do_compile`; the caller fills it in once the
+/// compile succeeds.
+fn retained_merge_source(inputargs: &[InputArgRc], ops: &[OpRc]) -> MergeSource {
     MergeSource {
-        trace_id,
+        trace_id: 0,
         inputargs: snapshot_inputargs(inputargs),
         ops: snapshot_trace_ops(ops),
     }
@@ -8392,6 +8487,340 @@ fn clone_merge_source(src: &MergeSource) -> MergeSource {
         inputargs: snapshot_inputargs(&src.inputargs),
         ops: snapshot_ops(&src.ops),
     }
+}
+
+/// A value position a merged bridge op may take. Void results occupy no
+/// position (`GcRewriterImpl::rewrite_for_gc_segments` skips them for the
+/// same reason), and the `VoidOp(u32::MAX)` sentinel would otherwise pin the
+/// renumbering at `u32::MAX`.
+fn is_value_position(opref: OpRef) -> bool {
+    !opref.is_none() && !opref.is_constant() && opref.ty() != Some(Type::Void)
+}
+
+fn note_opref_raw(max_raw: &mut u32, opref: OpRef) {
+    if is_value_position(opref) {
+        *max_raw = (*max_raw).max(opref.raw());
+    }
+}
+
+fn max_opref_raw(inputargs: &[InputArgRc], ops: &[Op]) -> u32 {
+    let mut max_raw = 0u32;
+    for ia in inputargs {
+        max_raw = max_raw.max(ia.index);
+    }
+    for op in ops {
+        note_opref_raw(&mut max_raw, op.pos().get());
+        for i in 0..op.num_args() {
+            note_opref_raw(&mut max_raw, op.arg(i).to_opref());
+        }
+        if let Some(fail_args) = op.getfailargs() {
+            for arg in fail_args.iter() {
+                note_opref_raw(&mut max_raw, arg.to_opref());
+            }
+        }
+    }
+    max_raw
+}
+
+/// Non-hole fail-arg `OpRef`s in fail-arg order. A hole is `OpRef::NONE` or
+/// the `0xFFFF` marker `rebuild_faillocs_from_descr` skips. An empty
+/// `rd_locs` is the identity fast path: every present fail arg is live.
+fn nonhole_fail_args(op: &Op) -> Vec<OpRef> {
+    let Some(fail_args) = op.getfailargs() else {
+        return Vec::new();
+    };
+    let rd = op
+        .getdescr()
+        .map(|descr| {
+            descr
+                .as_fail_descr()
+                .map(|fd| fd.rd_locs().to_vec())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    fail_args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| {
+            if arg.is_none() || arg.to_opref().is_none() {
+                return None;
+            }
+            if rd.get(index).copied() == Some(0xFFFF) {
+                return None;
+            }
+            Some(arg.to_opref())
+        })
+        .collect()
+}
+
+/// Codegen keys a value by its raw position (`opref_var_map`), so an
+/// operand names a bridge inputarg or result by raw, whatever its variant.
+fn remap_opref(opref: OpRef, input_map: &[(OpRef, OpRef)], result_map: &[(OpRef, OpRef)]) -> OpRef {
+    if opref.is_none() || opref.is_constant() {
+        return opref;
+    }
+    let raw = opref.raw();
+    if let Some((_, mapped)) = input_map.iter().find(|(old, _)| old.raw() == raw) {
+        return *mapped;
+    }
+    if let Some((_, mapped)) = result_map.iter().find(|(old, _)| old.raw() == raw) {
+        return *mapped;
+    }
+    opref
+}
+
+fn rewrite_operand(arg: &majit_ir::operand::Operand, mapped: OpRef) -> majit_ir::operand::Operand {
+    if mapped == arg.to_opref() {
+        return snapshot_operand(arg);
+    }
+    if mapped.is_none() || mapped.is_constant() {
+        majit_ir::operand::Operand::from_opref(mapped)
+    } else {
+        majit_ir::operand::Operand::bound_from_opref(mapped)
+    }
+}
+
+/// Renumber `bridge_ops` above `next_raw` and replace each bridge inputarg
+/// with the source guard's non-hole fail arg. Constants stay. Descrs stay,
+/// so a bridge exit still stores that bridge's descr pointer.
+fn renumber_bridge_ops(
+    bridge_ops: &[Op],
+    bridge_inputargs: &[InputArgRc],
+    fail_args: &[OpRef],
+    mut next_raw: u32,
+) -> Option<(Vec<Op>, u32)> {
+    if bridge_inputargs.len() != fail_args.len() {
+        return None;
+    }
+    let input_map: Vec<(OpRef, OpRef)> = bridge_inputargs
+        .iter()
+        .enumerate()
+        .map(|(index, ia)| {
+            (
+                OpRef::input_arg_typed(ia.index, ia.tp.get()),
+                fail_args[index],
+            )
+        })
+        .collect();
+    let mut result_map: Vec<(OpRef, OpRef)> = Vec::new();
+    for op in bridge_ops {
+        let old = op.pos().get();
+        if !is_value_position(old) {
+            continue;
+        }
+        let new = old.with_raw(next_raw);
+        next_raw = next_raw.saturating_add(1);
+        result_map.push((old, new));
+    }
+    let map = |opref| remap_opref(opref, &input_map, &result_map);
+    let mut out = Vec::with_capacity(bridge_ops.len());
+    for op in bridge_ops {
+        let fresh = snapshot_op(op);
+        let argc = fresh.num_args();
+        for i in 0..argc {
+            let mapped = map(fresh.arg(i).to_opref());
+            let arg = fresh.arg(i);
+            let rewritten = rewrite_operand(&arg, mapped);
+            fresh.args_slice_mut()[i] = rewritten;
+        }
+        let rewritten_fails = fresh.getfailargs().map(|fail_args| {
+            fail_args
+                .iter()
+                .map(|arg| rewrite_operand(arg, map(arg.to_opref())))
+                .collect::<majit_ir::resoperation::OpArgVec>()
+        });
+        if let Some(copied) = rewritten_fails {
+            fresh.setfailargs(copied);
+        }
+        let old_pos = fresh.pos().get();
+        fresh.pos().set(map(old_pos));
+        out.push(fresh);
+    }
+    Some((out, next_raw))
+}
+
+/// Re-read every non-null reference constant of `ops` from `table`, the
+/// `GcTable` the compile of these ops filled: `remove_constptr` and the
+/// fail-arg `_gcref_index` put each such constant there, keyed by the address
+/// it had at that compile. The retained ops still name that address; the slot
+/// holds the address after any collection since. `None` when a constant is
+/// not in the table, which refuses the merge.
+fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> Option<()> {
+    let refresh = |arg: &majit_ir::operand::Operand| -> Option<majit_ir::operand::Operand> {
+        let Some(majit_ir::Value::Ref(gcref)) = arg.const_value() else {
+            return Some(arg.clone());
+        };
+        if gcref.is_null() {
+            return Some(arg.clone());
+        }
+        let table = table?;
+        let index = (0..table.len()).find(|&i| table.compile_key(i) == gcref.0)?;
+        Some(majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+            table.slot(index),
+        )))
+    };
+    for op in ops {
+        for i in 0..op.num_args() {
+            let fresh = refresh(&op.arg(i))?;
+            op.args_slice_mut()[i] = fresh;
+        }
+        if let Some(fail_args) = op.getfailargs() {
+            let fresh = fail_args
+                .iter()
+                .map(refresh)
+                .collect::<Option<majit_ir::resoperation::OpArgVec>>()?;
+            op.setfailargs(fresh);
+        }
+    }
+    Some(())
+}
+
+fn guard_shape_refuses_merge(op: &Op) -> bool {
+    if !op.opcode.is_guard() {
+        return false;
+    }
+    // A non-identity `rd_locs` is the normal layout `apply_resident_failarg_locs`
+    // publishes. The merged exit honours that table; it does not refuse it.
+    guard_must_save_exception(op.opcode)
+        || matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2)
+}
+
+/// The rewritten op index of each segment's source guard, searched in the
+/// loop part (ops before the first segment). Missing or duplicated descr
+/// identity refuses the merge.
+fn resolve_merged_source_guards(
+    ops: &[Op],
+    segments: &[MergeSegment],
+) -> Result<Vec<usize>, BackendError> {
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let loop_end = segments[0].start_op;
+    if loop_end > ops.len() {
+        return Err(BackendError::CompilationFailed(
+            "merged segment start past rewritten ops".into(),
+        ));
+    }
+    let mut resolved = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let mut found = None;
+        for (index, op) in ops[..loop_end].iter().enumerate() {
+            if !op.opcode.is_guard() {
+                continue;
+            }
+            let Some(descr) = op.getdescr() else {
+                continue;
+            };
+            if majit_ir::descr_identity(&descr) != segment.source_guard_descr {
+                continue;
+            }
+            if found.is_some() {
+                return Err(BackendError::CompilationFailed(
+                    "merged source guard descr is not unique".into(),
+                ));
+            }
+            found = Some(index);
+        }
+        let Some(index) = found else {
+            return Err(BackendError::CompilationFailed(
+                "merged source guard descr not in rewritten loop".into(),
+            ));
+        };
+        resolved.push(index);
+    }
+    Ok(resolved)
+}
+
+/// Owned inputs for one merged `do_compile`, or `None` when this attach
+/// must keep today's separate bridge function.
+fn prepare_merged_recompile(
+    token: &JitCellToken,
+    source_fail_descr: &dyn FailDescr,
+) -> Option<(Vec<InputArgRc>, Vec<Op>, MergePlan)> {
+    if token.is_invalidated() {
+        return None;
+    }
+    let compiled = token
+        .compiled
+        .get()
+        .and_then(|c| c.downcast_ref::<CompiledLoop>())?;
+    if source_fail_descr.trace_id() != compiled.trace_id {
+        return None;
+    }
+    let loop_src = compiled.merge_source.as_ref()?;
+    let mut pieces: Vec<(usize, Vec<InputArgRc>, Vec<Op>)> = Vec::new();
+    for (op_idx, op) in loop_src.ops.iter().enumerate() {
+        if !op.opcode.is_guard() {
+            continue;
+        }
+        let Some(descr) = op.getdescr() else {
+            continue;
+        };
+        let Some(fd) = descr.as_fail_descr() else {
+            continue;
+        };
+        let Some(bridge) = fail_descr_bridge_ref(fd) else {
+            continue;
+        };
+        let flag_set = bridge
+            .invalidated_arc
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+        if flag_set {
+            continue;
+        }
+        let Some(bridge_src) = bridge.merge_source.as_ref() else {
+            continue;
+        };
+        let bridge_ops = snapshot_ops(&bridge_src.ops);
+        refresh_retained_constptrs(&bridge_ops, bridge.gc_table.as_deref())?;
+        pieces.push((
+            op_idx,
+            snapshot_inputargs(&bridge_src.inputargs),
+            bridge_ops,
+        ));
+    }
+    if pieces.is_empty() {
+        return None;
+    }
+    let loop_ops = snapshot_ops(&loop_src.ops);
+    refresh_retained_constptrs(&loop_ops, compiled.gc_table.as_deref())?;
+    if loop_ops.iter().any(guard_shape_refuses_merge) {
+        return None;
+    }
+    for (_, _, bridge_ops) in &pieces {
+        if bridge_ops.iter().any(guard_shape_refuses_merge) {
+            return None;
+        }
+    }
+    let mut next_raw = max_opref_raw(&loop_src.inputargs, &loop_ops).saturating_add(1);
+    let mut combined = loop_ops;
+    let mut segments = Vec::with_capacity(pieces.len());
+    for (source_guard_op, bridge_inputargs, bridge_ops) in pieces {
+        let fail_args = nonhole_fail_args(&combined[source_guard_op]);
+        let (renumbered, next) =
+            renumber_bridge_ops(&bridge_ops, &bridge_inputargs, &fail_args, next_raw)?;
+        next_raw = next;
+        let start_op = combined.len();
+        combined.extend(renumbered);
+        let source_guard_descr = combined[source_guard_op]
+            .getdescr()
+            .map(|descr| majit_ir::descr_identity(&descr))
+            .expect("merged source guard carries a descr");
+        segments.push(MergeSegment {
+            start_op,
+            source_guard_descr,
+        });
+    }
+    let inputargs = snapshot_inputargs(&loop_src.inputargs);
+    Some((
+        inputargs,
+        combined,
+        MergePlan {
+            trace_id: compiled.trace_id,
+            segments,
+        },
+    ))
 }
 
 struct CompiledLoop {
@@ -8434,6 +8863,10 @@ struct CompiledLoop {
     /// `register_fail_descrs`), because a bridge's `CompiledLoop` is
     /// consumed into `BridgeData` and would otherwise drop the table.
     gc_table: Option<Arc<majit_gc::GcTable>>,
+    /// Leaked `[length, data...]` pointers from `allocate_gcmap` for this
+    /// function's exits. A merged generation moves them so the baked
+    /// `jf_gcmap` immediates stay allocated.
+    gcmap_allocs: Vec<i64>,
     /// Retained compile inputs. `None` when `merge_source_eligible` refused
     /// the trace. Set in `compile_loop`; a bridge's copy lives on `BridgeData`.
     merge_source: Option<MergeSource>,
@@ -10115,6 +10548,48 @@ impl CraneliftBackend {
         }
     }
 
+    /// Merge mode: normalize like `prepare_ops_for_compile`, then
+    /// `GcRewriter::rewrite_for_gc_segments` so each bridge starts from
+    /// fresh rewrite state. Returns post-rewrite start indices, one per
+    /// segment, as the running output length.
+    fn prepare_merged_ops_for_compile(
+        &mut self,
+        inputargs: &[InputArgRc],
+        ops: &[OpRc],
+        segments: &[MergeSegment],
+    ) -> Result<(Vec<Op>, Vec<GcRef>, Vec<usize>), BackendError> {
+        normalize_ops_for_codegen_simple(inputargs, ops);
+        inject_builtin_string_descrs(ops);
+        let mut parts: Vec<&[OpRc]> = Vec::with_capacity(segments.len() + 1);
+        let mut cursor = 0usize;
+        for segment in segments {
+            if segment.start_op < cursor || segment.start_op > ops.len() {
+                return Err(BackendError::CompilationFailed(
+                    "merged segment start is out of order".into(),
+                ));
+            }
+            parts.push(&ops[cursor..segment.start_op]);
+            cursor = segment.start_op;
+        }
+        parts.push(&ops[cursor..]);
+        let rewriter = self.gc_rewriter();
+        let Some((rewritten, gcrefs)) = rewriter.rewrite_for_gc_segments(&parts, &self.constants)
+        else {
+            return Err(BackendError::CompilationFailed(
+                "gc rewriter has no segmented rewrite".into(),
+            ));
+        };
+        let mut starts = Vec::with_capacity(segments.len());
+        let mut out = Vec::new();
+        for (index, part) in rewritten.iter().enumerate() {
+            if index > 0 {
+                starts.push(out.len());
+            }
+            out.extend(part.iter().map(|rc| (**rc).clone()));
+        }
+        Ok((out, gcrefs, starts))
+    }
+
     /// Execute a compiled bridge, returning the DeadFrame from the bridge's
     /// llgraph/runner.py LLFrame.execute() parity.
     ///
@@ -10397,10 +10872,24 @@ impl CraneliftBackend {
         invalidation_flag_ptr: Option<usize>,
         source_guard: Option<(u64, u32)>,
         caller_layout: Option<&ExitRecoveryLayout>,
+        merge: Option<&MergePlan>,
     ) -> Result<CompiledLoop, BackendError> {
+        let mut merge_segment_buf: Vec<MergeSegment> =
+            merge.map(|plan| plan.segments.clone()).unwrap_or_default();
         validate_call_assembler_rewrite_prereqs(ops)?;
-        let (owner_prepared, gcrefs) = self.prepare_ops_for_compile(inputargs, ops);
+        let (owner_prepared, gcrefs) = if merge_segment_buf.is_empty() {
+            self.prepare_ops_for_compile(inputargs, ops)
+        } else {
+            let (prepared, gcrefs, starts) =
+                self.prepare_merged_ops_for_compile(inputargs, ops, &merge_segment_buf)?;
+            for (segment, start) in merge_segment_buf.iter_mut().zip(starts) {
+                segment.start_op = start;
+            }
+            (prepared, gcrefs)
+        };
         let ops = owner_prepared.as_slice();
+        let source_guard_ops = resolve_merged_source_guards(ops, &merge_segment_buf)?;
+        let merge_segments: &[MergeSegment] = &merge_segment_buf;
         // assembler.py:793-824 parity: build the per-loop gc_table from
         // the rewrite's reference-constant list. Its base address is baked
         // by the `LoadFromGcTable` genop; the strong `Arc` is moved into
@@ -10424,12 +10913,23 @@ impl CraneliftBackend {
         // the silent `iconst(0)` fallback that previously turned
         // undefined OpRefs into runtime SIGSEGVs.
         validate_oprefs_for_compile(inputargs, ops, &self.constants)?;
-        let trace_id = self.next_trace_id.take().unwrap_or_else(|| {
-            let trace_id = self.trace_counter;
-            self.trace_counter += 1;
-            trace_id
-        });
-        let header_pc = self.next_header_pc.take().unwrap_or(0);
+        // A merged recompile keeps the loop's trace id and does not consume
+        // the one-shot `next_trace_id` / `next_header_pc` the bridge compile
+        // already took.
+        let trace_id = if let Some(plan) = merge {
+            plan.trace_id
+        } else {
+            self.next_trace_id.take().unwrap_or_else(|| {
+                let trace_id = self.trace_counter;
+                self.trace_counter += 1;
+                trace_id
+            })
+        };
+        let header_pc = if merge.is_some() {
+            0
+        } else {
+            self.next_header_pc.take().unwrap_or(0)
+        };
         // One-shot like `next_trace_id` / `next_header_pc`: a compile entry that
         // installs no override (`compile_tmp_callback`) must fall back to the
         // process-global callback rather than inherit the previous driver's
@@ -10531,6 +11031,8 @@ impl CraneliftBackend {
             &constants_i64,
             attached_descrs,
             frame_value_count_fn,
+            merge_segments,
+            merge.is_some(),
         )?;
         // RPython jitframe layout parity: ref_root slots start AFTER all
         // output slots. max_output_slots must be >= inputs.len() so that
@@ -10568,9 +11070,10 @@ impl CraneliftBackend {
                             }
                         })
                         .collect();
-                    if let Some(fd) = fail_descrs
-                        .get(info.fail_index as usize)
-                        .and_then(|descr| descr.as_fail_descr())
+                    if merge.is_none()
+                        && let Some(fd) = fail_descrs
+                            .get(info.fail_index as usize)
+                            .and_then(|descr| descr.as_fail_descr())
                     {
                         fd.set_rd_locs(rd_locs.clone());
                     }
@@ -10736,6 +11239,7 @@ impl CraneliftBackend {
             max_output_slots,
             guaranteed_frame_depth,
             &mut guard_infos,
+            merge_segments,
         );
 
         let gc_nursery_addrs =
@@ -11413,6 +11917,28 @@ impl CraneliftBackend {
         // agrees with the `label_blocks`-driven dispatch below.
         debug_assert_eq!(label_blocks.len(), label_indices.len());
 
+        // One block per merged bridge. A segment whose first op is a LABEL
+        // reuses that LABEL's block so `label_block_id` numbering, which
+        // follows LABEL order, is unchanged. Any other segment opens a
+        // parameter-less block the source guard jumps to.
+        let mut merge_targets: Vec<(usize, cranelift_codegen::ir::Block)> =
+            Vec::with_capacity(merge_segments.len());
+        let mut merge_start_blocks: Vec<(usize, cranelift_codegen::ir::Block)> =
+            Vec::with_capacity(merge_segments.len());
+        for segment in merge_segments {
+            let block = if ops[segment.start_op].opcode == OpCode::Label {
+                label_blocks
+                    .iter()
+                    .find(|(label_idx, _)| *label_idx == segment.start_op)
+                    .map(|(_, block)| *block)
+                    .expect("merged segment LABEL has a block")
+            } else {
+                builder.create_block()
+            };
+            merge_targets.push((source_guard_ops[merge_targets.len()], block));
+            merge_start_blocks.push((segment.start_op, block));
+        }
+
         // RPython backend: Label ops define loop blocks.
         // Linear traces (no Label, no Jump) stay in the entry block.
         // Bridge traces (source_guard.is_some()) never self-loop — their
@@ -11622,7 +12148,48 @@ impl CraneliftBackend {
         // else: linear trace — already in entry_block with vars defined
 
         let dump_offsets = majit_dump_enabled();
+        #[derive(Clone)]
+        struct WalkSnap {
+            defined_ref_vars: IndexSet<u32>,
+            synced_ref_vars: IndexSet<u32>,
+            stale_ref_vars: IndexSet<u32>,
+            dense_ref_bindings: IndexMap<usize, u32>,
+            demoted_failarg_slots: IndexMap<u32, i32>,
+            preamble_phase: bool,
+        }
+        let mut guard_snaps: Vec<Option<WalkSnap>> = merge_segments.iter().map(|_| None).collect();
         for op_idx in 0..ops.len() {
+            if let Some(slot) = source_guard_ops
+                .iter()
+                .position(|source_op| *source_op == op_idx)
+            {
+                guard_snaps[slot] = Some(WalkSnap {
+                    defined_ref_vars: defined_ref_vars.clone(),
+                    synced_ref_vars: synced_ref_vars.clone(),
+                    stale_ref_vars: stale_ref_vars.clone(),
+                    dense_ref_bindings: dense_ref_bindings.clone(),
+                    demoted_failarg_slots: demoted_failarg_slots.clone(),
+                    preamble_phase,
+                });
+            }
+            if let Some(slot) = merge_segments
+                .iter()
+                .position(|segment| segment.start_op == op_idx)
+            {
+                if let Some(snap) = guard_snaps[slot].clone() {
+                    defined_ref_vars = snap.defined_ref_vars;
+                    synced_ref_vars = snap.synced_ref_vars;
+                    stale_ref_vars = snap.stale_ref_vars;
+                    dense_ref_bindings = snap.dense_ref_bindings;
+                    demoted_failarg_slots = snap.demoted_failarg_slots;
+                    preamble_phase = snap.preamble_phase;
+                }
+                if ops[op_idx].opcode != OpCode::Label {
+                    let block = merge_start_blocks[slot].1;
+                    builder.switch_to_block(block);
+                    builder.seal_block(block);
+                }
+            }
             // Carry the trace's op index through codegen as a source location.
             // Cranelift closes a srcloc region when the next one opens, so
             // every byte the op emits — including the block plumbing a LABEL
@@ -11914,6 +12481,16 @@ impl CraneliftBackend {
                     preamble_phase = false;
                 }
                 continue;
+            }
+            if merge_start_blocks
+                .iter()
+                .any(|(start_op, _)| *start_op == op_idx)
+            {
+                // Values defined in the guard's block do not dominate the
+                // bridge block. Re-read the pinned jitframe here.
+                last_ovf_flag = None;
+                jf_ptr = builder.ins().get_pinned_reg(ptr_type);
+                builder.ins().set_pinned_reg(jf_ptr);
             }
             let op = &ops[op_idx];
             let vi = op_var_index(op, op_idx, num_inputs) as u32;
@@ -12408,6 +12985,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12446,6 +13024,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12502,6 +13081,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12560,6 +13140,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12609,6 +13190,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12669,6 +13251,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12734,6 +13317,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12775,6 +13359,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12827,6 +13412,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12961,6 +13547,7 @@ impl CraneliftBackend {
                             call_conv,
                             &mut failure_recovery,
                             &fail_descrs,
+                            &merge_targets,
                         );
 
                         builder.switch_to_block(cont_block);
@@ -13009,6 +13596,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -13035,6 +13623,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     // Create a continuation block for subsequent ops (dead code).
@@ -13101,6 +13690,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -13220,6 +13810,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -13388,6 +13979,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -16095,15 +16687,28 @@ impl CraneliftBackend {
                     // into block params, so the runtime num_block_params is
                     // unreliable — compare against the arity captured before
                     // codegen).
-                    let local_target_arity_matches = op.getdescr().is_some_and(|d| {
-                        label_arity_by_descr
-                            .get(&d.index())
-                            .copied()
-                            .is_some_and(|arity| arity == op.num_args())
-                    });
+                    let bridge_jump = op_in_merge_segment(op_idx, merge_segments);
+                    let local_target_arity_matches =
+                        jump_is_local(op, ops, &label_arity_by_descr, bridge_jump);
                     let target_block = if local_target_arity_matches {
-                        op.getdescr()
-                            .and_then(|descr| label_blocks_by_descr.get(&descr.index()).copied())
+                        if bridge_jump {
+                            let id = majit_ir::descr_identity(
+                                &op.getdescr().expect("local bridge jump carries a descr"),
+                            );
+                            label_blocks
+                                .iter()
+                                .find(|(label_idx, _)| {
+                                    ops[*label_idx].num_args() == op.num_args()
+                                        && ops[*label_idx].getdescr().is_some_and(|descr| {
+                                            majit_ir::descr_identity(&descr) == id
+                                        })
+                                })
+                                .map(|(_, block)| *block)
+                        } else {
+                            op.getdescr().and_then(|descr| {
+                                label_blocks_by_descr.get(&descr.index()).copied()
+                            })
+                        }
                     } else if op.has_descr() {
                         // Descr present but either points outside this function
                         // (bridge → main loop) or to a local label with
@@ -16164,6 +16769,7 @@ impl CraneliftBackend {
                             call_conv,
                             &mut failure_recovery,
                             &fail_descrs,
+                            &merge_targets,
                         );
                     }
                 }
@@ -16186,6 +16792,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
                 }
 
@@ -16396,6 +17003,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -16437,6 +17045,7 @@ impl CraneliftBackend {
                         call_conv,
                         &mut failure_recovery,
                         &fail_descrs,
+                        &merge_targets,
                     );
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -17728,8 +18337,10 @@ impl CraneliftBackend {
             header_pc,
             source_guard: None,
         };
-        for descr in &fail_descrs {
-            fail_descr_set_trace_info(as_fd(descr), trace_info.clone());
+        if merge.is_none() {
+            for descr in &fail_descrs {
+                fail_descr_set_trace_info(as_fd(descr), trace_info.clone());
+            }
         }
         // Freeze the fail_descrs vector. The collect_guards loop assigns
         // `fail_index = vec.len() as u32` immediately before pushing each
@@ -17799,23 +18410,32 @@ impl CraneliftBackend {
         // the closing-jump reallocate at the source before the tail-call
         // rather than relying solely on that destination check.
         let target_frame_depth = max_output_slots + reserved_tail;
-        let mut label_block_id: u32 = 0;
-        for op in ops.iter() {
-            if op.opcode != OpCode::Label {
-                continue;
-            }
-            if let Some(descr_ref) = op.getdescr() {
-                if let Some(target) = descr_ref.as_loop_target_descr() {
-                    target.set_dispatch_target(
-                        body_ptr as usize,
-                        label_block_id,
-                        target_frame_depth,
-                    );
+        // `publish_merged_entry` keeps each loop LABEL's existing
+        // `label_block_id` and retargets the code pointer. Stamping here
+        // would write the merged body onto bridge LABELs too.
+        if merge.is_none() {
+            let mut label_block_id: u32 = 0;
+            for op in ops.iter() {
+                if op.opcode != OpCode::Label {
+                    continue;
                 }
-                register_loop_target(&descr_ref, entry.clone());
+                if let Some(descr_ref) = op.getdescr() {
+                    if let Some(target) = descr_ref.as_loop_target_descr() {
+                        target.set_dispatch_target(
+                            body_ptr as usize,
+                            label_block_id,
+                            target_frame_depth,
+                        );
+                    }
+                    register_loop_target(&descr_ref, entry.clone());
+                }
+                label_block_id += 1;
             }
-            label_block_id += 1;
         }
+        let gcmap_allocs: Vec<i64> = guard_infos
+            .iter()
+            .filter_map(|info| (info.gcmap != 0).then_some(info.gcmap))
+            .collect();
         Ok(CompiledLoop {
             trace_id,
             input_types: trace_info.input_types.clone(),
@@ -17835,6 +18455,7 @@ impl CraneliftBackend {
             max_output_slots,
             cpu_attachments: self.cpu_handle(),
             gc_table,
+            gcmap_allocs,
             merge_source: None,
             entry_code_ptr: AtomicUsize::new(code_ptr as usize),
             entry_body_ptr: AtomicUsize::new(body_ptr as usize),
@@ -18023,6 +18644,8 @@ fn collect_guards(
     // `-live-` decoder for the `rd_numb` reads below.  `None` falls back to the
     // process-global callback.
     frame_value_count_fn: Option<fn(i32, i32) -> usize>,
+    merge_segments: &[MergeSegment],
+    preserve_descrs: bool,
 ) -> Result<(), BackendError> {
     let type_index = OpTypeIndex::new(inputargs, ops);
     let (type_overrides, op_def_positions) = build_type_overrides(ops, &type_index);
@@ -18048,13 +18671,12 @@ fn collect_guards(
         let is_finish = op.opcode == OpCode::Finish;
         // External JUMP: target not in this function's Labels, or local
         // target with mismatched arity (treated as external for parity).
-        let is_external_jump = op.opcode == OpCode::Jump
-            && op
-                .getdescr()
-                .is_some_and(|d| match label_arity_by_descr.get(&d.index()) {
-                    None => true,
-                    Some(&arity) => arity != op.num_args(),
-                });
+        let is_external_jump = jump_is_external(
+            op,
+            ops,
+            &label_arity_by_descr,
+            op_in_merge_segment(op_idx, merge_segments),
+        );
 
         if !is_guard && !is_finish && !is_external_jump {
             continue;
@@ -18140,10 +18762,36 @@ fn collect_guards(
             .zip(counter_slot)
             .inspect(|&(_, slot)| *max_output_slots = (*max_output_slots).max(slot + 1));
         let fail_loc_base = usize::from(op.opcode == OpCode::GuardNotForced2);
-        let fail_locs: Vec<usize> = (0..fail_arg_refs.len())
+        let mut fail_locs: Vec<usize> = (0..fail_arg_refs.len())
             .map(|index| fail_loc_base + index)
             .collect();
-        let n = fail_arg_refs.len() + fail_loc_base;
+        // Merged recompile: `fail_locs` are the descr's existing `rd_locs`.
+        // An empty table is the identity fast path. A non-empty table of the
+        // fail args' length is the layout `apply_resident_failarg_locs`
+        // already published; holes stay `0xFFFF`.
+        if preserve_descrs && let Some(descr) = op.getdescr() {
+            if let Some(fd) = descr.as_fail_descr() {
+                let rd = fd.rd_locs();
+                if rd.len() == fail_arg_refs.len() {
+                    fail_locs = rd.iter().map(|&loc| loc as usize).collect();
+                }
+            }
+        }
+        // Ref-root slots start at `max_output_slots`. A merged exit stores
+        // fail arg k at `rd_locs[k]`, which may be a stale ref-root or a
+        // demoted home from the original compile. Widening the value area
+        // to cover every non-hole location keeps that store inside the
+        // output region, so it cannot overwrite a ref-root slot that
+        // another fail arg of the same exit reloads from
+        // (`resolve_failarg_opref`).
+        let n = fail_locs
+            .iter()
+            .copied()
+            .filter(|&loc| loc != 0xFFFF)
+            .max()
+            .map(|loc| loc + 1)
+            .unwrap_or(0)
+            .max(fail_arg_refs.len() + fail_loc_base);
         if n > *max_output_slots {
             *max_output_slots = n;
         }
@@ -18542,7 +19190,13 @@ fn collect_guards(
                         is_finish || is_external_jump || !arg_ref.is_constant(),
                         "regalloc.py:1206: guard fail_args must not contain Const (slot={i}, opref={arg_ref:?})"
                     );
-                    slots.push(fail_locs[i]);
+                    let loc = fail_locs[i];
+                    // A `0xFFFF` hole is not a frame word. `emit_guard_exit`
+                    // skips it; the gcmap must not mark it either.
+                    if loc == 0xFFFF {
+                        continue;
+                    }
+                    slots.push(loc);
                 }
             }
             slots
@@ -18658,7 +19312,11 @@ fn collect_guards(
             // setters at the ResumeDescr family; non-Resume meta
             // descrs skip the trait calls so the trait-default panic
             // path stays unreached.
-            if (descr.is_resume_guard() || descr.is_resume_guard_copied())
+            // Merged recompile does not stamp an existing descr. The
+            // original compile already published trace id, fail index,
+            // fail-arg types, and source op index.
+            if !preserve_descrs
+                && (descr.is_resume_guard() || descr.is_resume_guard_copied())
                 && let Some(fd) = descr.as_fail_descr()
             {
                 fd.set_fail_index_per_trace(fail_index);
@@ -18672,11 +19330,11 @@ fn collect_guards(
             // ownership — non-Resume descrs (PropagateExceptionDescr
             // attached via compile_tmp_callback, etc.) carry no such slot
             // and the trait-default panic would fire otherwise.
-            if descr.is_resume_guard() || descr.is_resume_guard_copied() {
+            if !preserve_descrs && (descr.is_resume_guard() || descr.is_resume_guard_copied()) {
                 as_fd(&descr).set_source_op_index(op_idx);
             }
             let _ = recovery_layout;
-            if let Some(target) = external_jump_target {
+            if !preserve_descrs && let Some(target) = external_jump_target {
                 fail_descr_set_external_jump_target(&descr, target);
             }
             descr
@@ -18715,7 +19373,9 @@ fn collect_guards(
                     Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
                     _ => majit_backend::STATUS_TY_INT,
                 };
-                as_fd(&descr).make_a_counter_per_value(slot as u32, type_tag);
+                if !preserve_descrs {
+                    as_fd(&descr).make_a_counter_per_value(slot as u32, type_tag);
+                }
             }
         }
         // assembler.py get_gcref_from_faildescr parity: store the
@@ -18799,7 +19459,7 @@ fn collect_guards(
         } else {
             None
         };
-        if op.opcode == OpCode::GuardNotForced2 {
+        if op.opcode == OpCode::GuardNotForced2 && !preserve_descrs {
             // llsupport/assembler.py `store_info_on_descr`: force() reads
             // exactly the locations written by the register allocator.
             as_fd(&descr).set_rd_locs(
@@ -18846,7 +19506,9 @@ fn collect_guards(
             source_op_index: op_idx,
             fail_index,
             can_have_bridge,
-            redirect_resident_failargs: is_guard && op.opcode != OpCode::GuardNotForced2,
+            redirect_resident_failargs: !preserve_descrs
+                && is_guard
+                && op.opcode != OpCode::GuardNotForced2,
             fail_arg_refs,
             fail_locs,
             counter_value_spill,
@@ -19006,6 +19668,44 @@ impl CraneliftBackend {
         compiled.entry_body_ptr.store(body_ptr, Ordering::Release);
         compiled.entry_code_ptr.store(code_ptr, Ordering::Release);
     }
+
+    /// Recompile `token`'s loop together with the bridges attached to its
+    /// own guards (`assembler.py patch_jump_for_descr`) and publish that
+    /// function. A refusal or a `do_compile` error returns without changing
+    /// the current entry.
+    fn publish_merged_recompile(
+        &mut self,
+        token: &JitCellToken,
+        source_fail_descr: &dyn FailDescr,
+    ) {
+        let Some((inputargs, ops, plan)) = prepare_merged_recompile(token, source_fail_descr)
+        else {
+            return;
+        };
+        let op_rcs: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+        let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
+        let Ok(merged) =
+            self.do_compile(&inputargs, &op_rcs, Some(flag_ptr), None, None, Some(&plan))
+        else {
+            return;
+        };
+        let depth = merged.max_output_slots + merged.num_ref_roots;
+        let code_ptr = merged.code_ptr as usize;
+        let body_ptr = merged.body_ptr as usize;
+        self.publish_merged_entry(
+            token,
+            code_ptr,
+            body_ptr,
+            depth,
+            MergedGeneration {
+                asm_memory_blocks: merged.asm_memory_blocks,
+                gcmap_allocs: merged.gcmap_allocs,
+                fail_descr_cells: vec![merged.fail_descr_cells],
+                gc_table: merged.gc_table,
+                cpu_attachments: Some(merged.cpu_attachments),
+            },
+        );
+    }
 }
 
 // Backend trait implementation
@@ -19062,13 +19762,17 @@ impl majit_backend::Backend for CraneliftBackend {
         // can load from it at runtime.
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
         // Read the pool before `do_compile` takes it (`set_constants` /
-        // `set_constants_pool`). Snapshot after compile so the retained ops
-        // match the `OpRc`s the caller still holds.
-        let retain_merge_source = merge_source_eligible(!self.constants.is_empty(), ops);
-        let mut compiled = self.do_compile(inputargs, ops, Some(flag_ptr), None, None)?;
-        if retain_merge_source {
-            compiled.merge_source = Some(retained_merge_source(compiled.trace_id, inputargs, ops));
-        }
+        // `set_constants_pool`), and snapshot the ops before it too: the
+        // normalize and GC rewrite passes forward operands of the caller's
+        // `OpRc`s to positions they mint, which a merged recompile, rewriting
+        // the retained ops again, would never define.
+        let merge_source = merge_source_eligible(!self.constants.is_empty(), ops)
+            .then(|| retained_merge_source(inputargs, ops));
+        let mut compiled = self.do_compile(inputargs, ops, Some(flag_ptr), None, None, None)?;
+        compiled.merge_source = merge_source.map(|source| MergeSource {
+            trace_id: compiled.trace_id,
+            ..source
+        });
         compiled.green_key = token.green_key();
         let info = AsmInfo {
             code_addr: compiled.code_ptr as usize,
@@ -19249,17 +19953,22 @@ impl majit_backend::Backend for CraneliftBackend {
             popped.frames.pop();
             popped
         });
-        let retain_merge_source = merge_source_eligible(!self.constants.is_empty(), ops);
+        // Snapshot before `do_compile`, like the loop path above.
+        let merge_source = merge_source_eligible(!self.constants.is_empty(), ops)
+            .then(|| retained_merge_source(inputargs, ops));
         let compiled = self.do_compile(
             inputargs,
             ops,
             Some(flag_ptr),
             Some((source_trace_id, fail_descr.fail_index_per_trace())),
             caller_layout.as_ref(),
+            None,
         );
         let mut compiled = compiled?;
-        let merge_source =
-            retain_merge_source.then(|| retained_merge_source(compiled.trace_id, inputargs, ops));
+        let merge_source = merge_source.map(|source| MergeSource {
+            trace_id: compiled.trace_id,
+            ..source
+        });
         // Same invariant as the loop path above: skipping would free the arena
         // range the bridge was just written into.
         {
@@ -19439,6 +20148,11 @@ impl majit_backend::Backend for CraneliftBackend {
         // loop. Cranelift cannot write a rel32 into finalized CLIF, so
         // `fail_descr_attach_bridge` / `emit_attached_bridge_dispatch`
         // is the patch — the guard's cache cell is the `adr_jump_offset`.
+        //
+        // When the source guard lives in the loop's own ops, also recompile
+        // the loop with every currently attached bridge spliced in. Any
+        // refusal or compile error leaves the cell dispatch in place.
+        self.publish_merged_recompile(original_token, fail_descr);
 
         Ok(info)
     }
@@ -22436,6 +23150,97 @@ mod tests {
         assert_eq!(unsafe { *(got.0 as *const u64) }, 0xD30F_0004);
     }
 
+    /// The merged recompile rewrites the loop's retained ops again, after a
+    /// collection has moved a reference constant they name. The merged
+    /// function must bake the forwarded address from the loop's `GcTable`,
+    /// not the nursery address the ops were retained with.
+    #[test]
+    fn merged_recompile_reads_forwarded_loop_constant() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xD30F_0005 };
+        let mut backend = backend_with_gc(gc);
+        let label = make_label_descr(1_500_294);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Ref]);
+        let enter_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        for descr in [&exit_descr, &enter_descr] {
+            descr
+                .as_fail_descr()
+                .unwrap()
+                .set_rd_locs(smallvec::smallvec![0u16]);
+        }
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let counter = OpRef::input_arg_int(0);
+        let exit = mk_op_with_descr(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(1)],
+            OpRef::NONE.raw(),
+            exit_descr,
+        );
+        exit.setfailargs(smallvec::smallvec![rb(OpRef::ref_op(3))]);
+        let enter = mk_op_with_descr(
+            OpCode::GuardFalse,
+            &[OpRef::int_op(2)],
+            OpRef::NONE.raw(),
+            enter_descr.clone(),
+        );
+        enter.setfailargs(smallvec::smallvec![rb(counter)]);
+        let ops = vec![
+            mk_op_with_descr(OpCode::Label, &[counter], OpRef::NONE.raw(), label.clone()),
+            mk_op(OpCode::IntGt, &[counter, OpRef::const_int(0)], 1),
+            mk_op(OpCode::IntEq, &[counter, OpRef::const_int(2)], 2),
+            mk_op(OpCode::SameAsR, &[OpRef::const_ptr(root)], 3),
+            exit,
+            enter,
+            mk_op(OpCode::IntSub, &[counter, OpRef::const_int(1)], 4),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(4)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(1_500_294);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let failed = backend.execute_token(&token, &[Value::Int(2)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&failed),
+            &enter_descr
+        ));
+        with_cranelift_gc_required(|gc| gc.collect_nursery());
+        let owner = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let moved = owner.gc_table.as_ref().unwrap().slot(0);
+        assert_ne!(moved, root);
+        let entry_before = owner.entry_code_ptr.load(Ordering::Acquire);
+        let bridge = vec![
+            mk_op(OpCode::IntSub, &[counter, OpRef::const_int(1)], 1),
+            mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), label),
+        ];
+        backend
+            .compile_bridge(as_fd(&enter_descr), &inputargs, &bridge, &token, &[], None)
+            .unwrap();
+        assert_ne!(
+            owner.entry_code_ptr.load(Ordering::Acquire),
+            entry_before,
+            "the bridge attach publishes a merged entry"
+        );
+        let frame = backend.execute_token(&token, &[Value::Int(2)]);
+        let got = backend.get_ref_value(&frame, 0);
+        assert_eq!(got, moved);
+        assert_eq!(unsafe { *(got.0 as *const u64) }, 0xD30F_0005);
+    }
+
     /// `demoted_failarg_slots` is trace-global while `loop_phi_keep` is per
     /// LABEL, so a raw the first LABEL demoted can be a kept block param at a
     /// later one. For such a raw the home, not the SSA value, is what a guard
@@ -22876,6 +23681,8 @@ mod tests {
                 asm_memory_blocks: Vec::new(),
                 gcmap_allocs: Vec::new(),
                 fail_descr_cells: Vec::new(),
+                gc_table: None,
+                cpu_attachments: None,
             },
         );
         let frame = backend.execute_token(&token_a, &[Value::Int(21)]);
@@ -22886,6 +23693,528 @@ mod tests {
         assert_eq!(target.ll_loop_code(), b_body);
         // `token_b` keeps B's assembler memory alive for the redirected entry.
         let _keep_b = token_b;
+    }
+
+    fn guard_op(
+        opcode: OpCode,
+        arg: OpRef,
+        fail: OpRef,
+        pos: u32,
+        descr: majit_ir::DescrRef,
+    ) -> OpRc {
+        let op = Op::with_descr(opcode, &[rb(arg)], descr);
+        op.pos().set(OpRef::void_op(pos));
+        op.set_fail_arg_types(vec![Type::Int]);
+        op.setfailargs(smallvec::smallvec![rb(fail)]);
+        OpRc::new(op)
+    }
+
+    #[test]
+    fn merged_bridge_jump_keeps_the_loop_exit() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(11);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        exit_descr
+            .as_fail_descr()
+            .unwrap()
+            .set_rd_locs(smallvec::smallvec![0u16]);
+        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        odd_descr
+            .as_fail_descr()
+            .unwrap()
+            .set_rd_locs(smallvec::smallvec![0u16]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(100)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_descr.clone(),
+            ),
+            mk_op(OpCode::IntAnd, &[OpRef::int_op(1), OpRef::const_int(1)], 3),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(3),
+                OpRef::int_op(1),
+                11,
+                odd_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9200);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let before = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&before),
+            &odd_descr
+        ));
+        assert_eq!(backend.get_int_value(&before, 0), 1);
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+
+        let bridge_inputargs = vec![InputArg::new_int_rc(0)];
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
+                1,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&odd_descr),
+                &bridge_inputargs,
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_ne!(entry_before, entry_after);
+        let after = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&after),
+            &exit_descr
+        ));
+        assert_eq!(backend.get_int_value(&after, 0), 108);
+    }
+
+    #[test]
+    fn merged_bridge_survives_rewrite_inserted_before_the_bridge() {
+        // An allocation after the source guard makes the GC rewrite insert
+        // ops in the loop tail. The bridge's post-rewrite start must still
+        // be the failure edge, and the loop must exit at 108.
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(14);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        exit_descr
+            .as_fail_descr()
+            .unwrap()
+            .set_rd_locs(smallvec::smallvec![0u16]);
+        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        odd_descr
+            .as_fail_descr()
+            .unwrap()
+            .set_rd_locs(smallvec::smallvec![0u16]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(100)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_descr.clone(),
+            ),
+            mk_op(OpCode::IntAnd, &[OpRef::int_op(1), OpRef::const_int(1)], 3),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(3),
+                OpRef::int_op(1),
+                11,
+                odd_descr.clone(),
+            ),
+            mk_op_with_descr(OpCode::New, &[], 4, make_size_descr(16, 14)),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9204);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let bridge_inputargs = vec![InputArg::new_int_rc(0)];
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
+                1,
+            ),
+            mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), label),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&odd_descr),
+                &bridge_inputargs,
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        {
+            let entry = token
+                .compiled
+                .get()
+                .unwrap()
+                .downcast_ref::<CompiledLoop>()
+                .unwrap();
+            assert_ne!(
+                entry.entry_code_ptr.load(Ordering::Acquire),
+                entry.code_ptr as usize
+            );
+        }
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&frame),
+            &exit_descr
+        ));
+        assert_eq!(backend.get_int_value(&frame, 0), 108);
+    }
+
+    #[test]
+    fn merged_bridge_guard_returns_its_own_descr() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(12);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        exit_descr
+            .as_fail_descr()
+            .unwrap()
+            .set_rd_locs(smallvec::smallvec![0u16]);
+        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        odd_descr
+            .as_fail_descr()
+            .unwrap()
+            .set_rd_locs(smallvec::smallvec![0u16]);
+        let bridge_guard_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        bridge_guard_descr
+            .as_fail_descr()
+            .unwrap()
+            .set_rd_locs(smallvec::smallvec![0u16]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(100)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_descr.clone(),
+            ),
+            mk_op(OpCode::IntAnd, &[OpRef::int_op(1), OpRef::const_int(1)], 3),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(3),
+                OpRef::int_op(1),
+                11,
+                odd_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9201);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let bridge_inputargs = vec![InputArg::new_int_rc(0)];
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
+                1,
+            ),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(1),
+                OpRef::int_op(1),
+                4,
+                bridge_guard_descr.clone(),
+            ),
+            // The guard fails on this input. The success edge still needs a
+            // terminator; an empty continuation block is not a valid function.
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&odd_descr),
+                &bridge_inputargs,
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&frame),
+            &bridge_guard_descr
+        ));
+        assert_eq!(backend.get_int_value(&frame, 0), 11);
+    }
+
+    #[test]
+    fn merged_exit_honours_redirected_rd_locs() {
+        // The carried ref is deopt-only, so `compute_loop_phi_keep` demotes
+        // it and `apply_resident_failarg_locs` points `rd_locs` at that home.
+        // A nursery allocation before the guard forwards the home. The merged
+        // exit must publish that word, not the positional slot.
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut u64) = 0xD30F_00C1;
+        }
+        let mut backend = backend_with_gc(gc);
+        let label = make_label_descr(15);
+        // Raw 1 is the int input's index. A ref at that raw is treated as an
+        // input and is not demoted, so the carried box sits above the inputs.
+        let carried = OpRef::ref_op(8);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Ref]);
+        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit = Op::with_descr(
+            OpCode::GuardTrue,
+            &[rb(OpRef::int_op(3))],
+            exit_descr.clone(),
+        );
+        exit.pos().set(OpRef::void_op(10));
+        exit.set_fail_arg_types(vec![Type::Ref]);
+        exit.setfailargs(smallvec::smallvec![rb(carried)]);
+        let odd = Op::with_descr(
+            OpCode::GuardFalse,
+            &[rb(OpRef::int_op(4))],
+            odd_descr.clone(),
+        );
+        odd.pos().set(OpRef::void_op(11));
+        odd.set_fail_arg_types(vec![Type::Int]);
+        odd.setfailargs(smallvec::smallvec![rb(OpRef::int_op(2))]);
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried, OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 6),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(1), OpRef::const_int(1)],
+                2,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(2), OpRef::const_int(100)], 3),
+            OpRc::new(exit),
+            mk_op(OpCode::IntAnd, &[OpRef::int_op(2), OpRef::const_int(1)], 4),
+            OpRc::new(odd),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[carried, OpRef::int_op(2)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9205);
+        token.record_target_token(label.clone());
+        backend.set_constants(indexmap::IndexMap::new());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let locs = exit_descr.as_fail_descr().unwrap().rd_locs();
+        assert!(
+            !locs.is_empty() && locs[0] != 0 && locs[0] != 0xFFFF,
+            "original compile should redirect the demoted ref, got {locs:?}"
+        );
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
+                1,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&odd_descr),
+                &[InputArg::new_int_rc(0)],
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_ne!(entry_before, entry_after);
+        let frame = backend.execute_token(&token, &[Value::Ref(root), Value::Int(99)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&frame),
+            &exit_descr
+        ));
+        let moved = backend.get_ref_value(&frame, 0);
+        assert_ne!(moved, root);
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_00C1);
+    }
+
+    #[test]
+    fn must_save_exception_guard_skips_merged_entry() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(16);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(100)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_descr.clone(),
+            ),
+            mk_op(OpCode::IntAnd, &[OpRef::int_op(1), OpRef::const_int(1)], 3),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(3),
+                OpRef::int_op(1),
+                11,
+                odd_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9206);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
+                1,
+            ),
+            mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), label),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&odd_descr),
+                &[InputArg::new_int_rc(0)],
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_eq!(entry_before, entry_after);
+        assert!(fail_descr_bridge_ref(as_fd(&odd_descr)).is_some());
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&frame),
+            &exit_descr
+        ));
+        assert_eq!(backend.get_int_value(&frame, 0), 108);
     }
 
     #[test]

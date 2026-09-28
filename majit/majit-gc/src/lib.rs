@@ -2056,6 +2056,18 @@ pub trait GcRewriter: Send {
         let _ = constants;
         (self.rewrite_for_gc(ops), Vec::new())
     }
+
+    /// `GcRewriterAssembler.rewrite` once per segment (`assemble_bridge`).
+    /// The default is `None`: a rewriter that cannot reset per-segment
+    /// state must not be used to splice bridges into one trace.
+    fn rewrite_for_gc_segments(
+        &self,
+        segments: &[&[OpRc]],
+        constants: &ConstMap<Const>,
+    ) -> Option<(Vec<Vec<OpRc>>, Vec<GcRef>)> {
+        let _ = (segments, constants);
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
