@@ -104,6 +104,17 @@ PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace   # runs the prepa
 - `extract-llbc.py` **skips** a crate whose source fingerprint is unchanged;
   `--force` / `LLBC_FORCE_REEXTRACT=1` overrides. `pyre-interpreter.ullbc` is
   ~300 MB and takes minutes.
+- **On Windows, keep `CHARON_TARGET_DIR` short.** cargo passes one
+  `-L dependency=...` per dependency build dir, so under a long target path
+  `pyre-interpreter`'s rustc line passes the 32767-character limit; cargo then
+  hands charon-driver an `@argfile`, charon-driver reads `--target` from its
+  unexpanded argv, does not find it, and compiles the crate against the host
+  sysroot, failing every `--extern` with `E0463: can't find crate`. The wall of
+  missing crates is that, not a bad install or a stale pin. CI's Windows job
+  sets `CHARON_TARGET_DIR=D:\ct`; a local path of that length works, while
+  `.pyre-build/charon-target-<worktree>` under a home directory does not.
+- A nonzero `extract-llbc.py` does **not** stop a shell gate on its own, and the
+  `cargo test` after it then runs against stale LLBC. Abort the script on it.
 - It internally sets `MAJIT_LLBC_EXTRACTION=1` to break the
   `pyre-jit → pyre-jit-trace → pyre-jit.ullbc` bootstrap cycle, which makes
   `build.rs` emit placeholder artifacts. Never set it for an ordinary build.
