@@ -7031,9 +7031,11 @@ pub struct LazyGraph(std::rc::Rc<LazyGraphCell>);
 struct LazyGraphCell {
     graph: std::cell::OnceCell<Option<std::rc::Rc<FunctionGraph>>>,
     build: std::cell::Cell<Option<Box<dyn FnOnce() -> Option<FunctionGraph>>>>,
-    /// The funcobj's [`GraphKey`] while its graph is not built; a built
-    /// graph answers from its own fields.
-    key: Option<GraphKey>,
+    /// What the funcobj declares before its body is built — the
+    /// `pygraph.py PyGraph.__init__` part, taken from the code object: the
+    /// startblock with the parameters, and the header fields. `None` for a
+    /// graph that was built from the start.
+    header: Option<std::rc::Rc<FunctionGraph>>,
 }
 
 impl LazyGraph {
@@ -7042,30 +7044,36 @@ impl LazyGraph {
         Self(std::rc::Rc::new(LazyGraphCell {
             graph: std::cell::OnceCell::from(Some(graph.into())),
             build: std::cell::Cell::new(None),
-            key: None,
+            header: None,
         }))
     }
 
     /// A graph `build` produces on first demand; `None` from `build` means
-    /// the funcobj has no graph. `key` is the funcobj identity the built
-    /// graph will carry.
+    /// the funcobj has no graph. `header` is what the funcobj declares: the
+    /// built graph starts from it.
     pub fn deferred(
-        key: GraphKey,
+        header: impl Into<std::rc::Rc<FunctionGraph>>,
         build: impl FnOnce() -> Option<FunctionGraph> + 'static,
     ) -> Self {
         Self(std::rc::Rc::new(LazyGraphCell {
             graph: std::cell::OnceCell::new(),
             build: std::cell::Cell::new(Some(Box::new(build))),
-            key: Some(key),
+            header: Some(header.into()),
         }))
     }
 
     /// The funcobj identity, read without building the graph.
     pub fn graph_key(&self) -> GraphKey {
-        match (&self.0.key, self.0.graph.get()) {
-            (_, Some(Some(graph))) => graph.graph_key(),
-            (Some(key), _) => key.clone(),
-            (None, _) => unreachable!("a built LazyGraph holds its graph"),
+        self.header().graph_key()
+    }
+
+    /// What the funcobj declares, read without building the graph: the
+    /// built graph when there is one, else the declared header.
+    pub fn header(&self) -> &FunctionGraph {
+        match (self.0.graph.get(), &self.0.header) {
+            (Some(Some(graph)), _) => graph,
+            (_, Some(header)) => header,
+            (_, None) => unreachable!("a built LazyGraph holds its graph"),
         }
     }
 

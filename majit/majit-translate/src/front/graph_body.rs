@@ -204,24 +204,21 @@ impl GraphBodyProvider {
                 .llbc
                 .iter_local_fns()
                 .filter(|fd| lowering.admit_decl(fd, module_filter, None))
-                // A declaration with no body (a required trait method, an
-                // extern) is no function object.
-                .filter(|fd| {
-                    let has_body = fd.has_unstructured_body();
-                    if !has_body {
-                        lowering.record_decl_failure(fd, DeclBuildError::NoBody);
-                    }
-                    has_body
-                })
-                .map(|fd| {
+                .filter_map(|fd| {
                     let header = lowering.decl_header(fd);
                     let stamp = header.graph_stamp();
-                    let key = stamp.decl_graph_key(fd);
+                    // A declaration with no body (a required trait method,
+                    // an extern) is no function object.
+                    let Some(declared) = lowering.decl_header_graph(fd, &stamp) else {
+                        lowering.record_decl_failure(fd, DeclBuildError::NoBody);
+                        return None;
+                    };
+                    let declared = Rc::new(declared);
                     let (krate, tables, def_id) = (krate.clone(), self.tables.clone(), fd.def_id);
-                    let graph = LazyGraph::deferred(key.clone(), move || {
-                        krate.build_decl_graph(&tables, def_id, &stamp, &key)
+                    let graph = LazyGraph::deferred(declared.clone(), move || {
+                        krate.build_decl_graph(&tables, def_id, &stamp, &declared)
                     });
-                    header.into_semantic(graph)
+                    Some(header.into_semantic(graph))
                 })
                 .collect()
         })
@@ -311,16 +308,17 @@ impl ProvidedCrate {
         tables: &ProviderTables,
         def_id: u64,
         stamp: &GraphStamp,
-        key: &GraphKey,
+        declared: &FunctionGraph,
     ) -> Option<FunctionGraph> {
         let fd = self.llbc.fn_by_id(def_id)?;
         self.lowering(tables, |lowering| match lowering.build_decl_body(fd) {
             Ok(graph) => {
                 let graph = stamp.apply(graph);
                 assert_eq!(
-                    &graph.graph_key(),
-                    key,
-                    "the built body names another funcobj"
+                    declaration(&graph),
+                    declaration(declared),
+                    "the built body of {} departs from its declaration",
+                    graph.name
                 );
                 Some(graph)
             }
@@ -330,6 +328,45 @@ impl ProvidedCrate {
             }
         })
     }
+}
+
+/// The part of a graph its declaration fixes: identity, `FUNC.RESULT`,
+/// and the startblock's parameters with their declared types.
+fn declaration(
+    graph: &FunctionGraph,
+) -> (
+    GraphKey,
+    Option<String>,
+    Vec<String>,
+    usize,
+    Vec<(String, crate::model::ValueType, Option<String>)>,
+) {
+    let startblock = graph.block(graph.startblock);
+    let inputs = startblock
+        .operations
+        .iter()
+        .filter_map(|op| match &op.kind {
+            crate::model::OpKind::Input {
+                name,
+                ty,
+                class_root,
+            } => {
+                let index = startblock
+                    .inputargs
+                    .iter()
+                    .position(|arg| op.result.as_ref() == Some(arg))?;
+                Some((format!("{index}:{name}"), ty.clone(), class_root.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    (
+        graph.graph_key(),
+        graph.return_type.clone(),
+        graph.hints.clone(),
+        startblock.inputargs.len(),
+        inputs,
+    )
 }
 
 impl ProviderTables {

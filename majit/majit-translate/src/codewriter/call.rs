@@ -1391,7 +1391,10 @@ impl GraphStore {
         key: GraphKey,
         build: impl FnOnce() -> Option<FunctionGraph> + 'static,
     ) {
-        let graph = crate::model::LazyGraph::deferred(key, build);
+        let (identity, name) = key;
+        let mut header = FunctionGraph::new(name);
+        header.source_identity = identity;
+        let graph = crate::model::LazyGraph::deferred(header, build);
         self.insert_lazy(path, graph, GraphTransform::default(), None);
     }
 
@@ -14050,7 +14053,7 @@ mod tests {
     fn aliases_of_one_funcobj_share_one_unbuilt_slot() {
         let builds = std::rc::Rc::new(std::cell::Cell::new(0));
         let counter = builds.clone();
-        let funcobj = crate::model::LazyGraph::deferred((None, "helper".to_string()), move || {
+        let funcobj = crate::model::LazyGraph::deferred(FunctionGraph::new("helper"), move || {
             counter.set(counter.get() + 1);
             Some(FunctionGraph::new("helper"))
         });

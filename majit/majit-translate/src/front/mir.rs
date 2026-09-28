@@ -1407,6 +1407,31 @@ impl<'l> CrateLowering<'l> {
         )
     }
 
+    /// What the funcobj `fd` declares, built from the declaration alone —
+    /// `pygraph.py PyGraph.__init__` reads the code object, not the flowed
+    /// body: the startblock the body lowering starts from and the
+    /// `FUNC.RESULT` it stamps, under the header's `stamp`. `None` without
+    /// an `Unstructured` body.
+    pub(crate) fn decl_header_graph(
+        &self,
+        fd: &FunDecl,
+        stamp: &GraphStamp,
+    ) -> Option<crate::model::FunctionGraph> {
+        let locals = fd.unstructured_locals()?;
+        let mut graph = crate::model::FunctionGraph::new(graph_name_of(self.llbc, fd));
+        pygraph_initial_block(
+            &mut graph,
+            &locals,
+            self.llbc,
+            fd.generics.as_ref(),
+            &self.state.tombstoned_leaves,
+        );
+        if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
+            graph.return_type = Some("()".to_string());
+        }
+        Some(stamp.apply(graph))
+    }
+
     /// Lower the body of `fd`, unstamped: the funcobj's header stamps it
     /// ([`SemanticFunctionHeader::graph_stamp`]).
     pub(crate) fn build_decl_body(
@@ -1952,12 +1977,6 @@ impl GraphStamp {
             crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &self.hints);
         }
         graph
-    }
-
-    /// The [`crate::model::GraphKey`] of the stamped body of the declaration
-    /// `fd`, known before the body is built.
-    pub(crate) fn decl_graph_key(&self, fd: &FunDecl) -> crate::model::GraphKey {
-        (Some(self.source_identity.clone()), fd.item_meta.name_path())
     }
 }
 
@@ -3620,6 +3639,18 @@ fn instance_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     ))
 }
 
+/// A `Result<(), PyError>` scoped callee returns void after the
+/// exception-link lowering; its returnblock is widened so the call
+/// descriptor's `FUNC.RESULT` is `v`, not the `Ref`-typed unit shell.
+fn result_exc_ok_is_unit(
+    fd: &FunDecl,
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    crate::front::result_exc::tyref_is_result_of_carrier(&fd.signature.output, llbc, error_carrier)
+        && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc)
+}
+
 fn lower_unstructured_with_static_addrs_and_attrs(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -3653,11 +3684,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         llbc,
         static_addrs.error_carrier,
     );
-    // A `Result<(), PyError>` scoped callee returns void after the
-    // exception-link lowering; widen its returnblock so the call
-    // descriptor's `FUNC.RESULT` is `v`, not the `Ref`-typed unit shell.
-    let result_exc_ok_is_unit = result_exc_callee
-        && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc);
+    let result_exc_ok_is_unit = result_exc_ok_is_unit(fd, llbc, static_addrs.error_carrier);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
         // MIR framestate argument threading must finish before adding native
         // enum arms: its successor table names MIR blocks, not these new

@@ -89,6 +89,25 @@ impl FunDecl {
             .map(|p| p.unstructured)
     }
 
+    /// The `locals` table of the `Unstructured` body, without building its
+    /// basic blocks: the parameters are what a declaration exposes before
+    /// its body is lowered.
+    pub fn unstructured_locals(&self) -> Option<Locals> {
+        #[derive(Deserialize)]
+        struct Body {
+            locals: Locals,
+        }
+        #[derive(Deserialize)]
+        struct Proj {
+            #[serde(rename = "Unstructured")]
+            unstructured: Body,
+        }
+        let body = self.body.as_ref()?;
+        serde_json::from_str::<Proj>(body.get())
+            .ok()
+            .map(|p| p.unstructured.locals)
+    }
+
     /// Whether the body is the `Unstructured` variant, the one
     /// [`Self::unstructured`] projects.
     ///
