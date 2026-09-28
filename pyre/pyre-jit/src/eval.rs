@@ -1598,7 +1598,7 @@ use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new_managed, w_tuple_new
 const JIT_THRESHOLD: u32 = majit_metainterp::jit::PARAMETERS.threshold;
 type JitDriverPair = (
     JitDriver<PyreJitState>,
-    Option<std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>>,
+    std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
 );
 
 thread_local! {
@@ -5144,11 +5144,11 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // computes the hidden mutate field's address, pyre unlinks the instance
     // and flips every loop flag it recorded.
     majit_metainterp::set_force_quasi_immutable_hook(Some(crate::call_jit::force_quasi_immutable));
-    // `warmspot.py` builds `VirtualizableInfo` while translating the
-    // portal. The cold counter tick does not read it. The first trace
-    // or compiled entry calls `ensure_pyframe_virtualizable`, which
-    // publishes the one Arc onto jd0 before `staticdata` is cloned.
+    // `warmspot.py` `WarmRunnerDesc.make_virtualizable_infos` builds this
+    // before the entry function and `finish_setup`.
+    let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);
+    d.set_virtualizable_info(info.clone());
     // info.py `ConstPtrInfo.getstrlen1(mode)` — install pyre's
     // `W_UnicodeObject` length reader so constant STRLEN / UNICODELEN ops
     // fold to `IntBound::from_constant(len)` during intbounds
@@ -5229,7 +5229,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // warmspot.py `jd.portal_runner_adr = adr_of(ll_portal_runner)`.
     let mut jd = PyreJitState::pypyjit_driver_descriptor();
     jd.result_type = majit_ir::Type::Ref;
-    // Filled by `ensure_pyframe_virtualizable` before the first trace.
+    jd.virtualizable_info = Some(info.clone());
     jd.portal_runner_adr = crate::call_jit::ll_portal_runner_shim as *const () as i64;
     jd.handle_jitexc_from_bh = Some(pyre_portal_runner);
     // warmstate.py get_unique_id(greenkey) → interp_jit.py get_unique_id.
@@ -5269,11 +5269,27 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd2.portal_runner_adr = ll_generatorentry_portal_runner_shim as *const () as i64;
     jd2.handle_jitexc_from_bh = Some(generatorentry_portal_runner);
     d.meta_interp_mut().register_jitdriver_sd(jd2);
-    // `finish_setup` installs opcode ids, `all_liveness`, and the
-    // `OS_STR_CONCAT` callinfo before a trace clones `staticdata`. That
-    // install waits for the first trace
+    // `finish_setup` installs opcode ids and `all_liveness` before a trace
+    // clones `staticdata`. That install waits for the first trace
     // (`install_build_time_liveness_before_trace`). Doing it here decodes
     // `liveness.bin` on the cold portal tick `python -c ''` pays.
+    // `jtransform.py` `_handle_stroruni_call` / `_handle_oopspec_call`
+    // adds `OS_STR_CONCAT` to `callinfocollection`, and `finish_setup`
+    // publishes that collection. Seed the row here so
+    // `resume.py concat_strings` can run without a prior trace.
+    {
+        let descr = majit_metainterp::make_call_descr_with_effect(
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::Type::Ref,
+            pyre_jit_trace::descr::ll_strconcat_effectinfo(),
+        );
+        d.meta_interp_mut().ensure_oopspec_callinfo(
+            majit_ir::OopSpecIndex::StrConcat,
+            descr,
+            pyre_object::lowlevel_string::jit_ll_strconcat as *const () as u64,
+            "jit_ll_strconcat",
+        );
+    }
     // rlib/jit.py set_user_param — the translation-time `--jit STR`
     // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
@@ -5303,31 +5319,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     );
     pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
     pyre_interpreter::executioncontext::register_force_vref_hook(force_pyframe_vref);
-    (d, None)
-}
-
-/// One `VirtualizableInfo` for the pypyjit portal, built on the first
-/// trace or compiled entry rather than on the cold counter tick.
-pub(crate) fn publish_pyframe_vinfo(
-    meta: &mut majit_metainterp::MetaInterp<crate::jit::state::PyreMeta>,
-) -> std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo> {
-    if let Some(info) = meta.virtualizable_info().cloned() {
-        return info;
-    }
-    let info = build_pyframe_virtualizable_info();
-    meta.jitdriver_sd_mut(0).expect("jd0").virtualizable_info = Some(info.clone());
-    info
-}
-
-pub fn ensure_pyframe_virtualizable(
-    pair: &mut JitDriverPair,
-) -> std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo> {
-    if let Some(info) = pair.1.clone() {
-        return info;
-    }
-    let info = publish_pyframe_vinfo(pair.0.meta_interp_mut());
-    pair.1 = Some(info.clone());
-    info
+    (d, info)
 }
 
 /// After `write_from_resume_data_partial` copies every
@@ -5413,10 +5405,7 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
     if frame.is_null() {
         return;
     }
-    let pair = driver_pair();
-    let info_arc = ensure_pyframe_virtualizable(pair);
-    let info = info_arc.as_ref();
-    let driver = &mut pair.0;
+    let (driver, info) = driver_pair();
     unsafe {
         let mut traced_frame_escaped = false;
         let tracing_frame = driver.meta_interp_mut().trace_ctx().and_then(|ctx| {
@@ -5866,8 +5855,7 @@ fn mapdict_method_cache_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef
 pub(crate) fn get_virtualizable_info() -> *const majit_metainterp::virtualizable::VirtualizableInfo
 {
     let pair = driver_pair();
-    let info = ensure_pyframe_virtualizable(pair);
-    std::sync::Arc::as_ptr(&info)
+    std::sync::Arc::as_ptr(&pair.1)
 }
 
 /// pypy/module/pypyjit/interp_jit.py → PyPyJitDriver(JitDriver).
@@ -5978,7 +5966,7 @@ impl PyPyJitDriver {
             return false;
         }
         let env = PyreEnv;
-        let driver = &mut driver_pair().0;
+        let (driver, info) = driver_pair();
         let loop_pycode = pycode as *const ();
         let green_key_hash = make_green_key(loop_pycode, next_instr, is_being_profiled);
         let green_key = driver.resolve_cell_key(green_key_hash, || {
@@ -5993,10 +5981,9 @@ impl PyPyJitDriver {
                 >= portal_metatrace_skip()
             && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            let info = publish_pyframe_vinfo(driver.meta_interp_mut());
             if let Some(result) = drive_portal_metatrace(
                 driver,
-                &info,
+                info,
                 &env,
                 green_key,
                 next_instr,
@@ -6010,9 +5997,14 @@ impl PyPyJitDriver {
         // Admission and portal setup may collect; reload the caller-owned
         // root before the legacy compile path reads the frame.
         let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
-        let Some(loop_result) =
-            maybe_compile_and_run(unsafe { &mut *f }, green_key, next_instr, driver, &env)
-        else {
+        let Some(loop_result) = maybe_compile_and_run(
+            unsafe { &mut *f },
+            green_key,
+            next_instr,
+            driver,
+            info,
+            &env,
+        ) else {
             return false;
         };
         set_pending_loop_exit(ec, loop_result);
@@ -8268,29 +8260,12 @@ fn publish_kind0_descrs_before_trace() {
 fn install_build_time_liveness_before_trace(
     meta: &mut majit_metainterp::MetaInterp<crate::jit::state::PyreMeta>,
 ) {
-    let _vinfo = publish_pyframe_vinfo(meta);
     if meta.staticdata.op_live >= 0 {
         return;
     }
     meta.install_liveness_from_build_parts(
         pyre_jit_trace::jitcode_runtime::insns_opname_to_byte(),
         pyre_jit_trace::jitcode_runtime::all_liveness(),
-    );
-    // `jtransform.py` `_handle_stroruni_call` / `_handle_oopspec_call`
-    // adds `OS_STR_CONCAT` to `callinfocollection`. The walker records
-    // `jit_ll_strconcat` itself, so seed the same row for
-    // `resume.py concat_strings`. `ensure_oopspec_callinfo` takes
-    // `Arc::get_mut` on `staticdata`, so this stays on the first trace.
-    let descr = majit_metainterp::make_call_descr_with_effect(
-        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-        majit_ir::Type::Ref,
-        pyre_jit_trace::descr::ll_strconcat_effectinfo(),
-    );
-    meta.ensure_oopspec_callinfo(
-        majit_ir::OopSpecIndex::StrConcat,
-        descr,
-        pyre_object::lowlevel_string::jit_ll_strconcat as *const () as u64,
-        "jit_ll_strconcat",
     );
 }
 
@@ -10358,6 +10333,7 @@ fn maybe_compile_and_run(
     green_key: u64,
     loop_header_pc: usize,
     driver: &mut JitDriver<PyreJitState>,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     // pyre-local extension: PYRE_NO_JIT disables JIT entirely.
@@ -10473,12 +10449,10 @@ fn maybe_compile_and_run(
             {
                 return None;
             }
-            let info = publish_pyframe_vinfo(driver.meta_interp_mut());
-            bound_reached(frame, green_key, loop_header_pc, driver, &info, env)
+            bound_reached(frame, green_key, loop_header_pc, driver, info, env)
         }
         (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
-            let info = publish_pyframe_vinfo(driver.meta_interp_mut());
-            execute_assembler(frame, compiled_key, loop_header_pc, driver, &info, env)
+            execute_assembler(frame, compiled_key, loop_header_pc, driver, info, env)
         }
         (majit_metainterp::warmstate::HotResult::NotHot, _) => {
             if driver
@@ -12081,8 +12055,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if matches!(step, FunctionEntryStep::NotHot) {
         return None;
     }
-    let info_arc = ensure_pyframe_virtualizable(pair);
-    let info = info_arc.as_ref();
+    let info = pair.1.as_ref();
     let driver = &mut pair.0;
 
     // `warmstate.py maybe_compile_and_run` carries the token the cell read
@@ -14164,7 +14137,7 @@ fn build_resumed_frames(
         // `set_virtualizable_info` at JIT_DRIVER init rather than rebuilding
         // a fresh instance, so the guard-failure recovery path shares a
         // single vinfo identity with the tracing / blackhole consumers.
-        let vinfo = crate::eval::ensure_pyframe_virtualizable(crate::eval::driver_pair());
+        let vinfo = crate::eval::driver_pair().1.clone();
         match vable_mode {
             ResumeVableMode::GuardFailureSync => {
                 sync_virtualizable_after_guard_failure(&resolved_vable, frame_u8, &vinfo);
