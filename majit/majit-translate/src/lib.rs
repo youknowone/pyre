@@ -1138,7 +1138,9 @@ fn analyze_pipeline_from_module_paths(
             program
                 .functions
                 .iter()
-                .filter_map(|f| f.lazy_graph().get())
+                .map(|f| f.lazy_graph())
+                .filter(|graph| graph.is_built())
+                .filter_map(|graph| graph.get())
         };
         format!(
             "  program: {} functions ({} built: {} blocks, {} ops), {} struct_fields, {} type layouts",
