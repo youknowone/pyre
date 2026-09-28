@@ -572,8 +572,10 @@ pub struct TraceCtx {
     /// instruction boundary).  RPython has no counterpart: it has no panic arm
     /// here.
     pub abort_after_panic: bool,
-    /// Set when the walk refused a residual call whose target was still a
-    /// symbolic path hash.  A dispatch-arm sub-JitCode may contain an earlier
+    /// Set when the walk refused a call before making it: a residual call
+    /// whose target was still a symbolic path hash, or a recursive portal
+    /// call with neither an inline portal frame nor an assembler token.  A
+    /// dispatch-arm sub-JitCode may contain an earlier
     /// residual call that already executed concretely, so neither replaying
     /// the source opcode nor resuming after the refused call is sound —
     /// unless the host marked that earlier call via

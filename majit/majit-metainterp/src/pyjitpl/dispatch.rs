@@ -1243,6 +1243,20 @@ fn report_symbolic_residual_call_target_once(func: i64, arg_classes: Option<&str
     }
 }
 
+/// Refuse a `BC_RECURSIVE_CALL_*` before its call has run.
+///
+/// `pyjitpl.py do_residual_call` writes the call's result
+/// (`make_result_of_lastop`) before anything can raise `SwitchToBlackhole`,
+/// so a blackhole resumed after the opcode always finds its result register
+/// filled. A walk that refuses the call has run nothing and written nothing:
+/// converting the post-decode framestack would resume past the call and read
+/// whatever the result register held before. Refuse it the way an unbound
+/// residual target is refused, so the portal replays the source arm.
+fn refuse_unexecuted_recursive_call(ctx: &mut TraceCtx) -> TraceAction {
+    ctx.symbolic_residual_abort = true;
+    TraceAction::Abort
+}
+
 /// Report a residual call whose target is still a `symbolic_fnaddr_for_path`
 /// placeholder, once per distinct target.
 ///
@@ -3692,7 +3706,7 @@ where
         // (`warmspot.py` `jd.portal_runner_adr = adr_of(ll_portal_runner)`;
         // `eval.rs` wires one for jd0, which is why production has no such
         // hole), not a decision-routing change here.
-        TraceAction::Abort
+        refuse_unexecuted_recursive_call(ctx)
     }
 
     /// pyjitpl.py `do_recursive_call(assembler_call=True)` for a
@@ -3734,7 +3748,7 @@ where
             | (Some(JitArgKind::Ref), Some(_))
             | (Some(JitArgKind::Float), Some(_))
             | (None, None) => {}
-            _ => return TraceAction::Abort,
+            _ => return refuse_unexecuted_recursive_call(ctx),
         }
 
         // The greens carry the portal green key (pyjitpl.py:3593-3599
@@ -3749,7 +3763,7 @@ where
         let (token_arc, _green_key) =
             match runtime.recursive_call_assembler_target(jd_index, green_values) {
                 Some(target) => target,
-                None => return TraceAction::Abort,
+                None => return refuse_unexecuted_recursive_call(ctx),
             };
 
         // Build the callee's red args.  A recursive portal call runs the
@@ -3765,15 +3779,15 @@ where
         // run.
         let (fresh_values, fresh_owner) = match sym.recursive_fresh_entry_reds() {
             Some(pair) => pair,
-            None => return TraceAction::Abort,
+            None => return refuse_unexecuted_recursive_call(ctx),
         };
         let fresh_capacities = match sym.recursive_fresh_entry_vable_capacities() {
             Some(capacities) => capacities,
-            None => return TraceAction::Abort,
+            None => return refuse_unexecuted_recursive_call(ctx),
         };
         let (alloc_fp, free_fp) = match sym.recursive_fresh_alloc_free_targets() {
             Some(targets) => targets,
-            None => return TraceAction::Abort,
+            None => return refuse_unexecuted_recursive_call(ctx),
         };
         // The trace-time fresh state stands in for the residual allocator's
         // result (byte-identical by construction — both build a fresh state,
@@ -3816,7 +3830,7 @@ where
                     // an extra portal red (pyjitpl.py `do_recursive_call`).
                     let cap = match capacities.next() {
                         Some(cap) => cap,
-                        None => return TraceAction::Abort,
+                        None => return refuse_unexecuted_recursive_call(ctx),
                     };
                     let cap_arg = OpRef::const_int(cap);
                     let alloc_result = ctx.call_ref_typed_with_effect(
@@ -3831,11 +3845,11 @@ where
                     arg_types.push(majit_ir::Type::Ref);
                     idx += 1;
                 }
-                _ => return TraceAction::Abort,
+                _ => return refuse_unexecuted_recursive_call(ctx),
             }
         }
         if capacities.next().is_some() {
-            return TraceAction::Abort;
+            return refuse_unexecuted_recursive_call(ctx);
         }
 
         // 8-step `do_residual_call(assembler_call=True)` protocol, mirroring
@@ -14066,6 +14080,61 @@ mod tests {
         assert_eq!(
             leave_count, enter_count,
             "normal-return path must balance ENTER_PORTAL_FRAME with LEAVE_PORTAL_FRAME",
+        );
+    }
+
+    /// [`RecursivePortalRuntime`] without a portal jitcode: the inline
+    /// decision has no frame to push.
+    struct RecursivePortalWithoutJitcodeRuntime;
+
+    impl JitCodeRuntime for RecursivePortalWithoutJitcodeRuntime {
+        fn label_at(&self, _pc: usize) -> usize {
+            0
+        }
+
+        fn recursive_inline_decision(
+            &self,
+            _jd_index: usize,
+            _green_values: &[i64],
+            _inline_depth: usize,
+            _recursive_depth: usize,
+        ) -> crate::pyjitpl::InlineDecision {
+            crate::pyjitpl::InlineDecision::Inline
+        }
+    }
+
+    /// A refused `BC_RECURSIVE_CALL_INT` has not run, so its result register
+    /// holds whatever it held before. Handing the post-decode framestack to
+    /// the blackhole would resume past the call and read that stale value;
+    /// the refusal must instead leave the portal to replay the source arm.
+    #[test]
+    fn refused_recursive_call_hands_the_blackhole_no_framestack() {
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.load_const_i_value(5, 42);
+        caller_builder.recursive_call_int(0, 0, &[], &[(JitArgKind::Int, 5)]);
+        caller_builder.int_return(0);
+        let caller = caller_builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args_and_runtime(
+            &mut ctx,
+            &mut sym,
+            &caller,
+            0,
+            &RecursivePortalWithoutJitcodeRuntime,
+            &[],
+        );
+
+        assert!(matches!(action, TraceAction::Abort), "got {action:?}");
+        assert!(
+            ctx.aborted_framestack.is_none(),
+            "a refused recursive call must not resume after itself",
+        );
+        assert_eq!(ctx.walk_final_pc, None);
+        assert!(
+            !ctx.symbolic_residual_abort,
+            "the one-shot refusal flag must be consumed by the publisher",
         );
     }
 
