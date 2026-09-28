@@ -294,8 +294,10 @@ fn init_compress_type(ns: PyObjectRef) {
                             "compress() missing data",
                         ));
                     }
-                    let data = as_bytes(args[1])?;
-                    let this = compressor_this(args[0])?;
+                    let mut w_self = args[0];
+                    let w_data = args[1];
+                    let data = pyre_object::with_roots!(w_self => as_bytes(w_data))?;
+                    let this = compressor_this(w_self)?;
                     if this.backend.is_null() {
                         return Err(zlib_error("Error -2: inconsistent stream state"));
                     }
@@ -336,11 +338,14 @@ fn init_compress_type(ns: PyObjectRef) {
                 // interp_zlib.py `@unwrap_spec(mode="c_int")` — the
                 // converter reports a value outside the C `int` range rather
                 // than truncating it into a different flush mode.
+                let mut w_self = args[0];
                 let mode = match args.get(1).copied() {
-                    Some(o) if !{ is_none(o) } => pyre_interpreter::baseobjspace::c_int_w(o)?,
+                    Some(o) if !{ is_none(o) } => {
+                        pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::c_int_w(o))?
+                    }
                     _ => backend::Z_FINISH,
                 };
-                let this = compressor_this(args[0])?;
+                let this = compressor_this(w_self)?;
                 if this.backend.is_null() {
                     return Err(zlib_error("Error -2: inconsistent stream state"));
                 }
@@ -509,23 +514,24 @@ fn decompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_inter
             "decompress() missing data",
         ));
     }
-    let data = as_bytes(data_obj)?;
+    let mut w_self = args[0];
+    let mut w_max_length = args.get(2).copied().unwrap_or(PY_NULL);
+    let data = pyre_object::with_roots!(w_self, w_max_length => as_bytes(data_obj))?;
     // An omitted `max_length` is unlimited; a supplied value — including
     // `None` — goes through `int_w`.  Zero also means unlimited here, and a
     // negative value is rejected.
-    let max_length = match args.get(2).copied() {
-        Some(o) if !o.is_null() => {
-            let v = pyre_interpreter::baseobjspace::int_w(o)?;
-            if v < 0 {
-                return Err(pyre_interpreter::PyError::value_error(
-                    "max_length must be non-negative",
-                ));
-            }
-            (v != 0).then_some(v as usize)
+    let max_length = if w_max_length.is_null() {
+        None
+    } else {
+        let v = pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::int_w(w_max_length))?;
+        if v < 0 {
+            return Err(pyre_interpreter::PyError::value_error(
+                "max_length must be non-negative",
+            ));
         }
-        _ => None,
+        (v != 0).then_some(v as usize)
     };
-    let this = decompressor_this(args[0])?;
+    let this = decompressor_this(w_self)?;
     if this.backend.is_null() {
         return Err(zlib_error("Error -2: inconsistent stream state"));
     }
@@ -596,9 +602,10 @@ fn init_decompress_type(ns: PyObjectRef) {
                         "flush() missing self",
                     ));
                 }
+                let mut w_self = args[0];
                 let length = match args.get(1).copied() {
                     Some(o) if !{ is_none(o) } => {
-                        let v = pyre_interpreter::baseobjspace::int_w(o)?;
+                        let v = pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::int_w(o))?;
                         if v <= 0 {
                             return Err(pyre_interpreter::PyError::value_error(
                                 "length must be greater than zero",
@@ -608,7 +615,7 @@ fn init_decompress_type(ns: PyObjectRef) {
                     }
                     _ => backend::DEF_BUF_SIZE,
                 };
-                let this = decompressor_this(args[0])?;
+                let this = decompressor_this(w_self)?;
                 if this.backend.is_null() {
                     return Err(zlib_error("Error -2: inconsistent stream state"));
                 }
@@ -774,13 +781,20 @@ fn zdecompress_getset(
 // with PY_NULL.
 fn zdecompress_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // args[0] is the type; args[1..] are the constructor arguments.
-    let wbits = to_wbits(int_or_default(
-        args.get(1).copied().unwrap_or(PY_NULL),
+    let mut w_cls = args.first().copied().unwrap_or(PY_NULL);
+    let w_wbits = args.get(1).copied().unwrap_or(PY_NULL);
+    let mut w_zdict = args.get(2).copied().unwrap_or(PY_NULL);
+    let wbits = to_wbits(pyre_object::with_roots!(w_cls, w_zdict => int_or_default(
+        w_wbits,
         backend::MAX_WBITS as i64,
-    )?);
-    let zdict = zdict_or_none(args.get(2).copied().unwrap_or(PY_NULL))?;
+    ))?);
+    let zdict = pyre_object::with_roots!(w_cls => zdict_or_none(w_zdict))?;
     let d = backend::ZlibDecompressor::new(wbits, zdict).map_err(init_error)?;
-    let cls = args.first().copied().unwrap_or_else(zdecompress_type);
+    let cls = if w_cls.is_null() {
+        zdecompress_type()
+    } else {
+        w_cls
+    };
     allocate_zdecompress(cls, d)
 }
 
@@ -813,20 +827,21 @@ fn zdecompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_inte
             "decompress() missing data",
         ));
     }
-    let data = as_bytes(data_obj)?;
+    let mut w_self = args[0];
+    let mut w_max_length = args.get(2).copied().unwrap_or(PY_NULL);
+    let data = pyre_object::with_roots!(w_self, w_max_length => as_bytes(data_obj))?;
     // `max_length=-1` (the default) means unlimited; an omitted slot behaves
     // the same.  Only PY_NULL selects that default: a supplied value —
     // including `None` — goes through `int_w`, which raises for `None` and on
     // ssize_t overflow.  A negative value is unlimited, zero caps the output
     // at zero bytes.
-    let max_length = match args.get(2).copied() {
-        Some(o) if !o.is_null() => {
-            let v = pyre_interpreter::baseobjspace::int_w(o)?;
-            (v >= 0).then_some(v as usize)
-        }
-        _ => None,
+    let max_length = if w_max_length.is_null() {
+        None
+    } else {
+        let v = pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::int_w(w_max_length))?;
+        (v >= 0).then_some(v as usize)
     };
-    let this = zdecompressor_this(args[0])?;
+    let this = zdecompressor_this(w_self)?;
     if this.backend.is_null() {
         return Err(zlib_error("Error -2: inconsistent stream state"));
     }
@@ -1013,13 +1028,17 @@ pyre_interpreter::py_module! {
     },
     functions: {
         "crc32" / * = |args| {
-            let data = as_bytes(args.first().copied().unwrap_or(w_none()))?;
-            let start = args.get(1).map(|&o| unsafe { w_int_get_value(o) } as u32).unwrap_or(0);
+            let w_data = args.first().copied().unwrap_or(w_none());
+            let mut w_start = args.get(1).copied().unwrap_or(PY_NULL);
+            let data = pyre_object::with_roots!(w_start => as_bytes(w_data))?;
+            let start = if w_start.is_null() { 0 } else { unsafe { w_int_get_value(w_start) as u32 } };
             Ok(w_int_new(crc32_compute(&data, start) as i64))
         },
         "adler32" / * = |args| {
-            let data = as_bytes(args.first().copied().unwrap_or(w_none()))?;
-            let start = args.get(1).map(|&o| unsafe { w_int_get_value(o) } as u32).unwrap_or(1);
+            let w_data = args.first().copied().unwrap_or(w_none());
+            let mut w_start = args.get(1).copied().unwrap_or(PY_NULL);
+            let data = pyre_object::with_roots!(w_start => as_bytes(w_data))?;
+            let start = if w_start.is_null() { 1 } else { unsafe { w_int_get_value(w_start) as u32 } };
             Ok(w_int_new(adler32_compute(&data, start) as i64))
         },
     },
