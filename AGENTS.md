@@ -321,6 +321,29 @@ cargo test -p pyre-jit --no-default-features --features dynasm,prepass
 - The core loop does not replace the full gate below. When the full gate is
   due (see "How much to verify"), it is the product `cargo test` and a bare
   `python3 pyre/check.py`, not their core variants.
+- **Which crate owns a module has three criteria, and PyPy's
+  `default_modules` tier is not one of them.** A module belongs in
+  `pyre-interpreter` when the interpreter reaches it by name -- `import`,
+  `absolute_import`, `import_module`, or upstream's `space.getbuiltinmodule`,
+  so `bootstrap_importlib_modules` -> `_imp`, `eval.rs build_template_op` ->
+  `_template` and `importing.py read_compiled_module` -> `marshal` all count.
+  The last shows why a pyre-side string search is not the whole test: pyre
+  reaches `marshal` from `interp_imp.rs` as a direct Rust call, so only
+  upstream names it -- read the upstream owner before concluding a module is
+  unreached. A module belongs there too when PyPy's `essential_modules` names it
+  (`_opcode`, `__pypy__`), or when CPython's `Modules/Setup.bootstrap` does
+  (`_abc`, `_functools`, `_stat`, `_symtable`, `_types`, `faulthandler`, `pwd`,
+  `time`). Everything else stays in `pyre-module`, and the test runs in both
+  directions: a module in `pyre-interpreter` that answers none of the three
+  belongs in `pyre-module`. Note that `Modules/Setup.bootstrap` is narrower than
+  CPython's always-built-in table in `config.c.in` -- `_tokenize` is in the
+  latter only and is not a criterion hit. A `default_modules` hit is **not** a
+  reason to move: `pypyoption.py` gives every module a
+  `BoolOption(modname, default=modname in default_modules)`, so that tier means
+  "on by default, switchable off" -- which is what `pyrex`'s
+  `default = [..., "pyre-module"]` already expresses. `math` and `cmath` are
+  `default_modules` and stay optional; a fixture that needs one takes the skip
+  marker above instead.
 
 ## How much to verify
 
