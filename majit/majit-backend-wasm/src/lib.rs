@@ -6931,6 +6931,10 @@ impl majit_backend::Backend for WasmBackend {
                     *((items_base + compiled.frame.dispatch_key_ofs as usize) as *mut i64) =
                         i64::from(dispatch_key);
                 }
+                // llmodel.py `execute_token`: `llop.gc_writebarrier(ll_frame)`
+                // after the input stores. A frame born old (oversized, or a
+                // refused young rawmalloc) now holds young refs.
+                wasm_jit_write_barrier(jf as i64);
 
                 let saved = majit_gc::shadow_stack::push_jf(majit_ir::GcRef(jf as usize));
                 {
