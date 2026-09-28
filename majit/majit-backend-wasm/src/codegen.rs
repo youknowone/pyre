@@ -3104,24 +3104,19 @@ fn emit_ca_pop_shadowstack(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_store(mem32(0));
 }
 
-/// CA return footer: `_call_footer_shadowstack`.
+/// CA return footer: `_call_footer_shadowstack`, the x86 `SUB`.
 ///
-/// `genop_finish` publishes `_finish_gcmap` (or NULL) before the footer.
-/// A CA callee's `FINISH` now does that publish inside generated wasm, so
-/// the caller footer is the x86 `SUB`. A callee that retains
-/// `GUARD_NOT_FORCED_2` still keeps the frame reachable after the pop;
-/// those traces keep `wasm_jit_ca_pop_frame` (finish map + write barrier
-/// + pop). The flag is the callee's and lives on the stable dispatch
+/// `genop_finish` publishes `_finish_gcmap` (or NULL) before the footer, and
+/// a CA callee's `FINISH` does that publish inside generated wasm. A callee
+/// that retains `GUARD_NOT_FORCED_2` keeps that map while its force token is
+/// armed, because the frame stays reachable after the pop; an unarmed one
+/// clears it. The flag is the callee's and lives on the stable dispatch
 /// cell, not the pre-call snapshot: a GNF2 bridge can attach while this
-/// invocation is inside the callee. The caller's own ops do not
-/// describe the frame being popped, including after
-/// `redirect_call_assembler`.
+/// invocation is inside the callee. The caller's own ops do not describe
+/// the frame being popped, including after `redirect_call_assembler`.
 fn emit_ca_pop_footer(
     sink: &mut PeepSink<'_, '_>,
     inline: CaInlineParams,
-    residual_type_base: u32,
-    ca_pop_fn_ptr: i64,
-    ca_cfp_local: u32,
     scratch: u32,
     dispatch_entry: i32,
 ) {
@@ -3154,17 +3149,9 @@ fn emit_ca_pop_footer(
         sink.i64_const(0);
         sink.i64_store(memarg(JF_GCMAP_OFS as u64, 3));
     }
-    emit_ca_pop_shadowstack(sink, inline.jf_top_addr);
-    sink.else_();
-    sink.local_get(ca_cfp_local);
-    sink.i64_extend_i32_u();
-    sink.i32_const(ca_pop_fn_ptr as i32);
-    sink.call_indirect(0, residual_type_base + 1);
-    sink.drop();
     sink.end();
-    sink.else_();
-    emit_ca_pop_shadowstack(sink, inline.jf_top_addr);
     sink.end();
+    emit_ca_pop_shadowstack(sink, inline.jf_top_addr);
 }
 
 /// While a CA callee is pushed, its caller's `jf_ptr` is `top[-3 * WORD]`.
@@ -9533,19 +9520,10 @@ fn build_function(
                 }
                 // Pop the callee frame off the jitframe shadow stack (strict
                 // LIFO).  `assembler.py` `_call_footer_shadowstack` is
-                // `SUB [rootstacktop], 2*WORD`; keep the helper only when
-                // the inline nursery path is off (it also publishes the
-                // finish gcmap).
-                if let (Some(base), Some(inline)) = (residual_type_base, ca.inline) {
-                    emit_ca_pop_footer(
-                        &mut sink,
-                        inline,
-                        base,
-                        ca.ca_pop_fn_ptr,
-                        ca_cfp_local,
-                        alloc_scratch_local,
-                        dispatch_entry,
-                    );
+                // `SUB [rootstacktop], 2*WORD`; the helper pops only when
+                // the inline shadow-stack cells are not published.
+                if let Some(inline) = ca.inline {
+                    emit_ca_pop_footer(&mut sink, inline, alloc_scratch_local, dispatch_entry);
                 } else if let Some(base) = residual_type_base {
                     sink.local_get(ca_cfp_local);
                     sink.i64_extend_i32_u();
