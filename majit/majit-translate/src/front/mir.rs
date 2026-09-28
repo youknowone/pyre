@@ -28873,6 +28873,11 @@ pub(crate) struct RootStackAnalyzer<'a> {
     /// analysed at the call site.  In a crate that only imports the API a
     /// foreign body may be one of its helpers, so nothing is known about it.
     root_api_is_local: bool,
+    /// Whether this artefact names the root-stack API at all, locally or as
+    /// an import.  One that does not sits below the API's crate, as do the
+    /// crates it calls into, so none of its bodies can reach the stack
+    /// except through a callback analysed at the call site.
+    root_api_is_visible: bool,
     /// `GraphAnalyzer._analyzed_calls`, keyed by `FunDecl` id.
     analyzed_calls: std::cell::RefCell<
         crate::tool::algo::unionfind::UnionFind<
@@ -28882,6 +28887,9 @@ pub(crate) struct RootStackAnalyzer<'a> {
     >,
     /// Every impl body a trait method call may reach, built on first use.
     trait_methods: std::cell::OnceCell<TraitMethodBodies>,
+    /// `FunDecl` id -> whether that body opens a bracket and returns its
+    /// guard inside the result, as `DictOperationGuard::new` does.
+    scope_constructors: std::cell::RefCell<std::collections::HashMap<u64, bool>>,
 }
 
 /// The impl bodies behind each trait method of one artefact.
@@ -28900,14 +28908,47 @@ impl<'a> RootStackAnalyzer<'a> {
         let root_api_is_local = llbc.iter_type_decls().any(|decl| {
             decl.item_meta.is_local && gc_root_scope_type_path(&decl.item_meta.name_path())
         });
+        let root_api_is_visible = root_api_is_local
+            || llbc
+                .iter_type_decls()
+                .any(|decl| gc_root_scope_type_path(&decl.item_meta.name_path()))
+            || llbc.iter_fun_decls().any(|fd| {
+                fd.item_meta
+                    .name_path()
+                    .split("::")
+                    .any(|s| s == ROOT_SCOPE_MODULE)
+            });
         Self {
             llbc,
             root_api_is_local,
+            root_api_is_visible,
             analyzed_calls: std::cell::RefCell::new(crate::tool::algo::unionfind::UnionFind::new(
                 |_: &u64| crate::translator::backendopt::graphanalyze::Dependency::new(false),
             )),
             trait_methods: std::cell::OnceCell::new(),
+            scope_constructors: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Whether this call returns a value owning a bracket the callee opened.
+    /// The caller's local holding the result is then that bracket's guard:
+    /// the call opens it and the local's drop closes it.
+    fn call_returns_owned_scope(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        if let Some(&known) = self.scope_constructors.borrow().get(id) {
+            return known;
+        }
+        let answer = self
+            .llbc
+            .fn_by_id(*id)
+            .and_then(|fd| fd.unstructured())
+            .is_some_and(|body| {
+                body_returns_owned_scope(self.llbc, &body, &|reg| regular_call_name_path(reg, self.llbc))
+            });
+        self.scope_constructors.borrow_mut().insert(*id, answer);
+        answer
     }
 
     /// Whether a statically resolved call can change the root stack.
@@ -28942,6 +28983,14 @@ impl<'a> RootStackAnalyzer<'a> {
         if path.split("::").any(|s| s == ROOT_SCOPE_MODULE) {
             return !root_stack_api_is_neutral(&path);
         }
+        // Charon's drop glue without a body this reader can walk, for a type
+        // outside the root-stack API: the generic `Drop` reasoning in
+        // `analyze_trait_call` applies to it unchanged -- a value can close a
+        // bracket only by holding a guard it was handed, and the body that
+        // handed it over is charged.
+        if path.rsplit("::").next() == Some("drop_in_place") && fd.unstructured().is_none() {
+            return false;
+        }
         if fd.body.is_none() {
             return self.analyze_external_call(fd);
         }
@@ -28957,8 +29006,34 @@ impl<'a> RootStackAnalyzer<'a> {
     }
 
     /// `analyze_external_call`: a declaration with no body in this artefact.
+    ///
+    /// A crate that is not part of the linked translation input cannot name
+    /// the root-stack API, which lives in one that is; like a dependency of
+    /// the API's own crate, it reaches the stack only through a callback,
+    /// and a callback is analysed at the call site.  A body in a linked crate
+    /// analysed earlier answers with that artefact's published result.
     fn analyze_external_call(&self, fd: &FunDecl) -> bool {
-        fd.item_meta.is_local || !self.root_api_is_local
+        if fd.item_meta.is_local {
+            return true;
+        }
+        if self.root_api_is_local {
+            return false;
+        }
+        if !self.llbc.has_root_stack_effects() {
+            return self.root_api_is_visible;
+        }
+        let path = fd.item_meta.name_path();
+        let krate = path.split("::").next().unwrap_or_default();
+        match self.llbc.root_stack_effect(krate, &path) {
+            Some(touches) => touches,
+            None => crate::local_crates::is_local_crate_root(krate),
+        }
+    }
+
+    /// Whether the body with this `FunDecl` id can change the root stack.
+    fn fn_touches_root_stack(&self, id: u64) -> bool {
+        let mut seen = RootStackTracker::new();
+        self.analyze_direct_call(id, &mut seen)
     }
 
     /// Every body a trait method call may reach: the impl the call selected,
@@ -28980,6 +29055,23 @@ impl<'a> RootStackAnalyzer<'a> {
         if let Some(impl_id) = traitref_impl_id(traitref, self.llbc, 0) {
             targets.extend(bodies.by_impl.get(&(impl_id, method)).copied());
         } else if let Some(trait_id) = traitref_decl_id(traitref, self.llbc, 0) {
+            // A still-generic `Drop::drop` (or the `Destruct` drop glue that
+            // reaches it) destroys a value whose type the
+            // caller chose.  The only destructors that change the root stack
+            // are guards closing their own bracket, and a guard reaches a
+            // generic drop only by being passed in by value: the body that
+            // handed it over is the one charged, because its pins then run
+            // outside any close it owns.  The close itself truncates to the
+            // guard's save point, which drops no pin its opener did not see
+            // made.
+            if self.llbc.trait_by_id(trait_id).is_some_and(|decl| {
+                matches!(
+                    decl.item_meta.name_path().as_str(),
+                    "core::ops::drop::Drop" | "core::marker::Destruct"
+                )
+            }) {
+                return false;
+            }
             targets.extend(
                 bodies
                     .by_trait
@@ -28989,9 +29081,14 @@ impl<'a> RootStackAnalyzer<'a> {
                     .copied(),
             );
         }
+        // Only a provided default is a body; a required method's declaration
+        // carries none to analyse, and every impl is already listed.
         if let Some(decl) = traitref_decl_id(traitref, self.llbc, 0)
             .and_then(|trait_id| trait_default_method_id(self.llbc, trait_id, method))
-            && self.llbc.fn_by_id(decl).is_some_and(|fd| fd.body.is_some())
+            && self
+                .llbc
+                .fn_by_id(decl)
+                .is_some_and(|fd| fd.unstructured().is_some())
         {
             targets.push(decl);
         }
@@ -29028,17 +29125,24 @@ impl<'a> RootStackAnalyzer<'a> {
     /// The body's own result: some call it makes outside every bracket it
     /// opens and closes itself can change the root stack.
     fn analyze_body(&self, body: &Unstructured, seen: &mut RootStackTracker) -> bool {
-        let owned = owned_root_scopes(self.llbc, body, &|reg| {
-            regular_call_name_path(reg, self.llbc)
-        });
+        let owned = owned_root_scopes(
+            self.llbc,
+            body,
+            &|reg| regular_call_name_path(reg, self.llbc),
+            &|reg| self.call_returns_owned_scope(reg),
+        );
         let mut covered: Option<bit_set::BitSet> = None;
         for (bb_idx, bb) in body.body.iter().enumerate() {
             let mut touches = bb
                 .statements
                 .iter()
                 .any(|stmt| self.analyze_fn_values(&stmt.kind, seen));
+            // An opener's own call is what its close truncates: a guard
+            // constructor's pins land in the bracket this body now holds.
+            let opens = owned.opener.values().any(|&open_bb| open_bb == bb_idx);
             touches = touches
                 || match bb.term(self.llbc) {
+                    Ok(TermKind::Call { .. }) if opens => false,
                     Ok(TermKind::Call { call, .. }) => match &call.func {
                         CallFunc::Regular(reg) => {
                             self.analyze_regular_call(reg, seen)
@@ -29069,15 +29173,42 @@ impl<'a> RootStackAnalyzer<'a> {
     }
 }
 
-/// Root-stack API calls that leave the stack's depth and its slots alone:
-/// opening a bracket saves the current length, and the base and length reads
-/// write nothing.
+/// Root-stack API calls that leave the stack's depth alone and name no slot
+/// they did not open themselves.
+///
+/// Opening a bracket saves the current length, and a scope's `base` is its
+/// own save point.  A read or write by explicit index is neutral too: the
+/// index comes from the body that opened the slot, and
+/// [`analyze_root_brackets_with`] step (3) keeps any bracket whose slot index
+/// reaches a call or a captured value, so no callee ever indexes a slot an
+/// erased bracket failed to push.  What stays charged is a depth change, and
+/// a position read -- `shadow_stack_len` or the top slot -- made outside any
+/// bracket the body opened itself, which observes whatever its caller pushed.
+///
+/// The static roots (`RootedOnceRef`, the prebuilt dirty bit) share the
+/// module but are not stack slots.
 fn root_stack_api_is_neutral(path: &str) -> bool {
     gc_root_scope_open_path(path)
         || gc_root_scope_base_path(path)
         || matches!(
             path.rsplit("::").next(),
-            Some("shadow_stack_len" | "root_stack_depth" | "increase_root_stack_depth")
+            Some(
+                "root_stack_depth"
+                    | "increase_root_stack_depth"
+                    | "shadow_stack_get"
+                    | "shadow_stack_set"
+                    | "shadow_stack_copy_range"
+                    | "get"
+                    | "set"
+                    | "take"
+                    | "get_or_init"
+                    | "normalize"
+                    | "normalize_moved"
+                    | "normalize_roots"
+                    | "gcarray_ref_items"
+                    | "mark_prebuilt_roots_dirty"
+                    | "prebuilt_roots_dirty"
+            )
         )
 }
 
@@ -29168,6 +29299,7 @@ fn owned_root_scopes(
     llbc: &Llbc,
     body: &Unstructured,
     name_of: &impl Fn(&RegularCall) -> Option<String>,
+    returns_owned_scope: &impl Fn(&RegularCall) -> bool,
 ) -> OwnedRootScopes {
     let moved = moved_out_locals(body);
     let mut opener = std::collections::HashMap::new();
@@ -29179,7 +29311,9 @@ fn owned_root_scopes(
         let CallFunc::Regular(reg) = &call.func else {
             continue;
         };
-        if !name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path)) {
+        if !name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path))
+            && !returns_owned_scope(reg)
+        {
             continue;
         }
         let PlaceKind::Local(dest) = call.dest.kind else {
@@ -29197,6 +29331,85 @@ fn owned_root_scopes(
         opener.remove(&dest);
     }
     OwnedRootScopes { opener }
+}
+
+/// Whether `body` opens a bracket and hands its guard back inside the value
+/// it returns: the guard, through any plain moves, enters an aggregate that
+/// becomes `_0`, directly or through one moved local.  Such a constructor's pins belong to
+/// the bracket its caller now holds.
+fn body_returns_owned_scope(
+    llbc: &Llbc,
+    body: &Unstructured,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> bool {
+    let guards: bit_set::BitSet = body
+        .body
+        .iter()
+        .filter_map(|bb| match bb.term(llbc) {
+            Ok(TermKind::Call { call, .. }) => match (&call.func, &call.dest.kind) {
+                (CallFunc::Regular(reg), PlaceKind::Local(dest))
+                    if name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path)) =>
+                {
+                    Some(*dest as usize)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    if guards.is_empty() {
+        return false;
+    }
+    // Follow plain moves of a guard (`_21 = move _3`) to the local that
+    // enters the aggregate.
+    let mut guards = guards;
+    loop {
+        let before = guards.len();
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                if let Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Move(src), _))) =
+                    stmt.stmt_kind()
+                    && let (PlaceKind::Local(dest), PlaceKind::Local(from)) =
+                        (&place.kind, &src.kind)
+                    && guards.contains(*from as usize)
+                {
+                    guards.insert(*dest as usize);
+                }
+            }
+        }
+        if guards.len() == before {
+            break;
+        }
+    }
+    let mut holders = bit_set::BitSet::new();
+    let mut moved_into_result = bit_set::BitSet::new();
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = place.kind else {
+                continue;
+            };
+            match value {
+                Rvalue::Aggregate(_, operands)
+                    if operands.iter().any(|op| {
+                        matches!(op, Operand::Move(src)
+                            if matches!(src.kind, PlaceKind::Local(g) if guards.contains(g as usize)))
+                    }) =>
+                {
+                    holders.insert(dest as usize);
+                }
+                Rvalue::Use(Operand::Move(src), _) if dest == 0 => {
+                    if let PlaceKind::Local(h) = src.kind {
+                        moved_into_result.insert(h as usize);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    holders.contains(0) || holders.iter().any(|h| moved_into_result.contains(h))
 }
 
 impl OwnedRootScopes {
@@ -29726,6 +29939,24 @@ fn pin_roots_slice_values(
             _ => return None,
         }
     }
+}
+
+/// Every local body of `llbc` that can change the root stack, by path.
+///
+/// Published to the artefacts linked after this one, so a call into this
+/// crate from there is answered by its body instead of being assumed to
+/// touch the stack.  Paths that name several bodies (`<Impl>::new`) are
+/// listed if any of them touches.
+pub fn harvest_root_stack_touching_paths(llbc: &Llbc) -> Vec<String> {
+    let analyzer = RootStackAnalyzer::new(llbc);
+    let mut touching: Vec<String> = llbc
+        .iter_local_fns()
+        .filter(|fd| fd.body.is_some() && analyzer.fn_touches_root_stack(fd.def_id))
+        .map(|fd| fd.item_meta.name_path())
+        .collect();
+    touching.sort();
+    touching.dedup();
+    touching
 }
 
 /// Build the erasure plan for one body.  Everything it does not recognise

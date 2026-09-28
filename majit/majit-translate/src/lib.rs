@@ -250,11 +250,19 @@ fn build_semantic_program_via_active_frontend(
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
+            // Root-stack effects, harvested in link order: each artefact is
+            // analysed with the effects of the crates it depends on already
+            // published, so a call into one of them reads that body's answer.
+            let mut root_stack_crates: Vec<String> = Vec::new();
+            let mut root_stack_touching: Vec<String> = Vec::new();
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 prof.mark(&format!("    harvest {p}"));
                 crate_names.push(llbc.crate_name().to_string());
+                llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
+                root_stack_touching.extend(front::mir::harvest_root_stack_touching_paths(&llbc));
+                root_stack_crates.push(llbc.crate_name().to_string());
                 discovered.extend(front::mir::discover_transparent_scalar_kinds(&llbc));
                 duplicate_leaf_facts.absorb(front::mir::DuplicateLeafFacts::discover(&llbc));
                 let mut impl_folds = Vec::new();
@@ -298,6 +306,7 @@ fn build_semantic_program_via_active_frontend(
                 if !eval_hook_graphs.is_empty() {
                     llbc.set_eval_hook_graphs(eval_hook_graphs.clone());
                 }
+                llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);
