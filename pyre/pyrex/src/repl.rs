@@ -192,7 +192,8 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
                 continue;
             }
             ReadlineResult::Eof => {
-                println!();
+                // The line the prompt left open ends on the prompt's stream.
+                eprintln!();
                 break;
             }
             ReadlineResult::Io(err) => {

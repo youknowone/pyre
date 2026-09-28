@@ -131,9 +131,15 @@ impl Readline {
     }
 }
 
+/// `PyOS_StdioReadline`: flush stdout, then write the prompt to stderr, so a
+/// session whose stdout is captured gets the results without the prompts.
 fn read_basic_line(prompt: &str) -> ReadlineResult {
-    print!("{prompt}");
-    if let Err(err) = io::stdout().flush() {
+    let written = io::stdout().flush().and_then(|()| {
+        let mut stderr = io::stderr();
+        stderr.write_all(prompt.as_bytes())?;
+        stderr.flush()
+    });
+    if let Err(err) = written {
         return ReadlineResult::Io(err);
     }
 
