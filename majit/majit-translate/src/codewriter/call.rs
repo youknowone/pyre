@@ -1057,10 +1057,6 @@ impl FuncObjDeclarations {
     pub(crate) fn get(&self, index: usize) -> Option<DeclaredFuncObj> {
         self.0.borrow().get(index).cloned()
     }
-
-    pub(crate) fn len(&self) -> usize {
-        self.0.borrow().len()
-    }
 }
 
 /// One source funcobj's stored graph plus the metadata derived from it at

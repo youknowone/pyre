@@ -171,7 +171,11 @@ impl GraphBodyProvider {
         }
     }
 
-    /// Lower one already-linked artefact and keep it. The caller applied
+    /// Declare the funcobjs of one already-linked artefact and keep it. No
+    /// body is built here: each is built when something first asks for its
+    /// graph (`description.py FunctionDesc.getgraphs` / `cachedgraph`), and
+    /// building one declares the clause specializations it names. The
+    /// caller applied
     /// `discover_transparent_scalar_kinds` and `discover_foldable_const_lits`
     /// across the whole set first, and `cross_tombstoned_leaves` is the
     /// duplicate-leaf verdict across that set.
@@ -191,21 +195,6 @@ impl GraphBodyProvider {
         );
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let functions = self.declare_crate(&krate, module_filter.as_ref());
-        let first_spec = self.tables.declarations.len();
-        // Every declared body is built here, in declaration order and
-        // before the clause specializations those bodies declare. A body
-        // that does not lower leaves its funcobj external.
-        for function in &functions {
-            function.lazy_graph().get();
-        }
-        // Then every clause specialization those bodies declared, in
-        // declaration order; building one declares the specializations its
-        // copy binds.
-        let mut next = first_spec;
-        while let Some(spec) = self.tables.declarations.get(next) {
-            spec.graph.get();
-            next += 1;
-        }
         let mut program = krate.state.finish(functions);
         mir::harden_duplicate_leaf_metadata(
             &mut program.struct_fields,
