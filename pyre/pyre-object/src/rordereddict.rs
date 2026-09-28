@@ -1199,6 +1199,64 @@ where
         Some(self.move_slot_to_end(slot, last))
     }
 
+    /// Copy this table's entry-slot layout under a new key type.
+    ///
+    /// `W_BaseSetObject.switch_to_object_strategy` (`setobject.py`) builds a
+    /// fresh object dict from `getdict_w`, which walks live keys only.
+    /// `W_SetIterObject.slot` is an index into this array, and a tombstone
+    /// must keep its index so slot `N` still names the same element after the
+    /// switch (`_ll_dict_del_entry` does not renumber). `keys.len()` is
+    /// `num_ever_used_items`; `keys[i]` is the image of a live slot `i` and is
+    /// ignored for a tombstone. The index is `ll_dict_reindex` on the new
+    /// keys' hashes, not a copy of the old probe table.
+    pub fn map_keys_preserving_layout<K2, S2>(&self, keys: &[K2]) -> RDict<K2, V, S2>
+    where
+        K2: Hash + Eq + Copy + EntryDummy,
+        S2: BuildHasher + Default,
+        (K2, V): GcEntriesType,
+    {
+        let n = self.num_ever_used_items;
+        debug_assert_eq!(keys.len(), n);
+        if n == 0 {
+            return RDict::with_hasher(S2::default());
+        }
+        let mut dst = RDict::with_hasher(S2::default());
+        dst.entries = alloc_entries::<K2, V>(n);
+        let mut live = 0usize;
+        for slot in 0..n {
+            if !self.entry_valid(slot) {
+                continue;
+            }
+            let value = self.entry_at(slot).value;
+            let key = keys[slot];
+            let hash = dst.hash_of(&key);
+            dst.barrier_entries();
+            unsafe {
+                std::ptr::write(
+                    dst.entry_ptr().add(slot),
+                    Entry {
+                        key,
+                        f_valid: true,
+                        value,
+                        f_hash: hash,
+                    },
+                );
+            }
+            live += 1;
+        }
+        debug_assert_eq!(live, self.num_live_items);
+        dst.num_live_items = live;
+        dst.num_ever_used_items = n;
+        let index_size = if self.indexes.len().is_power_of_two() && !self.indexes.is_empty() {
+            self.indexes.len()
+        } else {
+            DICT_INITSIZE
+        };
+        dst.reindex(index_size);
+        crate::gc_hook::try_gc_write_barrier_managed(dst.entries as *mut u8);
+        dst
+    }
+
     pub fn reserve(&mut self, additional: usize)
     where
         K: Copy,
