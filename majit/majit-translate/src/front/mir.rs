@@ -23780,7 +23780,9 @@ impl<'a> Lowering<'a> {
     }
 
     fn type_decl_has_explicit_drop(&self, def_id: u64) -> bool {
-        self.llbc.has_explicit_drop_impl(def_id)
+        self.llbc.has_explicit_drop_impl(def_id, |ty| {
+            resolve_tyexpr_to_adt_def_id_free(self.llbc, ty)
+        })
     }
 
     /// Resolve a recognized `Option::map`/`and_then`/`unwrap_or_else(opt,

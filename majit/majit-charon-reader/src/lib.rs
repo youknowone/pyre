@@ -652,8 +652,13 @@ impl Llbc {
     /// Whether a `trait_impls` row implements `Drop` for the ADT
     /// `adt_def_id`: its first generic type names that ADT, and its trait
     /// is `core::ops::drop::Drop` or has no declaration here to prove it
-    /// is not.
-    pub fn has_explicit_drop_impl(&self, adt_def_id: u64) -> bool {
+    /// is not. `adt_of` reads the ADT a type expression names; the owner
+    /// set is built with the first caller's `adt_of`.
+    pub fn has_explicit_drop_impl(
+        &self,
+        adt_def_id: u64,
+        adt_of: impl Fn(&serde_json::Value) -> Option<u64>,
+    ) -> bool {
         self.drop_impl_owners
             .get_or_init(|| {
                 let mut owners: Vec<u64> = self
@@ -668,7 +673,7 @@ impl Llbc {
                             .and_then(|generics| generics.get("types"))
                             .and_then(serde_json::Value::as_array)
                             .and_then(|types| types.first())
-                            .and_then(|owner| self.tyexpr_adt_def_id(owner))?;
+                            .and_then(|owner| adt_of(owner))?;
                         impl_trait
                             .get("id")
                             .and_then(serde_json::Value::as_u64)
@@ -685,21 +690,6 @@ impl Llbc {
             })
             .binary_search(&adt_def_id)
             .is_ok()
-    }
-
-    /// ADT def_id a type expression names: an inline
-    /// `{"HashConsedValue": [id, {"Adt": {"id": {"Adt": N}}}]}` or a
-    /// `{"Deduplicated": id}` reference into [`Self::dedup_adt`].
-    fn tyexpr_adt_def_id(&self, ty: &serde_json::Value) -> Option<u64> {
-        let obj = ty.as_object()?;
-        if let Some(body) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|arr| arr.get(1))
-        {
-            return body.get("Adt")?.get("id")?.get("Adt")?.as_u64();
-        }
-        self.dedup_to_adt_def_id(obj.get("Deduplicated")?.as_u64()?)
     }
 
     /// The `trait_impls` row whose `def_id` is `id` — the impl block
