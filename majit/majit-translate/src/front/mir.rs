@@ -29012,9 +29012,13 @@ impl<'a> RootStackAnalyzer<'a> {
     /// the API's own crate, it reaches the stack only through a callback,
     /// and a callback is analysed at the call site.  A body in a linked crate
     /// analysed earlier answers with that artefact's published result.
+    ///
+    /// A local declaration whose body Charon left `Opaque` is unknown, except
+    /// in an artefact that does not name the API at all: nothing it contains
+    /// can reach the stack but a callback.
     fn analyze_external_call(&self, fd: &FunDecl) -> bool {
         if fd.item_meta.is_local {
-            return true;
+            return self.root_api_is_visible;
         }
         if self.root_api_is_local {
             return false;
@@ -29092,8 +29096,12 @@ impl<'a> RootStackAnalyzer<'a> {
         {
             targets.push(decl);
         }
+        // No body in this artefact implements the method.  An artefact that
+        // does not name the root-stack API reaches it only through an impl a
+        // crate built on top of it supplies, which is a callback, as in
+        // `analyze_external_call`.
         if targets.is_empty() {
-            return true;
+            return self.root_api_is_visible;
         }
         targets
             .into_iter()
@@ -56449,6 +56457,121 @@ mod tests {
             !analyzer.regular_call_touches_root_stack(&direct(3)),
             "outer closes every pin inner leaves, whichever is asked first"
         );
+    }
+
+    #[test]
+    fn root_stack_analysis_charges_no_unknown_body_in_an_artefact_below_the_api() {
+        use majit_charon_reader::ullbc::RegularCall;
+        // An artefact that names no part of the root-stack API sits below
+        // it: a local body Charon left opaque, or a trait method no body in
+        // the artefact implements, reaches the stack only through a callback
+        // a crate above supplies.  Once the artefact names the API, the same
+        // unknowns may be its helpers.
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": {"Regular": id}}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |terminator: serde_json::Value| serde_json::json!({"statements": [], "terminator": {"kind": terminator}});
+        let body = |blocks: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+                "body": blocks
+            })
+        };
+        let fun = |def_id: u64, path: &[&str], body: serde_json::Value| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                    "span": span(),
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                },
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [],
+                    "output": {"Tuple": []}
+                },
+                "body": body
+            })
+        };
+        let artefact = |krate: &str, names_api: bool| {
+            let mut funs = vec![
+                fun(
+                    0,
+                    &[krate, "fixture", "opaque"],
+                    serde_json::json!("Opaque"),
+                ),
+                //   bb0: _2 = opaque(_1) -> bb1
+                //   bb1: return
+                fun(
+                    1,
+                    &[krate, "fixture", "caller"],
+                    serde_json::json!({"Unstructured": body(vec![
+                        block(call(0, vec![copy(1)], 2, 1)),
+                        block(serde_json::json!("Return")),
+                    ])}),
+                ),
+                // A required trait method: a declaration with no body.
+                fun(
+                    2,
+                    &[krate, "fixture", "Hook", "run"],
+                    serde_json::json!("Missing"),
+                ),
+            ];
+            if names_api {
+                funs.push(fun(
+                    3,
+                    &[krate, "gc_roots", "push_roots"],
+                    serde_json::json!("Missing"),
+                ));
+            }
+            llbc_with_types(krate, vec![], funs)
+        };
+        let direct: RegularCall = serde_json::from_value(
+            serde_json::json!({"kind": {"Fun": {"Regular": 1}}, "generics": null}),
+        )
+        .expect("fixture call parses");
+        let method: RegularCall = serde_json::from_value(
+            serde_json::json!({"kind": {"Trait": [{}, 0, 2]}, "generics": null}),
+        )
+        .expect("fixture call parses");
+
+        let below = artefact("majit_rlib", false);
+        let analyzer = super::RootStackAnalyzer::new(&below);
+        assert!(
+            !analyzer.regular_call_touches_root_stack(&direct),
+            "an opaque local body below the API cannot reach the stack"
+        );
+        assert!(
+            !analyzer.regular_call_touches_root_stack(&method),
+            "an unimplemented trait method below the API cannot reach the stack"
+        );
+
+        let above = artefact("pyre_object", true);
+        let analyzer = super::RootStackAnalyzer::new(&above);
+        assert!(analyzer.regular_call_touches_root_stack(&direct));
+        assert!(analyzer.regular_call_touches_root_stack(&method));
     }
 
     #[test]
