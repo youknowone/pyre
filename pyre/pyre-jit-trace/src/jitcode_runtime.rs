@@ -3953,7 +3953,6 @@ mod tests {
             .collect();
         gap.sort();
         let expected = [
-            "abort/>r",
             "assert_not_none/r",
             "check_neg_index/rid>i",
             "gc_load_indexed_f/riiii>f",

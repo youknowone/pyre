@@ -7897,6 +7897,41 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     // ResumeDataDirectReader methods (resume.py)
 
+    /// A `-live-` entry names one bank. `TAGINT` (or a const of another
+    /// type) in the ref or float section is the same bug as an int box in
+    /// `registers_r`: `getref_base` is not defined on that box.
+    fn expect_liveness_item_bank(
+        &self,
+        jitcode_name: &str,
+        pc: usize,
+        bank: majit_ir::Type,
+        reg_idx: u32,
+        num_regs: usize,
+    ) {
+        crate::blackhole::expect_liveness_bank(jitcode_name, pc, bank, reg_idx, num_regs);
+        let tagged = self.resumecodereader.peek() as i16;
+        let (num, tag) = untag(tagged);
+        let got = match tag {
+            TAGINT => Some(majit_ir::Type::Int),
+            TAGCONST => {
+                if bank == majit_ir::Type::Ref && tagged_eq(tagged, NULLREF) {
+                    Some(majit_ir::Type::Ref)
+                } else {
+                    let idx = (num - TAG_CONST_OFFSET) as usize;
+                    self.consts.get(idx).map(|c| c.get_type())
+                }
+            }
+            _ => None,
+        };
+        if let Some(got) = got
+            && got != bank
+        {
+            panic!(
+                "liveness: jitcode {jitcode_name} pc {pc} bank {bank:?} register {reg_idx} holds {got:?}"
+            );
+        }
+    }
+
     /// resume.py `consume_one_section(self, blackholeinterp)`.
     ///
     /// ```python
@@ -7961,6 +7996,13 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
             for reg_idx in it.by_ref() {
+                self.expect_liveness_item_bank(
+                    &bh.jitcode.name,
+                    bh.position,
+                    majit_ir::Type::Int,
+                    reg_idx,
+                    bh.jitcode.num_regs_i(),
+                );
                 bh.registers_i[reg_idx as usize] = self.next_int();
             }
             offset = it.offset;
@@ -7969,6 +8011,13 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             for reg_idx in it.by_ref() {
+                self.expect_liveness_item_bank(
+                    &bh.jitcode.name,
+                    bh.position,
+                    majit_ir::Type::Ref,
+                    reg_idx,
+                    bh.jitcode.num_regs_r(),
+                );
                 let value = self.next_ref_for_resume_slot();
                 bh.registers_r[reg_idx as usize] = value;
                 if let Some(vinfo) = vinfo_heap {
@@ -7981,6 +8030,13 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
             for reg_idx in it {
+                self.expect_liveness_item_bank(
+                    &bh.jitcode.name,
+                    bh.position,
+                    majit_ir::Type::Float,
+                    reg_idx,
+                    bh.jitcode.num_regs_f(),
+                );
                 bh.registers_f[reg_idx as usize] = self.next_float();
             }
             // `offset` is the end of the float section; no further use.
@@ -8001,6 +8057,9 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn _prepare_next_section_with(
         &mut self,
         info: usize,
+        jitcode_name: &str,
+        pc: usize,
+        num_regs: (usize, usize, usize),
         mut cb: impl FnMut(majit_ir::Type, u32, i64),
     ) {
         use majit_jitcode::liveness::LivenessIterator;
@@ -8021,6 +8080,13 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
             for reg_idx in it.by_ref() {
+                self.expect_liveness_item_bank(
+                    jitcode_name,
+                    pc,
+                    majit_ir::Type::Int,
+                    reg_idx,
+                    num_regs.0,
+                );
                 let value = self.next_int();
                 cb(majit_ir::Type::Int, reg_idx, value);
             }
@@ -8030,6 +8096,13 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             for reg_idx in it.by_ref() {
+                self.expect_liveness_item_bank(
+                    jitcode_name,
+                    pc,
+                    majit_ir::Type::Ref,
+                    reg_idx,
+                    num_regs.1,
+                );
                 let value = self.next_ref_for_resume_slot();
                 cb(majit_ir::Type::Ref, reg_idx, value);
             }
@@ -8039,6 +8112,13 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
             for reg_idx in it {
+                self.expect_liveness_item_bank(
+                    jitcode_name,
+                    pc,
+                    majit_ir::Type::Float,
+                    reg_idx,
+                    num_regs.2,
+                );
                 let value = self.next_float();
                 cb(majit_ir::Type::Float, reg_idx, value);
             }
@@ -8078,9 +8158,19 @@ impl<'a> ResumeDataDirectReader<'a> {
             // `jitcode.get_live_vars_info(position, op_live)` is the
             // section info offset for the current PC.
             let info = jitcode.get_live_vars_info(resolved_pc, op_live);
-            self._prepare_next_section_with(info, |_kind, _reg_idx, value| {
-                outputs.push(value);
-            });
+            self._prepare_next_section_with(
+                info,
+                &jitcode.name,
+                resolved_pc,
+                (
+                    jitcode.num_regs_i(),
+                    jitcode.num_regs_r(),
+                    jitcode.num_regs_f(),
+                ),
+                |_kind, _reg_idx, value| {
+                    outputs.push(value);
+                },
+            );
         }
         true
     }

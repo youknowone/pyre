@@ -271,7 +271,7 @@ fn stamp_gc_ref_base(base: &crate::flowspace::model::Variable, graph_name: &str)
     }
 }
 
-fn field_owner_is_gc(
+pub(crate) fn field_owner_is_gc(
     field: &crate::model::FieldDescriptor,
     callcontrol: Option<&crate::call::CallControl>,
 ) -> bool {

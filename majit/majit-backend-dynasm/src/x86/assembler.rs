@@ -5191,7 +5191,12 @@ impl<'a> Assembler386<'a> {
             };
             let expected_typeid = self
                 .lookup_typeid_from_classptr(i.value as usize)
-                .expect("GuardClass: missing typeid for classptr");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "GuardClass: missing typeid for classptr {:#x}",
+                        i.value as usize
+                    )
+                });
             self._cmp_guard_gc_type(&Loc::Reg(*obj), &Loc::immed(expected_typeid as i64));
         }
     }

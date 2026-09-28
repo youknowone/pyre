@@ -16893,6 +16893,21 @@ mod tests {
     }
 
     #[test]
+    fn cast_ptr_to_int_and_back_records_the_same_bits() {
+        let bits = 0x68i64;
+        let mut builder = JitCodeBuilder::new();
+        builder.record_cast_ptr_to_int(1, 0);
+        builder.record_cast_int_to_ptr(2, 1);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), bits)],
+        );
+        assert!(recorded.contains(&OpCode::CastPtrToInt));
+        assert!(recorded.contains(&OpCode::CastIntToPtr));
+    }
+
+    #[test]
     fn float_bits_conversions_fold_a_constant_operand() {
         let mut builder = JitCodeBuilder::new();
         builder.load_const_f_value(0, 1.5f64.to_bits() as i64);

@@ -1805,3 +1805,296 @@ fn mem_replace_of_a_multi_word_value_is_field_wise() {
         "a u128 variant field makes move_plan None, so replace stays: {wide_calls:?}"
     );
 }
+
+/// `mem::replace` of a `Dynamic`-like enum reached through `Box::as_mut`.
+/// The stores are the variant fields (`store_enum_variant`). The caller's
+/// write set names `__discriminant` and the payload. No `mem::replace` call
+/// remains.
+#[test]
+fn mem_replace_through_box_deref_names_enum_fields() {
+    use majit_ir::descr::OopSpecIndex;
+    use majit_ir::effectinfo::DescrSetMember;
+    use majit_ir::value::Type;
+    use majit_translate::CallPath;
+    use majit_translate::call::{AnalysisCache, CallControl};
+    use majit_translate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
+
+    let llbc = load_corpus();
+    let program = build_semantic_program_from_llbc(llbc).expect("builder");
+
+    let assert_lowered = |name: &str| {
+        let func = program
+            .functions
+            .iter()
+            .find(|f| f.name == name || f.name.ends_with(&format!("::{name}")))
+            .unwrap_or_else(|| panic!("missing {name}"));
+        let mut replace_calls = 0usize;
+        let mut writes = Vec::new();
+        for block in &func.graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::FieldWrite { field, .. } => writes.push(field.name.clone()),
+                    OpKind::Call { target, .. } => {
+                        if format!("{target:?}").contains("replace") {
+                            replace_calls += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(replace_calls, 0, "{name} still calls mem::replace");
+        assert!(
+            writes.iter().any(|n| n == "__discriminant"),
+            "{name} writes no tag: {writes:?}"
+        );
+        assert!(
+            writes.iter().any(|n| n.starts_with("__pos_")),
+            "{name} writes no payload: {writes:?}"
+        );
+
+        let mut cc = CallControl::new();
+        cc.set_struct_fields(program.struct_fields.clone());
+        let path = CallPath::from_segments([name]);
+        cc.register_function_graph(path.clone(), func.graph.clone());
+        cc.add_candidate_graph(path);
+        let mut cache = AnalysisCache::default();
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path([name]),
+                args: Vec::new(),
+                result_ty: ValueType::Void,
+            },
+        };
+        let nargs = func.graph.block(func.graph.startblock).inputargs.len();
+        let descriptor = cc.getcalldescr(
+            &op,
+            vec![Type::Ref; nargs],
+            Type::Ref,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        let named: Vec<String> = descriptor
+            .extra_info
+            .descr_set_keys
+            .iter()
+            .flat_map(|keys| keys.write_fields.iter())
+            .filter_map(|member| match member {
+                DescrSetMember::Field { field_name, .. } => Some(field_name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            named.iter().any(|n| n.contains("__discriminant")),
+            "{name} write set {named:?}"
+        );
+        assert!(
+            named.iter().any(|n| n.contains("__pos_")),
+            "{name} write set {named:?}"
+        );
+    };
+
+    assert_lowered("replace_boxed_held");
+    assert_lowered("replace_boxed_held_call");
+    assert_lowered("replace_indexed_box");
+    assert_lowered("replace_indexed_box_call");
+    assert_lowered("replace_boxed_dynlike");
+}
+
+/// `*held = i64` through `&mut HeldUnion` is `setfield` of
+/// `HeldUnion::Int.__pos_0`. The SSA dump of that graph carries no
+/// `__deref_write` symbol for the assembler to resolve.
+#[test]
+fn store_through_union_int_is_setfield_not_deref_write() {
+    use majit_translate::model::OpKind;
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "store_held_int").unwrap_or_else(|e| panic!("{e}"));
+    let mut ssa_dump = String::new();
+    let mut writes = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            ssa_dump.push_str(&format!("{:?}\n", op.kind));
+            if let OpKind::FieldWrite { field, .. } = &op.kind {
+                writes.push((field.name.clone(), field.owner_root.clone()));
+            }
+        }
+    }
+    assert!(
+        !ssa_dump.contains("__deref_write"),
+        "deref-write symbol reached the SSA dump:\n{ssa_dump}"
+    );
+    assert!(
+        writes.iter().any(|(name, owner)| {
+            name == "__pos_0"
+                && owner
+                    .as_deref()
+                    .is_some_and(|owner| owner.contains("HeldUnion::Int"))
+        }),
+        "expected HeldUnion::Int.__pos_0 setfield, writes={writes:?}\n{ssa_dump}"
+    );
+}
+
+/// `slot.0 = HeldUnion::Int(value)` moves the enum into the inline field.
+/// The field is not a pointer, so the graph has no `HeldCell.__pos_0` store
+/// of the temporary's address.
+#[test]
+fn store_inline_enum_field_moves_the_variant() {
+    use majit_translate::model::{ExitSwitch, OpKind};
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "store_held_cell").unwrap_or_else(|e| panic!("{e}"));
+    let mut writes = Vec::new();
+    let mut switches = 0usize;
+    for block in &graph.blocks {
+        if matches!(block.exitswitch, Some(ExitSwitch::Value(_))) {
+            switches += 1;
+        }
+        for op in &block.operations {
+            if let OpKind::FieldWrite { field, .. } = &op.kind {
+                writes.push((
+                    field.name.clone(),
+                    field.owner_root.clone().unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    assert!(
+        switches >= 1,
+        "inline enum move has no discriminant switch, writes={writes:?}"
+    );
+    assert!(
+        writes.iter().all(|(_, owner)| !owner.contains("HeldCell")),
+        "inline enum field stored as one HeldCell word: {writes:?}"
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(name, owner)| name == "__discriminant" && owner.contains("HeldUnion")),
+        "missing discriminant move, writes={writes:?}"
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(name, owner)| name == "__pos_0" && owner.contains("HeldUnion::Int")),
+        "missing Int payload move, writes={writes:?}"
+    );
+}
+
+/// A whole `HeldUnion` move switches on `__discriminant`. The `Ref`
+/// payload is read only in its own arm, so an `Int` value is never
+/// loaded as a reference.
+#[test]
+fn whole_enum_move_switches_per_variant() {
+    use majit_translate::model::{ExitSwitch, OpKind};
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "replace_held_union").unwrap_or_else(|e| panic!("{e}"));
+    let mut switch_blocks = Vec::new();
+    let mut ref_blocks = Vec::new();
+    let mut int_blocks = Vec::new();
+    for block in &graph.blocks {
+        if matches!(block.exitswitch, Some(ExitSwitch::Value(_))) {
+            switch_blocks.push(block.id);
+        }
+        for op in &block.operations {
+            if let OpKind::FieldRead { field, ty, .. } = &op.kind {
+                if field.name != "__pos_0" {
+                    continue;
+                }
+                let owner = field.owner_root.clone().unwrap_or_default();
+                if owner.contains("HeldUnion::Ref") {
+                    assert!(
+                        matches!(ty, majit_translate::model::ValueType::Ref(_)),
+                        "Ref payload read as {ty:?}"
+                    );
+                    ref_blocks.push(block.id);
+                }
+                if owner.contains("HeldUnion::Int") {
+                    assert!(
+                        matches!(
+                            ty,
+                            majit_translate::model::ValueType::Int
+                                | majit_translate::model::ValueType::Unsigned
+                        ),
+                        "Int payload read as {ty:?}"
+                    );
+                    int_blocks.push(block.id);
+                }
+            }
+        }
+    }
+    assert!(
+        !switch_blocks.is_empty(),
+        "whole-enum move has no discriminant switch"
+    );
+    assert!(!ref_blocks.is_empty(), "no HeldUnion::Ref.__pos_0 read");
+    assert!(!int_blocks.is_empty(), "no HeldUnion::Int.__pos_0 read");
+    assert!(
+        ref_blocks
+            .iter()
+            .all(|block| !switch_blocks.contains(block)),
+        "Ref payload read sits on the switch block: ref={ref_blocks:?} switch={switch_blocks:?}"
+    );
+    assert!(
+        ref_blocks.iter().all(|block| !int_blocks.contains(block)),
+        "Ref and Int payloads are read in one block: ref={ref_blocks:?} int={int_blocks:?}"
+    );
+}
+
+/// `clear_inline_tag` borrows an inline `Vec<u8>` after a word field.
+/// The index operand is that field, retargeted to the buffer word
+/// (`vec_part = Buf`) or marked as the field's address. It is not a
+/// load of the Vec's first word used as a pointer.
+#[test]
+fn clear_inline_tag_indexes_the_buffer_not_the_capacity_word() {
+    use majit_translate::model::{OpKind, VecFieldPart};
+
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "clear_inline_tag").expect("lowering");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let tags_reads: Vec<_> = ops
+        .iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "tags"
+            )
+        })
+        .collect();
+    assert!(
+        !tags_reads.is_empty(),
+        "expected a tags field read; ops={ops:?}"
+    );
+    assert!(
+        tags_reads.iter().all(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } => {
+                field.vec_part == Some(VecFieldPart::Buf) || field.taken_by_address
+            }
+            _ => false,
+        }),
+        "tags must be the buffer word or its address, not word 0; reads={tags_reads:?}"
+    );
+    for op in &ops {
+        let OpKind::FieldRead { base, field, .. } = &op.kind else {
+            continue;
+        };
+        if field.name != "buf" {
+            continue;
+        }
+        let producer = ops.iter().find(|src| src.result.as_ref() == Some(base));
+        if let Some(src) = producer
+            && let OpKind::FieldRead { field: tags, .. } = &src.kind
+            && tags.name == "tags"
+        {
+            assert!(
+                tags.vec_part == Some(VecFieldPart::Buf) || tags.taken_by_address,
+                "buf read off a capacity-word copy of tags"
+            );
+        }
+    }
+}

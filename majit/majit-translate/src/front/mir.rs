@@ -5213,6 +5213,7 @@ fn scalar_replace_one_struct_aggregate(
         crate::model::LinkArg,
         ValueType,
     )> = Vec::new();
+    let mut field_alias: Vec<(Variable, Variable)> = Vec::new();
     for (i, op) in ops.into_iter().enumerate() {
         if i == op_idx {
             continue;
@@ -5233,6 +5234,18 @@ fn scalar_replace_one_struct_aggregate(
                 if let Some((_, value, _)) =
                     fields.iter().find(|(seen, _, _)| seen.name == field.name)
                 {
+                    if let (Some(dest), LinkArg::Value(src)) = (&op.result, value) {
+                        // The read is the stored SSA value. A block input
+                        // stays a `same_as`: that parameter is distinct.
+                        if !graph.blocks[block_idx]
+                            .inputargs
+                            .iter()
+                            .any(|arg| arg == dest)
+                        {
+                            field_alias.push((dest.clone(), src.clone()));
+                            continue;
+                        }
+                    }
                     if let Some(kind) = link_arg_as_alias_op(value, ty) {
                         out.push(crate::model::SpaceOperation {
                             result: op.result.clone(),
@@ -5257,8 +5270,54 @@ fn scalar_replace_one_struct_aggregate(
         }
     }
 
+    let apply_alias = |var: &Variable| -> Variable {
+        let mut current = var.clone();
+        let mut seen: Vec<Variable> = Vec::new();
+        loop {
+            if seen.iter().any(|item| item == &current) {
+                return current;
+            }
+            seen.push(current.clone());
+            let Some((_, next)) = field_alias.iter().find(|(from, _)| from == &current) else {
+                return current;
+            };
+            current = next.clone();
+        }
+    };
+    for op in &mut out {
+        let remap = |var: &Variable| apply_alias(var);
+        op.kind = crate::inline::remap_op_kind(&op.kind, &remap);
+        if let Some(result) = op.result.clone() {
+            let renamed = apply_alias(&result);
+            if renamed != result {
+                op.result = Some(renamed);
+            }
+        }
+    }
     let mut phi_copies: Vec<(BlockId, usize, Variable)> = Vec::new();
     let mut exits = std::mem::take(&mut graph.blocks[block_idx].exits);
+    for link in &mut exits {
+        for arg in &mut link.args {
+            if let Some(var) = arg.as_variable() {
+                let renamed = apply_alias(var);
+                if &renamed != var {
+                    *arg = LinkArg::Value(renamed);
+                }
+            }
+        }
+        if let Some(var) = link.last_exception.as_ref().and_then(LinkArg::as_variable) {
+            let renamed = apply_alias(var);
+            if &renamed != var {
+                link.last_exception = Some(LinkArg::Value(renamed));
+            }
+        }
+        if let Some(var) = link.last_exc_value.as_ref().and_then(LinkArg::as_variable) {
+            let renamed = apply_alias(var);
+            if &renamed != var {
+                link.last_exc_value = Some(LinkArg::Value(renamed));
+            }
+        }
+    }
     for link in &mut exits {
         for (slot, arg) in link.args.iter_mut().enumerate() {
             if arg.as_variable() != Some(&result) {
@@ -5359,6 +5418,58 @@ fn retarget_link_arg(arg: &mut LinkArg, from: &Variable, to: &Variable) {
     if arg.as_variable() == Some(from) {
         *arg = LinkArg::Value(to.clone());
     }
+}
+
+/// Replace uses of `from` with `to` and drop the op that defined `from`.
+///
+/// This is the graph `remove_same_as` builds. Returns false when `from`
+/// is a block input: that parameter is the edge's own variable, and the
+/// copy that feeds it has to stay a distinct `same_as`.
+pub(crate) fn forward_identity(graph: &mut FunctionGraph, from: &Variable, to: &Variable) -> bool {
+    if from == to {
+        return true;
+    }
+    if graph
+        .blocks
+        .iter()
+        .any(|block| block.inputargs.iter().any(|arg| arg == from))
+    {
+        return false;
+    }
+    let remap = |var: &Variable| {
+        if var == from { to.clone() } else { var.clone() }
+    };
+    for block in &mut graph.blocks {
+        block
+            .operations
+            .retain(|op| op.result.as_ref() != Some(from));
+        for op in &mut block.operations {
+            op.kind = crate::inline::remap_op_kind(&op.kind, &remap);
+        }
+        match &mut block.exitswitch {
+            Some(ExitSwitch::Value(var)) if var == from => *var = to.clone(),
+            Some(ExitSwitch::Fused { args, .. }) => {
+                for arg in args {
+                    if arg == from {
+                        *arg = to.clone();
+                    }
+                }
+            }
+            Some(ExitSwitch::LastException | ExitSwitch::Value(_)) | None => {}
+        }
+        for link in &mut block.exits {
+            for arg in &mut link.args {
+                retarget_link_arg(arg, from, to);
+            }
+            if let Some(arg) = link.last_exception.as_mut() {
+                retarget_link_arg(arg, from, to);
+            }
+            if let Some(arg) = link.last_exc_value.as_mut() {
+                retarget_link_arg(arg, from, to);
+            }
+        }
+    }
+    true
 }
 
 fn upsert_struct_field(
@@ -6900,6 +7011,10 @@ impl<'a> Lowering<'a> {
                 self.block_entry_local_var[bb] = PackedLocalRow::pack(&self.local_var);
             }
             self.lower_block(bb)?;
+            // A whole-enum move closes this MIR block's head with a
+            // discriminant switch and leaves the real terminator on the
+            // join. Successors are that join's exits.
+            let bb_id = self.block_id[bb];
             let mut ex = self.getstate();
             // Scrub phantom locals before threading.  A slot bound to a
             // Variable that is neither an inputarg nor an op result of this
@@ -6940,7 +7055,7 @@ impl<'a> Lowering<'a> {
                 if tgt == returnblock || tgt == exceptblock {
                     continue;
                 }
-                let tmir = block_to_mir[tgt.0];
+                let tmir = block_to_mir.get(tgt.0).copied().unwrap_or(usize::MAX);
                 if tmir == usize::MAX {
                     continue;
                 }
@@ -7038,7 +7153,7 @@ impl<'a> Lowering<'a> {
                 if tgt == returnblock || tgt == exceptblock {
                     continue;
                 }
-                let tmir = block_to_mir[tgt.0];
+                let tmir = block_to_mir.get(tgt.0).copied().unwrap_or(usize::MAX);
                 if tmir == usize::MAX {
                     continue;
                 }
@@ -7699,6 +7814,12 @@ impl<'a> Lowering<'a> {
         let (value_local, index_spelling) = index_identity_inputs(&inner, self.llbc);
         let (projection_array_type_id, projection_array_nolength) =
             fixed_array_index_identity(value_local, &index_spelling);
+        // `*p = v` on a `*mut T` is `raw_store` (`rewrite_op_raw_store`).
+        // A `&mut T` is a field or array place, not an integer address.
+        let deref_base_is_raw_ptr = tyref_node(&inner.ty, self.llbc)
+            .and_then(|node| strip_ty_wrappers(node, self.llbc))
+            .and_then(|node| node.as_object())
+            .is_some_and(|obj| obj.contains_key("RawPtr"));
         let base = self.resolve_place(mir_bb, inner)?;
         let bb_id = self.block_id[mir_bb];
         let op = match &elem {
@@ -7820,32 +7941,85 @@ impl<'a> Lowering<'a> {
                             STRING_GCREF_GCARRAY_TYPE_ID,
                         )),
                     }
+                } else if let Some(local) = inner_local
+                    && let Some(referent) = self.atomic_ref_place.get(&local).map(clone_place)
+                {
+                    // `*p = v` where `p` was bound as `&mut place` is that
+                    // place's store: `setfield` / `setarrayitem`
+                    // (`rewrite_op_setfield`), the same place
+                    // `concrete_borrow_place` recovers for `mem::replace`.
+                    let place = self.concrete_borrow_place(referent);
+                    match place.kind {
+                        PlaceKind::Projection(field_inner, elem) => {
+                            let same_deref = matches!(
+                                (&field_inner.kind, &elem),
+                                (PlaceKind::Local(i), ProjectionElem::Atom(name))
+                                    if *i as usize == local && name == "Deref"
+                            );
+                            if !same_deref {
+                                let ty = clone_tyref(&place.ty);
+                                return self.emit_projection_write(
+                                    mir_bb,
+                                    *field_inner,
+                                    elem,
+                                    value,
+                                    &ty,
+                                );
+                            }
+                        }
+                        PlaceKind::Local(i) => {
+                            self.local_var[i as usize] = Some(value_var(&value));
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                    match self.deref_word_store_or_decline(
+                        mir_bb,
+                        bb_id,
+                        inner_local,
+                        base,
+                        value_var(&value),
+                        dest_ty,
+                        deref_base_is_raw_ptr,
+                    )? {
+                        Some(op) => op,
+                        None => return Ok(()),
+                    }
                 } else {
-                    // `*p = val` — no IR-level FieldWrite/ArrayWrite
-                    // fits.  Emit a synthetic 2-arg Call so the write
-                    // remains visible to the downstream side-effect
-                    // tracking.
-                    //
-                    // The write produces no value (`result` below is `None`),
-                    // so the declared result kind must be Void: jtransform's
-                    // `resolve_call_result` reads `result_ty` when the op has
-                    // no result Variable, and a non-void kind there assembles
-                    // a `residual_call_r_<kind>` key with no `>` result tail
-                    // — a malformed opname nothing wires (`getkind(Void)`
-                    // keeps result-less calls on the `residual_call_*_v`
-                    // row).
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath {
-                            segments: vec!["__deref_write".to_string()],
-                            fun_decl_id: None,
-                        },
-                        args: crate::model::call_args(vec![base, value_var(&value)]),
-                        result_ty: ValueType::Void,
+                    // A store this front end cannot name as a field, an
+                    // array element, or a raw word must not become a
+                    // symbolic `__deref_write`: that path has no code
+                    // address. Decline the graph so the caller residualizes
+                    // the helper that contains the store.
+                    match self.deref_word_store_or_decline(
+                        mir_bb,
+                        bb_id,
+                        inner_local,
+                        base,
+                        value_var(&value),
+                        dest_ty,
+                        deref_base_is_raw_ptr,
+                    )? {
+                        Some(op) => op,
+                        None => return Ok(()),
                     }
                 }
             }
             ProjectionElem::Tagged(v) => {
                 if let Some(field_payload) = v.as_object().and_then(|m| m.get("Field")) {
+                    // A multi-word inline field is the aggregate, not a
+                    // pointer. Storing the temporary's address into the
+                    // first word overwrites the discriminant.
+                    if self.struct_field_offset_from_payload(field_payload) == Some(0) {
+                        if let Some(plan) = self.move_plan(dest_ty) {
+                            if !plan.arms.is_empty() {
+                                if let LinkArg::Value(src) = &value {
+                                    self.write_aggregate_into(mir_bb, &base, &plan, src)?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
                     // Resolve the field through its TypeDecl exactly
                     // like the read side (`resolve_place` Field arm):
                     // the descriptor must carry the same
@@ -7939,6 +8113,67 @@ impl<'a> Lowering<'a> {
             kind: op,
         });
         Ok(())
+    }
+
+    /// `*p = v` when `p` is not a field or array reborrow.
+    ///
+    /// A multi-word pointee is the field-wise move `exchange_deref_aggregate`
+    /// already emits for `mem::replace` (`rffi.py` `_get_structcopy_fn`).
+    /// A one-word raw pointer is `raw_store` at offset 0
+    /// (`rewrite_op_raw_store`). Anything else declines the graph: a
+    /// symbolic `__deref_write` has no code address.
+    ///
+    /// `Ok(None)` means the field writes were already pushed.
+    fn deref_word_store_or_decline(
+        &mut self,
+        mir_bb: usize,
+        bb_id: BlockId,
+        inner_local: Option<usize>,
+        base: Variable,
+        value: Variable,
+        dest_ty: &TyRef,
+        deref_base_is_raw_ptr: bool,
+    ) -> Result<Option<OpKind>, LowerError> {
+        if let Some(local) = inner_local {
+            let place = Place {
+                kind: PlaceKind::Projection(
+                    Box::new(Place {
+                        kind: PlaceKind::Local(local as u64),
+                        ty: unit_tyref(),
+                    }),
+                    ProjectionElem::Atom("Deref".to_string()),
+                ),
+                ty: clone_tyref(dest_ty),
+            };
+            if self.move_plan(&place.ty).is_some()
+                && self.store_moved_aggregate(mir_bb, &place, &value, Some(base.clone()))?
+            {
+                return Ok(None);
+            }
+        }
+        if deref_base_is_raw_ptr
+            && let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(dest_ty)
+        {
+            let offset = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(offset.clone()),
+                kind: OpKind::ConstInt(0),
+            });
+            return Ok(Some(OpKind::RawStore {
+                base,
+                offset,
+                value,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            }));
+        }
+        let _ = (bb_id, base);
+        Err(LowerError::Unsupported(format!(
+            "bb{mir_bb}: deref store is not a field, array element, or raw word"
+        )))
     }
 
     /// Preserve the declared RPython reference repr of a typed field value.
@@ -9876,9 +10111,10 @@ impl<'a> Lowering<'a> {
                             field: FieldDescriptor::new(field_name, Some(owner_root))
                                 .with_owner_id(owner_id)
                                 .with_base_is_deref(base_is_deref)
-                                .with_inline_vec(crate::vec_layout::field_layout_is_inline_vec(
-                                    &tyref_to_field_layout_string(&field_ty, self.llbc),
-                                )),
+                                .with_inline_vec(
+                                    field_ty_is_inline_vec(&field_ty, self.llbc)
+                                        || field_ty_is_inline_vec(&place_ty, self.llbc),
+                                ),
                             ty,
                             pure: false,
                         },
@@ -12223,18 +12459,9 @@ impl<'a> Lowering<'a> {
                     if first_arg_ty.as_ref().is_some_and(|src_ty| {
                         transmute_is_same_layout_bank(src_ty, &call.dest.ty, self.llbc)
                     }) {
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind: OpKind::UnaryOp {
-                                op: "same_as".to_string(),
-                                operand: args[0].clone(),
-                                result_ty: result_ty.clone(),
-                            },
-                        });
-                        self.local_var[dest_local] = Some(res);
+                        // Same bank and same size: the destination local is
+                        // the argument. `remove_same_as` deletes this copy.
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
                         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17229,6 +17456,20 @@ impl<'a> Lowering<'a> {
             self.rewrite_equal_layout_result_branch(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
         let op_kind =
             self.stamp_result_branch_payloads(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
+        // `lower_std_primitive_op` rewrites an identity wrapper
+        // (`Box::as_ref` / `as_mut`, `Cell::get`, scalar `clone`) to
+        // `same_as` only when the banks agree. Bind the destination
+        // local to that operand. A separate `same_as` variable hides
+        // the producer from `retarget_vec_operand`.
+        if let OpKind::UnaryOp { op, operand, .. } = &op_kind
+            && op == "same_as"
+        {
+            self.local_var[dest_local] = Some(operand.clone());
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(());
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
@@ -18054,11 +18295,16 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         }
         let leaf = name.rsplit("::").next();
+        let arg_address = |this: &Self, index: usize| -> Option<Variable> {
+            let local = arg_locals.get(index).copied().flatten()?;
+            this.local_var.get(local).and_then(|var| var.clone())
+        };
         match leaf {
             Some("replace") if args.len() == 2 => {
                 let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
                     return Ok(false);
                 };
+                let address = arg_address(self, 0);
                 // `*p = new` where `p` is not an `index_mut` alias is one word
                 // at that address: `raw_load` then `raw_store`
                 // (`rewrite_op_raw_load` / `rewrite_op_raw_store`). A
@@ -18072,7 +18318,7 @@ impl<'a> Lowering<'a> {
                     {
                         old
                     } else if let Some(old) =
-                        self.exchange_deref_aggregate(mir_bb, &place, args[1].clone())?
+                        self.exchange_deref_aggregate(mir_bb, &place, args[1].clone(), address)?
                     {
                         old
                     } else {
@@ -18092,18 +18338,24 @@ impl<'a> Lowering<'a> {
                 let Some(slot1) = self.mem_slot(arg_locals.get(1).copied().flatten()) else {
                     return Ok(false);
                 };
+                let address0 = arg_address(self, 0);
+                let address1 = arg_address(self, 1);
                 if let (Some(place0), Some(place1)) =
                     (self.bare_deref_place(&slot0), self.bare_deref_place(&slot1))
                     && self.move_plan(&place0.ty).is_some()
                 {
-                    let Some(old0) = self.read_moved_aggregate(mir_bb, &place0)? else {
+                    let Some(old0) =
+                        self.read_moved_aggregate(mir_bb, &place0, address0.clone())?
+                    else {
                         return Ok(false);
                     };
-                    let Some(old1) = self.read_moved_aggregate(mir_bb, &place1)? else {
+                    let Some(old1) =
+                        self.read_moved_aggregate(mir_bb, &place1, address1.clone())?
+                    else {
                         return Ok(false);
                     };
-                    if !self.store_moved_aggregate(mir_bb, &place0, &old1)?
-                        || !self.store_moved_aggregate(mir_bb, &place1, &old0)?
+                    if !self.store_moved_aggregate(mir_bb, &place0, &old1, address0)?
+                        || !self.store_moved_aggregate(mir_bb, &place1, &old0, address1)?
                     {
                         return Ok(false);
                     }
@@ -18120,6 +18372,7 @@ impl<'a> Lowering<'a> {
                 let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
                     return Ok(false);
                 };
+                let address = arg_address(self, 0);
                 if let Some(place) = self.bare_deref_place(&slot)
                     && self.move_plan(&place.ty).is_some()
                 {
@@ -18143,7 +18396,9 @@ impl<'a> Lowering<'a> {
                             result_ty,
                         },
                     });
-                    let Some(old) = self.exchange_deref_aggregate(mir_bb, &place, fresh)? else {
+                    let Some(old) =
+                        self.exchange_deref_aggregate(mir_bb, &place, fresh, address)?
+                    else {
                         return Ok(false);
                     };
                     self.local_var[dest_local] = Some(old);
@@ -18288,7 +18543,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// `&mut *borrow` where `borrow` is itself `&mut place` is that place.
-    /// A bare `Deref` otherwise stays, and lowers as `__deref_write`.
+    /// A bare `Deref` that is not a field, an array element, or a raw word
+    /// declines the graph (`emit_projection_write`).
     fn concrete_borrow_place(&self, mut place: Place) -> Place {
         for _ in 0..8 {
             let PlaceKind::Projection(inner, elem) = &place.kind else {
@@ -18396,11 +18652,12 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         place: &Place,
         new_value: Variable,
+        address: Option<Variable>,
     ) -> Result<Option<Variable>, LowerError> {
-        let Some(old) = self.read_moved_aggregate(mir_bb, place)? else {
+        let Some(old) = self.read_moved_aggregate(mir_bb, place, address.clone())? else {
             return Ok(None);
         };
-        if !self.store_moved_aggregate(mir_bb, place, &new_value)? {
+        if !self.store_moved_aggregate(mir_bb, place, &new_value, address)? {
             return Ok(None);
         }
         Ok(Some(old))
@@ -18410,11 +18667,15 @@ impl<'a> Lowering<'a> {
         &mut self,
         mir_bb: usize,
         place: &Place,
+        address: Option<Variable>,
     ) -> Result<Option<Variable>, LowerError> {
         let Some(plan) = self.move_plan(&place.ty) else {
             return Ok(None);
         };
-        let base = self.deref_base(mir_bb, place)?;
+        if !plan.arms.is_empty() {
+            return self.copy_enum_switch(mir_bb, place, &plan, None, address);
+        }
+        let base = self.deref_base(mir_bb, place, address)?;
         let mut parts = Vec::with_capacity(plan.spans.len());
         for span in &plan.spans {
             parts.push(self.emit_span_read(mir_bb, &base, span));
@@ -18427,11 +18688,16 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         place: &Place,
         value: &Variable,
+        address: Option<Variable>,
     ) -> Result<bool, LowerError> {
         let Some(plan) = self.move_plan(&place.ty) else {
             return Ok(false);
         };
-        let base = self.deref_base(mir_bb, place)?;
+        if !plan.arms.is_empty() {
+            self.copy_enum_switch(mir_bb, place, &plan, Some(value.clone()), address)?;
+            return Ok(true);
+        }
+        let base = self.deref_base(mir_bb, place, address)?;
         for span in &plan.spans {
             let part = self.emit_span_read(mir_bb, value, span);
             self.emit_span_write(mir_bb, &base, span, part);
@@ -18439,12 +18705,176 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    fn deref_base(&mut self, mir_bb: usize, place: &Place) -> Result<Variable, LowerError> {
+    /// Move `src` into `slot` when `slot` is the address of an inline
+    /// aggregate at offset 0 (`Dynamic.__pos_0`, `HeldCell.0`).
+    fn write_aggregate_into(
+        &mut self,
+        mir_bb: usize,
+        slot: &Variable,
+        plan: &MovePlan,
+        src: &Variable,
+    ) -> Result<(), LowerError> {
+        if plan.arms.is_empty() {
+            for span in &plan.spans {
+                let part = self.emit_span_read(mir_bb, src, span);
+                self.emit_span_write(mir_bb, slot, span, part);
+            }
+            return Ok(());
+        }
+        self.store_enum_variant(mir_bb, slot, src, plan)
+    }
+
+    /// Switch on `__discriminant` and copy that variant's fields into
+    /// `slot`. One builder for an inline field store and for
+    /// `copy_enum_switch`'s store.
+    fn store_enum_variant(
+        &mut self,
+        mir_bb: usize,
+        slot: &Variable,
+        src: &Variable,
+        plan: &MovePlan,
+    ) -> Result<(), LowerError> {
+        let discr = plan
+            .spans
+            .first()
+            .expect("enum move plan carries __discriminant");
+        let head = self.block_id[mir_bb];
+        let tag = self.emit_span_read(mir_bb, src, discr);
+        let join = self.graph.create_block();
+        let mut links = Vec::with_capacity(plan.arms.len());
+        for arm in &plan.arms {
+            let arm_bb = self.graph.create_block();
+            self.block_id[mir_bb] = arm_bb;
+            for span in &arm.spans {
+                let part = self.emit_span_read(mir_bb, src, span);
+                self.emit_span_write(mir_bb, slot, span, part);
+            }
+            self.emit_span_write(mir_bb, slot, discr, tag.clone());
+            self.graph.set_goto(arm_bb, join, Vec::new());
+            links.push(
+                Link::from_variables(
+                    &self.graph,
+                    Vec::new(),
+                    arm_bb,
+                    Some(ExitCase::Const(ConstValue::Int(arm.discr))),
+                )
+                .with_prevblock(head)
+                .with_llexitcase_from_exitcase(),
+            );
+        }
+        self.graph.block_mut(head).exitswitch = Some(ExitSwitch::Value(tag));
+        self.graph.closeblock(head, links);
+        self.block_id[mir_bb] = join;
+        Ok(())
+    }
+
+    fn struct_field_offset_from_payload(&self, payload: &serde_json::Value) -> Option<u64> {
+        let arr = payload.as_array()?;
+        if arr.len() != 2 {
+            return None;
+        }
+        let container = arr[0].as_object()?;
+        let adt = container.get("Adt")?.as_array()?;
+        if adt.get(1).and_then(serde_json::Value::as_u64).is_some() {
+            return None;
+        }
+        let head = adt.first()?;
+        let type_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
+        let field_idx = arr[1].as_u64()? as usize;
+        let td = self.llbc.type_by_id(type_id)?;
+        let target = std::env::var("TARGET").unwrap_or_default();
+        td.layout_for_target(&target)?
+            .struct_field_offset(field_idx)
+    }
+
+    /// Whole-enum move: switch on `__discriminant`, then copy that
+    /// variant's fields. `new_value` stores into `place`; `None` reads
+    /// `place` and returns the join phi.
+    fn copy_enum_switch(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        plan: &MovePlan,
+        new_value: Option<Variable>,
+        address: Option<Variable>,
+    ) -> Result<Option<Variable>, LowerError> {
+        if new_value.is_some() {
+            let slot = self.deref_base(mir_bb, place, address)?;
+            let src = new_value.expect("enum store has a source");
+            self.store_enum_variant(mir_bb, &slot, &src, plan)?;
+            return Ok(None);
+        }
+        let discr = plan
+            .spans
+            .first()
+            .expect("enum move plan carries __discriminant");
+        let head = self.block_id[mir_bb];
+        let slot = self.deref_base(mir_bb, place, address)?;
+        let tag = self.emit_span_read(mir_bb, &slot, discr);
+        let (join, vars) = self.graph.create_block_with_arg_vars(1);
+        let phi = vars.into_iter().next().expect("enum move phi");
+        let mut links = Vec::with_capacity(plan.arms.len());
+        for arm in &plan.arms {
+            let arm_bb = self.graph.create_block();
+            self.block_id[mir_bb] = arm_bb;
+            let mut parts = Vec::with_capacity(1 + arm.spans.len());
+            parts.push(tag.clone());
+            for span in &arm.spans {
+                parts.push(self.emit_span_read(mir_bb, &slot, span));
+            }
+            let mut spans = Vec::with_capacity(parts.len());
+            spans.push(discr.clone());
+            spans.extend(arm.spans.iter().cloned());
+            let agg_plan = MovePlan {
+                ctor_id: plan.ctor_id,
+                spans,
+                arms: Vec::new(),
+            };
+            let agg = self.emit_span_aggregate(mir_bb, &agg_plan, &parts);
+            self.graph.set_goto(arm_bb, join, vec![agg]);
+            links.push(
+                Link::from_variables(
+                    &self.graph,
+                    Vec::new(),
+                    arm_bb,
+                    Some(ExitCase::Const(ConstValue::Int(arm.discr))),
+                )
+                .with_prevblock(head)
+                .with_llexitcase_from_exitcase(),
+            );
+        }
+        self.graph.block_mut(head).exitswitch = Some(ExitSwitch::Value(tag));
+        self.graph.closeblock(head, links);
+        self.block_id[mir_bb] = join;
+        Ok(Some(phi))
+    }
+
+    fn deref_base(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        address: Option<Variable>,
+    ) -> Result<Variable, LowerError> {
         let PlaceKind::Projection(inner, _) = &place.kind else {
             return Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: aggregate exchange place is not a deref"
             )));
         };
+        // `&*p` aliases `p`. The `&mut` argument's own variable is that
+        // address; the inner local is not live in the replace block.
+        if let PlaceKind::Local(i) = &inner.kind
+            && self
+                .local_var
+                .get(*i as usize)
+                .and_then(|var| var.as_ref())
+                .is_none()
+            && let Some(address) = address
+        {
+            return Ok(address);
+        }
         self.resolve_place(mir_bb, (**inner).clone())
     }
 
@@ -18497,46 +18927,56 @@ impl<'a> Lowering<'a> {
                 if spans.is_empty() {
                     return None;
                 }
-                Some(MovePlan { ctor_id: id, spans })
+                Some(MovePlan {
+                    ctor_id: id,
+                    spans,
+                    arms: Vec::new(),
+                })
             }
             TypeDeclKind::Enum(variants) => {
                 let name_path = td.item_meta.name_path();
                 let leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
                 let canon = strip_crate_prefix(&name_path);
                 let base_id = majit_ir::descr::StructId::from_canonical(&canon);
-                let mut candidates: Vec<MoveSpan> = Vec::new();
-                if let (Some(offset), Some(int_ty)) =
+                // A union payload has no single kind (`rclass.py` never
+                // bit-copies a pointer into an int). The move is a switch
+                // on `__discriminant` and a typed copy of the live variant.
+                let (Some(disc_offset), Some(int_ty)) =
                     (layout.discriminant_offset(), layout.discriminant_int_type())
-                {
-                    let itemsize = int_type_byte_width(int_ty) as usize;
-                    if itemsize == 0 || itemsize > 8 {
-                        return None;
-                    }
-                    let signed = int_ty.starts_with('i');
-                    let item_ty = if signed {
-                        ValueType::Int
-                    } else {
-                        ValueType::Unsigned
-                    };
-                    // `getfield` of `__discriminant`. `raw_load` requires an
-                    // int-kind address; the slot is a reference.
-                    candidates.push(MoveSpan {
-                        offset,
-                        bytes: itemsize,
-                        kind: SpanKind::Field {
-                            name: "__discriminant".to_string(),
-                            owner: leaf.clone(),
-                            owner_id: base_id,
-                            ty: item_ty,
-                        },
-                    });
+                else {
+                    return None;
+                };
+                let itemsize = int_type_byte_width(int_ty) as usize;
+                if itemsize == 0 || itemsize > 8 {
+                    return None;
                 }
+                let signed = int_ty.starts_with('i');
+                let item_ty = if signed {
+                    ValueType::Int
+                } else {
+                    ValueType::Unsigned
+                };
+                let discr = MoveSpan {
+                    offset: disc_offset,
+                    bytes: itemsize,
+                    kind: SpanKind::Field {
+                        name: "__discriminant".to_string(),
+                        owner: leaf.clone(),
+                        owner_id: base_id,
+                        ty: item_ty,
+                    },
+                };
+                let mut arms = Vec::with_capacity(variants.len());
                 for (vidx, variant) in variants.iter().enumerate() {
+                    let Some(discr_value) = variant.discriminant_i64() else {
+                        return None;
+                    };
                     let variant_owner = format!("{leaf}::{}", variant.name);
                     let variant_id = majit_ir::descr::StructId::from_canonical(&format!(
                         "{canon}::{}",
                         variant.name
                     ));
+                    let mut candidates: Vec<MoveSpan> = Vec::new();
                     for (i, field) in variant.fields.iter().enumerate() {
                         let Some(offset) = layout.field_offset(vidx, i) else {
                             return None;
@@ -18564,28 +19004,36 @@ impl<'a> Lowering<'a> {
                             },
                         });
                     }
-                }
-                candidates.sort_by(|left, right| {
-                    left.offset
-                        .cmp(&right.offset)
-                        .then(right.bytes.cmp(&left.bytes))
-                });
-                let mut spans: Vec<MoveSpan> = Vec::new();
-                for candidate in candidates {
-                    let start = candidate.offset;
-                    let end = start + candidate.bytes as u64;
-                    let overlaps = spans.iter().any(|kept| {
-                        let kept_end = kept.offset + kept.bytes as u64;
-                        start < kept_end && kept.offset < end
+                    candidates.sort_by(|left, right| {
+                        left.offset
+                            .cmp(&right.offset)
+                            .then(right.bytes.cmp(&left.bytes))
                     });
-                    if !overlaps {
-                        spans.push(candidate);
+                    let mut arm_spans: Vec<MoveSpan> = Vec::new();
+                    for candidate in candidates {
+                        let start = candidate.offset;
+                        let end = start + candidate.bytes as u64;
+                        let overlaps = arm_spans.iter().any(|kept| {
+                            let kept_end = kept.offset + kept.bytes as u64;
+                            start < kept_end && kept.offset < end
+                        });
+                        if !overlaps {
+                            arm_spans.push(candidate);
+                        }
                     }
+                    arms.push(EnumMoveArm {
+                        discr: discr_value,
+                        spans: arm_spans,
+                    });
                 }
-                if spans.is_empty() {
+                if arms.is_empty() {
                     return None;
                 }
-                Some(MovePlan { ctor_id: id, spans })
+                Some(MovePlan {
+                    ctor_id: id,
+                    spans: vec![discr],
+                    arms,
+                })
             }
             _ => None,
         }
@@ -31219,6 +31667,52 @@ fn inline_adt_def_id(body: &serde_json::Value) -> Option<u64> {
         .as_u64()
 }
 
+/// An inline `Vec<T, A>` value, not `Box<Vec<_>>` and not `&Vec<_>`.
+///
+/// The ADT is the type decl whose name segments are `alloc::vec::Vec`
+/// (that decl's identity). The use site's type-argument count is the
+/// decl's generic arity: one (`T`) or two (`T` and the allocator).
+fn field_ty_is_inline_vec(ty: &TyRef, llbc: &Llbc) -> bool {
+    let body = match tyref_node(ty, llbc) {
+        Some(body) => body,
+        None => return false,
+    };
+    let Some(obj) = body.as_object() else {
+        return false;
+    };
+    if obj.contains_key("Ref") || obj.contains_key("RawPtr") {
+        return false;
+    }
+    let Some(id) = inline_adt_def_id(body) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(id) else {
+        return false;
+    };
+    if td.item_meta.name.len() != 3 {
+        return false;
+    }
+    let idents: Vec<&str> = td
+        .item_meta
+        .name
+        .iter()
+        .filter_map(|seg| match seg {
+            NameSeg::Ident { ident: (s, _) } => Some(s.as_str()),
+            NameSeg::Other(_) => None,
+        })
+        .collect();
+    if idents != ["alloc", "vec", "Vec"] {
+        return false;
+    }
+    let arity = obj
+        .get("Adt")
+        .and_then(|adt| adt.get("generics"))
+        .and_then(|generics| generics.get("types"))
+        .and_then(|types| types.as_array())
+        .map(|types| types.len());
+    matches!(arity, Some(1 | 2))
+}
+
 /// Clone a [`TyRef`] (no `Clone` impl on the schema enum).  Used by
 /// [`Lowering::resolve_adt_field`] when handing the resolved field's
 /// type to [`tyref_to_value_type`].
@@ -31239,8 +31733,17 @@ enum MemSlot {
 struct MovePlan {
     ctor_id: u64,
     spans: Vec<MoveSpan>,
+    /// Empty for a struct. An enum move switches on `spans`' discriminant
+    /// and copies `arms` (one live variant).
+    arms: Vec<EnumMoveArm>,
 }
 
+struct EnumMoveArm {
+    discr: i64,
+    spans: Vec<MoveSpan>,
+}
+
+#[derive(Clone)]
 struct MoveSpan {
     offset: u64,
     /// Physical width. Overlap uses this, not the JIT field's word size.
@@ -31248,6 +31751,7 @@ struct MoveSpan {
     kind: SpanKind,
 }
 
+#[derive(Clone)]
 enum SpanKind {
     /// Named field. `getfield_gc` / `setfield_gc`.
     Field {
@@ -33975,9 +34479,18 @@ fn type_node_box_pointee<'l>(
 /// pointer.  Kept separate from the Option recognizer so real-artefact tests
 /// can pin Charon's Box spelling directly.
 fn type_node_is_thin_box(node: &serde_json::Value, llbc: &Llbc) -> bool {
-    type_node_box_pointee(node, llbc)
-        .and_then(|pointee| strip_ty_wrappers(pointee, llbc))
-        .and_then(adt_node_def_id)
+    let Some(pointee) = type_node_box_pointee(node, llbc) else {
+        return false;
+    };
+    let Some(peeled) = strip_ty_wrappers(pointee, llbc) else {
+        return false;
+    };
+    // `Box<i64>`'s pointee is a literal, not an ADT. A sized literal is one
+    // pointer word, the same as `Box<Struct>` whose layout size is known.
+    if json_ty_literal_byte_size(peeled).is_some() {
+        return true;
+    }
+    adt_node_def_id(peeled)
         .and_then(|def_id| llbc.type_by_id(def_id))
         .and_then(|td| td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()))
         .and_then(|layout| layout.size)
@@ -42061,16 +42574,26 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
         // 2. Replace the `alloc::fmt::format` op with `same_as(fmt_args)`:
         //    after the link re-thread below, `fmt_args` carries the folded
         //    String, so the format result forwards it unchanged.
-        if let Some(op) = graph
-            .block_mut(site.format_block)
+        let format_result = graph
+            .block(site.format_block)
             .operations
-            .get_mut(site.format_idx)
-        {
-            op.kind = OpKind::UnaryOp {
-                op: "same_as".to_string(),
-                operand: site.fmt_args.clone(),
-                result_ty: ValueType::Ref(None),
-            };
+            .get(site.format_idx)
+            .and_then(|op| op.result.clone());
+        if let Some(format_result) = format_result {
+            if !forward_identity(graph, &format_result, &site.fmt_args) {
+                // The format result is a block input. Keep the copy.
+                if let Some(op) = graph
+                    .block_mut(site.format_block)
+                    .operations
+                    .get_mut(site.format_idx)
+                {
+                    op.kind = OpKind::UnaryOp {
+                        op: "same_as".to_string(),
+                        operand: site.fmt_args.clone(),
+                        result_ty: ValueType::Ref(None),
+                    };
+                }
+            }
         }
         // 3. Fold the rendered values with the literal pieces at the args
         //    block (`piece0 ++ rendered0 ++ piece1 ++ … ++ pieceN`).  The
@@ -43764,7 +44287,18 @@ mod tests {
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
         assert_eq!(replace_struct_ctors(&mut graph), 1);
         assert_eq!(struct_ctor_ops(&graph), (0, 0, 0));
-        assert_eq!(same_as_count(&graph), 1);
+        assert_eq!(same_as_count(&graph), 0);
+        let payload = graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| match &op.kind {
+                OpKind::ConstInt(1) => op.result.as_ref(),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            graph.block(graph.startblock).exits[0].args[0].as_variable(),
+            payload,
+            "the field read is the stored value"
+        );
     }
 
     /// Returning the aggregate materialises one `New` at the escape. The
@@ -44082,7 +44616,7 @@ mod tests {
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
         simplify_lowered_graph(&mut graph, &empty_struct_attrs(), true);
         assert_eq!(struct_ctor_ops(&graph), (0, 0, 0));
-        assert_eq!(same_as_count(&graph), 1);
+        assert_eq!(same_as_count(&graph), 0);
     }
 
     /// `malloc_typed(T { .. })` is the boxing cluster. Its stack aggregate
@@ -46386,18 +46920,18 @@ mod tests {
             "B0→B1 Tuple slot rebound to y"
         );
 
-        // Bf's format op became `same_as(fmt_args_in)`, keeping `formatted`.
+        // Bf's format result is `fmt_args_in`. The copy is not a new variable.
         let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
-        let same_as = bf_block
-            .operations
-            .iter()
-            .find(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as"))
-            .expect("Bf same_as op");
-        match &same_as.kind {
-            OpKind::UnaryOp { operand, .. } => assert_eq!(operand.id(), fmt_args_in.id()),
-            _ => unreachable!(),
-        }
-        assert_eq!(same_as.result.as_ref().unwrap().id(), formatted.id());
+        assert!(
+            bf_block
+                .operations
+                .iter()
+                .all(|op| { !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") })
+        );
+        assert_eq!(
+            bf_block.exits[0].args[0].as_variable().map(|v| v.id()),
+            Some(fmt_args_in.id())
+        );
 
         // Bp now folds the rendered values with the pieces (str_const + add)
         // and forwards the folded String where it forwarded `Arguments`.
@@ -49186,19 +49720,11 @@ mod tests {
             .collect();
 
         assert!(!ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })));
-        let copies: Vec<_> = ops
-            .iter()
-            .filter_map(|op| match &op.kind {
-                OpKind::UnaryOp {
-                    op,
-                    operand,
-                    result_ty,
-                } if op == "same_as" => Some((operand, result_ty)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(copies.len(), 1, "transmute must become one scalar copy");
-        assert_eq!(*copies[0].1, ValueType::Int);
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")),
+            "same-bank transmute binds the destination to the input"
+        );
         let input = ops
             .iter()
             .find_map(|op| match (&op.result, &op.kind) {
@@ -49206,7 +49732,18 @@ mod tests {
                 _ => None,
             })
             .expect("value input");
-        assert_eq!(copies[0].0.id(), input.id());
+        let returned = graph
+            .blocks
+            .iter()
+            .find_map(|block| {
+                block
+                    .exits
+                    .iter()
+                    .find_map(|link| (link.target == graph.returnblock).then(|| link.args.first()))
+            })
+            .flatten()
+            .and_then(LinkArg::as_variable);
+        assert_eq!(returned, Some(input));
     }
 
     fn scalar_method_call_fixture(

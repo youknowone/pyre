@@ -1815,6 +1815,38 @@ fn getsubstruct_offset_for_access(
     }
 }
 
+/// Address of a borrow of an inline aggregate wider than one word.
+///
+/// `jtransform.py rewrite_op_getsubstruct` turns that borrow into
+/// `int_add(ptr, offsetof)` when the container's `_gckind` is `raw`, and
+/// raises otherwise. A one-word field is an ordinary load. `vec_part`
+/// already names one word of the aggregate, so it is not this address.
+fn wide_inline_borrow_offset(
+    field: &FieldDescriptor,
+    cc: Option<&crate::call::CallControl>,
+) -> Option<Result<usize, ()>> {
+    if !field.taken_by_address || field.vec_part.is_some() {
+        return None;
+    }
+    let owner = field.owner_root.as_deref()?;
+    let row = cc
+        .and_then(|cc| cc.struct_layout_for(owner))
+        .and_then(|layout| layout.fields.iter().find(|row| row.name == field.name));
+    // An inline aggregate (`descr.py` `get_type_flag` → `FLAG_STRUCT`)
+    // wider than one word. A scalar is one register value at any size:
+    // an `i64` on a 32-bit target is still `FLAG_SIGNED`.
+    let word = crate::layout::target_word_size();
+    let wider = field.inline_vec
+        || row.is_some_and(|row| row.flag == majit_ir::descr::ArrayFlag::Struct && row.size > word);
+    if !wider {
+        return None;
+    }
+    Some(match row {
+        Some(row) => Ok(row.offset),
+        None => Err(()),
+    })
+}
+
 /// Struct name of a VTYPEPTR-shaped lltype (`Ptr(Struct)` / resolved fwd).
 fn lltype_vtype_name(
     ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
@@ -2863,7 +2895,7 @@ impl<'a> Transformer<'a> {
                 rewritten
             }
             OpKind::FieldRead { field, ty, .. } => {
-                self.rewrite_op_getfield(op, field, ty, graph_name)
+                self.rewrite_op_getfield(op, field, ty, graph_name, graph)
             }
             // ── rewrite_op_setfield ──
             OpKind::FieldWrite { field, value, .. }
@@ -2876,6 +2908,91 @@ impl<'a> Transformer<'a> {
                 field, value, ty, ..
             } if self.config.lower_virtualizable => {
                 self.rewrite_op_setfield(op, field, value, ty, graph_name)
+            }
+            OpKind::RawLoad {
+                base,
+                offset,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            } => {
+                // `rewrite_op_raw_load` asserts the result kind is not `'r'`.
+                // A pointer loaded from raw memory comes back through
+                // `cast_int_to_ptr`.
+                let (addr, mut ops) = self.coerce_operand_to_int(graph, base);
+                let result_is_ref = op
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| self.get_value_kind_var(result) == 'r');
+                if ops.is_empty() && !result_is_ref {
+                    RewriteResult::Keep
+                } else if result_is_ref {
+                    let loaded = self.fresh_synthetic_variable_typed(
+                        graph,
+                        crate::codewriter::type_state::ConcreteType::Signed,
+                    );
+                    ops.push(SpaceOperation {
+                        result: Some(loaded.clone()),
+                        kind: OpKind::RawLoad {
+                            base: addr,
+                            offset: offset.clone(),
+                            item_ty: ValueType::Int,
+                            itemsize: *itemsize,
+                            is_item_signed: *is_item_signed,
+                        },
+                    });
+                    ops.push(SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::UnaryOp {
+                            op: "cast_int_to_ptr".into(),
+                            operand: loaded,
+                            result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    RewriteResult::Replace(ops)
+                } else {
+                    ops.push(SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::RawLoad {
+                            base: addr,
+                            offset: offset.clone(),
+                            item_ty: item_ty.clone(),
+                            itemsize: *itemsize,
+                            is_item_signed: *is_item_signed,
+                        },
+                    });
+                    RewriteResult::Replace(ops)
+                }
+            }
+            OpKind::RawStore {
+                base,
+                offset,
+                value,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            } => {
+                // `rewrite_op_raw_store` asserts the value kind is not `'r'`.
+                // A pointer stored in raw memory is its int address.
+                let (addr, mut ops) = self.coerce_operand_to_int(graph, base);
+                let (stored, store_ops) = self.coerce_operand_to_int(graph, value);
+                if ops.is_empty() && store_ops.is_empty() {
+                    RewriteResult::Keep
+                } else {
+                    ops.extend(store_ops);
+                    ops.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::RawStore {
+                            base: addr,
+                            offset: offset.clone(),
+                            value: stored,
+                            item_ty: item_ty.clone(),
+                            itemsize: *itemsize,
+                            is_item_signed: *is_item_signed,
+                        },
+                    });
+                    RewriteResult::Replace(ops)
+                }
             }
             // ── rewrite_op_getarrayitem ──
             OpKind::ArrayRead {
@@ -4454,6 +4571,48 @@ impl<'a> Transformer<'a> {
         )
     }
 
+    /// `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)`.
+    /// The result stays in the int bank. Offset 0 is `cast_ptr_to_int`
+    /// of a ref base, or the base itself when it is already an int.
+    fn rewrite_raw_substruct_address(
+        &mut self,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+        offset: usize,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        let (addr, mut ops) = self.coerce_operand_to_int(graph, base);
+        self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
+        if offset == 0 {
+            if let Some(result) = op.result.clone() {
+                self.aliases.insert(result, addr.clone());
+            }
+            return if ops.is_empty() {
+                RewriteResult::Identity(addr)
+            } else {
+                RewriteResult::Replace(ops)
+            };
+        }
+        let shift = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        ops.push(SpaceOperation {
+            result: Some(shift.clone()),
+            kind: OpKind::ConstInt(offset as i64),
+        });
+        ops.push(SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: addr,
+                rhs: shift,
+                result_ty: ValueType::Int,
+            },
+        });
+        RewriteResult::Replace(ops)
+    }
+
     /// `Transformer.rewrite_op_direct_ptradd` (`jtransform.py`).
     ///
     /// A non-`CCHARP` pointer scales the count by `llmemory.sizeof(TO.OF)`.
@@ -4880,6 +5039,7 @@ impl<'a> Transformer<'a> {
         field: &FieldDescriptor,
         ty: &ValueType,
         graph_name: &str,
+        graph: &mut FunctionGraph,
     ) -> RewriteResult {
         // jtransform.py `if self.is_typeptr_getset(op): return
         // self.handle_getfield_typeptr(op)` — checked before anything else,
@@ -4916,8 +5076,35 @@ impl<'a> Transformer<'a> {
                 },
             ]);
         }
-        // `rewrite_op_getsubstruct` applies only to an address-producing
-        // projection.  A by-value Rust field can itself have an inline-struct
+        // `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)`.
+        // A raw address is an int. A later getfield/setfield/raw_load/
+        // raw_store through it keeps that int base (`_gckind == 'raw'`).
+        // A GC container is refused: emitting the field's first word as a
+        // Ref and then reading `buf` off it is the capacity-word fault.
+        // Retarget (`vec_part`) already selected one word and is not this
+        // address; `wide_inline_borrow_offset` leaves that read alone.
+        if let Some(offset) = wide_inline_borrow_offset(field, self.callcontrol.as_deref()) {
+            let gc = crate::codewriter::type_state::field_owner_is_gc(
+                field,
+                self.callcontrol.as_deref(),
+            );
+            if gc || offset.is_err() {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::Abort {
+                        kind: crate::model::UnknownKind::UnsupportedExpr {
+                            variant: crate::model::UnsupportedExprKind::RawAddr,
+                        },
+                    },
+                }]);
+            }
+            let offset = offset.expect("raw offset");
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                unreachable!("rewrite_op_getfield called on non-FieldRead op")
+            };
+            return self.rewrite_raw_substruct_address(op, base, offset, graph);
+        }
+        // A by-value Rust field can itself have an inline-struct
         // layout (notably a `#[repr(transparent)]` newtype) while the operation
         // is still an ordinary load.  Treating every offset-zero Struct field
         // as getsubstruct aliases the result to the container pointer and
@@ -8458,12 +8645,14 @@ impl<'a> Transformer<'a> {
                 None,
             )
         };
-        // jtransform.py:1677: assert not forces_virtual_or_virtualizable
+        // jtransform.py:1677: assert not forces_virtual_or_virtualizable.
+        // The Python assert's traceback shows `op`; name the callee here.
         assert!(
             !descriptor
                 .extra_info
                 .check_forces_virtual_or_virtualizable(),
-            "conditional_call target must not force virtualizable"
+            "conditional_call target must not force virtualizable: \
+             graph={graph_name} callee={func_target} op={op:?}"
         );
         // jtransform.py: rewrite_call with force_ir=True
         let (args_i, args_r, args_f) = self.rewrite_call_three_lists(
@@ -11358,6 +11547,408 @@ mod tests {
         assert_eq!(
             getsubstruct_offset_for_access(&address, || Some(0)),
             Some(0)
+        );
+    }
+
+    /// A scalar wider than a word (an `i64` on a 32-bit target, an `i128`
+    /// here) borrowed by address is `FLAG_SIGNED`, not an inline aggregate,
+    /// so it is not a substructure address.
+    #[test]
+    fn wide_scalar_borrow_is_not_a_substruct_address() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "holder::WideScalar";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 2 * word,
+                align: word,
+                fields: vec![StructFieldLayout {
+                    name: "count".into(),
+                    offset: 0,
+                    size: 2 * word,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+            },
+        );
+        let field = FieldDescriptor::new("count", Some(owner.into())).with_taken_by_address(true);
+        assert_eq!(wide_inline_borrow_offset(&field, Some(&cc)), None);
+    }
+
+    /// `&mut s.tags` on a raw `#[repr(C)]` holder is `int_add` of the
+    /// field offset (`rewrite_op_getsubstruct`). The address stays int.
+    /// A GC holder declines instead.
+    #[test]
+    fn raw_inline_vec_borrow_is_field_address_not_capacity() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::{FieldDescriptor, VecFieldPart};
+
+        fn holder(owner: &str, gc: bool) -> (CallControl, majit_ir::descr::StructId) {
+            let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+            let mut cc = CallControl::new();
+            cc.set_struct_layout(
+                owner_id,
+                StructLayout {
+                    size: 32,
+                    align: 8,
+                    fields: vec![
+                        StructFieldLayout {
+                            name: "word".into(),
+                            offset: 0,
+                            size: 8,
+                            flag: majit_ir::descr::ArrayFlag::Signed,
+                            field_type: majit_ir::value::Type::Int,
+                            rank: None,
+                        },
+                        StructFieldLayout {
+                            name: "tags".into(),
+                            offset: 8,
+                            size: 24,
+                            flag: majit_ir::descr::ArrayFlag::Struct,
+                            field_type: majit_ir::value::Type::Ref,
+                            rank: None,
+                        },
+                    ],
+                },
+            );
+            let storage = if gc {
+                crate::StructStorageDescriptor::headerless(owner)
+            } else {
+                crate::StructStorageDescriptor::raw(owner)
+            };
+            cc.set_struct_storage(&[storage]);
+            (cc, owner_id)
+        }
+
+        fn graph_for(owner: &str) -> FunctionGraph {
+            let mut graph = FunctionGraph::new("clear_tag");
+            let s = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "s".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(graph.startblock, s.clone());
+            let tags = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::FieldRead {
+                        base: s,
+                        field: FieldDescriptor::new("tags", Some(owner.into()))
+                            .with_taken_by_address(true)
+                            .with_inline_vec(true),
+                        ty: ValueType::Ref(None),
+                        pure: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::FieldRead {
+                        base: tags,
+                        field: FieldDescriptor::new("buf", Some("alloc::vec::Vec".into()))
+                            .with_vec_part(VecFieldPart::Buf),
+                        ty: ValueType::Ref(None),
+                        pure: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph
+        }
+
+        let owner = "raw_holder::TagHolder";
+        let gc_owner = "gc_holder::TagHolder";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let gc_id = majit_ir::descr::StructId::from_canonical(gc_owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+                (gc_owner.to_string(), Some(gc_id)),
+            ]));
+        let (mut cc, _) = holder(owner, false);
+        let config = GraphTransformConfig::default();
+        let out = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph_for(owner));
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, rhs, .. } if op == "add" && matches!(
+                    ops.iter().find(|c| c.result.as_ref() == Some(rhs)).map(|c| &c.kind),
+                    Some(OpKind::ConstInt(8))
+                )
+            )),
+            "address is base + field offset 8; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr"
+            )),
+            "rewrite_op_getsubstruct leaves the address in the int bank; ops={ops:?}"
+        );
+        let buf = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.vec_part == Some(VecFieldPart::Buf)
+            )
+        });
+        let buf_base = match &buf.expect("buf getfield").kind {
+            OpKind::FieldRead { base, .. } => base,
+            _ => unreachable!(),
+        };
+        assert!(
+            ops.iter().any(|op| {
+                op.result.as_ref() == Some(buf_base)
+                    && matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")
+            }),
+            "buf is read off the int interior address, not the capacity word; ops={ops:?}"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(buf_base),
+            ConcreteType::Signed,
+            "a raw substructure address is int-kind"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "tags" && field.vec_part.is_none()
+            )),
+            "the inline Vec field is not loaded as its first word"
+        );
+
+        let (mut gc_cc, _) = holder(gc_owner, true);
+        let gc_out = Transformer::new(&config)
+            .with_callcontrol(&mut gc_cc)
+            .transform(&graph_for(gc_owner));
+        let gc_ops: Vec<_> = gc_out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            gc_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Abort { kind: crate::model::UnknownKind::UnsupportedExpr { variant } }
+                    if *variant == crate::model::UnsupportedExprKind::RawAddr
+            )),
+            "a GC base declines the interior address"
+        );
+        assert!(
+            gc_ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "tags"
+            )),
+            "a GC base does not load word 0 of the inline Vec"
+        );
+    }
+
+    /// A ref stored through a raw substructure address is `cast_ptr_to_int`
+    /// plus `raw_store` on an int base. Loading that word back is `raw_load`
+    /// plus `cast_int_to_ptr` (`rewrite_op_raw_store` / `rewrite_op_raw_load`
+    /// reject kind `'r'`).
+    #[test]
+    fn raw_substruct_stores_ref_as_int_and_loads_it_back() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "raw_dispatch::Special";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 32,
+                align: 8,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "word".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "slot".into(),
+                        offset: 8,
+                        size: 24,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+            },
+        );
+        cc.set_struct_storage(&[crate::StructStorageDescriptor::raw(owner)]);
+
+        let mut graph = FunctionGraph::new("try_dispatch_binary_special");
+        let s = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(graph.startblock, s.clone());
+        let ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(graph.startblock, ptr.clone());
+        let addr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: s,
+                    field: FieldDescriptor::new("slot", Some(owner.into()))
+                        .with_taken_by_address(true)
+                        .with_inline_vec(true),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let zero = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(0), true)
+            .unwrap();
+        let word = crate::layout::target_word_size();
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::RawStore {
+                    base: addr.clone(),
+                    offset: zero.clone(),
+                    value: ptr.clone(),
+                    item_ty: ValueType::Ref(None),
+                    itemsize: word,
+                    is_item_signed: false,
+                },
+            });
+        let _loaded = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::RawLoad {
+                    base: addr,
+                    offset: zero,
+                    item_ty: ValueType::Ref(None),
+                    itemsize: word,
+                    is_item_signed: false,
+                },
+                true,
+            )
+            .unwrap();
+
+        let config = GraphTransformConfig::default();
+        let out = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+
+        let cast_to_int = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_ptr_to_int" && operand == &ptr
+            )
+        });
+        let cast_to_int = cast_to_int.expect("ref value is cast_ptr_to_int");
+        let stored = cast_to_int.result.clone().expect("cast result");
+        let store = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::RawStore { value, .. } if value == &stored
+            )
+        });
+        let store = store.expect("raw_store of the int address");
+        let store_base = match &store.kind {
+            OpKind::RawStore { base, .. } => base,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            FunctionGraph::concretetype_of(store_base),
+            ConcreteType::Signed,
+            "raw_store base is the int substructure address; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.result.as_ref() == Some(store_base)
+                    && matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")
+            }),
+            "the address is rewrite_op_getsubstruct's int_add; ops={ops:?}"
+        );
+
+        let load = ops
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::RawLoad { .. }));
+        let load = load.expect("raw_load");
+        let loaded_int = load.result.clone().expect("raw_load result");
+        assert_eq!(
+            FunctionGraph::concretetype_of(&loaded_int),
+            ConcreteType::Signed,
+            "raw_load of a ref word is int-kind; ops={ops:?}"
+        );
+        let load_base = match &load.kind {
+            OpKind::RawLoad { base, .. } => base,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            FunctionGraph::concretetype_of(load_base),
+            ConcreteType::Signed,
+            "raw_load base is the int substructure address"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, result_ty, .. }
+                    if op == "cast_int_to_ptr"
+                        && operand == &loaded_int
+                        && matches!(result_ty, ValueType::Ref(_))
+            )),
+            "the loaded word comes back through cast_int_to_ptr; ops={ops:?}"
         );
     }
 

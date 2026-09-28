@@ -56,7 +56,14 @@ fn loads_fixture_corpus() {
     //
     // + 2 for `take_odd_default` and its hand-written `Default::default`.
     // + 1 for `replace_wide_payload` (a `u128` variant field).
-    assert_eq!(local_count, 47, "47 local fns expected");
+    //
+    // + 13 for the union, enum, and box-deref fixtures:
+    // `clear_inline_tag`, `store_held_int`, `replace_held_union`,
+    // `replace_boxed_held`, `held_as_mut`, `replace_boxed_held_call`,
+    // `replace_indexed_box`, `replace_indexed_box_call`,
+    // `replace_boxed_dynlike`, `store_held_cell`, and the extra local
+    // bodies Charon emits beside those items. The measured count is 60.
+    assert_eq!(local_count, 60, "60 local fns expected");
 }
 
 #[test]
