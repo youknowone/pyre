@@ -1990,6 +1990,214 @@ pub(crate) fn non_arm_skip_category(msg: &str) -> Option<&'static str> {
     None
 }
 
+/// The registry dedupe key of `path` (see
+/// [`populate_call_registry_from_call_graphs`]).
+fn canonical_dedup_key(path: &crate::parse::CallPath) -> Vec<String> {
+    let mut segs: Vec<String> = path.segments.to_vec();
+    if segs
+        .first()
+        .map(|s| s == "crate" || crate::local_crates::is_local_crate_root(s))
+        .unwrap_or(false)
+    {
+        segs.remove(0);
+    }
+    segs
+}
+
+/// Why a funcobj under the canonical path `canonical_strip` gets no
+/// registry entry: its callsites resolve elsewhere.
+fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
+    // `pyre_object::lltype::malloc[_typed/_stable]` are GC allocation intrinsics,
+    // recognised as host builtins (annotator `malloc_typed_alloc`, HOST_ENV
+    // `pyre_object.lltype` module). Their real bodies enter the host
+    // allocator (`malloc_typed` first reads the un-flowable
+    // `<T as GcType>::type_id()` trait accessor), so lifting either records
+    // a poison lift-error that surfaces on the first boxing caller. Skip
+    // registering it as a user function: with no registry entry, callsites
+    // resolve to the HOST_ENV builtin (translate_op Layer-3b) instead of
+    // this failed user-graph entry (Layer-1 `call_registry.lookup`).
+    //
+    // `fuse_boxing_alloc` now derives every payload from the registered
+    // struct layout and rewrites a proven `malloc[_typed](T { ... })`
+    // cluster to `NewWithVtable` plus setfields, matching
+    // `jtransform.rewrite_op_malloc` (`jtransform.py`).  A surviving call
+    // is still not a residual boundary: it means the frontend could not
+    // prove the allocation header/type identity.  The fail-closed guard in
+    // `flowspace_adapter::translate_op` therefore rejects every surviving
+    // `malloc`, `malloc_typed`, `malloc_typed_managed`, or
+    // `malloc_typed_stable` call instead of
+    // emitting an executable symbolic fnaddr.
+    if canonical_strip == ["lltype", "malloc"]
+        || canonical_strip == ["lltype", "malloc_typed"]
+        || canonical_strip == ["lltype", "malloc_typed_managed"]
+        || canonical_strip == ["lltype", "malloc_typed_stable"]
+    {
+        return Some("skip-malloc-typed-intrinsic");
+    }
+    // `#[pyre_class]`'s generated allocation constructors
+    // (`<Owner>::allocate(payload: Self)` / `allocate_stable(payload:
+    // Self)`) build the object then call the non-numeric
+    // `lltype::malloc_typed[_stable]`, which has no ported general
+    // `malloc->new` lowering — lifting the body records a poison lift-error
+    // that surfaces on the first constructing caller (`w_range_new`,
+    // the iterator/`GenericAlias` `*_new` heads).  Skip registering the
+    // constructor as a user function so its key is instead served by the
+    // residual stub from `collect_marked_class_ctor_stubs_from_llbc` (seeded
+    // through the `unsafe_fn_stubs` carrier), whose `*mut PyObject` return
+    // shell lets the caller annotate.  The numeric boxes never reach here —
+    // they call `malloc_typed` inline (`w_float_new`/`w_int_new`), not the
+    // macro `allocate` wrapper — so this does not disturb
+    // `fuse_boxing_alloc`.
+    if matches!(
+        canonical_strip.last().map(String::as_str),
+        Some("allocate") | Some("allocate_stable")
+    ) {
+        return Some("skip-pyre-class-allocate-ctor");
+    }
+    // `pyre_object::lltype::malloc_raw` is the raw (non-GC) allocation
+    // intrinsic (`lltype.malloc(T, flavor='raw')` parity), recognised as
+    // a host builtin (annotator `malloc_raw_alloc`, HOST_ENV
+    // `pyre_object.lltype` module).  Its body calls the analyser-less
+    // `Box::new` / `Box::into_raw`, so lifting it records a poison
+    // lift-error that surfaces on the first raw-allocating caller.  Skip
+    // registering it as a user function for the same reason as
+    // `malloc_typed`: callsites resolve to the HOST_ENV builtin
+    // (translate_op Layer-3b) instead of this failed user-graph entry.
+    if canonical_strip == ["lltype", "malloc_raw"] {
+        return Some("skip-malloc-raw-intrinsic");
+    }
+    // `rlib/nonconst.py NonConstant` is an `ExtRegistryEntry`, not a
+    // graph: its whole purpose is that the annotator must NOT see the
+    // argument's constancy, and the identity body lifted from
+    // `majit-rlib` would hand that constancy straight back.  With no
+    // registry entry the callsite resolves through
+    // `translate_op` Layer-3b to the `majit_rlib.nonconst` HOST_ENV
+    // callable, whose analyzer answers `not_const(s_arg)` and whose
+    // `rtype_non_constant` returns argument 0.
+    if canonical_strip == ["nonconst", "non_constant"] {
+        return Some("skip-nonconst-extregistry-entry");
+    }
+    None
+}
+
+/// Publish what the source callable of `graph` declares about its result
+/// on its registry entry.
+fn publish_source_signature(graph: &LegacyGraph, entry: &FunctionEntry) {
+    // GraphStore aliases are iteration-ordered, so the canonical entry
+    // selected above can be keyed by the bare leaf even though the graph
+    // retains its exact source callable identity.  RPython attaches
+    // `_signature_` to that callable object, not to one spelling of its
+    // import path (`bookkeeper.py getdesc`, `description.py:234-244`).  allow-line-citation
+    // Recover the same fact from `FunctionGraph.source_identity` here;
+    // this keeps a foreign same-leaf function distinct while ensuring
+    // every alias of the real materializer shares the semantic result.
+    if graph
+        .source_identity
+        .as_deref()
+        .map(|identity| {
+            is_exception_object_materializer(&FunctionPathKey::from_segments(identity.split("::")))
+        })
+        .unwrap_or(false)
+    {
+        entry.publish_exception_object_result_signature();
+    }
+}
+
+/// Project the callee's declared LLBC fn-ptr signature onto its entry
+/// before any body is lifted (see the pre-pass in
+/// [`populate_call_registry_from_call_graphs`]).
+fn seed_declared_funcptr_type(graph: &LegacyGraph, entry: &FunctionEntry) {
+    if let Some(ft) = declared_funcptr_type_from_legacy(graph) {
+        entry.set_declared_funcptr_type(ft);
+    }
+}
+
+/// Give the registry entry of a funcobj the lowered body its default
+/// graph is built from (Pass 2 of
+/// [`populate_call_registry_from_call_graphs`]).
+fn install_source_graph(
+    registry: &Rc<CallRegistry>,
+    key: &FunctionPathKey,
+    graph: &LegacyGraph,
+    entry: &FunctionEntry,
+    signature: &Signature,
+    body: &crate::codewriter::call::StoredBody,
+) {
+    // `@jit.dont_look_inside` (`rlib/jit.py`) callees: the JIT
+    // pipeline never builds a jitcode for the body
+    // (`policy.py look_inside_graph` returns False, so
+    // `codewriter.py find_all_graphs` excludes the graph and the
+    // callsite residualizes).  Pyre's annotator exists solely to
+    // feed that jitcode pipeline, so lifting the body here is
+    // upstream-dead work — and bodies marked opaque are typically
+    // unliftable host plumbing (`OnceLock` init walks etc.) whose
+    // lift failure would poison every caller.  Prefill the same
+    // signature-only stub pygraph `register_unsafe_fn_stubs` uses
+    // (the `ExtRegistryEntry.compute_result_annotation` shape) so
+    // callers annotate the declared result and the codewriter emits
+    // the residual call via the fn's registered C ABI address
+    // (`pyre/jit_fnaddr.rs`).  The FUNC.RESULT token is the canonical
+    // spelling `front::mir::dont_look_inside_return_token` stamps from
+    // the callee's return `ValueType`; [`residual_return_shell`]
+    // decodes it.  A token it declines falls through to the normal
+    // lift.
+    // specialize.memo evaluates the host callable, never its original
+    // flow graph. MemoTable.finish installs the decision graph later.
+    if entry.function_desc.borrow().is_memo() {
+        return;
+    }
+    let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
+        || graph.hints.iter().any(|h| h == "elidable");
+    if residualize {
+        // The materialisers' raw `*mut PyObject` return is only their
+        // residual-call ABI.  Their FunctionDesc carries the orthodox
+        // `_signature_`-style SomeInstance result, so the synthetic
+        // annotator graph must carry that same result on its return link.
+        // Leaving the generic OBJECTPTR/SomePtr shell here makes Phase B
+        // insert a PtrRepr -> InstanceRepr conversion that upstream never
+        // has, then the first failed specialization replaces the shared
+        // stub and strands every later caller on an unbound return var.
+        let semantic_key = graph
+            .source_identity
+            .as_deref()
+            .map(|identity| FunctionPathKey::from_segments(identity.split("::")))
+            .unwrap_or_else(|| key.clone());
+        let result_shell = residual_stub_result_shell(&semantic_key, graph.return_type.as_deref());
+        if let Some(result_shell) = result_shell {
+            let stub = build_stub_pygraph_with_result_shell(
+                graph.name.clone(),
+                signature.clone(),
+                result_shell,
+            );
+            entry.prefill_default_cache(stub);
+            return;
+        }
+    }
+    let func = entry
+        .host_object
+        .user_function()
+        .expect("registered source callable")
+        .clone();
+    let body = body.clone();
+    let signature = signature.clone();
+    // The registry is the body's global namespace; the entry it owns
+    // must not keep it alive.
+    let globals = Rc::downgrade(registry);
+    entry
+        .function_desc
+        .borrow()
+        .set_source_graph(crate::annotator::description::SourceGraph::new(move || {
+            let registry = globals
+                .upgrade()
+                .ok_or_else(|| "the call registry was dropped".to_string())?;
+            let source = body
+                .graph()
+                .ok_or_else(|| "the funcobj's graph build produced no graph".to_string())?;
+            lift_callee_to_pygraph_with_func(&source, signature, &registry, func)
+                .map_err(|e| format!("{e}"))
+        }));
+}
+
 /// Whether the dual gate should Skip this failure to the legacy walker.
 ///
 /// The predicate is [`unported_category`] with its answer erased, so there is
@@ -2058,17 +2266,6 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // bare-name dedupe trap (using `FunctionGraph::name`) is still
     // avoided because we key on the post-strip segment sequence, not
     // on the bare leaf.
-    fn canonical_dedup_key(path: &crate::parse::CallPath) -> Vec<String> {
-        let mut segs: Vec<String> = path.segments.to_vec();
-        if segs
-            .first()
-            .map(|s| s == "crate" || crate::local_crates::is_local_crate_root(s))
-            .unwrap_or(false)
-        {
-            segs.remove(0);
-        }
-        segs
-    }
     let mut pending: Vec<(
         FunctionPathKey,
         Rc<LegacyGraph>,
@@ -2084,96 +2281,15 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // carrying the indirection.
     let mut by_canonical_path: HashMap<Vec<String>, FunctionPathKey> = HashMap::new();
     for (path, graph) in function_graphs.iter_declared() {
+        // A funcobj the front end declared gets its entry on first lookup
+        // (`describe_declared_funcobj`).
+        if function_graphs.declared_funcobj(&path).is_some() {
+            continue;
+        }
         let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
         let canonical_strip = canonical_dedup_key(&path);
-        // `pyre_object::lltype::malloc[_typed/_stable]` are GC allocation intrinsics,
-        // recognised as host builtins (annotator `malloc_typed_alloc`, HOST_ENV
-        // `pyre_object.lltype` module). Their real bodies enter the host
-        // allocator (`malloc_typed` first reads the un-flowable
-        // `<T as GcType>::type_id()` trait accessor), so lifting either records
-        // a poison lift-error that surfaces on the first boxing caller. Skip
-        // registering it as a user function: with no registry entry, callsites
-        // resolve to the HOST_ENV builtin (translate_op Layer-3b) instead of
-        // this failed user-graph entry (Layer-1 `call_registry.lookup`).
-        //
-        // `fuse_boxing_alloc` now derives every payload from the registered
-        // struct layout and rewrites a proven `malloc[_typed](T { ... })`
-        // cluster to `NewWithVtable` plus setfields, matching
-        // `jtransform.rewrite_op_malloc` (`jtransform.py`).  A surviving call
-        // is still not a residual boundary: it means the frontend could not
-        // prove the allocation header/type identity.  The fail-closed guard in
-        // `flowspace_adapter::translate_op` therefore rejects every surviving
-        // `malloc`, `malloc_typed`, `malloc_typed_managed`, or
-        // `malloc_typed_stable` call instead of
-        // emitting an executable symbolic fnaddr.
-        if canonical_strip == ["lltype", "malloc"]
-            || canonical_strip == ["lltype", "malloc_typed"]
-            || canonical_strip == ["lltype", "malloc_typed_managed"]
-            || canonical_strip == ["lltype", "malloc_typed_stable"]
-        {
-            crate::decline::record(
-                REGISTRY_GATE,
-                "skip-malloc-typed-intrinsic",
-                format_args!("{path}"),
-            );
-            continue;
-        }
-        // `#[pyre_class]`'s generated allocation constructors
-        // (`<Owner>::allocate(payload: Self)` / `allocate_stable(payload:
-        // Self)`) build the object then call the non-numeric
-        // `lltype::malloc_typed[_stable]`, which has no ported general
-        // `malloc->new` lowering — lifting the body records a poison lift-error
-        // that surfaces on the first constructing caller (`w_range_new`,
-        // the iterator/`GenericAlias` `*_new` heads).  Skip registering the
-        // constructor as a user function so its key is instead served by the
-        // residual stub from `collect_marked_class_ctor_stubs_from_llbc` (seeded
-        // through the `unsafe_fn_stubs` carrier), whose `*mut PyObject` return
-        // shell lets the caller annotate.  The numeric boxes never reach here —
-        // they call `malloc_typed` inline (`w_float_new`/`w_int_new`), not the
-        // macro `allocate` wrapper — so this does not disturb
-        // `fuse_boxing_alloc`.
-        if matches!(
-            canonical_strip.last().map(String::as_str),
-            Some("allocate") | Some("allocate_stable")
-        ) {
-            crate::decline::record(
-                REGISTRY_GATE,
-                "skip-pyre-class-allocate-ctor",
-                format_args!("{path}"),
-            );
-            continue;
-        }
-        // `pyre_object::lltype::malloc_raw` is the raw (non-GC) allocation
-        // intrinsic (`lltype.malloc(T, flavor='raw')` parity), recognised as
-        // a host builtin (annotator `malloc_raw_alloc`, HOST_ENV
-        // `pyre_object.lltype` module).  Its body calls the analyser-less
-        // `Box::new` / `Box::into_raw`, so lifting it records a poison
-        // lift-error that surfaces on the first raw-allocating caller.  Skip
-        // registering it as a user function for the same reason as
-        // `malloc_typed`: callsites resolve to the HOST_ENV builtin
-        // (translate_op Layer-3b) instead of this failed user-graph entry.
-        if canonical_strip == ["lltype", "malloc_raw"] {
-            crate::decline::record(
-                REGISTRY_GATE,
-                "skip-malloc-raw-intrinsic",
-                format_args!("{path}"),
-            );
-            continue;
-        }
-        // `rlib/nonconst.py NonConstant` is an `ExtRegistryEntry`, not a
-        // graph: its whole purpose is that the annotator must NOT see the
-        // argument's constancy, and the identity body lifted from
-        // `majit-rlib` would hand that constancy straight back.  With no
-        // registry entry the callsite resolves through
-        // `translate_op` Layer-3b to the `majit_rlib.nonconst` HOST_ENV
-        // callable, whose analyzer answers `not_const(s_arg)` and whose
-        // `rtype_non_constant` returns argument 0.
-        if canonical_strip == ["nonconst", "non_constant"] {
-            crate::decline::record(
-                REGISTRY_GATE,
-                "skip-nonconst-extregistry-entry",
-                format_args!("{path}"),
-            );
+        if let Some(reason) = registration_decline(&canonical_strip) {
+            crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
             continue;
         }
         let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
@@ -2195,26 +2311,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             by_canonical_path.insert(canonical_strip, key.clone());
             entry
         };
-        // GraphStore aliases are iteration-ordered, so the canonical entry
-        // selected above can be keyed by the bare leaf even though the graph
-        // retains its exact source callable identity.  RPython attaches
-        // `_signature_` to that callable object, not to one spelling of its
-        // import path (`bookkeeper.py getdesc`, `description.py:234-244`).  allow-line-citation
-        // Recover the same fact from `FunctionGraph.source_identity` here;
-        // this keeps a foreign same-leaf function distinct while ensuring
-        // every alias of the real materializer shares the semantic result.
-        if graph
-            .source_identity
-            .as_deref()
-            .map(|identity| {
-                is_exception_object_materializer(&FunctionPathKey::from_segments(
-                    identity.split("::"),
-                ))
-            })
-            .unwrap_or(false)
-        {
-            entry.publish_exception_object_result_signature();
-        }
+        publish_source_signature(&graph, &entry);
         let body = function_graphs
             .body(&path)
             .expect("a declared path names a funcobj");
@@ -2301,9 +2398,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             if !seeded.insert(Rc::as_ptr(entry)) {
                 continue;
             }
-            if let Some(ft) = declared_funcptr_type_from_legacy(graph) {
-                entry.set_declared_funcptr_type(ft);
-            }
+            seed_declared_funcptr_type(graph, entry);
         }
     }
     for (key, graph, entry, signature, body) in &pending {
@@ -2311,79 +2406,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if !lifted.insert(entry_ptr) {
             continue;
         }
-        // `@jit.dont_look_inside` (`rlib/jit.py`) callees: the JIT
-        // pipeline never builds a jitcode for the body
-        // (`policy.py look_inside_graph` returns False, so
-        // `codewriter.py find_all_graphs` excludes the graph and the
-        // callsite residualizes).  Pyre's annotator exists solely to
-        // feed that jitcode pipeline, so lifting the body here is
-        // upstream-dead work — and bodies marked opaque are typically
-        // unliftable host plumbing (`OnceLock` init walks etc.) whose
-        // lift failure would poison every caller.  Prefill the same
-        // signature-only stub pygraph `register_unsafe_fn_stubs` uses
-        // (the `ExtRegistryEntry.compute_result_annotation` shape) so
-        // callers annotate the declared result and the codewriter emits
-        // the residual call via the fn's registered C ABI address
-        // (`pyre/jit_fnaddr.rs`).  The FUNC.RESULT token is the canonical
-        // spelling `front::mir::dont_look_inside_return_token` stamps from
-        // the callee's return `ValueType`; [`residual_return_shell`]
-        // decodes it.  A token it declines falls through to the normal
-        // lift.
-        // specialize.memo evaluates the host callable, never its original
-        // flow graph. MemoTable.finish installs the decision graph later.
-        if entry.function_desc.borrow().is_memo() {
-            continue;
-        }
-        let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
-            || graph.hints.iter().any(|h| h == "elidable");
-        if residualize {
-            // The materialisers' raw `*mut PyObject` return is only their
-            // residual-call ABI.  Their FunctionDesc carries the orthodox
-            // `_signature_`-style SomeInstance result, so the synthetic
-            // annotator graph must carry that same result on its return link.
-            // Leaving the generic OBJECTPTR/SomePtr shell here makes Phase B
-            // insert a PtrRepr -> InstanceRepr conversion that upstream never
-            // has, then the first failed specialization replaces the shared
-            // stub and strands every later caller on an unbound return var.
-            let semantic_key = graph
-                .source_identity
-                .as_deref()
-                .map(|identity| FunctionPathKey::from_segments(identity.split("::")))
-                .unwrap_or_else(|| key.clone());
-            let result_shell =
-                residual_stub_result_shell(&semantic_key, graph.return_type.as_deref());
-            if let Some(result_shell) = result_shell {
-                let stub = build_stub_pygraph_with_result_shell(
-                    graph.name.clone(),
-                    signature.clone(),
-                    result_shell,
-                );
-                entry.prefill_default_cache(stub);
-                continue;
-            }
-        }
-        let func = entry
-            .host_object
-            .user_function()
-            .expect("registered source callable")
-            .clone();
-        let body = body.clone();
-        let signature = signature.clone();
-        // The registry is the body's global namespace; the entry it owns
-        // must not keep it alive.
-        let globals = Rc::downgrade(registry);
-        entry.function_desc.borrow().set_source_graph(
-            crate::annotator::description::SourceGraph::new(move || {
-                let registry = globals
-                    .upgrade()
-                    .ok_or_else(|| "the call registry was dropped".to_string())?;
-                let source = body
-                    .graph()
-                    .ok_or_else(|| "the funcobj's graph build produced no graph".to_string())?;
-                lift_callee_to_pygraph_with_func(&source, signature, &registry, func)
-                    .map_err(|e| format!("{e}"))
-            }),
-        );
+        install_source_graph(registry, key, graph, entry, signature, body);
     }
     // Pass 3 — make impl methods visible in their owner's class dict.
     // RPython's ClassDesc reads methods straight off the class object
@@ -2425,7 +2448,41 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             );
         }
     }
+    let store = function_graphs.clone();
+    let globals = Rc::downgrade(registry);
+    registry.set_getdesc(Rc::new(move |key| {
+        let registry = globals.upgrade()?;
+        describe_declared_funcobj(&store, &registry, key)
+    }));
     Ok(())
+}
+
+/// `bookkeeper.py getdesc` for a funcobj the front end declared: its
+/// registry entry, made on the first lookup of the one path its call sites
+/// name. `None` when `key` names no declared funcobj.
+fn describe_declared_funcobj(
+    store: &crate::codewriter::call::GraphStore,
+    registry: &Rc<CallRegistry>,
+    key: &FunctionPathKey,
+) -> Option<Rc<FunctionEntry>> {
+    use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
+    let path = crate::parse::CallPath::from_segments(key.segments().iter().cloned());
+    let graph = store.declared_funcobj(&path)?;
+    if let Some(reason) = registration_decline(&canonical_dedup_key(&path)) {
+        crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
+        return None;
+    }
+    let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
+    let entry = registry.get_or_register_with_func(
+        key.clone(),
+        signature.clone(),
+        source_graph_func(&graph),
+    );
+    publish_source_signature(&graph, &entry);
+    seed_declared_funcptr_type(&graph, &entry);
+    let body = store.body(&path).expect("a declared path names a funcobj");
+    install_source_graph(registry, key, &graph, &entry, &signature, &body);
+    Some(entry)
 }
 
 // There is no program-wide `build_program_annotator` /

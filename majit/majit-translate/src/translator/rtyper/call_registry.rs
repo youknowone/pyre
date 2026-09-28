@@ -335,7 +335,15 @@ pub struct CallRegistry {
             Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
         )>,
     >,
+    /// Makes the entry of a function object seen after the registry was
+    /// populated, on its first lookup (`bookkeeper.py getdesc`: the
+    /// descriptor is created the first time the object is seen).
+    getdesc: RefCell<Option<Getdesc>>,
 }
+
+/// [`CallRegistry::set_getdesc`]'s callback: the entry for a path the
+/// registry has none for, or `None` when the path names no function object.
+pub type Getdesc = Rc<dyn Fn(&FunctionPathKey) -> Option<Rc<FunctionEntry>>>;
 
 impl CallRegistry {
     /// Construct an empty registry sharing `bookkeeper`.
@@ -346,7 +354,14 @@ impl CallRegistry {
             aliases: RefCell::new(HashMap::new()),
             two_phase: RefCell::new(TwoPhaseTypeCache::default()),
             session: RefCell::new(None),
+            getdesc: RefCell::new(None),
         }
+    }
+
+    /// Describe a function object the registry has no entry for through
+    /// `getdesc`, on its first lookup.
+    pub fn set_getdesc(&self, getdesc: Getdesc) {
+        *self.getdesc.borrow_mut() = Some(getdesc);
     }
 
     /// Drop every lowered body whose graph was never asked for. The
@@ -718,9 +733,23 @@ impl CallRegistry {
     /// resolves through `aliases` to the canonical key and re-reads.
     /// Mirrors RPython `Bookkeeper.getdesc(pyobj)`'s "obj_key direct
     /// lookup" plus alias indirection (`bookkeeper.py`).
+    ///
+    /// A path with no entry yet is handed to the [`Self::set_getdesc`]
+    /// callback, which makes the entry of a function object seen after
+    /// the registry was populated.
     pub fn lookup(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
-        if let Some(entry) = self.entries.borrow().get(key) {
-            return Some(entry.clone());
+        if let Some(entry) = self.lookup_registered(key) {
+            return Some(entry);
+        }
+        let getdesc = self.getdesc.borrow().clone()?;
+        getdesc(key)
+    }
+
+    /// [`Self::lookup`] over the entries made so far.
+    fn lookup_registered(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
+        let entry = self.entries.borrow().get(key).cloned();
+        if entry.is_some() {
+            return entry;
         }
         let canonical = self.aliases.borrow().get(key).cloned()?;
         self.entries.borrow().get(&canonical).cloned()
@@ -969,7 +998,7 @@ impl CallRegistry {
         signature: Signature,
         graph_func: GraphFunc,
     ) -> Rc<FunctionEntry> {
-        if let Some(existing) = self.lookup(&key) {
+        if let Some(existing) = self.lookup_registered(&key) {
             assert_eq!(
                 existing.function_desc.borrow().signature,
                 signature,

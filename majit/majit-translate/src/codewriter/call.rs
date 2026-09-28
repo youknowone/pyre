@@ -968,7 +968,7 @@ use crate::model::GraphKey;
 /// translator's graphs through the bookkeeper. A write while a pending lift
 /// still holds the store copies it, so the lift reads the store as it was
 /// when the registry was populated.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct GraphStore(std::rc::Rc<StoreCore>);
 
 impl std::ops::Deref for GraphStore {
@@ -1098,6 +1098,9 @@ struct GraphSlot {
     /// passes the build catches up on, as it does while a whole-store pass
     /// has taken it out of the store.
     building: std::cell::Cell<bool>,
+    /// Whether the funcobj came from the front end's declarations
+    /// ([`FuncObjDeclarations`]) rather than a registration.
+    declared: bool,
 }
 
 #[derive(Clone)]
@@ -1338,6 +1341,7 @@ impl GraphSlot {
             attrs: FuncObjAttrs::default(),
             since: 0,
             building: std::cell::Cell::new(false),
+            declared: false,
         }
     }
 
@@ -1348,6 +1352,7 @@ impl GraphSlot {
             attrs: FuncObjAttrs::default(),
             since,
             building: std::cell::Cell::new(false),
+            declared: false,
         }
     }
 
@@ -1471,6 +1476,7 @@ impl StoreCore {
             None => {
                 let mut slot = GraphSlot::lazy(graph, transform, 0);
                 slot.attrs = attrs;
+                slot.declared = true;
                 graphs.insert(key.clone(), std::rc::Rc::new(slot));
             }
             Some(slot) => {
@@ -1755,6 +1761,16 @@ impl StoreCore {
         let key = self.path_to_key.get_mut().get(path)?.clone();
         let built = self.slot_mut(&key)?.graph.get_mut()?.as_mut()?;
         Some(std::rc::Rc::make_mut(&mut built.graph))
+    }
+
+    /// The declaration of the funcobj `path` names when it came from the
+    /// front end's declarations, read without building its graph.
+    pub(crate) fn declared_funcobj(&self, path: &CallPath) -> Option<std::rc::Rc<FunctionGraph>> {
+        let slot = self.slot_for(path)?;
+        if !slot.declared {
+            return None;
+        }
+        self.slot_declaration(&slot)
     }
 
     /// `GraphKey` of the funcobj `path` names. Alias spellings of one
