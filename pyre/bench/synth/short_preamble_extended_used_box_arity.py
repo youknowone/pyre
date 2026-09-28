@@ -1,5 +1,8 @@
 # pyre-check: skip-backends=cranelift
 # cranelift runs the core build, which has no `pyre-module` and so no `math`.
+# pyre-check: jitstats-band=guard_failures=16
+# guard_failures measured 347 on macOS arm64, 345 on ubuntu and 335 on
+# windows (CI run 36401570302) for the same source.
 # The loop over `cdf(invcdf(p))` reads each lambda's closure cell, a heap
 # short box whose receiver is another short box.  The loop's own close adds
 # that box to the LABEL through `ExtendedShortPreambleBuilder`; a bridge back
