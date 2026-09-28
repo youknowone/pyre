@@ -2279,7 +2279,7 @@ impl OptHeap {
                 .is_some()
             && let Some(value) = ctx.constant_fold(op)
         {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, value);
             return OptimizationResult::Remove;
         }
@@ -2526,7 +2526,7 @@ impl OptHeap {
             ctx.emit(op.clone());
             let zero_ref = ctx.make_constant_int(0);
             let cmp_pos = ctx.alloc_op_position_typed(OpCode::IntNe.result_type());
-            let cmp_arg0 = ctx.materialize_operand_at(op.pos().get());
+            let cmp_arg0 = Operand::from_bound_op(op_rc);
             let cmp_arg1 = ctx.materialize_operand_at(zero_ref);
             let mut cmp_op = Op::new(OpCode::IntNe, &[cmp_arg0, cmp_arg1]);
             cmp_op.pos().set(cmp_pos);

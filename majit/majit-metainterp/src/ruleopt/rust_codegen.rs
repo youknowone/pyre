@@ -723,29 +723,15 @@ impl RustCodegen {
                         Pattern::PatternVar(var) => {
                             let typ = var.typ.unwrap_or(self.binding_types[&var.name]);
                             if typ == RuleType::Int {
-                                let value = self.bindings[&var.name].clone();
-                                let reference = format!("target_ref_{index}");
-                                let operand = format!("target_arg_{index}");
-                                self.emit(format!(
-                                    "let {reference} = ctx.make_constant_int({value});"
-                                ));
-                                self.emit(format!(
-                                    "let {operand} = ctx.materialize_operand_at({reference});"
-                                ));
-                                args.push(operand);
+                                let value = &self.bindings[&var.name];
+                                args.push(format!("Operand::const_(Const::Int({value}))"));
                             } else {
                                 args.push(format!("{}.clone()", self.bindings[&var.name]));
                             }
                         }
                         Pattern::PatternConst(value) => {
                             let value = Self::rust_constant(&value.const_value);
-                            let reference = format!("target_ref_{index}");
-                            let operand = format!("target_arg_{index}");
-                            self.emit(format!("let {reference} = ctx.make_constant_int({value});"));
-                            self.emit(format!(
-                                "let {operand} = ctx.materialize_operand_at({reference});"
-                            ));
-                            args.push(operand);
+                            args.push(format!("Operand::const_(Const::Int({value}))"));
                         }
                         Pattern::PatternOp(_) => {
                             unreachable!("generated targets use flat arguments")

@@ -198,7 +198,7 @@ impl OptRewrite {
                 .and_then(|b| ctx.get_constant_int_box(&b)),
         ) && let Some(result) = self.try_fold_binary_int(OpCode::IntFloorDiv, a, b)
         {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(result));
             return OptimizationResult::Remove;
         }
@@ -229,7 +229,7 @@ impl OptRewrite {
             .resolve_operand_operand_opt(&arg0)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -239,7 +239,7 @@ impl OptRewrite {
             .resolve_operand_operand(&arg0)
             .same_box(&ctx.resolve_operand_operand(&arg1))
         {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(1));
             return OptimizationResult::Remove;
         }
@@ -311,7 +311,7 @@ impl OptRewrite {
                 .and_then(|b| ctx.get_constant_int_box(&b)),
         ) && let Some(result) = self.try_fold_binary_int(OpCode::IntMod, a, b)
         {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(result));
             return OptimizationResult::Remove;
         }
@@ -321,7 +321,7 @@ impl OptRewrite {
             .resolve_operand_operand_opt(&arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -331,7 +331,7 @@ impl OptRewrite {
             .resolve_operand_operand_opt(&arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -341,7 +341,7 @@ impl OptRewrite {
             .resolve_operand_operand_opt(&arg0)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -351,7 +351,7 @@ impl OptRewrite {
             .resolve_operand_operand(&arg0)
             .same_box(&ctx.resolve_operand_operand(&arg1))
         {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(0));
             return OptimizationResult::Remove;
         }
@@ -448,8 +448,13 @@ impl OptRewrite {
     /// Constant fold INT_IS_ZERO.
     /// rewrite.py `optimize_INT_IS_ZERO`:
     ///     return self._optimize_nullness(op, op.getarg(0), False)
-    fn optimize_int_is_zero(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        self.optimize_nullness(op, op.arg(0).to_opref(), false, ctx)
+    fn optimize_int_is_zero(
+        &self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        self.optimize_nullness(op, op_rc, op.arg(0).to_opref(), false, ctx)
     }
 
     /// rewrite.py `optimize_INT_IS_TRUE`:
@@ -500,14 +505,13 @@ impl OptRewrite {
             && inner.opcode == OpCode::IntAnd
             && ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false)) == Some(i64::MIN)
         {
-            let zero = ctx.make_constant_int(0);
-            let arg_zero = ctx.materialize_operand_at(zero);
+            let arg_zero = Operand::const_(majit_ir::Const::Int(0));
             let mut new_op = Op::new(OpCode::IntLt, &[inner.arg(0), arg_zero.clone()]);
             new_op.pos().set(op.pos().get());
             return OptimizationResult::Emit(new_op);
         }
 
-        self.optimize_nullness(op, arg0.to_opref(), true, ctx)
+        self.optimize_nullness(op, op_rc, arg0.to_opref(), true, ctx)
     }
 
     /// rewrite.py: _optimize_oois_ooisnot(op, expect_isnot, instance)
@@ -516,6 +520,7 @@ impl OptRewrite {
     fn optimize_oois_ooisnot(
         &self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         expect_isnot: bool,
         instance: bool,
         ctx: &mut OptContext,
@@ -549,12 +554,12 @@ impl OptRewrite {
             } else {
                 expect_isnot
             };
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(intres as i64));
             return OptimizationResult::Remove;
         }
         if is_virtual1 {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(expect_isnot as i64));
             return OptimizationResult::Remove;
         }
@@ -563,16 +568,16 @@ impl OptRewrite {
         let arg0 = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
         let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
         if info1.as_ref().is_some_and(|i| i.is_null()) {
-            return self.optimize_nullness(op, arg0, expect_isnot, ctx);
+            return self.optimize_nullness(op, op_rc, arg0, expect_isnot, ctx);
         }
         if info0.as_ref().is_some_and(|i| i.is_null()) {
-            return self.optimize_nullness(op, arg1, expect_isnot, ctx);
+            return self.optimize_nullness(op, op_rc, arg1, expect_isnot, ctx);
         }
 
         // rewrite.py: `elif arg0 is arg1:` — box identity
         // (resoperation.py `same_box` base = `self is other`).
         if ctx.box_is(arg0, arg1) {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(!expect_isnot as i64));
             return OptimizationResult::Remove;
         }
@@ -588,7 +593,7 @@ impl OptRewrite {
             if let (Some(c0), Some(c1)) = (cls0, cls1)
                 && c0 != c1
             {
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 ctx.make_constant_box(&b, Value::Int(expect_isnot as i64));
                 return OptimizationResult::Remove;
             }
@@ -601,7 +606,7 @@ impl OptRewrite {
             if let (Some(lb0), Some(lb1)) = (lb0, lb1)
                 && lb0.known_ne(&lb1)
             {
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 ctx.make_constant_box(&b, Value::Int(expect_isnot as i64));
                 return OptimizationResult::Remove;
             }
@@ -618,18 +623,19 @@ impl OptRewrite {
     fn optimize_nullness(
         &self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         arg: OpRef,
         expect_nonnull: bool,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         match self.getnullness(arg, ctx) {
             Nullness::Nonnull => {
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 ctx.make_constant_box(&b, Value::Int(expect_nonnull as i64));
                 OptimizationResult::Remove
             }
             Nullness::Null => {
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 ctx.make_constant_box(&b, Value::Int(!expect_nonnull as i64));
                 OptimizationResult::Remove
             }
@@ -650,7 +656,7 @@ impl OptRewrite {
             .resolve_operand_operand_opt(&arg0)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(if a < 0 { 0 } else { a }));
             return OptimizationResult::Remove;
         }
@@ -668,7 +674,7 @@ impl OptRewrite {
             }
             // force_ge_zero_neg: int_force_ge_zero(x) => 0 (if x known negative)
             if bound.upper < 0 {
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 ctx.make_constant_box(&b, Value::Int(0));
                 return OptimizationResult::Remove;
             }
@@ -1124,7 +1130,7 @@ impl OptRewrite {
 
         // rewrite.py:774-777: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(0));
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -1140,7 +1146,7 @@ impl OptRewrite {
         }
         // rewrite.py:785-788: x % 1 → 0
         if val == 1 {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(0));
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -1197,7 +1203,7 @@ impl OptRewrite {
 
         // rewrite.py:726-729: b1.known_eq_const(0) → 0
         if b1.known_eq_const(0) {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(0));
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -1544,7 +1550,13 @@ impl OptRewrite {
 
     /// `OptRewrite.try_boolinvers`: look up the synthetic inverse and,
     /// when its intbound is exactly 0 or 1, fold this op to the other bit.
-    fn try_boolinvers(&self, op: &Op, top: &Op, ctx: &mut OptContext) -> bool {
+    fn try_boolinvers(
+        &self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        top: &Op,
+        ctx: &mut OptContext,
+    ) -> bool {
         let Some(old) = self.get_pure_result(top.opcode, [top.arg(0), top.arg(1)], ctx) else {
             return false;
         };
@@ -1559,7 +1571,7 @@ impl OptRewrite {
         } else {
             return false;
         };
-        let b = ctx.materialize_operand_at(op.pos().get());
+        let b = Operand::from_bound_op(op_rc);
         ctx.make_constant_box(&b, Value::Int(value));
         true
     }
@@ -1582,7 +1594,7 @@ impl OptRewrite {
 
         if let Some(inverse) = op.opcode.bool_inverse() {
             let top = Op::new(inverse, &[arg0.clone(), arg1.clone()]);
-            if self.try_boolinvers(op, &top, ctx) {
+            if self.try_boolinvers(op, op_rc, &top, ctx) {
                 return Some(OptimizationResult::Remove);
             }
         }
@@ -1599,7 +1611,7 @@ impl OptRewrite {
         }
         if let Some(reflex_inverse) = reflex.bool_inverse() {
             let top = Op::new(reflex_inverse, &[arg1, arg0]);
-            if self.try_boolinvers(op, &top, ctx) {
+            if self.try_boolinvers(op, op_rc, &top, ctx) {
                 return Some(OptimizationResult::Remove);
             }
         }
@@ -1766,7 +1778,7 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
 
-            OpCode::IntIsZero => self.optimize_int_is_zero(op, ctx),
+            OpCode::IntIsZero => self.optimize_int_is_zero(op, op_rc, ctx),
             OpCode::IntIsTrue => self.optimize_int_is_true(op, op_rc, ctx),
             OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, op_rc, ctx),
 
@@ -2067,7 +2079,7 @@ impl Optimization for OptRewrite {
                         arg0,
                     );
                 }
-                self.optimize_oois_ooisnot(op, false, instance, ctx)
+                self.optimize_oois_ooisnot(op, op_rc, false, instance, ctx)
             }
             OpCode::PtrNe | OpCode::InstancePtrNe => {
                 let instance = matches!(op.opcode, OpCode::InstancePtrNe);
@@ -2082,7 +2094,7 @@ impl Optimization for OptRewrite {
                         arg0,
                     );
                 }
-                self.optimize_oois_ooisnot(op, true, instance, ctx)
+                self.optimize_oois_ooisnot(op, op_rc, true, instance, ctx)
             }
 
             // ── Cast round-trip elimination ──

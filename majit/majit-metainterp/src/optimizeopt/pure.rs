@@ -1176,7 +1176,7 @@ impl Optimization for OptPure {
 
             // pure.py: _can_optimize_call_pure(op, start_index=1).
             if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 ctx.make_constant_box(&b, value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;

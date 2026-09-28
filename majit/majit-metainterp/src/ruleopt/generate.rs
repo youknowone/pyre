@@ -33,7 +33,7 @@ pub const RUST_AUTOGEN_HEADER: &str = r#"//! Generated from `rpython/jit/metaint
 use crate::optimizeopt::intbounds::OptIntBounds;
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{OptContext, OptimizationResult};
-use majit_ir::{Op, OpCode, operand::Operand};
+use majit_ir::{Const, Op, OpCode, operand::Operand};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 "#;

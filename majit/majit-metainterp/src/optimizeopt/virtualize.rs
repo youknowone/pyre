@@ -743,7 +743,7 @@ impl OptVirtualize {
                 && let Some(class_val) = info.get_known_class(ctx.cpu.as_ref())
             {
                 drop(info);
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 // PyPy's `handle_getfield_typeptr` removes this load before
                 // optimization and carries the vtable as a `ConstInt`.  Pyre's
                 // object model can still expose the header as GETFIELD_GC_R;
@@ -792,7 +792,7 @@ impl OptVirtualize {
                     .filter(|&w| w != 0)
                 {
                     drop(info);
-                    let b = ctx.materialize_operand_at(op.pos().get());
+                    let b = Operand::from_bound_op(op_rc);
                     ctx.make_constant_box(
                         &b,
                         majit_ir::Value::Ref(majit_ir::GcRef(w_class as usize)),
@@ -925,7 +925,7 @@ impl OptVirtualize {
                 };
                 if let Some(vtable) = vtable {
                     drop(info);
-                    let b = ctx.materialize_operand_at(op.pos().get());
+                    let b = Operand::from_bound_op(op_rc);
                     ctx.make_constant_box(&b, Value::Int(vtable as i64));
                     return OptimizationResult::Remove;
                 }
@@ -964,7 +964,7 @@ impl OptVirtualize {
                     majit_ir::OpCode::GetfieldGcF => Value::Float(0.0),
                     _ => Value::Int(0),
                 };
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 ctx.make_constant_box(&b, zero);
                 return OptimizationResult::Remove;
             }
@@ -1061,7 +1061,12 @@ impl OptVirtualize {
     }
 
     /// virtualize.py optimize_ARRAYLEN_GC
-    fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_arraylen_gc(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
 
         let length = array_box
@@ -1072,7 +1077,7 @@ impl OptVirtualize {
                 _ => None,
             });
         if let Some(len) = length {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(len));
             return OptimizationResult::Remove;
         }
@@ -1656,7 +1661,6 @@ impl OptVirtualize {
         }
 
         // virtualize.py:129: vrefvalue.setfield(descr_forced, newop, CONST_NULL)
-        let null_ref = ctx.make_constant_ref(majit_ir::GcRef::NULL);
 
         // virtualize.py: make_virtual(c_cls, newop, vref_descr)
         // → InstancePtrInfo(descr, known_class, is_virtual=True)
@@ -1668,7 +1672,7 @@ impl OptVirtualize {
             ),
             (
                 VREF_FORCED_FIELD_INDEX,
-                ctx.materialize_operand_at(null_ref),
+                Operand::const_(majit_ir::Const::Ref(majit_ir::GcRef::NULL)),
             ),
         ]);
         // info.py AbstractStructPtrInfo stores no fielddescr side-list; the SizeDescr
@@ -1762,8 +1766,7 @@ impl OptVirtualize {
             // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
             // make_constant_ref needs a ctx reborrow, hence two sequential
             // with_ptr_info_mut calls.
-            let null_ref = ctx.make_constant_ref(majit_ir::GcRef(0));
-            let null_op = ctx.materialize_operand_at(null_ref);
+            let null_op = Operand::const_(majit_ir::Const::Ref(majit_ir::GcRef::NULL));
             if let Some(b) = vref_box.as_ref() {
                 ctx.with_ptr_info_mut(b, |info| {
                     if let PtrInfo::Virtual(vinfo) = info {
@@ -1793,9 +1796,8 @@ impl OptVirtualize {
 
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL via
         // `vrefinfo.descr_virtual_token` (`virtualref.py:40-41`).
-        let null_ref = ctx.make_constant_ref(majit_ir::GcRef(0));
         let arg_vref = ctx.materialize_operand_at(vref_ref);
-        let arg_null = ctx.materialize_operand_at(null_ref);
+        let arg_null = Operand::const_(majit_ir::Const::Ref(majit_ir::GcRef::NULL));
         let mut set_token = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_null.clone()]);
         set_token.setdescr(self.vrefinfo.descr_virtual_token.clone());
         ctx.emit_extra(ctx.current_pass_idx, set_token);
@@ -1981,7 +1983,7 @@ impl Optimization for OptVirtualize {
             }
 
             // Array length
-            OpCode::ArraylenGc => self.optimize_arraylen_gc(op, ctx),
+            OpCode::ArraylenGc => self.optimize_arraylen_gc(op, op_rc, ctx),
 
             // Interior field access on potentially-virtual array-of-structs
             OpCode::GetinteriorfieldGcI

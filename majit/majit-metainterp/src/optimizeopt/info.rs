@@ -1126,8 +1126,7 @@ fn force_box_impl(
             && let Some(bound) = ctx.peek_intbound_box(b)
             && bound.is_constant()
         {
-            let c = ctx.make_constant_int(bound.get_constant_int());
-            return ctx.materialize_operand_at(c);
+            return Operand::const_(majit_ir::Const::Int(bound.get_constant_int()));
         }
         let value_is_virtual = match &value_box {
             Some(b) => ctx.is_virtual(b),

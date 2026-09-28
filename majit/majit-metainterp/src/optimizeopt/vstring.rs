@@ -1,7 +1,7 @@
 #![allow(non_upper_case_globals)]
 
 use majit_ir::operand::Operand;
-use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRc, OpRef, Value};
+use majit_ir::{Const, EffectInfo, OopSpecIndex, Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt, VStringVariant};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -290,10 +290,7 @@ pub fn string_copy_parts(
             let lengthbox = ctx.getstrlen_opref(opref.to_opref(), mode);
             let lengthbox = ctx.materialize_operand_at(lengthbox);
             let srcbox = force_child_for_string(opref, ctx);
-            let zero = {
-                let __zero = ctx.make_constant_int(0);
-                ctx.materialize_operand_at(__zero)
-            };
+            let zero = Operand::const_(Const::Int(0));
             copy_str_content(
                 ctx, &srcbox, targetbox, &zero, offsetbox, &lengthbox, mode, true,
             )
@@ -805,10 +802,7 @@ impl OptString {
                 } else {
                     (concat.vright.clone(), idx - len1)
                 };
-                let child_idx_box = {
-                    let c = ctx.make_constant_int(child_idx);
-                    ctx.materialize_operand_at(c)
-                };
+                let child_idx_box = Operand::const_(Const::Int(child_idx));
                 let child_resolved = ctx.resolve_operand_operand(&child);
                 return Some(
                     self.strgetitem_rebase_residual(&child_resolved, &child_idx_box, mode, ctx)
@@ -1063,7 +1057,7 @@ impl OptString {
                 self.opt_call_stroruni_str_concat(op, op_rc, mode_string, ctx)
             }
             OopSpecIndex::StrSlice => self.opt_call_stroruni_str_slice(op, op_rc, mode_string, ctx),
-            OopSpecIndex::StrEqual => self.opt_call_stroruni_str_equal(op, mode_string, ctx),
+            OopSpecIndex::StrEqual => self.opt_call_stroruni_str_equal(op, op_rc, mode_string, ctx),
             OopSpecIndex::StrCmp => self.opt_call_stroruni_str_cmp(op, op_rc, mode_string, ctx),
             OopSpecIndex::UniConcat => {
                 self.opt_call_stroruni_str_concat(op, op_rc, mode_unicode, ctx)
@@ -1071,7 +1065,9 @@ impl OptString {
             OopSpecIndex::UniSlice => {
                 self.opt_call_stroruni_str_slice(op, op_rc, mode_unicode, ctx)
             }
-            OopSpecIndex::UniEqual => self.opt_call_stroruni_str_equal(op, mode_unicode, ctx),
+            OopSpecIndex::UniEqual => {
+                self.opt_call_stroruni_str_equal(op, op_rc, mode_unicode, ctx)
+            }
             OopSpecIndex::UniCmp => self.opt_call_stroruni_str_cmp(op, op_rc, mode_unicode, ctx),
             OopSpecIndex::ShrinkArray => self.opt_call_shrink_array(op, op_rc, ctx),
             _ => {
@@ -1170,6 +1166,7 @@ impl OptString {
     fn opt_call_stroruni_str_equal(
         &mut self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         mode: u8,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
@@ -1200,16 +1197,16 @@ impl OptString {
             if let (Some(v1), Some(v2)) = (l1c, l2c)
                 && v1 != v2
             {
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 ctx.make_constant_box(&b, Value::Int(0));
                 return OptimizationResult::Remove;
             }
         }
         // vstring.py: handle_str_equal_level1 both directions
-        if let Some(result) = self.handle_str_equal_level1(&arg1, &arg2, op, mode, ctx) {
+        if let Some(result) = self.handle_str_equal_level1(&arg1, &arg2, op, op_rc, mode, ctx) {
             return result;
         }
-        if let Some(result) = self.handle_str_equal_level1(&arg2, &arg1, op, mode, ctx) {
+        if let Some(result) = self.handle_str_equal_level1(&arg2, &arg1, op, op_rc, mode, ctx) {
             return result;
         }
         // vstring.py: handle_str_equal_level2 both directions, each
@@ -1249,6 +1246,7 @@ impl OptString {
         arg1: &Operand,
         arg2: &Operand,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         mode: u8,
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
@@ -1269,9 +1267,8 @@ impl OptString {
                     ctx.make_nonnull_str(arg1, mode);
                     // vstring.py: lengthbox = i1.getstrlen(arg1, self, mode)
                     let lengthbox = ctx.getstrlen_opref(arg1.to_opref(), mode);
-                    let zero = ctx.make_constant_int(0);
                     let arg_len = ctx.materialize_operand_at(lengthbox);
-                    let arg_zero = ctx.materialize_operand_at(zero);
+                    let arg_zero = Operand::const_(Const::Int(0));
                     let mut eq_op = Op::new(OpCode::IntEq, &[arg_len.clone(), arg_zero.clone()]);
                     eq_op.pos().set(op.pos().get());
                     // vstring.py:751-754: replace_op_with(INT_EQ, [len, 0]) then
@@ -1322,12 +1319,12 @@ impl OptString {
         // vstring.py:776-787: arg2 is null
         if self.is_known_null(arg2, ctx) {
             if self.is_known_nonnull(arg1, ctx) {
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 ctx.make_constant_box(&b, Value::Int(0));
                 return Some(OptimizationResult::Remove);
             }
             if self.is_known_null(arg1, ctx) {
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 ctx.make_constant_box(&b, Value::Int(1));
                 return Some(OptimizationResult::Remove);
             }
