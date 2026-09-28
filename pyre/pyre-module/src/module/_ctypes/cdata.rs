@@ -755,10 +755,10 @@ pub(super) fn new_simplecdata_obj(
     let obj = pyre_object::with_roots!(cls => new_cdata_obj_from_bytes(cls, size, &[]))?;
     // The new instance is reachable only from this frame while `encode_value_into`
     // runs, and that call can run Python.  It does not move, so it is pinned once
-    // and never re-read; the bytearray rides along through the instance dict.
+    // and never re-read; the bytearray rides along through the instance dict and
+    // does move, so it is looked up there after the encode.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj = pyre_object::gc_roots::pin_root(obj);
-    let ba = cdata_buffer(obj).expect("new cdata object has a backing buffer");
     // Encode after the instance exists so a `char*` keepalive can attach to it.
     if let Some(v) = value {
         // `v` is an arbitrary object, so under `"O"` it can be a `list` or a
@@ -773,6 +773,7 @@ pub(super) fn new_simplecdata_obj(
             bytes.reverse();
         }
         let n = bytes.len().min(size);
+        let ba = cdata_buffer(obj).expect("new cdata object has a backing buffer");
         unsafe {
             pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
         }
@@ -792,11 +793,17 @@ pub(super) fn new_cdata_obj_from_bytes(
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // Until the store below links them, the bytearray and the instance are
     // reachable only from this frame, and `w_instance_new`, `getdict_native`
-    // and the store each allocate.  Neither kind moves, so one pin apiece keeps
-    // them live and no word has to be re-read.
+    // and the store each allocate.  The instance does not move, so its pin only
+    // keeps it live; the bytearray is a nursery object, so it is filled before
+    // anything else allocates and read back from its pin at the store.
     let ba = pyre_object::w_bytearray_new(size);
+    unsafe {
+        let n = bytes.len().min(size);
+        pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
+    }
     let _roots = pyre_object::gc_roots::push_roots();
-    let ba = pyre_object::gc_roots::pin_root(ba);
+    let ba_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ba);
     let obj = pyre_object::w_instance_new(cls);
     let obj = pyre_object::gc_roots::pin_root(obj);
     let d = pyre_interpreter::baseobjspace::getdict_native(obj);
@@ -806,9 +813,11 @@ pub(super) fn new_cdata_obj_from_bytes(
         ));
     }
     unsafe {
-        pyre_object::w_dict_setitem_str(d, CDATA_BUFFER_KEY, ba);
-        let n = bytes.len().min(size);
-        pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
+        pyre_object::w_dict_setitem_str(
+            d,
+            CDATA_BUFFER_KEY,
+            pyre_object::gc_roots::shadow_stack_get(ba_slot),
+        );
     }
     Ok(obj)
 }

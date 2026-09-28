@@ -9195,7 +9195,9 @@ fn os_error_family_new(
         }
     }
     let exc = ctor(cls, &live_positional)?;
-    let exc = pyre_object::gc_roots::pin_root(exc);
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let positional: Vec<PyObjectRef> = (0..positional.len())
         .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
         .collect();
@@ -9210,14 +9212,14 @@ fn os_error_family_new(
         cls
     };
     if let Some(w_target) = w_target {
-        crate::typedef::tag_subclass_instance(exc, w_target);
+        crate::typedef::tag_subclass_instance(exc(), w_target);
     }
     // Fill the slots after the retag so `os_error_fill_slots` can see the
     // resolved class (the `BlockingIOError` numeric-filename special-case).
     if !use_init {
-        os_error_fill_slots(exc, &positional)?;
+        os_error_fill_slots(exc(), &positional)?;
     }
-    Ok(exc)
+    Ok(exc())
 }
 
 pub fn exc_os_error_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
