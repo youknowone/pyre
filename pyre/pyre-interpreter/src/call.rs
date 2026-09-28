@@ -996,9 +996,13 @@ fn fill_user_function_args(
     if !missing_positional.is_empty() {
         let fname = unsafe { crate::function_get_qualname(roots.get(header_base)) };
         let err = crate::PyError::type_error(format_missing_err(&fname, &missing_positional, true));
+        let mut live_args = Vec::with_capacity(nargs);
+        for i in 0..nargs {
+            live_args.push(roots.get(args_base + i));
+        }
         return Err(crate::builtins::applevel_binding_error(
             roots.get(header_base),
-            args,
+            &live_args,
             &[],
             err,
         ));
@@ -1014,9 +1018,13 @@ fn fill_user_function_args(
     if !missing_kwonly.is_empty() {
         let fname = unsafe { crate::function_get_qualname(roots.get(header_base)) };
         let err = crate::PyError::type_error(format_missing_err(&fname, &missing_kwonly, false));
+        let mut live_args = Vec::with_capacity(nargs);
+        for i in 0..nargs {
+            live_args.push(roots.get(args_base + i));
+        }
         return Err(crate::builtins::applevel_binding_error(
             roots.get(header_base),
-            args,
+            &live_args,
             &[],
             err,
         ));
@@ -2348,8 +2356,10 @@ fn call_non_function_callable_with_mode(
     // dispatch each bound call from the forwarded roots — this native slice is
     // not one the collector updates.
     let _override_roots = pyre_object::gc_roots::push_roots();
-    let override_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_roots(args);
+    let override_base = pyre_object::gc_roots::publish_roots(args);
+    let callable_slot = pyre_object::gc_roots::publish_roots(&[callable]);
+    pyre_object::gc_roots::normalize_roots(override_base, args.len() + 1);
+    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     let reloaded_args = || {
         let mut reloaded = Vec::with_capacity(args.len());
         for index in 0..args.len() {
@@ -2377,14 +2387,25 @@ fn call_non_function_callable_with_mode(
                 std::ptr::null_mut(),
             );
         }
-        return type_descr_call_with_mode(execution_context, callable, args, mode);
+        return type_descr_call_with_mode(
+            execution_context,
+            pyre_object::gc_roots::shadow_stack_get(callable_slot),
+            &reloaded_args(),
+            mode,
+        );
     }
 
     // staticmethod → unwrap
     // PyPy: function.py StaticMethod.descr_call
     if unsafe { pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE) } {
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
-        return call_callable_with_mode(execution_context, func, args, mode, std::ptr::null_mut());
+        return call_callable_with_mode(
+            execution_context,
+            func,
+            &reloaded_args(),
+            mode,
+            std::ptr::null_mut(),
+        );
     }
     if let Some(bound) = staticmethod_call_override(callable)? {
         return call_callable_with_mode(
@@ -2395,7 +2416,9 @@ fn call_non_function_callable_with_mode(
             std::ptr::null_mut(),
         );
     }
-    if let Some(bound) = classmethod_call_override(callable)? {
+    if let Some(bound) =
+        classmethod_call_override(pyre_object::gc_roots::shadow_stack_get(callable_slot))?
+    {
         return call_callable_with_mode(
             execution_context,
             bound,
@@ -2411,22 +2434,11 @@ fn call_non_function_callable_with_mode(
     // live while binding a non-Function `__call__` descriptor.  `space.get`
     // may execute arbitrary Python and move every nursery argument, so mirror
     // the translated shadow-stack roots and reload them after binding.
-    let _user_call_roots = pyre_object::gc_roots::push_roots();
-    let user_call_root_base = pyre_object::gc_roots::shadow_stack_len();
-    let callable = pyre_object::gc_roots::pin_root(callable);
-    for &arg in args {
-        let _ = pyre_object::gc_roots::pin_root(arg);
-    }
-    if let Some((call_fn, prepend_receiver)) =
-        user_call_slot(pyre_object::gc_roots::shadow_stack_get(user_call_root_base))?
-    {
-        let current_callable = pyre_object::gc_roots::shadow_stack_get(user_call_root_base);
-        let mut current_args = Vec::with_capacity(args.len());
-        for i in 0..args.len() {
-            current_args.push(pyre_object::gc_roots::shadow_stack_get(
-                user_call_root_base + 1 + i,
-            ));
-        }
+    // `callable` and `args` stay published in the override bracket above.
+    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
+    if let Some((call_fn, prepend_receiver)) = user_call_slot(callable)? {
+        let current_callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
+        let current_args = reloaded_args();
         if prepend_receiver {
             let mut call_args = Vec::with_capacity(1 + current_args.len());
             call_args.push(current_callable);
@@ -2457,18 +2469,27 @@ fn call_non_function_callable_with_mode(
     // GenericAlias.__call__ (`_pypy_generic_alias.py`) —
     // `self.__origin__(*args, **kwargs)`, then best-effort
     // `result.__orig_class__ = self`.
+    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     if unsafe { pyre_object::is_generic_alias(callable) } {
         let origin = unsafe { pyre_object::w_generic_alias_get_origin(callable) };
-        let result =
-            call_callable_with_mode(execution_context, origin, args, mode, std::ptr::null_mut())?;
-        set_orig_class(result, callable)?;
+        let result = call_callable_with_mode(
+            execution_context,
+            origin,
+            &reloaded_args(),
+            mode,
+            std::ptr::null_mut(),
+        )?;
+        set_orig_class(
+            result,
+            pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        )?;
         return Ok(result);
     }
 
     call_function_carrier_with_mode(
         execution_context,
         callable,
-        args,
+        &reloaded_args(),
         mode,
         profile_anchor.live(),
     )
@@ -4433,8 +4454,9 @@ pub fn call_function_impl_result(
             if let Some(bound) = metaclass_call_override(callable) {
                 return call_function_impl_result(bound, &reloaded_args());
             }
+            // The override lookup can collect: dispatch from the roots.
             clear_call_error();
-            let result = type_descr_call_impl(callable, args);
+            let result = type_descr_call_impl(_roots.get(root_base), &reloaded_args());
             if result.is_null()
                 && let Some(err) = take_call_error()
             {
@@ -4451,7 +4473,7 @@ pub fn call_function_impl_result(
         if let Some(bound) = staticmethod_call_override(callable)? {
             return call_function_impl_result(bound, &reloaded_args());
         }
-        if let Some(bound) = classmethod_call_override(callable)? {
+        if let Some(bound) = classmethod_call_override(_roots.get(root_base))? {
             return call_function_impl_result(bound, &reloaded_args());
         }
         // ClassMethod has no descr_call (function.py; CPython 3.14
@@ -4461,10 +4483,11 @@ pub fn call_function_impl_result(
         // `self.__origin__(*args, **kwargs)`, then best-effort
         // `result.__orig_class__ = self`.  Resolved here because the call
         // path does not consult a typedef `__call__` for builtin W_Roots.
+        let callable = _roots.get(root_base);
         if pyre_object::is_generic_alias(callable) {
             let origin = pyre_object::w_generic_alias_get_origin(callable);
-            let result = call_function_impl_result(origin, args)?;
-            set_orig_class(result, callable)?;
+            let result = call_function_impl_result(origin, &reloaded_args())?;
+            set_orig_class(result, _roots.get(root_base))?;
             return Ok(result);
         }
         if let Some((call_fn, prepend_receiver)) =
@@ -4491,7 +4514,7 @@ pub fn call_function_impl_result(
             return call_function_impl_result(call_fn, &current_args);
         }
     }
-    Err(not_callable_error(callable))
+    Err(not_callable_error(_roots.get(root_base)))
 }
 
 /// CPython: typeobject.c calculate_metaclass

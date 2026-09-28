@@ -180,8 +180,18 @@ pub(crate) fn walk_handle_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// Named `__majit_wrap_*` because it is a `BuiltinCode.func`: the descriptor
 /// below puts it in that PBC family, which admits `__majit_wrap_` leaves only.
 pub fn __majit_wrap_builtin_sorted(args: &[PyObjectRef]) -> PyResult {
+    // `args` is the gateway's native copy; publishing `sorted` allocates.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(args);
     install_applevel_builtins();
-    crate::call::call_function_impl_result(app_sorted()?, args)
+    let w_sorted = app_sorted()?;
+    let mut live_args = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        live_args.push(_roots.get(base + i));
+        i += 1;
+    }
+    crate::call::call_function_impl_result(w_sorted, &live_args)
 }
 
 /// Identity of the published app-level `sorted` BuiltinFunction.  Compares

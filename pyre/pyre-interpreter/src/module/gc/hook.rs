@@ -587,13 +587,15 @@ fn is_hidden_stat_slot(name: &str) -> bool {
 }
 
 fn collect_step_stats_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let name = crate::baseobjspace::text_w(args[1])?;
+    // `args` is the gateway's native copy; `text_w` can collect.
+    let mut w_obj = args[0];
+    let name = pyre_object::with_roots!(w_obj => crate::baseobjspace::text_w(args[1]))?;
     if is_hidden_stat_slot(name) {
         return Err(crate::PyError::attribute_error(format!(
             "'GcCollectStepStats' object has no attribute '{name}'"
         )));
     }
-    crate::baseobjspace::object_getattribute(args[0], name)
+    crate::baseobjspace::object_getattribute(w_obj, name)
 }
 
 fn collect_step_stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -769,13 +771,15 @@ fn stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn stats_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let name = crate::baseobjspace::text_w(args[1])?;
+    // `args` is the gateway's native copy; `text_w` can collect.
+    let mut w_obj = args[0];
+    let name = pyre_object::with_roots!(w_obj => crate::baseobjspace::text_w(args[1]))?;
     if is_hidden_stat_slot(name) {
         return Err(crate::PyError::attribute_error(format!(
             "stats object has no attribute '{name}'"
         )));
     }
-    crate::baseobjspace::object_getattribute(args[0], name)
+    crate::baseobjspace::object_getattribute(w_obj, name)
 }
 
 fn make_private_stats_type(

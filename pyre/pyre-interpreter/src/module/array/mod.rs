@@ -398,7 +398,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     // its slot where it is used.
     let _pos_roots = pyre_object::gc_roots::push_roots();
     let pos_base = pyre_object::gc_roots::pin_roots(pos);
-    let cls = pos[0];
+    let cls = pyre_object::gc_roots::shadow_stack_get(pos_base);
     let canonical = crate::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
         .map_or(PY_NULL, |ty| ty.as_ptr());
     // PyPy's interp2app gateway leaves keywords available to a subtype's
@@ -421,7 +421,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
             "array.array() takes no keyword arguments",
         ));
     }
-    let w_typecode = pos[1];
+    let w_typecode = pyre_object::gc_roots::shadow_stack_get(pos_base + 1);
     // typecode must be a 1-character str.
     if !unsafe { pyre_object::is_str(w_typecode) } {
         return Err(PyError::type_error(format!(
@@ -457,6 +457,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     // is what stops a major cycle sweeping it as unreachable.
     let obj = pyre_object::gc_roots::pin_root(obj);
     // Subclass: retag the fresh array with the requested class.
+    let cls = pyre_object::gc_roots::shadow_stack_get(pos_base);
     if !cls.is_null() && unsafe { pyre_object::is_type(cls) } && !std::ptr::eq(cls, canonical) {
         crate::typedef::tag_subclass_instance(obj, cls);
     }
@@ -1201,8 +1202,9 @@ fn array_release_buffer(args: &[PyObjectRef]) -> PyResult {
 
 fn array_buffer(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "__buffer__", false)?;
-    let flags = crate::baseobjspace::c_int_w(args[1])?;
-    crate::builtins::w_memoryview_new_native_with_flags(args[0], flags)
+    let mut obj = args[0];
+    let flags = pyre_object::with_roots!(obj => crate::baseobjspace::c_int_w(args[1]))?;
+    crate::builtins::w_memoryview_new_native_with_flags(obj, flags)
 }
 
 fn array_count_method(args: &[PyObjectRef]) -> PyResult {
@@ -1867,8 +1869,9 @@ fn array_deepcopy_method(args: &[PyObjectRef]) -> PyResult {
 fn array_mul_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "__mul__", false)?;
     check_arity(args, 2, "array.__mul__")?;
-    let count = array_repeat_count(args[1])?;
-    array_repeat_bytes(args[0], count)
+    let mut obj = args[0];
+    let count = pyre_object::with_roots!(obj => array_repeat_count(args[1]))?;
+    array_repeat_bytes(obj, count)
 }
 
 fn array_imul_method(args: &[PyObjectRef]) -> PyResult {
@@ -2054,7 +2057,11 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
             "_array_reconstructor() takes exactly 4 arguments",
         ));
     }
+    // `args` is the gateway's native copy; the conversions below can collect.
     let mut w_cls = args[0];
+    let mut w_typecode = args[1];
+    let mut w_mformat_arg = args[2];
+    let mut w_bytes = args[3];
     if !unsafe { pyre_object::is_type(w_cls) } {
         return Err(PyError::type_error(format!(
             "_array_reconstructor() argument 1 must be type, not {}",
@@ -2062,19 +2069,22 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
         )));
     }
     let array_type = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
-    if !pyre_object::with_roots!(w_cls => crate::baseobjspace::issubclass(w_cls, array_type))? {
+    if !pyre_object::with_roots!(w_cls, w_typecode, w_mformat_arg, w_bytes =>
+        crate::baseobjspace::issubclass(w_cls, array_type))?
+    {
         return Err(PyError::type_error(format!(
             "{} is not a subtype of array.array",
             unsafe { pyre_object::w_type_get_name(w_cls) }
         )));
     }
-    if !unsafe { pyre_object::is_str(args[1]) } {
+    if !unsafe { pyre_object::is_str(w_typecode) } {
         return Err(PyError::type_error(format!(
             "_array_reconstructor() argument 2 must be a unicode character, not {}",
-            crate::type_methods::clinic_arg_type_name(args[1])
+            crate::type_methods::clinic_arg_type_name(w_typecode)
         )));
     }
-    let typecode_bytes = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(args[1]) }.as_bytes();
+    let typecode_bytes =
+        unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_typecode) }.as_bytes();
     if typecode_bytes.len() != 1 || arr::typecode_itemsize(typecode_bytes[0]).is_none() {
         return Err(PyError::value_error("invalid type code"));
     }
@@ -2083,44 +2093,42 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     // mformat_code: int in [MACHINE_FORMAT_CODE_MIN, MACHINE_FORMAT_CODE_MAX].
     // The `int` converter takes `PyNumber_Index`, which names the type it
     // could not convert.
-    let w_mformat = pyre_object::with_roots!(w_cls => crate::baseobjspace::space_index(args[2]))?;
-    let mformat = pyre_object::with_roots!(w_cls => crate::baseobjspace::int_w(w_mformat))?;
+    let w_mformat = pyre_object::with_roots!(w_cls, w_typecode, w_bytes =>
+        crate::baseobjspace::space_index(w_mformat_arg))?;
+    let mformat = pyre_object::with_roots!(w_cls, w_typecode, w_bytes =>
+        crate::baseobjspace::int_w(w_mformat))?;
     if !(0..=21).contains(&mformat) {
         return Err(PyError::value_error(
             "third argument must be a valid machine format code.",
         ));
     }
-    if !unsafe { pyre_object::bytesobject::is_bytes_like(args[3]) } {
+    if !unsafe { pyre_object::bytesobject::is_bytes_like(w_bytes) } {
         return Err(PyError::type_error(format!(
             "fourth argument should be bytes, not {}",
-            crate::error::type_name_of(args[3])
+            crate::error::type_name_of(w_bytes)
         )));
     }
-    let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(args[3]) }.to_vec();
+    let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) }.to_vec();
     if mformat == array_machine_format_code(typecode, itemsize) {
-        let obj = array_descr_new(&[w_cls, args[1]])?;
+        let obj = array_descr_new(&[w_cls, w_typecode])?;
         array_frombytes(obj, &bytes)?;
         return Ok(obj);
     }
 
     if matches!(mformat, 18..=21) {
-        let obj = array_descr_new(&[w_cls, args[1]])?;
+        let obj = pyre_object::with_roots!(w_bytes => array_descr_new(&[w_cls, w_typecode]))?;
         let _roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(obj);
+        let obj_slot = _roots.pin_roots(&[obj, w_bytes]);
         let encoding = match mformat {
             18 => "utf-16-le",
             19 => "utf-16-be",
             20 => "utf-32-le",
             _ => "utf-32-be",
         };
-        let decoded = call_method(
-            args[3],
-            "decode",
-            &[pyre_object::w_str_new_managed(encoding)],
-        )?;
-        array_fromunicode(pyre_object::gc_roots::shadow_stack_get(obj_slot), decoded)?;
-        return Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let w_encoding = pyre_object::w_str_new_managed(encoding);
+        let decoded = call_method(_roots.get(obj_slot + 1), "decode", &[w_encoding])?;
+        array_fromunicode(_roots.get(obj_slot), decoded)?;
+        return Ok(_roots.get(obj_slot));
     }
 
     let (source_size, signed, big_endian) = reconstructor_descriptor(mformat);
@@ -2135,7 +2143,9 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
         typecode
     };
     let output_typecode_text = (output_typecode as char).to_string();
-    let mut obj = array_descr_new(&[w_cls, pyre_object::w_str_new_managed(&output_typecode_text)])?;
+    let w_output_typecode =
+        pyre_object::with_roots!(w_cls => pyre_object::w_str_new_managed(&output_typecode_text));
+    let mut obj = array_descr_new(&[w_cls, w_output_typecode])?;
     for chunk in bytes.chunks_exact(source_size) {
         let w_item = if matches!(mformat, 14 | 15) {
             let raw: [u8; 4] = chunk.try_into().unwrap();

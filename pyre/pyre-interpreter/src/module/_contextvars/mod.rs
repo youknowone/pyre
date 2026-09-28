@@ -167,8 +167,15 @@ fn call_method_result(
     name: &str,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    // `args` is a native copy; the attribute lookup can collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(args);
     let method = pyre_interpreter::baseobjspace::getattr_str(obj, name)?;
-    pyre_interpreter::call::call_function_impl_result(method, args)
+    let mut live_args = Vec::with_capacity(args.len());
+    for i in 0..args.len() {
+        live_args.push(_roots.get(base + i));
+    }
+    pyre_interpreter::call::call_function_impl_result(method, &live_args)
 }
 
 fn current_context(create: bool) -> Result<Option<PyObjectRef>, pyre_interpreter::PyError> {
@@ -522,8 +529,10 @@ fn token_enter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::Py
 }
 
 fn token_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let var = pyre_interpreter::baseobjspace::getattr_str(args[0], "_var")?;
-    context_var_reset(&[var, args[0]])?;
+    // `args` is the gateway's native copy; the lookup can collect.
+    let mut w_token = args[0];
+    let var = pyre_object::with_roots!(w_token => pyre_interpreter::baseobjspace::getattr_str(w_token, "_var"))?;
+    context_var_reset(&[var, w_token])?;
     Ok(w_bool_from(false))
 }
 

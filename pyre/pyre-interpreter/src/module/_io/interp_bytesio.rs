@@ -58,9 +58,10 @@ impl W_BytesIO {
         // and `close` run after they store into the old stream. An unchanged
         // address — the whole `exports == 0` path, which returns before it
         // collects — skips both.
-        let current = self.buffer;
-        let live = unsafe { crate::builtins::bytearray_check_exports(current)? };
-        if !std::ptr::eq(live, current) {
+        // Only the pre-call address is kept: it is compared, never read.
+        let current_addr = self.buffer as usize;
+        let live = unsafe { crate::builtins::bytearray_check_exports(self.buffer)? };
+        if live as usize != current_addr {
             self.buffer = live;
             pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
         }

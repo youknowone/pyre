@@ -3618,14 +3618,16 @@ unsafe fn seq_iter_clamp_length(seq: PyObjectRef) -> Option<i64> {
 /// `W_FastUnicodeIterObject.descr_setstate` (`iterobject.py`), which
 /// clamps because it must recompute a byte offset from the cursor.
 pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let mut index = iter_setstate_index(args[1])?;
+    // `args` is the gateway's native copy; `iter_setstate_index` can collect.
+    let mut w_iter = args[0];
+    let mut index = pyre_object::with_roots!(w_iter => iter_setstate_index(args[1]))?;
     unsafe {
-        let seq = pyre_object::w_seq_iter_seq(args[0]);
-        if seq.is_null() || pyre_object::w_seq_iter_index(args[0]) < 0 {
+        let seq = pyre_object::w_seq_iter_seq(w_iter);
+        if seq.is_null() || pyre_object::w_seq_iter_index(w_iter) < 0 {
             return Ok(w_none());
         }
         if index < 0 {
-            index = if pyre_object::iterobject::is_bytearray_iter(args[0]) {
+            index = if pyre_object::iterobject::is_bytearray_iter(w_iter) {
                 -1
             } else {
                 0
@@ -3633,7 +3635,7 @@ pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
         } else if let Some(length) = seq_iter_clamp_length(seq) {
             index = index.min(length);
         }
-        pyre_object::w_seq_iter_set_index(args[0], cursor_from_i64(index)?);
+        pyre_object::w_seq_iter_set_index(w_iter, cursor_from_i64(index)?);
     }
     Ok(w_none())
 }
@@ -3661,9 +3663,11 @@ pub(crate) fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
         if is_instance(seq) && lookup(seq, "__len__").is_none() {
             return Ok(pyre_object::special::w_not_implemented());
         }
-        let length = len_w(seq)?;
+        // `args` is the gateway's native copy; `len_w` can run `__len__`.
+        let mut w_iter = args[0];
+        let length = pyre_object::with_roots!(w_iter => len_w(seq))?;
         let remaining =
-            length - pyre_object::seq_index_to_i64(pyre_object::w_seq_iter_index(args[0]));
+            length - pyre_object::seq_index_to_i64(pyre_object::w_seq_iter_index(w_iter));
         Ok(w_int_new(remaining.max(0)))
     }
 }
@@ -3693,9 +3697,11 @@ pub(crate) fn list_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// the generic sequence iterator does, and an index past the end is clamped to
 /// the length rather than stored verbatim.
 pub(crate) fn list_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let mut index = iter_setstate_index(args[1])?;
+    // `args` is the gateway's native copy; `iter_setstate_index` can collect.
+    let mut w_iter = args[0];
+    let mut index = pyre_object::with_roots!(w_iter => iter_setstate_index(args[1]))?;
     unsafe {
-        let seq = pyre_object::w_list_iter_seq(args[0]);
+        let seq = pyre_object::w_list_iter_seq(w_iter);
         if seq.is_null() {
             return Ok(w_none());
         }
@@ -3711,7 +3717,7 @@ pub(crate) fn list_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
         } else if index > length {
             index = length;
         }
-        pyre_object::w_list_iter_set_index(args[0], cursor_from_i64(index)?);
+        pyre_object::w_list_iter_set_index(w_iter, cursor_from_i64(index)?);
     }
     Ok(w_none())
 }
@@ -3751,14 +3757,16 @@ pub(crate) fn tuple_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// iterator rather than the verbatim cursor PyPy's
 /// `W_AbstractSeqIterObject.descr_setstate` keeps.
 pub(crate) fn tuple_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let mut index = iter_setstate_index(args[1])?;
+    // `args` is the gateway's native copy; `iter_setstate_index` can collect.
+    let mut w_iter = args[0];
+    let mut index = pyre_object::with_roots!(w_iter => iter_setstate_index(args[1]))?;
     unsafe {
-        let seq = pyre_object::w_tuple_iter_seq(args[0]);
+        let seq = pyre_object::w_tuple_iter_seq(w_iter);
         if seq.is_null() {
             return Ok(w_none());
         }
         index = index.clamp(0, pyre_object::w_tuple_len(seq) as i64);
-        pyre_object::w_tuple_iter_set_index(args[0], cursor_from_i64(index)?);
+        pyre_object::w_tuple_iter_set_index(w_iter, cursor_from_i64(index)?);
     }
     Ok(w_none())
 }
@@ -3809,9 +3817,11 @@ pub(crate) fn list_reverse_iter_reduce_method(args: &[PyObjectRef]) -> PyResult 
 /// once it walks off the front.  The list outlives exhaustion, so this restores
 /// a spent iterator to a live cursor as well.
 pub(crate) fn list_reverse_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let mut index = iter_setstate_index(args[1])?;
+    // `args` is the gateway's native copy; `iter_setstate_index` can collect.
+    let mut w_iter = args[0];
+    let mut index = pyre_object::with_roots!(w_iter => iter_setstate_index(args[1]))?;
     unsafe {
-        let seq = pyre_object::w_list_reverse_iter_seq(args[0]);
+        let seq = pyre_object::w_list_reverse_iter_seq(w_iter);
         if seq.is_null() {
             return Ok(w_none());
         }
@@ -3825,7 +3835,7 @@ pub(crate) fn list_reverse_iter_setstate_method(args: &[PyObjectRef]) -> PyResul
             // sentinel, so every negative cursor normalizes to it.
             index = -1;
         }
-        pyre_object::w_list_reverse_iter_set_index(args[0], cursor_from_i64(index)?);
+        pyre_object::w_list_reverse_iter_set_index(w_iter, cursor_from_i64(index)?);
     }
     Ok(w_none())
 }
@@ -3976,17 +3986,20 @@ pub(crate) fn range_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
             // CPython 3.14 `rangeiter_setstate`: `PyLong_AsLong`, so an
             // overflowing Python int raises instead of being clipped. Unlike
             // the long variant, PyLong_AsLong also accepts `__index__`.
-            let state = int_w(space_index(args[1])?).map_err(|err| {
+            // `args` is the gateway's native copy; `__index__` can collect.
+            let mut w_iter = args[0];
+            let w_state = pyre_object::with_roots!(w_iter => space_index(args[1]))?;
+            let state = pyre_object::with_roots!(w_iter => int_w(w_state)).map_err(|err| {
                 if err.kind == PyErrorKind::OverflowError {
                     PyError::overflow_error("Python int too large to convert to C long")
                 } else {
                     err
                 }
             })?;
-            let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
+            let (current, remaining, step) = pyre_object::w_range_iter_fields(w_iter);
             let skipped = state.clamp(0, remaining);
             let next = (current as i128 + skipped as i128 * step as i128) as i64;
-            pyre_object::w_range_iter_set_cursor(args[0], next, remaining - skipped);
+            pyre_object::w_range_iter_set_cursor(w_iter, next, remaining - skipped);
         } else {
             // CPython 3.14 `longrangeiter_setstate` requires an exact int,
             // then compares/clips it at arbitrary precision.

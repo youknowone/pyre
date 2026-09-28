@@ -23,10 +23,16 @@ fn import_module(name: &str) -> Result<PyObjectRef, PyError> {
     if let Some(module) = crate::importing::get_sys_module(name) {
         return Ok(module);
     }
+    // The fresh `"*"` has to be rooted across the list's own allocation.
+    let w_fromlist = {
+        let mut items = pyre_object::gc_roots::RootedItems::new();
+        items.push(w_str_new("*"));
+        w_list_new(items.take())
+    };
     crate::importing::importhook(
         rustpython_wtf8::Wtf8::new(name),
         w_none(),
-        w_list_new(vec![w_str_new("*")]),
+        w_fromlist,
         0,
         crate::call::getexecutioncontext(),
     )?;

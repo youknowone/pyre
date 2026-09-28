@@ -714,10 +714,17 @@ fn unpack_simple_int(raw: &[u8], size: usize, signed: bool, bigendian: bool) -> 
 /// Repeat / `__index__` / error residual of `descr_pack`.
 #[majit_macros::dont_look_inside]
 fn pack_slow(this: &W_Struct, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `args` is the gateway's native copy; `str_utf8_w` can collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(args);
     this.ensure_ready()?;
     let format = majit_metainterp::jit::promote_string(this.format);
     let fmt = crate::baseobjspace::str_utf8_w(format)?;
-    do_pack(fmt, &args[1..])
+    let mut values = Vec::with_capacity(args.len() - 1);
+    for i in 1..args.len() {
+        values.push(_roots.get(base + i));
+    }
+    do_pack(fmt, &values)
 }
 
 /// Length / bytes-like / error residual of `descr_unpack`.
@@ -811,19 +818,34 @@ fn do_pack_iff(format: &str, _values: &[PyObjectRef]) -> bool {
 /// `do_pack` — pack `values` according to `format`.
 #[majit_macros::look_inside_iff(do_pack_iff)]
 fn do_pack(format: &str, values: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `values` is a native copy; parsing and packing can collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(values);
     let parsed = parse_format(format)?;
-    Ok(w_bytes_from_bytes(&pack_values(&parsed, values)?))
+    Ok(w_bytes_from_bytes(&pack_values(
+        &parsed,
+        &_roots,
+        base,
+        values.len(),
+    )?))
 }
 
-/// `_pack` — the packed bytes of `values` according to a parsed format.
+/// `_pack` — the packed bytes of the `count` values pinned at `base` in
+/// `roots`, according to a parsed format.  Each value is read from its slot:
+/// the per-value conversions run Python.
 /// `PackFormatIterator.operate` is `@jit.unroll_safe`.
 #[majit_macros::unroll_safe]
-fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
+fn pack_values(
+    parsed: &Parsed,
+    roots: &pyre_object::gc_roots::RootScope,
+    base: usize,
+    count: usize,
+) -> Result<Vec<u8>, crate::PyError> {
     let expected = parsed.expected_args();
-    if values.len() != expected {
+    if count != expected {
         return Err(struct_error(format!(
             "pack expected {expected} items for packing (got {})",
-            values.len()
+            count
         )));
     }
 
@@ -839,7 +861,7 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
             Code::Pad => out.extend(std::iter::repeat_n(0u8, rep)),
             Code::Char => {
                 for _ in 0..rep {
-                    let arg = values[ai];
+                    let arg = roots.get(base + ai);
                     ai += 1;
                     // PyPy `standardfmttable.pack_char` reaches
                     // `PackFormatIterator.accept_str_arg` / `space.bytes_w`:
@@ -861,13 +883,13 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
                 }
             }
             Code::Str => {
-                let arg = values[ai];
+                let arg = roots.get(base + ai);
                 ai += 1;
                 let data = unsafe { accept_bytes(arg, "argument for 's' must be a bytes object")? };
                 pack_string_bytes(&mut out, data, rep);
             }
             Code::Pascal => {
-                let arg = values[ai];
+                let arg = roots.get(base + ai);
                 ai += 1;
                 let data = unsafe { accept_bytes(arg, "argument for 'p' must be a bytes object")? };
                 // CPython 3.14 accepts `0p`: it still consumes one argument,
@@ -893,7 +915,7 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
             }
             Code::Bool => {
                 for _ in 0..rep {
-                    let arg = values[ai];
+                    let arg = roots.get(base + ai);
                     ai += 1;
                     out.push(if crate::baseobjspace::is_true(arg)? {
                         1
@@ -904,7 +926,7 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
             }
             Code::Int { signed } => {
                 for _ in 0..rep {
-                    let arg = values[ai];
+                    let arg = roots.get(base + ai);
                     ai += 1;
                     unsafe {
                         pack_int(
@@ -920,14 +942,14 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
             }
             Code::Float | Code::Double | Code::HalfFloat => {
                 for _ in 0..rep {
-                    let arg = values[ai];
+                    let arg = roots.get(base + ai);
                     ai += 1;
                     unsafe { pack_float_code(&mut out, arg, fmt.code, parsed.bigendian)? };
                 }
             }
             Code::FloatComplex | Code::DoubleComplex => {
                 for _ in 0..rep {
-                    let arg = values[ai];
+                    let arg = roots.get(base + ai);
                     ai += 1;
                     unsafe { pack_complex_code(&mut out, arg, fmt.code, parsed.bigendian)? };
                 }
@@ -945,6 +967,9 @@ fn do_pack_into(
     offset: i64,
     values: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
+    // `values` is a native copy; the buffer lease and packing can collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(values);
     let parsed = pyre_object::with_roots!(buffer => parse_format(format))?;
     let size = parsed.calcsize()?;
     // PyPy `Struct.pack_into` acquires `space.writebuf_w` once and keeps that
@@ -979,7 +1004,7 @@ fn do_pack_into(
             required, size, offset, buflen
         )));
     }
-    let packed = pack_values(&parsed, values)?;
+    let packed = pack_values(&parsed, &_roots, base, values.len())?;
     let start = offset as usize;
     buf[start..start + packed.len()].copy_from_slice(&packed);
     Ok(w_none())
@@ -1604,8 +1629,10 @@ fn pack(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args[0].is_null() {
         return Err(crate::PyError::type_error("missing format argument"));
     }
-    let fmt = format_to_string(args[0])?;
-    let values = unsafe { w_tuple_items_copy_as_vec(args[1]) };
+    // `args` is the gateway's native copy; encoding the format can collect.
+    let mut w_values = args[1];
+    let fmt = pyre_object::with_roots!(w_values => format_to_string(args[0]))?;
+    let values = unsafe { w_tuple_items_copy_as_vec(w_values) };
     do_pack(&fmt, &values)
 }
 
@@ -1677,8 +1704,11 @@ pub mod unpack_iter {
     use pyre_object::*;
 
     fn unpack_iter_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let name = crate::baseobjspace::text_w(args.get(1).copied().unwrap_or_else(w_none))?;
-        crate::baseobjspace::object_getattribute(args[0], name)
+        // `args` is the gateway's native copy; `text_w` can collect.
+        let mut w_obj = args[0];
+        let w_name = args.get(1).copied().unwrap_or_else(w_none);
+        let name = pyre_object::with_roots!(w_obj => crate::baseobjspace::text_w(w_name))?;
+        crate::baseobjspace::object_getattribute(w_obj, name)
     }
 
     // `_struct_exec` creates unpackiter_type from its immutable heap spec.

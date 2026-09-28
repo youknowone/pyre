@@ -482,6 +482,8 @@ impl W_Pickler {
         // catch-all so the ctor keyword parameters (protocol/fix_imports/
         // buffer_callback) do not trip an unknown-argument error in `__new__`.
         let _ = _args;
+        // Allocate the memo before the payload's other words are taken.
+        let w_memo = pyre_object::listobject::w_list_new_empty();
         W_Pickler::allocate_stable(W_Pickler {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
@@ -494,7 +496,7 @@ impl W_Pickler {
             framing: false,
             fix_imports: true,
             buffer_callback: pyre_object::w_none(),
-            w_memo: pyre_object::listobject::w_list_new_empty(),
+            w_memo,
             fast: 0,
             w_dispatch_table: pyre_object::PY_NULL,
             w_pers_func: pyre_object::PY_NULL,
