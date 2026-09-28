@@ -7238,6 +7238,12 @@ pub struct FunctionGraph {
     /// `dont_look_inside` stub reads the class from here.  `None` for
     /// scalar, pointer and unit returns.
     pub return_class_root: Option<String>,
+    /// The declared return is a pointer to the low-level `STR` storage
+    /// (`*mut BytesBlock`) — the `SomeString` result a `_signature_`
+    /// (`returns=types.str()`) would declare.  `return_type` carries only its
+    /// register kind (`ref`), so a `dont_look_inside` stub reads the string
+    /// result from here.
+    pub return_is_str: bool,
     /// Per-graph JIT hints — the `_jit_*_` / `_elidable_function_`
     /// attributes RPython `policy.py look_inside_graph` reads off
     /// `graph.func`. Pyre carries them on the graph itself so
@@ -7369,6 +7375,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         notes: graph.notes.clone(),
         return_type: graph.return_type.clone(),
         return_class_root: graph.return_class_root.clone(),
+        return_is_str: graph.return_is_str,
         hints: graph.hints.clone(),
         access_directly: graph.access_directly,
         func: graph.func.clone(),
@@ -7435,6 +7442,7 @@ impl FunctionGraph {
             notes: Vec::new(),
             return_type: None,
             return_class_root: None,
+            return_is_str: false,
             owner_root: None,
             source_identity: None,
             fun_decl_id: None,

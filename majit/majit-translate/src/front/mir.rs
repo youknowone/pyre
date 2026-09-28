@@ -3986,6 +3986,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             static_addrs.error_carrier,
         );
+        lo.graph.return_is_str =
+            dont_look_inside_return_is_str(&fd.signature.output, llbc, static_addrs.error_carrier);
         // MIR framestate argument threading must finish before adding native
         // enum arms: its successor table names MIR blocks, not these new
         // flow blocks. No temporary tagged-pair root reaches annotation.
@@ -16862,6 +16864,8 @@ impl<'a> Lowering<'a> {
         // Rust `String`, which the residual ABI cannot express. Retarget only
         // those exact formatting boundaries to one-word `BytesBlock*`
         // wrappers; the complex sign/parenthesis builder remains in its graph.
+        // The wrapper's own body is the one caller of the host formatter that
+        // keeps it: retargeting there would make the wrapper call itself.
         let op_kind = if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -16869,6 +16873,7 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && let Some(residual) = crate::front::rfloat_call::repr_residual_path(segments)
+            && residual.join("::") != self.graph.name
         {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
@@ -16876,7 +16881,7 @@ impl<'a> Lowering<'a> {
                     fun_decl_id: None,
                 },
                 args: args.clone(),
-                result_ty: ValueType::Ref(None),
+                result_ty: ValueType::Str,
             }
         } else {
             op_kind
@@ -35697,6 +35702,25 @@ fn dont_look_inside_return_class_root(
     }
     let suffix = adt_head_instantiation_suffix(adt, llbc)?;
     Some(format!("{}{suffix}", td.item_meta.name_path()))
+}
+
+/// Whether a callee's result is a pointer to the low-level `STR` storage
+/// (`*mut BytesBlock`) — the value `FunctionGraph::return_is_str` carries so
+/// a `dont_look_inside` stub returns `SomeString` instead of the
+/// classdef-less `ref` shell.  Reads the same `Result<T, PyError>` payload
+/// [`dont_look_inside_return_token`] reads.  A by-value Rust `String` does
+/// not qualify: the residual-call ABI cannot return its three words.
+fn dont_look_inside_return_is_str(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
+        crate::front::result_exc::tyref_result_ok(output, llbc)
+    } else {
+        None
+    };
+    tyref_raw_ptr_pointee_is_string_value(payload.as_ref().unwrap_or(output), llbc)
 }
 
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the

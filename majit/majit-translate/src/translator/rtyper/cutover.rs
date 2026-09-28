@@ -2163,7 +2163,7 @@ fn install_source_graph(
             .map(|identity| FunctionPathKey::from_segments(identity.split("::")))
             .unwrap_or_else(|| key.clone());
         let result_shell = residual_stub_result_shell(&semantic_key, graph.return_type.as_deref())
-            .map(|shell| declared_return_instance(registry, graph).unwrap_or(shell));
+            .map(|shell| declared_return_annotation(registry, graph).unwrap_or(shell));
         if let Some(result_shell) = result_shell {
             let stub = build_stub_pygraph_with_result_shell(
                 graph.name.clone(),
@@ -2407,8 +2407,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if !lifted.insert(entry_ptr) {
             continue;
         }
-        install_source_graph(registry, key, graph, entry, signature, body);
-    }
+        install_source_graph(registry, key, graph, entry, signature, body);    }
     // Pass 3 — make impl methods visible in their owner's class dict.
     // RPython's ClassDesc reads methods straight off the class object
     // (`classdesc.py find_source_for` → `cls.__dict__[name]`):
@@ -2824,18 +2823,24 @@ fn residual_stub_result_shell(
     }
 }
 
-/// `SomeInstance(classdef)` of a residual callee's by-value ADT result
-/// (`FunctionGraph::return_class_root`), the result a `_signature_` naming
-/// that class declares.  The `ref` token alone shells the result as a
-/// classdef-less instance, whose payload reads (`__discriminant`,
-/// `__pos_0`) cannot be annotated.  `None` when the token is not `ref` or
-/// the graph names no class.
-fn declared_return_instance(
+/// The result a `_signature_` declares for a residual callee whose `ref`
+/// token alone would shell it as a classdef-less instance: `SomeString` for
+/// a low-level `STR` pointer (`FunctionGraph::return_is_str`), else
+/// `SomeInstance(classdef)` of a by-value ADT result
+/// (`FunctionGraph::return_class_root`), whose payload reads
+/// (`__discriminant`, `__pos_0`) the classdef-less shell cannot annotate.
+/// `None` when the token is not `ref` or the graph declares neither.
+fn declared_return_annotation(
     registry: &CallRegistry,
     graph: &LegacyGraph,
 ) -> Option<crate::annotator::model::SomeValue> {
     if graph.return_type.as_deref() != Some("ref") {
         return None;
+    }
+    if graph.return_is_str {
+        return crate::codewriter::annotation_state::valuetype_to_someshell(
+            &crate::model::ValueType::Str,
+        );
     }
     let root = graph.return_class_root.as_deref()?;
     let bk = registry.bookkeeper();
@@ -2939,7 +2944,14 @@ fn declared_funcptr_type_from_legacy(
             valuetype_to_lltype(ty)?
         });
     }
-    let result = return_token_to_lltype(legacy.return_type.as_deref())?;
+    // A `STR`-pointer result rtypes as `SomeString` (`declared_return_annotation`),
+    // so its function type returns `Ptr(STR)` like the callable's typed
+    // return variable (`rtyper.py getcallable`), not the token's `OBJECTPTR`.
+    let result = if legacy.return_is_str && legacy.return_type.as_deref() == Some("ref") {
+        crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone()
+    } else {
+        return_token_to_lltype(legacy.return_type.as_deref())?
+    };
     Some(crate::translator::rtyper::lltypesystem::lltype::FuncType { args, result })
 }
 
@@ -8005,6 +8017,30 @@ mod tests {
         assert!(
             matches!(ordinary, SomeValue::Ptr(_)),
             "ordinary object-pointer residuals keep their typed Ptr shell"
+        );
+    }
+
+    #[test]
+    fn a_str_pointer_residual_declares_a_string_result() {
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("formatd");
+        graph.return_type = Some("ref".into());
+        assert_eq!(declared_return_annotation(&registry, &graph), None);
+        graph.return_is_str = true;
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a STR pointer result declares its annotation");
+        let SomeValue::String(s) = declared else {
+            panic!("a STR pointer result is SomeString, got {declared:?}")
+        };
+        assert!(!s.inner.can_be_none);
+        let ft = declared_funcptr_type_from_legacy(&graph)
+            .expect("a no-arg STR-returning graph has a declared fn type");
+        assert_eq!(
+            ft.result,
+            crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
+            "the declared fn type returns what the SomeString result rtypes to"
         );
     }
 

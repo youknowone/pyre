@@ -958,6 +958,37 @@ fn a_dont_look_inside_by_value_adt_return_declares_its_class() {
 }
 
 #[test]
+fn a_formatd_residual_declares_a_string_and_keeps_its_host_formatter_call() {
+    for path in [
+        "pyre_interpreter::display::jit_format_float_repr_rstr",
+        "pyre_interpreter::typedef::jit_format_complex_component_repr_rstr",
+    ] {
+        let graph = lower_function(interp(), path).expect("formatd residual lowers");
+        assert!(
+            graph.return_is_str,
+            "{path}: the `*mut BytesBlock` result is the `SomeString` a stub returns"
+        );
+        let calls_itself = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.join("::") == path
+                )
+            });
+        assert!(
+            !calls_itself,
+            "{path}: the wrapper must not be retargeted onto itself"
+        );
+    }
+}
+
+#[test]
 fn result_map_of_some_builds_the_option_instead_of_a_fn_const() {
     let graph = lower_function(
         interp(),
