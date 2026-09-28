@@ -756,6 +756,39 @@ mod jit_module {
         assert_eq!(counter.0, 3);
     }
 
+    mod dont_look_inside_generic_method_module {
+        use majit_macros::{dont_look_inside, elidable};
+
+        pub struct Holder<T>(pub T);
+
+        impl<T: Copy> Holder<T> {
+            /// A monomorphized extraction instantiates the method and drops
+            /// an associated const of the generic impl, so the marker is
+            /// body-local.  Returning it is the assertion: it has to be
+            /// spelled `_jit_look_inside_<NAME>` with the `False` value, or
+            /// this does not compile or fails below.
+            #[dont_look_inside]
+            pub fn opaque_get(&self) -> (T, bool) {
+                (self.0, _jit_look_inside_opaque_get)
+            }
+
+            #[elidable]
+            pub fn pure_get(&self) -> (T, bool) {
+                (self.0, _elidable_function_pure_get)
+            }
+        }
+    }
+
+    /// A method of a generic impl carries its hint markers in its body.
+    #[test]
+    fn test_hint_markers_of_generic_impl_methods_are_body_local() {
+        use dont_look_inside_generic_method_module::Holder;
+
+        let holder = Holder(7u8);
+        assert_eq!(holder.opaque_get(), (7, false));
+        assert_eq!(holder.pure_get(), (7, true));
+    }
+
     mod look_inside_alias_module {
         use majit_macros::{look_inside, purefunction, purefunction_promote};
 
