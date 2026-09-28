@@ -6236,6 +6236,168 @@ struct Lowering<'a> {
     pointer_word_arrays: std::collections::HashSet<Variable>,
 }
 
+/// `PyGraph.__init__` (`flowspace/pygraph.py`): the startblock of a
+/// declared function, one named inputarg per formal parameter, built from
+/// the code object's locals alone. Returns the local-to-Variable table
+/// with the parameters bound.
+fn pygraph_initial_block(
+    graph: &mut FunctionGraph,
+    locals: &majit_charon_reader::ullbc::Locals,
+    llbc: &Llbc,
+    generics: Option<&serde_json::Value>,
+    tombstoned_leaves: &std::collections::HashSet<String>,
+) -> Vec<Option<Variable>> {
+    let n_locals = locals.locals.len();
+    let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
+
+    let arg_count = locals.arg_count as usize;
+    // Arguments become startblock inputargs in source order
+    // (RPython parity: `flowcontext.py` `init_locals_stack` fills
+    // `locals_w`; arguments are `model.py` `Block` inputargs).
+    //
+    // Each parameter is also emitted as a paired `OpKind::Input { name,
+    // ty }` op into the startblock.  Downstream consumers
+    // — `flowspace_adapter::derive_subject_inputcells`
+    // (`translator/rtyper/flowspace_adapter.rs`),
+    // `graph_non_void_arg_types` (`codewriter/call.rs`),
+    // `type_state` (`codewriter/type_state.rs`) — locate
+    // each inputarg's declared `ValueType` by scanning the leading
+    // `OpKind::Input` ops with `op.result == &arg`.  Without the
+    // Input op, `derive_subject_inputcells` fails-loud at
+    // `flowspace_adapter.rs` for any MIR-built graph that
+    // reaches the real-rtyper dual-gate.
+    let mut startblock_args: Vec<Variable> = Vec::with_capacity(arg_count);
+    let mut input_ops: Vec<SpaceOperation> = Vec::with_capacity(arg_count);
+    for (i, (local, slot)) in locals
+        .locals
+        .iter()
+        .zip(local_var.iter_mut())
+        .enumerate()
+        .take(arg_count + 1)
+        .skip(1)
+    {
+        let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
+        let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        // Register a stable name so canonical comparison can spot
+        // arg-renames.  Names live on the value via `name_value_var`
+        // (mirrors the `parse.rs` arg-binding path).
+        graph.name_value_var(&var, name.clone());
+        *slot = Some(var.clone());
+        let ty = tyref_to_value_type_with(&local.ty, llbc, tombstoned_leaves);
+        // A parameter with no runtime representation (`Arg<T>`'s
+        // `PhantomData` marker is the case in point — rustc gives it no
+        // ABI slot) has to read as `Void` here, matching upstream's
+        // `getkind(lltype.Void)`: `NON_VOID_ARGS` (the caller's actual
+        // arguments) and `FUNC.ARGS` filtered the same way (this
+        // graph's declared parameters via `graph_non_void_arg_types`)
+        // both filter by the identical is-not-Void test, so a param the
+        // caller's own concretetype tracking already treats as
+        // void-carrying must agree here or `getcalldescr` sees a
+        // caller/callee arity mismatch and hard fails. Scoped to the
+        // declared-parameter fallback only — not
+        // `tyref_to_value_type` itself, which construction sites
+        // (`AggregateKind` lowering et al.) also call, and which must
+        // keep minting a real value for a zero-sized type until they
+        // erase it the way rtyper does everywhere. Guarded on the
+        // generic `Ref(None)` fallback so a real (non-zero-sized) Ref
+        // param is never touched, and a fieldless enum — already
+        // resolved to `Int` above regardless of its own zero-sized
+        // layout — never reaches this arm.
+        let ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc) {
+            ValueType::Void
+        } else {
+            ty
+        };
+        // `class_root` carries the param's named-ADT leaf so
+        // `derive_subject_inputcells` can seed the receiver's
+        // `ClassDef`; only `Ref`-typed params consume it there.  A
+        // generic param (`&T` where `T: Trait`, incl. trait default
+        // bodies' `&Self`) has no ADT leaf — carry the bound
+        // trait's qualified path instead, which the adapter
+        // resolves through the unique-impl map
+        // (`trait_unique_impls`, keyed by qualified path).
+        // RPython's GC transformer casts a GC helper's pointer *argument*
+        // to `llmemory.GCREF` before the call — `gct_gc_identityhash`
+        // (`framework.py:1174-1182`) does
+        // `[v_ptr] = hop.spaceop.args; v_ptr = hop.genop("cast_opaque_ptr",
+        // [v_ptr], resulttype=llmemory.GCREF)`.  Rust's `PyObjectRef`
+        // parameter is the physical carrier for that opaque slot, not a
+        // W_Root instance.  Preserve the GCREF input boundary explicitly so
+        // StringRepr and InstanceRepr callers never meet in one
+        // source-level FunctionDesc cell.
+        //
+        // Key it on the LAST parameter, never on index 1: both spellings
+        // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
+        // `RootScope` method form puts `&self` first, so stamping index 1
+        // there annotates the receiver and leaves the GC pointer untouched.
+        let class_root = if i == arg_count && gc_root_pin_path(&graph.name) {
+            Some("GCREF".to_string())
+        } else {
+            match &ty {
+                ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc, tombstoned_leaves)
+                    // A `&str` / `str` param strips to the `str` builtin
+                    // (not an ADT), so `tyref_class_root` answers `None`;
+                    // name it `"str"` so `derive_subject_inputcells` seeds
+                    // the byte `SomeString` (`s_str0`) instead of the
+                    // abstract `SomeInstance(None)` a `Ref(None)` projects
+                    // to.  A string param compared against a string literal
+                    // then rtypes as `pair(StringRepr, StringRepr)` rather
+                    // than walling at `pair(InstanceRepr, StringRepr)`.
+                    .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
+                    .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
+                    // A list-typed param (`Vec<T>`, `&[T]`, …) has no
+                    // named-ADT leaf — `tyref_class_root` answers `None`
+                    // because `adt_node_class_root` excludes the
+                    // core/std/alloc container family from classdef
+                    // minting.  Carry its full monomorphic spelling so
+                    // `derive_subject_inputcells` projects it through the
+                    // annotator's list model (`project_struct_field_type`)
+                    // instead of the classdef-less `SomeInstance(None)`
+                    // shell, on which a `len()` / iteration would wall at
+                    // `getattr` over a classdef-less instance.
+                    .or_else(|| {
+                        let spelling = tyref_to_ast_string(&local.ty, llbc);
+                        majit_ir::descr::is_list_container_spelling(&spelling).then_some(spelling)
+                    }),
+                // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
+                // so it takes the non-`Ref` arm and would otherwise carry no
+                // `class_root`.  Its variant-name metadata is a side table
+                // keyed by the enum type (the RPython "names by int" model),
+                // not a field on the value; carry the crate-stripped enum
+                // path so the `Debug`-fmt collapse can recover the enum
+                // identity from the value's origin (`debug_enum_disc_owner`)
+                // now that no `__discriminant` field read remains to scavenge.
+                // `derive_subject_inputcells` only consumes `class_root` on
+                // the `Ref` arm, so the annotation seed stays a plain
+                // `SomeInteger`.
+                _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
+            }
+        };
+        input_ops.push(SpaceOperation {
+            result: Some(var.clone()),
+            kind: OpKind::Input {
+                name,
+                ty,
+                class_root,
+            },
+        });
+        startblock_args.push(var);
+    }
+    // Startblock gets the args as its inputargs. The startblock is
+    // BlockId(0), already created by `FunctionGraph::new`.
+    for var in &startblock_args {
+        graph.push_inputarg_var(graph.startblock, var.clone());
+    }
+    // Push the paired `OpKind::Input` ops into the startblock so
+    // `derive_subject_inputcells` can project each inputarg's
+    // declared ValueType to a SomeValue shell.
+    graph
+        .block_mut(graph.startblock)
+        .operations
+        .extend(input_ops);
+    local_var
+}
+
 impl<'a> Lowering<'a> {
     fn new(
         llbc: &'a Llbc,
@@ -6250,156 +6412,10 @@ impl<'a> Lowering<'a> {
         root_stack: &RootStackAnalyzer<'_>,
     ) -> Result<Self, LowerError> {
         let mut graph = FunctionGraph::new(name);
-        let n_locals = body.locals.locals.len();
-        let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
-
+        let local_var =
+            pygraph_initial_block(&mut graph, &body.locals, llbc, generics, tombstoned_leaves);
+        let n_locals = local_var.len();
         let arg_count = body.locals.arg_count as usize;
-        // Arguments become startblock inputargs in source order
-        // (RPython parity: `flowcontext.py` `init_locals_stack` fills
-        // `locals_w`; arguments are `model.py` `Block` inputargs).
-        //
-        // Each parameter is also emitted as a paired `OpKind::Input { name,
-        // ty }` op into the startblock.  Downstream consumers
-        // — `flowspace_adapter::derive_subject_inputcells`
-        // (`translator/rtyper/flowspace_adapter.rs`),
-        // `graph_non_void_arg_types` (`codewriter/call.rs`),
-        // `type_state` (`codewriter/type_state.rs`) — locate
-        // each inputarg's declared `ValueType` by scanning the leading
-        // `OpKind::Input` ops with `op.result == &arg`.  Without the
-        // Input op, `derive_subject_inputcells` fails-loud at
-        // `flowspace_adapter.rs` for any MIR-built graph that
-        // reaches the real-rtyper dual-gate.
-        let mut startblock_args: Vec<Variable> = Vec::with_capacity(arg_count);
-        let mut input_ops: Vec<SpaceOperation> = Vec::with_capacity(arg_count);
-        for (i, (local, slot)) in body
-            .locals
-            .locals
-            .iter()
-            .zip(local_var.iter_mut())
-            .enumerate()
-            .take(arg_count + 1)
-            .skip(1)
-        {
-            let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
-            let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            // Register a stable name so canonical comparison can spot
-            // arg-renames.  Names live on the value via `name_value_var`
-            // (mirrors the `parse.rs` arg-binding path).
-            graph.name_value_var(&var, name.clone());
-            *slot = Some(var.clone());
-            let ty = tyref_to_value_type_with(&local.ty, llbc, tombstoned_leaves);
-            // A parameter with no runtime representation (`Arg<T>`'s
-            // `PhantomData` marker is the case in point — rustc gives it no
-            // ABI slot) has to read as `Void` here, matching upstream's
-            // `getkind(lltype.Void)`: `NON_VOID_ARGS` (the caller's actual
-            // arguments) and `FUNC.ARGS` filtered the same way (this
-            // graph's declared parameters via `graph_non_void_arg_types`)
-            // both filter by the identical is-not-Void test, so a param the
-            // caller's own concretetype tracking already treats as
-            // void-carrying must agree here or `getcalldescr` sees a
-            // caller/callee arity mismatch and hard fails. Scoped to the
-            // declared-parameter fallback only — not
-            // `tyref_to_value_type` itself, which construction sites
-            // (`AggregateKind` lowering et al.) also call, and which must
-            // keep minting a real value for a zero-sized type until they
-            // erase it the way rtyper does everywhere. Guarded on the
-            // generic `Ref(None)` fallback so a real (non-zero-sized) Ref
-            // param is never touched, and a fieldless enum — already
-            // resolved to `Int` above regardless of its own zero-sized
-            // layout — never reaches this arm.
-            let ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc) {
-                ValueType::Void
-            } else {
-                ty
-            };
-            // `class_root` carries the param's named-ADT leaf so
-            // `derive_subject_inputcells` can seed the receiver's
-            // `ClassDef`; only `Ref`-typed params consume it there.  A
-            // generic param (`&T` where `T: Trait`, incl. trait default
-            // bodies' `&Self`) has no ADT leaf — carry the bound
-            // trait's qualified path instead, which the adapter
-            // resolves through the unique-impl map
-            // (`trait_unique_impls`, keyed by qualified path).
-            // RPython's GC transformer casts a GC helper's pointer *argument*
-            // to `llmemory.GCREF` before the call — `gct_gc_identityhash`
-            // (`framework.py:1174-1182`) does
-            // `[v_ptr] = hop.spaceop.args; v_ptr = hop.genop("cast_opaque_ptr",
-            // [v_ptr], resulttype=llmemory.GCREF)`.  Rust's `PyObjectRef`
-            // parameter is the physical carrier for that opaque slot, not a
-            // W_Root instance.  Preserve the GCREF input boundary explicitly so
-            // StringRepr and InstanceRepr callers never meet in one
-            // source-level FunctionDesc cell.
-            //
-            // Key it on the LAST parameter, never on index 1: both spellings
-            // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
-            // `RootScope` method form puts `&self` first, so stamping index 1
-            // there annotates the receiver and leaves the GC pointer untouched.
-            let class_root = if i == arg_count && gc_root_pin_path(&graph.name) {
-                Some("GCREF".to_string())
-            } else {
-                match &ty {
-                    ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc, tombstoned_leaves)
-                        // A `&str` / `str` param strips to the `str` builtin
-                        // (not an ADT), so `tyref_class_root` answers `None`;
-                        // name it `"str"` so `derive_subject_inputcells` seeds
-                        // the byte `SomeString` (`s_str0`) instead of the
-                        // abstract `SomeInstance(None)` a `Ref(None)` projects
-                        // to.  A string param compared against a string literal
-                        // then rtypes as `pair(StringRepr, StringRepr)` rather
-                        // than walling at `pair(InstanceRepr, StringRepr)`.
-                        .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
-                        .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
-                        // A list-typed param (`Vec<T>`, `&[T]`, …) has no
-                        // named-ADT leaf — `tyref_class_root` answers `None`
-                        // because `adt_node_class_root` excludes the
-                        // core/std/alloc container family from classdef
-                        // minting.  Carry its full monomorphic spelling so
-                        // `derive_subject_inputcells` projects it through the
-                        // annotator's list model (`project_struct_field_type`)
-                        // instead of the classdef-less `SomeInstance(None)`
-                        // shell, on which a `len()` / iteration would wall at
-                        // `getattr` over a classdef-less instance.
-                        .or_else(|| {
-                            let spelling = tyref_to_ast_string(&local.ty, llbc);
-                            majit_ir::descr::is_list_container_spelling(&spelling)
-                                .then_some(spelling)
-                        }),
-                    // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
-                    // so it takes the non-`Ref` arm and would otherwise carry no
-                    // `class_root`.  Its variant-name metadata is a side table
-                    // keyed by the enum type (the RPython "names by int" model),
-                    // not a field on the value; carry the crate-stripped enum
-                    // path so the `Debug`-fmt collapse can recover the enum
-                    // identity from the value's origin (`debug_enum_disc_owner`)
-                    // now that no `__discriminant` field read remains to scavenge.
-                    // `derive_subject_inputcells` only consumes `class_root` on
-                    // the `Ref` arm, so the annotation seed stays a plain
-                    // `SomeInteger`.
-                    _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
-                }
-            };
-            input_ops.push(SpaceOperation {
-                result: Some(var.clone()),
-                kind: OpKind::Input {
-                    name,
-                    ty,
-                    class_root,
-                },
-            });
-            startblock_args.push(var);
-        }
-        // Startblock gets the args as its inputargs. The startblock is
-        // BlockId(0), already created by `FunctionGraph::new`.
-        for var in &startblock_args {
-            graph.push_inputarg_var(graph.startblock, var.clone());
-        }
-        // Push the paired `OpKind::Input` ops into the startblock so
-        // `derive_subject_inputcells` can project each inputarg's
-        // declared ValueType to a SomeValue shell.
-        graph
-            .block_mut(graph.startblock)
-            .operations
-            .extend(input_ops);
 
         // Pre-allocate a Block for each MIR basic block so terminators
         // can refer to successors via stable BlockId. MIR bb0 maps to
