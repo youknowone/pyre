@@ -670,22 +670,20 @@ fn expect_box_bank(
     );
 }
 
-/// `blackhole.py` `setarg_*` writes `registers_*[index]`. `copy_constants`
-/// fills the tail, and `pyjitpl.py` `get_list_of_active_boxes` indexes
-/// that same list. The length is `num_regs_and_consts_*`, so a live
-/// constant-area index is in range.
+/// `jitcode.py` `enumerate_vars` walks three banks. A live index at or past
+/// `num_regs_*` of that bank is a register listed in the wrong bank.
 pub(crate) fn expect_liveness_bank(
     jitcode_name: &str,
     pc: usize,
     bank: majit_ir::Type,
     index: u32,
-    num_regs_and_consts: usize,
+    num_regs: usize,
 ) {
-    if (index as usize) < num_regs_and_consts {
+    if (index as usize) < num_regs {
         return;
     }
     panic!(
-        "liveness: jitcode {jitcode_name} pc {pc} bank {bank:?} register {index} is outside that bank ({num_regs_and_consts} registers and constants)"
+        "liveness: jitcode {jitcode_name} pc {pc} bank {bank:?} register {index} is outside that bank ({num_regs} registers)"
     );
 }
 
@@ -3881,18 +3879,6 @@ mod tests {
     //! helpers and arithmetic edge cases directly.
 
     use super::*;
-
-    /// `blackhole.py` `setarg_*` indexes `registers_*` through the constant tail.
-    #[test]
-    fn expect_liveness_bank_accepts_a_constant_area_index() {
-        expect_liveness_bank("jc", 4, majit_ir::Type::Ref, 2, 3);
-    }
-
-    #[test]
-    #[should_panic(expected = "outside that bank")]
-    fn expect_liveness_bank_rejects_an_index_past_constants() {
-        expect_liveness_bank("jc", 4, majit_ir::Type::Ref, 3, 3);
-    }
 
     #[test]
     fn test_read_list_keeps_small_inline_call_args_off_heap() {
