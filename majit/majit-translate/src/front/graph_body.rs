@@ -13,17 +13,20 @@
 //! That requires the LLBC set to stay alive past the whole-program build,
 //! which is what a [`GraphBodyProvider`] owns.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::collections::HashSet;
 
 use majit_charon_reader::Llbc;
 
-use crate::front::mir::{self, LowerError};
-use crate::model::{FunctionGraph, ValueType};
+use crate::front::mir::{self, CrateLowering, CrateLoweringState, LowerError};
+use crate::front::semantic::{SemanticFunction, SemanticProgram};
 
 /// Where a funcobj's body comes from: the LLBC that carries it and the
 /// Charon `def_id` that indexes it there (`Llbc::fn_by_id`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no funcobj records its body source yet")
+)]
 pub(crate) struct GraphBodySource {
     pub llbc_index: u32,
     pub def_id: u64,
@@ -34,29 +37,24 @@ pub(crate) struct GraphBodySource {
 ///
 /// The three `HostStaticAddrs` tables and the error-carrier spec are held
 /// owned because [`crate::HostStaticAddrs`] borrows all of them from the
-/// caller's frame; the borrowed view is rebuilt per
-/// [`GraphBodyProvider::build`] call, which only a demanded body pays for.
+/// caller's frame; the borrowed view is rebuilt per lowering call.
 pub(crate) struct GraphBodyProvider {
-    llbcs: Vec<Llbc>,
-    /// Per-LLBC struct field-attribute map, the same one the whole-program
-    /// loop lowered that LLBC's decls with.  `derive_program_metadata` is a
-    /// pure function of the LLBC, so recovering it here reproduces the
-    /// map exactly; it is computed on the first body demanded from each
-    /// LLBC rather than for every LLBC up front.
-    struct_field_attrs: Vec<OnceLock<HashMap<String, Vec<(String, ValueType)>>>>,
-    /// Per-LLBC duplicate-leaf tombstones. Computed on the first body
-    /// demanded from that LLBC, the same cache as `struct_field_attrs`.
-    tombstoned_leaves: Vec<OnceLock<HashSet<String>>>,
-    /// Duplicate-leaf verdict across every LLBC this provider owns.
-    /// A leaf that collides only across artefacts is in this set and in
-    /// none of the per-LLBC sets.
-    cross_tombstoned_leaves: OnceLock<HashSet<String>>,
+    crates: Vec<ProvidedCrate>,
+    jitdriver_receiver_roots: Vec<String>,
     pytypes: Vec<(String, i64)>,
     pytypes_by_struct: Vec<(String, i64)>,
     refs: Vec<(String, i64)>,
     int_values: Vec<(String, i64)>,
     error_carrier: OwnedErrorCarrierSpec,
     scalar_field_stores: Vec<OwnedScalarFieldStore>,
+}
+
+/// One lowered crate: its artefact, the module filter its decls were
+/// admitted under, and the lowering state they were lowered with.
+struct ProvidedCrate {
+    llbc: Llbc,
+    module_filter: Option<HashSet<String>>,
+    state: CrateLoweringState,
 }
 
 /// Owned mirror of [`crate::ErrorCarrierSpec`], held for the same reason as
@@ -119,17 +117,16 @@ impl OwnedErrorCarrierSpec {
 }
 
 impl GraphBodyProvider {
-    pub(crate) fn new(llbcs: Vec<Llbc>, static_addrs: crate::HostStaticAddrs<'_>) -> Self {
+    pub(crate) fn new(
+        static_addrs: crate::HostStaticAddrs<'_>,
+        jitdriver_receiver_roots: &[String],
+    ) -> Self {
         let own = |rows: &[(&str, i64)]| -> Vec<(String, i64)> {
             rows.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
         };
-        let struct_field_attrs = llbcs.iter().map(|_| OnceLock::new()).collect();
-        let tombstoned_leaves = llbcs.iter().map(|_| OnceLock::new()).collect();
         Self {
-            llbcs,
-            struct_field_attrs,
-            tombstoned_leaves,
-            cross_tombstoned_leaves: OnceLock::new(),
+            crates: Vec::new(),
+            jitdriver_receiver_roots: jitdriver_receiver_roots.to_vec(),
             pytypes: own(static_addrs.pytypes),
             pytypes_by_struct: own(static_addrs.pytypes_by_struct),
             refs: own(static_addrs.refs),
@@ -141,6 +138,38 @@ impl GraphBodyProvider {
                 .map(OwnedScalarFieldStore::own)
                 .collect(),
         }
+    }
+
+    /// Lower one already-linked artefact and keep it. The caller applied
+    /// `discover_transparent_scalar_kinds` and `discover_foldable_const_lits`
+    /// across the whole set first, and `cross_tombstoned_leaves` is the
+    /// duplicate-leaf verdict across that set.
+    pub(crate) fn lower_prelinked_crate(
+        &mut self,
+        llbc: Llbc,
+        module_paths: &[&str],
+        cross_tombstoned_leaves: &HashSet<String>,
+    ) -> SemanticProgram {
+        let module_filter = mir::normalize_module_filter(module_paths);
+        let paint_tombstones = mir::prelink_crate(&llbc, cross_tombstoned_leaves);
+        let mut state = CrateLoweringState::new(&llbc, &paint_tombstones);
+        let functions = self.with_static_addrs(|static_addrs| {
+            CrateLowering::new(&llbc, static_addrs, &self.jitdriver_receiver_roots, &state)
+                .lower_all(module_filter.as_ref(), None)
+        });
+        let mut program = state.finish(functions);
+        mir::harden_duplicate_leaf_metadata(
+            &mut program.struct_fields,
+            &mut program.struct_origins,
+            &mut program.enum_variant_by_discriminant,
+            Some(&program.struct_ids),
+        );
+        self.crates.push(ProvidedCrate {
+            llbc,
+            module_filter,
+            state,
+        });
+        program
     }
 
     /// Locate the funcobj whose Charon `name_path()` is `name_path`, if
@@ -157,10 +186,11 @@ impl GraphBodyProvider {
     ///
     /// Linear over the corpus, so it is a registration-time helper (and
     /// the test seam), not a per-demand lookup.
+    #[cfg(test)]
     pub(crate) fn source_for_name_path(&self, name_path: &str) -> Option<GraphBodySource> {
         let mut found = None;
-        for (i, llbc) in self.llbcs.iter().enumerate() {
-            for fd in llbc.iter_local_fns() {
+        for (i, krate) in self.crates.iter().enumerate() {
+            for fd in krate.llbc.iter_local_fns() {
                 if fd.item_meta.name_path() != name_path {
                     continue;
                 }
@@ -176,30 +206,38 @@ impl GraphBodyProvider {
         found
     }
 
-    /// Lower the funcobj `src` names, reproducing what the whole-program
-    /// loop produced for it.
-    pub(crate) fn build(&self, src: GraphBodySource) -> Result<FunctionGraph, LowerError> {
+    /// Lower the funcobj `src` names with the state its crate was lowered
+    /// with, reproducing what the whole-program loop produced for it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no funcobj records its body source yet")
+    )]
+    pub(crate) fn build(&self, src: GraphBodySource) -> Result<SemanticFunction, LowerError> {
         let idx = src.llbc_index as usize;
-        let llbc = self
-            .llbcs
+        let krate = self
+            .crates
             .get(idx)
             .ok_or_else(|| LowerError::Unsupported(format!("llbc index {idx} out of range")))?;
-        let fd = llbc.fn_by_id(src.def_id).ok_or_else(|| {
+        let fd = krate.llbc.fn_by_id(src.def_id).ok_or_else(|| {
             LowerError::Unsupported(format!("no FunDecl for def_id {}", src.def_id))
         })?;
-        let attrs = self.struct_field_attrs[idx].get_or_init(|| mir::struct_field_attrs_of(llbc));
-        let local_tombstones = self.tombstoned_leaves[idx]
-            .get_or_init(|| mir::tombstoned_leaves_of(llbc))
-            .clone();
-        let cross = self.cross_tombstoned_leaves.get_or_init(|| {
-            let mut facts = mir::DuplicateLeafFacts::default();
-            for llbc in &self.llbcs {
-                facts.absorb(mir::DuplicateLeafFacts::discover(llbc));
-            }
-            facts.tombstoned_leaves()
-        });
-        let mut tombstoned = local_tombstones;
-        tombstoned.extend(cross.iter().cloned());
+        self.with_static_addrs(|static_addrs| {
+            CrateLowering::new(
+                &krate.llbc,
+                static_addrs,
+                &self.jitdriver_receiver_roots,
+                &krate.state,
+            )
+            .lower_decl(fd, krate.module_filter.as_ref(), None)
+        })
+        .ok_or_else(|| {
+            LowerError::Unsupported(format!("{} does not lower", fd.item_meta.name_path()))
+        })
+    }
+
+    /// Run `f` with the borrowed [`crate::HostStaticAddrs`] view of the
+    /// owned tables.
+    fn with_static_addrs<R>(&self, f: impl FnOnce(crate::HostStaticAddrs<'_>) -> R) -> R {
         let pytypes = borrowed(&self.pytypes);
         let pytypes_by_struct = borrowed(&self.pytypes_by_struct);
         let refs = borrowed(&self.refs);
@@ -212,28 +250,22 @@ impl GraphBodyProvider {
             .map(OwnedScalarFieldStore::borrowed)
             .collect();
         let to_exc_object = carrier.to_exc_object.as_deref().map(borrowed_segments);
-        mir::lower_fun_decl_with_static_addrs_and_attrs(
-            llbc,
-            fd,
-            crate::HostStaticAddrs {
-                pytypes: &pytypes,
-                pytypes_by_struct: &pytypes_by_struct,
-                refs: &refs,
-                int_values: &int_values,
-                error_carrier: crate::ErrorCarrierSpec {
-                    carrier_path: &carrier.carrier_path,
-                    carrier_wrappers: &carrier_wrappers,
-                    to_exc_object: to_exc_object.as_deref(),
-                    from_exc_object: carrier
-                        .from_exc_object
-                        .as_ref()
-                        .map(|(receiver, method)| (receiver.as_str(), method.as_str())),
-                },
-                scalar_field_stores: &scalar_field_stores,
+        f(crate::HostStaticAddrs {
+            pytypes: &pytypes,
+            pytypes_by_struct: &pytypes_by_struct,
+            refs: &refs,
+            int_values: &int_values,
+            error_carrier: crate::ErrorCarrierSpec {
+                carrier_path: &carrier.carrier_path,
+                carrier_wrappers: &carrier_wrappers,
+                to_exc_object: to_exc_object.as_deref(),
+                from_exc_object: carrier
+                    .from_exc_object
+                    .as_ref()
+                    .map(|(receiver, method)| (receiver.as_str(), method.as_str())),
             },
-            attrs,
-            &tombstoned,
-        )
+            scalar_field_stores: &scalar_field_stores,
+        })
     }
 }
 
@@ -247,7 +279,10 @@ fn borrowed_segments(segments: &[String]) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::model::FunctionGraph;
 
     const CORPUS: &str = crate::runtime_names::artifacts::CHARON_CORPUS_ULLBC;
 
@@ -315,40 +350,37 @@ mod tests {
     /// loop built: same graph shape, from the same `FunDecl`, for every
     /// funcobj in the corpus that lowers at all.
     ///
-    /// Also asserts every lowerable funcobj's name path is unique in the
+    /// Also asserts every lowered funcobj's name path is unique in the
     /// corpus: `source_for_name_path` resolves an ambiguous name to
     /// `None`, so a duplicate surfaces here as a lookup miss.
     #[test]
     fn provider_reproduces_the_eagerly_lowered_body() {
         let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
-        let attrs = mir::struct_field_attrs_of(&llbc);
-        let tombstoned = mir::tombstoned_leaves_of(&llbc);
-        let mut eager: Vec<(String, _)> = Vec::new();
-        for fd in llbc.iter_local_fns() {
-            if !fd.has_unstructured_body() || fd.is_global_initializer().is_some() {
+        let mut provider = GraphBodyProvider::new(crate::HostStaticAddrs::default(), &[]);
+        let program = provider.lower_prelinked_crate(llbc, &[], &HashSet::new());
+        let mut compared = 0;
+        for f in &program.functions {
+            let Some(fd) = f
+                .fun_decl_id
+                .and_then(|id| provider.crates[0].llbc.fn_by_id(id))
+            else {
                 continue;
-            }
-            if let Ok(g) = mir::lower_fun_decl_with_static_addrs_and_attrs(
-                &llbc,
-                fd,
-                crate::HostStaticAddrs::default(),
-                &attrs,
-                &tombstoned,
-            ) {
-                eager.push((fd.item_meta.name_path(), shape(&g)));
-            }
-        }
-        assert!(!eager.is_empty(), "corpus fixture lowered no bodies at all");
-
-        let provider = GraphBodyProvider::new(vec![llbc], crate::HostStaticAddrs::default());
-        for (name_path, want) in &eager {
+            };
+            let name_path = fd.item_meta.name_path();
             let src = provider
-                .source_for_name_path(name_path)
+                .source_for_name_path(&name_path)
                 .unwrap_or_else(|| panic!("no unique GraphBodySource for {name_path}"));
             let got = provider
                 .build(src)
                 .unwrap_or_else(|e| panic!("provider failed to build {name_path}: {e}"));
-            assert_eq!(&shape(&got), want, "{name_path}");
+            // A clause specialization shares its generic's `FunDecl` under
+            // its own name.
+            if got.name != f.name {
+                continue;
+            }
+            assert_eq!(shape(&got.graph), shape(&f.graph), "{name_path}");
+            compared += 1;
         }
+        assert!(compared > 0, "corpus fixture lowered no bodies at all");
     }
 }

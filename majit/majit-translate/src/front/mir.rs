@@ -212,27 +212,37 @@ pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_a
     )
 }
 
-/// Lower one already-linked artefact. The caller applied
-/// [`discover_transparent_scalar_kinds`] and
-/// [`discover_foldable_const_lits`] across the whole set first so
-/// this crate can be dropped before the next file is parsed.
-pub(crate) fn build_semantic_program_from_prelinked_llbc(
+/// The single-artefact prelude of
+/// [`build_semantic_program_from_llbcs_with_static_addrs_filtered`] for a
+/// crate the production frontend loads on its own: the duplicate-leaf
+/// tombstones to paint (this artefact's and `cross_tombstoned_leaves`),
+/// its named-const folds merged into the invocation table, and its
+/// eval-hook graph list. Returns the tombstones.
+pub(crate) fn prelink_crate(
     llbc: &Llbc,
-    static_addrs: crate::HostStaticAddrs<'_>,
-    module_paths: &[&str],
-    jitdriver_receiver_roots: &[String],
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
-) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    let module_filter = normalize_module_filter(module_paths);
-    build_semantic_program_from_llbcs_with_static_addrs_filtered(
-        std::slice::from_ref(llbc),
-        static_addrs,
-        jitdriver_receiver_roots,
-        module_filter.as_ref(),
-        None,
-        false,
-        cross_tombstoned_leaves,
-    )
+) -> std::collections::HashSet<String> {
+    let mut duplicate_leaf_facts = DuplicateLeafFacts::default();
+    duplicate_leaf_facts.absorb(DuplicateLeafFacts::discover(llbc));
+    let mut paint_tombstones = duplicate_leaf_facts.tombstoned_leaves();
+    paint_tombstones.extend(cross_tombstoned_leaves.iter().cloned());
+    merge_named_const_folds(llbc.crate_name(), harvest_named_const_folds(llbc));
+    let published = llbc.eval_hook_graphs();
+    let paths = if published.is_empty() {
+        discover_eval_hook_graphs(llbc)
+    } else {
+        published
+    };
+    let mut eval_hook_graphs = Vec::new();
+    for path in paths {
+        if !eval_hook_graphs.contains(&path) {
+            eval_hook_graphs.push(path);
+        }
+    }
+    if !eval_hook_graphs.is_empty() && llbc.eval_hook_graphs() != eval_hook_graphs {
+        llbc.set_eval_hook_graphs(eval_hook_graphs);
+    }
+    paint_tombstones
 }
 
 /// The `module_paths` entry point narrowed further to a set of leaf
@@ -485,7 +495,9 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     )
 }
 
-fn normalize_module_filter(module_paths: &[&str]) -> Option<std::collections::HashSet<String>> {
+pub(crate) fn normalize_module_filter(
+    module_paths: &[&str],
+) -> Option<std::collections::HashSet<String>> {
     let modules: std::collections::HashSet<String> = module_paths
         .iter()
         .copied()
@@ -986,7 +998,7 @@ impl PackedFrameState {
 /// artefact lowers against, the hint sets harvested from it, its root-stack
 /// analysis, its clause-specialization queue and the declarations that did
 /// not lower. A [`CrateLowering`] borrows it together with the artefact.
-struct CrateLoweringState {
+pub(crate) struct CrateLoweringState {
     known_struct_names: std::collections::HashSet<String>,
     known_trait_names: std::collections::HashSet<String>,
     struct_fields: crate::front::semantic::StructFieldRegistry,
@@ -1017,7 +1029,7 @@ struct CrateLoweringState {
 /// `build_semantic_program_from_llbc_with_static_addrs_filtered` lowers each
 /// declaration through [`CrateLowering::lower_decl`] and each queued
 /// specialization through [`CrateLowering::lower_spec`].
-struct CrateLowering<'l> {
+pub(crate) struct CrateLowering<'l> {
     llbc: &'l Llbc,
     static_addrs: crate::HostStaticAddrs<'l>,
     jitdriver_receiver_roots: &'l [String],
@@ -1026,7 +1038,10 @@ struct CrateLowering<'l> {
 }
 
 impl CrateLoweringState {
-    fn new(llbc: &Llbc, cross_tombstoned_leaves: &std::collections::HashSet<String>) -> Self {
+    pub(crate) fn new(
+        llbc: &Llbc,
+        cross_tombstoned_leaves: &std::collections::HashSet<String>,
+    ) -> Self {
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -1176,7 +1191,7 @@ impl CrateLoweringState {
 }
 
 impl<'l> CrateLowering<'l> {
-    fn new(
+    pub(crate) fn new(
         llbc: &'l Llbc,
         static_addrs: crate::HostStaticAddrs<'l>,
         jitdriver_receiver_roots: &'l [String],
@@ -1191,9 +1206,30 @@ impl<'l> CrateLowering<'l> {
         }
     }
 
+    /// Lower every declaration the filters admit, then every clause
+    /// specialization those bodies queued.
+    pub(crate) fn lower_all(
+        &self,
+        module_filter: Option<&std::collections::HashSet<String>>,
+        function_filter: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<crate::front::semantic::SemanticFunction> {
+        let mut functions: Vec<_> = self
+            .llbc
+            .iter_local_fns()
+            .filter_map(|fd| self.lower_decl(fd, module_filter, function_filter))
+            .collect();
+        // `specialize.py` `cachedgraph` keys one graph per instantiation. The
+        // walk above enqueues each concrete call; lowering a copy enqueues the
+        // callees whose clauses that copy just bound.
+        while let Some(req) = self.pop_spec() {
+            functions.extend(self.lower_spec(req));
+        }
+        functions
+    }
+
     /// Lower one declaration of this artefact. `None` when a gate refuses it
     /// or its body does not lower; the latter is recorded in `skipped`.
-    fn lower_decl(
+    pub(crate) fn lower_decl(
         &self,
         fd: &'l FunDecl,
         module_filter: Option<&std::collections::HashSet<String>>,
@@ -1475,32 +1511,31 @@ impl<'l> CrateLowering<'l> {
 impl CrateLoweringState {
     /// `specialize.py default_specialize` and the positional-aggregate
     /// layouts over the lowered set, the coverage report, and the program.
-    fn finish(
-        self,
+    ///
+    /// The program takes the tables only it reads. `known_trait_names` and
+    /// `struct_field_attrs` are copied: a body lowered after this still
+    /// reads them, and the positional layouts below must not reach it.
+    pub(crate) fn finish(
+        &mut self,
         mut functions: Vec<crate::front::semantic::SemanticFunction>,
     ) -> crate::front::semantic::SemanticProgram {
-        let Self {
-            mut known_struct_names,
-            known_trait_names,
-            mut struct_fields,
-            enum_variant_by_discriminant,
-            struct_origins,
-            mut struct_field_attrs,
-            exact_layouts,
-            mut struct_ids,
-            dont_look_inside,
-            skipped,
-            atomic_load_decls,
-            ..
-        } = self;
-        let skipped = skipped.into_inner();
-        let atomic_load_decls = atomic_load_decls.into_inner();
+        let known_trait_names = self.known_trait_names.clone();
+        let mut struct_field_attrs = self.struct_field_attrs.clone();
+        let mut known_struct_names = std::mem::take(&mut self.known_struct_names);
+        let mut struct_fields = std::mem::take(&mut self.struct_fields);
+        let enum_variant_by_discriminant = std::mem::take(&mut self.enum_variant_by_discriminant);
+        let struct_origins = std::mem::take(&mut self.struct_origins);
+        let exact_layouts = std::mem::take(&mut self.exact_layouts);
+        let mut struct_ids = std::mem::take(&mut self.struct_ids);
+        let skipped = self.skipped.take();
+        let atomic_load_decls = self.atomic_load_decls.take();
+        let dont_look_inside = &self.dont_look_inside;
         // `specialize.py default_specialize` runs while the annotator walks
         // calls; on this path the whole function set has to exist first, so it
         // runs here, once, over the finished list.
         crate::front::semantic::propagate_access_directly(
             &mut functions,
-            &dont_look_inside,
+            dont_look_inside,
             &crate::virtualizable_decl::virtualizable_roots(),
         );
         register_synthetic_positional_metadata(
@@ -1589,18 +1624,9 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     function_filter: Option<&std::collections::HashSet<String>>,
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    let state = CrateLoweringState::new(llbc, cross_tombstoned_leaves);
-    let ctx = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state);
-    let mut functions: Vec<_> = llbc
-        .iter_local_fns()
-        .filter_map(|fd| ctx.lower_decl(fd, module_filter, function_filter))
-        .collect();
-    // `specialize.py` `cachedgraph` keys one graph per instantiation. The
-    // walk above enqueues each concrete call; lowering a copy enqueues the
-    // callees whose clauses that copy just bound.
-    while let Some(req) = ctx.pop_spec() {
-        functions.extend(ctx.lower_spec(req));
-    }
+    let mut state = CrateLoweringState::new(llbc, cross_tombstoned_leaves);
+    let functions = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state)
+        .lower_all(module_filter, function_filter);
     Ok(state.finish(functions))
 }
 /// Declaration facts of one function or clause specialization: every
@@ -3223,16 +3249,6 @@ pub fn lower_fun_decl_with_static_addrs(
     })
 }
 
-/// The `struct_field_attrs` projection of [`derive_program_metadata`] —
-/// the map the whole-program loop lowers this LLBC's decls with.
-#[cfg(test)]
-pub(crate) fn struct_field_attrs_of(
-    llbc: &Llbc,
-) -> std::collections::HashMap<String, Vec<(String, ValueType)>> {
-    let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
-    struct_field_attrs
-}
-
 /// The `#[dont_look_inside]` marker set for this LLBC, keyed
 /// `strip_crate_prefix(name_path())` — the same derivation the
 /// whole-program loop harvests inline for the return-token stamp.
@@ -3287,28 +3303,6 @@ fn policy_opaque_fn_set_of(llbc: &Llbc) -> std::collections::HashSet<String> {
         .filter(|(_, hints)| hints_reject_body(hints))
         .map(|(path, _)| path)
         .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
-    llbc: &Llbc,
-    fd: &FunDecl,
-    static_addrs: crate::HostStaticAddrs<'_>,
-    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
-    tombstoned_leaves: &std::collections::HashSet<String>,
-) -> Result<FunctionGraph, LowerError> {
-    let jitdriver_receiver_roots =
-        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
-    let dont_look_inside = dont_look_inside_set_of(llbc);
-    lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
-        llbc,
-        fd,
-        static_addrs,
-        &jitdriver_receiver_roots,
-        struct_field_attrs,
-        &dont_look_inside,
-        tombstoned_leaves,
-    )
 }
 
 fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(

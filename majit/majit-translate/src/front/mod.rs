@@ -72,7 +72,7 @@ pub(crate) mod clause_spec;
 pub(crate) mod exc_from_raise;
 pub(crate) mod from_raw_parts;
 pub(crate) mod from_size_align;
-#[cfg(test)]
+#[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) mod graph_body;
 pub(crate) mod iter_adapter;
 pub(crate) mod iter_next;

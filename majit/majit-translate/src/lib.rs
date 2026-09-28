@@ -232,13 +232,12 @@ fn build_semantic_program_via_active_frontend(
                     .filter(|paths: &Vec<String>| !paths.is_empty())
             });
         if let Some(paths) = resolved_paths {
-            // Parse one artefact at a time. Holding every crate's Llbc
-            // (interpreter ~825MB JSON plus its typed tree) together with
-            // the merged SemanticProgram is what blew a 12GB container.
+            // The harvest loop parses one artefact at a time and drops it.
             // The second loop reloads each file after
             // `register_transparent_scalar_kinds` so cross-crate
-            // `repr(transparent)` scalar returns resolve; that extra
-            // parse is the cost of not keeping every tree live.
+            // `repr(transparent)` scalar returns resolve, and hands it to
+            // the `GraphBodyProvider`, which keeps it and the state its
+            // decls were lowered with.
             let mut discovered = Vec::new();
             let mut foldable_cross = Vec::new();
             let mut foldable_impl_by_ord = Vec::new();
@@ -296,6 +295,8 @@ fn build_semantic_program_via_active_frontend(
             let cross_tombstoned_leaves = duplicate_leaf_facts.tombstoned_leaves();
             crate::local_crates::register_local_crate_roots(crate_names);
 
+            let mut graph_bodies =
+                front::graph_body::GraphBodyProvider::new(static_addrs, jitdriver_receiver_roots);
             let mut merged = None;
             let mut seen_function_keys = std::collections::HashSet::new();
             let mut seen_struct_names = std::collections::HashSet::new();
@@ -323,14 +324,11 @@ fn build_semantic_program_via_active_frontend(
                     .extend(front::mir::collect_marked_class_ctor_stubs_from_llbc(&llbc));
                 foreign_opaque_method_externals
                     .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
-                let prog = front::mir::build_semantic_program_from_prelinked_llbc(
-                    &llbc,
-                    static_addrs,
+                let prog = graph_bodies.lower_prelinked_crate(
+                    llbc,
                     module_paths,
-                    jitdriver_receiver_roots,
                     &cross_tombstoned_leaves,
-                )
-                .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower {p}: {e}"));
+                );
                 prof.mark(&format!("    lower {p}"));
                 front::mir::absorb_semantic_program(
                     &mut merged,
