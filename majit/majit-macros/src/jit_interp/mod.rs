@@ -2887,6 +2887,7 @@ fn emit_portal_runner(
         .collect();
     let direct = finish.return_finished_word();
     let drain = finish.drain(&door.driver);
+    let single_pass_drain = finish.drain_single_pass(&door.driver);
     let epilogue = &body_stmts[1..];
     let key = &door.key;
     let driver = &door.driver;
@@ -2913,6 +2914,16 @@ fn emit_portal_runner(
                     }
                     majit_metainterp::FunctionEntryRunner::Resume(__resume_pc) => {
                         #drain
+                        // A guard-resume bridge that reaches the portal return
+                        // publishes on the single-pass latch and reports
+                        // `usize::MAX`. `warmspot.py ll_portal_runner` returns
+                        // `DoneWithThisFrameRef.result` whether
+                        // `execute_assembler`, `blackhole.py
+                        // _done_with_this_frame`, or `pyjitpl.py
+                        // MetaInterp.compile_done_with_this_frame` raised it.
+                        if #driver.take_single_pass_finish() {
+                            #single_pass_drain
+                        }
                         if __resume_pc != usize::MAX {
                             return #portal_ident(#(#resume_args),*);
                         }
@@ -4123,6 +4134,12 @@ fn rewrite_body(
         let finish_drain = finish_return
             .map(|finish_return| finish_return.drain(&driver))
             .unwrap_or_default();
+        // Same emission as the back edge: `; state` is what sets the latch.
+        // With no finish projection the body is empty, and the take still
+        // clears the flag so a later merge point does not observe it.
+        let single_pass_drain = finish_return
+            .map(|finish_return| finish_return.drain_single_pass(&driver))
+            .unwrap_or_default();
         match green_key_expr(&pc, &pc, default_greens, default_green_type_tags) {
             // The block is the condition of `if #door { loop }`. A finished
             // frame reports `usize::MAX` and has no bytecode pc; assigning
@@ -4157,6 +4174,16 @@ fn rewrite_body(
                                 None => true,
                             };
                             #finish_drain
+                            // `warmspot.py ll_portal_runner` returns
+                            // `DoneWithThisFrameRef.result` from
+                            // `execute_assembler`, `blackhole.py
+                            // _done_with_this_frame`, or `pyjitpl.py
+                            // MetaInterp.compile_done_with_this_frame`. The
+                            // bridge walk publishes that result on the
+                            // single-pass latch and reports `usize::MAX`.
+                            if #driver.take_single_pass_finish() {
+                                #single_pass_drain
+                            }
                             __run_dispatch
                         }
                     }
@@ -5141,5 +5168,97 @@ mod tests {
             setup_at < door_at,
             "the door must sit after a setup loop, not before it. Expansion was:\n{expanded}"
         );
+    }
+
+    /// A `*mut T` portal's function-entry door drains the bridge walk's
+    /// single-pass finish, not only the back-edge latch. The take sits after
+    /// the entry call and before the loop's own back edge.
+    #[test]
+    fn pointer_portal_door_drains_single_pass_finish() {
+        fn assert_drain_before_back_edge(expanded: &str, entry_call: &str) {
+            let entry_at = expanded
+                .find(entry_call)
+                .unwrap_or_else(|| panic!("missing {entry_call}. Expansion was:\n{expanded}"));
+            let back_edge_at = expanded[entry_at..]
+                .find("back_edge_structured")
+                .map(|at| entry_at + at)
+                .unwrap_or(expanded.len());
+            let door = &expanded[entry_at..back_edge_at];
+            let flag_at = door.find("take_single_pass_finish").unwrap_or_else(|| {
+                panic!(
+                    "{entry_call} door must take the single-pass flag before \
+                     the back edge. Door was:\n{door}"
+                )
+            });
+            let after_flag = flag_at + "take_single_pass_finish".len();
+            assert!(
+                !door[after_flag..].starts_with("_"),
+                "the flag take must be its own call. Door was:\n{door}"
+            );
+            assert!(
+                door[after_flag..].contains("take_single_pass_finish_ref"),
+                "{entry_call} door must drain the ref finish. Door was:\n{door}"
+            );
+        }
+
+        let inline_config: JitInterpConfig = syn::parse2(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [pc, program],
+            state_fields = { acc: int },
+        })
+        .expect("fixture attribute must parse");
+        let inline: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> *mut u8 {
+                let mut driver: majit_metainterp::JitDriver<S> =
+                    majit_metainterp::JitDriver::new(threshold);
+                let mut pc: usize = 0;
+                let mut state = S { acc: 0 };
+                while pc < program.len() {
+                    jit_merge_point!(driver, program, pc; state);
+                    let op = program[pc];
+                    pc += 1;
+                    match op {
+                        0 => { state.acc += 1; }
+                        _ => break,
+                    }
+                }
+                std::ptr::null_mut()
+            }
+        };
+        let inline_expanded = transform_jit_interp(inline_config, inline).to_string();
+        assert_drain_before_back_edge(&inline_expanded, "function_entry_structured");
+
+        let runner_config: JitInterpConfig = syn::parse2(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [pc, program],
+            state_fields = { acc: int },
+        })
+        .expect("fixture attribute must parse");
+        let runner: ItemFn = parse_quote! {
+            fn mainloop(
+                mut driver: &mut majit_metainterp::JitDriver<S>,
+                program: &Bytecode,
+                state: &mut S,
+                mut pc: usize,
+            ) -> *mut u8 {
+                loop {
+                    jit_merge_point!(driver, program, pc; *state);
+                    let op = program[pc];
+                    pc += 1;
+                    match op {
+                        0 => { state.acc += 1; }
+                        _ => break,
+                    }
+                }
+                std::ptr::null_mut()
+            }
+        };
+        let runner_expanded = transform_jit_interp(runner_config, runner).to_string();
+        let portal_at = runner_expanded
+            .find("fn __mainloop_portal")
+            .expect("portal function");
+        assert_drain_before_back_edge(&runner_expanded[..portal_at], "function_entry_runner");
     }
 }
