@@ -3138,6 +3138,7 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
 /// Declared `GcKind` of every struct and enum in `llbcs`, keyed by the
 /// crate-stripped type path. `Gc` follows [`DeclaredGcFacts::gc_struct_ids`];
 /// every other analysed struct or enum is `Raw`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn declared_gckind_by_name(
     llbcs: &[Llbc],
 ) -> std::collections::HashMap<String, crate::translator::rtyper::lltypesystem::lltype::GcKind> {
