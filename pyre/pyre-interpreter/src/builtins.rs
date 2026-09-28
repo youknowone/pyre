@@ -10918,6 +10918,15 @@ pub(crate) fn exception_group_fields(
     Ok((message, exceptions))
 }
 
+/// `interp_group.py descr_new`, whose validation upstream is one applevel
+/// helper, `app_group.py check_new_args`, ending `return cls, tuple(exceptions)`.
+///
+/// It stays inline here because the constructor-time `exceptions` repr
+/// (gh-141732) has to be taken between two of that helper's own steps: after
+/// the sequence check, so a non-sequence still raises `TypeError` first, and
+/// before `tuple(exceptions)`, so the repr is the source sequence's and not the
+/// converted tuple's.  Extracting the helper puts the capture on one side or
+/// the other and loses one of those two orderings.
 fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `descr_new(space, w_subtype, w_message, w_exceptions)` counts only the
     // positional arguments it was bound to. Keywords ride the same flat slice
