@@ -22797,6 +22797,8 @@ impl<'a> Lowering<'a> {
     /// `Result::branch` whose operand and `ControlFlow` result share a
     /// Charon type-decl layout is already that value: emit `same_as`.
     /// A missing layout stays a call for the later discriminant match.
+    /// A `Result<T, PyError>` keeps its `branch`: `front::result_exc`
+    /// rewires that `?` diamond onto the exception edge.
     fn rewrite_equal_layout_result_branch(
         &self,
         op_kind: OpKind,
@@ -22806,7 +22808,13 @@ impl<'a> Lowering<'a> {
         let Some(recv_ty) = recv_ty else {
             return op_kind;
         };
-        if !crate::front::result_exc::tyref_is_result(recv_ty, self.llbc) {
+        if !crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
+            || crate::front::result_exc::tyref_is_result_of_carrier(
+                recv_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
+        {
             return op_kind;
         }
         let Some(result_layout) = self.layout_of_tyref(recv_ty) else {
