@@ -14,7 +14,7 @@ const OBJECT_LLBC: &str = concat!(
 );
 
 #[test]
-fn a_gc_pointer_slice_is_found_in_pyre_object() {
+fn a_gc_pointer_slice_is_found_in_the_object_crate() {
     if !std::path::Path::new(OBJECT_LLBC).is_file() {
         eprintln!("skipping: {OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
         return;
