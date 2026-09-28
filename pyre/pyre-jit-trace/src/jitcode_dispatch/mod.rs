@@ -14123,21 +14123,11 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx
                 .record_op(OpCode::DebugMergePoint, &debug_args);
 
-            // `dispatch_bytecode`'s `we_are_jitted()` arm reads the portal
-            // frame's `debugdata` at the top of every opcode (pyopcode.py).
-            // The merge point is the trace's counterpart of that loop top.
-            record_portal_debugdata_guard(ctx, op.pc)?;
-            // `execute_frame`'s `ec.call_trace` / `ec.return_trace`
-            // (pyframe.py) read the global trace function on every call the
-            // loop makes.  The walker records neither for an inlined callee,
-            // so the loop pins the slot instead.
-            record_portal_tracefunc_guard(ctx, op.pc)?;
-            record_portal_profilefunc_guard(ctx, op.pc)?;
-
-            // pyjitpl.py, the tail of `MIFrame.debug_merge_point`,
-            // which `opimpl_jit_merge_point` calls at :1542 — ahead of every
-            // early return the loop-header protocol below makes, so this check
-            // sits at the same place:
+            // pyjitpl.py, the tail of `MIFrame.debug_merge_point`, which
+            // `opimpl_jit_merge_point` calls ahead of every early return the
+            // loop-header protocol below makes.  The check follows the
+            // DEBUG_MERGE_POINT record directly, so `history.length()` counts
+            // nothing the opcode body records after the merge point:
             //
             //     if (metainterp.force_finish_trace and
             //             (metainterp.history.length() >
@@ -14170,6 +14160,18 @@ fn handle<Sym: WalkSym>(
                     return Ok((outcome, op.next_pc));
                 }
             }
+
+            // `dispatch_bytecode`'s `we_are_jitted()` arm reads the portal
+            // frame's `debugdata` at the top of every opcode (pyopcode.py).
+            // The merge point is the trace's counterpart of that loop top.
+            record_portal_debugdata_guard(ctx, op.pc)?;
+            // `execute_frame`'s `ec.call_trace` / `ec.return_trace`
+            // (pyframe.py) read the global trace function on every call the
+            // loop makes.  The walker records neither for an inlined callee,
+            // so the loop pins the slot instead.
+            record_portal_tracefunc_guard(ctx, op.pc)?;
+            record_portal_profilefunc_guard(ctx, op.pc)?;
+
             // An inlined callee's own loop
             // header routes to a `CALL_ASSEMBLER` into its already-compiled loop
             // token EVEN WHEN its pycode green resolves.  nbody's `advance` has a
