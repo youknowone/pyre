@@ -964,11 +964,13 @@ fn real_main(binary_name: &str) {
             }
         }
         RunMode::Module(module) => {
-            // `-m`: sys.path[0] is the cwd (runpy resets argv[0] to the
-            // module's resolved origin via `_run_module_as_main`).
+            // `-m`: sys.path[0] is the cwd, and argv[0] is `-m` while the
+            // module's packages import (`parse_command_line` returns
+            // `['-m'] + args`); `_run_module_as_main` then sets it to the
+            // module's resolved origin.
             let cwd = sys_path_cwd();
             importing::init_sys_path(&cwd, cwd.as_os_str());
-            let mut argv = vec![std::ffi::OsString::from(&module)];
+            let mut argv = vec![std::ffi::OsString::from("-m")];
             argv.extend(args);
             importing::set_sys_argv(&argv);
             let session = run_module(&module, no_site, true);
