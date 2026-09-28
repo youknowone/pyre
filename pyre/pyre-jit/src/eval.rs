@@ -6840,6 +6840,7 @@ pub fn portal_diag(slot: usize) -> u64 {
         .map_or(0, |cell| cell.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+#[majit_macros::elidable_cannot_raise]
 fn portal_metatrace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("PYRE_PORTAL_METATRACE").as_deref() == Ok("1"))
@@ -9500,6 +9501,7 @@ fn exit_frame_handler_needs_unwritten_stack(frame: &PyFrame) -> bool {
 }
 
 /// Whether `PYRE_EXIT_FRAME_DIAG` is set.
+#[majit_macros::elidable_cannot_raise]
 fn exit_frame_diag_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_EXIT_FRAME_DIAG").is_some())
