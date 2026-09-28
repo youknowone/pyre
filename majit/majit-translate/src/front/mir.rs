@@ -29124,6 +29124,12 @@ impl<'a> RootStackAnalyzer<'a> {
 
     /// The body's own result: some call it makes outside every bracket it
     /// opens and closes itself can change the root stack.
+    ///
+    /// A call inside such a bracket is not visited at all.  Its answer would
+    /// not reach this body's result, and `DependencyTracker` merges every
+    /// cycle it walks on the premise that each edge joins the callee's result
+    /// into the caller's: a cycle closed through a covered call would then
+    /// share one answer with graphs that cannot observe it.
     fn analyze_body(&self, body: &Unstructured, seen: &mut RootStackTracker) -> bool {
         let owned = owned_root_scopes(
             self.llbc,
@@ -29131,8 +29137,11 @@ impl<'a> RootStackAnalyzer<'a> {
             &|reg| regular_call_name_path(reg, self.llbc),
             &|reg| self.call_returns_owned_scope(reg),
         );
-        let mut covered: Option<bit_set::BitSet> = None;
+        let covered = owned.covered_blocks(self.llbc, body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
+            if covered.contains(bb_idx) {
+                continue;
+            }
             let mut touches = bb
                 .statements
                 .iter()
@@ -29161,11 +29170,7 @@ impl<'a> RootStackAnalyzer<'a> {
                     Ok(_) => false,
                     Err(_) => true,
                 };
-            if !touches {
-                continue;
-            }
-            let covered = covered.get_or_insert_with(|| owned.covered_blocks(self.llbc, body));
-            if !covered.contains(bb_idx) {
+            if touches {
                 return true;
             }
         }
@@ -56326,6 +56331,123 @@ mod tests {
         assert!(
             plan.scopes.contains(2),
             "a bracket around a callee that touches no slot is erased"
+        );
+    }
+
+    #[test]
+    fn root_stack_analysis_does_not_merge_a_cycle_closed_inside_a_bracket() {
+        use majit_charon_reader::ullbc::RegularCall;
+        // `outer` calls `inner` only inside a bracket it opens and closes, so
+        // `inner`'s pin never reaches `outer`'s caller.  `inner` calls back
+        // into `outer` and then pins for its own caller.  The two form a call
+        // cycle, but only `inner` touches the stack: asking about `inner`
+        // first must not leave `outer` with `inner`'s answer.
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": {"Regular": id}}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": {"Regular": 0}}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |terminator: serde_json::Value| serde_json::json!({"statements": [], "terminator": {"kind": terminator}});
+        let body = |blocks: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+                "body": blocks
+            })
+        };
+        let fun = |def_id: u64, path: &[&str], body: Option<serde_json::Value>| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                    "span": span(),
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                },
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [],
+                    "output": {"Tuple": []}
+                },
+                "body": match body {
+                    Some(b) => serde_json::json!({"Unstructured": b}),
+                    None => serde_json::json!("Missing"),
+                }
+            })
+        };
+        let ret = || block(serde_json::json!("Return"));
+        let funs = vec![
+            fun(0, &["pyre_object", "gc_roots", "RootScope", "drop"], None),
+            fun(1, &["pyre_object", "gc_roots", "push_roots"], None),
+            fun(2, &["pyre_object", "gc_roots", "pin_root"], None),
+            //   bb0: _2 = push_roots() -> bb1
+            //   bb1: _3 = inner(_1)    -> bb2
+            //   bb2: drop(_2)          -> bb3
+            //   bb3: return
+            fun(
+                3,
+                &["pyre_object", "fixture", "outer"],
+                Some(body(vec![
+                    block(call(1, vec![], 2, 1)),
+                    block(call(4, vec![copy(1)], 3, 2)),
+                    block(drop_guard(2, 3)),
+                    ret(),
+                ])),
+            ),
+            //   bb0: _2 = outer(_1)    -> bb1
+            //   bb1: _3 = pin_root(_1) -> bb2
+            //   bb2: return
+            fun(
+                4,
+                &["pyre_object", "fixture", "inner"],
+                Some(body(vec![
+                    block(call(3, vec![copy(1)], 2, 1)),
+                    block(call(2, vec![copy(1)], 3, 2)),
+                    ret(),
+                ])),
+            ),
+        ];
+        let llbc = llbc_with_types("pyre_object", vec![], funs);
+        let direct = |id: u64| -> RegularCall {
+            serde_json::from_value(
+                serde_json::json!({"kind": {"Fun": {"Regular": id}}, "generics": null}),
+            )
+            .expect("fixture call parses")
+        };
+        let analyzer = super::RootStackAnalyzer::new(&llbc);
+        assert!(
+            analyzer.regular_call_touches_root_stack(&direct(4)),
+            "inner leaves a pin for its caller"
+        );
+        assert!(
+            !analyzer.regular_call_touches_root_stack(&direct(3)),
+            "outer closes every pin inner leaves, whichever is asked first"
         );
     }
 
