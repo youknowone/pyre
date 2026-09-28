@@ -1417,13 +1417,10 @@ impl OptString {
         // descr=calldescr (possibly None). Op.descr is `Option<DescrRef>`, so
         // encode the None-descr CALL directly instead of bailing.
         let (calldescr, func_addr) = cic.callinfo_for_oopspec(oopspec);
-        let func_const = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let b = ctx.materialize_operand_at(func_const);
-        ctx.make_constant_box(&b, Value::Int(func_addr as i64));
-        let mut call_args = vec![func_const];
-        call_args.extend_from_slice(args);
-        let mut call_args_operand: Vec<Operand> = Vec::with_capacity(call_args.len());
-        for a in &call_args {
+        // `generate_modified_call`: `[ConstInt(func)] + args`
+        let mut call_args_operand: Vec<Operand> = Vec::with_capacity(args.len() + 1);
+        call_args_operand.push(Operand::const_(Const::Int(func_addr as i64)));
+        for a in args {
             call_args_operand.push(ctx.materialize_operand_at(*a));
         }
         // vstring.py:854: replace_op_with(result, rop.CALL_I, [...], descr=calldescr)
