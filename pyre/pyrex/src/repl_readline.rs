@@ -10,6 +10,8 @@ use rustyline::{CompletionType, Config, Context, Editor, Helper};
 
 pub enum ReadlineResult {
     Line(String),
+    /// The input ended inside this line, before its newline.
+    Partial(String),
     Eof,
     Interrupt,
     Io(std::io::Error),
@@ -147,11 +149,12 @@ fn read_basic_line(prompt: &str) -> ReadlineResult {
     match io::stdin().read_line(&mut line) {
         Ok(0) => ReadlineResult::Eof,
         Ok(_) => {
-            if line.ends_with('\n') {
+            if !line.ends_with('\n') {
+                return ReadlineResult::Partial(line);
+            }
+            line.pop();
+            if line.ends_with('\r') {
                 line.pop();
-                if line.ends_with('\r') {
-                    line.pop();
-                }
             }
             ReadlineResult::Line(line)
         }
