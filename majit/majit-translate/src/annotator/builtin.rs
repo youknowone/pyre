@@ -1626,12 +1626,7 @@ fn cast_instance_intrinsic(
             crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
         )
     } else if majit_ir::descr::is_shaped_tuple_name(&root) {
-        // A Rust tuple `Tuple<A,B>` is the RPython tuple `(A,B)`.
-        let items = root
-            .strip_prefix("Tuple<")
-            .and_then(|rest| rest.strip_suffix('>'))
-            .unwrap_or_default();
-        bk.project_struct_field_type(&format!("({items})"))
+        bk.project_shaped_tuple(&root)
     } else {
         bk.project_struct_field_type(&root)
     };

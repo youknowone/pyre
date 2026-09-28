@@ -4066,6 +4066,15 @@ pub(crate) fn derive_subject_inputcells(
                     cells.push(bk.project_struct_field_type(root));
                     continue;
                 }
+                // A tuple param carries its `Tuple<A,B>` shape; its `.N`
+                // reads are `getitem`s on the RPython tuple (`rtuple.py`),
+                // so seed the `SomeTuple`, not the shape's nominal classdef.
+                if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                    && majit_ir::descr::is_shaped_tuple_name(root)
+                {
+                    cells.push(bk.project_shaped_tuple(root));
+                    continue;
+                }
                 // String-typed params are string values, not class
                 // instances: `String` and `str` both map to the byte
                 // string type (`s_str0` = `SomeString(no_nul=True)`,
@@ -5803,6 +5812,45 @@ mod tests {
             .as_ref()
             .expect("source class_root must replace the classdef-less legacy shell");
         assert_eq!(classdef.borrow().name, "PyObject");
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_a_tuple_input_as_sometuple() {
+        let mut graph = LegacyGraph::new("closure::call_once");
+        let entry = graph.startblock;
+        let args = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "args".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("Tuple<i64,f64>".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, args);
+        let bk = Rc::new(Bookkeeper::new());
+        // The shape is also a registered positional class; the tuple arm
+        // must win over its nominal classdef.
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "Tuple<i64,f64>".to_string(),
+            vec![
+                ("__pos_0".to_string(), "i64".to_string()),
+                ("__pos_1".to_string(), "f64".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells =
+            derive_subject_inputcells(&graph, Some(&bk)).expect("a tuple-shaped input must seed");
+        let SomeValue::Tuple(tuple) = &cells[0] else {
+            panic!("a Tuple<..> input must seed SomeTuple, got {:?}", cells[0])
+        };
+        assert_eq!(tuple.items.len(), 2);
+        assert!(matches!(tuple.items[0], SomeValue::Integer(_)));
+        assert!(matches!(tuple.items[1], SomeValue::Float(_)));
     }
 
     #[test]

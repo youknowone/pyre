@@ -2688,6 +2688,16 @@ impl Bookkeeper {
             .is_some_and(|reg| reg.owner_or_variant_has_field(root, name))
     }
 
+    /// A Rust tuple of shape `Tuple<A,B>` is the RPython tuple `(A,B)`:
+    /// the `SomeTuple` of its projected items.
+    pub fn project_shaped_tuple(self: &Rc<Self>, shape: &str) -> SomeValue {
+        let items = shape
+            .strip_prefix("Tuple<")
+            .and_then(|rest| rest.strip_suffix('>'))
+            .unwrap_or_default();
+        self.project_struct_field_type(&format!("({items})"))
+    }
+
     /// TODO: no upstream equivalent.  Project a Rust type
     /// string (`"Vec<i32>"`, `"Option<PyFrame>"`, `"HashMap<String,
     /// Box<W_Obj>>"`, …) into a `SomeValue` matching what RPython

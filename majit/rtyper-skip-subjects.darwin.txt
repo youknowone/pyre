@@ -67,7 +67,6 @@ two-phase-never-a-subject	pyre_interpreter::argument::<Impl>::positional_only
 two-phase-never-a-subject	pyre_interpreter::argument::check_not_duplicate_kwargs
 two-phase-never-a-subject	pyre_interpreter::argument::combine_starargs_wrapped
 two-phase-never-a-subject	pyre_interpreter::argument::combine_starstarargs_wrapped
-two-phase-never-a-subject	pyre_interpreter::argument::combine_starstarargs_wrapped::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::<Impl>::jit_merge_point
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::<Impl>::release
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::_get_bases
@@ -1039,7 +1038,6 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::truediv
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::truediv_impl
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_call_special
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_dispatch_binary_special
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_dispatch_binary_special::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_dispatch_ternary_pow_special
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_dispatch_ternary_pow_special::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_inplace_special
@@ -1304,7 +1302,6 @@ two-phase-never-a-subject	pyre_interpreter::typedef::descr_member_name
 two-phase-never-a-subject	pyre_interpreter::typedef::direct_member_get
 two-phase-never-a-subject	pyre_interpreter::typedef::direct_member_set
 two-phase-never-a-subject	pyre_interpreter::typedef::float_descr_as_integer_ratio
-two-phase-never-a-subject	pyre_interpreter::typedef::float_descr_as_integer_ratio::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::typedef::fsdecode_wtf8
 two-phase-never-a-subject	pyre_interpreter::typedef::fsdecode_wtf8_total
 two-phase-never-a-subject	pyre_interpreter::typedef::getset_property_get

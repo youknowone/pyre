@@ -7073,7 +7073,13 @@ fn pygraph_initial_block(
                     .or_else(|| {
                         let spelling = tyref_to_ast_string(&local.ty, llbc);
                         majit_ir::descr::is_list_container_spelling(&spelling).then_some(spelling)
-                    }),
+                    })
+                    // A tuple param (a closure's `call_once(env, args)`
+                    // args tuple, or `&(A, B)`) is an RPython tuple.
+                    // Carry the same `Tuple<A,B>` shape its `.N` reads
+                    // name as owner, so `derive_subject_inputcells`
+                    // seeds the `SomeTuple` those `getitem`s read.
+                    .or_else(|| tyref_shaped_tuple_root(&local.ty, llbc)),
                 // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
                 // so it takes the non-`Ref` arm and would otherwise carry no
                 // `class_root`.  Its variant-name metadata is a side table
@@ -7131,7 +7137,6 @@ impl<'a> Lowering<'a> {
             pygraph_initial_block(&mut graph, &body.locals, llbc, generics, tombstoned_leaves);
         let n_locals = local_var.len();
         let arg_count = body.locals.arg_count as usize;
-
         // Pre-allocate a Block for each MIR basic block so terminators
         // can refer to successors via stable BlockId. MIR bb0 maps to
         // the FunctionGraph startblock (already exists); the rest are
@@ -38919,6 +38924,15 @@ fn tyref_tuple_suffix(ty: &TyRef, llbc: &Llbc) -> String {
         .unwrap_or_default()
 }
 
+/// The `Tuple<A,B>` shape of a non-unit tuple behind `ty`'s `Ref` layers —
+/// the owner a `(*p).N` read of it names (the read place is the deref'd
+/// tuple) — or `None` for any other type.
+fn tyref_shaped_tuple_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let suffix = tyref_tuple_suffix(&TyRef::Other(node.clone()), llbc);
+    (!suffix.is_empty()).then(|| format!("Tuple{suffix}"))
+}
+
 /// The per-shape suffix for a fixed-size array destination
 /// (`{"Array":[item,len]}`), including both the rendered item type and the
 /// concrete length. Charon's `AggregateKind::Array` head carries neither, so
@@ -46552,8 +46566,9 @@ mod tests {
         primitive_float_const, push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
         scalar_replace_named_struct_aggregates, shaped_array_parts, simplify_lowered_graph,
         static_key_segments, type_decl_is_closure_env, tyref_array_suffix, tyref_is_closure_env,
-        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_attr_value_type,
-        tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
+        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_shaped_tuple_root,
+        tyref_to_attr_value_type, tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
+        tyref_tuple_suffix,
     };
     use crate::flowspace::model::Variable;
     use crate::model::{
@@ -48300,6 +48315,51 @@ mod tests {
             ValueType::Int,
             "RPython history.getkind(Ptr(FuncType)) uses the int bank"
         );
+    }
+
+    #[test]
+    fn a_tuple_param_names_the_shape_its_reads_name() {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [], "fun_decls": [], "global_decls": [],
+                "trait_decls": [], "trait_impls": [],
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let tuple = serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {
+                    "types": [
+                        { "Scalar": { "Integer": { "Signed": "I64" } } },
+                        { "Scalar": "Bool" }
+                    ]
+                }
+            }
+        });
+        let owner = format!(
+            "Tuple{}",
+            tyref_tuple_suffix(&TyRef::Other(tuple.clone()), &llbc)
+        );
+        assert!(majit_ir::descr::is_shaped_tuple_name(&owner), "{owner}");
+        // By value (a closure's args tuple) and behind a borrow (the read
+        // place of `(*p).N` is the deref'd tuple) both name the read owner.
+        let by_value = TyRef::Other(tuple.clone());
+        let borrowed = TyRef::Other(serde_json::json!({ "Ref": ["Erased", tuple, "Shared"] }));
+        assert_eq!(
+            tyref_shaped_tuple_root(&by_value, &llbc),
+            Some(owner.clone())
+        );
+        assert_eq!(tyref_shaped_tuple_root(&borrowed, &llbc), Some(owner));
+        let unit = TyRef::Other(serde_json::json!({
+            "Adt": { "id": 0, "builtin": "Tuple", "generics": { "types": [] } }
+        }));
+        assert_eq!(tyref_shaped_tuple_root(&unit, &llbc), None);
+        let int = TyRef::Other(serde_json::json!({ "Scalar": { "Integer": { "Signed": "I64" } } }));
+        assert_eq!(tyref_shaped_tuple_root(&int, &llbc), None);
     }
 
     #[test]
