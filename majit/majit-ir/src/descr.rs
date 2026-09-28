@@ -3473,8 +3473,8 @@ pub trait LoopTargetDescr: Descr {
     /// the upgraded Weak while the token is still strongly held by the
     /// compile in flight.
     ///
-    /// Default `None` — number-only descrs (`BasicLoopTargetDescr`)
-    /// and a preamble sentinel that never received an owner.
+    /// `None` for a preamble sentinel that never received an owner, or
+    /// once the owner is gone.
     fn original_jitcell_token_handle(
         &self,
     ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
@@ -3497,6 +3497,9 @@ struct BasicLoopTargetDescrState {
     /// `history.py:493 self.original_jitcell_token`. Backfilled at
     /// compile-time once the owning JitCellToken is created.
     original_jitcell_token_number: Option<u64>,
+    /// The owner object itself, weak for the reason given on
+    /// `LoopTargetDescr::original_jitcell_token_handle`.
+    original_jitcell_token: Option<std::sync::Weak<dyn std::any::Any + Send + Sync>>,
 }
 
 #[derive(Debug)]
@@ -3624,6 +3627,23 @@ impl LoopTargetDescr for BasicLoopTargetDescr {
 
     fn set_original_jitcell_token_number(&self, num: u64) {
         self.state.lock().original_jitcell_token_number = Some(num);
+    }
+
+    fn original_jitcell_token_handle(
+        &self,
+    ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.state
+            .lock()
+            .original_jitcell_token
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    fn set_original_jitcell_token_handle(
+        &self,
+        handle: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) {
+        self.state.lock().original_jitcell_token = Some(std::sync::Arc::downgrade(&handle));
     }
 }
 

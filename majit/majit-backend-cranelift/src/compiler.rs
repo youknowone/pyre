@@ -7171,10 +7171,11 @@ fn emit_attached_bridge_dispatch(
 ///
 /// `assembler.py closing_jump` emits `JMP imm(target_token._ll_loop_code)`
 /// once the target is compiled. `LoopTargetDescr::set_dispatch_target` publishes
-/// `(ll_loop_code, label_block_id, target_frame_depth)` once per LABEL and does
-/// not re-point it, so a non-zero code cell at this compile is the address the
-/// JMP immediate would have named. A zero cell is a forward reference and keeps
-/// the runtime loads.
+/// `(ll_loop_code, label_block_id, target_frame_depth)` per LABEL, and only
+/// `publish_merged_entry` re-points it, for a loop that retains a merge source.
+/// For any other target a non-zero code cell at this compile is the address the
+/// JMP immediate would have named. A zero cell is a forward reference and, like
+/// a target that may be re-pointed, keeps the runtime loads.
 #[derive(Clone, Copy)]
 enum ClosingJumpTarget {
     Cells {
@@ -7187,6 +7188,23 @@ enum ClosingJumpTarget {
         label_block_id: u32,
         target_frame_depth: usize,
     },
+}
+
+/// Whether `publish_merged_entry` may later re-point this LABEL's dispatch
+/// cells: its owning loop retained a merge source. An owner that cannot be
+/// reached counts as re-pointable.
+fn loop_target_may_be_repointed(ltd: &dyn majit_ir::LoopTargetDescr) -> bool {
+    let Some(owner) = ltd
+        .original_jitcell_token_handle()
+        .and_then(|handle| handle.downcast::<JitCellToken>().ok())
+    else {
+        return true;
+    };
+    owner
+        .compiled
+        .get()
+        .and_then(|c| c.downcast_ref::<CompiledLoop>())
+        .is_none_or(|compiled| compiled.merge_source.is_some())
 }
 
 fn emit_loop_tail_call(
@@ -19433,7 +19451,10 @@ fn collect_guards(
         // is the same load the runtime reader uses; a non-zero value means
         // `set_dispatch_target` has published the code pointer and, before it,
         // `label_block_id` and `target_frame_depth`. A zero cell is a forward
-        // reference and keeps the three cell addresses.
+        // reference and keeps the three cell addresses. So does a target whose
+        // owning loop retains a merge source: `publish_merged_entry` re-points
+        // its cells at the merged function, and an immediate would keep
+        // entering the code the merge replaced.
         let closing_jump_target = if is_external_jump {
             op.getdescr()
                 .as_ref()
@@ -19442,7 +19463,7 @@ fn collect_guards(
                     let code = unsafe {
                         (*ltd.ll_loop_code_ptr()).load(std::sync::atomic::Ordering::Acquire)
                     };
-                    if code != 0 {
+                    if code != 0 && !loop_target_may_be_repointed(ltd) {
                         ClosingJumpTarget::Baked {
                             ll_loop_code: code,
                             label_block_id: ltd.label_block_id(),
@@ -23239,6 +23260,114 @@ mod tests {
         let got = backend.get_ref_value(&frame, 0);
         assert_eq!(got, moved);
         assert_eq!(unsafe { *(got.0 as *const u64) }, 0xD30F_0005);
+    }
+
+    /// A closing JUMP whose target loop retains a merge source keeps the cell
+    /// dispatch: `publish_merged_entry` re-points the target's cells, and a
+    /// baked immediate would keep entering the pre-merge code.
+    #[test]
+    fn closing_jump_into_merge_source_owner_uses_cells() {
+        let mut backend = CraneliftBackend::new();
+        let label_a = make_label_descr(1_500_296);
+        let enter_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        enter_descr
+            .as_fail_descr()
+            .unwrap()
+            .set_rd_locs(smallvec::smallvec![0u16]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let counter = OpRef::input_arg_int(0);
+        let exit = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        exit.setfailargs(smallvec::smallvec![rb(counter)]);
+        let enter = mk_op_with_descr(
+            OpCode::GuardFalse,
+            &[OpRef::int_op(2)],
+            OpRef::NONE.raw(),
+            enter_descr.clone(),
+        );
+        enter.setfailargs(smallvec::smallvec![rb(counter)]);
+        let ops_a = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[counter],
+                OpRef::NONE.raw(),
+                label_a.clone(),
+            ),
+            mk_op(OpCode::IntGt, &[counter, OpRef::const_int(0)], 1),
+            mk_op(OpCode::IntEq, &[counter, OpRef::const_int(3)], 2),
+            exit,
+            enter,
+            mk_op(OpCode::IntSub, &[counter, OpRef::const_int(1)], 3),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(3)],
+                OpRef::NONE.raw(),
+                label_a.clone(),
+            ),
+        ];
+        let token_a = Arc::new(JitCellToken::new(1_500_296));
+        token_a.record_target_token(label_a.clone());
+        label_a
+            .as_loop_target_descr()
+            .unwrap()
+            .set_original_jitcell_token_handle(token_a.clone());
+        backend.compile_loop(&inputargs, &ops_a, &token_a).unwrap();
+        let owner = token_a
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        assert!(owner.merge_source.is_some());
+
+        let label_b = make_label_descr(1_500_297);
+        let ops_b = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[counter],
+                OpRef::NONE.raw(),
+                label_b.clone(),
+            ),
+            mk_op(OpCode::IntAdd, &[counter, OpRef::const_int(5)], 1),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label_a.clone(),
+            ),
+        ];
+        let token_b = JitCellToken::new(1_500_297);
+        token_b.record_target_token(label_b);
+        backend.compile_loop(&inputargs, &ops_b, &token_b).unwrap();
+        assert!(
+            backend.last_body_clif.contains("atomic_load"),
+            "a JUMP into a merge-source owner must read its dispatch cells"
+        );
+
+        let entry_before = owner.entry_code_ptr.load(Ordering::Acquire);
+        let bridge = vec![
+            mk_op(OpCode::IntSub, &[counter, OpRef::const_int(2)], 1),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label_a,
+            ),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&enter_descr),
+                &inputargs,
+                &bridge,
+                &token_a,
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_ne!(owner.entry_code_ptr.load(Ordering::Acquire), entry_before);
+
+        // 1 + 5 = 6 enters A: 6, 5, 4, 3 (bridge -2) -> 1, 0 exits.
+        let frame = backend.execute_token(&token_b, &[Value::Int(1)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
     }
 
     /// `demoted_failarg_slots` is trace-global while `loop_phi_keep` is per
@@ -28712,7 +28841,11 @@ mod tests {
         root_constants.insert(100, 0);
         backend.set_constants(root_constants);
 
-        let token = JitCellToken::new(1_500_361);
+        let token = Arc::new(JitCellToken::new(1_500_361));
+        loop_descr
+            .as_loop_target_descr()
+            .unwrap()
+            .set_original_jitcell_token_handle(token.clone());
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Int(0)]);
