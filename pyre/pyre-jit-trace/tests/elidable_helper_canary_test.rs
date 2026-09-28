@@ -552,13 +552,16 @@ fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
 fn instance_getdictvalue_wrapper_null_receiver_returns_py_null() {
     // ABI contract: a null receiver / name returns PY_NULL (no deref).
     assert_eq!(
-        jit_instance_getdictvalue(0, 0),
-        pyre_object::PY_NULL as i64,
+        jit_instance_getdictvalue(pyre_object::PY_NULL, pyre_object::PY_NULL),
+        pyre_object::PY_NULL,
         "null receiver must short-circuit to PY_NULL",
     );
     assert_eq!(
-        jit_instance_getdictvalue(0, 0x4A3E_4444),
-        pyre_object::PY_NULL as i64,
+        jit_instance_getdictvalue(
+            pyre_object::PY_NULL,
+            0x4A3E_4444 as pyre_object::PyObjectRef
+        ),
+        pyre_object::PY_NULL,
         "null receiver must short-circuit to PY_NULL even with a non-null name",
     );
 }

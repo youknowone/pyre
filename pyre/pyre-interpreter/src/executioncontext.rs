@@ -1299,7 +1299,7 @@ impl ExecutionContext {
             // the ticker is negative (a signal / fired action), so the
             // residual call adds nothing to the no-signal hot path.
             let self_ptr = self as *mut ExecutionContext;
-            if perform_pending_actions(self_ptr as i64, frame as i64) != 0
+            if perform_pending_actions(self_ptr, frame) != 0
                 && let Some(err) = crate::call::take_call_error()
             {
                 return Err(err);
@@ -1496,7 +1496,7 @@ impl ExecutionContext {
             // through the same residual boundary as `bytecode_trace` so a
             // signal delivered during exception handling propagates.
             let self_ptr = self as *mut ExecutionContext;
-            if perform_pending_actions(self_ptr as i64, frame as i64) != 0
+            if perform_pending_actions(self_ptr, frame) != 0
                 && let Some(err) = crate::call::take_call_error()
             {
                 return Err(err);
@@ -2155,12 +2155,10 @@ fn has_pending_signal_action() -> bool {
 /// the error in `PENDING_CALL_ERROR` for the caller to re-raise — the
 /// same cross-residual error convention as `call_function_impl`.
 #[majit_macros::dont_look_inside]
-pub extern "C" fn perform_pending_actions(ec_ptr: i64, frame_ptr: i64) -> i64 {
-    let ec = ec_ptr as *mut ExecutionContext;
+pub extern "C" fn perform_pending_actions(ec: *mut ExecutionContext, frame: *mut PyFrame) -> i64 {
     if ec.is_null() {
         return 0;
     }
-    let frame = frame_ptr as *mut PyFrame;
     match unsafe { (*ec).perform_actions(frame) } {
         Ok(()) => 0,
         Err(err) => {
@@ -2857,10 +2855,10 @@ pub fn space_decrement_ticker(ec: &mut ExecutionContext, by: isize) -> isize {
 /// The residual lowering types a value-returning call as `(i64, i64) -> i64`;
 /// the Rust signature's reference and `isize` are narrower than a word on
 /// wasm32, where `call_indirect` type-checks its callee.
-pub extern "C" fn space_decrement_ticker_jit_abi(ec: i64, by: i64) -> i64 {
+pub extern "C" fn space_decrement_ticker_jit_abi(ec: *mut ExecutionContext, by: i64) -> i64 {
     // SAFETY: the residual's first slot is the execution context the walked
     // graph read it from; it outlives the call.
-    let ec = unsafe { &mut *(ec as *mut ExecutionContext) };
+    let ec = unsafe { &mut *(ec) };
     space_decrement_ticker(ec, by as isize) as i64
 }
 

@@ -1005,8 +1005,9 @@ pub(crate) fn compiler_bigint_to_rbigint(value: &malachite_bigint::BigInt) -> Py
 /// residual supplies the equivalent single GC reference without tracing into
 /// Malachite internals.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_compiler_bigint_to_rbigint(value: i64) -> *mut PyBigInt {
-    let value = value as *const malachite_bigint::BigInt;
+pub extern "C" fn jit_compiler_bigint_to_rbigint(
+    value: *const malachite_bigint::BigInt,
+) -> *mut PyBigInt {
     let converted = unsafe { compiler_bigint_to_rbigint(&*value) };
     pyre_object::longobject::alloc_bigint_nursery_collecting(converted)
 }

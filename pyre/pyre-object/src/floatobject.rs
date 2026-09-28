@@ -192,9 +192,9 @@ pub unsafe fn w_float_get_value(obj: PyObjectRef) -> f64 {
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_w_float_new(value_bits: i64) -> i64 {
+pub extern "C" fn jit_w_float_new(value_bits: i64) -> PyObjectRef {
     let value = f64::from_bits(value_bits as u64);
-    w_float_new(value) as i64
+    w_float_new(value)
 }
 
 #[cfg(test)]

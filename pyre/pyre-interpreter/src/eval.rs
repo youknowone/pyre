@@ -322,8 +322,8 @@ pub fn frame_anchor_release(depth: usize) {
 /// Each spelling gets its own bridge because `jit_trace_fnaddrs()` reads one
 /// address back as one function: two unrelated paths sharing an address is
 /// what `registered_paths_sharing_an_address_are_alias_spellings` refuses.
-pub extern "C" fn frame_anchor_push_jit_abi(frame: i64) -> i64 {
-    frame_anchor_push(frame as *mut PyFrame) as i64
+pub extern "C" fn frame_anchor_push_jit_abi(frame: *mut PyFrame) -> i64 {
+    frame_anchor_push(frame) as i64
 }
 
 /// One-word residual-call ABI for [`frame_anchor_live`].

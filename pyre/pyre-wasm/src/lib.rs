@@ -157,12 +157,14 @@ mod residual_host {
     /// an `r` argument may be a real `i32` pointer, a void descriptor may name
     /// a word-returning target, and guessing either signature traps at a wasm
     /// `call_indirect`.  These targets are different: every one is declared as
-    /// an explicit `pub extern "C"` wrapper, `(i64, ...) -> i64` or `()`, and the CPU
-    /// function table stores those exact function addresses.  Comparing the
-    /// table index (`fn as usize` on wasm32) therefore proves both the callee
-    /// identity and its ABI.  Calling the named wrapper directly matches the
-    /// native blackhole dispatch while avoiding a guest -> host -> guest
-    /// reflection round-trip.
+    /// an explicit `pub extern "C"` wrapper whose parameters and result are
+    /// `i64` words or pointers, and the CPU function table stores those exact
+    /// function addresses.  Comparing the table index (`fn as usize` on
+    /// wasm32) therefore proves the callee identity, and the Rust call below
+    /// converts each word to the declared parameter type ([`WordArg`]) and the
+    /// result back to a word ([`WordRet`]).  Calling the named wrapper directly
+    /// matches the native blackhole dispatch while avoiding a guest -> host ->
+    /// guest reflection round-trip.
     ///
     /// Keep this an exact-function allow-list, not a signature inference: the
     /// macro spells one line per callee so the arity and the symbol stay
@@ -171,13 +173,45 @@ mod residual_host {
     ///
     /// A `()` callee is listed separately and returns 0.  The reflective host
     /// writes 0 when the wasm result list is empty.
+    trait WordArg {
+        fn from_word(word: i64) -> Self;
+    }
+    impl WordArg for i64 {
+        fn from_word(word: i64) -> Self {
+            word
+        }
+    }
+    impl<T> WordArg for *mut T {
+        fn from_word(word: i64) -> Self {
+            word as usize as *mut T
+        }
+    }
+    impl<T> WordArg for *const T {
+        fn from_word(word: i64) -> Self {
+            word as usize as *const T
+        }
+    }
+    trait WordRet {
+        fn into_word(self) -> i64;
+    }
+    impl WordRet for i64 {
+        fn into_word(self) -> i64 {
+            self
+        }
+    }
+    impl<T> WordRet for *mut T {
+        fn into_word(self) -> i64 {
+            self as usize as i64
+        }
+    }
+
     fn direct_uniform_i64_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
         macro_rules! uniform_i64_allow_list {
             ($( [$($arg:ident),*] => $callee:path ),* $(,)?) => {
                 match args {
                     $(
                         [$($arg),*] if func_ptr == $callee as usize => {
-                            Some($callee($(*$arg),*))
+                            Some(WordRet::into_word($callee($(WordArg::from_word(*$arg)),*)))
                         }
                     )*
                     _ => None,
@@ -189,7 +223,7 @@ mod residual_host {
                 match args {
                     $(
                         [$($arg),*] if func_ptr == $callee as usize => {
-                            $callee($(*$arg),*);
+                            $callee($(WordArg::from_word(*$arg)),*);
                             Some(0)
                         }
                     )*

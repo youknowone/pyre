@@ -913,8 +913,8 @@ pub fn reload_top_root(root: PyObjectRef) -> PyObjectRef {
 /// type-checks its callee. Same exception effect as [`reload_top_root`]:
 /// the body only reads the shadow-stack top.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub extern "C" fn reload_top_root_jit_abi(root: i64) -> i64 {
-    reload_top_root(root as PyObjectRef) as i64
+pub extern "C" fn reload_top_root_jit_abi(root: PyObjectRef) -> i64 {
+    reload_top_root(root) as i64
 }
 
 /// Publish a complete translated livevar set before performing any

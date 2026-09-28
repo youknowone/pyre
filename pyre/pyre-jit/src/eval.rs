@@ -9316,19 +9316,15 @@ fn unpackiterable_ll_portal_runner(
 /// `llmemory.cast_ptr_to_adr(portal_runner_ptr)` on the driver.
 #[majit_macros::jit_may_force]
 pub extern "C" fn ll_unpackiterable_portal_runner_shim(
-    greenkey: i64,
-    w_iterator: i64,
-    items: i64,
-) -> i64 {
-    match unpackiterable_ll_portal_runner(
-        greenkey as pyre_object::PyObjectRef,
-        w_iterator as pyre_object::PyObjectRef,
-        items as pyre_object::PyObjectRef,
-    ) {
-        Ok(result) => result as i64,
+    greenkey: pyre_object::PyObjectRef,
+    w_iterator: pyre_object::PyObjectRef,
+    items: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    match unpackiterable_ll_portal_runner(greenkey, w_iterator, items) {
+        Ok(result) => result,
         Err(mut err) => {
             pyre_interpreter::stack_check::park_jit_pending_error(err);
-            0
+            pyre_object::PY_NULL
         }
     }
 }
@@ -9360,12 +9356,12 @@ fn generatorentry_ll_portal_runner(
 
 /// C ABI of [`generatorentry_ll_portal_runner`].
 #[majit_macros::jit_may_force]
-pub extern "C" fn ll_generatorentry_portal_runner_shim(pycode: i64, w_gen: i64, w_arg: i64) -> i64 {
-    match generatorentry_ll_portal_runner(
-        pycode as pyre_object::PyObjectRef,
-        w_gen as pyre_object::PyObjectRef,
-        w_arg as pyre_object::PyObjectRef,
-    ) {
+pub extern "C" fn ll_generatorentry_portal_runner_shim(
+    pycode: pyre_object::PyObjectRef,
+    w_gen: pyre_object::PyObjectRef,
+    w_arg: pyre_object::PyObjectRef,
+) -> i64 {
+    match generatorentry_ll_portal_runner(pycode, w_gen, w_arg) {
         Ok(result) => {
             // `compile_tmp_callback` is `CALL` + `GUARD_NO_EXCEPTION` +
             // `FINISH`. The caller's loop records the same
@@ -9382,7 +9378,7 @@ pub extern "C" fn ll_generatorentry_portal_runner_shim(pycode: i64, w_gen: i64, 
             // only in the interpreter pending slot leaves that guard green
             // and the null result fails the following `GuardTrue`.
             let exc = err.to_exc_object();
-            crate::call_jit::publish_residual_call_exception(exc as i64);
+            crate::call_jit::publish_residual_call_exception(exc);
             0
         }
     }
@@ -9793,7 +9789,7 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
             // observes the backend exception cell; the latter observes
             // `BH_LAST_EXC_VALUE` after the C ABI call returns. This is the
             // same dual-executor boundary as every may-force residual helper.
-            crate::call_jit::publish_residual_call_exception(err.to_exc_object() as i64);
+            crate::call_jit::publish_residual_call_exception(err.to_exc_object());
             pyre_object::PY_NULL
         }
     }

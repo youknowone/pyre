@@ -354,8 +354,11 @@ pub fn w_str_from_storage_and_length(
 
 /// Residual ABI for [`w_str_from_storage_and_length`].
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_w_str_from_storage_and_length(value: i64, length: i64) -> i64 {
-    w_str_from_storage_and_length(value as *mut UnicodeValueStorage, length as usize) as i64
+pub extern "C" fn jit_w_str_from_storage_and_length(
+    value: *mut UnicodeValueStorage,
+    length: i64,
+) -> PyObjectRef {
+    w_str_from_storage_and_length(value, length as usize)
 }
 
 /// Allocate a new W_UnicodeObject from a WTF-8 buffer that may carry lone
@@ -446,13 +449,13 @@ pub unsafe fn w_str_slice_codepoints(
 /// `a` and `b` must point to valid `W_UnicodeObject`s.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_str_concat(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
-    let sa = unsafe { w_str_storage(a) } as i64;
-    let sb = unsafe { w_str_storage(b) } as i64;
+    let sa = unsafe { w_str_storage(a) };
+    let sb = unsafe { w_str_storage(b) };
     let payload = crate::lowlevel_string::jit_ll_strconcat(sa, sb);
     // `W_UnicodeObject(self._utf8 + w_other._utf8, self._len() + w_other._len())`
     let length =
         unsafe { (*(a as *const W_UnicodeObject)).len + (*(b as *const W_UnicodeObject)).len };
-    w_str_from_storage_and_length(payload as *mut UnicodeValueStorage, length)
+    w_str_from_storage_and_length(payload, length)
 }
 
 /// Collectable `w_str_from_wtf8` for dynamic strings — see [`w_str_new_managed`].
@@ -1327,8 +1330,8 @@ pub unsafe fn is_str(obj: PyObjectRef) -> bool {
 }
 
 #[majit_macros::elidable]
-pub extern "C" fn jit_str_concat(a: i64, b: i64) -> i64 {
-    unsafe { w_str_concat(a as PyObjectRef, b as PyObjectRef) as i64 }
+pub extern "C" fn jit_str_concat(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    unsafe { w_str_concat(a, b) }
 }
 
 /// `rstr.py LLHelpers.ll_str_mul` — `@jit.elidable` on the STR payload.
@@ -1339,8 +1342,7 @@ pub extern "C" fn jit_str_concat(a: i64, b: i64) -> i64 {
 /// `GuardNoException` that follows the call and store a null ref, so the
 /// overflow aborts until MemoryError propagation is ported; `"" * n` does
 /// not loop.
-pub extern "C" fn jit_str_repeat(s: i64, n: i64) -> i64 {
-    let s = s as PyObjectRef;
+pub extern "C" fn jit_str_repeat(s: PyObjectRef, n: i64) -> PyObjectRef {
     unsafe {
         let sv = w_str_get_wtf8(s);
         let count = if n < 0 { 0 } else { n as usize };
@@ -1354,7 +1356,7 @@ pub extern "C" fn jit_str_repeat(s: i64, n: i64) -> i64 {
                 result.push_wtf8(sv);
             }
         }
-        w_str_from_wtf8_managed(result) as i64
+        w_str_from_wtf8_managed(result)
     }
 }
 
@@ -1370,8 +1372,7 @@ pub extern "C" fn jit_str_compare(a: PyObjectRef, b: PyObjectRef) -> i64 {
 }
 
 #[majit_macros::elidable]
-pub extern "C" fn jit_str_is_true(s: i64) -> i64 {
-    let s = s as PyObjectRef;
+pub extern "C" fn jit_str_is_true(s: PyObjectRef) -> i64 {
     unsafe { (w_str_len(s) != 0) as i64 }
 }
 
@@ -1510,27 +1511,13 @@ pub unsafe fn endswith(s1: PyObjectRef, s2: PyObjectRef, start: i64, end: i64) -
 /// the code-point match.  The walker pins both operands as exact `str`
 /// before this call, so a tuple needle or a non-str stays on the residual.
 #[majit_macros::elidable]
-pub extern "C" fn jit_str_startswith(s: i64, prefix: i64) -> i64 {
-    unsafe {
-        i64::from(startswith(
-            s as PyObjectRef,
-            prefix as PyObjectRef,
-            0,
-            i64::MAX,
-        ))
-    }
+pub extern "C" fn jit_str_startswith(s: PyObjectRef, prefix: PyObjectRef) -> i64 {
+    unsafe { i64::from(startswith(s, prefix, 0, i64::MAX)) }
 }
 
 #[majit_macros::elidable]
-pub extern "C" fn jit_str_endswith(s: i64, suffix: i64) -> i64 {
-    unsafe {
-        i64::from(endswith(
-            s as PyObjectRef,
-            suffix as PyObjectRef,
-            0,
-            i64::MAX,
-        ))
-    }
+pub extern "C" fn jit_str_endswith(s: PyObjectRef, suffix: PyObjectRef) -> i64 {
+    unsafe { i64::from(endswith(s, suffix, 0, i64::MAX)) }
 }
 
 /// `s.__contains__(sub)` / `sub in s` on two exact `str`s.
@@ -1593,19 +1580,18 @@ pub extern "C" fn jit_str_rfind_bounds(
 /// the whole string (`start == 0 and stop >= len`), and `is_w` then
 /// reports `s[:] is s` via `_utf8` identity.  Not elidable: two
 /// `s[1:4]` sites allocate two wrappers / payloads (`is_w` of `_len() > 1`).
-pub extern "C" fn jit_str_slice(s: i64, start: i64, end: i64) -> i64 {
-    let s = s as PyObjectRef;
+pub extern "C" fn jit_str_slice(s: PyObjectRef, start: i64, end: i64) -> PyObjectRef {
     unsafe {
         let Some((lo, hi)) = str_byte_window(s, start, end) else {
             // `_empty()`.  `w_str_new` is the immortal constructor: from a
             // residual call it would leave one unreclaimable header and
             // payload behind per `s[5:2]`.
-            return w_str_new_managed("") as i64;
+            return w_str_new_managed("");
         };
         let hay = w_str_get_wtf8(s);
         let part = rustpython_wtf8::Wtf8::from_bytes(&hay.as_bytes()[lo..hi])
             .expect("code-point-aligned slice is WTF-8");
-        w_str_cut(s, part) as i64
+        w_str_cut(s, part)
     }
 }
 
@@ -1708,10 +1694,10 @@ fn jit_str_search_bounds(
 /// `str(i)` walker splits the same pair so the wrap is a fresh
 /// `W_UnicodeObject` (`descr_repr`).
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_int_str(v: i64) -> i64 {
+pub extern "C" fn jit_int_str(v: i64) -> PyObjectRef {
     let payload = crate::lowlevel_string::jit_ll_int2dec(v);
     let length = crate::lowlevel_string::bh_lowlevel_string_len(payload as i64);
-    w_str_from_storage_and_length(payload, length) as i64
+    w_str_from_storage_and_length(payload, length)
 }
 
 /// `unicodeobject.py next_codepoint_pos_dont_look_inside` — `@jit.elidable`.
@@ -1785,26 +1771,25 @@ pub unsafe fn w_str_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef>
 /// allocation, so `call.py getcalldescr` picks its `cr == "mem"` branch
 /// rather than the conservative can-raise one.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_str_getitem(s: i64, index: i64) -> i64 {
-    let obj = s as PyObjectRef;
+pub extern "C" fn jit_str_getitem(obj: PyObjectRef, index: i64) -> PyObjectRef {
     // The index is a machine int, 64-bit on every target, while `usize` is
     // 32 bits on the wasm guest.  Converting is what declines a negative
     // index and one past `usize::MAX` alike: an `as` cast would truncate
     // `2**32` to `0` and answer `s[0]` where the interpreter raises
     // `IndexError`.
     let Ok(index) = usize::try_from(index) else {
-        return PY_NULL as i64;
+        return PY_NULL;
     };
     if obj.is_null() {
-        return PY_NULL as i64;
+        return PY_NULL;
     }
     unsafe {
         if !crate::pyobject::is_exact_type(obj, &crate::pyobject::STR_TYPE) {
-            return PY_NULL as i64;
+            return PY_NULL;
         }
         match w_str_codepoint_at(obj, index) {
-            Some(code_point) => w_str_from_codepoint(code_point.to_u32()) as i64,
-            None => PY_NULL as i64,
+            Some(code_point) => w_str_from_codepoint(code_point.to_u32()),
+            None => PY_NULL,
         }
     }
 }
@@ -1959,11 +1944,11 @@ mod tests {
         assert_eq!(jit_str_count_bounds(hay, needle, 0, i64::MAX), 2);
         assert_eq!(jit_str_count_bounds(hay, needle, 2, 6), 1);
         assert_eq!(jit_str_find_bounds(hay, needle, 2, 6), 5);
-        let sliced = jit_str_slice(hay as i64, 1, 4) as PyObjectRef;
+        let sliced = jit_str_slice(hay, 1, 4);
         unsafe {
             assert_eq!(w_str_get_wtf8(sliced), "二三四");
         }
-        let full = jit_str_slice(hay as i64, 0, unsafe { w_str_len(hay) } as i64) as PyObjectRef;
+        let full = jit_str_slice(hay, 0, unsafe { w_str_len(hay) } as i64);
         assert!(
             std::ptr::eq(full, hay),
             "full-window slice must reuse the receiver (`ll_stringslice_startstop` / `is_w`)"
@@ -2062,16 +2047,16 @@ mod tests {
     fn test_jit_string_helpers_share_str_semantics() {
         let a = w_str_new("ab");
         let b = w_str_new("cd");
-        let cat = jit_str_concat(a as i64, b as i64) as PyObjectRef;
-        let rep = jit_str_repeat(a as i64, 3) as PyObjectRef;
+        let cat = jit_str_concat(a, b);
+        let rep = jit_str_repeat(a, 3);
         unsafe {
             assert_eq!(w_str_get_wtf8(cat), "abcd");
             assert_eq!(w_str_get_wtf8(rep), "ababab");
             assert!(jit_str_compare(a, b) < 0);
             assert_eq!(jit_str_compare(a, a), 0);
             assert!(jit_str_compare(b, a) > 0);
-            assert_eq!(jit_str_is_true(a as i64), 1);
-            assert_eq!(jit_str_is_true(w_str_new("") as i64), 0);
+            assert_eq!(jit_str_is_true(a), 1);
+            assert_eq!(jit_str_is_true(w_str_new("")), 0);
         }
     }
 
@@ -2114,11 +2099,11 @@ mod tests {
     #[test]
     fn test_jit_int_str_renders_decimal() {
         unsafe {
-            assert_eq!(w_str_get_wtf8(jit_int_str(0) as PyObjectRef), "0");
-            assert_eq!(w_str_get_wtf8(jit_int_str(123) as PyObjectRef), "123");
-            assert_eq!(w_str_get_wtf8(jit_int_str(-7) as PyObjectRef), "-7");
+            assert_eq!(w_str_get_wtf8(jit_int_str(0)), "0");
+            assert_eq!(w_str_get_wtf8(jit_int_str(123)), "123");
+            assert_eq!(w_str_get_wtf8(jit_int_str(-7)), "-7");
             assert_eq!(
-                w_str_get_wtf8(jit_int_str(i64::MIN) as PyObjectRef),
+                w_str_get_wtf8(jit_int_str(i64::MIN)),
                 "-9223372036854775808",
             );
         }

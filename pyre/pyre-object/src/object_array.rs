@@ -215,8 +215,13 @@ pub unsafe fn items_block_set_ref(block: *mut ItemsBlock, index: usize, value: P
 /// TYPE_INFO row supplies the array token and `_contains_gcptr(TYPE.OF)` bit;
 /// a raw fallback block uses the `GcArray(PyObjectRef)` token this adapter
 /// boundary allocates. `ptr::copy` has memmove's overlap contract.
-pub extern "C" fn jit_ll_arraymove(array: i64, source_start: i64, dest_start: i64, length: i64) {
-    if array == 0 || length <= 0 {
+pub extern "C" fn jit_ll_arraymove(
+    array: crate::PyObjectRef,
+    source_start: i64,
+    dest_start: i64,
+    length: i64,
+) {
+    if array.is_null() || length <= 0 {
         return;
     }
     assert!(
@@ -282,13 +287,13 @@ pub extern "C" fn jit_ll_arraymove(array: i64, source_start: i64, dest_start: i6
 /// `writebarrier_before_copy` hook (not yet published through gc_hook);
 /// remembering dest is the safe side of that barrier.
 pub extern "C" fn jit_ll_arraycopy(
-    source: i64,
-    dest: i64,
+    source: crate::PyObjectRef,
+    dest: crate::PyObjectRef,
     source_start: i64,
     dest_start: i64,
     length: i64,
 ) {
-    if source == 0 || dest == 0 || length <= 0 {
+    if source.is_null() || dest.is_null() || length <= 0 {
         return;
     }
     assert!(
@@ -1916,7 +1921,7 @@ mod tests {
             ]
         };
         let left = unsafe { alloc_list_items_block(&values()) };
-        jit_ll_arraymove(left as i64, 1, 0, 3);
+        jit_ll_arraymove(left as crate::PyObjectRef, 1, 0, 3);
         assert_eq!(
             unsafe { std::slice::from_raw_parts(items_block_items_base(left), 4) },
             &[
@@ -1929,7 +1934,7 @@ mod tests {
         unsafe { dealloc_list_items_block(left) };
 
         let right = unsafe { alloc_list_items_block(&values()) };
-        jit_ll_arraymove(right as i64, 0, 1, 3);
+        jit_ll_arraymove(right as crate::PyObjectRef, 0, 1, 3);
         assert_eq!(
             unsafe { std::slice::from_raw_parts(items_block_items_base(right), 4) },
             &[
@@ -1944,7 +1949,7 @@ mod tests {
         // `rgc.ll_arraymove` keeps this case as an explicit `copy_item`
         // before entering the barrier-plus-memmove body.
         let one = unsafe { alloc_list_items_block(&values()) };
-        jit_ll_arraymove(one as i64, 3, 0, 1);
+        jit_ll_arraymove(one as crate::PyObjectRef, 3, 0, 1);
         assert_eq!(
             unsafe { std::slice::from_raw_parts(items_block_items_base(one), 4) },
             &[
@@ -1975,7 +1980,13 @@ mod tests {
                 0usize as PyObjectRef,
             ])
         };
-        jit_ll_arraycopy(src as i64, dst as i64, 1, 0, 3);
+        jit_ll_arraycopy(
+            src as crate::PyObjectRef,
+            dst as crate::PyObjectRef,
+            1,
+            0,
+            3,
+        );
         assert_eq!(
             unsafe { std::slice::from_raw_parts(items_block_items_base(dst), 4) },
             &[

@@ -3671,8 +3671,8 @@ pub unsafe fn drain_list_append(obj: PyObjectRef, value: PyObjectRef) {
 /// gives the table target the same `(i64, i64) -> ()` signature emitted by the
 /// wasm backend.
 #[inline(never)]
-pub extern "C" fn jit_drain_list_append(obj: i64, value: i64) {
-    unsafe { drain_list_append(obj as PyObjectRef, value as PyObjectRef) }
+pub extern "C" fn jit_drain_list_append(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe { drain_list_append(obj, value) }
 }
 
 /// Set the live length of an Integer-strategy list without reallocating
@@ -5759,25 +5759,25 @@ unsafe fn w_list_setslice_inner(
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_list_append(list: i64, item: i64) -> i64 {
-    unsafe { w_list_append(list as PyObjectRef, item as PyObjectRef) };
+pub extern "C" fn jit_list_append(list: PyObjectRef, item: PyObjectRef) -> i64 {
+    unsafe { w_list_append(list, item) };
     0
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_list_getitem(list: i64, index: i64) -> i64 {
+pub extern "C" fn jit_list_getitem(list: PyObjectRef, index: i64) -> PyObjectRef {
     unsafe {
-        match w_list_getitem(list as PyObjectRef, index) {
-            Some(value) => value as i64,
+        match w_list_getitem(list, index) {
+            Some(value) => value,
             None => panic!("list index out of range in JIT"),
         }
     }
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_list_setitem(list: i64, index: i64, value: i64) -> i64 {
+pub extern "C" fn jit_list_setitem(list: PyObjectRef, index: i64, value: PyObjectRef) -> i64 {
     unsafe {
-        if !w_list_setitem(list as PyObjectRef, index, value as PyObjectRef) {
+        if !w_list_setitem(list, index, value) {
             panic!("list assignment index out of range in JIT");
         }
     }
@@ -5785,8 +5785,8 @@ pub extern "C" fn jit_list_setitem(list: i64, index: i64, value: i64) -> i64 {
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_list_reverse(list: i64) -> i64 {
-    unsafe { w_list_reverse(list as PyObjectRef) };
+pub extern "C" fn jit_list_reverse(list: PyObjectRef) -> i64 {
+    unsafe { w_list_reverse(list) };
     0
 }
 
@@ -6344,12 +6344,12 @@ mod tests {
         let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
         unsafe {
             assert_eq!(
-                crate::intobject::w_int_get_value(jit_list_getitem(list as i64, 1) as PyObjectRef),
+                crate::intobject::w_int_get_value(jit_list_getitem(list, 1)),
                 2
             );
         }
-        assert_eq!(jit_list_setitem(list as i64, 0, w_int_new(9) as i64), 0);
-        assert_eq!(jit_list_append(list as i64, w_int_new(7) as i64), 0);
+        assert_eq!(jit_list_setitem(list, 0, w_int_new(9)), 0);
+        assert_eq!(jit_list_append(list, w_int_new(7)), 0);
         unsafe {
             assert_eq!(w_list_len(list), 3);
             assert_eq!(

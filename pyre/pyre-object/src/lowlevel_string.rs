@@ -228,17 +228,21 @@ fn shrink_lowlevel_array(buf: i64, new_len: i64, base_size: usize, item_size: us
 /// non-virtual buffer reaches here — a virtual buffer is folded by
 /// `opt_call_shrink_array`.
 ///
-/// `extern "C"` with an `(i64, i64) -> i64` ABI so the JIT residual call reaches
-/// it through the fnaddr registry.
+/// `extern "C"` so the JIT residual call reaches it through the fnaddr registry.
 /// `rstr.py LLHelpers.ll_strconcat` — join two rstr `STR` payloads.
 ///
 /// `@jit.elidable` + `@jit.oopspec('stroruni.concat')`.  The result is a
 /// fresh `STR` (`{ hash, len, chars }`), not a `W_UnicodeObject`.
 /// `descr_add` wraps that payload afterwards (`space.newutf8`).
 #[majit_macros::elidable]
-pub extern "C" fn jit_ll_strconcat(s1: i64, s2: i64) -> i64 {
+pub extern "C" fn jit_ll_strconcat(
+    s1: *mut crate::unicodeobject::Utf8Str,
+    s2: *mut crate::unicodeobject::Utf8Str,
+) -> *mut crate::unicodeobject::Utf8Str {
+    let s1 = s1 as i64;
+    let s2 = s2 as i64;
     if s1 == 0 || s2 == 0 {
-        return 0;
+        return std::ptr::null_mut();
     }
     let n1 = bh_lowlevel_string_len(s1);
     let n2 = bh_lowlevel_string_len(s2);
@@ -266,7 +270,7 @@ pub extern "C" fn jit_ll_strconcat(s1: i64, s2: i64) -> i64 {
             n2,
         );
     }
-    out
+    out as *mut crate::unicodeobject::Utf8Str
 }
 
 /// `rstr.py LLHelpers.ll_streq` — compare two rstr `STR` payloads.
@@ -307,9 +311,13 @@ pub extern "C" fn jit_ll_streq(
 /// MemoryError upstream; abort until that propagation is ported.  The
 /// doubling copy is `ll_str_mul`'s `copy_contents` loop.
 #[majit_macros::elidable]
-pub extern "C" fn jit_ll_str_mul(s: i64, mut times: i64) -> i64 {
+pub extern "C" fn jit_ll_str_mul(
+    s: *mut crate::unicodeobject::Utf8Str,
+    mut times: i64,
+) -> *mut crate::unicodeobject::Utf8Str {
+    let s = s as i64;
     if s == 0 {
-        return 0;
+        return std::ptr::null_mut();
     }
     if times < 0 {
         times = 0;
@@ -324,7 +332,7 @@ pub extern "C" fn jit_ll_str_mul(s: i64, mut times: i64) -> i64 {
         "ll_str_mul failed to allocate; MemoryError propagation is not ported yet"
     );
     if size == 0 || n == 0 {
-        return out;
+        return out as *mut crate::unicodeobject::Utf8Str;
     }
     unsafe {
         let src = (s as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
@@ -337,7 +345,7 @@ pub extern "C" fn jit_ll_str_mul(s: i64, mut times: i64) -> i64 {
             i += j;
         }
     }
-    out
+    out as *mut crate::unicodeobject::Utf8Str
 }
 
 /// `rstr.py LLHelpers._ll_stringslice` — `@jit.elidable` +
@@ -451,14 +459,14 @@ pub extern "C" fn jit_ll_int2dec(val: i64) -> *mut crate::unicodeobject::Utf8Str
     out as *mut crate::unicodeobject::Utf8Str
 }
 
-pub extern "C" fn jit_ll_shrink_array(buf: i64, new_len: i64) -> i64 {
+pub extern "C" fn jit_ll_shrink_array(buf: crate::PyObjectRef, new_len: i64) -> crate::PyObjectRef {
     // Width discovery reads the GC type header, so it needs the same entry
     // livevar normalization as the shrink itself rather than dereferencing the
     // raw residual-call word first.
     let roots = crate::gc_roots::push_roots();
-    let buf = roots.pin_root(buf as crate::PyObjectRef) as i64;
+    let buf = roots.pin_root(buf) as i64;
     let (base_size, item_size) = shrink_array_width(buf);
-    shrink_lowlevel_array(buf, new_len, base_size, item_size)
+    shrink_lowlevel_array(buf, new_len, base_size, item_size) as crate::PyObjectRef
 }
 
 pub fn bh_lowlevel_chars_offset(item_size: usize) -> usize {
@@ -531,8 +539,9 @@ mod tests {
     #[test]
     fn jit_ll_int2dec_renders_signed_decimal() {
         for val in [0i64, 1, -1, 10, -10, i64::MIN, i64::MAX] {
-            let buf = jit_ll_int2dec(val) as i64;
-            assert_ne!(buf, 0);
+            let buf = jit_ll_int2dec(val);
+            assert!(!buf.is_null());
+            let buf = buf as i64;
             let expected = val.to_string();
             assert_eq!(bh_lowlevel_string_len(buf), expected.len());
             let chars: String = bh_read_lowlevel_string(buf, 1)
@@ -546,20 +555,23 @@ mod tests {
 
     #[test]
     fn jit_ll_str_mul_repeats_and_clamps_negative() {
-        let one = jit_ll_int2dec(0) as i64;
+        let one = jit_ll_int2dec(0);
         // `0` renders as `"0"` — one char, used as the fill.
-        assert_eq!(bh_lowlevel_string_len(one), 1);
+        assert_eq!(bh_lowlevel_string_len(one as i64), 1);
         let four = jit_ll_str_mul(one, 4);
-        assert_eq!(bh_lowlevel_string_len(four), 4);
-        assert_eq!(bh_read_lowlevel_string(four, 1), vec![b'0' as i64; 4]);
+        assert_eq!(bh_lowlevel_string_len(four as i64), 4);
+        assert_eq!(
+            bh_read_lowlevel_string(four as i64, 1),
+            vec![b'0' as i64; 4]
+        );
         let empty = jit_ll_str_mul(one, 0);
-        assert_eq!(bh_lowlevel_string_len(empty), 0);
+        assert_eq!(bh_lowlevel_string_len(empty as i64), 0);
         let also_empty = jit_ll_str_mul(one, -1);
-        assert_eq!(bh_lowlevel_string_len(also_empty), 0);
-        bh_free_lowlevel_string(one, LOWLEVEL_STR_BASE_SIZE, 1);
-        bh_free_lowlevel_string(four, LOWLEVEL_STR_BASE_SIZE, 1);
-        bh_free_lowlevel_string(empty, LOWLEVEL_STR_BASE_SIZE, 1);
-        bh_free_lowlevel_string(also_empty, LOWLEVEL_STR_BASE_SIZE, 1);
+        assert_eq!(bh_lowlevel_string_len(also_empty as i64), 0);
+        bh_free_lowlevel_string(one as i64, LOWLEVEL_STR_BASE_SIZE, 1);
+        bh_free_lowlevel_string(four as i64, LOWLEVEL_STR_BASE_SIZE, 1);
+        bh_free_lowlevel_string(empty as i64, LOWLEVEL_STR_BASE_SIZE, 1);
+        bh_free_lowlevel_string(also_empty as i64, LOWLEVEL_STR_BASE_SIZE, 1);
     }
 
     #[test]
@@ -627,8 +639,9 @@ mod tests {
         for index in 0..6 {
             bh_write_lowlevel_char(buf, index, (b'A' + index as u8) as i64, 1);
         }
-        let new_buf = jit_ll_shrink_array(buf, 3);
-        assert_ne!(new_buf, 0);
+        let new_buf = jit_ll_shrink_array(buf as crate::PyObjectRef, 3);
+        assert!(!new_buf.is_null());
+        let new_buf = new_buf as i64;
         assert_eq!(bh_lowlevel_string_len(new_buf), 3);
         assert_eq!(bh_read_lowlevel_string(new_buf, 1), vec![65, 66, 67]);
         bh_free_lowlevel_string(new_buf, LOWLEVEL_STR_BASE_SIZE, 1);

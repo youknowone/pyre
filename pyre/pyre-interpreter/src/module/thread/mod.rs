@@ -462,10 +462,10 @@ pub(crate) fn all_thread_hooks_current(ec: &crate::PyExecutionContext) -> bool {
 /// A value-returning residual is lowered as `(i64) -> i64`; the Rust
 /// signature's reference argument and `bool` result are narrower than a word
 /// on wasm32, where `call_indirect` type-checks its callee.
-pub extern "C" fn all_thread_hooks_current_jit_abi(ec: i64) -> i64 {
+pub extern "C" fn all_thread_hooks_current_jit_abi(ec: *const crate::PyExecutionContext) -> i64 {
     // SAFETY: the residual's slot is the execution context the walked graph
     // read it from; it outlives the call.
-    let ec = unsafe { &*(ec as *const crate::PyExecutionContext) };
+    let ec = unsafe { &*(ec) };
     all_thread_hooks_current(ec) as i64
 }
 

@@ -503,8 +503,8 @@ pub fn w_range_iter_new(current: i64, remaining: i64, step: i64) -> PyObjectRef 
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_range_iter_new(current: i64, remaining: i64, step: i64) -> i64 {
-    w_range_iter_new(current, remaining, step) as i64
+pub extern "C" fn jit_range_iter_new(current: i64, remaining: i64, step: i64) -> PyObjectRef {
+    w_range_iter_new(current, remaining, step)
 }
 
 /// Advance the range iterator and return the next value, or `None` if exhausted.

@@ -107,8 +107,7 @@ const PLACEHOLDER_CALLEE: u16 = 0;
 /// call and tests after it.  The compiled-code channel (`store_jit_exception`)
 /// is deliberately not written: this jitcode is a resume coordinate, never a
 /// compilation unit.
-pub extern "C" fn bh_check_init_returned_none(init_result: i64) {
-    let result = init_result as pyre_object::PyObjectRef;
+pub extern "C" fn bh_check_init_returned_none(result: pyre_object::PyObjectRef) {
     if let Err(mut err) = pyre_interpreter::call::check_init_returned_none(result) {
         let exc_obj = err.to_exc_object();
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
@@ -283,10 +282,10 @@ mod tests {
     fn the_none_check_publishes_through_the_blackhole_exception_channel() {
         let cell = &majit_metainterp::blackhole::BH_LAST_EXC_VALUE;
         cell.with(|c| c.set(0));
-        bh_check_init_returned_none(pyre_object::w_none() as i64);
+        bh_check_init_returned_none(pyre_object::w_none());
         assert_eq!(cell.with(|c| c.get()), 0, "a None result must not raise");
 
-        bh_check_init_returned_none(pyre_object::w_int_new(1) as i64);
+        bh_check_init_returned_none(pyre_object::w_int_new(1));
         assert_ne!(
             cell.with(|c| c.get()),
             0,

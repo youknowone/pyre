@@ -9808,7 +9808,7 @@ fn walker_unbox_long<Sym: WalkSym>(
         majit_metainterp::cannot_raise_effect_info(),
     );
     if let Some(o) = obj_concrete {
-        let fits_concrete = pyre_object::longobject::jit_w_long_fits_int(o as usize as i64);
+        let fits_concrete = pyre_object::longobject::jit_w_long_fits_int(o);
         ctx.trace_ctx
             .set_opref_concrete(fits, majit_ir::Value::Int(fits_concrete));
     }
@@ -9823,7 +9823,7 @@ fn walker_unbox_long<Sym: WalkSym>(
         majit_metainterp::cannot_raise_effect_info(),
     );
     if let Some(o) = obj_concrete {
-        let v = pyre_object::longobject::jit_w_long_toint(o as usize as i64);
+        let v = pyre_object::longobject::jit_w_long_toint(o);
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Int(v));
     }
