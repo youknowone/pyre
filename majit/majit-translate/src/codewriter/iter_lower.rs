@@ -340,9 +340,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                     OpKind::ArrayLen {
                         base: site.iter_arg.clone(),
                         array_type_id: array_type_id.clone(),
-                        nolength: crate::front::typestr::nolength_from_array_type_id(
-                            array_type_id.as_deref(),
-                        ),
+                        nolength: false,
                     },
                 );
                 FunctionGraph::set_concretetype_of_inline(&len, ConcreteType::Signed);
