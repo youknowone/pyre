@@ -5753,6 +5753,24 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
+    /// `x as usize` / `x as isize` on the word-sized int bank.
+    /// `jtransform.py` `rewrite_op_cast_int_to_uint` /
+    /// `rewrite_op_cast_uint_to_int` rename on a 64-bit word, so only a
+    /// distinct target costs a copy. A 32-bit word narrows as
+    /// `_int_to_int_cast` does: `int_signext` to 4 bytes, or `int_and` with
+    /// the 32-bit mask.
+    pub fn cast_int_to_word(&mut self, dst: u16, src: u16, signed: bool) {
+        if std::mem::size_of::<usize>() >= 8 {
+            if dst != src {
+                self.move_i(dst, src);
+            }
+        } else if signed {
+            self.record_binop_i_const(dst, OpCode::IntSignext, src, 4);
+        } else {
+            self.record_binop_i_const(dst, OpCode::IntAnd, src, 0xFFFF_FFFF);
+        }
+    }
+
     /// `flatten.py` `self.emitline('int_push', v)` / `blackhole.py bhimpl_int_push`
     /// `bhimpl_int_push(a)` — save `src` into the int-kind scratch slot.
     pub fn push_i(&mut self, src: u16) {
@@ -8763,6 +8781,29 @@ mod tests {
 
     /// A `Constant` operand is the register-space index of its constants
     /// slot, `num_regs_i + const_idx`, and a repeated value reuses the slot.
+    #[test]
+    fn a_word_cast_onto_its_own_register_emits_nothing_on_a_64_bit_word() {
+        let mut builder = JitCodeBuilder::new();
+        builder.ensure_i_regs(2);
+        builder.cast_int_to_word(1, 1, false);
+        builder.cast_int_to_word(1, 1, true);
+        let empty = builder.code.is_empty();
+        builder.cast_int_to_word(0, 1, false);
+        let jitcode = builder.finish();
+        if std::mem::size_of::<usize>() >= 8 {
+            assert!(empty);
+            let int_copy = crate::jitcode::wellknown_bh_insns()
+                .into_iter()
+                .find(|(name, _)| *name == "int_copy/i>i")
+                .expect("int_copy/i>i is a wellknown insn")
+                .1;
+            assert_eq!(jitcode.code, vec![int_copy, 1, 0]);
+            assert!(jitcode.constants_i.is_empty());
+        } else {
+            assert_eq!(jitcode.constants_i, vec![4, 0xFFFF_FFFF]);
+        }
+    }
+
     #[test]
     fn a_constant_operand_is_patched_to_its_constants_slot() {
         let mut builder = JitCodeBuilder::new();

@@ -254,8 +254,10 @@ fn coloring(
         .collect();
     let mut unionfind = UnionFind::new();
     for op in ops.iter().rev() {
-        if !matches!(op.kind, OpKind::MoveI | OpKind::MoveR | OpKind::MoveF)
-            || op.reads.len() != 1
+        if !matches!(
+            op.kind,
+            OpKind::MoveI | OpKind::MoveR | OpKind::MoveF | OpKind::CastIntToWord
+        ) || op.reads.len() != 1
             || op.writes.len() != 1
         {
             continue;
@@ -590,6 +592,45 @@ mod tests {
                 .collect::<String>()
                 .contains("move_i")
         );
+    }
+
+    /// `as usize` is a rename on a 64-bit word. When its source dies at the
+    /// cast the two coalesce, and the op stays for the 32-bit narrowing.
+    #[test]
+    fn noninterfering_word_cast_is_coalesced_and_kept() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.emit_op(
+            OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(1)]),
+            quote! { __builder.load_const_i_value(1u16, 41i64); },
+        );
+        lowerer.emit_op(
+            OpMeta::linear(
+                OpKind::CastIntToWord,
+                vec![Register::int(1)],
+                vec![Register::int(2)],
+            ),
+            quote! { __builder.cast_int_to_word(2u16, 1u16, false); },
+        );
+        lowerer.emit_op(
+            OpMeta::terminal(vec![Register::int(2)]),
+            quote! { __builder.int_return(2u16); },
+        );
+
+        compact_registers(
+            &mut lowerer,
+            RegisterCounts {
+                ints: 1,
+                ..RegisterCounts::default()
+            },
+            Some(Register::int(2)),
+        );
+
+        let cast = lowerer
+            .op_metadata
+            .iter()
+            .find(|meta| meta.kind == OpKind::CastIntToWord)
+            .expect("the cast is kept");
+        assert_eq!(cast.reads, cast.writes, "source and target coalesced");
     }
 
     /// A link source that stays live after the assignment interferes with the

@@ -1891,6 +1891,11 @@ pub(super) enum OpKind {
     MoveI,
     MoveR,
     MoveF,
+    /// `as usize` / `as isize`: a rename on a 64-bit word, a narrowing on a
+    /// 32-bit one (`JitCodeBuilder::cast_int_to_word`). Register allocation
+    /// coalesces it like a `MoveI`; unlike a move it is kept when source and
+    /// target share a color, because the 32-bit narrowing still applies.
+    CastIntToWord,
     BinopI,
     BinopF,
     UnaryI,
