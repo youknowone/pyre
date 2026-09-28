@@ -55170,6 +55170,42 @@ mod tests {
     }
 
     #[test]
+    fn a_move_operand_typed_unlike_the_local_is_not_a_move_of_it() {
+        use majit_charon_reader::ullbc::Unstructured;
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        // `_1` is declared as the guard type (ty#7), `_2` as a `usize` (ty#0).
+        let local = |i: u64, ty: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": {"Deduplicated": ty}});
+        let body_of = |spelled_ty: u64| -> Unstructured {
+            serde_json::from_value(serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 0, "locals": [local(0, 0), local(1, 7), local(2, 0)]},
+                "body": [{
+                    "statements": [{
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 2}, "ty": {"Deduplicated": 0}},
+                            {"Use": {"Move": {"kind": {"Local": 1}, "ty": {"Deduplicated": spelled_ty}}}}
+                        ]},
+                        "comments_before": [],
+                        "span": span()
+                    }],
+                    "terminator": {"kind": "Return"}
+                }]
+            }))
+            .expect("fixture Unstructured parses")
+        };
+        assert!(super::moved_out_locals(&body_of(7)).contains(1));
+        assert!(
+            !super::moved_out_locals(&body_of(0)).contains(1),
+            "a `usize` operand spelled under the guard's index does not move the guard"
+        );
+    }
+
+    #[test]
     fn owner_root_erasure_needs_every_handle_use_to_be_new_deref_or_drop() {
         use super::OwnerRootCallee;
         use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
