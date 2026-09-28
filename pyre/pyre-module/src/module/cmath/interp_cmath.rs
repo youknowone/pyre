@@ -79,8 +79,14 @@ pub fn log(args: &[PyObjectRef]) -> PyResult {
             pos.len()
         )));
     }
-    let z = unpack(pos[0])?;
-    let base = pos.get(1).map(|&b| unpack(b)).transpose()?;
+    let w_z = pos[0];
+    let mut w_base = pos.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let z = pyre_object::with_roots!(w_base => unpack(w_z))?;
+    let base = if w_base.is_null() {
+        None
+    } else {
+        Some(unpack(w_base)?)
+    };
     pmc::log(z, base).map(wrap).map_err(map_err)
 }
 
@@ -102,8 +108,10 @@ pub fn polar(args: &[PyObjectRef]) -> PyResult {
 /// `wrapped_rect` — arguments go through `space.float_w`, so a complex
 /// operand is rejected rather than unpacked.
 pub fn rect(args: &[PyObjectRef]) -> PyResult {
-    let r = pyre_interpreter::baseobjspace::float_w(args[0])?;
-    let phi = pyre_interpreter::baseobjspace::float_w(args[1])?;
+    let w_r = args[0];
+    let mut w_phi = args[1];
+    let r = pyre_object::with_roots!(w_phi => pyre_interpreter::baseobjspace::float_w(w_r))?;
+    let phi = pyre_interpreter::baseobjspace::float_w(w_phi)?;
     pmc::rect(r, phi).map(wrap).map_err(map_err)
 }
 

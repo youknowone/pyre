@@ -951,8 +951,10 @@ fn math2_pymath(
             "{name}() takes exactly 2 arguments"
         )));
     }
-    let x = try_get_double(args[0])?;
-    let y = try_get_double(args[1])?;
+    let w_x = args[0];
+    let mut w_y = args[1];
+    let x = pyre_object::with_roots!(w_y => try_get_double(w_x))?;
+    let y = try_get_double(w_y)?;
     match compute(x, y) {
         Ok(v) => pyre_interpreter::objspace::descroperation::_float_pos(v),
         Err(pymath::Error::EDOM) => {
@@ -1009,8 +1011,10 @@ pub fn dist(args: &[PyObjectRef]) -> PyResult {
             })
             .collect()
     };
-    let p = collect_coords(args[0])?;
-    let q = collect_coords(args[1])?;
+    let w_p = args[0];
+    let mut w_q = args[1];
+    let p = pyre_object::with_roots!(w_q => collect_coords(w_p))?;
+    let q = collect_coords(w_q)?;
     if p.len() != q.len() {
         return Err(pyre_interpreter::PyError::value_error(
             "both points must have the same number of dimensions",
@@ -1229,11 +1233,13 @@ pub fn log(args: &[PyObjectRef]) -> PyResult {
     // too, a base of 1 leaves a zero denominator rather than a domain error,
     // and the result is one natural logarithm over another — not the logarithm
     // taken in that base, which rounds elsewhere.
-    let num = loghelper(args[0], 0.0)?;
-    let Some(base) = args.get(1).copied() else {
+    let w_x = args[0];
+    let mut w_base = args.get(1).copied().unwrap_or(PY_NULL);
+    let num = pyre_object::with_roots!(w_base => loghelper(w_x, 0.0))?;
+    if w_base.is_null() {
         return Ok(floatobject::w_float_new(num));
-    };
-    let den = loghelper(base, 0.0)?;
+    }
+    let den = loghelper(w_base, 0.0)?;
     if den == 0.0 {
         return Err(pyre_interpreter::PyError::zero_division("division by zero"));
     }
@@ -1565,14 +1571,17 @@ pub fn lcm(args: &[PyObjectRef]) -> PyResult {
         return Ok(w_int_new(1));
     }
     // app_math.py keeps `res` live while each later `index()` can execute
-    // arbitrary Python and collect.
-    let mut result = RBigIntGcRoot::new(get_bigint(args[0])?);
-    for &arg in &args[1..] {
+    // arbitrary Python and collect.  `args` is the gateway's native copy, so
+    // each argument is read back from its slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = _roots.pin_roots(args);
+    let mut result = RBigIntGcRoot::new(get_bigint(_roots.get(args_base))?);
+    for index in 1..args.len() {
         // Every argument goes through `__index__` even once the running result
         // is zero: `math_lcm_impl` only short-circuits the arithmetic, so
         // `math.lcm(0, 1.5)` still raises TypeError.  `app_math.lcm` returns
         // early instead and skips the remaining conversions.
-        let value = RBigIntGcRoot::new(get_bigint(arg)?);
+        let value = RBigIntGcRoot::new(get_bigint(_roots.get(args_base + index))?);
         if result.is_zero() {
             continue;
         }
@@ -1670,8 +1679,10 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
     }
     // `n` is an unboxed rbigint local across `index(k)`, exactly the kind of
     // local rooted automatically by RPython's GC transform.
-    let n_big = RBigIntGcRoot::new(get_bigint(args[0])?);
-    let k_big = RBigIntGcRoot::new(get_bigint(args[1])?);
+    let w_n = args[0];
+    let mut w_k = args[1];
+    let n_big = RBigIntGcRoot::new(pyre_object::with_roots!(w_k => get_bigint(w_n))?);
+    let k_big = RBigIntGcRoot::new(get_bigint(w_k)?);
 
     if n_big.int_lt(0) {
         return Err(pyre_interpreter::PyError::value_error(
@@ -1763,15 +1774,17 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
         }
     }
     // Keep `n` rooted while a non-None `k` invokes its `__index__`.
-    let n_big = RBigIntGcRoot::new(get_bigint(args[0])?);
-    if n_big.int_lt(0) {
+    let w_n = args[0];
+    let mut w_k = args.get(1).copied().unwrap_or(PY_NULL);
+    let n_big = RBigIntGcRoot::new(pyre_object::with_roots!(w_k => get_bigint(w_n))?);
+    if pyre_object::with_roots!(w_k => n_big.int_lt(0)) {
         return Err(pyre_interpreter::PyError::value_error(
             "n must be a non-negative integer",
         ));
     }
     // perm(n, None) means k = n (factorial).
-    let k_big = if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
-        Some(get_bigint(args[1])?)
+    let k_big = if !w_k.is_null() && !unsafe { pyre_object::is_none(w_k) } {
+        Some(get_bigint(w_k)?)
     } else {
         None
     };
@@ -2027,13 +2040,19 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
             "sumprod() takes exactly 2 arguments",
         ));
     }
-    let p = pyre_interpreter::builtins::collect_iterable(args[0])?;
+    let w_p = args[0];
+    let mut w_q = args[1];
+    let p = pyre_object::with_roots!(w_q => pyre_interpreter::builtins::collect_iterable(w_p))?;
     // Collecting the second input runs its iterator, so publish the first
-    // materialized sequence before that call. `pin_roots` writes every
-    // pointer before the first forwarding query.
+    // materialized sequence, and the second input with it, before that call.
+    // Every pointer is written before the first forwarding query.
     let _roots = pyre_object::gc_roots::push_roots();
-    let p_base = pyre_object::gc_roots::pin_roots(&p);
-    let q = pyre_interpreter::builtins::collect_iterable(args[1])?;
+    let p_base = pyre_object::gc_roots::publish_roots(&p);
+    let q_slot = pyre_object::gc_roots::publish_roots(&[w_q]);
+    pyre_object::gc_roots::normalize_roots(p_base, p.len() + 1);
+    let q = pyre_interpreter::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(
+        q_slot,
+    ))?;
     // `mul` and `add` dispatch to the operands' `__mul__` / `__add__`, so a
     // Decimal or Fraction element makes every turn a collection point.  Both
     // collected sequences and the running total are native locals no root
@@ -2089,8 +2108,10 @@ pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
     // interp_math.py::ldexp evaluates x before converting the exponent.
     // Besides preserving callback order, this avoids retaining an unboxed
     // exponent rbigint across x.__float__.
-    let x = try_get_double(args[0])?;
-    let exp_big = RBigIntGcRoot::new(get_bigint(args[1])?);
+    let w_x = args[0];
+    let mut w_exp = args[1];
+    let x = pyre_object::with_roots!(w_exp => try_get_double(w_x))?;
+    let exp_big = RBigIntGcRoot::new(get_bigint(w_exp)?);
     // Short-circuit special cases so an overflowing exponent doesn't
     // mask inf/nan propagation.
     if x.is_nan() {
@@ -2150,11 +2171,13 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
             "nextafter() takes exactly 2 positional arguments",
         ));
     }
+    let mut w_x = pos[0];
+    let mut w_y = pos[1];
     let steps = match kwargs.and_then(|kw| unsafe { pyre_object::w_dict_getitem_str(kw, "steps") })
     {
         Some(s) => {
-            let b = RBigIntGcRoot::new(get_bigint(s)?);
-            if b.int_lt(0) {
+            let b = RBigIntGcRoot::new(pyre_object::with_roots!(w_x, w_y => get_bigint(s))?);
+            if pyre_object::with_roots!(w_x, w_y => b.int_lt(0)) {
                 return Err(pyre_interpreter::PyError::value_error(
                     "steps must be a non-negative integer",
                 ));
@@ -2167,10 +2190,10 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
         }
         None => None,
     };
+    let x = pyre_object::with_roots!(w_y => try_get_double(w_x))?;
+    let y = try_get_double(w_y)?;
     Ok(floatobject::w_float_new(pymath::math::nextafter(
-        try_get_double(pos[0])?,
-        try_get_double(pos[1])?,
-        steps,
+        x, y, steps,
     )))
 }
 
@@ -2180,9 +2203,11 @@ pub fn fma(args: &[PyObjectRef]) -> PyResult {
             "fma() takes exactly 3 arguments",
         ));
     }
-    map_err(pymath::math::fma(
-        try_get_double(args[0])?,
-        try_get_double(args[1])?,
-        try_get_double(args[2])?,
-    ))
+    let w_x = args[0];
+    let mut w_y = args[1];
+    let mut w_z = args[2];
+    let x = pyre_object::with_roots!(w_y, w_z => try_get_double(w_x))?;
+    let y = pyre_object::with_roots!(w_z => try_get_double(w_y))?;
+    let z = try_get_double(w_z)?;
+    map_err(pymath::math::fma(x, y, z))
 }
