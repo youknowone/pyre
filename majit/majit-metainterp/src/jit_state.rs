@@ -222,6 +222,13 @@ pub trait JitState: Sized {
     type Sym;
     type Env: ?Sized;
 
+    /// Portal return kind recorded by `#[jit_interp]` from `finish_return_for`.
+    ///
+    /// `None` means the portal declared no `FinishReturn`. `JitDriver::new`
+    /// leaves `result_type` at `Type::Ref` (`warmspot.py` `getkind` default
+    /// before a portal signature is known). `Some` is applied once there.
+    const PORTAL_RESULT_TYPE: Option<Type> = None;
+
     /// Whether this frontend's own guard-failure recovery already filled the
     /// virtualizable from the resume stream.
     ///

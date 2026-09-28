@@ -689,16 +689,31 @@ pub(crate) fn new_via_gc_enabled() -> bool {
     NEW_VIA_GC.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Published Boehm `malloc_fixedsize` address, or `None` when it must not run.
+///
+/// `gc.py` has one `GcLLDescr` per translation. An installed collector
+/// owns fixed-size blocks; the hook's storage is unheadered and must not
+/// be handed to it. `collector_installed` is an argument so a test can
+/// force either arm without publishing a process-global collector.
+fn boehm_fixedsize_hook(collector_installed: bool) -> Option<usize> {
+    if collector_installed {
+        return None;
+    }
+    let addr = majit_gc::malloc_fixedsize_addr();
+    if addr == 0 { None } else { Some(addr) }
+}
+
 /// `GcLLDescr_boehm.malloc_fixedsize`: storage from the published function,
 /// or `None` when [`majit_gc::set_malloc_fixedsize`] is unset.
 ///
 /// `GC_malloc` returns zero-filled bytes (`malloc_zero_filled`). The caller
 /// does not clear the block again.
 pub(crate) fn call_malloc_fixedsize(size: usize) -> Option<*mut u8> {
-    let addr = majit_gc::malloc_fixedsize_addr();
-    if addr == 0 {
-        return None;
-    }
+    call_malloc_fixedsize_inner(size, majit_gc::collector_installed())
+}
+
+fn call_malloc_fixedsize_inner(size: usize, collector_installed: bool) -> Option<*mut u8> {
+    let addr = boehm_fixedsize_hook(collector_installed)?;
     let malloc: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(addr) };
     Some(malloc(size))
 }
@@ -706,8 +721,14 @@ pub(crate) fn call_malloc_fixedsize(size: usize) -> Option<*mut u8> {
 /// Address `genop_new_with_vtable` calls: the Boehm hook when published,
 /// otherwise `fallback` (`dynasm_new_alloc` or `libc::malloc`).
 pub(crate) fn malloc_fixedsize_or(fallback: i64) -> i64 {
-    let addr = majit_gc::malloc_fixedsize_addr();
-    if addr == 0 { fallback } else { addr as i64 }
+    malloc_fixedsize_or_inner(fallback, majit_gc::collector_installed())
+}
+
+fn malloc_fixedsize_or_inner(fallback: i64, collector_installed: bool) -> i64 {
+    match boehm_fixedsize_hook(collector_installed) {
+        Some(addr) => addr as i64,
+        None => fallback,
+    }
 }
 
 /// Compiled-code `New` allocation trampoline. Called from the machine code
@@ -1342,6 +1363,34 @@ pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
         );
     }
     ptr
+}
+
+/// `malloc_cond_varsize` headerless slow path.
+///
+/// The assembler passes the length, not a wrapping `length * itemsize +
+/// base_size + 7`. `gc.py` `malloc_cond_varsize` sends that slow path to
+/// `ovfcheck`; a negative length or an overflowing product returns null
+/// so the callsite's `emit_propagate_memory_error_if_null` raises.
+pub extern "C" fn dynasm_nursery_slowpath_headerless_varsize(
+    length: i64,
+    itemsize: u64,
+    base_size: u64,
+) -> u64 {
+    let Some(size) = headerless_varsize_alloc_size(length, itemsize, base_size) else {
+        return 0;
+    };
+    dynasm_nursery_slowpath_headerless(size)
+}
+
+fn headerless_varsize_alloc_size(length: i64, itemsize: u64, base_size: u64) -> Option<u64> {
+    if length < 0 {
+        return None;
+    }
+    let bytes = (length as u64)
+        .checked_mul(itemsize)?
+        .checked_add(base_size)?
+        .checked_add(7)?;
+    Some(bytes & !7)
 }
 
 /// Headerless nursery overflow slow path.
@@ -4730,6 +4779,48 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn headerless_varsize_slowpath_rejects_negative_and_overflowing_lengths() {
+        assert_eq!(dynasm_nursery_slowpath_headerless_varsize(-1, 8, 16), 0);
+        assert_eq!(
+            dynasm_nursery_slowpath_headerless_varsize(i64::MAX, 2, 0),
+            0
+        );
+    }
+
+    #[test]
+    fn boehm_malloc_fixedsize_yields_to_an_installed_collector() {
+        extern "C" fn hook(size: usize) -> *mut u8 {
+            unsafe { libc::malloc(size.max(1)) as *mut u8 }
+        }
+        let prev = majit_gc::malloc_fixedsize_addr();
+        majit_gc::set_malloc_fixedsize(Some(hook));
+        let hook_addr = hook as *const () as i64;
+        let fallback = 0x51i64;
+        // An installed collector suppresses the hook for both entry points.
+        // The flag is process-global and set-only, so the true arm is driven
+        // by the argument the live `collector_installed()` call passes.
+        assert!(call_malloc_fixedsize_inner(8, true).is_none());
+        assert_eq!(malloc_fixedsize_or_inner(fallback, true), fallback);
+        assert!(boehm_fixedsize_hook(false).is_some());
+        if majit_gc::collector_installed() {
+            assert!(call_malloc_fixedsize(8).is_none());
+            assert_eq!(malloc_fixedsize_or(fallback), fallback);
+        } else {
+            let ptr = call_malloc_fixedsize(8).expect("published hook");
+            assert!(!ptr.is_null());
+            unsafe { libc::free(ptr as *mut libc::c_void) };
+            assert_eq!(malloc_fixedsize_or(fallback), hook_addr);
+        }
+        if prev == 0 {
+            majit_gc::set_malloc_fixedsize(None);
+        } else {
+            let restored: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(prev) };
+            majit_gc::set_malloc_fixedsize(Some(restored));
+        }
+    }
+
     use majit_backend::Backend;
     use majit_backend::jitframe::{
         FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_INFO_OFS,

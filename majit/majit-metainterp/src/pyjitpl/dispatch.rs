@@ -4473,6 +4473,12 @@ where
                         .expect("BC_NEW: invalid struct layout");
                     unsafe { std::alloc::alloc_zeroed(layout) as i64 }
                 };
+                // A null from the hook or from `alloc_zeroed` is the same
+                // failure `BC_NEW_ARRAY` aborts on. The vtable store must not
+                // run against that pointer.
+                if ptr == 0 {
+                    return TraceAction::Abort;
+                }
                 if with_vtable && vtable != 0 {
                     unsafe { *(ptr as *mut usize) = vtable };
                 }

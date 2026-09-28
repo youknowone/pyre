@@ -4776,42 +4776,52 @@ impl<'a> Assembler386<'a> {
                 }
                 dynasm!(self.mc ; .arch x64 ; =>slow_path);
                 if headerless {
+                    // Length, itemsize, and base size go to the helper.
+                    // `malloc_cond_varsize` `ovfcheck`s there; wrapping
+                    // `length * itemsize + base_size + 7` here would hide it.
+                    // The regalloc reserves only ECX/EDX; the ABI call below
+                    // clobbers the argument and volatile registers, so every
+                    // register goes to the jitframe first
+                    // (`_push_all_regs_to_jitframe`).
+                    self.push_all_regs_to_jitframe(&[], true);
                     match arglocs.first() {
                         Some(Loc::Reg(len_r)) => {
-                            dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(len_r.value));
+                            self.emit_abi_int_arg_from_reg(0, len_r.value as u8);
                         }
                         Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
-                            dynasm!(self.mc ; .arch x64 ; mov rdx, QWORD len_i.value);
+                            self.emit_abi_int_arg_from_imm(0, len_i.value);
                         }
                         Some(Loc::Frame(len_f)) => {
-                            dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + len_f.ebp_loc.value]);
+                            self.emit_abi_int_arg_from_mem(0, len_f.ebp_loc.value);
                         }
                         Some(Loc::Ebp(len_e)) => {
-                            dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + len_e.value]);
+                            self.emit_abi_int_arg_from_mem(0, len_e.value);
                         }
                         other => panic!(
                             "CallMallocNurseryVarsizeHeaderless length is not a value: {other:?}"
                         ),
                     }
-                    let helper_addr = self.malloc_slowpath_headerless as i64;
-                    let call_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    dynasm!(self.mc ; .arch x64
-                        ; imul rdx, rdx, itemsize as i32
-                        ; add rdx, (base_size + 7) as i32
-                        ; and rdx, -8
-                        ; xor ecx, ecx
-                        ; mov Rq(call_scratch), QWORD helper_addr
-                        ; call Rq(call_scratch)
+                    self.emit_abi_int_arg_from_imm(1, itemsize);
+                    self.emit_abi_int_arg_from_imm(2, base_size);
+                    rx86::mov_ri(
+                        &mut self.mc,
+                        rx86::EAX,
+                        crate::runner::dynasm_nursery_slowpath_headerless_varsize as *const ()
+                            as i64,
                     );
-                    self.emit_propagate_exception_if_zero(crate::regloc::ECX.value);
+                    self.emit_abi_call_rax();
+                    self.reload_frame_if_necessary();
+                    // EAX carries the allocation result.
+                    self.pop_all_regs_from_jitframe(&[crate::regloc::EAX], true);
+                    self.emit_propagate_exception_if_zero(0);
                     let Some(Loc::Reg(r)) = result_loc else {
                         panic!(
                             "CallMallocNurseryVarsizeHeaderless result_loc must be a register; got {result_loc:?}"
                         );
                     };
-                    if r.value != crate::regloc::ECX.value {
+                    if r.value != crate::regloc::EAX.value {
                         let rv = r.value;
-                        dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rcx);
+                        dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
                     }
                     dynasm!(self.mc ; .arch x64 ; jmp =>done);
                 }
@@ -8693,14 +8703,17 @@ impl<'a> Assembler386<'a> {
             })
             .unwrap_or((0, None));
         // `rewrite.py gen_malloc_fixedsize` (Boehm arm): CALL malloc_fixedsize(size).
-        let malloc_ptr = crate::runner::malloc_fixedsize_or(Self::new_alloc_fn_addr());
+        // One read of the published hook picks both the call target and
+        // whether the raw fallback still needs to be cleared.
+        let fallback = Self::new_alloc_fn_addr();
+        let malloc_ptr = crate::runner::malloc_fixedsize_or(fallback);
         self.emit_abi_int_arg_from_imm(0, obj_size);
         rx86::mov_ri(&mut self.mc, rx86::EAX, malloc_ptr);
         self.emit_abi_call_rax();
         // `GcLLDescr_boehm.malloc_fixedsize` is `GC_malloc`
         // (`malloc_zero_filled`). A raw `malloc` is not, so only that
         // fallback is cleared here — never both.
-        if crate::runner::malloc_fixedsize_or(0) == 0 {
+        if malloc_ptr == fallback {
             self.emit_abi_int_arg_from_reg(0, 0);
             self.emit_abi_int_arg_from_imm(1, 0);
             self.emit_abi_int_arg_from_imm(2, obj_size);

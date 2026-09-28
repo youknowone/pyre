@@ -13547,8 +13547,12 @@ impl<M: Clone> MetaInterp<M> {
         // and builds a fresh list; it does not touch the frame, so it repeats.
         // Each pass drops what it built, which is the same drop the shipping
         // pass eventually pays for its own.
+        // The decode runs here, outside the function that read the repeats
+        // for the other stages, so it reads them again.
         #[cfg(feature = "__execute-stage-probe")]
         {
+            let stage_repeats =
+                ExecuteStageRepeats::unpack(EXECUTE_STAGE_REPEATS.load(Ordering::Relaxed));
             count_execute_stage_passes(ExecuteStage::Decode, stage_repeats.decode);
             for _ in 0..stage_repeats.decode {
                 let repeat_fail = self.backend.get_latest_descr(&frame);

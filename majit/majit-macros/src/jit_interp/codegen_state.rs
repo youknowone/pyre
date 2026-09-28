@@ -2083,22 +2083,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { self.#fname as i64 }
         })
         .collect();
-    let raw_array_pushes: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! {
-                for elem in &self.#fname {
-                    out.push(*elem as i64);
-                }
-            }
-        })
-        .collect();
-    let raw_vable_word: TokenStream = if has_vable_identity {
-        quote! { self as *const Self as i64, }
-    } else {
-        quote! {}
-    };
     let raw_ref_words: Vec<TokenStream> = ref_scalars
         .iter()
         .map(|(_, f)| {
@@ -2113,85 +2097,68 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { (self.#fname as f64).to_bits() as i64 }
         })
         .collect();
-    let fill_entry_raw_static_prefix: TokenStream = if scalars.is_empty() {
-        quote! {}
-    } else {
-        quote! {
-            out.extend_from_slice(&[
-                #(#raw_int_words,)*
-            ]);
-        }
-    };
-    let fill_entry_raw_static_suffix: TokenStream =
-        if !has_vable_identity && ref_scalars.is_empty() && float_scalars.is_empty() {
-            quote! {}
-        } else {
-            quote! {
-                out.extend_from_slice(&[
-                    #raw_vable_word
-                    #(#raw_ref_words,)*
-                    #(#raw_float_words,)*
-                ]);
-            }
-        };
+    // `compat_checks` is one `&& self.<arr>.len() == meta.<arr>_len` per
+    // flattened array, so an empty check list is an empty `arrays` list.
+    // The array-push arm under that condition was unreachable.
     let fill_entry_raw_reds_override: TokenStream = if steady_entry_without_meta {
-        if arrays.is_empty() {
-            // A separate `extend_from_slice` of a fixed word list lowers to a
-            // handful of stores when this function is outlined. Inlined into
-            // `enter_compiled_function_entry` that call becomes
-            // `Vec::extend_from_slice`'s memmove. Spell the spare-capacity
-            // arm as stores so the inline form keeps the outlined fast path.
-            let raw_vable_expr: TokenStream = if has_vable_identity {
-                quote! { self as *const Self as i64 }
-            } else {
-                quote! {}
-            };
-            let raw_words: Vec<TokenStream> = raw_int_words
-                .iter()
-                .cloned()
-                .chain(has_vable_identity.then(|| raw_vable_expr))
-                .chain(raw_ref_words.iter().cloned())
-                .chain(raw_float_words.iter().cloned())
-                .collect();
-            let raw_count = raw_words.len();
-            let raw_writes: Vec<TokenStream> = raw_words
-                .iter()
-                .enumerate()
-                .map(|(index, word)| {
-                    quote! { __dst.add(#index).write(#word); }
-                })
-                .collect();
-            quote! {
-                #[inline]
-                fn fill_entry_raw_reds(&self, out: &mut ::std::vec::Vec<i64>) -> bool {
-                    let __len = out.len();
-                    if out.capacity().wrapping_sub(__len) >= #raw_count {
-                        unsafe {
-                            let __dst = out.as_mut_ptr().add(__len);
-                            #(#raw_writes)*
-                            out.set_len(__len + #raw_count);
-                        }
-                    } else {
-                        out.extend_from_slice(&[
-                            #(#raw_words),*
-                        ]);
-                    }
-                    true
-                }
-            }
+        // A separate `extend_from_slice` of a fixed word list lowers to a
+        // handful of stores when this function is outlined. Inlined into
+        // `enter_compiled_function_entry` that call becomes
+        // `Vec::extend_from_slice`'s memmove. Spell the spare-capacity
+        // arm as stores so the inline form keeps the outlined fast path.
+        let raw_vable_expr: TokenStream = if has_vable_identity {
+            quote! { self as *const Self as i64 }
         } else {
-            quote! {
-                #[inline]
-                fn fill_entry_raw_reds(&self, out: &mut ::std::vec::Vec<i64>) -> bool {
-                    #fill_entry_raw_static_prefix
-                    #(#raw_array_pushes)*
-                    #fill_entry_raw_static_suffix
-                    true
+            quote! {}
+        };
+        let raw_words: Vec<TokenStream> = raw_int_words
+            .iter()
+            .cloned()
+            .chain(has_vable_identity.then(|| raw_vable_expr))
+            .chain(raw_ref_words.iter().cloned())
+            .chain(raw_float_words.iter().cloned())
+            .collect();
+        let raw_count = raw_words.len();
+        let raw_writes: Vec<TokenStream> = raw_words
+            .iter()
+            .enumerate()
+            .map(|(index, word)| {
+                quote! { __dst.add(#index).write(#word); }
+            })
+            .collect();
+        quote! {
+            #[inline]
+            fn fill_entry_raw_reds(&self, out: &mut ::std::vec::Vec<i64>) -> bool {
+                let __len = out.len();
+                if out.capacity().wrapping_sub(__len) >= #raw_count {
+                    unsafe {
+                        let __dst = out.as_mut_ptr().add(__len);
+                        #(#raw_writes)*
+                        out.set_len(__len + #raw_count);
+                    }
+                } else {
+                    out.extend_from_slice(&[
+                        #(#raw_words),*
+                    ]);
                 }
+                true
             }
         }
     } else {
         quote! {}
+    };
+    let portal_result_type: TokenStream = match super::finish_return_for(&func.sig.output) {
+        Some(finish) => {
+            let ty = match finish.kind {
+                super::FinishReturnKind::Int => quote!(majit_ir::Type::Int),
+                super::FinishReturnKind::Float => quote!(majit_ir::Type::Float),
+                super::FinishReturnKind::Ref => quote!(majit_ir::Type::Ref),
+            };
+            quote! {
+                const PORTAL_RESULT_TYPE: ::core::option::Option<majit_ir::Type> = ::core::option::Option::Some(#ty);
+            }
+        }
+        None => quote! {},
     };
     let live_value_types_override: TokenStream =
         if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
@@ -3229,6 +3196,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             type Meta = #meta_ty;
             type Sym = #sym_ty;
             type Env = #env_type;
+
+            #portal_result_type
 
             fn can_trace(&self) -> bool {
                 true

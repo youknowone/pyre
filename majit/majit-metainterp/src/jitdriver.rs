@@ -2197,6 +2197,12 @@ impl<S: JitState> JitDriver<S> {
     /// Create a new JitDriver with the given hot-counting threshold.
     pub fn new(threshold: u32) -> Self {
         let mut meta = MetaInterp::new(threshold);
+        // `warmspot.py` sets `jd.result_type` from the portal return kind
+        // once, when the driver is built. A state with no `FinishReturn`
+        // leaves the `Type::Ref` `MetaInterp::new` starts from.
+        if let Some(tp) = S::PORTAL_RESULT_TYPE {
+            meta.set_result_type(tp);
+        }
         if let Some(info) = S::__build_virtualizable_info() {
             meta.set_virtualizable_info(info);
         }
@@ -7063,8 +7069,11 @@ impl<S: JitState> JitDriver<S> {
         // Stage E4, before the arm split, so it prices one pair of calls
         // rather than a different pair per outcome — and before the FINISH
         // arm takes the exit values out from under it.
+        // The exit is consumed here, outside the function that read the
+        // repeats for the earlier stages, so it reads them again.
         #[cfg(feature = "__back-edge-stage-probe")]
         if result.is_finish || result.fail_index == u32::MAX {
+            let stage_repeats = back_edge_stage_repeats();
             count_back_edge_stage_passes(BackEdgeStage::MarshalOut, stage_repeats.marshal_out);
             for _ in 0..stage_repeats.marshal_out {
                 if !result.is_finish && !result.typed_values.is_empty() {
@@ -9616,8 +9625,8 @@ impl<S: JitState> JitDriver<S> {
         }
         // Same inputarg-length test as the raw path. This arm did not fill
         // raw words, so `have` is the typed red count. A longer
-        // `inputarg_types` list was not patched and falls back to
-        // `back_edge_resolved` without a second red fill.
+        // `inputarg_types` list was not patched. `back_edge_resolved` fills
+        // the reds again through `extract_live_values_into`.
         let have = scratch.live_values.len();
         if token.inputarg_types().len() > have {
             self.entry_scratch_out(scratch);
