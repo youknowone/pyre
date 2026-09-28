@@ -9037,6 +9037,9 @@ fn direct_call_release_gil<Sym: WalkSym>(
     // forces sub-case that recorded without executing — the same
     // un-executed-side-effect SIGBUS class already closed for the
     // may-force branch.
+    // `pyjitpl.py` `do_residual_call` / `execute_and_record_varargs` runs
+    // `call_external_function` (`ccall_*`). Only the recorded op is
+    // `CALL_RELEASE_GIL` (`direct_call_release_gil`).
     // `try_execute_residual_call_via_executor` self-gates (authoritative-
     // executor flag, const-funcbox, symbolic-fnaddr-tag sanity) and degrades to
     // recording-only on decline; on success it stamps `recorded` with the

@@ -15,7 +15,6 @@
 /// - #[jit_interp]: Auto-generate trace_instruction and JitState from dispatch
 /// - #[jit_inline]: Serialize a helper into a hidden sub-JitCode
 /// - #[jit_may_force]: Mark a helper as a may-force call surface
-/// - #[jit_release_gil]: Mark a helper as a release-GIL call surface
 /// - #[jit_loop_invariant]: Alias for #[loop_invariant]
 /// - #[jit_module]: Module-level automatic helper discovery
 /// - virtualizable!: Standalone virtualizable field declaration
@@ -28,7 +27,43 @@ use syn::{
 
 mod jit_interp;
 mod jit_struct;
+mod rffi_expand;
 mod virtualizable;
+
+/// `llexternal` (`rffi.py`): funcptr, `ccall_<name>`, and the forwarding wrapper.
+#[proc_macro]
+pub fn llexternal(input: TokenStream) -> TokenStream {
+    match rffi_expand::expand_llexternal(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// `ExternalCompilationInfo` (`cbuild.py`) plus the link directives genc hands
+/// to the linker. Non-empty `library_dirs`, `link_extra`,
+/// `separate_module_sources`, `separate_module_files`, and `compile_extra`
+/// are a compile error.
+#[proc_macro]
+pub fn external_compilation_info(input: TokenStream) -> TokenStream {
+    match rffi_expand::expand_external_compilation_info(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Marker for `call_external_function._call_aroundstate_target_ = funcptr, save_err`.
+/// Emits the sibling const `_call_aroundstate_target_<fn>`.
+#[proc_macro_attribute]
+pub fn call_aroundstate_target(attr: TokenStream, item: TokenStream) -> TokenStream {
+    rffi_expand::expand_call_aroundstate_target(attr.into(), item.into()).into()
+}
+
+/// `_gctransformer_hint_close_stack_` (`llexternal`'s `call_external_function`).
+/// Emits the sibling const `_gctransformer_hint_close_stack_<fn>`.
+#[proc_macro_attribute]
+pub fn jit_close_stack(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    rffi_expand::expand_jit_close_stack(item.into()).into()
+}
 
 fn gate_generated_items(
     tokens: proc_macro2::TokenStream,
@@ -684,9 +719,9 @@ fn helper_call_target_fn_name(path: &Path) -> syn::Result<Ident> {
 /// * `_jit_loop_invariant_` — `rlib/jit.py` `@loop_invariant`.
 /// * `_jit_unroll_safe_` — `rlib/jit.py` `@unroll_safe`.
 ///
-/// `_call_aroundstate_target_` (`rffi.py`) is emitted separately
-/// in `expand_call_surface_attr` because it carries a 2-tuple
-/// `(funcptr, save_err)` rather than a bool.
+/// `_call_aroundstate_target_` (`rffi.py`) is emitted by
+/// `#[call_aroundstate_target]` on `llexternal`'s `call_external_function`,
+/// because it carries a 2-tuple `(funcptr, save_err)` rather than a bool.
 ///
 /// Returns `None` for attributes with no RPython attribute counterpart
 /// (e.g. `jit_may_force` — `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` is
@@ -1401,7 +1436,6 @@ fn helper_policy_tokens_for_fn(
     attr_name: &str,
     trace_target_name: Option<&Ident>,
     concrete_target_name: Option<&Ident>,
-    _save_err: i32,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let unsupported_byte = jit_interp::call_policy_byte::UNSUPPORTED;
     let unsupported = quote! {
@@ -1412,23 +1446,6 @@ fn helper_policy_tokens_for_fn(
     else {
         return Ok(unsupported);
     };
-    // RPython `call.py:252-253 if getattr(func,
-    // "_call_aroundstate_target_", None): tgt_func, tgt_saveerr =
-    // func._call_aroundstate_target_` — destructure the 2-tuple under
-    // the upstream attribute name.  Pyre's `expand_call_surface_attr`
-    // emits this const at module scope for `#[jit_release_gil]` callees
-    // the policy fn body below mirrors the upstream
-    // destructure verbatim instead of threading the concrete target /
-    // save_err through opaque tuple slots.
-    let aroundstate_path = format_ident!("_call_aroundstate_target_{}", func.sig.ident);
-    let release_gil_destructure = |policy_byte: proc_macro2::TokenStream| {
-        quote! {
-            {
-                let (__tgt_func, __tgt_saveerr) = #aroundstate_path;
-                (#policy_byte, std::ptr::null(), #trace_target_name as *const (), __tgt_func, std::ptr::null(), __tgt_saveerr)
-            }
-        }
-    };
     // 6-tuple: (policy, inline_builder, trace_target, concrete_target, prebuild, save_err).
     // `prebuild` is the per-helper liveness prebuild fn pointer or null
     // for non-Inline helpers (these have no per-marker triples to register).
@@ -1436,17 +1453,16 @@ fn helper_policy_tokens_for_fn(
     // other helper attribute that flows through here advertises null and
     // the parent `#[jit_interp]` lowerer's inferred-policy site
     // (`jitcode_lower.rs::CallPolicySpec::Infer`) skips the call.
-    // `save_err` carries the parsed `#[jit_release_gil(save_err = N)]`
-    // value (`rffi.py` flag bits, default `RFFI_ERR_NONE = 0`)
-    // for the wrapped release-gil lowering's
-    // `add_call_target_with_save_err`; non-release-gil arms emit `0i32`.
+    // The trailing `save_err` is `0i32` (`RFFI_ERR_NONE`). A GIL-releasing
+    // external carries `save_err` on `EffectInfo.call_release_gil_target`,
+    // filled by `getcalldescr` from `_call_aroundstate_target_`.
     use jit_interp::call_policy_byte::{
         INT_DONT_LOOK_INSIDE, INT_DONT_LOOK_INSIDE_CANNOT_RAISE, INT_ELIDABLE,
         INT_ELIDABLE_CANNOT_RAISE, INT_ELIDABLE_OR_MEMERROR, INT_LOOP_INVARIANT, INT_MAY_FORCE,
-        INT_RELEASE_GIL, REF_DONT_LOOK_INSIDE, REF_DONT_LOOK_INSIDE_CANNOT_RAISE, REF_ELIDABLE,
+        REF_DONT_LOOK_INSIDE, REF_DONT_LOOK_INSIDE_CANNOT_RAISE, REF_ELIDABLE,
         REF_ELIDABLE_CANNOT_RAISE, REF_ELIDABLE_OR_MEMERROR, REF_LOOP_INVARIANT, REF_MAY_FORCE,
         UNSUPPORTED, VOID_DONT_LOOK_INSIDE, VOID_DONT_LOOK_INSIDE_CANNOT_RAISE,
-        VOID_LOOP_INVARIANT, VOID_MAY_FORCE, VOID_RELEASE_GIL,
+        VOID_LOOP_INVARIANT, VOID_MAY_FORCE,
     };
     match helper_call_kind_for_return(&func.sig.output) {
         HelperCallKind::Void => Ok(match attr_name {
@@ -1464,7 +1480,6 @@ fn helper_policy_tokens_for_fn(
             "jit_may_force" => quote! {
                 (#VOID_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
-            "jit_release_gil" => release_gil_destructure(quote! { #VOID_RELEASE_GIL }),
             "jit_loop_invariant" => quote! {
                 (#VOID_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
@@ -1492,7 +1507,6 @@ fn helper_policy_tokens_for_fn(
             "jit_may_force" => quote! {
                 (#INT_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
-            "jit_release_gil" => release_gil_destructure(quote! { #INT_RELEASE_GIL }),
             "jit_loop_invariant" => quote! {
                 (#INT_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
@@ -1536,24 +1550,12 @@ fn helper_policy_tokens_for_fn(
             "jit_may_force" => quote! {
                 (#REF_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
-            // RPython `resoperation.py call_release_gil_for_descr` has
-            // CALL_RELEASE_GIL_I/F/N only; ref-return release-gil calls
-            // assert instead of producing CALL_RELEASE_GIL_R.
-            "jit_release_gil" => unsupported,
             _ => unsupported,
         }),
         HelperCallKind::Float => Ok(match attr_name {
-            // Same restriction as ref-return helpers: explicit wrapped float
-            // policies consume these targets directly, but inferred value-call
-            // lowering cannot model the static float result bank.  RPython
-            // `resoperation.py call_release_gil_for_descr` keeps `CALL_RELEASE_GIL_F` so
-            // float release-gil helpers are legal — the wrapped lowering
-            // at `jitcode_lower.rs::ReleaseGilFloatWrapped` reads
-            // `__save_err` from this 6th tuple slot to thread the
-            // `#[jit_release_gil(save_err = N)]` value through
-            // `add_call_target_with_save_err` (`rffi.py:228
-            // _call_aroundstate_target_ = (funcptr, save_err)` parity).
-            "jit_release_gil" => release_gil_destructure(quote! { #UNSUPPORTED }),
+            // Inferred value-call lowering cannot model a static float
+            // result bank. Explicit wrapped float policies consume these
+            // targets directly. `save_err` on the tuple stays `0i32`.
             "elidable"
             | "elidable_cannot_raise"
             | "elidable_or_memerror"
@@ -1583,10 +1585,8 @@ fn emit_helper_policy_fn(
     // that cannot go stale, and this comment read "4-tuple" while the
     // signature returned six — an arity read off prose rather than off
     // the type is how a caller ends up destructuring the wrong shape.
-    // The trailing `i32` carries the wrapper
-    // callable's `_call_aroundstate_target_[1]` (`save_err`) per
-    // `rffi.py`; non-`release_gil` policies emit `0i32`
-    // (`RFFI_ERR_NONE`, `rffi.py`).
+    // The trailing `i32` is `0i32` (`RFFI_ERR_NONE`). `save_err` for a
+    // GIL-releasing external lives on `EffectInfo.call_release_gil_target`.
     Ok(quote! {
         #[doc(hidden)]
         #[allow(non_snake_case)]
@@ -1946,7 +1946,6 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
             attr_name,
             trace_target_name.as_ref(),
             concrete_target_name.as_ref(),
-            0,
         ) {
             Ok(tokens) => tokens,
             Err(err) => return err.to_compile_error().into(),
@@ -2068,7 +2067,6 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
             attr_name,
             trace_target_name.as_ref(),
             concrete_target_name.as_ref(),
-            0,
         ) {
             Ok(tokens) => tokens,
             Err(err) => return err.to_compile_error().into(),
@@ -2149,12 +2147,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
     expanded.into()
 }
 
-fn expand_call_surface_attr(
-    attr_name: &str,
-    marker_name: &str,
-    save_err: i32,
-    item: TokenStream,
-) -> TokenStream {
+fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
     let attrs = &func.attrs;
     let vis = &func.vis;
@@ -2178,7 +2171,6 @@ fn expand_call_surface_attr(
             attr_name,
             trace_target_name.as_ref(),
             concrete_target_name.as_ref(),
-            save_err,
         ) {
             Ok(tokens) => tokens,
             Err(err) => return err.to_compile_error().into(),
@@ -2188,58 +2180,12 @@ fn expand_call_surface_attr(
         Err(err) => return err.to_compile_error().into(),
     };
 
-    // RPython attribute-name parity: emit a separate 2-tuple static
-    // named verbatim after `_call_aroundstate_target_` for
-    // `#[jit_release_gil]` annotated helpers.  `rffi.py:228
-    // call_external_function._call_aroundstate_target_ = funcptr,
-    // save_err` attaches this 2-tuple to the wrapper at module-import
-    // time; pyre cannot replicate Python's late-bound attribute model,
-    // but it can emit a static next to the wrapper under the same
-    // identifier so `rg _call_aroundstate_target_` finds the parity
-    // counterpart in both repositories.  The bundled
-    // `__majit_call_policy_<NAME>` 6-tuple (`(policy_byte,
-    // inline_builder, trace_target, concrete_target, prebuild,
-    // save_err)`) keeps existing consumers wired; the named 2-tuple
-    // additionally surfaces `(concrete_target, save_err)` under its
-    // upstream attribute name for line-by-line parity readers.
-    //
-    // `call.py:252-253 if getattr(func, "_call_aroundstate_target_",
-    // None): tgt_func, tgt_saveerr = func._call_aroundstate_target_`
-    // is the upstream consumer site; future pyre slices migrate the
-    // codewriter to read from this static directly.
-    let aroundstate_target_static = if attr_name == "jit_release_gil" {
-        concrete_target_name.as_ref().map(|concrete| {
-            let const_name = format_ident!("_call_aroundstate_target_{}", sig.ident);
-            // `const` rather than `static`: `*const ()` is not `Sync`,
-            // but a `const` of the same type is a compile-time value
-            // (each use re-evaluates the initializer) so no `Sync`
-            // bound applies.  Semantically this matches upstream's
-            // read-only attribute attached to the wrapper callable:
-            // each `getattr(func, "_call_aroundstate_target_")` returns
-            // the same 2-tuple by value.
-            quote! {
-                #[doc(hidden)]
-                #[allow(non_upper_case_globals)]
-                #vis const #const_name: (*const (), i32) =
-                    (#concrete as *const (), #save_err);
-            }
-        })
-    } else {
-        None
-    };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
 
-    // Only `jit_release_gil` has an upstream basis for `#[inline(never)]`, and
-    // it is a GC reason rather than a tracing one: `rffi.py:219
-    // call_external_function._dont_inline_ = True` sits beside `:220
-    // _gctransformer_hint_close_stack_ = True`, explained at `:232` as "don't
-    // inline, as a hack to guarantee that no GC pointer is alive anywhere in
-    // call_external_function" — the body runs with the GIL released, so a
-    // caller folded into it would put live GC pointers in that window.
-    // `jit_may_force` and `loop_invariant` carry no such flag upstream, and keep
-    // it here for the reason recorded on [`elidable`]: their bodies are past
-    // the inlining budget the free RPython inliner would have applied, and
-    // dropping it measured flat to worse.
+    // `jit_may_force` and `loop_invariant` keep `#[inline(never)]` for the
+    // reason recorded on [`elidable`]: their bodies are past the inlining
+    // budget the free RPython inliner would have applied, and dropping it
+    // measured flat to worse.
     let expanded = quote! {
         #(#attrs)*
         #[inline(never)]
@@ -2254,7 +2200,6 @@ fn expand_call_surface_attr(
 
         #call_target_fn
         #policy_fn
-        #aroundstate_target_static
         #rpython_attribute_const
     };
 
@@ -2264,33 +2209,13 @@ fn expand_call_surface_attr(
 /// Mark a function as a may-force call surface.
 #[proc_macro_attribute]
 pub fn jit_may_force(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_call_surface_attr("jit_may_force", "_MAJIT_MAY_FORCE", 0, item)
-}
-
-/// Mark a function as a release-GIL call surface.
-///
-/// Optional `save_err = N` argument mirrors `rffi.llexternal(...,
-/// save_err=N)` (`rffi.py`); the parsed integer flows into the
-/// policy tuple's `save_err` slot, matching the second element of
-/// `_call_aroundstate_target_ = (funcptr, save_err)` (`rffi.py`).
-/// Default is `RFFI_ERR_NONE = 0` (`rffi.py`).
-#[proc_macro_attribute]
-pub fn jit_release_gil(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let save_err = if attr.is_empty() {
-        0
-    } else {
-        match parse_release_gil_save_err(attr.into()) {
-            Ok(v) => v,
-            Err(err) => return err.to_compile_error().into(),
-        }
-    };
-    expand_call_surface_attr("jit_release_gil", "_MAJIT_RELEASE_GIL", save_err, item)
+    expand_call_surface_attr("jit_may_force", "_MAJIT_MAY_FORCE", item)
 }
 
 /// Mark a function as a loop-invariant call surface.
 #[proc_macro_attribute]
 pub fn jit_loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", 0, item)
+    expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", item)
 }
 
 /// Mark a function as loop-invariant.
@@ -2302,47 +2227,7 @@ pub fn jit_loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream 
 /// Implies `@dont_look_inside`.
 #[proc_macro_attribute]
 pub fn loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", 0, item)
-}
-
-/// Parse `save_err = N` from `#[jit_release_gil(...)]` arguments.
-/// Mirrors `rffi.llexternal(..., save_err=...)` kwarg (`rffi.py`).
-fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32> {
-    use syn::{Lit, MetaNameValue, Token};
-    let parser = syn::punctuated::Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
-    let pairs = syn::parse::Parser::parse2(parser, attr)?;
-    let mut save_err: Option<i32> = None;
-    for pair in pairs {
-        let key = pair
-            .path
-            .get_ident()
-            .ok_or_else(|| syn::Error::new_spanned(&pair.path, "expected `save_err = N`"))?;
-        if key == "save_err" {
-            if save_err.is_some() {
-                return Err(syn::Error::new_spanned(
-                    key,
-                    "duplicate `save_err` argument",
-                ));
-            }
-            let syn::Expr::Lit(syn::ExprLit {
-                lit: Lit::Int(int_lit),
-                ..
-            }) = &pair.value
-            else {
-                return Err(syn::Error::new_spanned(
-                    &pair.value,
-                    "save_err must be an integer literal (`rffi.py:62-71` flag bits)",
-                ));
-            };
-            save_err = Some(int_lit.base10_parse::<i32>()?);
-        } else {
-            return Err(syn::Error::new_spanned(
-                key,
-                format!("unknown #[jit_release_gil] argument `{key}`; expected `save_err`"),
-            ));
-        }
-    }
-    Ok(save_err.unwrap_or(0))
+    expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", item)
 }
 
 /// Mark struct fields whose value never mutates after construction.
@@ -2947,7 +2832,6 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
             "elidable",
             trace_target_name.as_ref(),
             concrete_target_name.as_ref(),
-            0,
         ) {
             Ok(tokens) => tokens,
             Err(err) => return err.to_compile_error().into(),
@@ -3634,7 +3518,6 @@ const JIT_HELPER_ATTRS: &[&str] = &[
     "look_inside_iff",
     "oopspec",
     "jit_may_force",
-    "jit_release_gil",
     "jit_loop_invariant",
     // `rlib/jit.py` — `@purefunction` is a deprecated alias for
     // `@elidable`; `@purefunction_promote` (`jit.py`) likewise
@@ -3790,7 +3673,7 @@ fn discover_helpers(items: &[syn::Item]) -> Vec<DiscoveredHelper> {
 /// `#[elidable]`, `#[elidable_promote]`, `#[dont_look_inside]`,
 /// `#[unroll_safe]`, `#[loop_invariant]`, `#[not_in_trace]`,
 /// `#[look_inside_iff]`, `#[oopspec]`, `#[jit_inline]`,
-/// `#[jit_may_force]`, `#[jit_release_gil]`, `#[jit_loop_invariant]`.
+/// `#[jit_may_force]`, `#[jit_loop_invariant]`.
 /// The macro scans all items and generates a hidden registry constant
 /// listing discovered helpers and their attributes.
 ///

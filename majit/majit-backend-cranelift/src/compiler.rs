@@ -1026,7 +1026,7 @@ pub fn set_gil_hooks(
     let _ = GIL_REACQUIRE_HOOK.set(Box::new(reacquire));
 }
 
-extern "C" fn jit_release_gil_shim() {
+extern "C" fn gil_release_shim() {
     if let Some(hook) = GIL_RELEASE_HOOK.get() {
         hook();
     }
@@ -13655,7 +13655,7 @@ impl CraneliftBackend {
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        jit_release_gil_shim as *const () as usize,
+                        gil_release_shim as *const () as usize,
                         &[],
                         None,
                     );

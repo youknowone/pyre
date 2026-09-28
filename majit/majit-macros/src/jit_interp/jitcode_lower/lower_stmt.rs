@@ -1790,31 +1790,6 @@ impl<'c> Lowerer<'c> {
                         );
                     }
                 }
-                crate::jit_interp::CallPolicyKind::ReleaseGilVoid => {
-                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        let typed_args = quote! {
-                            &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*]
-                        };
-                        self.emit_op(
-                            OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_release_gil_void_canonical_via_target(__fn_idx, #typed_args);
-                            },
-                        );
-                    } else {
-                        let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<Register> =
-                            arg_bindings.iter().map(Register::from_binding).collect();
-                        self.emit_op(
-                            OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_release_gil_void_canonical_via_target(__fn_idx, #typed_args);
-                            },
-                        );
-                    }
-                }
                 crate::jit_interp::CallPolicyKind::LoopInvariantVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         let typed_args = quote! {
@@ -1850,14 +1825,13 @@ impl<'c> Lowerer<'c> {
                 // RPython jtransform.py `handle_residual_call` lowers
                 // every direct_call to a residual_call regardless of result
                 // usage; majit's CallPolicyKind enum captures the effect
-                // distinction (Residual / MayForce / ReleaseGil /
-                // LoopInvariant / Elidable) so the dispatched bytecode
+                // distinction (Residual / MayForce / LoopInvariant / Elidable)
+                // so the dispatched bytecode
                 // varies per policy here.  Wrapped variants stay deferred
                 // — wrapper closure plumbing is shared with the void path
                 // and not exercised by current `#[jit_interp]` users.
                 crate::jit_interp::CallPolicyKind::ResidualInt
                 | crate::jit_interp::CallPolicyKind::MayForceInt
-                | crate::jit_interp::CallPolicyKind::ReleaseGilInt
                 | crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
                     let throwaway_reg = self.alloc_reg();
                     let canonical_call = match kind {
@@ -1867,9 +1841,6 @@ impl<'c> Lowerer<'c> {
                         crate::jit_interp::CallPolicyKind::MayForceInt => {
                             quote! { call_may_force_int_canonical_via_target }
                         }
-                        crate::jit_interp::CallPolicyKind::ReleaseGilInt => {
-                            quote! { call_release_gil_int_canonical_via_target }
-                        }
                         crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
                             quote! { call_loopinvariant_int_canonical_via_target }
                         }
@@ -1878,7 +1849,7 @@ impl<'c> Lowerer<'c> {
                     // A declared `residual_writes` mutator routes through the
                     // `_with_effect_info` int variant carrying the field
                     // write-set; only the residual policy qualifies (may-force /
-                    // release-gil / loop-invariant carry their own effects).
+                    // loop-invariant carry their own effects).
                     let write_ei = match kind {
                         crate::jit_interp::CallPolicyKind::ResidualInt => {
                             self.residual_write_effect_info_tokens(func, true)
@@ -2067,7 +2038,6 @@ impl<'c> Lowerer<'c> {
                     );
                 }
                 crate::jit_interp::CallPolicyKind::MayForceVoidWrapped
-                | crate::jit_interp::CallPolicyKind::ReleaseGilVoidWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantVoidWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
@@ -2077,9 +2047,6 @@ impl<'c> Lowerer<'c> {
                     let call_stmt = match kind {
                         crate::jit_interp::CallPolicyKind::MayForceVoidWrapped => {
                             quote! { __builder.call_may_force_void_canonical_via_target(__fn_idx, #typed_args); }
-                        }
-                        crate::jit_interp::CallPolicyKind::ReleaseGilVoidWrapped => {
-                            quote! { __builder.call_release_gil_void_canonical_via_target(__fn_idx, #typed_args); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantVoidWrapped => {
                             quote! { __builder.call_loopinvariant_void_canonical_via_target(__fn_idx, #typed_args); }
@@ -2177,7 +2144,6 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualIntCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceIntWrapped
-                | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableIntWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaiseWrapped
@@ -2192,7 +2158,6 @@ impl<'c> Lowerer<'c> {
                 | crate::jit_interp::CallPolicyKind::ResidualFloatWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualFloatCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceFloatWrapped
-                | crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableFloatWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableFloatCannotRaiseWrapped
@@ -2205,7 +2170,6 @@ impl<'c> Lowerer<'c> {
                         crate::jit_interp::CallPolicyKind::ResidualIntWrapped
                         | crate::jit_interp::CallPolicyKind::ResidualIntCannotRaiseWrapped
                         | crate::jit_interp::CallPolicyKind::MayForceIntWrapped
-                        | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
                         | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
                         | crate::jit_interp::CallPolicyKind::ElidableIntWrapped
                         | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaiseWrapped
@@ -2240,9 +2204,6 @@ impl<'c> Lowerer<'c> {
                         }
                         crate::jit_interp::CallPolicyKind::MayForceIntWrapped => {
                             quote! { __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
-                        }
-                        crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped => {
-                            quote! { __builder.call_release_gil_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped => {
                             quote! { __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
@@ -2301,9 +2262,6 @@ impl<'c> Lowerer<'c> {
                         }
                         crate::jit_interp::CallPolicyKind::MayForceFloatWrapped => {
                             quote! { __builder.call_may_force_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
-                        }
-                        crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped => {
-                            quote! { __builder.call_release_gil_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped => {
                             quote! { __builder.call_loopinvariant_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
@@ -2399,9 +2357,6 @@ impl<'c> Lowerer<'c> {
                             #VOID_MAY_FORCE => {
                                 __builder.call_may_force_void_canonical_via_target(__fn_idx, #typed_args);
                             }
-                            #VOID_RELEASE_GIL => {
-                                __builder.call_release_gil_void_canonical_via_target(__fn_idx, #typed_args);
-                            }
                             #VOID_LOOP_INVARIANT => {
                                 __builder.call_loopinvariant_void_canonical_via_target(__fn_idx, #typed_args);
                             }
@@ -2419,7 +2374,7 @@ impl<'c> Lowerer<'c> {
                             // a dispatch JitCode body (A.2.5).
                             other => panic!(
                                 "inferred void-call policy returned unrecognized byte {other}; \
-                                 expected one of 1 (residual), 9 (may_force), 13 (release_gil), \
+                                 expected one of 1 (residual), 9 (may_force), \
                                  17 (loopinvariant)"
                             ),
                         }
@@ -2427,19 +2382,19 @@ impl<'c> Lowerer<'c> {
                 );
                 // jtransform.py:467-471 — trailing `-live-` gated on the
                 // runtime policy byte's can-raise codes (void residual /
-                // may-force / release-gil); LOOP_INVARIANT and the
+                // may-force); LOOP_INVARIANT and the
                 // CANNOT_RAISE void surface skip it.
                 self.emit_op(
                     OpMeta::live_marker_if(inferred_policy_live_condition(
                         func,
-                        &[VOID_DONT_LOOK_INSIDE, VOID_MAY_FORCE, VOID_RELEASE_GIL],
+                        &[VOID_DONT_LOOK_INSIDE, VOID_MAY_FORCE],
                     )),
                     quote! { let _ = __builder.live_placeholder(); },
                 );
             }
         }
         // jtransform.py:467-471 / 480-482 — trailing `-live-` for the explicit
-        // residual / elidable / may-force / release-gil arms (computed above).
+        // residual / elidable / may-force arms (computed above).
         if post_live_after_call {
             self.emit_op(
                 OpMeta::live_marker(),

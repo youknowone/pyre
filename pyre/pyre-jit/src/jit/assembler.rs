@@ -3396,8 +3396,12 @@ mod tests {
                     vec![Operand::Register(Register::new(Kind::Ref, 0))],
                 )),
                 Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
-                    effect_info:
-                        super::super::flatten::unresolved_release_gil_effect_info_for_via_target(),
+                    // `call.py` `getcalldescr` fills the target from
+                    // `_call_aroundstate_target_`.
+                    effect_info: majit_ir::EffectInfo {
+                        call_release_gil_target: (0x7777, 0),
+                        ..majit_ir::EffectInfo::MOST_GENERAL.clone()
+                    },
                     arg_kinds: vec![Kind::Int, Kind::Ref],
                     result_kind: None,
                     void_word_abi: false,

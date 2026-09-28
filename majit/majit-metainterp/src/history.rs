@@ -4484,12 +4484,11 @@ impl TraceCtx {
     /// `[savebox, realfuncaddr] + args`. The body reads
     /// `(realfuncaddr, saveerr)` directly off `effect_info.call_release_gil_target`
     /// matching `pyjitpl.py` line-by-line; the descr is guaranteed
-    /// to carry a real C address by the time we read it because either
-    /// (a) the emit-side `assembler.rs::resolve_call_release_gil_target`
-    /// substituted the resolved `target.concrete_ptr` into a sentinel
-    /// `(1, 0)` slot before the descr was materialized, or (b) a
-    /// producer-side typed caller (`trace_ctx.rs::call_release_gil_int_typed`,
-    /// `_float_typed`) populated the slot directly from `func_ptr`.
+    /// to carry a real C address by the time we read it because
+    /// `call.py` `getcalldescr` wrote `(tgt_func, tgt_saveerr)` from
+    /// `_call_aroundstate_target_`, or a producer-side typed caller
+    /// (`call_release_gil_int_typed` / `_float_typed`) populated the slot
+    /// directly from `func_ptr`.
     ///
     /// Routes heapcache invalidation through `invalidate_caches_varargs`
     /// (heapcache.py) instead of the escape-only path used by
@@ -4553,16 +4552,11 @@ impl TraceCtx {
         //   realfuncaddr, saveerr = effectinfo.call_release_gil_target
         //   funcbox = ConstInt(adr2int(realfuncaddr))
         //   savebox = ConstInt(saveerr)
-        // Pyre's emit-side `resolve_call_release_gil_target`
-        // (`jitcode/assembler.rs`) substitutes the resolved
-        // `target.concrete_ptr` into the `realfuncaddr` slot for the
-        // sentinel-(1, 0) descrs emitted by the macro DSL wrappers
-        // before the descr is materialized.  Caller-side
-        // `trace_ctx::call_release_gil_*_typed` already populates the
-        // slot with `func_ptr` directly (`call_release_gil_{int,float}_typed`
-        // in this file).
-        // Either way the descr carries a real C address by the time
-        // we read it here.
+        // `call.py` `getcalldescr` writes `(tgt_func, tgt_saveerr)` from
+        // `_call_aroundstate_target_` before this runs. Caller-side
+        // `call_release_gil_{int,float}_typed` populates the slot from
+        // `func_ptr` directly. Either way the descr carries a real C
+        // address by the time we read it here.
         //
         // PyPy's `call.py:252-258 _call_aroundstate_target_` allows
         // the wrapper at `direct_call`'s `args[0]` and the real GIL-
@@ -4573,7 +4567,7 @@ impl TraceCtx {
         let (realfuncaddr, saveerr) = effect_info.call_release_gil_target;
         debug_assert!(
             realfuncaddr != 0,
-            "release_gil call_release_gil_target unset — emit-side resolve_call_release_gil_target should have populated realfuncaddr",
+            "release_gil call_release_gil_target unset — getcalldescr should have populated realfuncaddr",
         );
         let _ = func_ptr;
         // history.py ConstInt.value inline for saveerr flags + static
@@ -4726,13 +4720,12 @@ impl TraceCtx {
     }
 
     // call_release_gil_void / _typed intentionally absent:
-    // production void release-GIL calls are emitted via the canonical
-    // `JitCodeBuilder::call_release_gil_void_canonical_via_target`
-    // (jitcode/assembler.rs) which writes the upstream-shaped
-    // `[savebox, funcbox]+args` operand layout directly. The legacy
-    // `call_family_typed`-based void helper produced a `[func]+args`
-    // layout that did not match `cranelift::compiler.rs`'s `do_compile`
-    // expectation, so it was removed once the only caller migrated.
+    // production void release-GIL calls are recorded by
+    // `call_release_gil_void_typed_with_effect`, which writes the
+    // upstream-shaped `[savebox, funcbox]+args` operand layout. The
+    // legacy `call_family_typed`-based void helper produced a
+    // `[func]+args` layout that did not match `compiler.rs`'s
+    // `do_compile` expectation.
     //
     // call_release_gil_ref / _typed intentionally absent:
     // resoperation.py (`# no such thing`) excludes

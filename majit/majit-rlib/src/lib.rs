@@ -10,6 +10,8 @@
 //! in a crate above the module that allocates it. The module path spells the
 //! upstream package it came from.
 
+extern crate self as majit_rlib;
+
 #[cfg(target_os = "windows")]
 #[allow(non_snake_case)]
 pub mod _rsocket_rffi;
@@ -19,6 +21,7 @@ pub mod jit;
 pub mod lltypesystem;
 pub mod nonconst;
 pub mod rbigint;
+pub mod rffi;
 pub mod rposix;
 pub mod rthread;
 pub mod rvmprof;

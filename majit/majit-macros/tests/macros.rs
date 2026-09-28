@@ -216,9 +216,7 @@ mod jit_module {
 
     #[jit_module]
     mod multi_attr_module {
-        use majit_macros::{
-            dont_look_inside, elidable, jit_may_force, jit_release_gil, loop_invariant,
-        };
+        use majit_macros::{dont_look_inside, elidable, jit_may_force, loop_invariant};
 
         #[elidable]
         pub fn pure_fn(x: i64) -> i64 {
@@ -235,11 +233,6 @@ mod jit_module {
             x - 1
         }
 
-        #[jit_release_gil]
-        pub fn gil_fn(x: i64) -> i64 {
-            x * 3
-        }
-
         // `#[loop_invariant]` — RPython canonical `rlib/jit.py
         // @loop_invariant`.  `#[jit_loop_invariant]` is a pyre-prefixed
         // alias kept for back-compat (exercised separately in
@@ -253,22 +246,20 @@ mod jit_module {
     #[test]
     fn test_all_attribute_types_discovered() {
         let helpers = multi_attr_module::__MAJIT_DISCOVERED_HELPERS;
-        assert_eq!(helpers.len(), 5);
+        assert_eq!(helpers.len(), 4);
         assert!(helpers.contains(&"pure_fn"));
         assert!(helpers.contains(&"opaque_fn"));
         assert!(helpers.contains(&"force_fn"));
-        assert!(helpers.contains(&"gil_fn"));
         assert!(helpers.contains(&"invariant_fn"));
     }
 
     #[test]
     fn test_all_attribute_policies() {
         let policies = multi_attr_module::__MAJIT_HELPER_POLICIES;
-        assert_eq!(policies.len(), 5);
+        assert_eq!(policies.len(), 4);
         assert!(policies.contains(&("pure_fn", "elidable")));
         assert!(policies.contains(&("opaque_fn", "dont_look_inside")));
         assert!(policies.contains(&("force_fn", "jit_may_force")));
-        assert!(policies.contains(&("gil_fn", "jit_release_gil")));
         assert!(policies.contains(&("invariant_fn", "loop_invariant")));
     }
 
@@ -277,7 +268,6 @@ mod jit_module {
         assert_eq!(multi_attr_module::pure_fn(5), 10);
         assert_eq!(multi_attr_module::opaque_fn(5), 6);
         assert_eq!(multi_attr_module::force_fn(5), 4);
-        assert_eq!(multi_attr_module::gil_fn(5), 15);
         assert_eq!(multi_attr_module::invariant_fn(10), 5);
     }
 
@@ -631,20 +621,6 @@ mod jit_module {
         assert_eq!(passthrough_free_fn_module::out_of_trace(5), 10);
     }
 
-    mod release_gil_aroundstate_module {
-        use majit_macros::jit_release_gil;
-
-        #[jit_release_gil]
-        pub fn release_default(x: i64) -> i64 {
-            x + 1
-        }
-
-        #[jit_release_gil(save_err = 5)]
-        pub fn release_with_errno(x: i64) -> i64 {
-            x + 2
-        }
-    }
-
     mod rpython_attribute_name_module {
         use majit_macros::{
             dont_look_inside, dont_look_inside_cannot_raise, elidable, elidable_cannot_raise,
@@ -861,44 +837,6 @@ mod jit_module {
 
         assert_eq!(oopspec_marked_isconstant, "jit.isconstant(value)");
         assert_eq!(oopspec_marked_not_in_trace, "jit.not_in_trace()");
-    }
-
-    /// RPython attribute-name parity: `#[jit_release_gil(save_err = N)]`
-    /// emits a named static `_call_aroundstate_target_<NAME>` next to the
-    /// wrapper, mirroring `rffi.py
-    /// call_external_function._call_aroundstate_target_ = funcptr,
-    /// save_err`.  Both halves (concrete target + save_err) must be
-    /// reachable under this upstream-named identifier so `rg
-    /// _call_aroundstate_target_` finds the parity counterpart in both
-    /// pyre and PyPy repositories.
-    #[test]
-    fn test_release_gil_emits_call_aroundstate_target_static() {
-        let (default_ptr, default_save_err) =
-            release_gil_aroundstate_module::_call_aroundstate_target_release_default;
-        assert!(
-            !default_ptr.is_null(),
-            "_call_aroundstate_target_release_default[0] must point at the concrete wrapper",
-        );
-        assert_eq!(
-            default_save_err, 0,
-            "default save_err = 0 (RFFI_ERR_NONE per rffi.py:80)",
-        );
-
-        let (errno_ptr, errno_save_err) =
-            release_gil_aroundstate_module::_call_aroundstate_target_release_with_errno;
-        assert!(
-            !errno_ptr.is_null(),
-            "_call_aroundstate_target_release_with_errno[0] must point at the concrete wrapper",
-        );
-        assert_eq!(
-            errno_save_err, 5,
-            "save_err = 5 must flow through the proc-macro tuple verbatim",
-        );
-
-        assert_ne!(
-            default_ptr, errno_ptr,
-            "per-function `_call_aroundstate_target_` consts must not alias",
-        );
     }
 }
 

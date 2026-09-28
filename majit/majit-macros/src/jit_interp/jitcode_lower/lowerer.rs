@@ -674,11 +674,10 @@ impl<'c> Lowerer<'c> {
         //   21u8/22u8/23u8 — `elidable*` Ref.
         //   24u8 — `jit_loop_invariant` Ref.
         //   25u8 — `dont_look_inside` Ref (`Plain`).
-        //   26u8 — Ref `MayForce` (rejected here). Ref `ReleaseGil` has
-        //   no upstream CALL_RELEASE_GIL_R and is emitted as unsupported.
-        //   9u8/10u8/13u8/14u8 — `MayForce` / `ReleaseGil` (rejected
-        //   by `cond_call_slot_for_policy`'s `jtransform.py:1677`
-        //   gate, but reach here at runtime — panic to match).
+        //   26u8 — Ref `MayForce` (rejected here).
+        //   9u8/10u8 — `MayForce` (rejected by `cond_call_slot_for_policy`'s
+        //   `jtransform.py` `_rewrite_op_cond_call` gate, but reach here at runtime — panic
+        //   to match). Slots 13 and 14 stay reserved.
         // Unknown bytes (including `0u8` "unsupported") are rejected by
         // the call-site-specific inferred policy check before this slot is
         // used.  The fallback is kept only for defensive expansion.
@@ -704,10 +703,9 @@ impl<'c> Lowerer<'c> {
                     #INT_ELIDABLE_OR_MEMERROR | #REF_ELIDABLE_OR_MEMERROR => {
                         majit_metainterp::EffectInfoSlot::ElidableOrMemerror
                     }
-                    #VOID_MAY_FORCE | #INT_MAY_FORCE | #VOID_RELEASE_GIL | #INT_RELEASE_GIL
-                    | #REF_MAY_FORCE => panic!(
+                    #VOID_MAY_FORCE | #INT_MAY_FORCE | #REF_MAY_FORCE => panic!(
                         "conditional_call! / conditional_call_elidable! / record_known_result! \
-                         cannot dispatch MayForce / ReleaseGil callees \
+                         cannot dispatch MayForce callees \
                          (jtransform.py:1677 _rewrite_op_cond_call assert)",
                     ),
                     _ => #static_slot_token,

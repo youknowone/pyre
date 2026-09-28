@@ -6925,10 +6925,18 @@ pub struct FuncEffects {
     pub elidable: bool,
     /// `func._jit_loop_invariant_` (call.py:240).
     pub loop_invariant: bool,
-    /// `func._gctransformer_hint_close_stack_` (call.py:129-134) — a
-    /// close_stack callee must never produce a JitCode and is classified
-    /// `Residual` by `guess_call_kind`.
+    /// `func._gctransformer_hint_close_stack_` (call.py `guess_call_kind`
+    /// / `get_jitcode`) — a close_stack callee must never produce a
+    /// JitCode and is classified `Residual` by `guess_call_kind`.
     pub close_stack: bool,
+    /// `func._call_aroundstate_target_` (`call.py` `CallControl.getcalldescr`).
+    /// `(funcptr identity, save_err)`. The identity is the funcptr's path,
+    /// and when Charon recorded `link_name` a tab plus that symbol. The
+    /// machine address is not in the LLBC; `getcalldescr` resolves it from
+    /// `function_fnaddrs` (`register_macro_helper_trace_fnaddr`). A miss
+    /// leaves `symbolic_fnaddr_for_path` of the funcptr, which
+    /// `rewrite_call_release_gil_target` maps through `jit_trace_fnaddrs`.
+    pub call_aroundstate_target: Option<(String, i64)>,
     /// `func._dont_inline_`, set by
     /// `WarmRunnerDesc.split_graph_and_record_jitdriver` on the copied
     /// portal.  The backend inliner reads this off the function object; it is
@@ -6957,6 +6965,7 @@ impl Default for FuncEffects {
             elidable: false,
             loop_invariant: false,
             close_stack: false,
+            call_aroundstate_target: None,
             dont_inline: false,
             module: None,
         }
@@ -6987,6 +6996,9 @@ impl FuncEffects {
         self.elidable |= other.elidable;
         self.loop_invariant |= other.loop_invariant;
         self.close_stack |= other.close_stack;
+        if other.call_aroundstate_target.is_some() {
+            self.call_aroundstate_target = other.call_aroundstate_target.clone();
+        }
         self.dont_inline |= other.dont_inline;
         if other.module.is_some() {
             self.module = other.module.clone();

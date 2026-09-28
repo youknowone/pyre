@@ -1565,7 +1565,6 @@ impl<'c> Lowerer<'c> {
             CallPolicySpec::Explicit(kind) => match kind {
                 crate::jit_interp::CallPolicyKind::ResidualInt
                 | crate::jit_interp::CallPolicyKind::MayForceInt
-                | crate::jit_interp::CallPolicyKind::ReleaseGilInt
                 | crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
                     let canonical_call = match kind {
                         crate::jit_interp::CallPolicyKind::ResidualInt => {
@@ -1573,9 +1572,6 @@ impl<'c> Lowerer<'c> {
                         }
                         crate::jit_interp::CallPolicyKind::MayForceInt => {
                             quote! { call_may_force_int_canonical_via_target }
-                        }
-                        crate::jit_interp::CallPolicyKind::ReleaseGilInt => {
-                            quote! { call_release_gil_int_canonical_via_target }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
                             quote! { call_loopinvariant_int_canonical_via_target }
@@ -1590,8 +1586,8 @@ impl<'c> Lowerer<'c> {
                     // it a stack-mutating residual (e.g. `jit_pop_is_zero`
                     // feeding a branch) leaves the cached `selected.size`
                     // stale and loop-peel const-folds it.  Only the residual
-                    // policy qualifies (may-force / release-gil /
-                    // loop-invariant carry their own effects).
+                    // policy qualifies (may-force / loop-invariant carry their
+                    // own effects).
                     let write_ei = match kind {
                         crate::jit_interp::CallPolicyKind::ResidualInt => {
                             self.residual_write_effect_info_tokens(func, true)
@@ -1816,7 +1812,6 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualIntCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceIntWrapped
-                | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableIntWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaiseWrapped
@@ -1831,7 +1826,6 @@ impl<'c> Lowerer<'c> {
                 | crate::jit_interp::CallPolicyKind::ResidualFloatWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualFloatCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceFloatWrapped
-                | crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableFloatWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableFloatCannotRaiseWrapped
@@ -1855,9 +1849,6 @@ impl<'c> Lowerer<'c> {
                         }
                         crate::jit_interp::CallPolicyKind::MayForceIntWrapped => {
                             quote! { __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #reg); }
-                        }
-                        crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped => {
-                            quote! { __builder.call_release_gil_int_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped => {
                             quote! { __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #reg); }
@@ -1926,10 +1917,6 @@ impl<'c> Lowerer<'c> {
                         crate::jit_interp::CallPolicyKind::MayForceFloatWrapped => {
                             result_kind = BindingKind::Float;
                             quote! { __builder.call_may_force_float_canonical_via_target(__fn_idx, #typed_args, #reg); }
-                        }
-                        crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped => {
-                            result_kind = BindingKind::Float;
-                            quote! { __builder.call_release_gil_float_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped => {
                             result_kind = BindingKind::Float;
@@ -2186,9 +2173,6 @@ impl<'c> Lowerer<'c> {
                                 #INT_MAY_FORCE => {
                                     __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
-                                #INT_RELEASE_GIL => {
-                                    __builder.call_release_gil_int_canonical_via_target(__fn_idx, #typed_args, #reg);
-                                }
                                 #INT_LOOP_INVARIANT => {
                                     __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
@@ -2216,7 +2200,6 @@ impl<'c> Lowerer<'c> {
                                 INT_ELIDABLE,
                                 INT_INLINE,
                                 INT_MAY_FORCE,
-                                INT_RELEASE_GIL,
                                 INT_ELIDABLE_OR_MEMERROR,
                             ],
                         )),
@@ -2285,9 +2268,6 @@ impl<'c> Lowerer<'c> {
                             #INT_MAY_FORCE => {
                                 __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                             }
-                            #INT_RELEASE_GIL => {
-                                __builder.call_release_gil_int_canonical_via_target(__fn_idx, #typed_args, #reg);
-                            }
                             #INT_LOOP_INVARIANT => {
                                 __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                             }
@@ -2305,7 +2285,6 @@ impl<'c> Lowerer<'c> {
                                 INT_ELIDABLE,
                                 INT_INLINE,
                                 INT_MAY_FORCE,
-                                INT_RELEASE_GIL,
                                 INT_ELIDABLE_OR_MEMERROR,
                             ],
                         )),
@@ -2316,7 +2295,7 @@ impl<'c> Lowerer<'c> {
         }
 
         // jtransform.py:467-471 / 480-482 — trailing `-live-` for the explicit
-        // residual / elidable / may-force / release-gil arms (computed above).
+        // residual / elidable / may-force arms (computed above).
         if post_live_after_call {
             self.emit_op(
                 OpMeta::live_marker(),

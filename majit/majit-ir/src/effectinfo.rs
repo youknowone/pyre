@@ -387,7 +387,7 @@ pub fn intern_effect_info(effect_info: EffectInfo) -> Arc<EffectInfoCell> {
     // every non-null target, so normalise the half no reader can reach from
     // here: `is_call_release_gil` tests `tgt_func` alone, and the two sites
     // that do consume the pair assert a resolved address first.  Without this,
-    // a `(0, save_err)` left by an unresolved `resolve_call_release_gil_target`
+    // a `(0, save_err)` with a null target
     // would key its own cell and mint a call descr upstream would have merged.
     let mut effect_info = effect_info;
     effect_info.call_release_gil_target = EffectInfo::_NO_CALL_RELEASE_GIL_TARGET;
