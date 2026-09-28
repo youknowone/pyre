@@ -322,12 +322,12 @@ pub fn gc_slice_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64>
         v.get("Deduplicated")
             .and_then(serde_json::Value::as_u64)
             .or_else(|| {
-                v.pointer("/HashConsedValue/0")
+                v.pointer("/Value/0")
                     .and_then(serde_json::Value::as_u64)
             })
     };
     let body_of = |v: &serde_json::Value| {
-        v.pointer("/HashConsedValue/1")
+        v.pointer("/Value/1")
             .cloned()
             .or_else(|| id_of(v).and_then(|id| llbc.dedup_body(id).cloned()))
     };
@@ -346,7 +346,7 @@ pub fn gc_slice_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64>
                 .dedup_body(t)
                 .and_then(|b| b.pointer("/Ref/1").cloned())
                 .and_then(|inner| body_of(&inner))
-                .and_then(|inner| inner.get("Slice").and_then(id_of));
+                .and_then(|inner| inner.pointer("/Slice/0").and_then(id_of));
             if elem.is_some_and(|e| gc_tys.contains(&e)) {
                 out.insert(t);
             }

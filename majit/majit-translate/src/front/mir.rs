@@ -31200,7 +31200,7 @@ fn elaborate_explicit_root_closes(
             };
             temps.push(cur);
             moves.push(i);
-            guard_place = stmt.kind["Assign"][1]["Use"]["Move"].clone();
+            guard_place = stmt.kind["Assign"][1]["Use"][0]["Move"].clone();
             cur = src as usize;
         }
         closes.push(Close {
@@ -31418,7 +31418,7 @@ fn local_move_counts(body: &Unstructured) -> std::collections::HashMap<usize, us
         v.get("Deduplicated")
             .and_then(serde_json::Value::as_u64)
             .or_else(|| {
-                v.get("HashConsedValue")
+                v.get("Value")
                     .and_then(|h| h.get(0))
                     .and_then(serde_json::Value::as_u64)
             })
@@ -55595,7 +55595,7 @@ mod tests {
                     "statements": [{
                         "kind": {"Assign": [
                             {"kind": {"Local": 2}, "ty": {"Deduplicated": 0}},
-                            {"Use": {"Move": {"kind": {"Local": 1}, "ty": {"Deduplicated": spelled_ty}}}}
+                            {"Use": [{"Move": {"kind": {"Local": 1}, "ty": {"Deduplicated": spelled_ty}}}, "No"]}
                         ]},
                         "comments_before": [],
                         "span": span()
@@ -56793,7 +56793,7 @@ mod tests {
         let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
             serde_json::json!({"Call": {
                 "call": {
-                    "func": {"Regular": {"kind": {"Fun": {"Regular": id}}, "generics": null}},
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
                     "args": args,
                     "dest": place(dest)
                 },
@@ -56804,7 +56804,7 @@ mod tests {
         let drop_guard = |local: u64, target: u64| {
             serde_json::json!({"Drop": {
                 "place": place(local),
-                "fn_ptr": {"kind": {"Fun": {"Regular": 0}}, "generics": {}},
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
                 "target": target,
                 "on_unwind": 99
             }})
@@ -56873,7 +56873,7 @@ mod tests {
         let llbc = llbc_with_types("pyre_object", vec![], funs);
         let direct = |id: u64| -> RegularCall {
             serde_json::from_value(
-                serde_json::json!({"kind": {"Fun": {"Regular": id}}, "generics": null}),
+                serde_json::json!({"kind": {"Fun": id}, "generics": null}),
             )
             .expect("fixture call parses")
         };
@@ -56910,7 +56910,7 @@ mod tests {
         let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
             serde_json::json!({"Call": {
                 "call": {
-                    "func": {"Regular": {"kind": {"Fun": {"Regular": id}}, "generics": null}},
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
                     "args": args,
                     "dest": place(dest)
                 },
@@ -56978,7 +56978,7 @@ mod tests {
             llbc_with_types(krate, vec![], funs)
         };
         let direct: RegularCall = serde_json::from_value(
-            serde_json::json!({"kind": {"Fun": {"Regular": 1}}, "generics": null}),
+            serde_json::json!({"kind": {"Fun": 1}, "generics": null}),
         )
         .expect("fixture call parses");
         let method: RegularCall = serde_json::from_value(
@@ -57022,12 +57022,12 @@ mod tests {
             |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
         let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
         let move_into = |dest: u64, src: u64| {
-            stmt(serde_json::json!({"Assign": [place(dest), {"Use": {"Move": place(src)}}]}))
+            stmt(serde_json::json!({"Assign": [place(dest), {"Use": [{"Move": place(src)}, "No"]}]}))
         };
         let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64, unwind: u64| {
             serde_json::json!({"Call": {
                 "call": {
-                    "func": {"Regular": {"kind": {"Fun": {"Regular": id}}, "generics": null}},
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
                     "args": args,
                     "dest": place(dest)
                 },
@@ -57039,7 +57039,7 @@ mod tests {
             serde_json::json!({"Drop": {
                 "kind": "Conditional",
                 "place": place(local),
-                "fn_ptr": {"kind": {"Fun": {"Regular": 0}}, "generics": {}},
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
                 "target": target,
                 "on_unwind": unwind
             }})
@@ -57135,21 +57135,21 @@ mod tests {
         let llbc = llbc_with_types("pyre_object", vec![], funs);
         let name_of = |reg: &RegularCall| super::regular_call_name_path(reg, &llbc);
         let drop_place =
-            |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb].term(&fixture_llbc()) {
+            |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb].term(&llbc) {
                 Ok(TermKind::Drop { place, target, .. }) => match place.kind {
                     PlaceKind::Local(l) => Some((l, target)),
                     _ => None,
                 },
                 _ => None,
             };
-        let goto = |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb].term(&fixture_llbc())
+        let goto = |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb].term(&llbc)
         {
             Ok(TermKind::Goto { target }) => Some(target),
             _ => None,
         };
 
         let mut u = llbc.fn_by_id(4).unwrap().unstructured().unwrap();
-        super::elaborate_explicit_root_closes(&fixture_llbc(), &mut u, &name_of);
+        super::elaborate_explicit_root_closes(&llbc, &mut u, &name_of);
         assert!(
             u.body[2].statements.is_empty(),
             "the move into the call goes"
@@ -57161,20 +57161,20 @@ mod tests {
         assert!(!super::moved_out_locals(&u).contains(2));
 
         let mut u = llbc.fn_by_id(5).unwrap().unstructured().unwrap();
-        super::elaborate_explicit_root_closes(&fixture_llbc(), &mut u, &name_of);
+        super::elaborate_explicit_root_closes(&llbc, &mut u, &name_of);
         assert_eq!(
             u.body[2].statements.len(),
             1,
             "a guard closed on one arm is left"
         );
-        assert!(matches!(u.body[2].term(&fixture_llbc()), Ok(TermKind::Call { .. })));
+        assert!(matches!(u.body[2].term(&llbc), Ok(TermKind::Call { .. })));
         assert_eq!(drop_place(&u, 3), Some((2, 4)));
 
         // The bracket closes every pin `operands` makes, so its caller sees
         // no change to the root stack.
         let analyzer = super::RootStackAnalyzer::new(&llbc);
         let direct: RegularCall = serde_json::from_value(
-            serde_json::json!({"kind": {"Fun": {"Regular": 4}}, "generics": null}),
+            serde_json::json!({"kind": {"Fun": 4}, "generics": null}),
         )
         .expect("fixture call parses");
         assert!(!analyzer.regular_call_touches_root_stack(&direct));
