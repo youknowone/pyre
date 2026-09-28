@@ -2818,6 +2818,13 @@ impl DynasmBackend {
         // Once the forwarded refs are in the frame, keeping their owner-root
         // slots through compiled execution would add them to every GC scan.
         drop(arg_roots);
+        // llmodel.py execute_token: `llop.gc_writebarrier(lltype.Void, ll_frame)`
+        // after the inputs are stored. A frame the allocation placed outside
+        // the nursery reaches the next minor collection only through the
+        // remembered set.
+        if gc_object {
+            with_gc_ll_descr(|gc| jitframe_write_barrier(gc, jf_ptr));
+        }
 
         // Each flag is folded into `diag`. A steady run takes the one
         // false test and does not call into the loggers.

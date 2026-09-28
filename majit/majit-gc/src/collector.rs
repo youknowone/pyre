@@ -3377,19 +3377,6 @@ impl MiniMarkGC {
         if self.gc_state == GcState::Marking {
             self.regray_remembered_black_during_marking();
         }
-        // incminimark.py:1826-1832: replace the list before anything can append
-        // to it, so parents discovered during this minor accumulate in the
-        // fresh one instead of in the copy being drained. Upstream performs the
-        // swap after `collect_roots_in_nursery` because its root callback
-        // passes a NULL parent and therefore records nothing; the
-        // old-generation jitframe arm of Phase 1c below traces with a real
-        // parent, so here the swap has to come first. A parent recorded after
-        // the swap keeps `GCFLAG_PINNED_OBJECT_PARENT_KNOWN` for the rest of
-        // the minor and would not be re-recorded when the drained copy is
-        // visited, which would drop it from the list permanently and leave the
-        // flag set for good.
-        let old_parents_pointing_to_pinned =
-            std::mem::take(&mut self.old_objects_pointing_to_pinned);
         crate::bh_probe_clear_traced();
         // Phase 1: Process roots — copy nursery objects they point to.
         // We use raw pointers to avoid borrow checker issues since
@@ -3421,10 +3408,12 @@ impl MiniMarkGC {
         }
 
         // Phase 1c: Process jitframe shadow stack roots.
-        // RPython root_walker.walk_roots with jitframe entries —
-        // reads jf_gcmap from each jitframe and traces ref slots.
-        // assembler.py:1122 (_call_header_shadowstack) pushes jf_ptr;
-        // callbuilder.py:93 (push_gcmap) writes per-call gcmap to jf_gcmap.
+        // `_call_header_shadowstack` pushes the frame and `root_walker.walk_roots`
+        // hands each entry to `_trace_drag_out1`, which only moves a young
+        // frame. An old frame's young refs are reached through the remembered
+        // set: `llmodel.py execute_token` and `_reload_frame_if_necessary`
+        // apply the write barrier to the frame, so `collect_oldrefs_to_nursery`
+        // traces it with the jitframe custom trace (`jf_gcmap` bits).
         // Collect libc-jitframe slots so we can traverse/update them
         // after the walk finishes without reborrowing `self` inside the
         // tracer callback.
@@ -3433,17 +3422,10 @@ impl MiniMarkGC {
             if self.is_nursery_object_start(gcref.0) {
                 self.drag_out_root(gcref);
             } else if self.is_young_rawmalloced(gcref.0) {
-                // Before the `oldgen.contains` arm below: a young rawmalloced
-                // block is registered in `rawmalloced_payloads` too, so that
-                // arm would trace it as an old jitframe and leave it without
-                // GCFLAG_VISITED_RMY — freed at the end of this collection
-                // with its children kept.
+                // `_trace_drag_out` on a young rawmalloced frame: flag it
+                // GCFLAG_VISITED_RMY so it survives, and queue it for the
+                // remembered walk that traces its slots.
                 self.visit_young_rawmalloced_object(gcref.0);
-            } else if !gcref.is_null() && self.oldgen.contains(gcref.0) {
-                // RPython parity: old-gen jitframes need their interior
-                // nursery refs traced directly. The custom_trace hook
-                // walks gcmap bits to find Ref slots.
-                self.trace_and_update_object(gcref.0, "minor_jitframe_root");
             } else if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
                 // pyre dynasm extension: jitframes allocated via
                 // `libc::calloc` in execute_token are neither in the
@@ -3544,10 +3526,13 @@ impl MiniMarkGC {
             crate::shadow_stack::ExtraRootWalkKind::Major,
         );
 
-        // incminimark.py:1820-1832: old parents that reached a pinned child in
-        // the previous minor must be traced again. `copy_nursery_object`
-        // repopulates the list swapped in above, and only for parents that
-        // still point to a pinned object.
+        // incminimark.py `_minor_collection`: old parents that reached a pinned
+        // child in the previous minor must be traced again. The list is
+        // swapped out after the root walk, whose callbacks record no parent,
+        // and `copy_nursery_object` repopulates the fresh one only for parents
+        // that still point to a pinned object.
+        let old_parents_pointing_to_pinned =
+            std::mem::take(&mut self.old_objects_pointing_to_pinned);
         for obj_addr in old_parents_pointing_to_pinned {
             self.trace_and_update_object(obj_addr, "minor_old_parent_pinned");
         }
@@ -16296,13 +16281,11 @@ cache size\t: 8192 kB\n";
         );
     }
 
-    /// The sibling above only ever discovers the parent *after* the list is
-    /// swapped out. Phase 1c traces an old-generation jitframe directly, with
-    /// itself as the holder, and that runs earlier — so a parent found there
-    /// would be re-flagged before the drained copy is visited, never make it
-    /// into the fresh list, and keep `PINNED` set for good.
+    /// An old parent that is also a jitframe root must stay in the list: the
+    /// root walk does not trace an old frame, so the parent is found only by
+    /// the drained copy of the list and re-recorded into the fresh one.
     #[test]
-    fn test_old_parent_found_before_the_swap_stays_in_the_list() {
+    fn test_old_parent_that_is_a_jitframe_root_stays_in_the_list() {
         let _guard = SHADOW_STACK_TEST_LOCK.lock();
         crate::shadow_stack::clear();
         let mut gc = test_gc(4096);
@@ -16319,8 +16302,7 @@ cache size\t: 8192 kB\n";
         assert!(gc.is_pinned(child));
         assert_eq!(gc.old_objects_pointing_to_pinned, vec![parent.0]);
 
-        // Publish the promoted parent as a jitframe root so the minor below
-        // reaches it through the pre-swap old-generation arm as well.
+        // Publish the promoted parent as a jitframe root as well.
         crate::shadow_stack::push_jf(parent);
         gc.do_collect_nursery();
         assert_eq!(gc.old_objects_pointing_to_pinned, vec![parent.0]);
