@@ -609,6 +609,22 @@ pub unsafe fn pyerror_value_error_to_exc_object(
     PyError::value_error(fused_raise_message(w_msg)).to_exc_object()
 }
 
+/// Literal-message `IndexError` twin of [`pyerror_value_error_to_exc_object`].
+///
+/// `getitem_str` (`descr_getitem` after `getindex_w`) raises
+/// `PyError::index_error("string index out of range")` when `_getitem_result`
+/// finds no code point. Fusing that constructor keeps the `PyError` aggregate,
+/// whose `Wtf8Buf` is not a one-word `STR`, out of the subscript JitCode.
+///
+/// # Safety
+/// `w_msg` is a live rstr `STR` payload.
+#[majit_macros::dont_look_inside]
+pub unsafe fn pyerror_index_error_to_exc_object(
+    w_msg: *mut pyre_object::PyObject,
+) -> *mut pyre_object::PyObject {
+    PyError::index_error(fused_raise_message(w_msg)).to_exc_object()
+}
+
 impl PyError {
     /// Publish the three GC references this carrier holds on `roots` without
     /// normalizing them, and return the base of their three slots.

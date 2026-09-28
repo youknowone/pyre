@@ -112,6 +112,16 @@ extern "C" fn w_list_pop_end_inner_word(obj: pyre_object::PyObjectRef) -> pyre_o
     unsafe { pyre_object::listobject::w_list_pop_end_inner(obj) }.unwrap_or(pyre_object::PY_NULL)
 }
 
+/// One-word residual ABI for `w_str_getitem`. Out of range is NULL; the
+/// descended `getitem_str` graph still owns the IndexError.
+/// `Option<PyObjectRef>` is two words, as for `w_list_pop_end_word`.
+extern "C" fn w_str_getitem_word(
+    obj: pyre_object::PyObjectRef,
+    index: i64,
+) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::unicodeobject::w_str_getitem(obj, index) }.unwrap_or(pyre_object::PY_NULL)
+}
+
 /// `extern "C"` bridge for the scalar bytecode read used by translated
 /// residual calls: the raw Rust function takes `&CodeObject` and returns
 /// `u16`, which this widens to a word.
@@ -3343,6 +3353,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_list_pop_end",
         w_list_pop_end_word,
     );
+    cpa2(
+        &mut entries,
+        "pyre_object::unicodeobject::w_str_getitem",
+        "pyre_object::w_str_getitem",
+        w_str_getitem_word,
+    );
     let w_list_len: unsafe fn(pyre_object::PyObjectRef) -> usize =
         pyre_object::listobject::w_list_len;
     upa1(
@@ -3464,12 +3480,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::unicodeobject::jit_int_str",
         "pyre_object::jit_int_str",
         pyre_object::jit_int_str,
-    );
-    cpa2(
-        &mut entries,
-        "pyre_object::unicodeobject::jit_str_getitem",
-        "pyre_object::jit_str_getitem",
-        pyre_object::jit_str_getitem,
     );
     // `rgc.ll_shrink_array` residual target for the StringBuilder `build` tree
     // (`_handle_rgc_call` rewrites the oopspec residual to `["jit_ll_shrink_array"]`).
@@ -3676,6 +3686,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::error::pyerror_value_error_to_exc_object",
         "pyre_interpreter::pyerror_value_error_to_exc_object",
         pyerror_value_error_to_exc_object,
+    );
+    let pyerror_index_error_to_exc_object: extern "C" fn(i64) -> i64 =
+        crate::error::__majit_call_target_pyerror_index_error_to_exc_object;
+    cpa1(
+        &mut entries,
+        "pyre_interpreter::error::pyerror_index_error_to_exc_object",
+        "pyre_interpreter::pyerror_index_error_to_exc_object",
+        pyerror_index_error_to_exc_object,
     );
     // `elidable_cannot_raise` subclass-range check; the trampoline widens its
     // one-word bool return by zero-extension.
@@ -5658,7 +5676,7 @@ mod tests {
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
         jit_trace_fnaddrs, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
         shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
-        w_list_pop_end_inner_word, w_list_pop_end_word,
+        w_list_pop_end_inner_word, w_list_pop_end_word, w_str_getitem_word,
     };
     use std::collections::HashMap;
 
@@ -5914,6 +5932,14 @@ mod tests {
             (
                 "pyre_object::w_list_pop_end_inner",
                 w_list_pop_end_inner_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::unicodeobject::w_str_getitem",
+                w_str_getitem_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::w_str_getitem",
+                w_str_getitem_word as *const () as usize as i64,
             ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
@@ -6573,6 +6599,18 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::pyerror_value_error_to_exc_object"],
             ve
+        );
+
+        let ie: extern "C" fn(i64) -> i64 =
+            crate::error::__majit_call_target_pyerror_index_error_to_exc_object;
+        let ie = ie as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::error::pyerror_index_error_to_exc_object"],
+            ie
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::pyerror_index_error_to_exc_object"],
+            ie
         );
     }
 

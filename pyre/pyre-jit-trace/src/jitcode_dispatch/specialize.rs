@@ -7058,22 +7058,17 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         });
     }
 
-    // A `str` receiver reaches `descr_getitem`'s scalar arm, which boxes one
-    // code point.  It is not a storage strategy like the list arms below, so
-    // it gets its own emit rather than an element load: the payload is
-    // variable-width UTF-8 and a fixed-stride read would be wrong the moment
-    // the string is not ASCII.
+    // A `str` receiver descends `getitem_str` (`descr_getitem`'s scalar arm).
     // `is_exact_type` only checks the shared payload `ob_type`; a str subclass
     // carries that same value and distinguishes itself through `w_class`.
-    // Admit exactly the shape the replay guard below will pin, so recording a
+    // Admit exactly the shape the descent's guards pin, so recording a
     // subclass cannot manufacture a guard which its own concrete operand
-    // already fails.
+    // already fails.  Every other key shape, slices included, keeps the
+    // generic residual.
     if unsafe { pyre_object::is_str(list_obj) && walker_exact_builtin_class(list_obj).is_some() } {
-        return spec_gate(SpecFold::SubscrStr, || {
-            try_walker_specialize_subscr_str(
-                ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
-            )
-        });
+        return try_walker_orthodox_str_getitem(
+            ctx, op_pc, list_op, key_op, list_obj, key_obj, dst, dst_bank,
+        );
     }
 
     // The `dict.lookup` gate.  Both `w_class` checks are load-bearing: a dict
@@ -9921,132 +9916,9 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
     )
 }
 
-/// `s[i]` on an exact `str` with an exact machine-`int` index: emit the
-/// guarded unbox plus one elidable [`pyre_object::jit_str_getitem`] call
-/// instead of the opaque `binary_value_from_tag` residual.
-///
-/// The residual it replaces is a `CallMayForce`, which forces virtualizables
-/// and clears the heap cache across itself; measured against an otherwise
-/// identical loop over a `list` receiver, whose storage arm below already
-/// folds, the str form costs an order of magnitude more per iteration than
-/// the one boxed code point it produces.
-///
-/// Both operands are guarded exactly. A `str` subclass may override
-/// `__getitem__`, which `baseobjspace::getitem` honours, and `bool` shares
-/// `int`'s `intval` while indexing as 0/1 through its own type — the same
-/// pair of reasons the tuple arm states. The helper declines a negative or
-/// out-of-range index with `PY_NULL`, so `IndexError` and `__index__`
-/// coercion stay in the interpreter; the trailing non-null guard carries that
-/// decline back. Any other shape falls through to the generic residual (SAFE).
-/// `s[start:stop]` via BINARY_SUBSCR of a constant `slice` — the
-/// `descr_getitem` slice arm (`_unicode_sliced`) with step 1.
-fn try_walker_specialize_subscr_str_slice<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    seq_op: OpRef,
-    slice_op: OpRef,
-    seq_obj: pyre_object::PyObjectRef,
-    slice_obj: pyre_object::PyObjectRef,
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if !slice_op.is_constant() {
-        return Ok(None);
-    }
-    let start_obj = unsafe { pyre_object::w_slice_get_start(slice_obj) };
-    let stop_obj = unsafe { pyre_object::w_slice_get_stop(slice_obj) };
-    let step_obj = unsafe { pyre_object::w_slice_get_step(slice_obj) };
-    if !unsafe { pyre_object::is_none(step_obj) } {
-        return Ok(None);
-    }
-    let exact_int = |obj: pyre_object::PyObjectRef| -> Option<i64> {
-        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
-            return None;
-        }
-        if obj.is_null()
-            || unsafe {
-                !std::ptr::eq((*obj).ob_type, &pyre_object::INT_TYPE)
-                    || !std::ptr::eq(
-                        (*obj).w_class,
-                        pyre_object::get_instantiate(&pyre_object::INT_TYPE),
-                    )
-            }
-        {
-            None
-        } else {
-            Some(unsafe { pyre_object::w_int_get_value(obj) })
-        }
-    };
-    let start_raw = if unsafe { pyre_object::is_none(start_obj) } {
-        0
-    } else if let Some(v) = exact_int(start_obj) {
-        v
-    } else {
-        return Ok(None);
-    };
-    let stop_raw = if unsafe { pyre_object::is_none(stop_obj) } {
-        i64::MAX
-    } else if let Some(v) = exact_int(stop_obj) {
-        v
-    } else {
-        return Ok(None);
-    };
-    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
-        return Ok(None);
-    };
-    let boxed_result = boxed_result_i64 as pyre_object::PyObjectRef;
-    if boxed_result.is_null()
-        || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
-    {
-        return Ok(None);
-    }
-    let helper_result = pyre_object::unicodeobject::jit_str_slice(seq_obj, start_raw, stop_raw);
-    let same = unsafe {
-        pyre_object::is_exact_type(
-            helper_result as pyre_object::PyObjectRef,
-            &pyre_object::STR_TYPE,
-        ) && pyre_object::w_str_get_value_opt(helper_result as pyre_object::PyObjectRef)
-            == pyre_object::w_str_get_value_opt(boxed_result)
-    };
-    if !same {
-        return Ok(None);
-    }
-    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
-    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
-    walker_guard_class(ctx, op_pc, seq_op, str_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, seq_op, str_typeobj)?;
-    let start_op = ctx.trace_ctx.const_int(start_raw);
-    let stop_op = ctx.trace_ctx.const_int(stop_raw);
-    let helper = pyre_object::unicodeobject::jit_str_slice as *const ();
-    let sliced = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallR,
-        helper,
-        &[seq_op, start_op, stop_op],
-        &[
-            majit_ir::Type::Ref,
-            majit_ir::Type::Int,
-            majit_ir::Type::Int,
-        ],
-        majit_ir::Type::Ref,
-        majit_ir::EffectInfo::const_new(
-            majit_ir::ExtraEffect::CanRaise,
-            majit_ir::OopSpecIndex::None,
-        ),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        sliced,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
-    );
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, sliced)?;
-    Ok(Some(()))
-}
-
 /// Descend `baseobjspace::getitem_str` (`descr_getitem` after
-/// `getindex_w`) instead of emitting `jit_str_getitem` by hand.
-/// A missing jitcode declines so the caller can keep the fold.
+/// `getindex_w`) for an exact `str` and an exact `int` index.
+/// A missing jitcode declines to the generic residual.
 ///
 /// The boxed index is not frozen: a loop over `s[i]` must keep the
 /// live key so the generated length test stays in the body.
@@ -10162,124 +10034,6 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-fn try_walker_specialize_subscr_str<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    seq_op: OpRef,
-    key_op: OpRef,
-    seq_obj: pyre_object::PyObjectRef,
-    key_obj: pyre_object::PyObjectRef,
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if dst_bank != 'r' {
-        return Ok(None);
-    }
-    if unsafe { pyre_object::is_slice(key_obj) } {
-        return try_walker_specialize_subscr_str_slice(
-            ctx, op_pc, seq_op, key_op, seq_obj, key_obj, allboxes, call_descr, dst, dst_bank,
-        );
-    }
-    if try_walker_orthodox_str_getitem(ctx, op_pc, seq_op, key_op, seq_obj, key_obj, dst, dst_bank)?
-        .is_some()
-    {
-        return Ok(Some(()));
-    }
-    // A tagged immediate has no header for the `w_class` and unbox guards to
-    // read, and this emit is not tag-aware.
-    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(key_obj) {
-        return Ok(None);
-    }
-    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-    let index = unsafe {
-        if !std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
-            || !std::ptr::eq((*key_obj).w_class, int_typeobj)
-        {
-            return Ok(None);
-        }
-        pyre_object::w_int_get_value(key_obj)
-    };
-    if index < 0 {
-        return Ok(None);
-    }
-    // What the helper would box, read without boxing it: the helper allocates,
-    // and a nursery collection under it could move `seq_obj` and the result,
-    // which this frame holds as raw pointers with no root scope.
-    //
-    // A receiver whose payload is not valid UTF-8 -- a lone surrogate --
-    // declines here, which is also what keeps `chars().nth` (a Rust `char`
-    // index) equal to the code-point index the helper uses.
-    let Some(expected) = (unsafe {
-        pyre_object::w_str_get_value_opt(seq_obj).and_then(|text| text.chars().nth(index as usize))
-    }) else {
-        return Ok(None);
-    };
-    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
-        return Ok(None);
-    };
-    let boxed_result = boxed_result_i64 as pyre_object::PyObjectRef;
-    let boxes_the_same = unsafe {
-        pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE)
-            && pyre_object::w_str_get_value_opt(boxed_result)
-                .is_some_and(|text| text.chars().eq(std::iter::once(expected)))
-    };
-    if !boxes_the_same {
-        return Ok(None);
-    }
-
-    // emit the specialized IR (walker-native)
-    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
-    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
-    walker_guard_class(ctx, op_pc, seq_op, str_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, seq_op, str_typeobj)?;
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, key_op, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, key_op, int_typeobj)?;
-    let index_raw = walker_unbox_int_typed(
-        ctx,
-        op_pc,
-        key_op,
-        int_type_addr,
-        crate::descr::int_intval_descr(),
-    )?;
-    let helper = pyre_object::unicodeobject::jit_str_getitem as *const ();
-    let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
-        OpCode::CallR,
-        helper,
-        &[seq_op, index_raw],
-        &[majit_ir::Type::Ref, majit_ir::Type::Int],
-        majit_ir::Type::Ref,
-        // The helper's own `#[majit_macros::elidable_or_memerror]`: pure but
-        // allocating, so the call carries a gcmap and the trailing
-        // `GuardNoException` makes the allocation's raise leg observable.
-        // Recording it pure lets the optimizer share one call between two
-        // `s[i]` sites on the same pair, which is unobservable for this
-        // result: it is a single code point, and `is_w` unique-ifies a `str`
-        // of `_len() <= 1` by WTF-8 equality, so two separate allocations
-        // already answer `is` exactly as one shared box does.
-        majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-        &[
-            majit_ir::Value::Int(helper as usize as i64),
-            majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
-            majit_ir::Value::Int(index),
-        ],
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
-    );
-    // Concrete before the guards: a guard captures a resume snapshot, and a
-    // `raw` with no value yet is recorded into it without one.
-    ctx.trace_ctx.set_opref_concrete(
-        raw,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
-    );
-    if raw.inline_const_to_value().is_none() {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-    }
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw])?;
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, raw)?;
-    Ok(Some(()))
-}
 /// Whether `callable` is the `dict.get` method object.
 ///
 /// The typedef registers the slot as

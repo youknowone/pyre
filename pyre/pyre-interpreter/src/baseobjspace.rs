@@ -2701,10 +2701,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // `_getitem_result` (`unicodeobject.py`) after `getindex_w`.
     match unsafe { pyre_object::unicodeobject::w_str_getitem(obj, idx) } {
         Some(item) => Ok(item),
-        None => Err(PyError::new(
-            PyErrorKind::IndexError,
-            "string index out of range",
-        )),
+        None => Err(PyError::index_error("string index out of range")),
     }
 }
 

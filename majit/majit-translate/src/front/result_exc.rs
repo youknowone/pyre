@@ -581,6 +581,24 @@ fn lower_result_exc_returns_inner(
                 graph.alloc_value_var_with_type(crate::model::ConcreteType::Void),
             ),
             None => {
+                // A payload-less `Err(e)` over a zero-sized error (such as
+                // `i64::try_from(&rbigint)`'s) that the graph itself
+                // `match`es is an ordinary ADT value, the same consumed
+                // intermediate the payload-carrying case below leaves
+                // materialised.  Only a shell that reaches `returnblock` is a
+                // return this rewrite must lower.
+                if !shell_reaches_returnblock(graph, bi, &ctor_var) {
+                    crate::decline::record_reason(
+                        RESULT_EXC_CALLEE_GATE,
+                        "site-skipped-consumed-intermediate",
+                        &format!(
+                            "{}: block {bi} payload-less Err shell left materialised",
+                            graph.name
+                        ),
+                        &graph.name,
+                    );
+                    continue;
+                }
                 return Err(format!(
                     "{}: block {bi} Result Err ctor without a __pos_0 payload write",
                     graph.name
@@ -4428,7 +4446,8 @@ pub(crate) fn collapse_pos0_read(
 /// Gateway wrappers contribute the `type_error` sites; the exact-int
 /// `int_floordiv` / `int_mod` bodies contribute the literal-message
 /// `zero_division` sites; `long_lshift` / `long_rshift` / `int_lshift` /
-/// `int_rshift` contribute the literal-message `value_error` sites.  Each
+/// `int_rshift` contribute the literal-message `value_error` sites;
+/// `getitem_str` contributes a literal-message `index_error` site.  Each
 /// entry removes the Rust carrier aggregate from the generated JitCode while
 /// preserving the interpreter's exception-object materialisation as one
 /// opaque call.
@@ -4440,6 +4459,8 @@ const FUSED_KIND_CTORS: &[(&str, &str)] = &[
     // `PyError` aggregate in the graph stores that word as a `Wtf8Buf` niche
     // and the native materialiser reads an empty or huge length.
     ("value_error", "pyerror_value_error_to_exc_object"),
+    // `getitem_str`'s out-of-range `_getitem_result`, for the same reason.
+    ("index_error", "pyerror_index_error_to_exc_object"),
 ];
 
 /// Fuse `PyError::<kind>(msg)` and the `pyerror_to_exc_object` that consumes
