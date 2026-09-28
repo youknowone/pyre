@@ -116,14 +116,17 @@ pub fn emit_trace_call_ref_typed(
 /// the same reentrant stripe again.  A miss returns `PY_NULL` for the caller's
 /// `guard_nonnull` to side-exit on.
 unsafe fn jit_dict_exact_lookup_or_null(
-    dict: i64,
-    key: i64,
+    dict: PyObjectRef,
+    key: PyObjectRef,
     lookup: unsafe fn(PyObjectRef, PyObjectRef) -> Option<PyObjectRef>,
-) -> i64 {
-    lookup(dict as PyObjectRef, key as PyObjectRef).map_or(PY_NULL as i64, |value| value as i64)
+) -> PyObjectRef {
+    lookup(dict, key).unwrap_or(PY_NULL)
 }
 
-pub extern "C" fn jit_dict_exact_int_lookup_or_null(dict: i64, key: i64) -> i64 {
+pub extern "C" fn jit_dict_exact_int_lookup_or_null(
+    dict: PyObjectRef,
+    key: PyObjectRef,
+) -> PyObjectRef {
     unsafe {
         jit_dict_exact_lookup_or_null(
             dict,
@@ -140,17 +143,17 @@ pub extern "C" fn jit_dict_exact_int_lookup_or_null(dict: i64, key: i64) -> i64 
 /// identity (`ll_int_hash`), which is why PyPy's after-opt is
 /// `call_i(lookup, p62, i47, i47, 0)`.
 pub extern "C" fn jit_dict_exact_int_lookup_index(
-    storage: i64,
+    storage: *const pyre_object::dictmultiobject::IntDictStorage,
     key: i64,
     _hash: i64,
     flag: i64,
 ) -> i64 {
     debug_assert_eq!(flag, 0, "only FLAG_LOOKUP is implemented");
-    if storage == 0 {
+    if storage.is_null() {
         return -1;
     }
     unsafe {
-        let entries = &*(storage as *const pyre_object::dictmultiobject::IntDictStorage);
+        let entries = &*storage;
         entries
             .index_of(&key)
             .map(|index| index as i64)
@@ -163,16 +166,19 @@ pub extern "C" fn jit_dict_exact_int_lookup_index(
 /// `odictentry.value` (`ll_dict_getitem_with_hash`); pyre's `RDict` is not
 /// a GC array-of-structs, so the load cannot be a raw interior field.
 /// A stale index answers `PY_NULL` so the caller's `GuardNonnull` side-exits.
-pub extern "C" fn jit_dict_int_value_at(storage: i64, index: i64) -> i64 {
-    if index < 0 || storage == 0 {
-        return PY_NULL as i64;
+pub extern "C" fn jit_dict_int_value_at(
+    storage: *const pyre_object::dictmultiobject::IntDictStorage,
+    index: i64,
+) -> PyObjectRef {
+    if index < 0 || storage.is_null() {
+        return PY_NULL;
     }
     unsafe {
-        let entries = &*(storage as *const pyre_object::dictmultiobject::IntDictStorage);
+        let entries = &*storage;
         entries
             .get_slot(index as usize)
-            .map(|(_, &value)| value as i64)
-            .unwrap_or(PY_NULL as i64)
+            .map(|(_, &value)| value)
+            .unwrap_or(PY_NULL)
     }
 }
 
@@ -191,9 +197,9 @@ pub extern "C" fn jit_dict_value_at(
     index: i64,
     key: PyObjectRef,
     hash: i64,
-) -> i64 {
+) -> PyObjectRef {
     if index < 0 {
-        return PY_NULL as i64;
+        return PY_NULL;
     }
     unsafe {
         pyre_object::dictmultiobject::w_dict_unicode_value_at_checked(
@@ -201,7 +207,7 @@ pub extern "C" fn jit_dict_value_at(
             index as usize,
             key,
             hash,
-        ) as i64
+        )
     }
 }
 
@@ -210,14 +216,12 @@ pub extern "C" fn jit_dict_value_at(
 /// `sys._getframe` fold emits per hop (`pyjitpl.py _do_jit_force_virtual
 /// _do_jit_force_virtual`).
 ///
-/// `executioncontext::force_vref` cannot be the callee directly:
-/// `fn(*mut PyFrame) -> *mut PyFrame` is `(i32) -> i32` on wasm32 while the
-/// residual-call ABI is uniformly `(i64×n) -> i64`
-/// (`majit-backend-wasm/src/codegen.rs residual_call_i64_arity`), so the direct
-/// `call_indirect` traps with an indirect call type mismatch.  Word-width
-/// agreement on 64-bit targets makes that difference invisible there.
-pub extern "C" fn jit_force_vref(frame: *mut pyre_interpreter::PyFrame) -> i64 {
-    pyre_interpreter::executioncontext::force_vref(frame) as usize as i64
+/// `executioncontext::force_vref` is a Rust-ABI function, so it cannot be the
+/// callee directly; this is its `extern "C"` entry.
+pub extern "C" fn jit_force_vref(
+    frame: *mut pyre_interpreter::PyFrame,
+) -> *mut pyre_interpreter::PyFrame {
+    pyre_interpreter::executioncontext::force_vref(frame)
 }
 
 /// Rebuild a definition's keyword-only defaults into the namespace mapping —
@@ -225,22 +229,17 @@ pub extern "C" fn jit_force_vref(frame: *mut pyre_interpreter::PyFrame) -> i64 {
 /// allocates.  The SET_FUNCTION_ATTRIBUTE fold stores the result rather than
 /// the operand, so a compiled replay installs the same flavour the recording
 /// did.
-///
-/// Spelled on the machine word for [`jit_dict_value_at`]'s reason: a
-/// `*mut PyObject` parameter is `i32` on wasm32 while the residual-call ABI is
-/// uniformly `(i64 x n) -> i64`.
-pub extern "C" fn jit_init_kwdefaults_dict(dict: PyObjectRef) -> i64 {
-    unsafe { pyre_interpreter::function::init_kwdefaults_dict(dict) as i64 }
+pub extern "C" fn jit_init_kwdefaults_dict(dict: PyObjectRef) -> PyObjectRef {
+    unsafe { pyre_interpreter::function::init_kwdefaults_dict(dict) }
 }
 
 /// `objspace.py space.getexecutioncontext()` as a residual callee: the
 /// running thread's ExecutionContext, read out of its thread-local slot.
 ///
-/// `call::getexecutioncontext` cannot be the callee directly, for the reason
-/// `jit_force_vref` records above: its pointer return is `i32` on wasm32,
-/// where the residual-call ABI is `(i64×n) -> i64`.
-pub extern "C" fn jit_getexecutioncontext() -> i64 {
-    pyre_interpreter::call::getexecutioncontext() as usize as i64
+/// `call::getexecutioncontext` is a Rust-ABI function, so it cannot be the
+/// callee directly; this is its `extern "C"` entry.
+pub extern "C" fn jit_getexecutioncontext() -> *const pyre_interpreter::PyExecutionContext {
+    pyre_interpreter::call::getexecutioncontext()
 }
 
 /// Emit the [`jit_getexecutioncontext`] residual for a trace that holds no
@@ -268,7 +267,10 @@ pub(crate) fn emit_current_execution_context(ctx: &mut TraceCtx, site: &'static 
     )
 }
 
-pub extern "C" fn jit_dict_exact_unicode_lookup_or_null(dict: i64, key: i64) -> i64 {
+pub extern "C" fn jit_dict_exact_unicode_lookup_or_null(
+    dict: PyObjectRef,
+    key: PyObjectRef,
+) -> PyObjectRef {
     unsafe {
         jit_dict_exact_lookup_or_null(
             dict,
@@ -354,14 +356,14 @@ pub extern "C" fn jit_lookup_where_with_method_cache(
     w_type: PyObjectRef,
     w_name: PyObjectRef,
     version_tag: i64,
-) -> i64 {
+) -> PyObjectRef {
     if w_type.is_null() || w_name.is_null() {
-        return PY_NULL as i64;
+        return PY_NULL;
     }
     let w_descr = unsafe {
         pyre_interpreter::_pure_lookup_where_with_method_cache(w_type, w_name, version_tag as u64)
     };
-    w_descr as i64
+    w_descr
 }
 
 /// The receiver test the mapdict storage wrappers share: `mapdict_carrier`'s
@@ -413,13 +415,12 @@ pub extern "C" fn jit_instance_getdictvalue(
 /// `storage[index]` fetch.  Null receiver / non-carrier returns `PY_NULL`
 /// (the fast path pinned the receiver type with `guard_class`, so this only
 /// guards against a torn recording).
-pub extern "C" fn jit_mapdict_read(w_obj: PyObjectRef, storageindex: i64) -> i64 {
+pub extern "C" fn jit_mapdict_read(w_obj: PyObjectRef, storageindex: i64) -> PyObjectRef {
     if !unsafe { is_mapdict_carrier(w_obj) } {
-        return PY_NULL as i64;
+        return PY_NULL;
     }
     unsafe {
         pyre_interpreter::objspace::std::mapdict::read_boxed_storage(w_obj, storageindex as usize)
-            as i64
     }
 }
 

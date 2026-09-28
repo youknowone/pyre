@@ -25216,13 +25216,13 @@ pub(crate) fn builtin_dunder_import_keyword(
 /// and is not a residual slot. The address is published through the
 /// argument hatch so the walker refuses the call.
 pub extern "C" fn builtin_dunder_import_keyword_jit_abi(
-    args_ptr: i64,
+    args_ptr: *const PyObjectRef,
     args_len: i64,
 ) -> PyObjectRef {
-    let args = if args_ptr == 0 || args_len <= 0 {
+    let args = if args_ptr.is_null() || args_len <= 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(args_ptr as *const PyObjectRef, args_len as usize) }
+        unsafe { std::slice::from_raw_parts(args_ptr, args_len as usize) }
     };
     match builtin_dunder_import_keyword(args) {
         Ok(result) => result,

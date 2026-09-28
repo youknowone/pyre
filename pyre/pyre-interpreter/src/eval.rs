@@ -342,10 +342,10 @@ pub extern "C" fn frame_anchor_release_jit_abi(depth: i64) {
 /// The anchor is one word, and the trace keeps that word: the construction is
 /// handed back without running `Drop`, exactly as the aggregate return did
 /// when the method itself was the registered target.
-pub extern "C" fn frame_anchor_new_jit_abi(frame: i64) -> i64 {
+pub extern "C" fn frame_anchor_new_jit_abi(frame: *mut PyFrame) -> i64 {
     // SAFETY: the residual's slot holds the frame the walked graph read it
     // from, or null, which `from_raw` anticipates.
-    let anchor = unsafe { FrameAnchor::from_raw(frame as *mut PyFrame) };
+    let anchor = unsafe { FrameAnchor::from_raw(frame) };
     let depth = anchor.depth;
     std::mem::forget(anchor);
     depth as i64

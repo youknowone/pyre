@@ -6200,13 +6200,16 @@ pub(crate) fn handle_fromlist_fast(
 /// Three outcomes share the result register: `Ok(Some(p))` is `p`,
 /// `Ok(None)` is null, and an error is published then answered as
 /// [`import_lookup_err_ptr`].
-pub extern "C" fn handle_fromlist_fast_jit_abi(w_mod: PyObjectRef, w_fromlist: PyObjectRef) -> i64 {
+pub extern "C" fn handle_fromlist_fast_jit_abi(
+    w_mod: PyObjectRef,
+    w_fromlist: PyObjectRef,
+) -> PyObjectRef {
     match handle_fromlist_fast(w_mod, w_fromlist) {
-        Ok(Some(result)) => result as i64,
-        Ok(None) => 0,
+        Ok(Some(result)) => result,
+        Ok(None) => pyre_object::PY_NULL,
         Err(error) => {
             crate::runtime_ops::jit_publish_residual_error(error);
-            import_lookup_err_ptr() as i64
+            import_lookup_err_ptr()
         }
     }
 }

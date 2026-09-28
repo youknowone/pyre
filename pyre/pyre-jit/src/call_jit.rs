@@ -6633,7 +6633,7 @@ pub extern "C" fn bh_load_method_self_fn(
     attr: PyObjectRef,
     w_code_ptr: PyObjectRef,
     name_idx: i64,
-) -> i64 {
+) -> PyObjectRef {
     let code = unsafe {
         &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
     };
@@ -6647,10 +6647,10 @@ pub extern "C" fn bh_load_method_self_fn(
         code.names.len()
     );
     if idx >= code.names.len() {
-        return pyre_object::PY_NULL as i64;
+        return pyre_object::PY_NULL;
     }
     let name = code.names[idx].as_ref();
-    pyre_interpreter::eval::compute_load_method_bound(obj, attr, name) as i64
+    pyre_interpreter::eval::compute_load_method_bound(obj, attr, name)
 }
 
 #[inline]
@@ -6688,14 +6688,14 @@ pub extern "C" fn bh_with_except_start_fn(
     exit_func: PyObjectRef,
     exit_self: PyObjectRef,
     val: PyObjectRef,
-) -> i64 {
+) -> PyObjectRef {
     let result = pyre_interpreter::eval::with_except_start_values(exit_func, exit_self, val);
     if result.is_null() {
         let mut err = pyre_interpreter::call::take_call_error()
             .unwrap_or_else(|| pyre_interpreter::PyError::type_error("__exit__ failed"));
         publish_residual_call_exception(err.to_exc_object());
     }
-    result as i64
+    result
 }
 
 /// `LOAD_NAME` residual for the standalone (blackhole / deopt)
@@ -6711,14 +6711,18 @@ pub extern "C" fn bh_with_except_start_fn(
 /// feeds the `pycode._globals_caches[nameindex]` global cache
 /// (`celldict.py:292`).  On error it sets `BH_LAST_EXC_VALUE` and
 /// returns 0, matching `bh_load_global_fn`'s NameError path.
-pub extern "C" fn bh_load_name_fn(frame_ptr: i64, w_name: PyObjectRef, namei: i64) -> PyObjectRef {
+pub extern "C" fn bh_load_name_fn(
+    frame_ptr: *mut PyFrame,
+    w_name: PyObjectRef,
+    namei: i64,
+) -> PyObjectRef {
     use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
     assert!(
-        frame_ptr != 0,
+        !frame_ptr.is_null(),
         "bh_load_name_fn requires a non-null PyFrame; every LOAD_NAME emit \
          site must thread portal_frame_reg as the leading ref operand"
     );
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let frame = unsafe { &mut *frame_ptr };
     // `&str` namespace tables cannot hold a lone surrogate, so this is the
     // same miss `load_name_checked_value` reports for an unknown name.
     let Some(name) = (unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }) else {
@@ -6760,14 +6764,18 @@ pub extern "C" fn bh_load_name_fn(frame_ptr: i64, w_name: PyObjectRef, namei: i6
 /// that `w_name` instead of resolving a `co_names_w` slot.
 /// Returns 1 on success; on error it sets `BH_LAST_EXC_VALUE` and
 /// returns 0, matching `bh_store_subscr_fn`.
-pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: PyObjectRef, value: PyObjectRef) -> i64 {
+pub extern "C" fn bh_store_name_fn(
+    frame_ptr: *mut PyFrame,
+    w_name: PyObjectRef,
+    value: PyObjectRef,
+) -> i64 {
     use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
     assert!(
-        frame_ptr != 0,
+        !frame_ptr.is_null(),
         "bh_store_name_fn requires a non-null PyFrame; every STORE_NAME emit \
          site must thread portal_frame_reg as the leading ref operand"
     );
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let frame = unsafe { &mut *frame_ptr };
     match unsafe { pyre_interpreter::eval::store_name_value_w(frame, w_name, value) } {
         Ok(()) => 1,
         Err(mut err) => {
@@ -6794,17 +6802,17 @@ pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: PyObjectRef, value: P
 /// enters through `store_global_value_w`.  Returns 1 on
 /// success; on error it sets `BH_LAST_EXC_VALUE` and returns 0.
 pub extern "C" fn bh_store_global_fn(
-    frame_ptr: i64,
+    frame_ptr: *mut PyFrame,
     w_name: PyObjectRef,
     value: PyObjectRef,
 ) -> i64 {
     use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
     assert!(
-        frame_ptr != 0,
+        !frame_ptr.is_null(),
         "bh_store_global_fn requires a non-null PyFrame; every STORE_GLOBAL emit \
          site must thread portal_frame_reg as the leading ref operand"
     );
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let frame = unsafe { &mut *frame_ptr };
     match unsafe { pyre_interpreter::eval::store_global_value_w(frame, w_name, value) } {
         Ok(()) => 1,
         Err(mut err) => {
@@ -6824,13 +6832,13 @@ pub extern "C" fn bh_store_global_fn(
 /// when the binding is absent.  The trace carries no `co_names` index, so it
 /// enters through `delete_name_w`, which deletes through the key object the
 /// trace already holds.
-pub extern "C" fn bh_delete_name_fn(frame_ptr: i64, w_name: PyObjectRef) -> i64 {
+pub extern "C" fn bh_delete_name_fn(frame_ptr: *mut PyFrame, w_name: PyObjectRef) -> i64 {
     assert!(
-        frame_ptr != 0,
+        !frame_ptr.is_null(),
         "bh_delete_name_fn requires a non-null PyFrame; every DELETE_NAME emit \
          site must thread portal_frame_reg as the leading ref operand"
     );
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let frame = unsafe { &mut *frame_ptr };
     match unsafe { pyre_interpreter::eval::delete_name_w(frame, w_name) } {
         Ok(()) => 1,
         Err(mut err) => {
@@ -6845,14 +6853,14 @@ pub extern "C" fn bh_delete_name_fn(frame_ptr: i64, w_name: PyObjectRef) -> i64 
 /// must hand back the frame's own mapping so a metaclass `__prepare__` result
 /// keeps its type. Infallible, so unlike the name residuals there is no
 /// exception-publishing arm.
-pub extern "C" fn bh_load_locals_fn(frame_ptr: i64) -> i64 {
+pub extern "C" fn bh_load_locals_fn(frame_ptr: *mut PyFrame) -> PyObjectRef {
     assert!(
-        frame_ptr != 0,
+        !frame_ptr.is_null(),
         "bh_load_locals_fn requires a non-null PyFrame; every LOAD_LOCALS emit \
          site must thread portal_frame_reg as its ref operand"
     );
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    frame.get_or_create_w_locals() as i64
+    let frame = unsafe { &mut *frame_ptr };
+    frame.get_or_create_w_locals()
 }
 
 /// `LOAD_BUILD_CLASS` residual using the frame receiver.
@@ -6861,14 +6869,14 @@ pub extern "C" fn bh_load_locals_fn(frame_ptr: i64) -> i64 {
 /// `eval.rs load_build_class_value` so the interpreter and the residual share
 /// one lookup, the same contract `bh_load_name_fn` documents. On error it
 /// publishes through both exception cells and returns 0.
-pub extern "C" fn bh_load_build_class_fn(frame_ptr: i64) -> PyObjectRef {
+pub extern "C" fn bh_load_build_class_fn(frame_ptr: *mut PyFrame) -> PyObjectRef {
     use pyre_interpreter::pyopcode::OpcodeStepExecutor;
     assert!(
-        frame_ptr != 0,
+        !frame_ptr.is_null(),
         "bh_load_build_class_fn requires a non-null PyFrame; every \
          LOAD_BUILD_CLASS emit site must thread portal_frame_reg as its ref operand"
     );
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let frame = unsafe { &mut *frame_ptr };
     match frame.load_build_class_value() {
         Ok(w_value) => w_value,
         Err(mut err) => {
@@ -6919,14 +6927,14 @@ pub extern "C" fn bh_load_import_fn(frame: *mut PyFrame) -> PyObjectRef {
 /// `bh_load_locals_fn` uses for the same reason -- publishing an exception for
 /// it would convert a miswired emit site into a `SystemError` raised at some
 /// unrelated Python line.
-pub extern "C" fn bh_load_import_locals_fn(frame_ptr: i64) -> i64 {
+pub extern "C" fn bh_load_import_locals_fn(frame_ptr: *mut PyFrame) -> PyObjectRef {
     assert!(
-        frame_ptr != 0,
+        !frame_ptr.is_null(),
         "bh_load_import_locals_fn requires a non-null PyFrame; every IMPORT_NAME \
          emit site must thread portal_frame_reg as its ref operand"
     );
-    let frame = unsafe { &*(frame_ptr as *mut PyFrame) };
-    pyre_interpreter::importing::import_locals(frame) as i64
+    let frame = unsafe { &*frame_ptr };
+    pyre_interpreter::importing::import_locals(frame)
 }
 
 /// IMPORT_NAME's globals argument — `pyopcode.py`'s `self.get_w_globals()`.
@@ -6936,26 +6944,26 @@ pub extern "C" fn bh_load_import_locals_fn(frame_ptr: i64) -> i64 {
 /// `debugdata.w_globals` when the frame carries a payload and from
 /// `promote(pycode).w_globals` when it does not. Asking the live frame is what
 /// keeps an inlined callee on its own namespace.
-pub extern "C" fn bh_load_import_globals_fn(frame_ptr: i64) -> i64 {
+pub extern "C" fn bh_load_import_globals_fn(frame_ptr: *mut PyFrame) -> PyObjectRef {
     assert!(
-        frame_ptr != 0,
+        !frame_ptr.is_null(),
         "bh_load_import_globals_fn requires a non-null PyFrame; every IMPORT_NAME \
          emit site must thread portal_frame_reg as its ref operand"
     );
-    let frame = unsafe { &*(frame_ptr as *mut PyFrame) };
-    frame.get_w_globals() as i64
+    let frame = unsafe { &*frame_ptr };
+    frame.get_w_globals()
 }
 
 /// DELETE_GLOBAL residual using the frame receiver and interned-name ABI.
 /// pyopcode.py DELETE_GLOBAL deletes directly from `w_globals`.
-pub extern "C" fn bh_delete_global_fn(frame_ptr: i64, w_name: PyObjectRef) -> i64 {
+pub extern "C" fn bh_delete_global_fn(frame_ptr: *mut PyFrame, w_name: PyObjectRef) -> i64 {
     use pyre_interpreter::pyopcode::OpcodeStepExecutor;
     assert!(
-        frame_ptr != 0,
+        !frame_ptr.is_null(),
         "bh_delete_global_fn requires a non-null PyFrame; every DELETE_GLOBAL emit \
          site must thread portal_frame_reg as the leading ref operand"
     );
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let frame = unsafe { &mut *frame_ptr };
     // Same miss as `delete_global` for a name the `&str` dict cannot hold.
     let Some(name) = (unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }) else {
         let text = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_name) };
@@ -6977,16 +6985,16 @@ pub extern "C" fn bh_delete_global_fn(frame_ptr: i64, w_name: PyObjectRef) -> i6
 
 /// Load a constant from the code object.
 /// jtransform.py parity: code comes from getfield_vable_r(frame, pycode).
-pub extern "C" fn bh_load_const_fn(w_code_ptr: PyObjectRef, consti: i64) -> i64 {
+pub extern "C" fn bh_load_const_fn(w_code_ptr: PyObjectRef, consti: i64) -> PyObjectRef {
     // `getconstant_w(index) -> co_consts_w[index]`: read the one shared object
     // off the virtualizable `pycode`, exactly as the interpreter does.
     let w_const = unsafe { pyre_interpreter::pycode::w_code_const(w_code_ptr, consti as usize) };
-    w_const as i64
+    w_const
 }
 
 /// Box a raw integer into a PyObject (w_int_new wrapper).
-pub extern "C" fn bh_box_int_fn(value: i64) -> i64 {
-    w_int_new(value) as i64
+pub extern "C" fn bh_box_int_fn(value: i64) -> PyObjectRef {
+    w_int_new(value)
 }
 
 /// `eval.rs`'s `raise_varargs` (RAISE_VARARGS) normalization for
@@ -7287,7 +7295,7 @@ pub extern "C" fn bh_load_deref_value_fn(
     slot: PyObjectRef,
     w_code_ptr: PyObjectRef,
     deref_idx: i64,
-) -> i64 {
+) -> PyObjectRef {
     let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
         unsafe { pyre_object::w_cell_get(slot) }
     } else {
@@ -7300,9 +7308,9 @@ pub extern "C" fn bh_load_deref_value_fn(
         let exc_obj = pyre_interpreter::pyframe::deref_unbound_error(code, deref_idx as usize)
             .to_exc_object();
         publish_residual_call_exception(exc_obj);
-        return 0;
+        return PY_NULL;
     }
-    value as i64
+    value
 }
 
 /// STORE_DEREF residual (`store_deref_value` HLOp → `residual_call_r_r`).
@@ -7392,8 +7400,11 @@ pub extern "C" fn bh_get_iter_fn(obj: PyObjectRef) -> PyObjectRef {
 /// bytecode-boundary service in `eval_loop_jit`: that service collects
 /// through `gc_interp::safepoint`, which is safe only at the interpreter's
 /// dispatch safepoint, not from a residual call inside machine code.
-pub extern "C" fn bh_bytecode_trace_jitted_slow(ec_ptr: i64, frame_ptr: *mut PyFrame) -> i64 {
-    if ec_ptr == 0 {
+pub extern "C" fn bh_bytecode_trace_jitted_slow(
+    ec: *mut pyre_interpreter::PyExecutionContext,
+    frame_ptr: *mut PyFrame,
+) -> i64 {
+    if ec.is_null() {
         return 0;
     }
     let decr_by = if pyre_interpreter::module::thread::gil::threads_initialized() {
@@ -7401,7 +7412,6 @@ pub extern "C" fn bh_bytecode_trace_jitted_slow(ec_ptr: i64, frame_ptr: *mut PyF
     } else {
         0
     };
-    let ec = ec_ptr as *mut pyre_interpreter::PyExecutionContext;
     match unsafe { (*ec).bytecode_trace(frame_ptr, decr_by) } {
         Ok(()) => 0,
         Err(mut err) => {
@@ -7475,14 +7485,14 @@ pub extern "C" fn bh_get_len_fn(subject: PyObjectRef) -> PyObjectRef {
 /// MATCH_SEQUENCE residual (`match_sequence` HLOp → `residual_call_r_r`).
 /// Reads the subject type's PATMA marker; runs no user code and never
 /// raises (`Plain`).
-pub extern "C" fn bh_match_sequence_fn(subject: PyObjectRef) -> i64 {
-    pyre_interpreter::opcode_ops::match_sequence_value(subject) as i64
+pub extern "C" fn bh_match_sequence_fn(subject: PyObjectRef) -> PyObjectRef {
+    pyre_interpreter::opcode_ops::match_sequence_value(subject)
 }
 
 /// MATCH_MAPPING residual (`match_mapping` HLOp → `residual_call_r_r`).
 /// Mirrors [`bh_match_sequence_fn`].
-pub extern "C" fn bh_match_mapping_fn(subject: PyObjectRef) -> i64 {
-    pyre_interpreter::opcode_ops::match_mapping_value(subject) as i64
+pub extern "C" fn bh_match_mapping_fn(subject: PyObjectRef) -> PyObjectRef {
+    pyre_interpreter::opcode_ops::match_mapping_value(subject)
 }
 
 /// MATCH_KEYS residual (`match_keys` HLOp → `residual_call_r_r`).  Looks
@@ -7524,10 +7534,10 @@ pub extern "C" fn bh_match_class_fn(
 /// built builtin function for `all`/`any` (hence `MayForce` — it
 /// allocates).  Runs no user code and never raises; an out-of-range
 /// discriminant (corrupt bytecode) returns PY_NULL.
-pub extern "C" fn bh_load_common_constant_fn(disc: i64) -> i64 {
+pub extern "C" fn bh_load_common_constant_fn(disc: i64) -> PyObjectRef {
     match pyre_interpreter::bytecode::CommonConstant::try_from(disc as u32) {
-        Ok(cc) => pyre_interpreter::opcode_ops::load_common_constant_value(cc) as i64,
-        Err(_) => pyre_object::PY_NULL as i64,
+        Ok(cc) => pyre_interpreter::opcode_ops::load_common_constant_value(cc),
+        Err(_) => pyre_object::PY_NULL,
     }
 }
 /// UNARY_NOT residual (`unary_not` HLOp → `residual_call_r_r`).  Returns
@@ -7536,12 +7546,12 @@ pub extern "C" fn bh_load_common_constant_fn(disc: i64) -> i64 {
 /// interpreter's UNARY_NOT truth path; a raising `__bool__` publishes
 /// through `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the
 /// call returns 0.
-pub extern "C" fn bh_unary_not_fn(value: PyObjectRef) -> i64 {
+pub extern "C" fn bh_unary_not_fn(value: PyObjectRef) -> PyObjectRef {
     match pyre_interpreter::opcode_ops::truth_value(value) {
-        Ok(truth) => pyre_object::w_bool_from(!truth) as i64,
+        Ok(truth) => pyre_object::w_bool_from(!truth),
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object());
-            0
+            PY_NULL
         }
     }
 }
@@ -7630,13 +7640,13 @@ pub extern "C" fn bh_build_slice_fn(
     start: PyObjectRef,
     stop: PyObjectRef,
     step: PyObjectRef,
-) -> i64 {
+) -> PyObjectRef {
     let step = if argc == 2 {
         pyre_object::w_none()
     } else {
         step
     };
-    pyre_object::w_slice_new(start, stop, step) as i64
+    pyre_object::w_slice_new(start, stop, step)
 }
 
 /// UNPACK_SEQUENCE: validate that `seq` has exactly `count` elements and
@@ -7644,12 +7654,12 @@ pub extern "C" fn bh_build_slice_fn(
 /// mismatch or non-sequence the same way the interpreter does. The portal
 /// reads the items back out with `bh_unpack_item_fn`; producing the
 /// validated tuple once keeps the iteration-protocol fallback single-pass.
-pub extern "C" fn bh_unpack_sequence_fn(count: i64, seq: PyObjectRef) -> i64 {
+pub extern "C" fn bh_unpack_sequence_fn(count: i64, seq: PyObjectRef) -> PyObjectRef {
     match pyre_interpreter::runtime_ops::unpack_sequence_exact(seq, count as usize) {
-        Ok(items) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as i64,
+        Ok(items) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&items),
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object());
-            0
+            PY_NULL
         }
     }
 }
@@ -7673,12 +7683,12 @@ pub extern "C" fn bh_unpack_item_fn(index: i64, seq: PyObjectRef) -> PyObjectRef
 /// too few values, or any iteration error from a non-sequence source). The
 /// portal reads each slot back out with `bh_unpack_item_fn`, mirroring
 /// `bh_unpack_sequence_fn`.
-pub extern "C" fn bh_unpack_ex_fn(before: i64, after: i64, seq: PyObjectRef) -> i64 {
+pub extern "C" fn bh_unpack_ex_fn(before: i64, after: i64, seq: PyObjectRef) -> PyObjectRef {
     match pyre_interpreter::runtime_ops::unpack_ex_slots(before as usize, after as usize, seq) {
-        Ok(slots) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&slots) as i64,
+        Ok(slots) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&slots),
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object());
-            0
+            PY_NULL
         }
     }
 }
@@ -7686,14 +7696,14 @@ pub extern "C" fn bh_unpack_ex_fn(before: i64, after: i64, seq: PyObjectRef) -> 
 /// Read the current (per-thread) exception saved in
 /// `pyre_interpreter::eval::CURRENT_EXCEPTION`: the value a catch-covered
 /// bare `raise` re-raises.
-pub extern "C" fn bh_get_current_exception() -> i64 {
-    pyre_interpreter::eval::get_current_exception() as i64
+pub extern "C" fn bh_get_current_exception() -> PyObjectRef {
+    pyre_interpreter::eval::get_current_exception()
 }
 
 /// The value `pyopcode.py PUSH_EXC_INFO` saves below the caught exception:
 /// the exception being handled, or `None` when there is none.
-pub extern "C" fn bh_current_exception_or_none() -> i64 {
-    pyre_interpreter::eval::current_exception_or_none() as i64
+pub extern "C" fn bh_current_exception_or_none() -> PyObjectRef {
+    pyre_interpreter::eval::current_exception_or_none()
 }
 
 /// `eval.rs`'s `raise_varargs(0)` — the value a bare `raise` re-raises.
@@ -7707,14 +7717,14 @@ pub extern "C" fn bh_current_exception_or_none() -> i64 {
 /// (`blackhole.py:1002` asserts non-null).  Unlike raw `get_current_exception`,
 /// this can allocate (the `RuntimeError`), so it is registered `Plain`, not
 /// `PlainCannotRaiseNoHeap`.
-pub extern "C" fn bh_reraise_varargs_zero() -> i64 {
+pub extern "C" fn bh_reraise_varargs_zero() -> PyObjectRef {
     let exc = pyre_interpreter::eval::get_current_exception();
     unsafe {
         if !exc.is_null() && pyre_object::is_exception(exc) {
-            exc as i64
+            exc
         } else {
             pyre_interpreter::PyError::runtime_error("No active exception to reraise")
-                .to_exc_object() as i64
+                .to_exc_object()
         }
     }
 }

@@ -1221,8 +1221,12 @@ pub extern "C" fn jit_descroperation_pos(value: PyObjectRef) -> PyObjectRef {
 }
 
 #[inline(never)]
-pub extern "C" fn jit_runtime_ops_is_op(w_1: PyObjectRef, w_2: PyObjectRef, invert: i64) -> i64 {
-    crate::runtime_ops::is_op(w_1, w_2, invert) as i64
+pub extern "C" fn jit_runtime_ops_is_op(
+    w_1: PyObjectRef,
+    w_2: PyObjectRef,
+    invert: i64,
+) -> PyObjectRef {
+    crate::runtime_ops::is_op(w_1, w_2, invert)
 }
 
 #[inline(never)]

@@ -36,11 +36,11 @@ pub fn make_function_from_code_obj_with_globals_obj(
     crate::function::function_new_from_code(code_obj, w_globals)
 }
 
-fn decode_name(name_ptr: i64, name_len: i64) -> Option<&'static str> {
-    if name_ptr == 0 || name_len < 0 {
+fn decode_name(name_ptr: *const u8, name_len: i64) -> Option<&'static str> {
+    if name_ptr.is_null() || name_len < 0 {
         return None;
     }
-    let bytes = unsafe { slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
+    let bytes = unsafe { slice::from_raw_parts(name_ptr, name_len as usize) };
     std::str::from_utf8(bytes).ok()
 }
 
@@ -100,13 +100,13 @@ pub extern "C" fn jit_set_function_attribute(
 
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_load_name_from_namespace(
-    frame_ptr: i64,
+    frame_ptr: *const crate::pyframe::PyFrame,
     mut w_globals: PyObjectRef,
-    name_ptr: i64,
+    name_ptr: *const u8,
     name_len: i64,
-) -> i64 {
+) -> PyObjectRef {
     let Some(name) = decode_name(name_ptr, name_len) else {
-        return 0;
+        return PY_NULL;
     };
     // `pyopcode.py _load_global`: `space.finditem_str(w_globals,
     // varname)`.  finditem_str takes the borrowed-string fast path for real
@@ -120,11 +120,11 @@ pub extern "C" fn jit_load_name_from_namespace(
             Ok(value) => value,
             Err(mut error) => {
                 jit_publish_exception(error.to_exc_object());
-                return 0;
+                return PY_NULL;
             }
         };
         if let Some(v) = value {
-            return v as i64;
+            return v;
         }
     }
     // Globals miss: `_load_global` (pyopcode.py) falls back to
@@ -138,8 +138,8 @@ pub extern "C" fn jit_load_name_from_namespace(
     // raises NameError.  The accessor still prefers the picked module when a
     // frame does carry one, so a mid-execution `__builtins__` rebind is
     // honoured exactly as before.
-    let w_builtin = if frame_ptr != 0 {
-        unsafe { (*(frame_ptr as *const crate::pyframe::PyFrame)).get_builtin() }
+    let w_builtin = if !frame_ptr.is_null() {
+        unsafe { (*frame_ptr).get_builtin() }
     } else {
         std::ptr::null_mut()
     };
@@ -147,7 +147,7 @@ pub extern "C" fn jit_load_name_from_namespace(
         if let Some(v) =
             unsafe { crate::eval::load_global_via_cache_extern(w_globals, w_builtin, name) }
         {
-            return v as i64;
+            return v;
         }
     } else if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
         // `_load_global` builtin fallback also fires on non-module-dict
@@ -156,16 +156,16 @@ pub extern "C" fn jit_load_name_from_namespace(
         if !w_builtin_dict.is_null()
             && let Ok(Some(v)) = crate::baseobjspace::finditem_str(w_builtin_dict, name)
         {
-            return v as i64;
+            return v;
         }
     }
-    std::ptr::null_mut::<()>() as i64
+    PY_NULL
 }
 
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_store_name_to_namespace(
     w_globals: PyObjectRef,
-    name_ptr: i64,
+    name_ptr: *const u8,
     name_len: i64,
     value: PyObjectRef,
 ) -> i64 {
@@ -2088,10 +2088,10 @@ pub extern "C" fn jit_next(iter: PyObjectRef) -> PyObjectRef {
 ///
 /// Returns `None`. A raising `__hash__` publishes through both exception
 /// channels and answers PY_NULL, the residual-call ABI [`jit_next`] documents.
-pub extern "C" fn jit_set_add_method(set: PyObjectRef, value: PyObjectRef) -> i64 {
+pub extern "C" fn jit_set_add_method(set: PyObjectRef, value: PyObjectRef) -> PyObjectRef {
     match crate::opcode_ops::set_add_value(set, value) {
-        Ok(()) => pyre_object::w_none() as i64,
-        Err(err) => jit_publish_residual_error(err),
+        Ok(()) => pyre_object::w_none(),
+        Err(err) => jit_publish_residual_error_ref(err),
     }
 }
 
