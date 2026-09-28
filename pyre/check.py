@@ -2070,6 +2070,11 @@ PYRE_MODULE_NAMES = tuple(
 )
 
 
+# Leads the line the `sys.builtin_module_names` probe prints, so the answer is
+# told apart from anything else the binary writes to stdout.
+BUILTIN_MODULES_MARKER = "pyre-check-builtin-modules:"
+
+
 def synth_requires_modules(path):
     """Read the `pyre-module` modules a fixture imports from its header:
         # pyre-check: requires-modules=math
@@ -3533,12 +3538,17 @@ def rewrite_jitstats_baselines(script, contents):
             specific.write_text(text, encoding="utf-8", newline="")
 
 
-def store_jitstats_baseline(script, backend, text):
+def store_jitstats_baseline(script, backend, text, absent=()):
     """Record `text` for `backend` and re-fold sibling baselines.
 
     `text` None removes this backend's baseline. An existing platform
     overlay is updated in place and does not participate in the fold:
     recording one host must not rewrite the baseline the other hosts read.
+
+    `absent` names backends whose binary lacks a module the fixture's
+    `requires-modules=` header names. They sit out the fold like a
+    `skip-backends=` one: they never ran the fixture, so splitting the shared
+    file must not hand them a baseline of their own.
     """
     source = Path(script)
     overlay = _jitstats_overlay_path(source, backend)
@@ -3549,7 +3559,7 @@ def store_jitstats_baseline(script, backend, text):
             overlay.write_text(text, encoding="utf-8", newline="")
         return
 
-    skipped = set(synth_skip_backends(script))
+    skipped = set(synth_skip_backends(script)) | set(absent)
     backends = [name for name in ALL_BACKENDS if name not in skipped]
     if backend not in backends:
         backends.append(backend)
@@ -3712,13 +3722,17 @@ class Check:
 
         None when the probe itself fails: the fixtures that asked are then
         run rather than skipped, so a binary that cannot start is reported
-        by them instead of hidden behind a skip.
+        by them instead of hidden behind a skip. An exit status of 0 is not
+        enough, because a wasm guest without an exit-status export reports 0
+        after an uncaught exception: the answer counts only when its marked
+        line is there and names `sys`, which every build has.
         """
         if backend not in self.builtin_modules:
             with tempfile.TemporaryDirectory() as tmp:
                 probe = Path(tmp) / "builtin_modules.py"
                 probe.write_text(
-                    "import sys\nprint(' '.join(sys.builtin_module_names))\n",
+                    "import sys\n"
+                    f"print({BUILTIN_MODULES_MARKER!r}, *sys.builtin_module_names)\n",
                     encoding="utf-8",
                 )
                 output, _, code, _ = run_timed(
@@ -3726,8 +3740,16 @@ class Check:
                     timeout_s=scaled_timeout(30, self._timeout_scale(backend)),
                     env=pyre_env(),
                 )
+            names = next(
+                (
+                    frozenset(line.split()[1:])
+                    for line in output.splitlines()
+                    if line.split()[:1] == [BUILTIN_MODULES_MARKER]
+                ),
+                None,
+            )
             self.builtin_modules[backend] = (
-                frozenset(output.split()) if code == 0 else None
+                names if code == 0 and names and "sys" in names else None
             )
         return self.builtin_modules[backend]
 
@@ -4143,7 +4165,13 @@ class Check:
             # Fold after writing: a backend that now matches its siblings
             # drops `<name>.<backend>.jitstats` in favor of `<name>.jitstats`,
             # and one that diverges is split back out of the shared file.
-            store_jitstats_baseline(script, backend, jitstats)
+            store_jitstats_baseline(
+                script, backend, jitstats,
+                self._fixture_skips({
+                    "skip_backends": (),
+                    "requires_modules": synth_requires_modules(script),
+                }),
+            )
 
         if self.args.snapshot_mode == "diff":
             if not out_path.exists():
