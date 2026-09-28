@@ -7069,8 +7069,11 @@ impl<S: JitState> JitDriver<S> {
         // Stage E4, before the arm split, so it prices one pair of calls
         // rather than a different pair per outcome — and before the FINISH
         // arm takes the exit values out from under it.
+        // The exit is consumed here, outside the function that read the
+        // repeats for the earlier stages, so it reads them again.
         #[cfg(feature = "__back-edge-stage-probe")]
         if result.is_finish || result.fail_index == u32::MAX {
+            let stage_repeats = back_edge_stage_repeats();
             count_back_edge_stage_passes(BackEdgeStage::MarshalOut, stage_repeats.marshal_out);
             for _ in 0..stage_repeats.marshal_out {
                 if !result.is_finish && !result.typed_values.is_empty() {
