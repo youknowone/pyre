@@ -8567,8 +8567,10 @@ mod tests {
             *gcmap_field = gcmap.as_ptr() as *const u8;
         }
 
-        // Discover the frame the orthodox way: push it on the jitframe shadow
-        // stack so Phase 1c traces its interior via the gcmap.
+        // The store into an old frame is followed by the frame barrier, as
+        // `llmodel.py execute_token` and `_reload_frame_if_necessary` do; the
+        // minor collection then traces the remembered frame through its gcmap.
+        gc.write_barrier(frame);
         let saved = majit_gc::shadow_stack::push_jf(frame);
         gc.do_collect_nursery();
         majit_gc::shadow_stack::pop_jf_to(saved);
