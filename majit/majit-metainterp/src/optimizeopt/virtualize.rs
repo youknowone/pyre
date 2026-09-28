@@ -433,7 +433,6 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let size_ref = op.arg(0).to_opref();
         if let Some(size) = ctx
             .resolve_operand_operand_opt(&op.arg(0))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
@@ -508,15 +507,12 @@ impl OptVirtualize {
         // arg, descr=op.getdescr())` — array descr discriminates the
         // pure-cache key so the reverse ARRAYLEN→size fold doesn't
         // collide across distinct array types.
+        let array_box = Operand::from_bound_op(op_rc);
+        let size_box = op.arg(0);
         if let Some(descr) = op.getdescr() {
-            ctx.register_pure_from_args1_with_descr(
-                OpCode::ArraylenGc,
-                op.pos().get(),
-                size_ref,
-                descr,
-            );
+            ctx.register_pure_from_args1_with_descr(OpCode::ArraylenGc, array_box, size_box, descr);
         } else {
-            ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos().get(), size_ref);
+            ctx.register_pure_from_args1(OpCode::ArraylenGc, array_box, size_box);
         }
         OptimizationResult::PassOn
     }
@@ -1660,7 +1656,7 @@ impl OptVirtualize {
         }
 
         // virtualize.py:129: vrefvalue.setfield(descr_forced, newop, CONST_NULL)
-        let null_ref = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
+        let null_ref = ctx.make_constant_ref(majit_ir::GcRef::NULL);
 
         // virtualize.py: make_virtual(c_cls, newop, vref_descr)
         // → InstancePtrInfo(descr, known_class, is_virtual=True)
@@ -1764,9 +1760,9 @@ impl OptVirtualize {
             .unwrap_or(false);
         if did_forced_write {
             // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
-            // emit_constant_ref needs a ctx reborrow, hence two sequential
+            // make_constant_ref needs a ctx reborrow, hence two sequential
             // with_ptr_info_mut calls.
-            let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
+            let null_ref = ctx.make_constant_ref(majit_ir::GcRef(0));
             let null_op = ctx.materialize_operand_at(null_ref);
             if let Some(b) = vref_box.as_ref() {
                 ctx.with_ptr_info_mut(b, |info| {
@@ -1797,7 +1793,7 @@ impl OptVirtualize {
 
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL via
         // `vrefinfo.descr_virtual_token` (`virtualref.py:40-41`).
-        let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
+        let null_ref = ctx.make_constant_ref(majit_ir::GcRef(0));
         let arg_vref = ctx.materialize_operand_at(vref_ref);
         let arg_null = ctx.materialize_operand_at(null_ref);
         let mut set_token = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_null.clone()]);
@@ -2260,7 +2256,7 @@ impl Optimization for OptVirtualize {
         matches!(opcode, OpCode::Finish)
     }
 
-    fn propagate_postprocess(&mut self, op: &Op, ctx: &mut OptContext) {
+    fn propagate_postprocess(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
         if op.opcode != OpCode::Finish {
             return;
         }
@@ -3869,6 +3865,42 @@ mod tests {
         }
     }
 
+    /// Drive `propagate_forward` on the same `OpRc`s the args already name.
+    fn drive_bound_ops(pass: &mut OptVirtualize, ctx: &mut OptContext, ops: &[OpRc]) {
+        for rc in ops {
+            for i in 0..rc.num_args() {
+                let arg = rc.arg(i);
+                let canonical = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
+                    None => {
+                        let argref = arg.to_opref();
+                        if argref.is_none() {
+                            arg
+                        } else {
+                            ctx.materialize_operand_at(argref)
+                                .get_box_replacement(false)
+                        }
+                    }
+                };
+                rc.setarg(i, canonical);
+            }
+            ctx.bind_input_resops(std::slice::from_ref(rc));
+            match pass.propagate_forward(rc, rc, ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::PassOn => {
+                    ctx.emit_rc(rc.clone());
+                }
+                OptimizationResult::InvalidLoop(_) => panic!("unexpected InvalidLoop in test"),
+            }
+        }
+    }
+
     fn run_pass(ops: &[Op]) -> Vec<Op> {
         run_pass_typed(ops, &[])
     }
@@ -3921,28 +3953,67 @@ mod tests {
 
     fn run_pass_with_constants(ops: &[Op], constants: &[(OpRef, Value)]) -> Vec<Op> {
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
-        let mut ctx = OptContext::new(ops.len());
-        ctx.snapshot_boxes = snapshots;
-        for &(opref, ref val) in constants {
-            let b = ctx.materialize_operand_at(opref);
-            ctx.make_constant_box(&b, *val);
+        // Constants are Const operands in the args. A position-keyed
+        // `make_constant_box` would forward a different object than the one
+        // the ops carry.
+        let mut owned: Vec<Op> = ops;
+        for op in &mut owned {
+            for i in 0..op.num_args() {
+                let r = op.arg(i).to_opref();
+                if let Some(&(_, val)) = constants.iter().find(|(pref, _)| *pref == r) {
+                    op.setarg(i, Operand::const_from_value(val));
+                }
+            }
         }
+
+        // One object per position: a producer's result box is what later
+        // args at that position carry, and a leaf keeps the first operand.
+        let mut wrapped: Vec<OpRc> = Vec::with_capacity(owned.len());
+        let mut leaves: Vec<Operand> = Vec::new();
+        for op in &owned {
+            let rc = OpRc::new(op.clone());
+            for i in 0..rc.num_args() {
+                let arg = rc.arg(i);
+                if arg.is_constant() || arg.is_none() {
+                    continue;
+                }
+                let opref = arg.to_opref();
+                if let Some(prod) = wrapped.iter().rev().find(|p| {
+                    let pos = p.pos().get();
+                    pos == opref && p.opcode.result_type() != Type::Void
+                }) {
+                    rc.setarg(i, Operand::from_bound_op(prod));
+                    continue;
+                }
+                if let Some(leaf) = leaves.iter().find(|leaf| leaf.to_opref() == opref) {
+                    rc.setarg(i, leaf.clone());
+                    continue;
+                }
+                leaves.push(arg);
+            }
+            wrapped.push(rc);
+        }
+
+        let mut ctx = OptContext::new(wrapped.len());
+        ctx.snapshot_boxes = snapshots;
+        let produced: std::collections::HashSet<OpRef> =
+            wrapped.iter().map(|op| op.pos().get()).collect();
+        let leaf_args: Vec<Operand> = leaves
+            .into_iter()
+            .filter(|arg| !produced.contains(&arg.to_opref()))
+            .collect();
+        ctx.seed_boxes_canonical(&leaf_args);
 
         let mut pass = OptVirtualize::new();
         pass.setup();
 
-        for op in &ops {
-            // Resolve forwarded arguments
-            let mut resolved_op = op.clone();
-            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
-            // binds each arg to its canonical box (oparser object-identity),
-            // materialising and registering a bound box for any unbound
-            // position so no position-only `Operand::Box` is minted.
-            resolve_op_args(&mut resolved_op, &mut ctx);
-
-            let resolved_rc = OpRc::new(resolved_op.clone());
-            ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
-            match pass.propagate_forward(&resolved_op, &resolved_rc, &mut ctx) {
+        for rc in &wrapped {
+            for i in 0..rc.num_args() {
+                let resolved = ctx.resolve_operand_operand(&rc.arg(i));
+                rc.setarg(i, resolved);
+            }
+            ctx.bind_input_resops(std::slice::from_ref(rc));
+            match pass.propagate_forward(rc, rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -3951,7 +4022,7 @@ mod tests {
                 }
                 OptimizationResult::Remove => {}
                 OptimizationResult::PassOn => {
-                    ctx.emit(resolved_op);
+                    ctx.emit_rc(rc.clone());
                 }
                 OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
@@ -3997,7 +4068,7 @@ mod tests {
                 identity_input_index: Some(0),
             },
         )));
-        let forced = opt.force_box(OpRef::input_arg_ref(0), &mut ctx);
+        let forced = opt.force_box(&vable_box, &mut ctx);
         assert_eq!(forced, OpRef::input_arg_ref(0));
         assert!(
             ctx.new_operations.is_empty(),
@@ -4032,67 +4103,34 @@ mod tests {
         // OptVirtualize must treat the access as an ordinary raw heap read.
         let field_descr = test_vable_field_descr(8, Type::Int, 1);
         let arr_descr = array_descr(20);
-        let b = ctx.materialize_operand_at(OpRef::int_op(50));
-        ctx.make_constant_box(&b, Value::Int(0));
+        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let idx = Operand::const_from_value(Value::Int(0));
 
-        let get_array_ptr = Op::with_descr(
+        let get_array_ptr = OpRc::new(Op::with_descr(
             OpCode::GetfieldRawI,
-            &[crate::history::test_support::rooted_inputarg_operand(
-                Type::Ref,
-                0,
-            )],
+            &[vable.clone()],
             field_descr,
-        );
-        let get_item = Op::with_descr(
+        ));
+        get_array_ptr.pos().set(OpRef::int_op(0));
+        let array_ptr_box = Operand::from_bound_op(&get_array_ptr);
+        let get_item = OpRc::new(Op::with_descr(
             OpCode::GetarrayitemRawI,
-            &[
-                crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 50),
-            ],
+            &[array_ptr_box.clone(), idx.clone()],
             arr_descr.clone(),
-        );
-        let get_item_again = Op::with_descr(
+        ));
+        get_item.pos().set(OpRef::int_op(1));
+        let get_item_again = OpRc::new(Op::with_descr(
             OpCode::GetarrayitemRawI,
-            &[
-                crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 50),
-            ],
+            &[array_ptr_box, idx],
             arr_descr,
+        ));
+        get_item_again.pos().set(OpRef::int_op(2));
+
+        drive_bound_ops(
+            &mut pass,
+            &mut ctx,
+            &[get_array_ptr, get_item, get_item_again],
         );
-
-        let mut ops = vec![get_array_ptr, get_item, get_item_again];
-        assign_positions(&mut ops);
-        // Bind the array-element reads to the GetfieldRawI producer's bound
-        // result box (oparser object-identity); GetfieldRawI (ops[0]) is
-        // Int-typed so its result position is `OpRef::int_op(0)`.
-        let array_ptr_box =
-            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos().get().raw());
-        ops[1].setarg(0, array_ptr_box.clone());
-        ops[2].setarg(0, array_ptr_box);
-
-        for op in &ops {
-            let mut resolved = op.clone();
-            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
-            // binds each arg to its canonical box (oparser object-identity),
-            // materialising and registering a bound box for any unbound
-            // position so no position-only `Operand::Box` is minted.
-            resolve_op_args(&mut resolved, &mut ctx);
-            match pass.propagate_forward(&resolved, &OpRc::new(resolved.clone()), &mut ctx) {
-                OptimizationResult::Emit(emitted) => {
-                    ctx.emit(emitted);
-                }
-                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
-                    ctx.emit(replaced);
-                }
-                OptimizationResult::Remove => {}
-                OptimizationResult::PassOn => {
-                    ctx.emit(resolved);
-                }
-                OptimizationResult::InvalidLoop(_) => {
-                    panic!("unexpected InvalidLoop in test");
-                }
-            }
-        }
 
         let get_count = ctx
             .new_operations
@@ -4170,13 +4208,8 @@ mod tests {
         });
         pass.setup();
 
-        let mut get = Op::new(
-            OpCode::GetfieldRawI,
-            &[crate::history::test_support::rooted_inputarg_operand(
-                Type::Ref,
-                0,
-            )],
-        );
+        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let mut get = Op::new(OpCode::GetfieldRawI, &[vable]);
         get.setdescr(test_vable_field_descr(8, Type::Int, 1));
         get.pos().set(OpRef::int_op(10));
 
@@ -4200,13 +4233,9 @@ mod tests {
         });
         pass.setup();
 
-        let mut set = Op::new(
-            OpCode::SetfieldRaw,
-            &[
-                crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                crate::history::test_support::rooted_inputarg_operand(Type::Int, 1),
-            ],
-        );
+        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let value = ctx.materialize_operand_at(OpRef::input_arg_int(1));
+        let mut set = Op::new(OpCode::SetfieldRaw, &[vable, value]);
         set.setdescr(test_vable_field_descr(8, Type::Int, 1));
 
         let result = pass.propagate_forward(&set, &OpRc::new(set.clone()), &mut ctx);
@@ -4260,29 +4289,15 @@ mod tests {
         });
         pass.setup();
 
-        let mut get_field = Op::new(
-            OpCode::GetfieldRawI,
-            &[crate::history::test_support::rooted_inputarg_operand(
-                Type::Ref,
-                0,
-            )],
-        );
+        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let index = ctx.materialize_operand_at(OpRef::input_arg_int(1));
+        let get_field = OpRc::new(Op::new(OpCode::GetfieldRawI, &[vable]));
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos().set(OpRef::int_op(10));
-        resolve_op_args(&mut get_field, &mut ctx);
-        assert!(matches!(
-            pass.propagate_forward(&get_field, &OpRc::new(get_field.clone()), &mut ctx),
-            OptimizationResult::PassOn
-        ));
-        ctx.emit(get_field);
+        drive_bound_ops(&mut pass, &mut ctx, std::slice::from_ref(&get_field));
+        let array_ptr = Operand::from_bound_op(&get_field);
 
-        let mut get_item = Op::new(
-            OpCode::GetarrayitemRawI,
-            &[
-                crate::history::test_support::rooted_resop_operand(Type::Int, 10),
-                crate::history::test_support::rooted_inputarg_operand(Type::Int, 1),
-            ],
-        );
+        let mut get_item = Op::new(OpCode::GetarrayitemRawI, &[array_ptr, index]);
         get_item.setdescr(array_descr(24));
         let result = pass.propagate_forward(&get_item, &OpRc::new(get_item.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -4304,30 +4319,17 @@ mod tests {
         });
         pass.setup();
 
-        let mut get_field = Op::new(
-            OpCode::GetfieldRawI,
-            &[crate::history::test_support::rooted_inputarg_operand(
-                Type::Ref,
-                0,
-            )],
-        );
+        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let index = ctx.materialize_operand_at(OpRef::input_arg_int(1));
+        let get_field = OpRc::new(Op::new(OpCode::GetfieldRawI, &[vable]));
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos().set(OpRef::int_op(10));
-        resolve_op_args(&mut get_field, &mut ctx);
-        assert!(matches!(
-            pass.propagate_forward(&get_field, &OpRc::new(get_field.clone()), &mut ctx),
-            OptimizationResult::PassOn
-        ));
-        ctx.emit(get_field);
+        drive_bound_ops(&mut pass, &mut ctx, std::slice::from_ref(&get_field));
+        let array_ptr = Operand::from_bound_op(&get_field);
+        let stored = crate::history::test_support::rooted_resop_operand(Type::Int, 2);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&stored));
 
-        let mut set_item = Op::new(
-            OpCode::SetarrayitemRaw,
-            &[
-                crate::history::test_support::rooted_resop_operand(Type::Int, 10),
-                crate::history::test_support::rooted_inputarg_operand(Type::Int, 1),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 2),
-            ],
-        );
+        let mut set_item = Op::new(OpCode::SetarrayitemRaw, &[array_ptr, index, stored]);
         set_item.setdescr(array_descr(24));
         let result = pass.propagate_forward(&set_item, &OpRc::new(set_item.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -4353,70 +4355,29 @@ mod tests {
 
         let field_descr = test_vable_field_descr(8, Type::Int, 1);
         let arr_descr = array_descr(20);
-        // const array index 0 and a stored value.
-        let b = ctx.materialize_operand_at(OpRef::int_op(50));
-        ctx.make_constant_box(&b, Value::Int(0));
-        let b = ctx.materialize_operand_at(OpRef::int_op(51));
-        ctx.make_constant_box(&b, Value::Int(42));
+        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let idx = Operand::const_from_value(Value::Int(0));
+        let stored = Operand::const_from_value(Value::Int(42));
 
-        let get_array_ptr = Op::with_descr(
-            OpCode::GetfieldRawI,
-            &[crate::history::test_support::rooted_inputarg_operand(
-                Type::Ref,
-                0,
-            )],
-            field_descr,
-        );
-        let set_item = Op::with_descr(
+        let get_array_ptr = OpRc::new(Op::with_descr(OpCode::GetfieldRawI, &[vable], field_descr));
+        get_array_ptr.pos().set(OpRef::int_op(0));
+        let array_ptr_box = Operand::from_bound_op(&get_array_ptr);
+        let set_item = OpRc::new(Op::with_descr(
             OpCode::SetarrayitemGc,
-            &[
-                crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 50),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 51),
-            ],
+            &[array_ptr_box.clone(), idx.clone(), stored],
             arr_descr.clone(),
-        );
-        let get_item = Op::with_descr(
+        ));
+        set_item
+            .pos()
+            .set(OpRef::op_typed(1, OpCode::SetarrayitemGc.result_type()));
+        let get_item = OpRc::new(Op::with_descr(
             OpCode::GetarrayitemGcI,
-            &[
-                crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 50),
-            ],
+            &[array_ptr_box, idx],
             arr_descr,
-        );
+        ));
+        get_item.pos().set(OpRef::int_op(2));
 
-        let mut ops = vec![get_array_ptr, set_item, get_item];
-        assign_positions(&mut ops);
-        // Route the array element ops through the GetfieldRawI result so
-        // resolve_array_source() sees the producing OpRef, not the bare
-        // vable inputarg. GetfieldRawI (ops[0]) is Int-typed so its result
-        // position is `OpRef::int_op(0)`.
-        let array_ptr_box =
-            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos().get().raw());
-        ops[1].setarg(0, array_ptr_box.clone());
-        ops[2].setarg(0, array_ptr_box);
-
-        for op in &ops {
-            let mut resolved = op.clone();
-            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
-            // binds each arg to its canonical box (oparser object-identity),
-            // materialising and registering a bound box for any unbound
-            // position so no position-only `Operand::Box` is minted.
-            resolve_op_args(&mut resolved, &mut ctx);
-            match pass.propagate_forward(&resolved, &OpRc::new(resolved.clone()), &mut ctx) {
-                OptimizationResult::Emit(emitted) => {
-                    ctx.emit(emitted);
-                }
-                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
-                    ctx.emit(replaced);
-                }
-                OptimizationResult::Remove => {}
-                OptimizationResult::PassOn => {
-                    ctx.emit(resolved);
-                }
-                OptimizationResult::InvalidLoop(_) => panic!("unexpected InvalidLoop in test"),
-            }
-        }
+        drive_bound_ops(&mut pass, &mut ctx, &[get_array_ptr, set_item, get_item]);
 
         let get_count = ctx
             .new_operations
@@ -4459,84 +4420,46 @@ mod tests {
 
         let field_descr = test_vable_field_descr(8, Type::Int, 1);
         let arr_descr = array_descr(20);
-        // const index 0 + two stored values; int_op(60) is a NON-constant
-        // index (never made constant) for the variable-index write.
-        let b = ctx.materialize_operand_at(OpRef::int_op(50));
-        ctx.make_constant_box(&b, Value::Int(0));
-        let b = ctx.materialize_operand_at(OpRef::int_op(51));
-        ctx.make_constant_box(&b, Value::Int(42));
-        let b = ctx.materialize_operand_at(OpRef::int_op(52));
-        ctx.make_constant_box(&b, Value::Int(99));
+        // const index 0 + two stored values; position 60 is a non-constant
+        // index for the variable-index write.
+        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let idx = Operand::const_from_value(Value::Int(0));
+        let stored_const = Operand::const_from_value(Value::Int(42));
+        let stored_var = Operand::const_from_value(Value::Int(99));
+        let idx_var = crate::history::test_support::rooted_resop_operand(Type::Int, 60);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&idx_var));
 
-        let get_array_ptr = Op::with_descr(
-            OpCode::GetfieldRawI,
-            &[crate::history::test_support::rooted_inputarg_operand(
-                Type::Ref,
-                0,
-            )],
-            field_descr,
-        );
-        // stack[0] = 42
-        let set_item_const = Op::with_descr(
+        let get_array_ptr = OpRc::new(Op::with_descr(OpCode::GetfieldRawI, &[vable], field_descr));
+        get_array_ptr.pos().set(OpRef::int_op(0));
+        let array_ptr_box = Operand::from_bound_op(&get_array_ptr);
+        let set_item_const = OpRc::new(Op::with_descr(
             OpCode::SetarrayitemGc,
-            &[
-                crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 50),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 51),
-            ],
+            &[array_ptr_box.clone(), idx.clone(), stored_const],
             arr_descr.clone(),
-        );
-        // stack[i] = 99
-        let set_item_var = Op::with_descr(
+        ));
+        set_item_const
+            .pos()
+            .set(OpRef::op_typed(1, OpCode::SetarrayitemGc.result_type()));
+        let set_item_var = OpRc::new(Op::with_descr(
             OpCode::SetarrayitemGc,
-            &[
-                crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 60),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 52),
-            ],
+            &[array_ptr_box.clone(), idx_var, stored_var],
             arr_descr.clone(),
-        );
-        // stack[0]
-        let get_item = Op::with_descr(
+        ));
+        set_item_var
+            .pos()
+            .set(OpRef::op_typed(2, OpCode::SetarrayitemGc.result_type()));
+        let get_item = OpRc::new(Op::with_descr(
             OpCode::GetarrayitemGcI,
-            &[
-                crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 50),
-            ],
+            &[array_ptr_box, idx],
             arr_descr,
+        ));
+        get_item.pos().set(OpRef::int_op(3));
+
+        drive_bound_ops(
+            &mut pass,
+            &mut ctx,
+            &[get_array_ptr, set_item_const, set_item_var, get_item],
         );
-
-        let mut ops = vec![get_array_ptr, set_item_const, set_item_var, get_item];
-        assign_positions(&mut ops);
-        // GetfieldRawI (ops[0]) is Int-typed so its result position is
-        // `OpRef::int_op(0)`; bind the element ops to its result box.
-        let array_ptr_box =
-            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos().get().raw());
-        ops[1].setarg(0, array_ptr_box.clone());
-        ops[2].setarg(0, array_ptr_box.clone());
-        ops[3].setarg(0, array_ptr_box);
-
-        for op in &ops {
-            let mut resolved = op.clone();
-            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
-            // binds each arg to its canonical box (oparser object-identity),
-            // materialising and registering a bound box for any unbound
-            // position so no position-only `Operand::Box` is minted.
-            resolve_op_args(&mut resolved, &mut ctx);
-            match pass.propagate_forward(&resolved, &OpRc::new(resolved.clone()), &mut ctx) {
-                OptimizationResult::Emit(emitted) => {
-                    ctx.emit(emitted);
-                }
-                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
-                    ctx.emit(replaced);
-                }
-                OptimizationResult::Remove => {}
-                OptimizationResult::PassOn => {
-                    ctx.emit(resolved);
-                }
-                OptimizationResult::InvalidLoop(_) => panic!("unexpected InvalidLoop in test"),
-            }
-        }
 
         let get_count = ctx
             .new_operations
@@ -4568,30 +4491,13 @@ mod tests {
             identity_input_index: Some(0),
         });
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let vable = crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0);
+        let i1 = crate::history::test_support::rooted_inputarg_operand(Type::Int, 1);
+        let i2 = crate::history::test_support::rooted_inputarg_operand(Type::Int, 2);
         let mut ops = vec![
-            Op::new(
-                OpCode::Label,
-                &[
-                    crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 1),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 2),
-                ],
-            ),
-            Op::new(
-                OpCode::GuardTrue,
-                &[crate::history::test_support::rooted_resop_operand(
-                    Type::Int,
-                    1,
-                )],
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 1),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 2),
-                ],
-            ),
+            Op::new(OpCode::Label, &[vable.clone(), i1.clone(), i2.clone()]),
+            Op::new(OpCode::GuardTrue, &[i1.clone()]),
+            Op::new(OpCode::Jump, &[vable, i1, i2]),
         ];
         ops[1].setfailargs(Default::default());
         assign_positions(&mut ops);
@@ -5131,12 +5037,11 @@ mod tests {
             OptimizationResult::Remove
         ));
 
+        let value = crate::history::test_support::rooted_resop_operand(Type::Int, 100);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&value));
         let mut set_op = Op::with_descr(
             OpCode::SetfieldGc,
-            &[
-                crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 100),
-            ],
+            &[Operand::from_bound_op(&new_op_rc), value],
             fd,
         );
         set_op.pos().set(OpRef::int_op(1));
@@ -5458,17 +5363,14 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::NewArrayClear,
-                &[crate::history::test_support::rooted_resop_operand(
-                    Type::Int,
-                    50,
-                )],
+                &[majit_ir::operand::Operand::const_from_value(Value::Int(1))],
                 arr.clone(),
             ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
                 &[
                     crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 51),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(0)),
                     crate::history::test_support::rooted_inputarg_operand(Type::Float, 60),
                 ],
                 real.clone(),
@@ -5477,7 +5379,7 @@ mod tests {
                 OpCode::SetinteriorfieldGc,
                 &[
                     crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 51),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(0)),
                     crate::history::test_support::rooted_inputarg_operand(Type::Float, 61),
                 ],
                 imag.clone(),
@@ -5505,10 +5407,8 @@ mod tests {
         types[61] = Type::Float;
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         opt.snapshot_boxes = snapshots;
-        let mut constants = majit_ir::ConstMap::default();
-        constants.insert(50u32, Value::Int(1));
-        constants.insert(51u32, Value::Int(0));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
 
         // Forced reconstruction: NEW_ARRAY_CLEAR, 2× SETINTERIORFIELD_GC, CALL_N.
         assert_eq!(
@@ -5592,7 +5492,7 @@ mod tests {
                 OpCode::GuardClass,
                 &[
                     crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 200),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(42)),
                 ],
             ),
         ];
@@ -5601,9 +5501,8 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        constants.insert(200u32, majit_ir::Value::Int(42)); // expected class ptr matches vtable
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
         // Both NEW_WITH_VTABLE (virtual) and GuardClass (redundant) removed
         assert!(
             result.is_empty(),
@@ -6180,14 +6079,14 @@ mod tests {
                 OpCode::GuardClass,
                 &[
                     crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 200),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(42)),
                 ],
             ),
             Op::new(
                 OpCode::GuardClass,
                 &[
                     crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 200),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(42)),
                 ],
             ),
         ];
@@ -6196,9 +6095,8 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        constants.insert(200u32, majit_ir::Value::Int(42)); // class ptr constant
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
         assert_eq!(
             result.len(),
             1,
@@ -6525,35 +6423,60 @@ mod tests {
         constants: &[(OpRef, Value)],
         raw_bufs: &[(OpRef, usize)],
     ) -> Vec<Op> {
-        let mut ctx = OptContext::new(ops.len());
-        for &(opref, ref val) in constants {
-            let b = ctx.materialize_operand_at(opref);
-            ctx.make_constant_box(&b, *val);
+        // Constants are Const operands. PtrInfo is seeded on the buffer
+        // operand the ops carry, not on a second box materialized by position.
+        let mut owned: Vec<Op> = ops.to_vec();
+        for op in &mut owned {
+            for i in 0..op.num_args() {
+                let r = op.arg(i).to_opref();
+                if let Some(&(_, val)) = constants.iter().find(|(pref, _)| *pref == r) {
+                    op.setarg(i, Operand::const_from_value(val));
+                }
+            }
+        }
+        let mut wrapped: Vec<OpRc> = Vec::with_capacity(owned.len());
+        let mut leaves: Vec<Operand> = Vec::new();
+        for op in &owned {
+            let rc = OpRc::new(op.clone());
+            for i in 0..rc.num_args() {
+                let arg = rc.arg(i);
+                if arg.is_constant() || arg.is_none() {
+                    continue;
+                }
+                let opref = arg.to_opref();
+                if let Some(leaf) = leaves.iter().find(|leaf| leaf.to_opref() == opref) {
+                    rc.setarg(i, leaf.clone());
+                    continue;
+                }
+                leaves.push(arg);
+            }
+            wrapped.push(rc);
         }
 
+        let mut ctx = OptContext::new(wrapped.len());
+        ctx.seed_boxes_canonical(&leaves);
         let mut pass = OptVirtualize::new();
         pass.setup();
 
-        // Pre-populate VirtualRawBuffer info for specified OpRefs
         for &(opref, size) in raw_bufs {
-            let b = ctx.materialize_operand_at(opref);
+            let b = leaves
+                .iter()
+                .find(|leaf| leaf.to_opref() == opref)
+                .cloned()
+                .unwrap_or_else(|| ctx.materialize_operand_at(opref));
             ctx.set_ptr_info(
                 &b,
                 PtrInfo::VirtualRawBuffer(RawBufferPtrInfo::new(0, size, None)),
             );
         }
 
-        for op in ops {
-            let mut resolved_op = op.clone();
-            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
-            // binds each arg to its canonical box (oparser object-identity),
-            // materialising and registering a bound box for any unbound
-            // position so no position-only `Operand::Box` is minted.
-            resolve_op_args(&mut resolved_op, &mut ctx);
-
-            let resolved_rc = OpRc::new(resolved_op.clone());
-            ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
-            match pass.propagate_forward(&resolved_op, &resolved_rc, &mut ctx) {
+        for rc in &wrapped {
+            for i in 0..rc.num_args() {
+                let resolved = ctx.resolve_operand_operand(&rc.arg(i));
+                rc.setarg(i, resolved);
+            }
+            ctx.bind_input_resops(std::slice::from_ref(rc));
+            match pass.propagate_forward(rc, rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6562,7 +6485,7 @@ mod tests {
                 }
                 OptimizationResult::Remove => {}
                 OptimizationResult::PassOn => {
-                    ctx.emit(resolved_op);
+                    ctx.emit_rc(rc.clone());
                 }
                 OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
@@ -6989,7 +6912,7 @@ mod tests {
                 OpCode::SetfieldGc,
                 &[
                     crate::history::test_support::rooted_resop_operand(Type::Ref, 2),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 100),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(7)),
                 ],
                 value_fd.clone(),
             ),
@@ -7006,7 +6929,7 @@ mod tests {
                 OpCode::SetfieldGc,
                 &[
                     crate::history::test_support::rooted_resop_operand(Type::Ref, 5),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 101),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(11)),
                 ],
                 value_fd.clone(),
             ),
@@ -7035,8 +6958,6 @@ mod tests {
 
         let mut opt = Optimizer::default_pipeline();
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        constants.insert(100u32, majit_ir::Value::Int(7));
-        constants.insert(101u32, majit_ir::Value::Int(11));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: Vec<_> = result

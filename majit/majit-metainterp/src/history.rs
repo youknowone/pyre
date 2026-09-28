@@ -685,8 +685,8 @@ impl TreeLoop {
         if self.ops.is_empty() {
             return true;
         }
-        let mut seen: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
-        let mut op_positions: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+        let mut seen: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
+        let mut op_positions: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
         // history.py:564-565: inputargs must not contain constants
         for ia in &self.inputargs {
             let ia_ref = OpRef::input_arg_typed(ia.index, ia.tp.get());
@@ -718,7 +718,7 @@ impl TreeLoop {
                 }
             }
             // history.py: each arg must be Const or in seen
-            for arg in op.getarglist().iter() {
+            for arg in op.args_slice().iter() {
                 if arg.is_none() {
                     return false;
                 }
@@ -761,7 +761,7 @@ impl TreeLoop {
             // history.py:596-602: LABEL resets seen
             if op.opcode == OpCode::Label {
                 seen.clear();
-                for arg in op.getarglist().iter() {
+                for arg in op.args_slice().iter() {
                     if arg.is_none() || arg.is_constant() {
                         return false;
                     }
@@ -835,8 +835,9 @@ impl TreeLoop {
 
         // Phase 1: Build initial remap from original_boxes → new inputargs.
         // Each new inputarg carries the type recorded in `GreenBox.ty`.
-        let mut remap: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
-        let original_set: IndexSet<OpRef> = original_boxes.iter().map(|gb| gb.opref).collect();
+        let mut remap: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
+        let original_set: crate::FxIndexSet<OpRef> =
+            original_boxes.iter().map(|gb| gb.opref).collect();
         for (i, gb) in original_boxes.iter().enumerate() {
             remap.insert(gb.opref, OpRef::input_arg_typed(i as u32, gb.ty));
         }
@@ -848,7 +849,7 @@ impl TreeLoop {
             original_boxes.iter().map(|gb| gb.ty).collect();
 
         // Collect all OpRefs defined by post-cut ops.
-        let defined_after_cut: IndexSet<OpRef> = cut_ops
+        let defined_after_cut: crate::FxIndexSet<OpRef> = cut_ops
             .iter()
             .filter(|op| !op.pos().get().is_none())
             .map(|op| op.pos().get())
@@ -863,7 +864,7 @@ impl TreeLoop {
                 && !defined_after_cut.contains(r)
         };
 
-        let mut escaped_set: IndexSet<OpRef> = IndexSet::new();
+        let mut escaped_set: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
         let mut queue: VecDeque<OpRef> = VecDeque::new();
 
         // Seed with refs used by post-cut ops (args only, not fail_args).
@@ -873,7 +874,7 @@ impl TreeLoop {
         // cut namespace owes them nothing. Only regular op args seed escaped
         // refs for prefix re-emission.
         for op in cut_ops {
-            for arg in op.getarglist().iter() {
+            for arg in op.args_slice().iter() {
                 if is_pre_cut_ref(&arg.to_opref()) && escaped_set.insert(arg.to_opref()) {
                     queue.push_back(arg.to_opref());
                 }
@@ -961,7 +962,7 @@ impl TreeLoop {
         // Returns the extra pre-cut ops the caller must seed alongside the
         // root; `None` is the decline.
         let snapshot_cone_is_reemittable = |root: &OpRef| -> Option<Vec<OpRef>> {
-            let mut seen: IndexSet<OpRef> = IndexSet::new();
+            let mut seen: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
             let mut extra: Vec<OpRef> = Vec::new();
             let mut stack: Vec<(OpRef, bool)> = vec![(*root, true)];
             while let Some((r, is_root)) = stack.pop() {
@@ -978,7 +979,7 @@ impl TreeLoop {
                         return None;
                     }
                     for other in self.ops[..start.op_index].iter() {
-                        if !other.getarglist().iter().any(|a| a.to_opref() == r) {
+                        if !other.args_slice().iter().any(|a| a.to_opref() == r) {
                             continue;
                         }
                         if other.opcode.is_guard() {
@@ -1003,7 +1004,7 @@ impl TreeLoop {
                         extra.push(other.pos().get());
                     }
                 }
-                for arg in op.getarglist().iter() {
+                for arg in op.args_slice().iter() {
                     let a = arg.to_opref();
                     if is_pre_cut_ref(&a) {
                         stack.push((a, false));
@@ -1068,7 +1069,7 @@ impl TreeLoop {
             }
             let op_idx = (esc_ref.raw() - num_original_inputargs) as usize;
             if let Some(op) = self.ops.get(op_idx) {
-                for arg in op.getarglist().iter() {
+                for arg in op.args_slice().iter() {
                     if is_pre_cut_ref(&arg.to_opref()) && escaped_set.insert(arg.to_opref()) {
                         queue.push_back(arg.to_opref());
                     }
@@ -5758,7 +5759,7 @@ mod history_record_tests {
         let op = take_single_call_op(ctx, &args);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
         assert_eq!(
-            op.getarglist()
+            op.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -5793,7 +5794,7 @@ mod history_record_tests {
         let op = take_single_call_op(ctx, &[frame]);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
         assert_eq!(
-            op.getarglist()
+            op.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

@@ -160,7 +160,7 @@ mod tests {
             assert_eq!(result[0].opcode, expected_op);
             assert_eq!(
                 &result[0]
-                    .getarglist()
+                    .args_slice()
                     .iter()
                     .map(|a| a.to_opref())
                     .collect::<Vec<_>>()[..],
@@ -197,7 +197,7 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::SameAsR);
         assert_eq!(
             result[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::CallI);
         assert_eq!(
             result[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),

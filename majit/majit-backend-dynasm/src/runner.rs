@@ -72,8 +72,8 @@ thread_local! {
     /// at compile time (the resolved address is baked into the code), so
     /// thread-local scope never narrows what production (single-threaded) can
     /// reach.
-    static CALL_ASSEMBLER_TARGETS: RefCell<IndexMap<u64, DynasmCaTarget>> =
-        RefCell::new(IndexMap::new());
+    static CALL_ASSEMBLER_TARGETS: RefCell<IndexMap<u64, DynasmCaTarget, rustc_hash::FxBuildHasher>> =
+        RefCell::new(IndexMap::with_hasher(rustc_hash::FxBuildHasher));
 }
 
 fn unregister_dynasm_ca_target(number: u64) {
@@ -1947,7 +1947,10 @@ impl DynasmBackend {
     /// helper is retained for in-crate tests that construct
     /// `IndexMap<u32, i64>` literals by hand. Each raw value is wrapped
     /// as a `ConstInt` — the only constant kind these fixtures build.
-    pub fn set_constants(&mut self, constants: indexmap::IndexMap<u32, i64>) {
+    pub fn set_constants(
+        &mut self,
+        constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher>,
+    ) {
         self.constants = constants
             .iter()
             .map(|(&k, &v)| (k, majit_ir::Const::Int(v)))
@@ -3160,12 +3163,8 @@ impl Backend for DynasmBackend {
         // The assembler stores the typed `Const` pool directly; each box
         // variant carries its own type (`Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
-        if std::env::var("MAJIT_TRACE_OPS_DIAG")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            == Some(trace_id)
-        {
-            let constants: indexmap::IndexMap<u32, i64> = const_pool
+        if crate::trace_ops_diag_id() == Some(trace_id) {
+            let constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> = const_pool
                 .iter()
                 .map(|(&key, value)| (key, value.as_raw_i64()))
                 .collect();
@@ -3428,12 +3427,9 @@ impl Backend for DynasmBackend {
         // format_trace reads raw `i64` values; the assembler stores the
         // typed `Const` pool directly (type rides on `Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
-        let trace_ops_diag = std::env::var("MAJIT_TRACE_OPS_DIAG")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            == Some(trace_id);
+        let trace_ops_diag = crate::trace_ops_diag_id() == Some(trace_id);
         if trace_ops_diag {
-            let constants: IndexMap<u32, i64> = const_pool
+            let constants: IndexMap<u32, i64, rustc_hash::FxBuildHasher> = const_pool
                 .iter()
                 .map(|(&k, c)| (k, c.as_raw_i64()))
                 .collect();
@@ -5055,7 +5051,8 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -5127,7 +5124,8 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         consts.insert(10000, 0_i64); // FLAG_ARRAY
         consts.insert(10001, 8_i64); // item size / length-store width
         consts.insert(10002, 0_i64); // length offset
@@ -5202,7 +5200,8 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -5282,7 +5281,8 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -5369,7 +5369,8 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         consts.insert(10000, 264_i64);
         consts.insert(10001, 256_i64);
         consts.insert(10002, 8_i64);
@@ -5435,7 +5436,8 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref_rc(0)];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
 
@@ -5462,7 +5464,8 @@ mod tests {
         let _guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = backend.get_latest_descr_arc(&failed);
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut bridge_constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         bridge_constants.insert(200, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(bridge_constants);
         let bridge_value = mk_op(
@@ -5525,7 +5528,8 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
 
@@ -5559,7 +5563,7 @@ mod tests {
         let _guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = backend.get_latest_descr_arc(&failed);
 
-        backend.set_constants(indexmap::IndexMap::new());
+        backend.set_constants(indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher));
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 2);
@@ -5624,7 +5628,8 @@ mod tests {
 
         // arg 0 is the cond-call predicate, passed 0 so the call is taken.
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         constants.insert(200, return_int_passthrough as *const () as usize as i64);
         backend.set_constants(constants);
 
@@ -5691,7 +5696,8 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref_rc(0)];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         constants.insert(200, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(constants);
 
@@ -5732,7 +5738,8 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         consts.insert(205, alloc_marked_ref as *const () as usize as i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -5773,7 +5780,8 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         consts.insert(
             206,
             alloc_marked_ref_collecting as *const () as usize as i64,

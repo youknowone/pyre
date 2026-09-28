@@ -898,7 +898,7 @@ pub struct Assembler386<'a> {
 
     // ── State tracking for code generation ──
     /// Maps OpRef → jitframe slot index.
-    opref_to_slot: IndexMap<OpRef, usize>,
+    opref_to_slot: IndexMap<OpRef, usize, rustc_hash::FxBuildHasher>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
     inputargs: &'a [InputArgRc],
     /// Trace operations — borrowed for `opref_type` lookups (reads
@@ -1194,7 +1194,7 @@ impl<'a> Assembler386<'a> {
             header_pc,
             input_types: Vec::new(),
             bridge_input_locs: None,
-            opref_to_slot: IndexMap::new(),
+            opref_to_slot: IndexMap::with_hasher(rustc_hash::FxBuildHasher),
             inputargs,
             operations,
             inputarg_pos,
@@ -6538,7 +6538,7 @@ impl<'a> Assembler386<'a> {
             if ts.len() == expected_len {
                 SmallVec::from_slice(&ts)
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-                op.getarglist()
+                op.args_slice()
                     .iter()
                     .map(|opref| {
                         self.opref_type_at(opref.to_opref(), op_index)
@@ -6592,7 +6592,7 @@ impl<'a> Assembler386<'a> {
             // matches the caller's CALL_ASSEMBLER result kind (a Void
             // mismatch routes every return through the assembler helper
             // instead of the result-loading fast path).
-            op.getarglist()
+            op.args_slice()
                 .iter()
                 .map(|opref| {
                     self.opref_type_at(opref.to_opref(), op_index)
@@ -6714,7 +6714,7 @@ impl<'a> Assembler386<'a> {
     fn genop_finish(&mut self, op: &Op, fail_index: u32) {
         // compiler.rs parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
-        let finish_refs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let finish_refs: Vec<OpRef> = op.args_slice().iter().map(|a| a.to_opref()).collect();
         let fail_arg_types = if let Some(explicit) = op.get_fail_arg_types() {
             if explicit.len() == finish_refs.len() {
                 explicit.to_vec()

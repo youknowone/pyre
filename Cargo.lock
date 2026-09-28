@@ -2030,6 +2030,7 @@ dependencies = [
  "majit-ir",
  "parking_lot",
  "region",
+ "rustc-hash",
 ]
 
 [[package]]

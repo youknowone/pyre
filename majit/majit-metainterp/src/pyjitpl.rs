@@ -405,11 +405,9 @@ impl OptimizationInfoItem for OpRc {
         // guard's checked box is made constant after the guard is emitted.
         // Forget on the operands too, so no forwarding written during
         // optimization outlives it.
-        let producers = self
-            .getarglist()
-            .into_iter()
-            .chain(self.getfailargs().into_iter().flatten());
-        for arg in producers {
+        let args = self.args_slice();
+        let failargs = self.guard_fail_args().unwrap_or(&[]);
+        for arg in args.iter().chain(failargs) {
             if arg.is_bound() {
                 arg.clear_forwarded();
             }
@@ -623,7 +621,7 @@ pub(crate) struct CompiledTrace {
     /// Static exit metadata for each guard/finish in this trace.
     pub(crate) exit_layouts: crate::FxIndexMap<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
-    pub(crate) terminal_exit_layouts: indexmap::IndexMap<usize, StoredExitLayout>,
+    pub(crate) terminal_exit_layouts: crate::FxIndexMap<usize, StoredExitLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -1076,6 +1074,38 @@ fn snapshot_maps_from_ctx(
     snapshot_map_from_trace_snapshots(ctx.snapshots(), constants, &inputargs)
 }
 
+/// `ResumeDataLoopMemo.number` source for an optimizer that walks the
+/// recorded operations themselves (`SimpleCompileData`, the no-unroll
+/// retry): each recorded position is its own box in `_cache`.
+fn recorder_self_feed(
+    recorder: &crate::recorder::Trace,
+    inputargs: &[majit_ir::InputArgRc],
+    ops: &[OpRc],
+) -> crate::recorder::ByteBridgeResume {
+    let mut cache: Vec<Option<majit_ir::operand::Operand>> = Vec::new();
+    let mut put = |pos: usize, operand| {
+        if cache.len() <= pos {
+            cache.resize(pos + 1, None);
+        }
+        cache[pos] = Some(operand);
+    };
+    for inputarg in inputargs {
+        put(
+            inputarg.index as usize,
+            majit_ir::operand::Operand::from_bound_inputarg(inputarg),
+        );
+    }
+    for op in ops {
+        if op.result_type() != majit_ir::Type::Void {
+            put(
+                op.pos().get().raw() as usize,
+                majit_ir::operand::Operand::from_bound_op(op),
+            );
+        }
+    }
+    crate::recorder::ByteBridgeResume::from_recorder(recorder, cache)
+}
+
 fn snapshot_map_from_byte_recorder(
     recorder: &crate::recorder::Trace,
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
@@ -1421,6 +1451,20 @@ pub(crate) fn translate_trace_iter_opref(
     translated
 }
 
+/// opencoder.py `TraceIterator._get(i)`: the box object `_cache[i]` holds
+/// for a recorded position, or `None` for a constant / absent slot.
+pub(crate) fn trace_iter_cached_box(
+    opref: OpRef,
+    cache: &[Option<majit_ir::operand::Operand>],
+) -> Option<&majit_ir::operand::Operand> {
+    if opref.is_none() || opref.is_constant() {
+        return None;
+    }
+    cache
+        .get(opref.raw() as usize)
+        .and_then(|slot| slot.as_ref())
+}
+
 fn translate_trace_iter_box_map(
     mut box_map: SnapshotBoxes,
     cache: &[Option<majit_ir::operand::Operand>],
@@ -1481,7 +1525,7 @@ fn prepare_bridge_trace_from_owned(
     };
     for op in bridge_ops.iter() {
         consider(op.pos().get());
-        for a in op.getarglist().iter() {
+        for a in op.args_slice().iter() {
             consider(a.to_opref());
         }
         op.visit_failarg_oprefs(&mut consider);
@@ -1884,8 +1928,8 @@ fn densify_root_loop_inputargs(
     args: &[OpRef],
     ops: Vec<majit_ir::OpRc>,
 ) -> (Vec<InputArgRc>, Vec<majit_ir::OpRc>) {
-    let mut replacements: indexmap::IndexMap<OpRef, majit_ir::InputArgRc> =
-        indexmap::IndexMap::new();
+    let mut replacements: crate::FxIndexMap<OpRef, majit_ir::InputArgRc> =
+        crate::FxIndexMap::default();
     let inputargs = args
         .iter()
         .enumerate()
@@ -1915,7 +1959,7 @@ fn densify_root_loop_inputargs(
         .into_iter()
         .map(|op| {
             let args: majit_ir::resoperation::OpArgVec =
-                op.getarglist().iter().map(&remap).collect();
+                op.args_slice().iter().map(&remap).collect();
             let cloned = OpRc::new(op.copy_and_change(op.opcode, Some(&args), None));
             if let Some(failargs) = op.guard_fail_args() {
                 cloned.setfailargs(failargs.iter().map(&remap).collect());
@@ -2144,7 +2188,7 @@ fn compute_next_global_opref<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
         .map(|op| {
             let op = op.as_ref();
             let mut hw = opref_high_water(op.pos().get());
-            for a in op.getarglist().iter() {
+            for a in op.args_slice().iter() {
                 hw = hw.max(opref_high_water(a.to_opref()));
             }
             if let Some(fa) = op.guard_fail_args() {
@@ -2321,7 +2365,7 @@ pub struct MetaInterp<M: Clone> {
     /// Lets a bridge that closes on a merge point resolve the procedure token
     /// of the loop living AT that merge point (pyjitpl.py:3005), which the
     /// `u64` key alone cannot be inverted to.
-    pub(crate) loop_header_greens: indexmap::IndexMap<u64, (Vec<i64>, Vec<i64>, Vec<i64>)>,
+    pub(crate) loop_header_greens: crate::FxIndexMap<u64, (Vec<i64>, Vec<i64>, Vec<i64>)>,
     /// Keys whose compiled loop came from a cross-loop CUT (compile.py:269-270,
     /// `TraceCtx::cut_inner_green_key`), rather than from a loop closing at its
     /// own header.
@@ -2353,7 +2397,7 @@ pub struct MetaInterp<M: Clone> {
     /// so an entry that has not run the discarded prefix loads and stores out
     /// of bounds. Only the cutting trace's own closing JUMP arrives with those
     /// facts proven.
-    pub(crate) cut_compiled_keys: indexmap::IndexSet<u64>,
+    pub(crate) cut_compiled_keys: crate::FxIndexSet<u64>,
     /// The [`Self::cut_compiled_keys`] entry the running `compile_loop_body`
     /// recorded on the way in, kept so `compile_loop` can retire it when the
     /// body returns without installing a loop.
@@ -2608,7 +2652,7 @@ pub struct MetaInterp<M: Clone> {
     /// even when Phase 2 raises InvalidLoop. Indexed by `green_key`; entries
     /// are added on InvalidLoop and removed when the next retrace succeeds,
     /// so the active set is bounded by the count of in-flight retraces.
-    pending_preamble_tokens: indexmap::IndexMap<u64, Vec<crate::history::TargetToken>>,
+    pending_preamble_tokens: crate::FxIndexMap<u64, Vec<crate::history::TargetToken>>,
     // pyjitpl.py `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
     // Access via `self.staticdata.all_descrs()`.
@@ -2824,7 +2868,7 @@ pub struct MetaInterp<M: Clone> {
     /// Memoized symbolic names for boxes (debug/log output only).
     /// Pyre uses simple `OpRef → String` mapping; populated lazily by
     /// the on-demand log formatter.
-    pub box_names_memo: indexmap::IndexMap<OpRef, String>,
+    pub box_names_memo: crate::FxIndexMap<OpRef, String>,
 
     /// pyjitpl.py `self.trace_length_at_last_tco = -1`.
     ///
@@ -4121,7 +4165,8 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_fail_descr_layouts(token, trace_id)
         }) {
-            let mut merged: indexmap::IndexMap<u32, CompiledExitLayout> = indexmap::IndexMap::new();
+            let mut merged: crate::FxIndexMap<u32, CompiledExitLayout> =
+                crate::FxIndexMap::default();
             for layout in exit_layouts.drain(..) {
                 merged.insert(layout.fail_index, layout);
             }
@@ -4172,8 +4217,8 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_terminal_exit_layouts(token, trace_id)
         }) {
-            let mut merged: indexmap::IndexMap<usize, CompiledTerminalExitLayout> =
-                indexmap::IndexMap::new();
+            let mut merged: crate::FxIndexMap<usize, CompiledTerminalExitLayout> =
+                crate::FxIndexMap::default();
             for layout in terminal_exit_layouts.drain(..) {
                 merged.insert(layout.op_index, layout);
             }
@@ -4223,8 +4268,8 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops: crate::FxIndexMap::default(),
             compiled_loops_generation: 0,
             compiled_graph_minor_scan_pending: true,
-            loop_header_greens: indexmap::IndexMap::new(),
-            cut_compiled_keys: indexmap::IndexSet::new(),
+            loop_header_greens: crate::FxIndexMap::default(),
+            cut_compiled_keys: crate::FxIndexSet::default(),
             speculative_cut_owned_key: None,
             tracing: None,
             compile_tracing: None,
@@ -4271,7 +4316,7 @@ impl<M: Clone> MetaInterp<M> {
             cached_optimizer: None,
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
-            pending_preamble_tokens: indexmap::IndexMap::new(),
+            pending_preamble_tokens: crate::FxIndexMap::default(),
             pending_frontend_boxes: None,
             pending_frontend_box_types: None,
             cpu: crate::cpu::default_cpu(),
@@ -4298,7 +4343,7 @@ impl<M: Clone> MetaInterp<M> {
             class_of_last_exc_is_const: false,
             forced_virtualizable: 0,
             ovf_flag: false,
-            box_names_memo: indexmap::IndexMap::new(),
+            box_names_memo: crate::FxIndexMap::default(),
             trace_length_at_last_tco: -1,
             active_trace_session: None,
             bridge_info: None,
@@ -5984,8 +6029,8 @@ impl<M: Clone> MetaInterp<M> {
         //   self.staticdata.profiler.start_tracing()    # INNER open
         //   self.staticdata.try_to_free_some_loops()
         // `ensure_jitlog_initialised` is pyre's pre-`_setup_once` jitlog
-        // bootstrap; it has no PyPy analog (jitlog wiring runs inside
-        // `_setup_once` upstream) and stays idempotent.
+        // bootstrap; jitlog wiring runs inside `_setup_once` upstream, so
+        // it shares that one-shot `globaldata.initialized` gate.
         //
         // The debug section wraps `_setup_once` upstream so any
         // `debug_print` inside the one-shot bootstrap (vector-ext
@@ -5994,7 +6039,9 @@ impl<M: Clone> MetaInterp<M> {
         // the debug section *before* `_setup_once` and the profiler
         // event *after*, splitting the work that
         // [`enter_profiler_tracing`] would normally combine.
-        self.warm_state.ensure_jitlog_initialised();
+        if !self.staticdata.globaldata.lock().initialized {
+            self.warm_state.ensure_jitlog_initialised();
+        }
         // `_setup_once` contains unconditional asserts (vector_ext
         // setup, jitdriver registration sanity, etc.) — a failure
         // panics out of this function.  Use a dismissable RAII
@@ -6200,15 +6247,20 @@ impl<M: Clone> MetaInterp<M> {
             return BackEdgeAction::AlreadyTracing;
         }
 
-        // Force-start via the typed greenkey when the raw (code, pc) is
-        // present so the cell carries a `comparekey` like the back-edge
-        // path; synthetic (0, 0) call sites keep the legacy u64 path.
-        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            self.warm_state.force_start_tracing_for_key(key)
-        }) {
-            Some(h) => h,
-            None => self.warm_state.force_start_tracing(green_key),
-        };
+        // warmstate.py bound_reached: `cell = JitCell(*greenargs)`, so the
+        // cell carries a `comparekey`. The driver's own greens come first;
+        // without them the typed greenkey is rebuilt from the raw (code, pc),
+        // and synthetic (0, 0) call sites keep the legacy u64 path. A cell
+        // installed from the hash alone is one no typed lookup can match, so
+        // the next typed writer of the same greens mints a sibling and the
+        // two halves of one loop land on different cells.
+        let hot = match green_key_values.as_ref() {
+            Some(key) => Some(self.warm_state.force_start_tracing_for_key(key)),
+            None => Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                self.warm_state.force_start_tracing_for_key(key)
+            }),
+        }
+        .unwrap_or_else(|| self.warm_state.force_start_tracing(green_key));
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
@@ -6220,11 +6272,16 @@ impl<M: Clone> MetaInterp<M> {
                 // to `make_green_key(green_key_raw)`, which a minted cell key
                 // does not, so feeding a resolved key back in fails that
                 // assertion on exactly the chained-cell case this supports.
-                let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-                    self.warm_state.cell_key_for(key)
-                })
-                .flatten()
+                let green_key = match green_key_values.as_ref() {
+                    Some(key) => self.warm_state.cell_key_for(key),
+                    None => Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                        self.warm_state.cell_key_for(key)
+                    })
+                    .flatten(),
+                }
                 .unwrap_or(green_key);
+                // warmstate.py bound_reached: jitcounter.decay_all_counters()
+                self.warm_state.decay_counters();
                 self.prepare_trace_start_runtime();
                 self.setup_tracing(
                     green_key,
@@ -7591,14 +7648,14 @@ impl<M: Clone> MetaInterp<M> {
     pub fn finish_trace_for_parity(
         &mut self,
         finish_args: &[OpRef],
-    ) -> Option<(TreeLoop, indexmap::IndexMap<u32, i64>)> {
+    ) -> Option<(TreeLoop, crate::FxIndexMap<u32, i64>)> {
         self.force_finish_trace = false;
         self.compile_tracing = self.tracing.take();
         let _compile_tracing_guard = CompileTracingGuard::new(&mut self.compile_tracing);
         let ctx = self.compile_tracing.as_mut()?;
         let green_key = ctx.green_key;
         ctx.finish(finish_args, crate::make_fail_descr(finish_args.len()));
-        let constants = indexmap::IndexMap::new();
+        let constants = crate::FxIndexMap::default();
         let ctx = self.compile_tracing.take().unwrap();
         let trace = ctx.into_tree_loop();
         self.warm_state.abort_tracing(green_key, false);
@@ -8250,15 +8307,14 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
-        // resume.py ResumeDataLoopMemo.number reads encoded arrays directly.
-        // The materialized cut adapter still needs snapshots to remap their
-        // box namespace; an uncut trace can build the final maps immediately.
-        let byte_snapshot_maps = {
+        // resume.py ResumeDataLoopMemo.number walks `trace.get_snapshot_iter`
+        // for each guard that survives optimization. The materialized cut
+        // adapter still needs snapshots to remap their box namespace.
+        let number_from_recorder = {
             let ctx = self.compile_tracing.as_mut().unwrap();
-            (cross_loop_cut.is_none() && ctx.recorder.has_byte_buffer())
-                .then(|| snapshot_maps_from_ctx(ctx, &mut constants))
+            cross_loop_cut.is_none() && ctx.recorder.has_byte_buffer()
         };
-        let snapshots = if byte_snapshot_maps.is_some() {
+        let snapshots = if number_from_recorder {
             Vec::new()
         } else {
             self.compile_tracing.as_mut().unwrap().take_snapshots()
@@ -8283,8 +8339,14 @@ impl<M: Clone> MetaInterp<M> {
         let mut ctx = self.compile_tracing.take().unwrap();
         let mut recorder = ctx.recorder;
         // Only the materialized cut/legacy path needs TreeLoop snapshots.
-        // Uncut byte snapshots already live in the final maps above.
-        let mut trace = recorder.get_trace();
+        // An uncut byte trace keeps its recorder until optimize has numbered
+        // every guard; `snapshot_recorder` is not moved again, so the
+        // pointers the optimizers hold stay valid.
+        let (mut trace, snapshot_recorder) = if number_from_recorder {
+            (recorder.to_tree_loop(), Some(recorder))
+        } else {
+            (recorder.get_trace(), None)
+        };
         if !snapshots.is_empty() {
             trace.snapshots = snapshots;
         }
@@ -8351,8 +8413,8 @@ impl<M: Clone> MetaInterp<M> {
                 eprint!("{}", majit_ir::format_trace(trace_ops, &constants));
             } else {
                 eprintln!("  [trace too large for full dump, showing op counts]");
-                let mut counts: indexmap::IndexMap<majit_ir::OpCode, usize> =
-                    indexmap::IndexMap::new();
+                let mut counts: crate::FxIndexMap<majit_ir::OpCode, usize> =
+                    crate::FxIndexMap::default();
                 for op in trace_ops {
                     *counts.entry(op.opcode).or_insert(0) += 1;
                 }
@@ -8386,15 +8448,7 @@ impl<M: Clone> MetaInterp<M> {
             &trace.inputargs,
             &trace.ops,
         );
-        if crate::debug::have_debug_prints() {
-            let _s = crate::debug::scope("jit-log-noopt");
-            crate::debug::debug_print(&format!(
-                "# Traced loop or bridge with {num_ops_before} ops"
-            ));
-            for line in majit_ir::format_trace(&trace.ops, &constants).lines() {
-                crate::debug::debug_print(line);
-            }
-        }
+        crate::logger::log_loop_from_trace(&trace.ops, &constants);
 
         // PyPy: pyjitpl.py:3016-3017 gates unrolling on `unroll` in
         // warmstate.enable_opts. MAJIT_NO_UNROLL remains a diagnostic override.
@@ -8495,13 +8549,14 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             mut snapshot_frame_pcs,
-        ) = byte_snapshot_maps.unwrap_or_else(|| {
-            snapshot_map_from_trace_snapshots(
-                &trace_snapshots,
-                &mut constants,
-                preamble_data.base.inputargs(),
-            )
-        });
+        ) = snapshot_map_from_trace_snapshots(
+            &trace_snapshots,
+            &mut constants,
+            preamble_data.base.inputargs(),
+        );
+        unroll_opt.snapshot_recorder = snapshot_recorder
+            .as_ref()
+            .map(|recorder| recorder as *const crate::recorder::Trace);
         // history.py/261/307 — `Const{Int,Float,Ptr}.type` is an
         // intrinsic attribute on the Box itself, so no raw-u32 type
         // side-table propagation is needed; callers recover the type
@@ -8678,6 +8733,7 @@ impl<M: Clone> MetaInterp<M> {
                         // `Rc<Op>`), so producer lookup resolves identity.
                         simple_opt.explicit_input_ops_seed =
                             Some(preamble_data.base.operations().to_vec());
+                        simple_opt.trace_inputarg_boxes = trace.inputargs.clone();
                         // Consumed here and nowhere else, so the operations move
                         // into their `Rc`s instead of being copied into them.
                         // Unroll's TraceIterator allocates fresh operations
@@ -8685,6 +8741,10 @@ impl<M: Clone> MetaInterp<M> {
                         // are still the original trace.
                         let retry_ops: Vec<majit_ir::OpRc> =
                             preamble_data.base.operations().to_vec();
+                        simple_opt.byte_bridge_resume =
+                            snapshot_recorder.as_ref().map(|recorder| {
+                                recorder_self_feed(recorder, &trace.inputargs, &retry_ops)
+                            });
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.run_optimize_from_inputs(
@@ -8940,8 +9000,8 @@ impl<M: Clone> MetaInterp<M> {
                 (1.0 - compiled_ops.len() as f64 / num_ops_before as f64) * 100.0
             );
             if crate::diag_enabled() {
-                let mut counts: indexmap::IndexMap<majit_ir::OpCode, usize> =
-                    indexmap::IndexMap::new();
+                let mut counts: crate::FxIndexMap<majit_ir::OpCode, usize> =
+                    crate::FxIndexMap::default();
                 for op in &compiled_ops {
                     *counts.entry(op.opcode).or_insert(0) += 1;
                 }
@@ -8954,46 +9014,48 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        if crate::debug::have_debug_prints() {
+        {
             let _s = crate::debug::scope("jit-log-opt-loop");
-            crate::debug::debug_print(&format!(
-                "--- trace (after opt) --- [{} ops]",
-                compiled_ops.len()
-            ));
-            if compiled_ops.len() <= 10000 {
-                for line in majit_ir::format_trace(&compiled_ops, &constants).lines() {
-                    crate::debug::debug_print(line);
+            if crate::debug::have_debug_prints() {
+                crate::debug::debug_print(&format!(
+                    "--- trace (after opt) --- [{} ops]",
+                    compiled_ops.len()
+                ));
+                if compiled_ops.len() <= 10000 {
+                    for line in majit_ir::format_trace(&compiled_ops, &constants).lines() {
+                        crate::debug::debug_print(line);
+                    }
+                } else {
+                    // The pre-optimizer dump above answers the same truncation with an
+                    // op-count table. Answering it here with a bare notice instead
+                    // leaves a census over this log reading zero of every opcode it
+                    // looks for, which is indistinguishable from a trace that really
+                    // contains none.
+                    crate::debug::debug_print("[trace too large for full dump, showing op counts]");
+                    let mut counts: crate::FxIndexMap<majit_ir::OpCode, usize> =
+                        crate::FxIndexMap::default();
+                    for op in &compiled_ops {
+                        *counts.entry(op.opcode).or_insert(0) += 1;
+                    }
+                    let mut sorted: Vec<_> = counts.into_iter().collect();
+                    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                    for (opcode, count) in sorted.iter().take(15) {
+                        crate::debug::debug_print(&format!("  {opcode:?}: {count}"));
+                    }
                 }
-            } else {
-                // The pre-optimizer dump above answers the same truncation with an
-                // op-count table. Answering it here with a bare notice instead
-                // leaves a census over this log reading zero of every opcode it
-                // looks for, which is indistinguishable from a trace that really
-                // contains none.
-                crate::debug::debug_print("[trace too large for full dump, showing op counts]");
-                let mut counts: indexmap::IndexMap<majit_ir::OpCode, usize> =
-                    indexmap::IndexMap::new();
                 for op in &compiled_ops {
-                    *counts.entry(op.opcode).or_insert(0) += 1;
-                }
-                let mut sorted: Vec<_> = counts.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.cmp(&a.1));
-                for (opcode, count) in sorted.iter().take(15) {
-                    crate::debug::debug_print(&format!("  {opcode:?}: {count}"));
-                }
-            }
-            for op in &compiled_ops {
-                if op.opcode == majit_ir::OpCode::GuardNotInvalidated
-                    && let Some(fa) = op.guard_fail_args()
-                {
-                    let raw: Vec<String> = fa
-                        .iter()
-                        .map(|a| format!("OpRef::from_raw({})", a.to_opref().raw()))
-                        .collect();
-                    crate::debug::debug_print(&format!(
-                        "FINAL GuardNotInv fail_args=[{}]",
-                        raw.join(", ")
-                    ));
+                    if op.opcode == majit_ir::OpCode::GuardNotInvalidated
+                        && let Some(fa) = op.guard_fail_args()
+                    {
+                        let raw: Vec<String> = fa
+                            .iter()
+                            .map(|a| format!("OpRef::from_raw({})", a.to_opref().raw()))
+                            .collect();
+                        crate::debug::debug_print(&format!(
+                            "FINAL GuardNotInv fail_args=[{}]",
+                            raw.join(", ")
+                        ));
+                    }
                 }
             }
         }
@@ -9173,6 +9235,11 @@ impl<M: Clone> MetaInterp<M> {
         // entry contract is `start_state.renamed_inputargs`, body LABEL is
         // `loop_info.label_op`). `emit_op` still rewrites residual body
         // LABEL args that share Box identity with a stripped inputarg.
+        // compile.py send_loop_to_backend: forget_optimization_info on the
+        // operations and inputargs before the virtualizable reload rewrites
+        // them through `_forwarded`.
+        forget_optimization_info(&compiled_ops);
+        forget_optimization_info(&inputargs);
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut compiled_ops,
@@ -9210,8 +9277,6 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         let compile_start = Instant::now();
-        forget_optimization_info(&compiled_ops);
-        forget_optimization_info(&inputargs);
         // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE_OPT,
@@ -10580,11 +10645,13 @@ impl<M: Clone> MetaInterp<M> {
         let combined_ops =
             compile::normalize_closing_jump_args(combined_ops, &constants, final_num_inputs);
 
-        if crate::debug::have_debug_prints() {
+        {
             let _s = crate::debug::scope("jit-log-opt-bridge");
-            crate::debug::debug_print("--- retrace combined (after opt) ---");
-            for line in majit_ir::format_trace(&combined_ops, &constants).lines() {
-                crate::debug::debug_print(line);
+            if crate::debug::have_debug_prints() {
+                crate::debug::debug_print("--- retrace combined (after opt) ---");
+                for line in majit_ir::format_trace(&combined_ops, &constants).lines() {
+                    crate::debug::debug_print(line);
+                }
             }
         }
 
@@ -10667,6 +10734,11 @@ impl<M: Clone> MetaInterp<M> {
         // the heap object at entry.
         let mut inputargs = inputargs;
         let mut combined_ops = combined_ops;
+        // compile.py send_loop_to_backend: forget_optimization_info on the
+        // operations and inputargs before the virtualizable reload rewrites
+        // them through `_forwarded`.
+        forget_optimization_info(&combined_ops);
+        forget_optimization_info(&inputargs);
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut combined_ops,
@@ -10714,8 +10786,6 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
-        forget_optimization_info(&combined_ops);
-        forget_optimization_info(&inputargs);
         // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE_OPT,
@@ -11531,13 +11601,25 @@ impl<M: Clone> MetaInterp<M> {
         self.jitlog_start_new_trace(true, green_key, &jd_name);
         // resume.py ResumeDataLoopMemo.number consumes the encoded snapshot
         // arrays without a materialized intermediate. Taking the parked ctx
-        // ends walk_active_trace_refs coverage; compile_snapshot_refs roots
-        // the final maps below, before optimization can invoke the GC.
+        // ends walk_active_trace_refs coverage; the recorder's `_refs` stay
+        // rooted by their owner roots, and compile_snapshot_refs roots the
+        // list recorder's maps below, before optimization can invoke the GC.
         let mut ctx = self.compile_tracing.take().unwrap();
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
-        let snapshot_maps = snapshot_maps_from_ctx(&mut ctx, &mut constants);
+        let number_from_recorder = ctx.recorder.has_byte_buffer();
+        let snapshot_maps = if number_from_recorder {
+            Default::default()
+        } else {
+            snapshot_maps_from_ctx(&mut ctx, &mut constants)
+        };
         let recorder = ctx.recorder;
-        let trace = recorder.get_trace();
+        // `snapshot_recorder` stays put until the optimizer has numbered
+        // every guard; the feed holds a pointer to it.
+        let (trace, snapshot_recorder) = if number_from_recorder {
+            (recorder.to_tree_loop(), Some(recorder))
+        } else {
+            (recorder.get_trace(), None)
+        };
         let SimpleCompileViews {
             data: simple_data,
             trace_ops,
@@ -11591,6 +11673,10 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
+        optimizer.trace_inputarg_boxes = trace.inputargs.clone();
+        optimizer.byte_bridge_resume = snapshot_recorder
+            .as_ref()
+            .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
 
         // Dumped before the call, not after: `Optimizer::propagate_from_pass_range`
         // resolves each argument in place on the op it is handed
@@ -11605,15 +11691,16 @@ impl<M: Clone> MetaInterp<M> {
         // the process. Matches compile_loop.
         // compile.py SimpleCompileData.optimize_trace → MARK_TRACE + optimize_loop.
         let optimize_start = Instant::now();
-        let optimize_result = simple_data.optimize_trace(self.jitlog_trace_id, |_| {
-            optimizer.optimize_with_constants_and_inputs_oprc(
-                // `trace.ops` are the canonical `Rc<Op>`, so `input_ops`
-                // seeds identity directly from them.
-                &trace.ops,
-                &mut constants,
-                trace.inputargs.len(),
-            )
-        });
+        let optimize_result =
+            simple_data.optimize_trace(self.jitlog_trace_id, &mut constants, |_, constants| {
+                optimizer.optimize_with_constants_and_inputs_oprc(
+                    // `trace.ops` are the canonical `Rc<Op>`, so `input_ops`
+                    // seeds identity directly from them.
+                    &trace.ops,
+                    constants,
+                    trace.inputargs.len(),
+                )
+            });
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
             // A guard proven to always fail (deferred `InvalidLoop` signal):
@@ -11700,15 +11787,17 @@ impl<M: Clone> MetaInterp<M> {
         );
         // compile.py send_loop_to_backend(..., "entry bridge") →
         // logger.py log_loop(..., type="entry bridge").
-        if crate::debug::have_debug_prints() {
+        {
             let _s = crate::debug::scope("jit-log-opt-loop");
-            crate::debug::debug_print(&format!(
-                "# Loop {} : entry bridge with {} ops",
-                self.jitlog_trace_id,
-                optimized_ops.len()
-            ));
-            for line in majit_ir::format_trace(&optimized_ops, &constants).lines() {
-                crate::debug::debug_print(line);
+            if crate::debug::have_debug_prints() {
+                crate::debug::debug_print(&format!(
+                    "# Loop {} : entry bridge with {} ops",
+                    self.jitlog_trace_id,
+                    optimized_ops.len()
+                ));
+                for line in majit_ir::format_trace(&optimized_ops, &constants).lines() {
+                    crate::debug::debug_print(line);
+                }
             }
         }
 
@@ -11794,6 +11883,11 @@ impl<M: Clone> MetaInterp<M> {
         // virtualizable inputarg at trace-start (captured above via
         // `ctx.initial_inputarg_consts` + `ctx.constants.get_value`), i.e.
         // RPython's `orig_inpargs[idx].getref_base()`.
+        // compile.py send_loop_to_backend: forget_optimization_info on the
+        // operations and inputargs before the virtualizable reload rewrites
+        // them through `_forwarded`.
+        forget_optimization_info(&optimized_ops);
+        forget_optimization_info(&inputargs);
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut optimized_ops,
@@ -11817,8 +11911,6 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
-        forget_optimization_info(&optimized_ops);
-        forget_optimization_info(&inputargs);
         // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE_OPT,
@@ -12054,12 +12146,21 @@ impl<M: Clone> MetaInterp<M> {
             .call_pure_results
             .clone();
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
-        // resume.py ResumeDataLoopMemo.number reads byte arrays directly;
-        // keep only the final maps that the optimizer consumes and roots.
+        // resume.py ResumeDataLoopMemo.number walks the encoded snapshot
+        // of each surviving guard; only the list recorder needs maps.
         let mut ctx = self.compile_tracing.take().unwrap();
-        let snapshot_maps = snapshot_maps_from_ctx(&mut ctx, &mut constants);
+        let number_from_recorder = ctx.recorder.has_byte_buffer();
+        let snapshot_maps = if number_from_recorder {
+            Default::default()
+        } else {
+            snapshot_maps_from_ctx(&mut ctx, &mut constants)
+        };
         let recorder = ctx.recorder;
-        let trace = recorder.get_trace();
+        let (trace, snapshot_recorder) = if number_from_recorder {
+            (recorder.to_tree_loop(), Some(recorder))
+        } else {
+            (recorder.get_trace(), None)
+        };
         let SimpleCompileViews {
             data: simple_data,
             trace_ops,
@@ -12116,19 +12217,24 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
+        optimizer.trace_inputarg_boxes = trace.inputargs.clone();
+        optimizer.byte_bridge_resume = snapshot_recorder
+            .as_ref()
+            .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
 
         // compile.py SimpleCompileData.optimize_trace → MARK_TRACE + optimize_loop.
         // compile_simple_loop / _create_segmented_trace_and_blackhole do
         // not call start_new_trace; they reuse the caller's tid (or 0).
         let optimize_start = Instant::now();
-        let optimize_result = simple_data.optimize_trace(self.jitlog_trace_id, |_| {
-            optimizer.optimize_with_constants_and_inputs_oprc(
-                // Canonical `Rc<Op>`; `input_ops` seeds identity from them.
-                &trace.ops,
-                &mut constants,
-                num_trace_inputargs,
-            )
-        });
+        let optimize_result =
+            simple_data.optimize_trace(self.jitlog_trace_id, &mut constants, |_, constants| {
+                optimizer.optimize_with_constants_and_inputs_oprc(
+                    // Canonical `Rc<Op>`; `input_ops` seeds identity from them.
+                    &trace.ops,
+                    constants,
+                    num_trace_inputargs,
+                )
+            });
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
             // A guard proven to always fail (deferred `InvalidLoop` signal):
@@ -12254,6 +12360,11 @@ impl<M: Clone> MetaInterp<M> {
         // entry. Without this, the vable inputarg contract differs from
         // the unrolled loop path and guard-failure recovery cannot restore
         // the heap array slots.
+        // compile.py send_loop_to_backend: forget_optimization_info on the
+        // operations and inputargs before the virtualizable reload rewrites
+        // them through `_forwarded`.
+        forget_optimization_info(&compiled_ops);
+        forget_optimization_info(&inputargs);
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut compiled_ops,
@@ -12276,8 +12387,6 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
-        forget_optimization_info(&compiled_ops);
-        forget_optimization_info(&inputargs);
         // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE_OPT,
@@ -14192,7 +14301,7 @@ impl<M: Clone> MetaInterp<M> {
             }) {
                 return Some(
                     label
-                        .getarglist()
+                        .args_slice()
                         .iter()
                         .map(|arg| {
                             type_index
@@ -15467,18 +15576,21 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
             .collect();
+        optimizer.trace_inputarg_boxes = bridge_inputargs.to_vec();
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
         // decode (resume.py decode_box).
         let retrace_limit = self.warm_state.retrace_limit();
-        // compile.py compile_trace: log_trace(MARK_TRACE) before optimize_bridge.
+        // compile.py compile_trace → CompileData.optimize_trace:
+        // log_trace(MARK_TRACE) and logger_noopt before optimize_bridge.
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE,
             self.jitlog_trace_id,
             bridge_inputargs,
             bridge_ops,
         );
+        crate::logger::log_loop_from_trace(bridge_ops, &constants);
         let optimize_start = Instant::now();
         let mut retraced_count = retraced_count;
         let bridge_optimize_result = {
@@ -15571,6 +15683,11 @@ impl<M: Clone> MetaInterp<M> {
         // reds-only input contract as ordinary root loops.  Compiling the
         // optimizer's expanded input list directly makes execute_token pass
         // two red values to a loop expecting dozens of frame-field slots.
+        // compile.py send_loop_to_backend: forget_optimization_info on the
+        // operations and inputargs before the virtualizable reload rewrites
+        // them through `_forwarded`.
+        forget_optimization_info(&optimized_ops);
+        forget_optimization_info(&entry_inputargs);
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut entry_inputargs,
             &mut optimized_ops,
@@ -15601,15 +15718,17 @@ impl<M: Clone> MetaInterp<M> {
         }
         // compile.py send_loop_to_backend(..., "entry bridge") →
         // logger.py log_loop(..., type="entry bridge").
-        if crate::debug::have_debug_prints() {
+        {
             let _s = crate::debug::scope("jit-log-opt-loop");
-            crate::debug::debug_print(&format!(
-                "# Loop {} : entry bridge with {} ops",
-                self.jitlog_trace_id,
-                optimized_ops.len()
-            ));
-            for line in majit_ir::format_trace(&optimized_ops, &constants).lines() {
-                crate::debug::debug_print(line);
+            if crate::debug::have_debug_prints() {
+                crate::debug::debug_print(&format!(
+                    "# Loop {} : entry bridge with {} ops",
+                    self.jitlog_trace_id,
+                    optimized_ops.len()
+                ));
+                for line in majit_ir::format_trace(&optimized_ops, &constants).lines() {
+                    crate::debug::debug_print(line);
+                }
             }
         }
 
@@ -15644,8 +15763,6 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
-        forget_optimization_info(&optimized_ops);
-        forget_optimization_info(&entry_inputargs);
         // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE_OPT,
@@ -15861,13 +15978,12 @@ impl<M: Clone> MetaInterp<M> {
             .last()
             .map(std::borrow::Borrow::borrow)
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+            .map(|op| op.args_slice().iter().map(|a| a.to_opref()).collect())
             .unwrap_or_default();
         if jump_arg_oprefs.is_empty() {
             return jump_arg_oprefs;
         }
-        let mut concrete: std::collections::HashMap<OpRef, Value> =
-            std::collections::HashMap::new();
+        let mut concrete: rustc_hash::FxHashMap<OpRef, Value> = rustc_hash::FxHashMap::default();
         for ia in bridge_inputargs {
             if let Some(v) = ia.get_value() {
                 concrete.insert(OpRef::input_arg_typed(ia.index, ia.tp.get()), v);
@@ -16271,6 +16387,7 @@ impl<M: Clone> MetaInterp<M> {
         // `renamed_inputargs` OpRefs that carry their type intrinsically
         // (history.py:220 InputArg{Int,Ref,Float}.type Box parity).
         optimizer.trace_inputargs = bridge_inputarg_types;
+        optimizer.trace_inputarg_boxes = bridge_inputargs.to_vec();
 
         // RPython-orthodox: no source→bridge constant_types merge.
         // bridgeopt.py / unroll.py do not copy the source loop's constant
@@ -16341,10 +16458,10 @@ impl<M: Clone> MetaInterp<M> {
                 &enable_opts,
             );
             debug_assert_eq!(bridge_data.runtime_boxes, prepared_runtime_boxes.as_slice());
-            bridge_data.optimize_trace(self.jitlog_trace_id, |_| {
+            bridge_data.optimize_trace(self.jitlog_trace_id, &mut constants, |_, constants| {
                 optimizer.optimize_bridge(
                     bridge_ops,
-                    &mut constants,
+                    constants,
                     bridge_inputargs.len(),
                     front_target_tokens,
                     bridge_runtime_boxes,
@@ -16365,10 +16482,10 @@ impl<M: Clone> MetaInterp<M> {
             );
             // compile.py SimpleCompileData.optimize → Optimizer.optimize_loop
             simple_data
-                .optimize_trace(self.jitlog_trace_id, |_| {
+                .optimize_trace(self.jitlog_trace_id, &mut constants, |_, constants| {
                     optimizer.optimize_loop(
                         bridge_ops,
-                        &mut constants,
+                        constants,
                         bridge_inputargs.len(),
                         pending_bridge_rd,
                         bridge_inputarg_base,
@@ -21649,7 +21766,7 @@ pub struct MetaInterpStaticData {
     /// across the metainterp / trace / bridge pipelines (mirroring
     /// `all_descrs` above).
     pub dispatch_array_descr_cache:
-        parking_lot::Mutex<indexmap::IndexMap<DispatchArrayDescrKey, DescrRef>>,
+        parking_lot::Mutex<crate::FxIndexMap<DispatchArrayDescrKey, DescrRef>>,
     /// pyjitpl.py `self.profiler = ProfilerClass()` —
     /// `metainterp_sd.profiler` is the shared counter sink hit from
     /// every metainterp / optimizer / heapcache / tracer site
@@ -21683,13 +21800,13 @@ pub struct MetaInterpStaticData {
 #[derive(Debug, Default)]
 pub struct MetaInterpGlobalData {
     /// pyjitpl.py:2308-2318 `addr2name`: `fnaddr → name` for debugging.
-    pub addr2name: Option<indexmap::IndexMap<usize, String>>,
-    /// pyjitpl.py bytecode_for_address `indirectcall_dict`: `fnaddr → JitCode`.
+    pub addr2name: Option<crate::FxIndexMap<usize, String>>,
+    /// pyjitpl.py:2326-2343 `indirectcall_dict`: `fnaddr → JitCode`.
     /// Stores the current runtime-adapter `JitCode`; the helper that
     /// builds this dict is intentionally type-agnostic so canonical
     /// codewriter jitcodes can reuse the same semantics.
     pub indirectcall_dict:
-        Option<indexmap::IndexMap<usize, std::sync::Arc<crate::jitcode::JitCode>>>,
+        Option<crate::FxIndexMap<usize, std::sync::Arc<crate::jitcode::JitCode>>>,
     /// pyjitpl.py `initialized` — guards `_setup_once` so the
     /// runtime side-effects (profiler start, jitlog setup) fire once.
     pub initialized: bool,
@@ -21698,8 +21815,8 @@ pub struct MetaInterpGlobalData {
 fn build_indirectcall_dict<T>(
     targets: &[std::sync::Arc<T>],
     fnaddr_of: impl Fn(&T) -> usize,
-) -> indexmap::IndexMap<usize, std::sync::Arc<T>> {
-    let mut d: indexmap::IndexMap<usize, std::sync::Arc<T>> = indexmap::IndexMap::new();
+) -> crate::FxIndexMap<usize, std::sync::Arc<T>> {
+    let mut d: crate::FxIndexMap<usize, std::sync::Arc<T>> = crate::FxIndexMap::default();
     for jitcode in targets {
         let fnaddr = fnaddr_of(jitcode);
         debug_assert!(
@@ -21713,7 +21830,7 @@ fn build_indirectcall_dict<T>(
 
 fn bytecode_for_address_in_targets<T>(
     targets: &[std::sync::Arc<T>],
-    cache: &mut Option<indexmap::IndexMap<usize, std::sync::Arc<T>>>,
+    cache: &mut Option<crate::FxIndexMap<usize, std::sync::Arc<T>>>,
     fnaddress: usize,
     fnaddr_of: impl Fn(&T) -> usize,
 ) -> Option<std::sync::Arc<T>> {
@@ -21747,7 +21864,7 @@ fn unique_effect_info_snapshots(
 ) -> (Vec<majit_ir::EffectInfo>, Vec<DescrRef>) {
     let mut owned_eis = Vec::new();
     let mut writeback_descrs = Vec::new();
-    let mut seen_eis: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut seen_eis: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     for d in all_descrs {
         if let Some(cd) = d.as_call_descr() {
             let ei = cd.get_extra_info();
@@ -22505,9 +22622,10 @@ impl MetaInterpStaticData {
     ///         self.globaldata.initialized = True
     /// ```
     ///
-    /// Pyre owns the jitlog `Logger` on
+    /// The binary `rjitlog` writer is process-global, so its
+    /// `setup_once` runs here. Pyre owns the stats `Logger` on
     /// `WarmEnterState`, not on `MetaInterpStaticData` as PyPy does
-    /// on `self.jitlog`.  The PyPy `setup_once` step `self.jitlog
+    /// on `self.jitlog`.  That half of `self.jitlog
     /// .setup_once()` therefore cannot run from here — it would need
     /// a list of registered warmstates that pyre doesn't keep, and
     /// the per-warmstate `Option<Logger>` is initialised eagerly by
@@ -22575,6 +22693,7 @@ impl MetaInterpStaticData {
              before the first trace start (pyjitpl.py:2274-2281; \
              warmspot.py:1013-1017)"
         );
+        crate::rjitlog::setup_once();
         self.debug_print_jit_starting_line();
         backend.setup_once();
         backend.vector_ext_setup_once();
@@ -22609,7 +22728,7 @@ impl MetaInterpStaticData {
     pub fn get_name_from_address(&self, addr: usize) -> String {
         let mut gd = self.globaldata.lock();
         let dict = gd.addr2name.get_or_insert_with(|| {
-            let mut d: indexmap::IndexMap<usize, String> = indexmap::IndexMap::new();
+            let mut d: crate::FxIndexMap<usize, String> = crate::FxIndexMap::default();
             for (i, key) in self._addr2name_keys.iter().enumerate() {
                 if let Some(value) = self._addr2name_values.get(i) {
                     d.insert(*key, value.clone());
@@ -26751,7 +26870,7 @@ mod tests {
                 ops: Vec::new(),
                 constants: majit_ir::ConstMap::default(),
                 exit_layouts,
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
         let mut meta = MetaInterp::<()>::new(1);
@@ -26957,7 +27076,7 @@ mod tests {
         assert_eq!(prepared.ops[0].pos().get(), OpRef::ref_op(12));
         assert_eq!(
             prepared.ops[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -26966,7 +27085,7 @@ mod tests {
         assert_eq!(prepared.ops[1].pos().get(), OpRef::int_op(13));
         assert_eq!(
             prepared.ops[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -26974,7 +27093,7 @@ mod tests {
         );
         assert_eq!(
             prepared.ops[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -27097,7 +27216,7 @@ mod tests {
         );
         assert_eq!(
             prepared.ops[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -27167,7 +27286,7 @@ mod tests {
                 ops: ops.into_iter().map(OpRc::new).collect(),
                 constants,
                 exit_layouts: crate::FxIndexMap::default(),
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
         // `compile.py` — `send_loop_to_backend` registers the token
@@ -27238,7 +27357,7 @@ mod tests {
                 ops: ops.into_iter().map(OpRc::new).collect(),
                 constants,
                 exit_layouts: crate::FxIndexMap::default(),
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
         // `compile.py` — `send_loop_to_backend` registers the token
@@ -27562,7 +27681,7 @@ mod tests {
                 ops: vec![],
                 constants: majit_ir::ConstMap::default(),
                 exit_layouts,
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
 
@@ -27647,7 +27766,7 @@ mod tests {
                 ops: vec![],
                 constants: majit_ir::ConstMap::default(),
                 exit_layouts,
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
 
@@ -27733,7 +27852,7 @@ mod tests {
                 ops: vec![],
                 constants: majit_ir::ConstMap::default(),
                 exit_layouts,
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
 
@@ -29800,6 +29919,62 @@ mod tests {
         assert!(
             meta.warm_state.lookup_chain_with_key(&key).is_some(),
             "force-started cell must carry a typed comparekey"
+        );
+    }
+
+    #[test]
+    fn bound_reached_installs_the_cell_under_the_drivers_own_greens() {
+        // A driver with no `(code, pc)` pair hands its greens to
+        // `bound_reached`; the cell it installs must carry them as its
+        // `comparekey`, so a later typed writer of the same greens finds that
+        // cell instead of minting a sibling beside a comparator-less one.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let key = majit_ir::GreenKey::with_types(vec![18, 18, 1, 0, 0], vec![Type::Int; 5]);
+        let green_key = key.get_uhash();
+        meta.bound_reached(
+            green_key,
+            (0, 18),
+            Some(key.clone()),
+            None,
+            &[Value::Int(0)],
+        );
+        assert!(meta.tracing.is_some(), "bound_reached must start tracing");
+
+        assert_eq!(
+            meta.warm_state.cell_key_for(&key),
+            Some(green_key),
+            "the started cell must be the typed cell of these greens"
+        );
+        assert_eq!(
+            meta.warm_state.ensure_cell_key(&key),
+            green_key,
+            "a typed writer of the same greens must land on that cell"
+        );
+    }
+
+    #[test]
+    fn bound_reached_decays_every_counter_before_it_starts_tracing() {
+        // `warmstate.py bound_reached` runs `jitcounter.decay_all_counters()`
+        // before it starts the trace, so a guard that failed once before an
+        // unrelated loop began tracing needs a full `trace_eagerness` of
+        // failures again under `decay=1000`.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.set_trace_eagerness(2);
+        meta.warm_state.set_param_decay(1000);
+        let guard_hash = meta.warm_state.fetch_next_hash();
+        assert!(!meta.warm_state.tick_guard_failure(guard_hash));
+
+        let code: usize = 0x5400;
+        let pc: usize = 21;
+        let green_key = crate::green_key_from_code_ptr(code, pc);
+        meta.bound_reached(green_key, (code, pc), None, None, &[Value::Int(0)]);
+        assert!(meta.tracing.is_some(), "bound_reached must start tracing");
+
+        assert!(
+            !meta.warm_state.tick_guard_failure(guard_hash),
+            "the failure counted before the trace start must have decayed away"
         );
     }
 

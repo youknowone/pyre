@@ -103,6 +103,29 @@ pub fn dynasm_exec_diag_enabled() -> bool {
     *ENABLED
 }
 
+/// The trace id `MAJIT_TRACE_CALL_DIAG` selects, cached at first access.
+///
+/// Consulted once per guard recovery stub and once per call, so the uncached
+/// form took the environment lock for every guard the backend assembled.
+pub fn trace_call_diag_id() -> Option<u64> {
+    static ID: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+        std::env::var("MAJIT_TRACE_CALL_DIAG")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    });
+    *ID
+}
+
+/// The trace id `MAJIT_TRACE_OPS_DIAG` selects, cached at first access.
+pub fn trace_ops_diag_id() -> Option<u64> {
+    static ID: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+        std::env::var("MAJIT_TRACE_OPS_DIAG")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    });
+    *ID
+}
+
 static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 // Holds the pending exception's `typeptr` (an immortal static `PyType`), never a
 // managed object, so it is deliberately not GC-rooted.

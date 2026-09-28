@@ -2467,10 +2467,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             {
                 sym.__vable_identity = __vable_op;
                 sym.__vable_identity_value = __vable_val;
-                if std::env::var("MAJIT_BRIDGE_DEBUG").is_ok() {
+                if majit_metainterp::bridge_debug_enabled() {
                     eprintln!("  vable identity REBOUND to {:?}", __vable_op);
                 }
-            } else if std::env::var("MAJIT_BRIDGE_DEBUG").is_ok() {
+            } else if majit_metainterp::bridge_debug_enabled() {
                 eprintln!("  vable identity NOT REBOUND — no standard argbox");
             }
         }
@@ -2488,7 +2488,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     &mut __bridge_cache,
                     fail_values,
                 );
-                if std::env::var("MAJIT_BRIDGE_DEBUG").is_ok() {
+                if majit_metainterp::bridge_debug_enabled() {
                     eprintln!(
                         "[bridgeB] vable seed={} stream={}",
                         __seeded,
@@ -3481,7 +3481,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             ) {
                 use majit_ir::resumedata::RebuiltValue;
                 use majit_metainterp::JitCodeSym as _;
-                if std::env::var_os("MAJIT_BRIDGE_DIAG").is_some() {
+                if majit_metainterp::bridge_diag_enabled() {
                     eprintln!(
                         "[setup_bridge_sym] CALLED frames={} rd_virtuals={}",
                         resume_data.frames.len(),
@@ -3524,7 +3524,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     Some(f) => f,
                     None => return,
                 };
-                let __dbg = std::env::var("MAJIT_BRIDGE_DEBUG").is_ok();
+                let __dbg = majit_metainterp::bridge_debug_enabled();
                 // Clone so `ctx` is free for `const_int`/`const_ref` below.
                 let reg_indices = match ctx.bridge_reg_indices() {
                     Some(r) => r.clone(),

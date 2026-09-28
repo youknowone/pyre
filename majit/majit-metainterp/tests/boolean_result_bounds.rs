@@ -4,6 +4,17 @@ use majit_ir::{ConstMap, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 use majit_metainterp::optimizeopt::optimizer::Optimizer;
 use majit_metainterp::optimizeopt::{OptContext, Optimization, OptimizationResult, pure::OptPure};
 
+fn const_int(value: i64) -> Operand {
+    Operand::const_from_value(Value::Int(value))
+}
+
+/// An emitted int box standing in for the op whose result the pure cache
+/// records.
+fn emit_result_box(ctx: &mut OptContext) -> Operand {
+    let pos = ctx.emit(Op::new(OpCode::SameAsI, &[const_int(0)]));
+    ctx.get_box_replacement_operand_opt(pos).unwrap()
+}
+
 #[test]
 fn postponed_boolean_result_is_not_retested_for_truth() {
     for opcode in [OpCode::IntIsZero, OpCode::IntIsTrue] {
@@ -47,19 +58,16 @@ fn pure_lookup_keeps_forwarding_and_commutative_matching() {
     let alias_pos = ctx.emit(Op::new(OpCode::SameAsI, &[x.clone()]));
     let alias = ctx.get_box_replacement_operand_opt(alias_pos).unwrap();
     ctx.make_equal_to(&alias, &x);
-    let result = OpRef::int_op(2);
-    pure.pure_from_args2(
-        OpCode::IntAdd,
-        x.to_opref(),
-        OpRef::ConstInt(5),
-        result,
-        &mut ctx,
-    );
+    let result = emit_result_box(&mut ctx);
+    pure.pure_from_args2(OpCode::IntAdd, &x, &const_int(5), &result, &mut ctx);
     let query = Op::new(
         OpCode::IntAdd,
         &[Operand::const_from_value(Value::Int(5)), alias],
     );
-    assert_eq!(pure.get_pure_result(&query, &mut ctx), Some(result));
+    assert_eq!(
+        pure.get_pure_result(&query, &mut ctx).map(|r| r.to_opref()),
+        Some(result.to_opref())
+    );
     let different = Op::new(
         OpCode::IntAdd,
         &[Operand::const_from_value(Value::Int(6)), x],
@@ -81,17 +89,12 @@ fn unchecked_arithmetic_reuses_checked_arithmetic() {
             &[Operand::const_from_value(Value::Int(9))],
         ));
         let x = ctx.get_box_replacement_operand_opt(x_pos).unwrap();
-        pure.pure_from_args2(
-            checked,
-            x_pos,
-            OpRef::ConstInt(5),
-            OpRef::int_op(2),
-            &mut ctx,
-        );
-        let query = Op::new(plain, &[x, Operand::const_from_value(Value::Int(5))]);
+        let result = emit_result_box(&mut ctx);
+        pure.pure_from_args2(checked, &x, &const_int(5), &result, &mut ctx);
+        let query = Op::new(plain, &[x, const_int(5)]);
         assert_eq!(
-            pure.get_pure_result(&query, &mut ctx),
-            Some(OpRef::int_op(2))
+            pure.get_pure_result(&query, &mut ctx).map(|r| r.to_opref()),
+            Some(result.to_opref())
         );
     }
 }
@@ -110,7 +113,8 @@ fn checked_arithmetic_does_not_reuse_unchecked_arithmetic() {
             &[Operand::const_from_value(Value::Int(9))],
         ));
         let x = ctx.get_box_replacement_operand_opt(x_pos).unwrap();
-        pure.pure_from_args2(plain, x_pos, OpRef::ConstInt(5), OpRef::int_op(2), &mut ctx);
+        let result = emit_result_box(&mut ctx);
+        pure.pure_from_args2(plain, &x, &const_int(5), &result, &mut ctx);
         let checked = OpRc::new(Op::new(
             checked,
             &[x, Operand::const_from_value(Value::Int(5))],

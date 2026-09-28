@@ -83,8 +83,8 @@ impl Default for VirtualStatesCantMatch {
 pub(crate) struct GenerateGuardState<'a> {
     pub ctx: &'a mut OptContext,
     pub extra_guards: &'a mut Vec<GuardRequirement>,
-    pub renum: indexmap::IndexMap<i32, i32>,
-    pub bad: IndexSet<*const VirtualStateInfoNode>,
+    pub renum: crate::FxIndexMap<i32, i32>,
+    pub bad: crate::FxIndexSet<*const VirtualStateInfoNode>,
     pub force_boxes: bool,
 }
 
@@ -641,7 +641,7 @@ impl VirtualState {
     /// recursive nested Rcs participate in the dedup.
     pub fn count_forced_boxes_for_entry_static(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut indexmap::IndexMap<usize, OpRef>,
+        visited: &mut crate::FxIndexMap<usize, OpRef>,
     ) -> usize {
         // RPython virtualstate.py enum first-visit guard via
         // `position == -1` — every visited node is recorded so a later
@@ -668,7 +668,7 @@ impl VirtualState {
 
     fn count_forced_boxes_for_entry(
         info: &VirtualStateInfo,
-        visited: &mut indexmap::IndexMap<usize, OpRef>,
+        visited: &mut crate::FxIndexMap<usize, OpRef>,
     ) -> usize {
         match info {
             VirtualStateInfo::Constant(_) => 0,
@@ -706,7 +706,7 @@ impl VirtualState {
     /// `is_some()` check, leaking NONE into downstream lookups.
     fn count_forced_boxes_for_entry_rc(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut indexmap::IndexMap<usize, OpRef>,
+        visited: &mut crate::FxIndexMap<usize, OpRef>,
     ) -> usize {
         let key = Rc::as_ptr(rc) as usize;
         if visited.contains_key(&key) {
@@ -885,8 +885,11 @@ impl VirtualState {
         // Reverse iteration with an overwriting insert leaves the LOWEST
         // matching index in the map, which is what the first-match-wins scan
         // this replaces returned.
-        let mut index_by_resolved: std::collections::HashMap<OpRef, usize> =
-            std::collections::HashMap::with_capacity(concrete_refs.len());
+        let mut index_by_resolved: rustc_hash::FxHashMap<OpRef, usize> =
+            rustc_hash::FxHashMap::with_capacity_and_hasher(
+                concrete_refs.len(),
+                Default::default(),
+            );
         for (index, &candidate) in concrete_refs.iter().enumerate().rev() {
             if self.state[index].is_virtual() || candidate.is_constant() {
                 continue;
@@ -1137,12 +1140,9 @@ impl VirtualState {
                 //             else:
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
-                let resolved = ctx.get_replacement_opref(opref);
-                let forced = match ctx
-                    .get_box_replacement_operand_opt(opref)
-                    .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b))
-                {
+                let resolved_box = ctx.get_box_replacement_operand_opt(opref);
+                let resolved = resolved_box.as_ref().map(|b| b.to_opref()).unwrap_or(opref);
+                let forced = match resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                     // RPython: Virtualizable refs stay virtual across iterations.
                     Some(PtrInfo::Virtualizable(_)) => resolved,
                     Some(ptr_info) if ptr_info.is_virtual() => {
@@ -1163,7 +1163,12 @@ impl VirtualState {
                         // upstream owner switch.
                         let saved_pass_idx = ctx.current_pass_idx;
                         ctx.current_pass_idx = ctx.optearlyforce_idx;
-                        let forced = optimizer.force_box(resolved, ctx);
+                        let forced = optimizer.force_box(
+                            resolved_box
+                                .as_ref()
+                                .expect("virtual info lives on the box"),
+                            ctx,
+                        );
                         ctx.current_pass_idx = saved_pass_idx;
                         forced
                     }
@@ -1248,8 +1253,8 @@ impl VirtualState {
         let mut state = GenerateGuardState {
             ctx,
             extra_guards: &mut guards,
-            renum: indexmap::IndexMap::new(),
-            bad: IndexSet::new(),
+            renum: crate::FxIndexMap::default(),
+            bad: crate::FxIndexSet::default(),
             force_boxes: false,
         };
         // virtualstate.py:640-642 `for i in range(len(self.state)):
@@ -1337,8 +1342,8 @@ impl VirtualState {
         let mut state = GenerateGuardState {
             ctx,
             extra_guards: &mut guards,
-            renum: indexmap::IndexMap::new(),
-            bad: IndexSet::new(),
+            renum: crate::FxIndexMap::default(),
+            bad: crate::FxIndexSet::default(),
             force_boxes,
         };
         // virtualstate.py `GenerateGuardState.renum` and :84-94
@@ -2609,15 +2614,15 @@ pub(crate) struct ExportCache {
     // assert traps that as a bind-at-alloc gap rather than silently
     // mis-deduping. `IndexMap`/`IndexSet` are Vec-backed and compare by `Eq` only
     // (never hash), so no GC pointer is hashed here.
-    pub finished: indexmap::IndexMap<majit_ir::operand::Operand, Rc<VirtualStateInfoNode>>,
-    pub in_progress: indexmap::IndexSet<majit_ir::operand::Operand>,
+    pub finished: crate::FxIndexMap<majit_ir::operand::Operand, Rc<VirtualStateInfoNode>>,
+    pub in_progress: crate::FxIndexSet<majit_ir::operand::Operand>,
 }
 
 impl ExportCache {
     pub fn new() -> Self {
         Self {
-            finished: indexmap::IndexMap::new(),
-            in_progress: indexmap::IndexSet::new(),
+            finished: crate::FxIndexMap::default(),
+            in_progress: crate::FxIndexSet::default(),
         }
     }
 }

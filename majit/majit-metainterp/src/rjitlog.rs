@@ -88,14 +88,23 @@ pub fn jitlog_try_init_using_env() {
         return;
     }
     match File::create(&path) {
-        Ok(file) => {
-            state.file = Some(file);
-            // rjitlog.py JitLogger.setup_once: header before any trace.
-            let header = assemble_header();
-            write_marked(&mut state, MARK_JITLOG_HEADER, &header);
-        }
+        Ok(file) => state.file = Some(file),
         Err(err) => eprintln!("could not open '{}': {err}", path.to_string_lossy()),
     }
+}
+
+/// `rjitlog.py JitLogger.setup_once`, run from `_setup_once`.
+pub fn setup_once() {
+    if jitlog_enabled() {
+        return;
+    }
+    jitlog_try_init_using_env();
+    let mut state = lock();
+    if state.file.is_none() {
+        return;
+    }
+    let header = assemble_header();
+    write_marked(&mut state, MARK_JITLOG_HEADER, &header);
 }
 
 /// `rjitlog.py assemble_header`.
@@ -124,7 +133,6 @@ pub fn jitlog_enabled() -> bool {
 /// `descr_or_entry` is `compute_unique_id(faildescr)` for a bridge, or
 /// `int(entry_bridge)` for a loop.
 pub fn start_new_trace(is_bridge: bool, descr_or_entry: u64, jd_name: &str) -> u64 {
-    jitlog_try_init_using_env();
     let mut state = lock();
     state.trace_id += 1;
     let tid = state.trace_id;
@@ -167,7 +175,6 @@ pub fn install_backend_hooks() {
 /// `rjitlog.py redirect_assembler`.
 pub fn redirect_assembler(old_id: u64, new_id: u64, asm_adr: u64) {
     install_backend_hooks();
-    jitlog_try_init_using_env();
     let mut state = lock();
     if state.file.is_none() {
         return;
@@ -180,7 +187,6 @@ pub fn redirect_assembler(old_id: u64, new_id: u64, asm_adr: u64) {
 
 /// `rjitlog.py JitLogger.log_patch_guard`.
 pub fn log_patch_guard(descr_number: u64, addr: u64) {
-    jitlog_try_init_using_env();
     let mut state = lock();
     if state.file.is_none() {
         return;
@@ -192,7 +198,6 @@ pub fn log_patch_guard(descr_number: u64, addr: u64) {
 
 /// `rjitlog.py tmp_callback`.
 pub fn tmp_callback(token_id: u64, token_number: u64) {
-    jitlog_try_init_using_env();
     let mut state = lock();
     if state.file.is_none() {
         return;
@@ -227,7 +232,6 @@ where
     A: Borrow<InputArg>,
     O: Borrow<Op>,
 {
-    jitlog_try_init_using_env();
     let mut state = lock();
     if state.file.is_none() {
         return;

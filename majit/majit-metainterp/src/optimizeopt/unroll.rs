@@ -110,7 +110,7 @@ fn callee_rca_virtual_state_summary(
         prefix: String,
         node: &crate::optimizeopt::virtualstate::VirtualStateInfoNode,
         out: &mut Vec<String>,
-        seen: &mut IndexSet<usize>,
+        seen: &mut crate::FxIndexSet<usize>,
     ) {
         let key = node as *const _ as usize;
         let kind = match &node.info {
@@ -189,7 +189,7 @@ fn callee_rca_virtual_state_summary(
     }
 
     let mut out = Vec::new();
-    let mut seen = IndexSet::new();
+    let mut seen = crate::FxIndexSet::default();
     for (idx, node) in vs.state.iter().enumerate() {
         walk(format!("state[{idx}]"), node, &mut out, &mut seen);
     }
@@ -383,6 +383,11 @@ pub struct UnrollOptimizer {
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
+    /// `trace` in `optimize_preamble` / `optimize_peeled_loop`: the byte
+    /// recorder whose `get_snapshot_iter` numbers each surviving guard.
+    /// Each phase installs it over its own `TraceIterator._cache`.
+    /// The caller keeps the recorder alive across `optimize_trace*`.
+    pub(crate) snapshot_recorder: Option<*const crate::recorder::Trace>,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Threaded through inner Optimizer instances for inline registration.
     pub all_descrs: std::sync::Arc<Vec<majit_ir::descr::DescrRef>>,
@@ -607,6 +612,7 @@ impl UnrollOptimizer {
             snapshot_vable_boxes: Vec::new(),
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: SnapshotFramePcs::new(),
+            snapshot_recorder: None,
             all_descrs: std::sync::Arc::new(Vec::new()),
             quasi_immutable_deps: Vec::new(),
             trace_inputargs: Vec::new(),
@@ -999,6 +1005,14 @@ impl UnrollOptimizer {
                 p1_ops_in.push(op);
             }
             let p1_iter_fresh_hw = p1_iter._fresh;
+            opt_p1.trace_inputarg_boxes = p1_iter.inputargs.clone();
+            if let Some(recorder) = self.snapshot_recorder {
+                // SAFETY: the caller keeps the recorder alive across optimize.
+                opt_p1.byte_bridge_resume = Some(crate::recorder::ByteBridgeResume::from_recorder(
+                    unsafe { &*recorder },
+                    std::mem::take(&mut p1_iter._cache),
+                ));
+            }
             // compile.py `PreambleCompileData(trace, jumpargs, ...)` —
             // the recorded JUMP arglist is the preamble's `runtime_boxes`
             // (live_arg_boxes captured at the merge point). Capture it into a
@@ -1012,7 +1026,7 @@ impl UnrollOptimizer {
                 ops.iter()
                     .rfind(|op| op.opcode == OpCode::Jump)
                     .map(|op| {
-                        op.getarglist()
+                        op.args_slice()
                             .iter()
                             .map(|a| match a.get_value() {
                                 Some(value) if !matches!(value, Value::Void) => {
@@ -1059,23 +1073,6 @@ impl UnrollOptimizer {
                 &mut self.quasi_immutable_deps,
                 &opt_p1.quasi_immutable_deps,
             );
-            // RPython parity: Phase 1 optimizer may discover new constants
-            // via make_constant (e.g., constant-folded heap reads, guard
-            // class pointers). These live on the operand's forwarded chain
-            // (and in `ctx.const_pool` for const-namespace OpRefs) but
-            // not in `consts_p1` (which was only seeded from the input
-            // constants). Merge them back so
-            // build_short_preamble_from_exported_boxes can capture all
-            // constants referenced by short preamble ops.
-            if let Some(ref final_ctx) = opt_p1.final_ctx {
-                // history.py:220 box.type parity: every `Value` carries its
-                // Const class identity intrinsically; no companion type map
-                // needs threading alongside.
-                crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
-                    final_ctx,
-                    &mut consts_p1,
-                );
-            }
             let p1_ni = opt_p1.final_num_inputs();
 
             match opt_p1.exported_loop_state.take() {
@@ -1378,6 +1375,7 @@ impl UnrollOptimizer {
             p2_ops_in.push(op);
         }
         let p2_high_water = iter._fresh;
+        opt_p2.trace_inputarg_boxes = iter.inputargs.clone();
         let p2_cache = iter._cache;
         // opencoder.py `_get(self, i)` parity. `p2_cache[raw_pos]`
         // holds the fresh per-iteration box for every Phase 1 input/op
@@ -1457,6 +1455,13 @@ impl UnrollOptimizer {
             &mut opt_p2.snapshot_vable_boxes,
             &mut opt_p2.snapshot_vref_boxes,
         ]));
+        if let Some(recorder) = self.snapshot_recorder {
+            // SAFETY: the caller keeps the recorder alive across optimize.
+            opt_p2.byte_bridge_resume = Some(crate::recorder::ByteBridgeResume::from_recorder(
+                unsafe { &*recorder },
+                p2_cache,
+            ));
+        }
         // Phase 1's emitted ops are already in Phase 1's emitted
         // namespace `[num_inputs..next_global_opref)`. Phase 2 body may
         // reference these via `imported_label_args`. They are NOT in the
@@ -1521,17 +1526,6 @@ impl UnrollOptimizer {
         // disjoint Phase 2 inputarg OpRefs via the inputarg_base parameter.
         // Phase 2 inputarg OpRefs at [phase2_inputarg_base..+body_num_inputs)
         // flow directly into the assembly without translation.
-        // Phase 2 may discover new constants via make_constant (e.g., guard
-        // class pointers from collect_use_box_guards).
-        // Merge back into consts_p2 so the backend can resolve them.
-        if let Some(ref final_ctx) = opt_p2.final_ctx {
-            // history.py:220 box.type parity: every `Value` carries its
-            // Const class identity intrinsically.
-            crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
-                final_ctx,
-                &mut consts_p2,
-            );
-        }
         let body_terminal_op = opt_p2.terminal_op.clone();
         let p2_ni = opt_p2.final_num_inputs();
         self.all_descrs = std::mem::take(&mut opt_p2.all_descrs);
@@ -1638,12 +1632,12 @@ impl UnrollOptimizer {
         // trusting the stale copy.
         let body_jump_args: Vec<OpRef> = body_terminal_op
             .as_ref()
-            .map(|jump| jump.getarglist().iter().map(|a| a.to_opref()).collect())
+            .map(|jump| jump.args_slice().iter().map(|a| a.to_opref()).collect())
             .or_else(|| {
                 p2_ops
                     .iter()
                     .rfind(|op| op.opcode == OpCode::Jump)
-                    .map(|jump| jump.getarglist().iter().map(|a| a.to_opref()).collect())
+                    .map(|jump| jump.args_slice().iter().map(|a| a.to_opref()).collect())
             })
             .unwrap_or_default();
         let (imported_short_preamble_builder, rebuilt_imported_short_preamble) =
@@ -1655,12 +1649,12 @@ impl UnrollOptimizer {
                     //
                     // Route through `force_box_for_end_of_preamble` (the
                     // per-box type-gating wrapper) rather than the inner
-                    // dispatcher, matching optimizer.py.
-                    let resolved_jump_args: Vec<OpRef> = body_jump_args
+                    // dispatcher, matching optimizer.py:306-319.
+                    let resolved_jump_args: Vec<majit_ir::operand::Operand> = body_jump_args
                         .iter()
-                        .map(|&arg| final_ctx.get_replacement_opref(arg))
+                        .filter_map(|&arg| final_ctx.get_box_replacement_operand_opt(arg))
                         .collect();
-                    for &arg in &resolved_jump_args {
+                    for arg in &resolved_jump_args {
                         let _ = opt_p2.force_box_for_end_of_preamble(arg, &mut final_ctx);
                     }
                     let forced_jump_args: Vec<OpRef> = body_jump_args
@@ -1690,80 +1684,20 @@ impl UnrollOptimizer {
                         true,
                     ) {
                         for arg in args {
-                            if !arg.is_none() {
-                                let _ = opt_p2.force_box(arg, &mut final_ctx);
+                            if arg.is_none() {
+                                continue;
                             }
-                        }
-                    }
-                }
-                {
-                    let mut visited_force: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
-                    // `shortpreamble.py:250` keeps the produced short boxes in a
-                    // DICT and looks them up by box (`:284`, `:312`, `:338`,
-                    // `:347`). pyre held a list and rescanned it per argument,
-                    // and every probe called `get_replacement_opref`, which
-                    // walks the producer maps and then the forwarding chain --
-                    // so the scan is quadratic in the entry count with an
-                    // expensive comparison.
-                    //
-                    // A virtualizable array contributes one entry per DECLARED
-                    // element whether or not the loop reads it, so the
-                    // quadratic term is paid in the square of the declared
-                    // length: the one-time compile cost of the same machine
-                    // goes 0.20 ms at 8 slots to 364 ms at 1792.
-                    //
-                    // The scan asked for `resolved(source) == arg && source !=
-                    // arg`. Keying by `resolved(source)` makes `arg` the key,
-                    // and since the key IS `resolved(source)`, `source != arg`
-                    // is just `source != resolved(source)` -- decidable once,
-                    // here. `or_insert` keeps the FIRST entry per key, which is
-                    // what `find` returned.
-                    let mut produced_by_resolved = std::collections::HashMap::new();
-                    for (_, produced) in exported_short_boxes_produced.iter() {
-                        let source = produced.res.to_opref();
-                        let resolved_source = final_ctx.get_replacement_opref(source);
-                        if resolved_source == source {
-                            continue;
-                        }
-                        produced_by_resolved
-                            .entry(resolved_source)
-                            .or_insert(produced);
-                    }
-                    for op in p2_ops.iter() {
-                        if op.opcode == OpCode::Jump {
-                            continue;
-                        }
-                        let mut consider_arg = |arg: OpRef| {
-                            if !is_trace_runtime_ref(arg, &consts_p2)
-                                || visited_force.contains(&arg)
-                            {
-                                return;
-                            }
-                            visited_force.insert(arg);
-                            let resolved = final_ctx.get_replacement_opref(arg);
-                            let needs_force = final_ctx.potential_extra_ops.contains_key(&arg)
-                                || final_ctx.potential_extra_ops.contains_key(&resolved);
-                            if !needs_force
-                                && let Some(produced) = produced_by_resolved.get(&arg).copied()
-                            {
-                                let preamble_op = crate::optimizeopt::info::PreambleOp {
-                                    op: produced.res.clone(),
-                                    invented_name: produced.invented_name,
-                                    preamble_op: produced.preamble_op.clone(),
-                                    same_as_source: produced.same_as_source.clone(),
+                            let arg_box = if arg.is_constant() {
+                                Operand::from_opref(arg)
+                            } else {
+                                let Some(arg_box) = final_ctx.get_box_replacement_operand_opt(arg)
+                                else {
+                                    continue;
                                 };
-                                let source = final_ctx.force_op_from_preamble_op(&preamble_op);
-                                let _ = opt_p2.force_box(source, &mut final_ctx);
-                                return;
-                            }
-                            if needs_force {
-                                let _ = opt_p2.force_box(arg, &mut final_ctx);
-                            }
-                        };
-                        for a in op.getarglist().iter() {
-                            consider_arg(a.to_opref());
+                                arg_box
+                            };
+                            let _ = opt_p2.force_box(&arg_box, &mut final_ctx);
                         }
-                        op.visit_failarg_oprefs(&mut consider_arg);
                     }
                 }
                 let rebuilt = final_ctx.build_imported_short_preamble();
@@ -1790,8 +1724,7 @@ impl UnrollOptimizer {
         // Per-slot ORIGINAL box (what each renamed `short_inputargs[i]`
         // replaces), recovered from the produced `InputArg` short boxes via
         // `label_arg_idx` (shortpreamble.py:417 keys the info lookup by
-        // `produced_op.short_op.res`, the original). Shared by the two
-        // consumers below. Every label/virtual slot produces an InputArg
+        // `produced_op.short_op.res`, the original). Every label/virtual slot produces an InputArg
         // entry, except a duplicate slot (one box appears twice in
         // `label_args + virtuals`: the `potential_ops[box]` overwrite keys the
         // single entry at its LAST slot — shortpreamble.py:259, mirrored by
@@ -1835,37 +1768,6 @@ impl UnrollOptimizer {
             }
             initial_sp.inputarg_infos = infos;
         }
-        // shortpreamble.py:255-259 renamed-short_inputargs: in THIS import path
-        // the short-preamble Label is the renamed `short_inputargs`, so seed
-        // `phase1_inputargs` with the per-slot ORIGINALS (paired 1:1 with the
-        // renamed Label / jump_args) as the second inline-mapping leg — see the
-        // load-bearing analysis at the consuming site in inline_short_preamble.
-        // NOTE (measured): the originals seeded here are empirically INERT — post
-        // #217 produce_arg embeds the renamed boxes into the short ops, so no short
-        // op references an original (0 of the 176 corpus consumptions of the
-        // phase1 leg were original boxes; the load-bearing consumptions all come
-        // from the build_short_preamble_struct producer, whose phase1 holds the
-        // RENAMED boxes). The field cannot be dropped on that account because the
-        // OTHER producer is load-bearing; see the convergence note at the consumer.
-        // Dead duplicate / const-folded slots (`slot_to_original == None`) fall
-        // back to the renamed Label box, leaving phase1[i] == inputargs[i] there
-        // (no insert at the consumer). No-op when the Label already IS the
-        // originals (the two box sets coincide).
-        if initial_sp.phase1_inputargs.is_none() {
-            let phase1: Vec<OpRef> = initial_sp
-                .inputargs
-                .iter()
-                .enumerate()
-                .map(|(i, label)| slot_to_original[i].unwrap_or(*label))
-                .collect();
-            let differs = phase1
-                .iter()
-                .zip(initial_sp.inputargs.iter())
-                .any(|(orig, label)| orig != label);
-            if differs {
-                initial_sp.phase1_inputargs = Some(phase1);
-            }
-        }
         let opt_unroll = OptUnroll::new();
         let (target_token, short_preamble_producer) = opt_unroll.finalize_short_preamble(
             self.target_tokens.len() as u64,
@@ -1903,12 +1805,12 @@ impl UnrollOptimizer {
         let jump_was_redirected = {
             let body_jump_args: Vec<OpRef> = body_terminal_op
                 .as_ref()
-                .map(|jump| jump.getarglist().iter().map(|a| a.to_opref()).collect())
+                .map(|jump| jump.args_slice().iter().map(|a| a.to_opref()).collect())
                 .or_else(|| {
                     body_ops
                         .iter()
                         .rfind(|o| o.opcode == OpCode::Jump)
-                        .map(|j| j.getarglist().iter().map(|a| a.to_opref()).collect())
+                        .map(|j| j.args_slice().iter().map(|a| a.to_opref()).collect())
                 })
                 .unwrap_or_default();
             let mut current_label_args = label_args.clone();
@@ -1916,7 +1818,7 @@ impl UnrollOptimizer {
             // when two virtuals share the same OpRef. Allocate fresh
             // OpRefs for duplicates so the LABEL carries independent slots.
             {
-                let mut seen_used: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+                let mut seen_used: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
                 let mut next_fresh = current_label_args
                     .iter()
                     .copied()
@@ -2297,7 +2199,7 @@ impl UnrollOptimizer {
         // RPython Box parity: drop duplicate-position ops. In RPython
         // each Box is unique so collisions can't happen. Keep first.
         {
-            let mut seen: indexmap::IndexSet<u32> = indexmap::IndexSet::new();
+            let mut seen: crate::FxIndexSet<u32> = crate::FxIndexSet::default();
             combined.retain(|op| {
                 if op.pos().get().is_none() || op.result_type() == Type::Void {
                     return true;
@@ -2305,20 +2207,18 @@ impl UnrollOptimizer {
                 seen.insert(op.pos().get().raw())
             });
         }
-        crate::optimizeopt::optimizer::sanitize_backend_constants_for_ops(
-            combined.iter().map(|op| &**op),
-            &mut consts_p2,
-        );
-        if crate::debug::have_debug_prints() {
+        {
             let _s = crate::debug::scope("jit-log-opt-loop");
-            crate::debug::debug_print("--- peeled trace (assembled) ---");
-            for line in majit_ir::format_trace(&combined, &consts_p2).lines() {
-                crate::debug::debug_print(line);
+            if crate::debug::have_debug_prints() {
+                crate::debug::debug_print("--- peeled trace (assembled) ---");
+                for line in majit_ir::format_trace(&combined, &consts_p2).lines() {
+                    crate::debug::debug_print(line);
+                }
+                let mut sorted_consts: Vec<_> =
+                    consts_p2.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
+                sorted_consts.sort_by_key(|(k, _)| *k);
+                crate::debug::debug_print(&format!("consts_p2: {sorted_consts:?}"));
             }
-            let mut sorted_consts: Vec<_> =
-                consts_p2.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
-            sorted_consts.sort_by_key(|(k, _)| *k);
-            crate::debug::debug_print(&format!("consts_p2: {sorted_consts:?}"));
         }
         // A LABEL arg the fallthrough scan appended is carried by the loop but
         // not by the short preamble, so `inline_short_preamble` cannot rebuild
@@ -2385,7 +2285,7 @@ impl UnrollOptimizer {
     /// unroll.py: _map_args(mapping, arglist)
     /// Remap a list of OpRefs through a forwarding mapping.
     /// Constant OpRefs are left unchanged because they are not remapped.
-    pub fn map_args(mapping: &indexmap::IndexMap<OpRef, OpRef>, args: &[OpRef]) -> Vec<OpRef> {
+    pub fn map_args(mapping: &crate::FxIndexMap<OpRef, OpRef>, args: &[OpRef]) -> Vec<OpRef> {
         args.iter()
             .map(|&arg| mapping.get(&arg).copied().unwrap_or(arg))
             .collect()
@@ -2851,7 +2751,7 @@ impl ExportedState {
         };
         let visit_op = |op: &Op, visit: &mut dyn FnMut(OpRef)| {
             visit(op.pos().get());
-            for arg in op.getarglist().iter() {
+            for arg in op.args_slice().iter() {
                 visit(arg.to_opref());
             }
             if let Some(fail_args) = op.guard_fail_args() {
@@ -2914,11 +2814,6 @@ impl ExportedState {
                 .chain(short_preamble.jump_args.iter())
             {
                 visit(*r);
-            }
-            if let Some(phase1_inputargs) = &short_preamble.phase1_inputargs {
-                for r in phase1_inputargs {
-                    visit(*r);
-                }
             }
             for short_op in &short_preamble.ops {
                 visit_op(&short_op.op, &mut visit);
@@ -3133,8 +3028,8 @@ impl ExportedState {
             // Re-share slots that originally aliased: walk the snapshot
             // map and copy each group's first canonical Rc into every
             // peer slot, restoring the pre-GC `Rc::as_ptr` equivalences.
-            let mut canonical_by_old: indexmap::IndexMap<usize, Rc<VirtualStateInfoNode>> =
-                indexmap::IndexMap::new();
+            let mut canonical_by_old: crate::FxIndexMap<usize, Rc<VirtualStateInfoNode>> =
+                crate::FxIndexMap::default();
             for (slot_idx, &old_ptr) in original_ptrs.iter().enumerate() {
                 let entry = canonical_by_old.entry_or_insert_with(old_ptr, || {
                     Rc::clone(&self.virtual_state.state[slot_idx])
@@ -3287,7 +3182,7 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         exported_int_bounds: Option<
-            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
     ) -> ExportedState {
         // The preview's VS/inputarg evaluation, when it ran to completion.
@@ -3619,7 +3514,7 @@ impl OptUnroll {
         arg_box: &Operand,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
         infos: &mut indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
@@ -3673,7 +3568,7 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
         infos: &mut indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
@@ -3940,7 +3835,7 @@ impl OptUnroll {
                 for mut guard_op in emitted {
                     if crate::log_jtet_enabled() {
                         let arg_values: Vec<_> = guard_op
-                            .getarglist()
+                            .args_slice()
                             .iter()
                             .map(|arg| {
                                 let arg = arg.to_opref();
@@ -4232,10 +4127,10 @@ impl OptUnroll {
             "inline_short_preamble: short_preamble.constants must be empty in production — \
              history.py:227/268/314 inline-Const is the single source of truth; \
              a non-empty entry indicates a stale legacy producer that would never reach \
-             the backend (merge_backend_constants_from_ctx no longer exports ctx.const_pool)"
+             the backend (nothing exports ctx.const_pool)"
         );
 
-        let mut mapping: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
+        let mut mapping: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
 
         // unroll.py `assert len(short_inputargs) == len(jump_args)` —
         // the mapping below is positional, so a length mismatch misaligns
@@ -4292,87 +4187,8 @@ impl OptUnroll {
             }
         }
 
-        // Map the second short-inputarg domain that the `inputargs → jump_args`
-        // seeding above does NOT cover. pyre keeps disjoint Phase-1/Phase-2 box
-        // namespaces (the export serializes boxes to integer OpRef positions), so
-        // a short preamble has two inputarg domains — the ORIGINAL Phase-1 label
-        // boxes and the RENAMED short_inputargs (shortpreamble.py:256-259) — and
-        // `short_preamble.inputargs` carries only one of them. The two producers
-        // assign OPPOSITE domains:
-        //   - the import seeding (this file, the `slot_to_original` block above):
-        //     inputargs = renamed Label, phase1_inputargs = originals;
-        //   - build_short_preamble_struct (shortpreamble.rs `if inputargs !=
-        //     &short_inputargs`): inputargs = original label_args, phase1_inputargs
-        //     = renamed short_inputargs.
-        // In the second (Extended/active-builder) case the short ops reference the
-        // RENAMED boxes — produce_arg embedded them at export (#217) — which are
-        // NOT in `inputargs` (= originals there), so THIS leg is the sole mapper
-        // that resolves them to jump_args. Measured LOAD-BEARING: 176 consumptions
-        // across the check.py corpus on both backends, all GuardNonnullClass /
-        // Immutable GetfieldGc over ref inputargs (the redundant-guard / field-read
-        // elimination on loop-carried references). Dropping this leg routes those
-        // args to the None → InvalidLoop arm below — correct, but it loses the loop
-        // inlining for those traces. (The originals-domain seeding from the import
-        // path is, by contrast, empirically inert: 0 of the 176 consumptions were
-        // original boxes, because post-#217 no short op references an original.)
-        // Upstream needs no analog: its single Box namespace is stable across the
-        // boundary, so the renamed inputarg IS the object the short ops reference
-        // and unroll.py:393-396 seeds only short_inputargs → jump_args.
-        // CONVERGENCE (issue #217 "known blocker"): make
-        // build_short_preamble_struct build the Label from the RENAMED
-        // short_inputargs (matching the import-seeding convention, #217, and
-        // upstream); then `inputargs` covers the renamed short-op args directly and
-        // this leg plus the phase1_inputargs field can be removed.
-        if let Some(ref phase1) = short_preamble.phase1_inputargs {
-            for (i, phase1_inputarg) in phase1.iter().enumerate() {
-                let phase1_inputarg = *phase1_inputarg;
-                if let Some(&jump_arg) = jump_args.get(i)
-                    && !mapping.contains_key(&phase1_inputarg)
-                {
-                    mapping.insert(phase1_inputarg, jump_arg);
-                }
-            }
-        }
-        // When setup() activates an Extended builder, replay reads its live
-        // remapped ops below rather than `short_preamble.ops`. Those operands
-        // are in the builder's current Label domain, so seed that domain from
-        // the same positional jump args. RPython needs only the primary seed:
-        // its setup stores and replays the same Box objects without pyre's
-        // serialized-OpRef remap between the stored target and live builder.
-        if let Some(builder) = ctx.active_short_preamble_producer.as_ref() {
-            // The two lists legitimately differ in length, and the `zip` is
-            // load-bearing rather than sloppy: upstream binds by Box identity
-            // and never asks how many there are, while here the builder's
-            // Label domain and the body's jump args agree only on their
-            // common prefix — the trailing jump args carry positions this
-            // Label never took. Binding that prefix is the whole point.
-            // Requiring equal arities instead was measured to take
-            // `retrace_outer_loop_type_flip` back to the failure this seed
-            // exists to fix: `loops_aborted` 0 -> 2, `retraces_compiled`
-            // 1 -> 0, `guard_failures` 201 -> 590 on both backends.
-            for (&label_arg, &jump_arg) in builder.label_args().iter().zip(jump_args.iter()) {
-                mapping.entry(label_arg).or_insert(jump_arg);
-            }
-        }
-
-        // RPython keys `mapping` by Box identity: the seeding loops above bind
-        // each short-preamble INPUT box to its jump arg, and the replay loop
-        // below binds each short-op RESULT box (`mapping[sop] = op`). Those two
-        // key spaces never intersect — a Box is either an input or a produced
-        // result, never both. pyre's flat-OpRef namespace has no such guarantee:
-        // a re-virtualizing ALLOCATION short op (e.g. `NewWithVtable`) can be
-        // assigned a result position that equals a loop-input OpRef (the export
-        // aliases the virtual's materialization onto the label slot that carries
-        // it). If the replay's `mapping.insert(sp_op.pos, ...)` overwrote that
-        // seeded entry, every later short op that reads the input would resolve to
-        // the fresh, field-less allocation instead of the loop-carried box.
-        // Snapshot the seeded input keys so the replay can preserve them for
-        // allocation ops only (the `skip_insert` gate below tests
-        // `is_malloc() && seeded_input_keys.contains(..)`), restoring the RPython
-        // input-vs-result key disjointness. (A colliding non-allocation op is a
-        // real recomputation and must NOT be preserved: its fresh result IS the
-        // correct binding.)
-        let seeded_input_keys: indexmap::IndexSet<OpRef> = mapping.keys().copied().collect();
+        // unroll.py inline_short_preamble: the only seed is
+        // `mapping[short_inputargs[i]] = jump_args[i]`.
 
         let mut replay_index = 0;
 
@@ -4544,34 +4360,10 @@ impl OptUnroll {
                 }
                 let new_ref = ctx.alloc_op_position_typed(new_op.result_type());
                 new_op.pos().set(new_ref);
-                // unroll.py:412-414: mapping[sop] = op; i += 1; send_extra_operation(op)
-                // RPython sets mapping BEFORE send_extra_operation.
-                //
-                // RPython keys `mapping` by Box identity, and a short-op RESULT
-                // Box is never also a short-preamble INPUT Box, so `mapping[sop]
-                // = op` can never overwrite a seeded input → jump_arg entry. In
-                // pyre's flat-OpRef namespace a re-virtualizing ALLOCATION short op
-                // can be exported with a result position that equals a loop-input
-                // OpRef (the virtual's materialization aliases the label slot that
-                // already carries it). Overwriting the seed for such an op would
-                // make every later short op that reads the input resolve to this
-                // fresh, field-less allocation instead of the loop-carried box, so
-                // a `GetfieldGcI` over the aliased input reads an uninitialized
-                // field. Skip the insert ONLY for those allocation ops
-                // (`is_malloc`: New..Newunicode) to preserve the seed. A colliding
-                // NON-allocation op (a pure read/compute whose result pos happens
-                // to alias a seed, e.g. `GetfieldGcI` producing an Int loop
-                // slot) is a genuine recomputation whose fresh result IS the
-                // correct binding — skipping it would strand the slot on the seed's
-                // Ref box and feed a Ref into an Int consumer (getintbound_handle
-                // 'i'-typed assert). Keep the RPython input-vs-result key
-                // disjointness for the allocation case only; the redundant
-                // reconstruction op is left unmapped (dead) and elided by DCE.
-                let skip_insert =
-                    sp_op.opcode.is_malloc() && seeded_input_keys.contains(&sp_op.pos().get());
-                if !skip_insert {
-                    mapping.insert(sp_op.pos().get(), new_ref);
-                }
+                // unroll.py `inline_short_preamble`: mapping[sop] = op, then
+                // send_extra_operation(op). The mapping write happens before
+                // send_extra_operation.
+                mapping.insert(sp_op.pos().get(), new_ref);
                 replay_index += 1;
                 // unroll.py:414 lets send_extra_operation raise InvalidLoop.
                 // This function returns Vec (flag convention, as the arity /
@@ -4618,7 +4410,16 @@ impl OptUnroll {
                 }
                 // unroll.py:419-421
                 for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
-                    let _ = optimizer.force_box(arg, ctx);
+                    if arg.is_none() {
+                        continue;
+                    }
+                    let arg_box = if arg.is_constant() {
+                        Operand::from_opref(arg)
+                    } else {
+                        ctx.get_box_replacement_operand_opt(arg)
+                            .unwrap_or_else(|| Operand::bound_from_opref(arg))
+                    };
+                    let _ = optimizer.force_box(&arg_box, ctx);
                 }
                 // unroll.py:425-434: if short_jump_args did not grow we are
                 // done. If force_box grew it via add_preamble_op, only re-force
@@ -4874,17 +4675,14 @@ impl OptUnroll {
         // before `produce_op` runs; majit must allocate the result OpRef
         // with the typed allocator so `opref_type` resolution doesn't
         // depend on a downstream type-registration patch.
-        let mut result_map: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
+        let mut result_map: indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         for (source, produced) in &exported_state.short_boxes {
             let result_type = produced.preamble_op.result_type();
             let result = match produced.kind {
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
                 | crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant => {
-                    if let Some(slot) = produced.label_arg_idx {
-                        short_args.get(slot).copied()
-                    } else {
-                        Some(ctx.alloc_op_position_typed(result_type))
-                    }
+                    Some(ctx.alloc_op_position_typed(result_type))
                 }
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Heap => {
                     match produced.preamble_op.opcode {
@@ -4907,52 +4705,31 @@ impl OptUnroll {
                 // arms above) have no producer yet; mint their canonical
                 // `SameAs*` stand-in here so a later `get_box_replacement`
                 // resolves them instead of fabricating a position-only box.
-                // Slot-mapped results (`short_args[slot]`) are already bound
-                // inputargs and resolve without minting.
                 if ctx.get_box_replacement_operand_opt(result).is_none() {
                     ctx.mint_box_at(result);
                 }
                 result_map.insert(*source, result);
             }
         }
-        let mut imported_constants: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
         let from_short_boxes = ctx.initialize_imported_short_preamble_builder_from_short_boxes(
             &short_args,
             &exported_state.short_inputargs,
             &exported_state.short_boxes,
             &result_map,
-            &mut imported_constants,
             &exported_state.exported_infos,
         );
         debug_assert!(
             from_short_boxes,
             "initialize_imported_short_preamble_builder_from_short_boxes returned false: \
-             the short-preamble import path failed to handle some entry. \
-             This signals an unresolvable arg classification (Slot/Const/Produced)."
+             a loop-invariant function pointer was not a constant int"
         );
-        // unroll.py:501-502 line-by-line port:
+        // unroll.py `import_state`:
         //
         //   for produced_op in exported_state.short_boxes:
         //       produced_op.produce_op(self, exported_state.exported_infos)
-        //
-        // `produced_results` accumulates `source pos -> replay identity` so
-        // successor entries can resolve `Produced` arg classifications. After
-        // The producer-side `produce_*` methods return
-        // `Some(source)` (Phase 1 OpRef = `self.res`); for invented Pure the
-        // value is the body-visible OpRef per `replay_pos` in
-        // `initialize_imported_short_preamble_builder_from_short_boxes`.
-        let mut produced_results: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
         for (_, produced) in &exported_state.short_boxes {
-            let produced_result = produced.produce_op(
-                ctx,
-                optimizer,
-                &exported_state.exported_infos,
-                &exported_state.short_inputargs,
-                &short_args,
-                &result_map,
-                &mut produced_results,
-                &mut imported_constants,
-            );
+            let produced_result =
+                produced.produce_op(ctx, optimizer, &exported_state.exported_infos, &result_map);
             debug_assert!(
                 produced_result.is_some()
                     || matches!(
@@ -4986,16 +4763,8 @@ impl OptUnroll {
         // (unroll.py:33-36 never registers a const PreambleOp in
         // `potential_extra_ops`), so they are replayed here explicitly.
         for (_, produced) in &const_short_boxes {
-            let _ = produced.produce_op(
-                ctx,
-                optimizer,
-                &exported_state.exported_infos,
-                &exported_state.short_inputargs,
-                &short_args,
-                &result_map,
-                &mut produced_results,
-                &mut imported_constants,
-            );
+            let _ =
+                produced.produce_op(ctx, optimizer, &exported_state.exported_infos, &result_map);
         }
     }
 
@@ -5022,7 +4791,7 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{FloatConstInfo, OpInfo, PtrInfo};
@@ -5148,7 +4917,7 @@ pub(crate) fn export_state(
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
     exported_int_bounds: Option<
-        &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+        &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
     >,
 ) -> ExportedState {
     OptUnroll::new().export_state_with_bounds(
@@ -5392,7 +5161,7 @@ fn emit_alias_same_as_for_imports(
 /// never received.
 fn push_fallthrough_same_as(
     fallthrough_aliases: &mut Vec<Op>,
-    stream_defs: &indexmap::IndexSet<OpRef>,
+    stream_defs: &crate::FxIndexSet<OpRef>,
     arg: OpRef,
     constants: &majit_ir::ConstMap<majit_ir::Value>,
     ctx: &mut crate::optimizeopt::OptContext,
@@ -5570,8 +5339,8 @@ fn assemble_peeled_trace_with_jump_args(
     // typed variants from `inputarg_types` so this set's OpRefs match the
     // typed mints used at trace start / Phase 2 import under variant-aware
     // Eq.
-    let preamble_defs: indexmap::IndexSet<OpRef> = {
-        let mut s: indexmap::IndexSet<OpRef> = (0..body_num_inputs)
+    let preamble_defs: crate::FxIndexSet<OpRef> = {
+        let mut s: crate::FxIndexSet<OpRef> = (0..body_num_inputs)
             .map(|i| {
                 let pos = inputarg_base + i as u32;
                 // history.py:220 box.type / resoperation.py InputArgInt/727/739  allow-line-citation
@@ -5621,7 +5390,7 @@ fn assemble_peeled_trace_with_jump_args(
         if is_trace_runtime_ref(op.pos().get(), constants) {
             max_pos = max_pos.max(op.pos().get().raw().saturating_add(1));
         }
-        for arg in op.getarglist().iter() {
+        for arg in op.args_slice().iter() {
             if is_trace_runtime_ref(arg.to_opref(), constants) {
                 max_pos = max_pos.max(arg.to_opref().raw().saturating_add(1));
             }
@@ -5648,7 +5417,7 @@ fn assemble_peeled_trace_with_jump_args(
     // OpRef can be appended directly to full_label_args — the JUMP's
     // mapped_base_args path picks up the corresponding fresh value on the
     // next iteration. The filter only needs to skip filtered_extra_jump_args.
-    let mut carried_source_slots: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+    let mut carried_source_slots: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     // `label_set` tracks which OpRefs are already carried by the label so
     // that the body-use-before-def pass doesn't add the same OpRef twice
@@ -5658,7 +5427,7 @@ fn assemble_peeled_trace_with_jump_args(
     // is NOT the Issue 1 dedup — which drops distinct Boxes that happen
     // to share an OpRef — it is RPython parity: the same Box appears
     // once in the label arglist.
-    let mut label_set: indexmap::IndexSet<OpRef> = full_label_args.iter().copied().collect();
+    let mut label_set: crate::FxIndexSet<OpRef> = full_label_args.iter().copied().collect();
     let mut fallthrough_aliases = Vec::new();
     let remap_dsts: &[OpRef] = if emit_start_label {
         start_label_args
@@ -5670,14 +5439,14 @@ fn assemble_peeled_trace_with_jump_args(
     // args are destinations of that LABEL, not producers. Seeding them
     // here drops the fallthrough SameAs that binds a preamble box onto
     // a remapped LABEL slot.
-    let mut stream_defs: indexmap::IndexSet<OpRef> = if emit_start_label {
+    let mut stream_defs: crate::FxIndexSet<OpRef> = if emit_start_label {
         start_label_args
             .iter()
             .copied()
             .filter(|a| is_trace_runtime_ref(*a, constants))
             .collect()
     } else {
-        indexmap::IndexSet::new()
+        crate::FxIndexSet::default()
     };
     for op in &result {
         if !op.pos().get().is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void
@@ -5690,8 +5459,8 @@ fn assemble_peeled_trace_with_jump_args(
     // used to do this translation; assembly now owns it). A Phase-2
     // InputArg that is not rewritten here is appended as a LABEL live-in
     // with no producer (`InputArgRef(99)` with token inputs `[0, 1]`).
-    let mut phase2_input_remap: std::collections::HashMap<OpRef, OpRef> =
-        std::collections::HashMap::new();
+    let mut phase2_input_remap: rustc_hash::FxHashMap<OpRef, OpRef> =
+        rustc_hash::FxHashMap::default();
     if inputarg_base > 0 {
         for i in 0..body_num_inputs {
             let tp = ctx.inputarg_type_at_strict(i);
@@ -5706,7 +5475,7 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
     {
-        let mut seen_body_defs = indexmap::IndexSet::new();
+        let mut seen_body_defs = crate::FxIndexSet::default();
         for op in p2_ops {
             // compile.py assembles the loop LABEL from `label_op` plus
             // short-preamble `used_boxes`; the terminal JUMP's target-local
@@ -5752,7 +5521,7 @@ fn assemble_peeled_trace_with_jump_args(
                 appended_label_args.push(arg);
                 label_set.insert(arg);
             };
-            for a in op.getarglist().iter() {
+            for a in op.args_slice().iter() {
                 consider_arg(a.to_opref());
             }
             op.visit_failarg_oprefs(&mut consider_arg);
@@ -5856,15 +5625,15 @@ fn assemble_peeled_trace_with_jump_args(
     // Keyed lookup only (`get`/`insert`, never iterated — codegen order comes
     // from the `p2_ops` walk below), so a hash map keeps each per-op remap O(1)
     // instead of the IndexMap linear `get_index_of` scan on long peeled traces.
-    let mut body_result_remap: std::collections::HashMap<OpRef, OpRef> =
-        std::collections::HashMap::new();
-    let visible_before_label: indexmap::IndexSet<OpRef> = full_label_args
+    let mut body_result_remap: rustc_hash::FxHashMap<OpRef, OpRef> =
+        rustc_hash::FxHashMap::default();
+    let visible_before_label: crate::FxIndexSet<OpRef> = full_label_args
         .iter()
         .copied()
         .chain(preamble_defs.iter().copied())
         .collect();
 
-    let mut assembly_alias_remap: std::collections::HashMap<OpRef, OpRef> = phase2_input_remap;
+    let mut assembly_alias_remap: rustc_hash::FxHashMap<OpRef, OpRef> = phase2_input_remap;
     for (i, &source_slot) in filtered_extra_label_args.iter().enumerate() {
         if source_slot.is_none() {
             continue;
@@ -5901,21 +5670,21 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
-    let mut seen_body_defs = indexmap::IndexSet::new();
+    let mut seen_body_defs = crate::FxIndexSet::default();
     let mut current_inner_label_index: Option<usize> = None;
-    let mut defs_since_inner_label: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+    let mut defs_since_inner_label: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
     // Combined-trace position → emitted clone, so remap hits bind to the
     // body clone producer instead of re-minting a position-only box (SSA:
     // a remapped arg's target clone was pushed in an earlier iteration).
-    let mut emitted_at: std::collections::HashMap<OpRef, majit_ir::OpRc> =
-        std::collections::HashMap::new();
+    let mut emitted_at: rustc_hash::FxHashMap<OpRef, majit_ir::OpRc> =
+        rustc_hash::FxHashMap::default();
     for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = (**op).clone();
         // compile.py never snapshots every body's arglist. Only the Label
         // arm extends this vec; a Vec per p2 op was a 32 B malloc on
         // every getfield/setfield (regex and/or 0.15 class).
         let mut original_args: Vec<OpRef> = if op.opcode == OpCode::Label {
-            op.getarglist().iter().map(|a| a.to_opref()).collect()
+            op.args_slice().iter().map(|a| a.to_opref()).collect()
         } else {
             Vec::new()
         };
@@ -5928,10 +5697,10 @@ fn assemble_peeled_trace_with_jump_args(
         // installed Const forwarding after the guard was emitted, and PyPy keeps
         // the guard's original runtime argument.
         let remap_body_arg = |arg: OpRef,
-                              assembly_alias_remap: &std::collections::HashMap<OpRef, OpRef>,
-                              body_result_remap: &std::collections::HashMap<OpRef, OpRef>,
-                              seen_body_defs: &indexmap::IndexSet<OpRef>,
-                              visible_before_label: &indexmap::IndexSet<OpRef>|
+                              assembly_alias_remap: &rustc_hash::FxHashMap<OpRef, OpRef>,
+                              body_result_remap: &rustc_hash::FxHashMap<OpRef, OpRef>,
+                              seen_body_defs: &crate::FxIndexSet<OpRef>,
+                              visible_before_label: &crate::FxIndexSet<OpRef>|
          -> OpRef {
             if let Some(&mapped) = assembly_alias_remap.get(&arg) {
                 return mapped;
@@ -5973,10 +5742,10 @@ fn assemble_peeled_trace_with_jump_args(
             }
         }
         if new_op.opcode == OpCode::Label {
-            let mut seen_after_label_defs = indexmap::IndexSet::new();
+            let mut seen_after_label_defs = crate::FxIndexSet::default();
             let mut extra_inner_sources = Vec::new();
-            let mut extra_inner_set = indexmap::IndexSet::new();
-            let label_arg_set: indexmap::IndexSet<OpRef> = original_args
+            let mut extra_inner_set = crate::FxIndexSet::default();
+            let label_arg_set: crate::FxIndexSet<OpRef> = original_args
                 .iter()
                 .copied()
                 .filter(|arg| !arg.is_none())
@@ -6010,7 +5779,7 @@ fn assemble_peeled_trace_with_jump_args(
                         extra_inner_sources.push(arg);
                     }
                 };
-                for a in later_op.getarglist().iter() {
+                for a in later_op.args_slice().iter() {
                     consider_arg(a.to_opref());
                 }
                 later_op.visit_failarg_oprefs(&mut consider_arg);
@@ -6066,7 +5835,7 @@ fn assemble_peeled_trace_with_jump_args(
             // the trace inputarg slots OpRef(0)..OpRef(start_label_args.len());
             // remap those positional refs to start_label_args[i].
             let mapped_base_args: Vec<OpRef> = new_op
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|arg| {
                     let arg = arg.to_opref();
@@ -6095,7 +5864,7 @@ fn assemble_peeled_trace_with_jump_args(
                 .and_then(|label_idx| {
                     result
                         .get(label_idx)
-                        .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+                        .map(|op| op.args_slice().iter().map(|a| a.to_opref()).collect())
                 })
                 .unwrap_or_else(|| full_label_args.clone());
             let jump_target_descr_idx = new_op.getdescr().map(|descr| descr.index());
@@ -6196,7 +5965,7 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(label_idx) = current_inner_label_index {
             let mut extra_live_args = Vec::new();
             let label_args: smallvec::SmallVec<[OpRef; 3]> = result[label_idx]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect();
@@ -6216,13 +5985,13 @@ fn assemble_peeled_trace_with_jump_args(
                 }
                 extra_live_args.push(arg);
             };
-            for a in new_op.getarglist().iter() {
+            for a in new_op.args_slice().iter() {
                 consider_arg(a.to_opref());
             }
             new_op.visit_failarg_oprefs(&mut consider_arg);
             if !extra_live_args.is_empty() {
-                let existing: indexmap::IndexSet<OpRef> = result[label_idx]
-                    .getarglist()
+                let existing: crate::FxIndexSet<OpRef> = result[label_idx]
+                    .args_slice()
                     .iter()
                     .map(|a| a.to_opref())
                     .collect();
@@ -6273,7 +6042,7 @@ fn assemble_peeled_trace_with_jump_args(
                 (
                     idx,
                     op.pos().get(),
-                    op.getarglist()
+                    op.args_slice()
                         .iter()
                         .map(|a| a.to_opref())
                         .collect::<Vec<_>>(),
@@ -6288,7 +6057,7 @@ fn assemble_peeled_trace_with_jump_args(
                 (
                     idx,
                     op.pos().get(),
-                    op.getarglist()
+                    op.args_slice()
                         .iter()
                         .map(|a| a.to_opref())
                         .collect::<Vec<_>>(),
@@ -6392,7 +6161,7 @@ impl OptUnroll {
         &self,
         jump_op: &Op,
         ctx: &mut OptContext,
-    ) -> indexmap::IndexMap<OpRef, OpRef> {
+    ) -> crate::FxIndexMap<OpRef, OpRef> {
         // First pass: reserve peeled-iteration positions, tagged with each
         // source op's result type ( `OpRef.ty()`
         // matches RPython's `box.type` at allocation time).
@@ -6401,7 +6170,7 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut ref_map: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
+        let mut ref_map: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
             ref_map.insert(op.pos().get(), new_pos);
         }
@@ -6451,7 +6220,7 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut orig_ref_map: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
+        let mut orig_ref_map: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
             orig_ref_map.insert(op.pos().get(), new_pos);
         }
@@ -6508,7 +6277,7 @@ fn fresh_snapshot_key(ctx: &OptContext) -> i32 {
 
 fn remap_snapshot_boxes(
     boxes: &[SnapshotBox],
-    ref_map: &indexmap::IndexMap<OpRef, OpRef>,
+    ref_map: &crate::FxIndexMap<OpRef, OpRef>,
 ) -> crate::optimizeopt::SnapshotBoxList {
     boxes
         .iter()
@@ -6519,7 +6288,7 @@ fn remap_snapshot_boxes(
 fn clone_guard_snapshot_remapped(
     ctx: &mut OptContext,
     guard: &mut Op,
-    ref_map: &indexmap::IndexMap<OpRef, OpRef>,
+    ref_map: &crate::FxIndexMap<OpRef, OpRef>,
 ) {
     let old_pos = guard.rd_resume_position();
     if old_pos < 0 {
@@ -6839,7 +6608,7 @@ mod tests {
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(
             result[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -6889,7 +6658,7 @@ mod tests {
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(
             result[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -7027,7 +6796,6 @@ mod tests {
             }])),
             constants,
             inputarg_infos: vec![Some(PtrInfo::Constant(old))],
-            phase1_inputargs: Some(vec![old_ref]),
         });
         state.runtime_boxes.push(old_ref);
         state.patchguardop = Some(Op::new(
@@ -7079,7 +6847,6 @@ mod tests {
         assert_eq!(short.inputargs[0], new_ref);
         assert_eq!(short.used_boxes[0], new_ref);
         assert_eq!(short.jump_args[0], new_ref);
-        assert_eq!(short.phase1_inputargs.as_ref().unwrap()[0], new_ref);
         assert_eq!(short.constants.get(&0), Some(&majit_ir::Const::Ref(new)));
     }
 
@@ -7367,7 +7134,7 @@ mod tests {
         let jump_args = ops.last().unwrap().getarglist_copy();
         assert_eq!(
             label
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -7770,8 +7537,8 @@ mod tests {
         use crate::optimizeopt::intutils::IntBound;
 
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let mut exported_bounds: indexmap::IndexMap<majit_ir::operand::Operand, IntBound> =
-            indexmap::IndexMap::new();
+        let mut exported_bounds: crate::FxIndexMap<majit_ir::operand::Operand, IntBound> =
+            crate::FxIndexMap::default();
         // Bind the export-input position at its source (a forced end-arg is a
         // bound box in production); virtualstate.py create_state
         // receives real AbstractValues.
@@ -7965,8 +7732,11 @@ mod tests {
             preamble_op: dep_op,
             same_as_source: None,
         };
-        assert_eq!(ctx.force_op_from_preamble_op(&mask_pop), masked);
-        assert_eq!(ctx.force_op_from_preamble_op(&dep_pop), dependent);
+        assert_eq!(ctx.force_op_from_preamble_op(&mask_pop).to_opref(), masked);
+        assert_eq!(
+            ctx.force_op_from_preamble_op(&dep_pop).to_opref(),
+            dependent
+        );
 
         let target_vs = VirtualState::new(vec![VirtualStateInfo::IntBounded(IntBound::bounded(
             0, MASK,
@@ -8233,12 +8003,14 @@ mod tests {
         );
         let pop = pop.unwrap();
         assert_eq!(pop.op.to_opref(), OpRef::const_int(7));
-        // The const entries never reach `used_boxes`, so no short-preamble
-        // builder holds a replay for this one and `produce_heap_field` builds
-        // it from the resolved receiver: `classify_short_arg` maps the renamed
-        // `short_inputargs[0]` back through `short_args` to the imported label
-        // arg, which is what the replay must carry.
-        assert_eq!(pop.preamble_op.arg(0).to_opref(), label_args[0]);
+        // The const entries are not builder keys, so the replay is the
+        // exported `preamble_op` itself: its receiver is the renamed
+        // `short_inputargs[0]` that `produce_arg` returned at export, the box
+        // `inline_short_preamble` maps to the jump arg.
+        assert_eq!(
+            pop.preamble_op.arg(0).to_opref(),
+            exported.short_inputargs[0]
+        );
         drop(parent);
     }
 
@@ -8257,22 +8029,26 @@ mod tests {
         // the preview's `create_short_inputargs` mints two Int renames.
         let (short_inputargs, short_inputarg_refs) =
             mint_short_inputargs(&mut ctx, &[Type::Int, Type::Int]);
+        // `produce_pure` copies `res.bound_op()` args. That producer is the
+        // Phase-1 getfield, whose receiver is the const pointer.
+        let const_arg = Operand::from_opref(OpRef::const_ptr(ptr));
+        let getfield = {
+            let mut op = Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[const_arg.clone()],
+                field_descr.clone(),
+            );
+            op.pos().set(OpRef::int_op(11));
+            OpRc::new(op)
+        };
         publish_preview_short_state(
             &mut ctx,
             short_inputargs,
             short_inputarg_refs,
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
-                op: {
-                    let mut op = Op::with_descr(
-                        OpCode::GetfieldGcI,
-                        &[Operand::from_opref(OpRef::const_ptr(ptr))],
-                        field_descr.clone(),
-                    );
-                    op.pos().set(OpRef::int_op(11));
-                    OpRc::new(op)
-                },
+                op: getfield.clone(),
                 source_op: None,
-                res: rooted_resop_operand(Type::Int, 11),
+                res: Operand::from_bound_op(&getfield),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -8311,15 +8087,17 @@ mod tests {
         // directly.
         let fresh_const = OpRef::const_ptr(ptr);
         assert_eq!(ctx2.get_constant(fresh_const), Some(Value::Ref(ptr)));
+        // A Pure short box gets a fresh replay box (`alloc_op_position_typed`).
+        // `label_arg_idx` does not reuse `short_args[slot]`.
+        assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
+        let result = ctx2.imported_short_pure_ops[0].result;
+        assert_ne!(result, OpRef::int_op(11));
         let expected = crate::optimizeopt::ImportedShortPureOp::new(
             &mut ctx2,
             OpCode::GetfieldGcI,
             Some(field_descr.clone()),
-            vec![crate::optimizeopt::ImportedShortPureArg::Const(
-                Value::Ref(ptr),
-                fresh_const,
-            )],
-            OpRef::int_op(11),
+            vec![const_arg],
+            result,
             OpRef::int_op(11),
             false,
             None,
@@ -8342,18 +8120,20 @@ mod tests {
         // the preview's `create_short_inputargs` mints two Int renames.
         let (short_inputargs, short_inputarg_refs) =
             mint_short_inputargs(&mut ctx, &[Type::Int, Type::Int]);
+        let call = {
+            let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
+            op.pos().set(OpRef::int_op(11));
+            OpRc::new(op)
+        };
         publish_preview_short_state(
             &mut ctx,
             short_inputargs,
             short_inputarg_refs,
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
-                op: {
-                    let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
-                    op.pos().set(OpRef::int_op(11));
-                    OpRc::new(op)
-                },
+                // `LoopInvariantOp.produce_op` reads `self.res.getarg(0)`.
+                res: Operand::from_bound_op(&call),
+                op: call,
                 source_op: None,
-                res: rooted_resop_operand(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -8416,6 +8196,11 @@ mod tests {
         let source = OpRef::int_op(11);
         let source_box = rooted_resop_operand(Type::Int, 11);
         let phase2_result = OpRef::int_op(3);
+        let call = {
+            let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
+            op.pos().set(source);
+            OpRc::new(op)
+        };
         let exported = ExportedState::new(
             vec![source],
             vec![0],
@@ -8423,13 +8208,10 @@ mod tests {
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             indexmap::IndexMap::new(),
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
-                op: {
-                    let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
-                    op.pos().set(source);
-                    OpRc::new(op)
-                },
+                // `LoopInvariantOp.produce_op` reads `self.res.getarg(0)`.
+                res: Operand::from_bound_op(&call),
+                op: call,
                 source_op: None,
-                res: source_box.clone(),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(0),
                 invented_name: false,
@@ -8512,12 +8294,12 @@ mod tests {
             .produced_short_op(&src20)
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: rooted_resop_operand(Type::Int, 20),
+            op: src20.clone(),
             invented_name: produced.invented_name,
             same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
         };
-        let forced = ctx.force_op_from_preamble_op(&pop);
+        let forced = ctx.force_op_from_preamble_op(&pop).to_opref();
         assert_eq!(forced, OpRef::int_op(20));
 
         // RPython `unroll.py:32` `use_box` populates `self.short`.
@@ -8526,7 +8308,7 @@ mod tests {
         // RPython `unroll.py:34-37` seeds `potential_extra_ops` so a later
         // `force_box` will run `add_preamble_op` (shortpreamble.py).
         assert!(
-            ctx.has_potential_extra_op(OpRef::int_op(20)),
+            ctx.has_potential_extra_op(&src20),
             "force_op_from_preamble_op must seed potential_extra_ops"
         );
         // RPython parity: `force_op_from_preamble` does NOT call
@@ -8536,7 +8318,7 @@ mod tests {
         assert!(sp.jump_args.is_empty());
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let _ = optimizer.force_box(OpRef::int_op(20), &mut ctx);
+        let _ = optimizer.force_box(&src20, &mut ctx);
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         // After force_box: orthodox `add_preamble_op` (shortpreamble.py)
@@ -8544,7 +8326,7 @@ mod tests {
         assert_eq!(sp.used_boxes.clone(), vec![OpRef::int_op(20)]);
         assert_eq!(sp.jump_args.clone(), vec![OpRef::int_op(20)]);
         assert!(
-            !ctx.has_potential_extra_op(OpRef::int_op(20)),
+            !ctx.has_potential_extra_op(&src20),
             "force_box must consume the potential_extra_ops entry"
         );
     }
@@ -8608,7 +8390,7 @@ mod tests {
             same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
         };
-        let forced = ctx.force_op_from_preamble_op(&pop);
+        let forced = ctx.force_op_from_preamble_op(&pop).to_opref();
         // RPython `unroll.py UnrollOptimizer.force_op_from_preamble return preamble_op.op` ≡ self.res.
         // pyre's Phase 1 source IS self.res for the imported short box.
         assert_eq!(forced, OpRef::ref_op(19));
@@ -8622,23 +8404,24 @@ mod tests {
         // `force_op_from_preamble_op` keys potential_extra_ops by
         // preamble_op.op == short_op.res, the exact body-visible Box.
         assert!(
-            ctx.has_potential_extra_op(OpRef::ref_op(19)),
+            ctx.has_potential_extra_op(&b_src),
             "force_op_from_preamble_op must seed potential_extra_ops by the body-visible box"
         );
+        let slot14 = ctx.materialize_operand_at(OpRef::ref_op(14));
         assert!(
-            !ctx.has_potential_extra_op(OpRef::ref_op(14)),
+            !ctx.has_potential_extra_op(&slot14),
             "the unrelated replay/body slot must not carry the potential_extra_ops entry"
         );
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let _ = optimizer.force_box(forced, &mut ctx);
+        let _ = optimizer.force_box(&b_src, &mut ctx);
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         // shortpreamble.py:436 `op = preamble_op.op.get_box_replacement()`.
         assert_eq!(sp.used_boxes.clone(), vec![OpRef::ref_op(19)]);
         assert_eq!(sp.jump_args.clone(), vec![OpRef::ref_op(19)]);
         assert!(
-            !ctx.has_potential_extra_op(OpRef::ref_op(19)),
+            !ctx.has_potential_extra_op(&b_src),
             "force_box must consume the potential_extra_ops entry"
         );
     }
@@ -8721,16 +8504,18 @@ mod tests {
         let imported_result = ctx2.imported_short_pure_ops[0].result;
         assert_ne!(imported_result, OpRef::int_op(30));
         let pop = ctx2.imported_short_pure_ops[0].pop.clone();
-        let forced = ctx2.force_op_from_preamble_op(&pop);
+        let forced = ctx2.force_op_from_preamble_op(&pop).to_opref();
         // force_op_from_preamble may return the imported position (not necessarily 30)
-        let _ = forced;
         assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
         // RPython parity: extra_same_as is populated lazily by add_preamble_op
         // (called from optimizer.force_box's potential_extra_ops.pop path).
         // shortpreamble.py record the SameAs Box at use-box time, not
         // at produce_op time — verify the lazy population fires.
+        let forced_box = ctx2
+            .get_box_replacement_operand_opt(forced)
+            .unwrap_or_else(|| Operand::bound_from_opref(forced));
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let _ = optimizer.force_box(forced, &mut ctx2);
+        let _ = optimizer.force_box(&forced_box, &mut ctx2);
         let aliases = ctx2.used_imported_short_aliases();
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases[0].same_as_source.to_opref(), OpRef::int_op(14));
@@ -8840,7 +8625,7 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::SameAsI);
         assert_eq!(
             combined[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -8919,7 +8704,7 @@ mod tests {
         assert_eq!(combined[1].pos().get(), OpRef::int_op(50));
         assert_eq!(
             combined[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9050,7 +8835,7 @@ mod tests {
             .expect("assembled peel has a body LABEL");
         assert_eq!(
             label
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9117,7 +8902,7 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(
             combined[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9263,7 +9048,7 @@ mod tests {
         assert_eq!(combined[2].opcode, OpCode::Label);
         assert_eq!(
             combined[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9272,7 +9057,7 @@ mod tests {
         assert_eq!(combined[4].opcode, OpCode::Jump);
         assert_eq!(
             combined[4]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9343,7 +9128,7 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(
             combined[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9357,7 +9142,7 @@ mod tests {
         assert_eq!(combined[2].opcode, OpCode::GuardValue);
         assert_eq!(
             combined[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9366,7 +9151,7 @@ mod tests {
         assert_eq!(combined[3].opcode, OpCode::Jump);
         assert_eq!(
             combined[3]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9432,7 +9217,7 @@ mod tests {
         let extra_label_arg = label.arg(1);
         assert_eq!(
             label
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9442,7 +9227,7 @@ mod tests {
         assert_eq!(body_getfield.opcode, OpCode::GetfieldGcI);
         assert_eq!(
             body_getfield
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9495,7 +9280,7 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
             combined[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9504,7 +9289,7 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::GuardTrue);
         assert_eq!(
             combined[1]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9570,7 +9355,7 @@ mod tests {
         // The caller is responsible for constructing the preamble-shaped Jump.
         assert_eq!(
             combined[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9630,7 +9415,7 @@ mod tests {
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
-            jump.getarglist()
+            jump.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9693,7 +9478,7 @@ mod tests {
             .expect("body label");
         assert_eq!(
             body_label
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9703,7 +9488,7 @@ mod tests {
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
-            jump.getarglist()
+            jump.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9790,7 +9575,7 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
             combined[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9891,7 +9676,7 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
             combined[0]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9902,7 +9687,7 @@ mod tests {
         assert_eq!(combined[2].opcode, OpCode::Jump);
         assert_eq!(
             combined[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -9962,7 +9747,7 @@ mod tests {
             .iter()
             .find(|op| op.opcode == OpCode::Label)
             .expect("assembled loop LABEL");
-        let label_args: Vec<OpRef> = label.getarglist().iter().map(|a| a.to_opref()).collect();
+        let label_args: Vec<OpRef> = label.args_slice().iter().map(|a| a.to_opref()).collect();
         assert!(
             !label_args
                 .iter()
@@ -9973,7 +9758,7 @@ mod tests {
             .iter()
             .find(|op| op.opcode == OpCode::Jump)
             .expect("assembled JUMP");
-        let jump_args: Vec<OpRef> = jump.getarglist().iter().map(|a| a.to_opref()).collect();
+        let jump_args: Vec<OpRef> = jump.args_slice().iter().map(|a| a.to_opref()).collect();
         assert_eq!(jump_args, start.to_vec());
     }
 
@@ -10103,7 +9888,7 @@ mod tests {
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
-            jump.getarglist()
+            jump.args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -10152,7 +9937,7 @@ mod tests {
         assert_eq!(spliced[2].opcode, OpCode::Jump);
         assert_eq!(
             spliced[2]
-                .getarglist()
+                .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
@@ -10395,7 +10180,7 @@ mod tests {
         ));
         let i0 = OpRef::input_arg_int(0);
         let mut sb = ShortBoxes::with_label_args(&[i0]);
-        sb.add_pure_op(&mut ctx, call);
+        sb.add_pure_op(&mut ctx, &OpRc::new(call));
         let short_boxes = sb.create_short_boxes(&mut ctx, &[i0], &[Type::Int]);
         let pure = short_boxes
             .iter()

@@ -439,11 +439,14 @@ pub struct HeapCache {
 
     /// heapcache.py: oldbox.set_replaced_with_const() in replace_box().
     ///
-    /// RPython stores this on the box's `_forwarded`.  Pyre's `OpRef`
-    /// carries both a position and a typed Box identity, so the key must be
-    /// the full `OpRef`, not just `raw()`: `IntOp(n)` and `RefOp(n)` are
-    /// different boxes upstream.
-    replaced_with_const: Vec<(OpRef, OpRef)>,
+    /// RPython sets `FO_REPLACED_WITH_CONST` in the FrontendOp's
+    /// `position_and_flags` and recovers the constant with
+    /// `constant_from_op(box)`. Pyre keeps the per-box slot indexed by
+    /// `OpRef.raw()`, like `heapc_flags`, holding the constant. `OpRef` also
+    /// carries a typed Box identity (`IntOp(n)` and `RefOp(n)` are different
+    /// boxes upstream), and the constant has its box's type, so a read only
+    /// answers a box of the same type.
+    replaced_with_const: Vec<Option<OpRef>>,
 
     /// heapcache.py: need_guard_not_invalidated — set True on reset,
     /// consumed by quasi-immut field recording to decide whether to emit
@@ -485,11 +488,10 @@ impl HeapCache {
         if opref.is_constant() {
             return opref;
         }
-        self.replaced_with_const
-            .iter()
-            .rev()
-            .find_map(|(old, new)| if *old == opref { Some(*new) } else { None })
-            .unwrap_or(opref)
+        match self.replaced_with_const.get(opref.raw() as usize) {
+            Some(Some(new)) if new.ty() == opref.ty() => *new,
+            _ => opref,
+        }
     }
 
     fn flags_for_ref(&self, opref: OpRef) -> u32 {
@@ -1043,15 +1045,11 @@ impl HeapCache {
     ///
     pub fn replace_box(&mut self, old: OpRef, new: OpRef) {
         if !old.is_constant() && new.is_constant() {
-            if let Some((_, existing)) = self
-                .replaced_with_const
-                .iter_mut()
-                .find(|(existing_old, _)| *existing_old == old)
-            {
-                *existing = new;
-            } else {
-                self.replaced_with_const.push((old, new));
+            let i = old.raw() as usize;
+            if i >= self.replaced_with_const.len() {
+                self.replaced_with_const.resize(i + 1, None);
             }
+            self.replaced_with_const[i] = Some(new);
         }
     }
 
@@ -1161,7 +1159,7 @@ impl HeapCache {
         if let Some(slot) = self.loopinvariant_result.as_mut() {
             forward(slot, visitor);
         }
-        for (_, slot) in self.replaced_with_const.iter_mut() {
+        for slot in self.replaced_with_const.iter_mut().flatten() {
             forward(slot, visitor);
         }
         for deps in self.heapc_deps.iter_mut().flatten() {
@@ -2209,7 +2207,7 @@ impl HeapCache {
         // history.py FO_REPLACED_WITH_CONST is stored on the
         // FrontendOp's `position_and_flags` field, so RPython's flag
         // dies with the FrontendOp at trace teardown.  pyre's
-        // `replaced_with_const` is keyed by the full OpRef identity and OpRef
+        // `replaced_with_const` is indexed by OpRef position and OpRef
         // numbers are reused across traces, so clear it at the same trace
         // boundary that drops the FrontendOp objects in upstream.
         self.replaced_with_const.clear();

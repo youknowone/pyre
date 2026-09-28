@@ -334,9 +334,7 @@ fn untag_snapshot_pools(
     inputargs: &[InputArgRc],
     slots: &[FrontendSlot],
     box_to_unique: &[u32],
-    refs: &[u64],
-    floats: &[u64],
-    bigints: &[i64],
+    trb: &TraceRecordBuffer,
     tagged: i64,
 ) -> SnapshotTagged {
     use crate::opencoder::{TAG_MASK, TAG_SHIFT, TAGBOX, TAGCONSTOTHER, TAGCONSTPTR, TAGINT};
@@ -349,13 +347,13 @@ fn untag_snapshot_pools(
             SnapshotTagged::Box(opref, opref.ty().unwrap_or(Type::Int))
         }
         TAGINT => SnapshotTagged::Const(v, Type::Int),
-        TAGCONSTPTR => SnapshotTagged::Const(refs[v as usize] as i64, Type::Ref),
+        TAGCONSTPTR => SnapshotTagged::Const(trb.current_ref(v as usize) as i64, Type::Ref),
         TAGCONSTOTHER => {
             let pool_idx = (v >> 1) as usize;
             if v & 1 != 0 {
-                SnapshotTagged::Const(floats[pool_idx] as i64, Type::Float)
+                SnapshotTagged::Const(trb._floats[pool_idx] as i64, Type::Float)
             } else {
-                SnapshotTagged::Const(bigints[pool_idx], Type::Int)
+                SnapshotTagged::Const(trb._bigints[pool_idx], Type::Int)
             }
         }
         other => panic!("decode snapshot: unknown tag {other}"),
@@ -363,27 +361,23 @@ fn untag_snapshot_pools(
 }
 
 /// Untag one snapshot word and rewrite it into the prepare cache's namespace.
-fn snapshot_box_from_tagged(
+fn snapshot_box_from_tagged<'c>(
     tagged: i64,
     inputargs: &[InputArgRc],
     slots: &[FrontendSlot],
     box_to_unique: &[u32],
-    refs: &[u64],
-    floats: &[u64],
-    bigints: &[i64],
-    unique_cache: &[Option<Operand>],
-) -> crate::resume::SnapshotBox {
-    let decoded = untag_snapshot_pools(
-        inputargs,
-        slots,
-        box_to_unique,
-        refs,
-        floats,
-        bigints,
-        tagged,
-    );
+    trb: &TraceRecordBuffer,
+    unique_cache: &'c [Option<Operand>],
+) -> (crate::resume::SnapshotBox, Option<&'c Operand>) {
+    let decoded = untag_snapshot_pools(inputargs, slots, box_to_unique, trb, tagged);
     let snap_box = crate::pyjitpl::snapshot_tagged_to_box(&decoded, inputargs);
-    snap_box.map_opref(|opref| crate::pyjitpl::translate_trace_iter_opref(opref, unique_cache))
+    // opencoder.py `SnapshotIterator._untag` returns `_cache[i]`, the box
+    // object itself.
+    let cached = crate::pyjitpl::trace_iter_cached_box(snap_box.opref(), unique_cache);
+    (
+        snap_box.map_opref(|opref| crate::pyjitpl::translate_trace_iter_opref(opref, unique_cache)),
+        cached,
+    )
 }
 
 /// One byte-mode bridge's resume source.
@@ -409,6 +403,18 @@ impl ByteBridgeResume {
             box_to_unique: recorder.box_to_unique_map(),
             unique_cache,
         }
+    }
+
+    /// Highest position a numbered snapshot box can resolve to: every
+    /// TAGBOX goes through `unique_cache`.
+    pub(crate) fn max_box_position(&self) -> Option<u32> {
+        self.unique_cache
+            .iter()
+            .flatten()
+            .map(|operand| operand.to_opref())
+            .filter(|opref| !opref.is_none() && !opref.is_constant())
+            .map(|opref| opref.raw())
+            .max()
     }
 
     pub(crate) fn contains(&self, resume_pos: i32) -> bool {
@@ -606,15 +612,7 @@ impl Trace {
 
     pub(crate) fn untag_snapshot(&self, tagged: i64, box_to_unique: &[u32]) -> SnapshotTagged {
         let trb = self.trb.as_ref().expect("untag_snapshot requires TRB");
-        untag_snapshot_pools(
-            &self.inputargs,
-            &self.slots,
-            box_to_unique,
-            &trb._refs,
-            &trb._floats,
-            &trb._bigints,
-            tagged,
-        )
+        untag_snapshot_pools(&self.inputargs, &self.slots, box_to_unique, trb, tagged)
     }
 
     /// `ResumeDataLoopMemo.number` for one captured snapshot.
@@ -646,9 +644,6 @@ impl Trace {
             .as_ref()
             .expect("number_byte_snapshot requires TraceRecordBuffer");
         let it = SnapshotIterator::new(&trb._snapshot_data, &trb._snapshot_array_data, offset);
-        let refs = trb._refs.as_slice();
-        let floats = trb._floats.as_slice();
-        let bigints = trb._bigints.as_slice();
 
         let vable_len = it.iter_vable_array().total_length;
         let vref_len = it.iter_vref_array().total_length;
@@ -677,9 +672,7 @@ impl Trace {
                     inputargs,
                     slots,
                     box_to_unique,
-                    refs,
-                    floats,
-                    bigints,
+                    trb,
                     unique_cache,
                 )
             },
@@ -690,9 +683,7 @@ impl Trace {
                     inputargs,
                     slots,
                     box_to_unique,
-                    refs,
-                    floats,
-                    bigints,
+                    trb,
                     unique_cache,
                 )
             },
@@ -702,16 +693,7 @@ impl Trace {
                     frame_i += 1;
                 }
                 let tagged = frame_iters[frame_i].next().expect("frame snapshot box");
-                snapshot_box_from_tagged(
-                    tagged,
-                    inputargs,
-                    slots,
-                    box_to_unique,
-                    refs,
-                    floats,
-                    bigints,
-                    unique_cache,
-                )
+                snapshot_box_from_tagged(tagged, inputargs, slots, box_to_unique, trb, unique_cache)
             },
             env,
             minimum_virtualizable_size,
@@ -1724,6 +1706,21 @@ impl Trace {
         // shared identity.
         let (inputargs, ops) = self.into_parts();
         crate::history::TreeLoop::from_oprc(inputargs, ops, Vec::new())
+    }
+
+    /// `TreeLoop` view of the recorded trace that leaves the recorder whole.
+    ///
+    /// `compile.py compile_loop` hands `metainterp.history.trace` to the
+    /// optimizer and keeps the opencoder buffer alive for
+    /// `ResumeDataLoopMemo.number`, which walks `trace.get_snapshot_iter`
+    /// per surviving guard.
+    pub fn to_tree_loop(&self) -> crate::history::TreeLoop {
+        let ops = if self.trb.is_some() && self.ops.is_empty() {
+            self.materialize_ops()
+        } else {
+            self.ops.clone()
+        };
+        crate::history::TreeLoop::from_oprc(self.live_inputargs_cloned(), ops, Vec::new())
     }
 
     /// opencoder.py `cut_point()` — the recorder's local slice of

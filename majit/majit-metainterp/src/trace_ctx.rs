@@ -2820,7 +2820,8 @@ impl TraceCtx {
     /// and the closing JUMP are normalized by separate invocations; this is
     /// called at each of those sites rather than once for both.
     pub fn remove_consts_and_duplicates(&mut self, boxes: &mut [(OpRef, Type)]) {
-        let mut duplicates: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+        let mut duplicates: indexmap::IndexSet<OpRef, rustc_hash::FxBuildHasher> =
+            indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher);
         for slot in boxes.iter_mut() {
             let (opref, declared) = *slot;
             if !opref.is_constant() && duplicates.insert(opref) {
@@ -2846,7 +2847,8 @@ impl TraceCtx {
         // pyjitpl.py `remove_consts_and_duplicates` rewrites `boxes[i]`
         // in place. A side `Vec<(OpRef, Type)>` was a 128 B class on the
         // regex and/or bridge close (`start_bridge_tracing`).
-        let mut duplicates: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+        let mut duplicates: indexmap::IndexSet<OpRef, rustc_hash::FxBuildHasher> =
+            indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher);
         for slot in boxes.iter_mut() {
             let opref = *slot;
             if !opref.is_constant() && duplicates.insert(opref) {

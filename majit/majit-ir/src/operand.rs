@@ -29,6 +29,7 @@ use crate::ptr_info::PtrInfo;
 use crate::resoperation::{OpRc, OpRef};
 use crate::value::{Const, GcRef, InputArgRc, Type, Value};
 use std::cell::{Cell, RefCell};
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
@@ -146,15 +147,16 @@ const OP_SMALLINT: u64 = 3;
 const OP_SMALLWIDE: u64 = 4;
 const OP_NULLREF: u64 = 5;
 
-/// Decoded view. Pointer variants own an `Rc` clone.
+/// Decoded view. Pointer variants borrow the operand's own reference without
+/// taking a count; the view must not outlive the operand it was read from.
 enum Opnd {
     None,
-    Op(OpRc),
-    InputArg(InputArgRc),
+    Op(ManuallyDrop<OpRc>),
+    InputArg(ManuallyDrop<InputArgRc>),
     SmallInt(u64),
     SmallWide(u64),
     NullRef,
-    Const(Rc<Cell<Value>>),
+    Const(ManuallyDrop<Rc<Cell<Value>>>),
 }
 
 impl Operand {
@@ -214,26 +216,15 @@ impl Operand {
             return Opnd::None;
         }
         match self.packed & OP_TAG {
-            OP_OP => {
-                let rc = unsafe { OpRc::from_raw(self.packed as *const crate::resoperation::Op) };
-                let out = Opnd::Op(rc.clone());
-                std::mem::forget(rc);
-                out
-            }
-            OP_INPUTARG => {
-                let rc = unsafe {
-                    InputArgRc::from_raw((self.packed & !OP_TAG) as *const crate::value::InputArg)
-                };
-                let out = Opnd::InputArg(rc.clone());
-                std::mem::forget(rc);
-                out
-            }
-            OP_CONST => {
-                let rc = unsafe { Rc::from_raw((self.packed & !OP_TAG) as *const Cell<Value>) };
-                let out = Opnd::Const(Rc::clone(&rc));
-                std::mem::forget(rc);
-                out
-            }
+            OP_OP => Opnd::Op(ManuallyDrop::new(unsafe {
+                OpRc::from_raw(self.packed as *const crate::resoperation::Op)
+            })),
+            OP_INPUTARG => Opnd::InputArg(ManuallyDrop::new(unsafe {
+                InputArgRc::from_raw((self.packed & !OP_TAG) as *const crate::value::InputArg)
+            })),
+            OP_CONST => Opnd::Const(ManuallyDrop::new(unsafe {
+                Rc::from_raw((self.packed & !OP_TAG) as *const Cell<Value>)
+            })),
             OP_SMALLINT => {
                 let val = (self.packed >> 3) as u32 as u64;
                 let id = self.packed >> 35;
@@ -265,6 +256,7 @@ impl Operand {
     }
 
     /// Clone an operand from a packed word the caller still owns.
+    #[inline]
     pub(crate) fn clone_from_packed(packed: u64) -> Operand {
         let view = Operand { packed };
         let out = view.clone();
@@ -279,6 +271,7 @@ impl Operand {
 }
 
 impl Clone for Operand {
+    #[inline]
     fn clone(&self) -> Self {
         if self.packed == 0 || self.packed == OP_NULLREF {
             return Operand {
@@ -308,6 +301,7 @@ impl Clone for Operand {
 }
 
 impl Drop for Operand {
+    #[inline]
     fn drop(&mut self) {
         if self.packed == 0 || self.packed == OP_NULLREF {
             return;
@@ -614,13 +608,31 @@ impl Operand {
     /// (`resoperation.py while isinstance(op, AbstractResOpOrInputArg)`).
     /// This is the canonical walker; the former box-wrapper `get_box_replacement`
     /// delegates here.
+    #[inline]
     pub fn get_box_replacement(&self, not_const: bool) -> Operand {
+        Operand::clone_from_packed(self.replacement_packed(not_const))
+    }
+
+    /// Borrowing form of `get_box_replacement(false)` for read-only queries:
+    /// `f` sees the chain terminal without the terminal handle's count being
+    /// taken and released. `self`'s chain keeps the terminal alive for the
+    /// call, so `f` must not rewrite `_forwarded` on that chain.
+    #[inline]
+    pub fn with_box_replacement<R>(&self, f: impl FnOnce(&Operand) -> R) -> R {
+        let view = std::mem::ManuallyDrop::new(Operand {
+            packed: self.replacement_packed(false),
+        });
+        f(&view)
+    }
+
+    /// Packed word of the `_forwarded` chain terminal, not counted: `self`
+    /// or a hop's `_forwarded` slot keeps it alive.
+    fn replacement_packed(&self, not_const: bool) -> u64 {
         if !self.is_resop() && !self.is_inputarg() {
-            return self.clone();
+            return self.packed;
         }
         // Packed-tag walk: `self` keeps the first producer alive, and each
         // hop is kept alive by the `_forwarded` slot that points at it.
-        // One owned Operand is built only at the end.
         let mut cur = self.packed;
         loop {
             let packed_fwd = if cur & OP_TAG == OP_OP {
@@ -639,31 +651,31 @@ impl Operand {
                 }
             };
             match classify_packed_forwarded(packed_fwd) {
-                PackedForwarded::None | PackedForwarded::Info => {
-                    return Operand::clone_from_packed(cur);
-                }
+                PackedForwarded::None | PackedForwarded::Info => return cur,
                 PackedForwarded::Op(p) => cur = p as u64,
                 PackedForwarded::InputArg(p) => cur = (p as u64) | OP_INPUTARG,
+                // `_forwarded` contains the Const object itself in RPython;
+                // its identity is reused.
                 PackedForwarded::Const(p) => {
-                    if not_const {
-                        return Operand::clone_from_packed(cur);
-                    }
-                    // `_forwarded` contains the Const object itself in
-                    // RPython. Reuse its identity; constructing a new cell
-                    // here made every replacement lookup allocate.
-                    return Operand::clone_from_packed((p as u64) | OP_CONST);
+                    return if not_const {
+                        cur
+                    } else {
+                        (p as u64) | OP_CONST
+                    };
                 }
                 PackedForwarded::SmallConst(enc) => {
-                    if not_const {
-                        return Operand::clone_from_packed(cur);
-                    }
-                    return Operand::SmallInt(enc);
+                    return if not_const {
+                        cur
+                    } else {
+                        std::mem::ManuallyDrop::new(Operand::SmallInt(enc)).packed
+                    };
                 }
                 PackedForwarded::SmallWide(id) => {
-                    if not_const {
-                        return Operand::clone_from_packed(cur);
-                    }
-                    return Operand::SmallWide(id);
+                    return if not_const {
+                        cur
+                    } else {
+                        std::mem::ManuallyDrop::new(Operand::SmallWide(id)).packed
+                    };
                 }
             }
         }
@@ -701,12 +713,10 @@ impl Operand {
     /// have no `_forwarded` slot and take the default (mirror of
     /// the carried producer's forwarding host).
     fn read_forwarding_host<R>(&self, default: R, f: impl FnOnce(&dyn ForwardingHost) -> R) -> R {
-        if let Some(op) = self.bound_op() {
-            f(&*op)
-        } else if let Some(ia) = self.bound_inputarg() {
-            f(&*ia)
-        } else {
-            default
+        match self.view() {
+            Opnd::Op(op) => f(&**op),
+            Opnd::InputArg(ia) => f(&**ia),
+            _ => default,
         }
     }
 
@@ -714,15 +724,13 @@ impl Operand {
     /// rejected by the caller's assert first; `None` has no slot and panics
     /// (routes to the carried producer's forwarding host).
     fn with_forwarding_host(&self, what: &str, f: impl FnOnce(&dyn ForwardingHost)) {
-        if let Some(op) = self.bound_op() {
-            f(&*op)
-        } else if let Some(ia) = self.bound_inputarg() {
-            f(&*ia)
-        } else {
-            panic!(
+        match self.view() {
+            Opnd::Op(op) => f(&**op),
+            Opnd::InputArg(ia) => f(&**ia),
+            _ => panic!(
                 "Operand::{what} on a non-producer operand — only a bound \
                  Op/InputArg carries a _forwarded slot (box identity precondition)"
-            )
+            ),
         }
     }
 

@@ -687,7 +687,7 @@ pub struct WarmEnterState {
     /// cell lives in** — trivially `cell_key` itself for an unminted key,
     /// because an unminted key is only ever assigned inside the bucket whose
     /// hash it equals.
-    minted: indexmap::IndexMap<u64, u64>,
+    minted: crate::FxIndexMap<u64, u64>,
     /// Serial feeding [`WarmEnterState::mint_cell_key`]'s candidate sequence.
     mint_serial: u64,
     /// Compilation threshold (copied from counter for easy access).
@@ -718,7 +718,7 @@ pub struct WarmEnterState {
     /// Maps a quasi-immutable field key (hash of object_id + field_index)
     /// to the set of cell keys whose compiled loops depend on that field.
     /// When a quasi-immutable field is mutated, all dependent loops are invalidated.
-    quasiimmut_deps: indexmap::IndexMap<u64, Vec<u64>>,
+    quasiimmut_deps: crate::FxIndexMap<u64, Vec<u64>>,
     // Function-entry hotness rides on the shared `counter: JitCounter`
     // below (warmstate.py — maybe_compile_and_run's tick + reset
     // goes through the common timetable, not a separate HashMap).
@@ -897,7 +897,7 @@ impl WarmEnterState {
         WarmEnterState {
             counter,
             celltable,
-            minted: indexmap::IndexMap::new(),
+            minted: crate::FxIndexMap::default(),
             mint_serial: 0,
             threshold,
             increment_threshold,
@@ -909,7 +909,7 @@ impl WarmEnterState {
             trace_limit: DEFAULT_TRACE_LIMIT,
             tracing_generation: 0,
             jitlog,
-            quasiimmut_deps: indexmap::IndexMap::new(),
+            quasiimmut_deps: crate::FxIndexMap::default(),
             vectorize: false,
             vec_all: false,
             vec_cost: 0,

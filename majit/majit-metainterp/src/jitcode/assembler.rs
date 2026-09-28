@@ -193,7 +193,7 @@ pub struct JitCodeBuilder {
     /// the runtime `DescrCache`.  Without it the optimizer's
     /// `optimize_setfield_gc` (`optimizeopt/virtualize.rs`) panics on
     /// the `get_parent_descr()` of a virtualized struct field.
-    struct_size_specs: std::collections::HashMap<u64, BhSizeSpec>,
+    struct_size_specs: rustc_hash::FxHashMap<u64, BhSizeSpec>,
     /// Pyre-only bridge for canonical `residual_call_*_v`: the bytecode
     /// itself keeps the RPython shape (`i` funcptr operand + `d`
     /// calldescr operand), while the runtime trace path still needs the

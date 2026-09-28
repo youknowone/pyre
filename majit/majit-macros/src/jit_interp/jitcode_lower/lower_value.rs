@@ -1092,10 +1092,14 @@ impl<'c> Lowerer<'c> {
         // join reads this register; a kind change has no single link
         // argument (`FrameState.union`).
         let merges = self.join_merge.get(&lhs_ident).copied() == Some(lhs.reg);
-        // Same refusal as `lower_local_update`: a green is a caller local
-        // threaded through the merge point, and writing this body's register
-        // would not carry the value back. Refuse before the RHS emits.
+        // Same refusal as `lower_local_update`: in a sub-JitCode a green is a
+        // caller local threaded through the merge point, and writing this
+        // body's register would not carry the value back. Refuse before the
+        // RHS emits. An inline dispatch arm (`pc_pinned`) writes the
+        // merge-point register itself, which `can_enter_jit!` then reads, so
+        // a green there merges like `pc`.
         if merges
+            && !self.pc_pinned
             && let Some(config) = self.config
             && super::lower_stmt::green_idents(config).contains(&lhs_ident)
         {

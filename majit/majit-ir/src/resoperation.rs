@@ -1269,13 +1269,13 @@ struct OpInnerHeap {
 unsafe impl Send for OpInnerHeap {}
 unsafe impl Sync for OpInnerHeap {}
 
-static OP_INNER_HEAP: std::sync::Mutex<OpInnerHeap> = std::sync::Mutex::new(OpInnerHeap {
+static OP_INNER_HEAP: parking_lot::Mutex<OpInnerHeap> = parking_lot::Mutex::new(OpInnerHeap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
 
 fn alloc_op_inner() -> std::ptr::NonNull<OpInner> {
-    let mut heap = OP_INNER_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heap = OP_INNER_HEAP.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -1294,20 +1294,15 @@ fn alloc_op_inner() -> std::ptr::NonNull<OpInner> {
 }
 
 fn free_op_inner(p: std::ptr::NonNull<OpInner>) {
-    OP_INNER_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
+    OP_INNER_HEAP.lock().free.push(p);
 }
 
 /// `GuardResOp` extra lives on the ResOperation in the nursery upstream.
 /// Chunked slots keep `Box<OpKindExtra>` (32–40 B) off the process
 /// allocator on the regex `and`/`or` leaf.
 const EXTRA_CHUNK: usize = 1024;
-/// `is_extra_inline` / `is_both_inline` require `w & 7 == 0` so the
-/// packed word stays distinct from `pack_forwarded` SmallWide (tag 4).
-/// wasm32's natural `align_of` for these types is 4.
+/// Extra / both pointers are 8-aligned so their low bits stay clear of
+/// a stamp word. wasm32's natural `align_of` for these types is 4.
 const PACKED_PTR_ALIGN: usize = 8;
 
 fn packed_stride<T>() -> usize {
@@ -1336,13 +1331,13 @@ struct ExtraHeap {
 unsafe impl Send for ExtraHeap {}
 unsafe impl Sync for ExtraHeap {}
 
-static EXTRA_HEAP: std::sync::Mutex<ExtraHeap> = std::sync::Mutex::new(ExtraHeap {
+static EXTRA_HEAP: parking_lot::Mutex<ExtraHeap> = parking_lot::Mutex::new(ExtraHeap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
 
 fn extra_slot() -> *mut OpKindExtra {
-    let mut heap = EXTRA_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heap = EXTRA_HEAP.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -1367,11 +1362,7 @@ fn alloc_extra(e: OpKindExtra) -> *mut OpKindExtra {
 }
 
 fn release_extra_slot(p: *mut OpKindExtra) {
-    EXTRA_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
+    EXTRA_HEAP.lock().free.push(p);
 }
 
 fn drop_extra(p: *mut OpKindExtra) {
@@ -1391,13 +1382,13 @@ struct BothHeap {
 unsafe impl Send for BothHeap {}
 unsafe impl Sync for BothHeap {}
 
-static BOTH_HEAP: std::sync::Mutex<BothHeap> = std::sync::Mutex::new(BothHeap {
+static BOTH_HEAP: parking_lot::Mutex<BothHeap> = parking_lot::Mutex::new(BothHeap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
 
 fn both_slot() -> *mut BothPayload {
-    let mut heap = BOTH_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heap = BOTH_HEAP.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -1422,11 +1413,7 @@ fn alloc_both(b: BothPayload) -> *mut BothPayload {
 }
 
 fn release_both_slot(p: *mut BothPayload) {
-    BOTH_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
+    BOTH_HEAP.lock().free.push(p);
 }
 
 fn drop_both(p: *mut BothPayload) {
@@ -1474,6 +1461,7 @@ impl OpRc {
         }
     }
 
+    #[inline]
     pub unsafe fn increment_strong_count(value: *const Op) {
         let rc = unsafe { Self::from_raw(value) };
         let extra = rc.clone();
@@ -1483,6 +1471,7 @@ impl OpRc {
 }
 
 impl Clone for OpRc {
+    #[inline]
     fn clone(&self) -> Self {
         let inner = unsafe { self.ptr.as_ref() };
         inner.strong.set(inner.strong.get() + 1);
@@ -1491,18 +1480,27 @@ impl Clone for OpRc {
 }
 
 impl Drop for OpRc {
+    #[inline]
     fn drop(&mut self) {
         let inner = unsafe { self.ptr.as_ref() };
         let n = inner.strong.get() - 1;
         if n == 0 {
-            unsafe {
-                std::ptr::drop_in_place(&mut (*self.ptr.as_ptr()).value);
-            }
-            free_op_inner(self.ptr);
+            release_op_inner(self.ptr);
         } else {
             inner.strong.set(n);
         }
     }
+}
+
+/// Last-reference teardown, kept out of line so the count decrement in
+/// `OpRc::drop` inlines at every handle drop.
+#[cold]
+#[inline(never)]
+fn release_op_inner(ptr: std::ptr::NonNull<OpInner>) {
+    unsafe {
+        std::ptr::drop_in_place(&mut (*ptr.as_ptr()).value);
+    }
+    free_op_inner(ptr);
 }
 
 impl std::ops::Deref for OpRc {
@@ -1582,11 +1580,11 @@ struct FailArgHeap {
 unsafe impl Send for FailArgHeap {}
 unsafe impl Sync for FailArgHeap {}
 
-static FAILARG8_HEAP: std::sync::Mutex<FailArgHeap> = std::sync::Mutex::new(FailArgHeap {
+static FAILARG8_HEAP: parking_lot::Mutex<FailArgHeap> = parking_lot::Mutex::new(FailArgHeap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
-static FAILARG16_HEAP: std::sync::Mutex<FailArgHeap> = std::sync::Mutex::new(FailArgHeap {
+static FAILARG16_HEAP: parking_lot::Mutex<FailArgHeap> = parking_lot::Mutex::new(FailArgHeap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
@@ -1599,8 +1597,8 @@ fn failarg_data(h: *mut FailArgHeader) -> *mut Operand {
     unsafe { (h as *mut u8).add(std::mem::size_of::<FailArgHeader>()) as *mut Operand }
 }
 
-fn alloc_failarg_class(heap: &std::sync::Mutex<FailArgHeap>, cap: usize) -> *mut FailArgHeader {
-    let mut heap = heap.lock().unwrap_or_else(|e| e.into_inner());
+fn alloc_failarg_class(heap: &parking_lot::Mutex<FailArgHeap>, cap: usize) -> *mut FailArgHeader {
+    let mut heap = heap.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -1675,17 +1673,9 @@ fn release_failargs(h: *mut FailArgHeader) {
             data.add(i).drop_in_place();
         }
         if cap <= FAILARG_SMALL {
-            FAILARG8_HEAP
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .free
-                .push(h);
+            FAILARG8_HEAP.lock().free.push(h);
         } else if cap <= FAILARG_LARGE {
-            FAILARG16_HEAP
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .free
-                .push(h);
+            FAILARG16_HEAP.lock().free.push(h);
         } else {
             let layout = std::alloc::Layout::from_size_align(failarg_slot_size(cap), 8)
                 .expect("fail_args overflow slot");
@@ -1937,6 +1927,7 @@ impl OpPosRef<'_> {
     }
 }
 
+#[inline]
 fn pack_op_pos(r: OpRef) -> u64 {
     let (tag, payload): (u8, u32) = match r {
         OpRef::None => (0, 0),
@@ -1959,6 +1950,7 @@ fn pack_op_pos(r: OpRef) -> u64 {
     ((tag as u64) << 32) | u64::from(payload)
 }
 
+#[inline]
 fn unpack_op_pos(packed: u64) -> OpRef {
     let tag = (packed >> 32) as u8;
     let payload = packed as u32;
@@ -1978,43 +1970,41 @@ fn unpack_op_pos(packed: u64) -> OpRef {
     }
 }
 
+#[cold]
 fn intern_overflow_pos(r: OpRef) -> u32 {
-    let mut slab = OVERFLOW_POS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slab = OVERFLOW_POS.lock();
     let idx = u32::try_from(slab.len()).expect("Op.pos overflow slab exhausted");
     slab.push(r);
     idx
 }
 
+#[cold]
 fn overflow_pos(idx: u32) -> OpRef {
-    let slab = OVERFLOW_POS.lock().unwrap_or_else(|e| e.into_inner());
+    let slab = OVERFLOW_POS.lock();
     slab[idx as usize]
 }
 
-static OVERFLOW_POS: std::sync::Mutex<Vec<OpRef>> = std::sync::Mutex::new(Vec::new());
+static OVERFLOW_POS: parking_lot::Mutex<Vec<OpRef>> = parking_lot::Mutex::new(Vec::new());
 
 /// Full fail-arg type lists that do not fit in [`GuardExtra::types`].
 /// Entries are leaked slices so `fail_arg_types` can return them after
 /// the lock drops.
-static FAIL_ARG_TYPES_OVERFLOW: std::sync::Mutex<Vec<&'static [Type]>> =
-    std::sync::Mutex::new(Vec::new());
+static FAIL_ARG_TYPES_OVERFLOW: parking_lot::Mutex<Vec<&'static [Type]>> =
+    parking_lot::Mutex::new(Vec::new());
 
 const FAIL_ARG_TYPES_INLINE: usize = 4;
 const FAIL_ARG_TYPES_HEAP: i8 = -2;
 
 fn intern_fail_arg_types(types: &[Type]) -> u32 {
     let leaked: &'static [Type] = Box::leak(types.to_vec().into_boxed_slice());
-    let mut slab = FAIL_ARG_TYPES_OVERFLOW
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut slab = FAIL_ARG_TYPES_OVERFLOW.lock();
     let idx = u32::try_from(slab.len()).expect("fail-arg types overflow slab exhausted");
     slab.push(leaked);
     idx
 }
 
 fn overflow_fail_arg_types(idx: u32) -> &'static [Type] {
-    let slab = FAIL_ARG_TYPES_OVERFLOW
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let slab = FAIL_ARG_TYPES_OVERFLOW.lock();
     slab[idx as usize]
 }
 
@@ -2095,13 +2085,13 @@ struct Arg32Heap {
 unsafe impl Send for Arg32Heap {}
 unsafe impl Sync for Arg32Heap {}
 
-static ARG32_HEAP: std::sync::Mutex<Arg32Heap> = std::sync::Mutex::new(Arg32Heap {
+static ARG32_HEAP: parking_lot::Mutex<Arg32Heap> = parking_lot::Mutex::new(Arg32Heap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
 
 fn alloc_arg32() -> *mut Operand {
-    let mut heap = ARG32_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heap = ARG32_HEAP.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -2121,11 +2111,7 @@ fn alloc_arg32() -> *mut Operand {
 }
 
 fn free_arg32(p: *mut Operand) {
-    ARG32_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
+    ARG32_HEAP.lock().free.push(p);
 }
 
 /// Packed `N_aryOp._args`. Two `Operand`s are 16 B; the length lives on
@@ -2317,11 +2303,7 @@ impl std::fmt::Debug for ArgSlot {
 /// - `(box, 2)` — `Box<(Option<DescrRef>, OpKindExtra)>`
 const EXTRA_TAG: usize = 1;
 const BOTH_TAG: usize = 2;
-const FWD_TAG: usize = 3;
-const DESCR_FWD_TAG: usize = 4;
-const EXTRA_FWD_TAG: usize = 5;
-const BOTH_FWD_TAG: usize = 6;
-const SLOT_TAG_MAX: usize = BOTH_FWD_TAG;
+const SLOT_TAG_MAX: usize = BOTH_TAG;
 
 struct BothPayload {
     /// Always present in this arm (`write_parts` `(Some, Some, false)`).
@@ -2330,47 +2312,21 @@ struct BothPayload {
     extra: OpKindExtra,
 }
 
-struct DescrFwd {
-    descr: DescrRef,
-    forwarded: u64,
-}
-
-struct ExtraFwd {
-    extra: OpKindExtra,
-    forwarded: u64,
-}
-
-struct BothFwd {
-    descr: Option<DescrRef>,
-    extra: OpKindExtra,
-    forwarded: u64,
-}
-
-/// Heap pair for descr / extra / stamp. Forwarded-only stays in the
-/// 8 B slot word so int-bound `set_forwarded` does not mint a box.
+/// Heap pair for descr / extra / stamp.
 struct DescrWords {
     lo: usize,
     hi: usize,
     stamp: u32,
 }
 
-/// Descr + `_forwarded` without extra/stamp. Thin descr is 8 B and
-/// the packed forwarded word is 8 B, so the pair is 16 B — not a
-/// 24 B `DescrFwd` plus a 24 B `DescrWords`.
-struct ThinFwd {
-    thin: u64,
-    forwarded: u64,
-}
-
 /// Stamp plus the previous slot word (empty / thin descr / extra /
-/// both / inline forwarded). 16 B so `set_stamp_word` leaves the
-/// 24-byte `DescrWords` class.
+/// both). 16 B so `set_stamp_word` leaves the 24-byte `DescrWords` class.
 struct ThinStamp {
     inner: u64,
     stamp: u32,
 }
 
-/// 16 B ThinFwd / ThinStamp slots come from reserved chunks so compile
+/// 16 B ThinStamp slots come from reserved chunks so compile
 /// restamp does not mint the 16-byte malloc class.
 const SLOT16: usize = 16;
 const SLOT16_CHUNK: usize = 4096;
@@ -2383,13 +2339,13 @@ struct Slot16Heap {
 unsafe impl Send for Slot16Heap {}
 unsafe impl Sync for Slot16Heap {}
 
-static SLOT16_HEAP: std::sync::Mutex<Slot16Heap> = std::sync::Mutex::new(Slot16Heap {
+static SLOT16_HEAP: parking_lot::Mutex<Slot16Heap> = parking_lot::Mutex::new(Slot16Heap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
 
 fn alloc_slot16() -> *mut u8 {
-    let mut heap = SLOT16_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heap = SLOT16_HEAP.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -2409,25 +2365,7 @@ fn alloc_slot16() -> *mut u8 {
 }
 
 fn free_slot16(p: *mut u8) {
-    SLOT16_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
-}
-
-fn alloc_thin_fwd(thin: u64, forwarded: u64) -> *mut ThinFwd {
-    let p = alloc_slot16() as *mut ThinFwd;
-    unsafe {
-        p.write(ThinFwd { thin, forwarded });
-    }
-    p
-}
-
-fn free_thin_fwd(p: *mut ThinFwd) -> ThinFwd {
-    let value = unsafe { p.read() };
-    free_slot16(p as *mut u8);
-    value
+    SLOT16_HEAP.lock().free.push(p);
 }
 
 fn alloc_thin_stamp(inner: u64, stamp: u32) -> *mut ThinStamp {
@@ -2444,16 +2382,11 @@ fn free_thin_stamp(p: *mut ThinStamp) -> ThinStamp {
     value
 }
 
-/// High bit marks a [`DescrWords`] or [`ThinFwd`] box. Heap pointers
-/// are 48-bit; `pack_forwarded` SmallConst ids would need bit 28 of
-/// the id to collide (256M mints).
+/// High bit marks a [`DescrWords`] box. Heap pointers are 48-bit.
 ///
 /// Tags live in a `u64` word so wasm32 (`usize` = 32) can still
 /// compile and pack the same layout.
 const SLOT_BOX_BIT: u64 = 1u64 << 63;
-/// Boxed [`ThinFwd`]. Distinct from [`THIN_DESCR_BIT`] (62) and the
-/// box bit (63). Heap pointers do not set bit 61.
-const SLOT_THIN_FWD_BIT: u64 = 1u64 << 61;
 /// Extra-only `Box<OpKindExtra>` pointer, no `DescrWords` wrapper.
 const SLOT_EXTRA_BIT: u64 = 1u64 << 60;
 /// `Box<BothPayload>` pointer, no `DescrWords` wrapper.
@@ -2465,9 +2398,8 @@ const SLOT_STAMP_BOX_BIT: u64 = 1u64 << 58;
 /// Heap pointers leave bits 48-63 clear. SmallConst would need id
 /// `0x7FFE << 13` (256M) to collide.
 const SLOT_STAMP_INLINE_TAG: u64 = 0x7FFE << 48;
-/// Descr-only (no extra / stamp / forwarded) is a thin word: data
+/// Descr-only (no extra / stamp) is a thin word: data
 /// pointer in bits 0-47, interned vtable id in 48-55, this flag at 62.
-/// Distinct from `pack_forwarded` SmallConst (low 3 bits = 3).
 const THIN_DESCR_BIT: u64 = 1u64 << 62;
 const THIN_DESCR_ID_SHIFT: u32 = 48;
 const THIN_DESCR_PTR_MASK: u64 = (1u64 << 48) - 1;
@@ -2477,8 +2409,7 @@ const THIN_DESCR_PTR_MASK: u64 = (1u64 << 48) - 1;
 const THIN_STAMP_SHIFT: u32 = 56;
 const THIN_STAMP_MASK: u64 = 0x3f;
 /// Wider stamps intern `(vtable_id, stamp)` and set bit 61 plus a 13-bit
-/// id in bits 48-60. Bit 61 on a thin descr (no `SLOT_BOX_BIT`) cannot
-/// collide with `ThinFwd` (which also sets bit 63).
+/// id in bits 48-60.
 const THIN_STAMPED_BIT: u64 = 1u64 << 61;
 const THIN_STAMPED_ID_SHIFT: u32 = 48;
 const THIN_STAMPED_ID_MASK: u64 = 0x1fff;
@@ -2494,12 +2425,6 @@ const THIN_STAMPED_SLOT_COUNT: usize = THIN_STAMPED_ID_MASK as usize + 1;
 struct ThinStamped {
     vtable: u8,
     stamp: u32,
-    /// Non-zero: descr data lives here and word bits 0-47 are a tag-stripped
-    /// forwarded payload. Zero: stamp intern only; descr data stays in the word.
-    data: usize,
-    /// `pack_forwarded` low-3-bit tag restored onto bits 0-47. Unused when
-    /// `data == 0`.
-    fwd_tag: u8,
 }
 
 struct ThinStampedTable {
@@ -2507,9 +2432,9 @@ struct ThinStampedTable {
     index: rustc_hash::FxHashMap<ThinStamped, usize>,
 }
 
-static THIN_STAMPED: std::sync::LazyLock<std::sync::Mutex<ThinStampedTable>> =
+static THIN_STAMPED: std::sync::LazyLock<parking_lot::Mutex<ThinStampedTable>> =
     std::sync::LazyLock::new(|| {
-        std::sync::Mutex::new(ThinStampedTable {
+        parking_lot::Mutex::new(ThinStampedTable {
             len: 0,
             index: rustc_hash::FxHashMap::default(),
         })
@@ -2518,31 +2443,47 @@ static THIN_STAMPED: std::sync::LazyLock<std::sync::Mutex<ThinStampedTable>> =
 static THIN_STAMPED_SLOTS: [std::sync::OnceLock<ThinStamped>; THIN_STAMPED_SLOT_COUNT] =
     [const { std::sync::OnceLock::new() }; THIN_STAMPED_SLOT_COUNT];
 
-static DESCR_VTABLES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+/// Published vtable pointers. Slot `i` is stored with `Release` before
+/// `DESCR_VTABLE_LEN` advances to `i + 1`, and before `intern_descr_vtable`
+/// returns the id that a thin word can carry. `descr_vtable_at` loads the
+/// slot with `Acquire`, pairing with that `Release`, so the read does not
+/// rely on synchronization of the id word itself.
+static DESCR_VTABLE_SLOTS: [std::sync::atomic::AtomicUsize; 256] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 256];
+static DESCR_VTABLE_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DESCR_VTABLE_INSERT: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+fn find_descr_vtable(vtable: usize, n: usize) -> Option<u8> {
+    DESCR_VTABLE_SLOTS[..n]
+        .iter()
+        .position(|slot| slot.load(std::sync::atomic::Ordering::Acquire) == vtable)
+        .map(|i| i as u8)
+}
 
 fn intern_descr_vtable(vtable: usize) -> Option<u8> {
-    let mut v = DESCR_VTABLES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(i) = v.iter().position(|&x| x == vtable) {
-        return u8::try_from(i).ok();
+    let n = DESCR_VTABLE_LEN.load(std::sync::atomic::Ordering::Acquire);
+    if let Some(id) = find_descr_vtable(vtable, n) {
+        return Some(id);
     }
-    if v.len() >= 256 {
+    let _guard = DESCR_VTABLE_INSERT.lock();
+    let n = DESCR_VTABLE_LEN.load(std::sync::atomic::Ordering::Acquire);
+    if let Some(id) = find_descr_vtable(vtable, n) {
+        return Some(id);
+    }
+    if n >= 256 {
         return None;
     }
-    v.push(vtable);
-    u8::try_from(v.len() - 1).ok()
+    DESCR_VTABLE_SLOTS[n].store(vtable, std::sync::atomic::Ordering::Release);
+    DESCR_VTABLE_LEN.store(n + 1, std::sync::atomic::Ordering::Release);
+    Some(n as u8)
 }
 
 fn descr_vtable_at(id: u8) -> usize {
-    let v = DESCR_VTABLES.lock().unwrap_or_else(|e| e.into_inner());
-    v[id as usize]
+    DESCR_VTABLE_SLOTS[id as usize].load(std::sync::atomic::Ordering::Acquire)
 }
 
 fn is_thin_descr(w: u64) -> bool {
     w & SLOT_BOX_BIT == 0 && w & THIN_DESCR_BIT != 0 && w & 7 == 0 && !is_stamp_inline(w)
-}
-
-fn is_thin_fwd_box(w: u64) -> bool {
-    w & SLOT_BOX_BIT != 0 && w & SLOT_THIN_FWD_BIT != 0
 }
 
 fn is_extra_inline(w: u64) -> bool {
@@ -2575,22 +2516,11 @@ fn thin_stamp(w: u64) -> u32 {
 }
 
 fn thin_data_ptr(w: u64) -> usize {
-    match thin_stamped_at(w) {
-        Some(e) if e.data != 0 => e.data,
-        _ => (w & THIN_DESCR_PTR_MASK) as usize,
-    }
-}
-
-fn thin_fwd_from_word(w: u64) -> u64 {
-    match thin_stamped_at(w) {
-        Some(e) if e.data != 0 => (w & THIN_DESCR_PTR_MASK) | u64::from(e.fwd_tag),
-        _ => 0,
-    }
+    (w & THIN_DESCR_PTR_MASK) as usize
 }
 
 /// Thin-stamped slot word, or `None` when that word would be
-/// bit-identical to a stamp-only slot. Callers promote to
-/// [`ThinStamp`] / [`ThinFwd`], which already store both.
+/// bit-identical to a stamp-only slot. Callers promote to [`ThinStamp`].
 fn thin_stamped_payload_word(payload: u64, id: u64) -> Option<u64> {
     debug_assert_eq!(payload & !THIN_DESCR_PTR_MASK, 0);
     let w = payload | (id << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT;
@@ -2613,7 +2543,7 @@ fn thin_with_stamp(thin: u64, stamp: u32) -> Option<u64> {
             return Some(w);
         }
     }
-    intern_thin_stamped(vtable_id, stamp, 0, 0).and_then(|id| thin_stamped_payload_word(data, id))
+    intern_thin_stamped(vtable_id, stamp).and_then(|id| thin_stamped_payload_word(data, id))
 }
 
 /// Refuse a new thin-stamp id once `len` has reached `limit`.
@@ -2628,16 +2558,9 @@ fn intern_thin_stamped_on(
     limit: usize,
     vtable: u8,
     stamp: u32,
-    data: usize,
-    fwd_tag: u8,
     install: impl FnOnce(usize, ThinStamped),
 ) -> Option<u64> {
-    let key = ThinStamped {
-        vtable,
-        stamp,
-        data,
-        fwd_tag,
-    };
+    let key = ThinStamped { vtable, stamp };
     if let Some(&i) = table.index.get(&key) {
         return Some(i as u64);
     }
@@ -2653,15 +2576,13 @@ fn intern_thin_stamped_on(
     Some(i as u64)
 }
 
-fn intern_thin_stamped(vtable: u8, stamp: u32, data: usize, fwd_tag: u8) -> Option<u64> {
-    let mut v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
+fn intern_thin_stamped(vtable: u8, stamp: u32) -> Option<u64> {
+    let mut v = THIN_STAMPED.lock();
     intern_thin_stamped_on(
         &mut v,
         THIN_STAMPED_ID_LIMIT as usize,
         vtable,
         stamp,
-        data,
-        fwd_tag,
         |i, key| {
             let _ = THIN_STAMPED_SLOTS[i].set(key);
         },
@@ -2681,19 +2602,6 @@ fn box_thin_stamp_word(slot: &DescrSlot, w: u64, stamp: u32) {
     }
 }
 
-fn thin_with_forwarded(thin: u64, packed: u64) -> Option<u64> {
-    // SmallConst / SmallWide use bits 48+ for identity; they do not fit
-    // in the thin word's 48-bit payload. Pointer-tagged forwarded does.
-    if packed == 0 || matches!(packed & 7, 3 | 4) {
-        return None;
-    }
-    let data = thin_data_ptr(thin);
-    let tag = (packed & 7) as u8;
-    let id = intern_thin_stamped(thin_vtable_id(thin), thin_stamp(thin), data, tag)?;
-    let fwd = packed & THIN_DESCR_PTR_MASK & !7;
-    thin_stamped_payload_word(fwd, id)
-}
-
 fn is_stamp_inline(w: u64) -> bool {
     // Bits 48-62 = 0x7FFE is the stamp-only tag. A thin descr with interned
     // wide-stamp id 0x1FFE sets the same bits, and on wasm32 bits 32-47 are
@@ -2711,62 +2619,43 @@ fn tagged_ptr(w: u64) -> usize {
 }
 
 fn box_payload(w: u64) -> usize {
-    (w & !SLOT_BOX_BIT & !SLOT_THIN_FWD_BIT) as usize
+    (w & !SLOT_BOX_BIT) as usize
 }
 
-fn take_word(w: u64) -> (Option<DescrRef>, Option<OpKindExtra>, u64, u32) {
+fn take_word(w: u64) -> (Option<DescrRef>, Option<OpKindExtra>, u32) {
     if w == 0 {
-        (None, None, 0, 0)
+        (None, None, 0)
     } else if is_stamp_inline(w) {
-        (None, None, 0, w as u32)
+        (None, None, w as u32)
     } else if is_stamp_box(w) {
         let p = free_thin_stamp(tagged_ptr(w) as *mut ThinStamp);
-        let (d, e, f, _) = take_word(p.inner);
-        (d, e, f, p.stamp)
+        let (d, e, _) = take_word(p.inner);
+        (d, e, p.stamp)
     } else if is_extra_inline(w) {
         let p = tagged_ptr(w) as *mut OpKindExtra;
         let extra = unsafe { p.read() };
         release_extra_slot(p);
-        (None, Some(extra), 0, 0)
+        (None, Some(extra), 0)
     } else if is_both_inline(w) {
         let p = tagged_ptr(w) as *mut BothPayload;
         let both = unsafe { p.read() };
         release_both_slot(p);
-        (Some(both.descr), Some(both.extra), 0, 0)
-    } else if is_thin_fwd_box(w) {
-        let p = free_thin_fwd(box_payload(w) as *mut ThinFwd);
-        let (lo, hi) = thin_to_lo_hi(p.thin);
-        (
-            Some(descr_arc_from_bits(lo, hi)),
-            None,
-            p.forwarded,
-            thin_stamp(p.thin),
-        )
+        (Some(both.descr), Some(both.extra), 0)
     } else if w & SLOT_BOX_BIT != 0 {
         let p = unsafe { Box::from_raw(box_payload(w) as *mut DescrWords) };
-        let (d, e, f) = unsafe { decode_descr_extra(p.lo, p.hi) };
-        (d, e, f, p.stamp)
+        let (d, e) = unsafe { decode_descr_extra(p.lo, p.hi) };
+        (d, e, p.stamp)
     } else if is_thin_descr(w) {
         let (lo, hi) = thin_to_lo_hi(w);
-        let stamp = thin_stamp(w);
-        let fwd = thin_fwd_from_word(w);
-        if fwd != 0 {
-            (Some(descr_arc_clone_from_bits(lo, hi)), None, fwd, stamp)
-        } else {
-            (Some(descr_arc_from_bits(lo, hi)), None, 0, stamp)
-        }
+        (Some(descr_arc_from_bits(lo, hi)), None, thin_stamp(w))
     } else {
-        // Unboxed forwarded word: the payload is the whole u64, not
-        // `w as usize` (wasm32 truncates SmallConst).
-        let stamp = crate::forwarding::fwd_stamp(w);
-        (None, None, crate::forwarding::strip_fwd_stamp(w), stamp)
+        (None, None, 0)
     }
 }
 
-/// Drop a packed slot without splitting `BothPayload` / `BothFwd` into a
-/// fresh `Box<OpKindExtra>`. `take_word` must split for live extract;
-/// using it from `Drop` minted a 32 B extra per descr+guard op at
-/// compile recycle.
+/// Drop a packed slot without splitting `BothPayload` into a fresh
+/// `Box<OpKindExtra>`. `take_word` must split for live extract; using
+/// it from `Drop` minted a 32 B extra per descr+guard op at compile recycle.
 fn drop_packed_word(w: u64) {
     if w == 0 || is_stamp_inline(w) {
         return;
@@ -2784,89 +2673,30 @@ fn drop_packed_word(w: u64) {
         drop_both(tagged_ptr(w) as *mut BothPayload);
         return;
     }
-    if is_thin_fwd_box(w) {
-        let p = free_thin_fwd(box_payload(w) as *mut ThinFwd);
-        // `p.thin` still owns the `encode_thin_descr` Arc. `take_word`
-        // rebuilds it with `descr_arc_from_bits`; drop must too, or a
-        // SmallConst/SmallWide forward leaks the descriptor.
-        let (lo, hi) = thin_to_lo_hi(p.thin);
-        drop(descr_arc_from_bits(lo, hi));
-        crate::forwarding::drop_packed_forwarded(p.forwarded);
-        return;
-    }
     if w & SLOT_BOX_BIT != 0 {
         let p = unsafe { Box::from_raw(box_payload(w) as *mut DescrWords) };
         unsafe { drop_descr_extra(p.lo, p.hi) };
         return;
     }
     if is_thin_descr(w) {
-        let (d, e, f, _) = take_word(w);
+        let (d, e, _) = take_word(w);
         drop(d);
         drop(e);
-        crate::forwarding::drop_packed_forwarded(f);
-        return;
     }
-    crate::forwarding::drop_packed_forwarded(crate::forwarding::strip_fwd_stamp(w));
 }
 
 unsafe fn drop_descr_extra(lo: usize, hi: usize) {
-    unsafe {
-        match hi {
-            EXTRA_TAG => drop_extra(lo as *mut OpKindExtra),
-            BOTH_TAG => drop_both(lo as *mut BothPayload),
-            FWD_TAG => crate::forwarding::drop_packed_forwarded(lo as u64),
-            DESCR_FWD_TAG => {
-                let p = Box::from_raw(lo as *mut DescrFwd);
-                crate::forwarding::drop_packed_forwarded(p.forwarded);
-            }
-            EXTRA_FWD_TAG => {
-                let p = Box::from_raw(lo as *mut ExtraFwd);
-                crate::forwarding::drop_packed_forwarded(p.forwarded);
-            }
-            BOTH_FWD_TAG => {
-                let p = Box::from_raw(lo as *mut BothFwd);
-                crate::forwarding::drop_packed_forwarded(p.forwarded);
-            }
-            0 => {}
-            _ => drop(descr_arc_from_bits(lo, hi)),
-        }
-    }
-}
-
-fn packed_forwarded_word(w: u64) -> u64 {
-    if is_stamp_inline(w) {
-        return 0;
-    }
-    if is_stamp_box(w) {
-        let p = tagged_ptr(w) as *const ThinStamp;
-        return packed_forwarded_word(unsafe { (*p).inner });
-    }
-    if is_thin_fwd_box(w) {
-        let p = box_payload(w) as *const ThinFwd;
-        return unsafe { (*p).forwarded };
-    }
-    if is_thin_descr(w) {
-        return thin_fwd_from_word(w);
-    }
-    if w & SLOT_BOX_BIT == 0 && !is_thin_descr(w) && !is_extra_inline(w) && !is_both_inline(w) {
-        return w;
-    }
-    let (lo, hi) = slot_bits(w);
     match hi {
-        FWD_TAG => lo as u64,
-        DESCR_FWD_TAG => unsafe { (*(lo as *const DescrFwd)).forwarded },
-        EXTRA_FWD_TAG => unsafe { (*(lo as *const ExtraFwd)).forwarded },
-        BOTH_FWD_TAG => unsafe { (*(lo as *const BothFwd)).forwarded },
-        _ => 0,
+        EXTRA_TAG => drop_extra(lo as *mut OpKindExtra),
+        BOTH_TAG => drop_both(lo as *mut BothPayload),
+        0 => {}
+        _ => drop(descr_arc_from_bits(lo, hi)),
     }
 }
 
 fn slot_bits(w: u64) -> (usize, usize) {
-    if w == 0 {
+    if w == 0 || is_stamp_inline(w) {
         (0, 0)
-    } else if is_thin_fwd_box(w) {
-        let p = box_payload(w) as *const ThinFwd;
-        thin_to_lo_hi(unsafe { (*p).thin })
     } else if w & SLOT_BOX_BIT != 0 {
         let p = box_payload(w) as *const DescrWords;
         unsafe { ((*p).lo, (*p).hi) }
@@ -2879,10 +2709,8 @@ fn slot_bits(w: u64) -> (usize, usize) {
     } else if is_stamp_box(w) {
         let p = tagged_ptr(w) as *const ThinStamp;
         slot_bits(unsafe { (*p).inner })
-    } else if is_stamp_inline(w) {
-        (0, 0)
     } else {
-        (w as usize, FWD_TAG)
+        (0, 0)
     }
 }
 
@@ -2911,8 +2739,8 @@ fn thin_to_lo_hi(w: u64) -> (usize, usize) {
     (thin_data_ptr(w), descr_vtable_at(thin_vtable_id(w)))
 }
 
-/// `ResOpWithDescr._descr` slot. One tagged word: empty, inline
-/// `_forwarded`, or a box for descr/extra/stamp.
+/// `ResOpWithDescr._descr` slot. One tagged word: empty, descr, extra,
+/// or stamp. `_forwarded` lives on [`ForwardedSlot`].
 pub struct DescrSlot {
     word: std::cell::UnsafeCell<u64>,
 }
@@ -2923,18 +2751,10 @@ impl DescrSlot {
     }
 
     fn from_parts(descr: Option<DescrRef>, extra: Option<OpKindExtra>) -> Self {
-        Self::from_parts_full(descr, extra, 0)
-    }
-
-    fn from_parts_full(
-        descr: Option<DescrRef>,
-        extra: Option<OpKindExtra>,
-        forwarded: u64,
-    ) -> Self {
         let slot = DescrSlot {
             word: std::cell::UnsafeCell::new(0),
         };
-        slot.write_parts(descr, extra, forwarded);
+        slot.write_parts(descr, extra);
         slot
     }
 
@@ -2953,16 +2773,13 @@ impl DescrSlot {
         } else if is_stamp_box(w) {
             let p = tagged_ptr(w) as *const ThinStamp;
             unsafe { (*p).stamp }
-        } else if is_thin_fwd_box(w) {
-            let p = box_payload(w) as *const ThinFwd;
-            thin_stamp(unsafe { (*p).thin })
         } else if w & SLOT_BOX_BIT != 0 {
             let p = box_payload(w) as *const DescrWords;
             unsafe { (*p).stamp }
         } else if is_thin_descr(w) {
             thin_stamp(w)
         } else {
-            crate::forwarding::fwd_stamp(w as u64)
+            0
         }
     }
 
@@ -2982,22 +2799,6 @@ impl DescrSlot {
             }
             return;
         }
-        if is_thin_fwd_box(w) {
-            let p = box_payload(w) as *mut ThinFwd;
-            if let Some(thin) = thin_with_stamp(unsafe { (*p).thin }, stamp) {
-                unsafe {
-                    (*p).thin = thin;
-                }
-                return;
-            }
-            if stamp == 0 {
-                return;
-            }
-            // Keep the ThinFwd box; wrap it in ThinStamp (16 B) instead
-            // of promoting to a 24 B DescrWords + DescrFwd.
-            box_thin_stamp_word(self, w, stamp);
-            return;
-        }
         if w & SLOT_BOX_BIT != 0 {
             let p = box_payload(w) as *mut DescrWords;
             unsafe {
@@ -3010,10 +2811,6 @@ impl DescrSlot {
                 unsafe {
                     *self.word.get() = 0;
                 }
-            } else if crate::forwarding::fwd_stamp(w as u64) != 0 {
-                unsafe {
-                    *self.word.get() = crate::forwarding::strip_fwd_stamp(w);
-                }
             }
             return;
         }
@@ -3023,56 +2820,16 @@ impl DescrSlot {
             }
             return;
         }
-        if is_thin_descr(w) {
-            if thin_fwd_from_word(w) != 0 {
-                let fwd_tag = thin_stamped_at(w).map(|e| e.fwd_tag).unwrap_or(0);
-                if let Some(id) =
-                    intern_thin_stamped(thin_vtable_id(w), stamp, thin_data_ptr(w), fwd_tag)
-                {
-                    let fwd = w & THIN_DESCR_PTR_MASK;
-                    if let Some(nw) = thin_stamped_payload_word(fwd, id) {
-                        unsafe {
-                            *self.word.get() = nw;
-                        }
-                        return;
-                    }
-                }
-            } else if let Some(thin) = thin_with_stamp(w, stamp) {
-                unsafe {
-                    *self.word.get() = thin;
-                }
-                return;
-            }
-        }
-        if let Some(packed) = crate::forwarding::try_pack_fwd_stamp(w as u64, stamp) {
-            unsafe {
-                *self.word.get() = packed;
-            }
-            return;
-        }
-        // Thin descr / extra / both / inline forwarded: 16 B ThinStamp,
-        // not a 24 B DescrWords.
-        box_thin_stamp_word(self, w, stamp);
-    }
-
-    fn write_thin_fwd(&self, thin: u64, forwarded: u64) {
-        debug_assert_eq!(self.word(), 0);
-        if forwarded == 0 {
+        if is_thin_descr(w)
+            && let Some(thin) = thin_with_stamp(w, stamp)
+        {
             unsafe {
                 *self.word.get() = thin;
             }
             return;
         }
-        if let Some(w) = thin_with_forwarded(thin, forwarded) {
-            unsafe {
-                *self.word.get() = w;
-            }
-            return;
-        }
-        let boxed = alloc_thin_fwd(thin, forwarded);
-        unsafe {
-            *self.word.get() = boxed as u64 | SLOT_BOX_BIT | SLOT_THIN_FWD_BIT;
-        }
+        // Thin descr / extra / both: 16 B ThinStamp, not a 24 B DescrWords.
+        box_thin_stamp_word(self, w, stamp);
     }
 
     fn set_bits(&self, lo: usize, hi: usize) {
@@ -3086,24 +2843,16 @@ impl DescrSlot {
         if lo == 0 && hi == 0 && stamp == 0 {
             return;
         }
-        if hi == FWD_TAG && stamp == 0 {
-            debug_assert_eq!(lo as u64 & SLOT_BOX_BIT, 0);
-            unsafe {
-                *self.word.get() = lo as u64;
-            }
-            return;
-        }
         let boxed = Box::into_raw(Box::new(DescrWords { lo, hi, stamp }));
         unsafe {
             *self.word.get() = boxed as u64 | SLOT_BOX_BIT;
         }
     }
 
-    fn write_parts(&self, descr: Option<DescrRef>, extra: Option<OpKindExtra>, forwarded: u64) {
-        let has_fwd = forwarded != 0;
-        match (descr, extra, has_fwd) {
-            (None, None, false) => self.set_bits(0, 0),
-            (Some(d), None, false) => match encode_thin_descr(d) {
+    fn write_parts(&self, descr: Option<DescrRef>, extra: Option<OpKindExtra>) {
+        match (descr, extra) {
+            (None, None) => self.set_bits(0, 0),
+            (Some(d), None) => match encode_thin_descr(d) {
                 Ok(thin) => {
                     debug_assert_eq!(self.word(), 0);
                     unsafe {
@@ -3116,7 +2865,7 @@ impl DescrSlot {
                     self.set_bits(lo, hi);
                 }
             },
-            (None, Some(e), false) => {
+            (None, Some(e)) => {
                 let ptr = alloc_extra(e) as usize;
                 debug_assert_eq!(self.word(), 0);
                 debug_assert_eq!(ptr as u64 & !THIN_DESCR_PTR_MASK, 0);
@@ -3125,7 +2874,7 @@ impl DescrSlot {
                     *self.word.get() = ptr as u64 | SLOT_EXTRA_BIT;
                 }
             }
-            (Some(d), Some(e), false) => {
+            (Some(d), Some(e)) => {
                 let ptr = alloc_both(BothPayload { descr: d, extra: e }) as usize;
                 debug_assert_eq!(self.word(), 0);
                 debug_assert_eq!(ptr as u64 & !THIN_DESCR_PTR_MASK, 0);
@@ -3134,260 +2883,15 @@ impl DescrSlot {
                     *self.word.get() = ptr as u64 | SLOT_BOTH_BIT;
                 }
             }
-            (None, None, true) => {
-                // Keep the full u64. `set_bits(forwarded as usize, …)`
-                // drops SmallConst identity / high i32 bits on wasm32.
-                debug_assert_eq!(forwarded & SLOT_BOX_BIT, 0);
-                unsafe {
-                    *self.word.get() = forwarded;
-                }
-            }
-            (Some(d), None, true) => match encode_thin_descr(d) {
-                Ok(thin) => self.write_thin_fwd(thin, forwarded),
-                Err(d) => {
-                    let ptr = Box::into_raw(Box::new(DescrFwd {
-                        descr: d,
-                        forwarded,
-                    }));
-                    self.set_bits(ptr as usize, DESCR_FWD_TAG);
-                }
-            },
-            (None, Some(e), true) => {
-                let ptr = Box::into_raw(Box::new(ExtraFwd {
-                    extra: e,
-                    forwarded,
-                }));
-                self.set_bits(ptr as usize, EXTRA_FWD_TAG);
-            }
-            (Some(d), Some(e), true) => {
-                let ptr = Box::into_raw(Box::new(BothFwd {
-                    descr: Some(d),
-                    extra: e,
-                    forwarded,
-                }));
-                self.set_bits(ptr as usize, BOTH_FWD_TAG);
-            }
         }
     }
 
-    fn take_parts_full(&self) -> (Option<DescrRef>, Option<OpKindExtra>, u64, u32) {
+    fn take_parts_full(&self) -> (Option<DescrRef>, Option<OpKindExtra>, u32) {
         let w = self.word();
         unsafe {
             *self.word.get() = 0;
         }
         take_word(w)
-    }
-
-    fn packed_forwarded(&self) -> u64 {
-        packed_forwarded_word(self.word())
-    }
-
-    fn set_packed_forwarded(&self, packed: u64) {
-        let w = self.word();
-        if is_stamp_inline(w) {
-            let stamp = w as u32;
-            unsafe {
-                *self.word.get() = 0;
-            }
-            self.set_packed_forwarded(packed);
-            if stamp != 0 {
-                self.set_stamp_word(stamp);
-            }
-            return;
-        }
-        if is_stamp_box(w) {
-            // Keep the ThinStamp box; rewrite only its inner word.
-            // Unwrapping and `set_stamp_word` minted a second 16 B box
-            // on every descr-bearing `set_forwarded`.
-            let p = tagged_ptr(w) as *mut ThinStamp;
-            let inner = unsafe { (*p).inner };
-            unsafe {
-                *self.word.get() = inner;
-            }
-            self.set_packed_forwarded(packed);
-            let new_inner = self.word();
-            unsafe {
-                (*p).inner = new_inner;
-                *self.word.get() = w;
-            }
-            return;
-        }
-        if is_thin_fwd_box(w) {
-            let p = box_payload(w) as *mut ThinFwd;
-            unsafe {
-                let old = (*p).forwarded;
-                if packed == 0 {
-                    let thin = free_thin_fwd(p).thin;
-                    crate::forwarding::drop_packed_forwarded(old);
-                    *self.word.get() = thin;
-                } else {
-                    (*p).forwarded = packed;
-                    crate::forwarding::drop_packed_forwarded(old);
-                }
-            }
-            return;
-        }
-        if w & SLOT_BOX_BIT != 0 {
-            // Mutate the existing DescrWords. Do not take/rebox: that
-            // minted a second 24 B on every descr-bearing set_forwarded.
-            let p = box_payload(w) as *mut DescrWords;
-            unsafe {
-                match (*p).hi {
-                    FWD_TAG => {
-                        crate::forwarding::drop_packed_forwarded((*p).lo as u64);
-                        if packed == 0 {
-                            (*p).lo = 0;
-                            (*p).hi = 0;
-                        } else {
-                            (*p).lo = packed as usize;
-                        }
-                    }
-                    EXTRA_FWD_TAG => {
-                        let slot = &mut *((*p).lo as *mut ExtraFwd);
-                        let old = slot.forwarded;
-                        slot.forwarded = packed;
-                        crate::forwarding::drop_packed_forwarded(old);
-                    }
-                    BOTH_FWD_TAG => {
-                        let slot = &mut *((*p).lo as *mut BothFwd);
-                        let old = slot.forwarded;
-                        slot.forwarded = packed;
-                        crate::forwarding::drop_packed_forwarded(old);
-                    }
-                    DESCR_FWD_TAG => {
-                        let slot = &mut *((*p).lo as *mut DescrFwd);
-                        let old = slot.forwarded;
-                        slot.forwarded = packed;
-                        crate::forwarding::drop_packed_forwarded(old);
-                    }
-                    EXTRA_TAG => {
-                        // `_forwarded = None` must not change the extra
-                        // representation. Boxing ExtraFwd on clear minted a
-                        // 32 B class per descr-bearing op at compile reset.
-                        if packed == 0 {
-                            return;
-                        }
-                        let ep = (*p).lo as *mut OpKindExtra;
-                        let extra = ep.read();
-                        release_extra_slot(ep);
-                        (*p).lo = Box::into_raw(Box::new(ExtraFwd {
-                            extra,
-                            forwarded: packed,
-                        })) as usize;
-                        (*p).hi = EXTRA_FWD_TAG;
-                    }
-                    BOTH_TAG => {
-                        if packed == 0 {
-                            return;
-                        }
-                        let bp = (*p).lo as *mut BothPayload;
-                        let both = bp.read();
-                        release_both_slot(bp);
-                        (*p).lo = Box::into_raw(Box::new(BothFwd {
-                            descr: Some(both.descr),
-                            extra: both.extra,
-                            forwarded: packed,
-                        })) as usize;
-                        (*p).hi = BOTH_FWD_TAG;
-                    }
-                    0 if (*p).lo == 0 => {
-                        if packed != 0 {
-                            (*p).lo = packed as usize;
-                            (*p).hi = FWD_TAG;
-                        }
-                    }
-                    _ => {
-                        if packed == 0 {
-                            return;
-                        }
-                        let descr = descr_arc_from_bits((*p).lo, (*p).hi);
-                        (*p).lo = Box::into_raw(Box::new(DescrFwd {
-                            descr,
-                            forwarded: packed,
-                        })) as usize;
-                        (*p).hi = DESCR_FWD_TAG;
-                    }
-                }
-            }
-            return;
-        }
-        if is_thin_descr(w) {
-            let old = thin_fwd_from_word(w);
-            if packed == 0 {
-                if old != 0 {
-                    crate::forwarding::drop_packed_forwarded(old);
-                    let (lo, hi) = thin_to_lo_hi(w);
-                    let stamp = thin_stamp(w);
-                    // The thin word is abandoned; take the Arc, do not clone.
-                    let descr = descr_arc_from_bits(lo, hi);
-                    unsafe {
-                        *self.word.get() = 0;
-                    }
-                    self.write_parts(Some(descr), None, 0);
-                    if stamp != 0 {
-                        self.set_stamp_word(stamp);
-                    }
-                }
-                return;
-            }
-            if let Some(nw) = thin_with_forwarded(w, packed) {
-                crate::forwarding::drop_packed_forwarded(old);
-                unsafe {
-                    *self.word.get() = nw;
-                }
-                return;
-            }
-            let (lo, hi) = thin_to_lo_hi(w);
-            let stamp = thin_stamp(w);
-            // Boxing ThinFwd overwrites the thin word. Take the encoded
-            // Arc; clone_from_bits would leak it (Codex on write_thin_fwd).
-            let descr = descr_arc_from_bits(lo, hi);
-            crate::forwarding::drop_packed_forwarded(old);
-            unsafe {
-                *self.word.get() = 0;
-            }
-            self.write_parts(Some(descr), None, packed);
-            if stamp != 0 {
-                self.set_stamp_word(stamp);
-            }
-            return;
-        }
-        if is_extra_inline(w) {
-            let p = tagged_ptr(w) as *mut OpKindExtra;
-            let extra = unsafe { p.read() };
-            release_extra_slot(p);
-            unsafe {
-                *self.word.get() = 0;
-            }
-            self.write_parts(None, Some(extra), packed);
-            return;
-        }
-        if is_both_inline(w) {
-            let p = tagged_ptr(w) as *mut BothPayload;
-            let both = unsafe { p.read() };
-            release_both_slot(p);
-            unsafe {
-                *self.word.get() = 0;
-            }
-            self.write_parts(Some(both.descr), Some(both.extra), packed);
-            return;
-        }
-        let stamp = if w != 0 {
-            crate::forwarding::fwd_stamp(w as u64)
-        } else {
-            0
-        };
-        if w != 0 {
-            crate::forwarding::drop_packed_forwarded(w as u64);
-        }
-        debug_assert_eq!(packed & SLOT_BOX_BIT, 0);
-        let packed = crate::forwarding::try_pack_fwd_stamp(packed, stamp).unwrap_or(packed);
-        unsafe {
-            *self.word.get() = packed;
-        }
-        if stamp != 0 && crate::forwarding::fwd_stamp(packed) == 0 {
-            self.set_stamp_word(stamp);
-        }
     }
 
     pub fn borrow(&self) -> Option<DescrRef> {
@@ -3396,8 +2900,8 @@ impl DescrSlot {
     }
 
     pub fn set_descr(&self, v: Option<DescrRef>) {
-        let (_, extra, fwd, stamp) = self.take_parts_full();
-        self.write_parts(v, extra, fwd);
+        let (_, extra, stamp) = self.take_parts_full();
+        self.write_parts(v, extra);
         if stamp != 0 {
             self.set_stamp_word(stamp);
         }
@@ -3414,9 +2918,9 @@ impl DescrSlot {
     }
 
     pub(crate) fn extra_replace(&self, extra: Option<OpKindExtra>) {
-        let (descr, old, fwd, stamp) = self.take_parts_full();
+        let (descr, old, stamp) = self.take_parts_full();
         drop(old);
-        self.write_parts(descr, extra, fwd);
+        self.write_parts(descr, extra);
         if stamp != 0 {
             self.set_stamp_word(stamp);
         }
@@ -3427,49 +2931,32 @@ impl DescrSlot {
     }
 }
 
-unsafe fn decode_descr_extra(lo: usize, hi: usize) -> (Option<DescrRef>, Option<OpKindExtra>, u64) {
+unsafe fn decode_descr_extra(lo: usize, hi: usize) -> (Option<DescrRef>, Option<OpKindExtra>) {
     unsafe {
         if lo == 0 && hi == 0 {
-            (None, None, 0)
+            (None, None)
         } else if hi == EXTRA_TAG {
             let p = lo as *mut OpKindExtra;
             let extra = p.read();
             release_extra_slot(p);
-            (None, Some(extra), 0)
+            (None, Some(extra))
         } else if hi == BOTH_TAG {
             let p = lo as *mut BothPayload;
             let both = p.read();
             release_both_slot(p);
-            (Some(both.descr), Some(both.extra), 0)
-        } else if hi == FWD_TAG {
-            (None, None, lo as u64)
-        } else if hi == DESCR_FWD_TAG {
-            let p = Box::from_raw(lo as *mut DescrFwd);
-            (Some(p.descr), None, p.forwarded)
-        } else if hi == EXTRA_FWD_TAG {
-            let p = Box::from_raw(lo as *mut ExtraFwd);
-            (None, Some(p.extra), p.forwarded)
-        } else if hi == BOTH_FWD_TAG {
-            let p = Box::from_raw(lo as *mut BothFwd);
-            (p.descr, Some(p.extra), p.forwarded)
+            (Some(both.descr), Some(both.extra))
         } else {
-            (Some(descr_arc_from_bits(lo, hi)), None, 0)
+            (Some(descr_arc_from_bits(lo, hi)), None)
         }
     }
 }
 
 unsafe fn peek_descr(lo: usize, hi: usize) -> Option<DescrRef> {
     unsafe {
-        if lo == 0 && hi == 0 {
-            None
-        } else if hi == EXTRA_TAG || hi == FWD_TAG || hi == EXTRA_FWD_TAG {
+        if lo == 0 && hi == 0 || hi == EXTRA_TAG {
             None
         } else if hi == BOTH_TAG {
             Some((*(lo as *const BothPayload)).descr.clone())
-        } else if hi == DESCR_FWD_TAG {
-            Some((*(lo as *const DescrFwd)).descr.clone())
-        } else if hi == BOTH_FWD_TAG {
-            (*(lo as *const BothFwd)).descr.clone()
         } else {
             Some(descr_arc_clone_from_bits(lo, hi))
         }
@@ -3503,10 +2990,6 @@ unsafe fn peek_extra<'a>(lo: usize, hi: usize) -> Option<&'a OpKindExtra> {
             Some(&*(lo as *const OpKindExtra))
         } else if hi == BOTH_TAG {
             Some(&(*(lo as *const BothPayload)).extra)
-        } else if hi == EXTRA_FWD_TAG {
-            Some(&(*(lo as *const ExtraFwd)).extra)
-        } else if hi == BOTH_FWD_TAG {
-            Some(&(*(lo as *const BothFwd)).extra)
         } else {
             None
         }
@@ -3519,10 +3002,6 @@ unsafe fn peek_extra_mut<'a>(lo: usize, hi: usize) -> Option<&'a mut OpKindExtra
             Some(&mut *(lo as *mut OpKindExtra))
         } else if hi == BOTH_TAG {
             Some(&mut (*(lo as *mut BothPayload)).extra)
-        } else if hi == EXTRA_FWD_TAG {
-            Some(&mut (*(lo as *mut ExtraFwd)).extra)
-        } else if hi == BOTH_FWD_TAG {
-            Some(&mut (*(lo as *mut BothFwd)).extra)
         } else {
             None
         }
@@ -3578,63 +3057,9 @@ impl std::fmt::Debug for ExtraSlot {
     }
 }
 
-/// Packed `_forwarded` word (8 B). Decode is [`Forwarded`] on the stack
-/// so `Rc<Op>` leaves the 144-byte class. `InputArg` still owns this
-/// field; `Op` stores the same word on [`DescrSlot`].
+/// Packed `_forwarded` word (8 B). `Op` and `InputArg` each own one
+/// (`AbstractResOpOrInputArg._forwarded`).
 pub struct ForwardedSlot(std::cell::UnsafeCell<u64>);
-
-/// `_forwarded` view over [`DescrSlot`] so `Op` has no extra word.
-pub struct ForwardedView<'a> {
-    slot: &'a DescrSlot,
-}
-
-impl ForwardedView<'_> {
-    #[inline]
-    pub fn borrow(&self) -> crate::forwarding::Forwarded {
-        crate::forwarding::unpack_forwarded(self.slot.packed_forwarded())
-    }
-
-    #[inline]
-    pub fn set(&self, v: crate::forwarding::Forwarded) {
-        self.slot
-            .set_packed_forwarded(crate::forwarding::pack_forwarded(v));
-    }
-
-    #[inline]
-    pub fn borrow_mut(&self) -> ForwardedViewMut<'_> {
-        ForwardedViewMut {
-            slot: self.slot,
-            view: self.borrow(),
-        }
-    }
-}
-
-/// Decoded `_forwarded` that writes back onto [`DescrSlot`] on drop.
-pub struct ForwardedViewMut<'a> {
-    slot: &'a DescrSlot,
-    view: crate::forwarding::Forwarded,
-}
-
-impl std::ops::Deref for ForwardedViewMut<'_> {
-    type Target = crate::forwarding::Forwarded;
-    fn deref(&self) -> &crate::forwarding::Forwarded {
-        &self.view
-    }
-}
-
-impl std::ops::DerefMut for ForwardedViewMut<'_> {
-    fn deref_mut(&mut self) -> &mut crate::forwarding::Forwarded {
-        &mut self.view
-    }
-}
-
-impl Drop for ForwardedViewMut<'_> {
-    fn drop(&mut self) {
-        let view = std::mem::replace(&mut self.view, crate::forwarding::Forwarded::None);
-        self.slot
-            .set_packed_forwarded(crate::forwarding::pack_forwarded(view));
-    }
-}
 
 /// Packed `_forwarded` word of a live `Op`, without cloning the slot.
 ///
@@ -3643,7 +3068,7 @@ impl Drop for ForwardedViewMut<'_> {
 #[inline]
 pub(crate) unsafe fn packed_forwarded_of_op(op: *const Op) -> u64 {
     // SAFETY: the caller holds a strong ref that keeps this Op alive.
-    unsafe { (*op).descr.packed_forwarded() }
+    unsafe { *(*op).forwarded.0.get() }
 }
 
 /// Packed `_forwarded` word of a live `InputArg`, without cloning the slot.
@@ -3789,6 +3214,9 @@ pub struct Op {
     /// writes go through [`DescrSlot`] the way RPython assigns
     /// `op._descr` on the same ResOp every observer sees.
     pub descr: DescrSlot,
+    /// `resoperation.py AbstractResOpOrInputArg._forwarded`. Fresh
+    /// identities start at `None`; [`Clone`] does not copy it.
+    pub forwarded: ForwardedSlot,
     /// `resoperation.py` subclass extras: `GuardResOp._fail_args`,
     /// `fail_arg_types`, `rd_resume_position`, and `VectorOp` /
     /// `VectorGuardOp` vector shape. `PlainResOp` / `ResOpWithDescr`
@@ -3818,6 +3246,7 @@ impl Clone for Op {
             pos_payload: std::cell::Cell::new(0),
             args,
             descr,
+            forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
             extra: ExtraSlot::new(None),
         };
         op.pos().set(self.pos().get());
@@ -3954,6 +3383,7 @@ impl Op {
             pos_payload: std::cell::Cell::new(0),
             args,
             descr: DescrSlot::new(None),
+            forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
             extra: ExtraSlot::new(None),
         }
     }
@@ -3968,6 +3398,7 @@ impl Op {
             pos_payload: std::cell::Cell::new(0),
             args,
             descr: DescrSlot::new(Some(descr)),
+            forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
             extra: ExtraSlot::new(None),
         }
     }
@@ -4034,10 +3465,10 @@ impl Op {
         self.descr.set_stamp_word(pack_stamp(v));
     }
 
-    /// `_forwarded` view. The packed word lives on [`DescrSlot`] so `Op`
-    /// stays in 32 B.
-    pub fn forwarded(&self) -> ForwardedView<'_> {
-        ForwardedView { slot: &self.descr }
+    /// `AbstractResOpOrInputArg._forwarded`.
+    #[inline]
+    pub fn forwarded(&self) -> &ForwardedSlot {
+        &self.forwarded
     }
 
     /// resoperation.py `GuardResOp.rd_resume_position`. `-1` when the
@@ -4105,6 +3536,7 @@ impl Op {
             pos_payload: std::cell::Cell::new(0),
             args,
             descr,
+            forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
             extra: ExtraSlot::new(None),
         };
         newop.pos().set(self.pos().get());
@@ -6335,21 +5767,22 @@ mod tests {
     fn ordinary_op_does_not_embed_guard_failarg_inline_storage() {
         // GuardResOp owns `_fail_args` upstream. A previous SmallVec<[Operand;
         // 3]> in the unified Rust Op made every ordinary operation reserve
-        // three Operand slots: that field measures 72 bytes against the Vec
-        // header's 32, so Op was 280 and is 240. Bound it at what the change
-        // reached, not merely under the old size, or half a regression passes.
+        // three Operand slots. The extra word on `Op` is
+        // `AbstractResOpOrInputArg._forwarded` (`ForwardedSlot`), beside
+        // the descr word. Bound it at the measured size, not merely under
+        // the old size, or half a regression passes.
         #[cfg(target_pointer_width = "64")]
         {
             let op = std::mem::size_of::<Op>();
             let rc_box = op + 2 * std::mem::size_of::<usize>();
-            assert!(
-                op <= 32,
-                "Op grew to {op} bytes (RcBox ~{rc_box}); keep the Op payload at 32 B"
+            assert_eq!(
+                op, 40,
+                "Op is {op} bytes (RcBox ~{rc_box}); the extra word is AbstractResOpOrInputArg._forwarded"
             );
             let inner = std::mem::size_of::<OpInner>();
-            assert!(
-                inner <= 40,
-                "OpInner grew to {inner} B; OpRc::new must stay out of the 48-byte class"
+            assert_eq!(
+                inner, 48,
+                "OpInner is {inner} B; the extra word is AbstractResOpOrInputArg._forwarded"
             );
             let extra = std::mem::size_of::<GuardExtra>();
             assert!(
@@ -6376,12 +5809,7 @@ mod tests {
             );
             assert!(
                 std::mem::size_of::<DescrSlot>() <= 8,
-                "DescrSlot grew; forwarded-only must stay an 8 B word"
-            );
-            assert!(
-                std::mem::size_of::<ThinFwd>() <= 16,
-                "ThinFwd grew to {} B; descr+forwarded must stay out of the 24-byte class",
-                std::mem::size_of::<ThinFwd>()
+                "DescrSlot grew; descr/extra/stamp must stay an 8 B word"
             );
             assert!(
                 std::mem::size_of::<ThinStamp>() <= 16,
@@ -6512,12 +5940,12 @@ mod tests {
         op.set_forwarded_const(crate::Const::from_value(Value::Int(-1)));
         assert!(
             matches!(
-                op.forwarded().borrow(),
+                op.forwarded.borrow(),
                 crate::forwarding::Forwarded::SmallConst(_)
             ),
             "i32 ConstInt must pack as SmallConst"
         );
-        assert_eq!(op.forwarded().borrow().const_value(), Some(Value::Int(-1)));
+        assert_eq!(op.forwarded.borrow().const_value(), Some(Value::Int(-1)));
     }
 
     #[test]
@@ -6525,16 +5953,16 @@ mod tests {
         let descr = crate::make_loop_target_descr(1, false);
         let op = Op::with_descr(OpCode::Label, &[], descr.clone());
         assert!(op.has_descr());
-        op.forwarded()
+        op.forwarded
             .set(crate::forwarding::Forwarded::from_const_value(
                 crate::value::Value::Int(7),
             ));
         assert!(op.has_descr());
         assert_eq!(
-            op.forwarded().borrow().const_value(),
+            op.forwarded.borrow().const_value(),
             Some(crate::value::Value::Int(7))
         );
-        op.forwarded().set(crate::forwarding::Forwarded::None);
+        op.forwarded.set(crate::forwarding::Forwarded::None);
         assert!(op.has_descr());
         assert!(op.getdescr().is_some());
     }
@@ -6543,14 +5971,14 @@ mod tests {
     fn descr_forwarded_and_stamp_roundtrip_together() {
         let descr = crate::make_loop_target_descr(2, false);
         let op = Op::with_descr(OpCode::Label, &[], descr);
-        op.forwarded()
+        op.forwarded
             .set(crate::forwarding::Forwarded::from_const_value(
                 crate::value::Value::Int(3),
             ));
         op.set_value(crate::value::Value::Int(9));
         assert!(op.has_descr());
         assert_eq!(
-            op.forwarded().borrow().const_value(),
+            op.forwarded.borrow().const_value(),
             Some(crate::value::Value::Int(3))
         );
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(9)));
@@ -6639,8 +6067,6 @@ mod tests {
             super::THIN_STAMPED_ID_LIMIT as usize,
             1,
             stamp,
-            0,
-            0,
             |_, _| installed = true,
         )
         .is_none();
@@ -6664,18 +6090,18 @@ mod tests {
     fn small_stamp_on_intbound_forwarded_stays_in_the_word() {
         let op = Op::new(OpCode::IntAdd, &[]);
         op.set_value(crate::value::Value::Int(1));
-        op.forwarded().set(crate::forwarding::Forwarded::Info(
+        op.forwarded.set(crate::forwarding::Forwarded::Info(
             crate::op_info::OpInfo::int_bound(crate::intbound::IntBound::from_constant(7)),
         ));
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(1)));
         assert!(matches!(
-            op.forwarded().borrow(),
+            op.forwarded.borrow(),
             crate::forwarding::Forwarded::Info(crate::op_info::OpInfo::IntBound(_))
         ));
         op.set_value(crate::value::Value::Int(0));
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(0)));
         assert!(matches!(
-            op.forwarded().borrow(),
+            op.forwarded.borrow(),
             crate::forwarding::Forwarded::Info(crate::op_info::OpInfo::IntBound(_))
         ));
     }
@@ -6686,9 +6112,8 @@ mod tests {
         let before = std::sync::Arc::strong_count(&descr);
         {
             let op = Op::with_descr(OpCode::GetfieldGcI, &[], descr.clone());
-            // SmallConst does not fit in the thin word, so write_thin_fwd
-            // boxes ThinFwd. Drop must release the encoded Arc.
-            op.forwarded()
+            // Drop must release the descr Arc and the forwarded payload.
+            op.forwarded
                 .set(crate::forwarding::Forwarded::SmallConst(0));
         }
         assert_eq!(std::sync::Arc::strong_count(&descr), before);
@@ -6699,20 +6124,20 @@ mod tests {
         let descr = crate::make_loop_target_descr(4, false);
         let op = Op::with_descr(OpCode::GetfieldGcI, &[], descr);
         op.set_value(crate::value::Value::Int(1));
-        op.forwarded().set(crate::forwarding::Forwarded::Info(
+        op.forwarded.set(crate::forwarding::Forwarded::Info(
             crate::op_info::OpInfo::int_bound(crate::intbound::IntBound::from_constant(7)),
         ));
         assert!(op.has_descr());
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(1)));
         assert!(matches!(
-            op.forwarded().borrow(),
+            op.forwarded.borrow(),
             crate::forwarding::Forwarded::Info(crate::op_info::OpInfo::IntBound(_))
         ));
         op.set_value(crate::value::Value::Int(0));
         assert!(op.has_descr());
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(0)));
         assert!(matches!(
-            op.forwarded().borrow(),
+            op.forwarded.borrow(),
             crate::forwarding::Forwarded::Info(crate::op_info::OpInfo::IntBound(_))
         ));
     }
@@ -6721,19 +6146,19 @@ mod tests {
     fn small_stamp_then_smallconst_forwarded_stays_in_the_word() {
         let op = Op::new(OpCode::IntAdd, &[]);
         op.set_value(crate::value::Value::Int(1));
-        op.forwarded()
+        op.forwarded
             .set(crate::forwarding::Forwarded::from_const_value(
                 crate::value::Value::Int(9),
             ));
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(1)));
         assert_eq!(
-            op.forwarded().borrow().const_value(),
+            op.forwarded.borrow().const_value(),
             Some(crate::value::Value::Int(9))
         );
         op.set_value(crate::value::Value::Int(0));
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(0)));
         assert_eq!(
-            op.forwarded().borrow().const_value(),
+            op.forwarded.borrow().const_value(),
             Some(crate::value::Value::Int(9))
         );
     }
@@ -6785,6 +6210,7 @@ mod tests {
                 pos_payload: std::cell::Cell::new(0),
                 args: __args,
                 descr: $descr,
+                forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
                 extra: $extra,
             };
             __op.type_ = __op.opcode.result_type();
@@ -8512,21 +7938,16 @@ mod tests {
 
     #[test]
     fn intern_thin_stamped_reuses_id_and_roundtrips_fields() {
-        let id_a =
-            intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_3333, 2).expect("intern first key");
-        let id_a_again =
-            intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_3333, 2).expect("intern same key");
+        let id_a = intern_thin_stamped(3, 0xABCDEF01).expect("intern first key");
+        let id_a_again = intern_thin_stamped(3, 0xABCDEF01).expect("intern same key");
         assert_eq!(id_a, id_a_again);
 
-        let id_b =
-            intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_4444, 2).expect("intern different key");
+        let id_b = intern_thin_stamped(4, 0xABCDEF01).expect("intern different key");
         assert_ne!(id_a, id_b);
 
-        let word = (id_a << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT;
+        let word = (id_a << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT;
         let e = thin_stamped_at(word).expect("reader path");
         assert_eq!(e.vtable, 3);
         assert_eq!(e.stamp, 0xABCDEF01);
-        assert_eq!(e.data, 0x1111_2222_3333);
-        assert_eq!(e.fwd_tag, 2);
     }
 }

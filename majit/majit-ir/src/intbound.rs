@@ -1358,10 +1358,10 @@ impl std::fmt::Display for IntBound {
 }
 
 /// Shared-identity `IntBound` handle. `getintbound` / `setintbound`
-/// mint through [`IntBoundRc::new`]. A one-word refcount (no `Weak`)
-/// in reserved chunks so the first install leaves the 56-byte
-/// `RcBox<RefCell<IntBound>>` class. Clone is a count bump; the last
-/// drop returns the slot to the chunk free list.
+/// mint through [`IntBoundRc::new`]. A one-word refcount (no `Weak`).
+/// The count is a `Cell`, so a handle stays on the allocating thread
+/// and each value is an ordinary allocation. Clone is a count bump;
+/// the last drop frees the allocation.
 pub struct IntBoundRc {
     ptr: std::ptr::NonNull<IntBoundInner>,
 }
@@ -1372,47 +1372,16 @@ struct IntBoundInner {
     value: std::cell::RefCell<IntBound>,
 }
 
-const INT_BOUND_CHUNK: usize = 256;
-
-struct IntBoundHeap {
-    chunks: Vec<(*mut IntBoundInner, usize)>,
-    free: Vec<std::ptr::NonNull<IntBoundInner>>,
-}
-
-unsafe impl Send for IntBoundHeap {}
-unsafe impl Sync for IntBoundHeap {}
-
-static INT_BOUND_HEAP: std::sync::Mutex<IntBoundHeap> = std::sync::Mutex::new(IntBoundHeap {
-    chunks: Vec::new(),
-    free: Vec::new(),
-});
-
 fn alloc_int_bound_inner() -> std::ptr::NonNull<IntBoundInner> {
-    let mut heap = INT_BOUND_HEAP.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(p) = heap.free.pop() {
-        return p;
-    }
-    if let Some((base, used)) = heap.chunks.last_mut()
-        && *used < INT_BOUND_CHUNK
-    {
-        let p = unsafe { std::ptr::NonNull::new_unchecked((*base).add(*used)) };
-        *used += 1;
-        return p;
-    }
-    let layout =
-        std::alloc::Layout::array::<IntBoundInner>(INT_BOUND_CHUNK).expect("IntBoundInner chunk");
-    let base = unsafe { std::alloc::alloc(layout) as *mut IntBoundInner };
-    assert!(!base.is_null(), "IntBoundInner chunk alloc failed");
-    heap.chunks.push((base, 1));
+    let layout = std::alloc::Layout::new::<IntBoundInner>();
+    let base = unsafe { std::alloc::alloc(layout) }.cast::<IntBoundInner>();
+    assert!(!base.is_null(), "IntBoundInner alloc failed");
     unsafe { std::ptr::NonNull::new_unchecked(base) }
 }
 
 fn free_int_bound_inner(p: std::ptr::NonNull<IntBoundInner>) {
-    INT_BOUND_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
+    let layout = std::alloc::Layout::new::<IntBoundInner>();
+    unsafe { std::alloc::dealloc(p.as_ptr().cast(), layout) };
 }
 
 impl IntBoundRc {
