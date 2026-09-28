@@ -2997,6 +2997,17 @@ fn mark_stacks(code: &CodeObject, len: usize) -> Vec<i64> {
                         stacks[j] = next_stack;
                     }
                 }
+                // The for-loop iterator is one slot here (`GET_ITER` above):
+                // `end_for` leaves the stack alone and `pop_iter` pops that
+                // one slot, where `stack_effect` counts the iterator/index
+                // pair of the bytecode's own stack model.
+                Instruction::EndFor => {
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::PopIter => {
+                    next_stack = mark_pop_value(next_stack);
+                    stacks[next_i] = next_stack;
+                }
                 Instruction::EndAsyncFor => {
                     next_stack = mark_pop_value(mark_pop_value(next_stack));
                     stacks[next_i] = next_stack;
@@ -7340,7 +7351,7 @@ mod tests {
 
     use super::{
         MARK_EMPTY_STACK, MARK_UNINITIALIZED, StackKind, mark_compatible_stack,
-        mark_first_line_not_before, mark_lines, mark_stacks,
+        mark_first_line_not_before, mark_lines, mark_push_value, mark_stacks,
     };
 
     #[test]
@@ -7388,6 +7399,34 @@ mod tests {
             saw_iterator_slot,
             "a for-loop's abstract stacks should contain an Iterator slot"
         );
+    }
+
+    #[test]
+    fn mark_stacks_after_inner_loop_keeps_outer_iterator() {
+        // The statement after an inner loop still runs inside the outer one,
+        // so its entry stack is exactly the outer loop's iterator.
+        let code = crate::compile_exec(
+            "for i in [1]:
+    for j in [2]:
+        pass
+    x = 6
+x = 7
+",
+        )
+        .expect("compile");
+        let len = code.instructions.len();
+        let stacks = mark_stacks(&code, len);
+        let first = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
+        let lines = mark_lines(&code, first, len);
+        let entry = |line: i32| {
+            (0..len)
+                .find(|&pc| lines[pc] == line)
+                .map(|pc| stacks[pc])
+                .expect("line has a start")
+        };
+        let outer = mark_push_value(MARK_EMPTY_STACK, StackKind::Iterator);
+        assert_eq!(entry(4), outer);
+        assert_eq!(entry(5), MARK_EMPTY_STACK);
     }
 
     #[test]
