@@ -36942,13 +36942,6 @@ pub fn slice_array_type_id(spelling: &str) -> Option<String> {
         return Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string());
     }
     if reader_scalar_spelling(element) {
-        // `[u8]` is the length-prefixed bytes GcArray. A Rust `&[u8]` is a
-        // raw `{ptr, len}` view reached by pointer arithmetic, so it names
-        // `*const [u8]`, the identity `nolength_from_array_type_id` answers
-        // true for. One identity has one nolength.
-        if element == "u8" {
-            return Some("*const [u8]".to_string());
-        }
         return Some(format!("[{element}]"));
     }
     slice_element_spelling(normalized).map(|_| normalized.to_string())
