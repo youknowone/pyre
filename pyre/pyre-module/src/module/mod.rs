@@ -103,8 +103,6 @@ pub mod syslog;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod termios;
 pub mod unicodedata;
-#[cfg(windows)]
-pub mod winreg;
 #[allow(non_snake_case)]
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod winsound;

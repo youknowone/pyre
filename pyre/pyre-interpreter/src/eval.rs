@@ -365,6 +365,28 @@ pub extern "C" fn frame_anchor_live_method_jit_abi(anchor: i64) -> i64 {
     anchor.live() as i64
 }
 
+/// Forward one reference field, skipping the unset ones.
+///
+/// Upstream tests the slot before it invokes the visitor on either side of the
+/// walk: `walk_stack_root` (shadowstack.py) reads the slot and calls `invoke`
+/// only `if content:`, and `trace` / `_trace_slow_path` reach `callback`
+/// through `points_to_valid_gc_object` (base.py).  The raw walkers below name a
+/// fixed field list per carrier rather than a computed offset table, and on a
+/// builtin function most of that list is unset — no closure, no defaults, no
+/// annotations, no `__dict__` — so the test belongs here, ahead of the
+/// visitor's indirect call and of the heap-membership probe behind it.  The
+/// major root walk of a bare `print(1)` visited 39,360 empty slots out of
+/// 60,341 roots before this.
+#[inline]
+fn visit_slot(slot: &mut PyObjectRef, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    if slot.is_null() {
+        return;
+    }
+    // The cast reinterprets one machine word in place, the same spelling every
+    // caller below uses for its own fields.
+    visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+}
+
 /// rpython/memory/gctransform/framework.py `root_walker.walk_roots` parity:
 /// expose every live slot of `PyFrame.locals_cells_stack_w` on the active
 /// f_backref chain as a GC root.
@@ -415,25 +437,25 @@ unsafe fn walk_raw_function_roots(
         // rename installs no root at all. A managed function reaches the same
         // field through `FUNCTION_GC_TYPE_ID`'s offsets, which is why the gap
         // showed up on immortal functions alone.
-        visitor(&mut *(&mut func.w_name as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.closure as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.defs_w as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_kw_defs as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_module as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_func_globals_obj as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_builtins as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_ann as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_annotate as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_func_dict as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_typeparams as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_doc as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_objclass as *mut PyObjectRef as *mut majit_ir::GcRef));
-        visitor(&mut *(&mut func.w_text_signature as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visit_slot(&mut func.w_name, visitor);
+        visit_slot(&mut func.closure, visitor);
+        visit_slot(&mut func.defs_w, visitor);
+        visit_slot(&mut func.w_kw_defs, visitor);
+        visit_slot(&mut func.w_module, visitor);
+        visit_slot(&mut func.w_func_globals_obj, visitor);
+        visit_slot(&mut func.w_builtins, visitor);
+        visit_slot(&mut func.w_ann, visitor);
+        visit_slot(&mut func.w_annotate, visitor);
+        visit_slot(&mut func.w_func_dict, visitor);
+        visit_slot(&mut func.w_typeparams, visitor);
+        visit_slot(&mut func.w_doc, visitor);
+        visit_slot(&mut func.w_qualname, visitor);
+        visit_slot(&mut func.w_objclass, visitor);
+        visit_slot(&mut func.w_text_signature, visitor);
         // BuiltinFunction.w_moduleobj is an ordinary movable module reference.
         // Builtin functions are immortal, so only this raw-root walker can
         // forward the slot during a collection.
-        visitor(&mut *(&mut func.w_moduleobj as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visit_slot(&mut func.w_moduleobj, visitor);
     }
 }
 
@@ -687,14 +709,14 @@ unsafe fn walk_raw_getset_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut
         // a positive `if` rather than negating `is_getset_property`.
         if pyre_object::typedef::is_getset_property(value) {
             let d = &mut *(value as *mut pyre_object::typedef::GetSetProperty);
-            visitor(&mut *(&mut d.fget as *mut PyObjectRef as *mut majit_ir::GcRef));
-            visitor(&mut *(&mut d.fset as *mut PyObjectRef as *mut majit_ir::GcRef));
-            visitor(&mut *(&mut d.fdel as *mut PyObjectRef as *mut majit_ir::GcRef));
-            visitor(&mut *(&mut d.doc as *mut PyObjectRef as *mut majit_ir::GcRef));
-            visitor(&mut *(&mut d.reqcls as *mut PyObjectRef as *mut majit_ir::GcRef));
-            visitor(&mut *(&mut d.name as *mut PyObjectRef as *mut majit_ir::GcRef));
-            visitor(&mut *(&mut d.w_objclass as *mut PyObjectRef as *mut majit_ir::GcRef));
-            visitor(&mut *(&mut d.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
+            visit_slot(&mut d.fget, visitor);
+            visit_slot(&mut d.fset, visitor);
+            visit_slot(&mut d.fdel, visitor);
+            visit_slot(&mut d.doc, visitor);
+            visit_slot(&mut d.reqcls, visitor);
+            visit_slot(&mut d.name, visitor);
+            visit_slot(&mut d.w_objclass, visitor);
+            visit_slot(&mut d.w_qualname, visitor);
             // The getters are functions whose own children (code / globals /
             // defaults) must stay reachable as well.
             walk_raw_function_roots(d.fget, visitor);
@@ -1554,6 +1576,9 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     unsafe {
         {
             let mut forward_declaration = |slot: &mut PyObjectRef| {
+                if slot.is_null() {
+                    return;
+                }
                 visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
                 walk_raw_function_roots(*slot, visitor);
                 walk_raw_getset_roots(*slot, visitor);
@@ -1569,6 +1594,9 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             pyre_object::typedef::walk_typedef_roots(&mut forward_declaration);
         }
         let mut forward = |slot: &mut PyObjectRef| {
+            if slot.is_null() {
+                return;
+            }
             visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
             walk_raw_function_roots(*slot, visitor);
             walk_raw_getset_roots(*slot, visitor);
@@ -6684,14 +6712,25 @@ result = (
     /// half-wired again.
     #[test]
     fn walk_raw_function_roots_covers_every_declared_gc_offset() {
-        // A zeroed `Function` is a valid subject: the walk hands each slot to
-        // the visitor as a pointer, and null is the legitimate "not stamped
-        // yet" value. Only `ob_type` has to be real, because `is_function`
-        // gates the walk on pointer identity with `FUNCTION_TYPE`.
+        // A zeroed `Function` carries a real `ob_type` and nothing else:
+        // `is_function_carrier` gates the walk on pointer identity with
+        // `FUNCTION_TYPE`.
         let mut func: crate::function::Function =
             unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         func.ob.ob_type = &crate::function::FUNCTION_TYPE as *const _;
-        let base = &func as *const crate::function::Function as usize;
+        let base = &mut func as *mut crate::function::Function as usize;
+        // Every declared slot but `code` is then stamped non-null, because
+        // `visit_slot` skips an unset reference and a zeroed carrier would
+        // report no coverage at all. The walk hands each of those slots to the
+        // visitor as a pointer and dereferences none of them, so the carrier's
+        // own address serves; `code` stays null because `walk_raw_code_roots`
+        // does follow it.
+        let code_offset = std::mem::offset_of!(crate::function::Function, code);
+        for &offset in crate::function::FUNCTION_GC_PTR_OFFSETS.iter() {
+            if offset != code_offset {
+                unsafe { *((base + offset) as *mut usize) = base };
+            }
+        }
 
         let mut seen: Vec<usize> = Vec::new();
         {

@@ -420,13 +420,24 @@ CARGO_CONFIG = {
         # that module's cases, and `test_importlib.extension` skips too.
         # `pyre-module` is a pyrex default that `--no-default-features` drops;
         # without it the binary lacks the builtin modules the product ships.
-        "extra": ["--no-default-features", "--features", "dynasm,cpyext,pyre-module"],
+        # `mimalloc` is a default for the same reason and drops the same way,
+        # and it is the global allocator every frame allocation goes through
+        # (`FrameBox::new` -> `external_malloc(alloc_young=True)`): leaving it
+        # out measured a no-argument Python call at 541 ns against 381 ns with
+        # it, so a binary without it gates a slower interpreter than the one
+        # the release ships.  `scripts/build-jit-core.sh` already passes it.
+        "extra": [
+            "--no-default-features",
+            "--features",
+            "dynasm,cpyext,pyre-module,mimalloc",
+        ],
         "bin": "pyre-dynasm",
     },
     "cranelift": {
         # The core: no `pyre-module`, so its build neither compiles nor
-        # translates the builtin modules that crate owns.
-        "extra": ["--no-default-features", "--features", "cranelift"],
+        # translates the builtin modules that crate owns.  `mimalloc` for the
+        # reason the dynasm leg gives, and so both legs measure one allocator.
+        "extra": ["--no-default-features", "--features", "cranelift,mimalloc"],
         "bin": "pyre-cranelift",
     },
     # The wasm backend is not a `pyrex` binary: it is the wasm32 build of
@@ -1243,6 +1254,29 @@ def _jit_panic_reason(stderr):
             except ValueError:
                 pass
     return None
+
+
+BOOTSTRAP_FAILURE_MARKER = "pyre: importlib bootstrap failed:"
+
+
+def _importlib_bootstrap_failure(stderr):
+    """Return the reported reason if *stderr* says the importlib bootstrap
+    failed, else None.
+
+    `init_importlib_bootstrap` failing is non-fatal in the interpreter by
+    design: a build with no reachable stdlib keeps serving imports from the
+    native importer, the minimal-importer role. Under this script the stdlib is
+    always reachable, so the only way to reach it is a builtin module the
+    bootstrap needs and the binary does not have, and every number measured
+    afterwards describes the fallback rather than the product.
+    """
+    if not stderr:
+        return None
+    for line in stderr.splitlines():
+        if line.startswith(BOOTSTRAP_FAILURE_MARKER):
+            return line.strip()
+    return None
+
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -4302,14 +4336,35 @@ class Check:
         for backend in ALL_BACKENDS:
             if self.enabled(backend):
                 try:
-                    subprocess.run(
+                    # stderr is captured, not inherited: this is the one run per
+                    # backend that happens before any fixture, so it is where a
+                    # binary that cannot bootstrap its own import machinery has
+                    # to be caught. Nothing else reads a warmup's stderr, and it
+                    # carried the `[jit-stats]` dump into the log for no reader.
+                    warm = subprocess.run(
                         [self._pyre(backend), script],
                         stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
                         timeout=30,
                         env=pyre_env(),
                     )
                 except Exception:
-                    pass
+                    continue
+                reason = _importlib_bootstrap_failure(
+                    warm.stderr.decode("utf-8", "replace")
+                )
+                if reason:
+                    print(red("BOOTSTRAP"))
+                    print(f"  {backend}: {reason}")
+                    print("  The interpreter falls back to the native importer "
+                          "when this happens, so every fixture on this backend "
+                          "runs a different import path than the other backends "
+                          "and its jit-stats are not comparable to theirs.")
+                    print("  The missing builtin module names the defect: this "
+                          "backend's feature set has to carry whatever "
+                          "`importlib._bootstrap_external` imports on this "
+                          "platform.")
+                    sys.exit(1)
         print(dim("done"))
 
     # ── single-backend bench run ──
