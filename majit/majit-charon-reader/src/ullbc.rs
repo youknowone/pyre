@@ -89,14 +89,23 @@ impl FunDecl {
             .map(|p| p.unstructured)
     }
 
-    /// Whether [`Self::unstructured`] returns `Some`.
+    /// Whether the body is the `Unstructured` variant, the one
+    /// [`Self::unstructured`] projects.
     ///
     /// Call lowering asks this of a callee at every call site; the answer is
-    /// a property of the declaration, so the body is parsed for it once.
+    /// a property of the declaration, so it is decided once, from the
+    /// variant tag alone: the basic blocks are skipped, not built.
     pub fn has_unstructured_body(&self) -> bool {
-        *self
-            .has_unstructured_body
-            .get_or_init(|| self.unstructured().is_some())
+        *self.has_unstructured_body.get_or_init(|| {
+            #[derive(Deserialize)]
+            struct Proj {
+                #[serde(rename = "Unstructured")]
+                _unstructured: serde::de::IgnoredAny,
+            }
+            self.body
+                .as_ref()
+                .is_some_and(|body| serde_json::from_str::<Proj>(body.get()).is_ok())
+        })
     }
 
     /// Source name of the first argument local (local index 1; index 0 is the
@@ -969,7 +978,9 @@ impl BasicBlock {
     /// Replace the raw terminator kind, forgetting the projection of the
     /// old one so the next [`term`](Self::term) reads the new kind.
     pub fn set_terminator_kind(&mut self, kind: Value) {
-        self.terminator.kind = kind;
+        self.terminator.kind =
+            serde_json::value::to_raw_value(&kind).expect("a JSON value serializes");
+        self.terminator.value_cache = OnceLock::from(kind);
         self.term_cache = OnceLock::new();
     }
 
@@ -985,31 +996,55 @@ impl BasicBlock {
 /// after the call rather than at it.
 #[derive(Debug, Deserialize)]
 pub struct Terminator {
-    /// Raw terminator-kind JSON. Project to [`TermKind`] via
+    /// Raw terminator-kind JSON text. Project to [`TermKind`] via
     /// [`BasicBlock::term`] so a parse error on a single terminator does
-    /// not poison the whole function.
-    pub kind: Value,
+    /// not poison the whole function; [`Terminator::kind_value`] is the
+    /// untyped tree.
+    pub kind: Box<RawValue>,
     /// Optional for the same reason `kind` is projected rather than typed:
     /// a terminator missing its span costs the caller a fallback, and
     /// should not cost the body its parse. Charon writes one on every
     /// terminator, so this is `Some` for an artefact it produced.
     #[serde(default)]
     pub span: Option<SpanRef>,
+    /// [`Terminator::kind_value`], parsed on first query.
+    #[serde(skip)]
+    value_cache: OnceLock<Value>,
+}
+
+impl Terminator {
+    /// The terminator kind as an untyped JSON tree, parsed on first query.
+    pub fn kind_value(&self) -> &Value {
+        self.value_cache.get_or_init(|| {
+            serde_json::from_str(self.kind.get()).expect("raw kind is a parsed JSON value")
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Statement {
-    /// Raw statement-kind JSON.
-    pub kind: Value,
+    /// Raw statement-kind JSON text. [`Statement::stmt_kind`] parses the
+    /// typed kind from it; [`Statement::kind_value`] is the untyped tree.
+    pub kind: Box<RawValue>,
     pub span: SpanRef,
     /// First successful or failed projection of [`kind`](Self::kind).
     /// Later [`stmt_kind`](Self::stmt_kind) calls clone this value instead
     /// of parsing the raw JSON again.
     #[serde(skip)]
     stmt_cache: OnceLock<Result<StmtKind, String>>,
+    /// [`Statement::kind_value`], parsed on first query.
+    #[serde(skip)]
+    value_cache: OnceLock<Value>,
 }
 
 impl Statement {
+    /// The statement kind as an untyped JSON tree, parsed on first query.
+    pub fn kind_value(&self) -> &Value {
+        self.value_cache.get_or_init(|| {
+            serde_json::from_str(self.kind.get()).expect("raw kind is a parsed JSON value")
+        })
+    }
+
     /// Project to the typed [`StmtKind`] enum.
     ///
     /// The projection is stored on the statement. Every later call returns
@@ -1028,8 +1063,8 @@ impl Statement {
 
     fn stmt_cached(&self) -> &Result<StmtKind, String> {
         self.stmt_cache.get_or_init(|| {
-            serde_json::from_value::<StmtKind>(self.kind.clone())
-                .map_err(|e| format!("{e}; raw kind: {}", self.kind))
+            let kind = self.kind.get();
+            serde_json::from_str::<StmtKind>(kind).map_err(|e| format!("{e}; raw kind: {kind}"))
         })
     }
 }
@@ -1206,13 +1241,25 @@ pub enum TermKind {
     Unknown,
 }
 
-fn decode_term_kind(kind: &Value, llbc: &crate::Llbc) -> Result<TermKind, String> {
-    if let Some(sw) = kind.get("Switch")
-        && sw.get("data").is_some()
-    {
-        return decode_switch(sw, llbc).map_err(|e| format!("{e}; raw kind: {kind}"));
-    }
-    let mut term = TermKind::deserialize(kind).map_err(|e| format!("{e}; raw kind: {kind}"))?;
+fn decode_term_kind(kind: &RawValue, llbc: &crate::Llbc) -> Result<TermKind, String> {
+    let raw = kind.get();
+    // Only a `Switch` can carry `data`, whose arm constants are read off
+    // the dedup tables; every other kind parses straight from the text.
+    let is_switch = raw
+        .trim_start()
+        .strip_prefix('{')
+        .is_some_and(|rest| rest.trim_start().starts_with("\"Switch\""));
+    let mut term = if is_switch {
+        let kind: Value = serde_json::from_str(raw).map_err(|e| format!("{e}; raw kind: {raw}"))?;
+        if let Some(sw) = kind.get("Switch")
+            && sw.get("data").is_some()
+        {
+            return decode_switch(sw, llbc).map_err(|e| format!("{e}; raw kind: {kind}"));
+        }
+        TermKind::deserialize(&kind).map_err(|e| format!("{e}; raw kind: {kind}"))?
+    } else {
+        serde_json::from_str(raw).map_err(|e| format!("{e}; raw kind: {raw}"))?
+    };
     match &mut term {
         TermKind::Call {
             call:
@@ -1504,7 +1551,10 @@ mod tests {
                 "on_unwind": 2
             }})
         };
-        let generics_of = |kind: &Value| match decode_term_kind(kind, &llbc) {
+        let generics_of = |kind: &Value| match decode_term_kind(
+            &serde_json::value::to_raw_value(kind).expect("a JSON value serializes"),
+            &llbc,
+        ) {
             Ok(TermKind::Call {
                 call:
                     CallPayload {

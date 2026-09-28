@@ -16,18 +16,20 @@ fn main() {
         for bb in &u.body {
             for st in &bb.statements {
                 if let Err(e) = st.stmt_kind() {
-                    let outer = outer_key(&st.kind);
+                    let outer = outer_key(st.kind_value());
                     let key = format!("[stmt:{outer}] {}", msg(&e));
                     *errors.entry(key.clone()).or_default() += 1;
-                    samples.entry(key).or_insert_with(|| short_sample(&st.kind));
+                    samples
+                        .entry(key)
+                        .or_insert_with(|| short_sample(st.kind_value()));
                 }
             }
             if let Err(e) = bb.term(&llbc) {
-                let raw = bb.terminator.kind.clone();
-                let outer = outer_key(&raw);
+                let raw = bb.terminator.kind_value();
+                let outer = outer_key(raw);
                 let key = format!("[term:{outer}] {}", msg(&e));
                 *errors.entry(key.clone()).or_default() += 1;
-                samples.entry(key).or_insert_with(|| short_sample(&raw));
+                samples.entry(key).or_insert_with(|| short_sample(raw));
             }
         }
     }

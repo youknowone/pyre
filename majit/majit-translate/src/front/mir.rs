@@ -29273,7 +29273,7 @@ impl<'a> RootStackAnalyzer<'a> {
             let mut touches = bb
                 .statements
                 .iter()
-                .any(|stmt| self.analyze_fn_values(&stmt.kind, seen));
+                .any(|stmt| self.analyze_fn_values(stmt.kind_value(), seen));
             // An opener's own call is what its close truncates: a guard
             // constructor's pins land in the bracket this body now holds.
             let opens = owned.opener.values().any(|&open_bb| open_bb == bb_idx);
@@ -29813,7 +29813,7 @@ fn root_pin_value_is_stable(llbc: &Llbc, body: &Unstructured, local: usize) -> b
                     definitions += 1;
                 }
                 if matches!(value, Rvalue::Ref { .. } | Rvalue::RawPtr { .. })
-                    && mentions_local(&stmt.kind, &watched)
+                    && mentions_local(stmt.kind_value(), &watched)
                 {
                     return false;
                 }
@@ -29861,7 +29861,7 @@ fn root_pin_value_is_stable_in_bracket(
         for stmt in &bb.statements {
             if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() {
                 if matches!(value, Rvalue::Ref { .. } | Rvalue::RawPtr { .. })
-                    && mentions_local(&stmt.kind, &watched)
+                    && mentions_local(stmt.kind_value(), &watched)
                 {
                     return false;
                 }
@@ -29922,7 +29922,7 @@ fn root_bracket_stack_effects_are_known(
                 Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Borrowck(_)) => {
                 }
                 Ok(StmtKind::Assign(place, _)) if matches!(place.kind, PlaceKind::Local(_)) => {
-                    if fn_values_touch(&stmt.kind) {
+                    if fn_values_touch(stmt.kind_value()) {
                         return false;
                     }
                 }
@@ -30454,11 +30454,11 @@ fn analyze_root_brackets_with(
                 }
                 _ => {}
             }
-            if mentions_local(&stmt.kind, &watched) {
-                retire_mentioned(&stmt.kind, &watched, &owner, &mut candidates);
+            if mentions_local(stmt.kind_value(), &watched) {
+                retire_mentioned(stmt.kind_value(), &watched, &owner, &mut candidates);
             }
         }
-        let term_kind = &body.body[bb_idx].terminator.kind;
+        let term_kind = body.body[bb_idx].terminator.kind_value();
         match bb.term(llbc) {
             Ok(TermKind::Drop {
                 place:
@@ -31115,7 +31115,7 @@ fn analyze_owner_roots_with(
                 }
                 _ => {}
             }
-            if mentions_local(assert_cond_or_whole(&stmt.kind, false), &watched) {
+            if mentions_local(assert_cond_or_whole(stmt.kind_value(), false), &watched) {
                 return refuse();
             }
         }
@@ -31155,12 +31155,15 @@ fn analyze_owner_roots_with(
                     },
                     OwnerRootCallee::Other => false,
                 };
-                if !accepted && mentions_local(&bb.terminator.kind, &watched) {
+                if !accepted && mentions_local(bb.terminator.kind_value(), &watched) {
                     return refuse();
                 }
             }
             _ => {
-                if mentions_local(assert_cond_or_whole(&bb.terminator.kind, true), &watched) {
+                if mentions_local(
+                    assert_cond_or_whole(bb.terminator.kind_value(), true),
+                    &watched,
+                ) {
                     return refuse();
                 }
             }
@@ -31278,7 +31281,7 @@ fn elaborate_explicit_root_closes(
         let PlaceKind::Local(arg_local) = arg.kind else {
             continue;
         };
-        let mut guard_place = bb.terminator.kind["Call"]["call"]["args"][0]["Move"].clone();
+        let mut guard_place = bb.terminator.kind_value()["Call"]["call"]["args"][0]["Move"].clone();
         let mut cur = arg_local as usize;
         let mut temps = Vec::new();
         let mut moves = Vec::new();
@@ -31297,7 +31300,7 @@ fn elaborate_explicit_root_closes(
             };
             temps.push(cur);
             moves.push(i);
-            guard_place = stmt.kind["Assign"][1]["Use"][0]["Move"].clone();
+            guard_place = stmt.kind_value()["Assign"][1]["Use"][0]["Move"].clone();
             cur = src as usize;
         }
         closes.push(Close {
@@ -31394,11 +31397,11 @@ fn elaborate_explicit_root_closes(
                         stmt.stmt_kind(),
                         Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_))
                     )
-                    && mentions_local(&stmt.kind, &private)
+                    && mentions_local(stmt.kind_value(), &private)
             });
             let term_hit = chain.is_none()
                 && !drop_of(bb).is_some_and(|l| temps.contains(l))
-                && mentions_local(&bb.terminator.kind, &private);
+                && mentions_local(bb.terminator.kind_value(), &private);
             stmt_hit || term_hit
         });
         if mentioned_elsewhere {
@@ -31412,7 +31415,7 @@ fn elaborate_explicit_root_closes(
                         .as_deref()
                         .is_some_and(gc_root_scope_drop_glue_path) =>
             {
-                Some(bb.terminator.kind.clone())
+                Some(bb.terminator.kind_value().clone())
             }
             _ => None,
         }) else {
@@ -31570,9 +31573,9 @@ fn local_move_counts(body: &Unstructured) -> std::collections::HashMap<usize, us
     let mut out = std::collections::HashMap::new();
     for bb in &body.body {
         for stmt in &bb.statements {
-            scan(&stmt.kind, &declared, &mut out);
+            scan(stmt.kind_value(), &declared, &mut out);
         }
-        scan(&bb.terminator.kind, &declared, &mut out);
+        scan(bb.terminator.kind_value(), &declared, &mut out);
     }
     out
 }
@@ -56180,7 +56183,8 @@ mod tests {
         // callee may append or overwrite a slot without borrowing this guard.
         for callee in [5, 6] {
             let mut foreign = body_of(4, 4);
-            foreign.body[2].terminator.kind = call(3, vec![copy(5), copy(1)], 6, 6);
+            foreign.body[2].terminator.kind =
+                serde_json::value::to_raw_value(&call(3, vec![copy(5), copy(1)], 6, 6)).unwrap();
             foreign.body.push(
                 serde_json::from_value(block(vec![], call(callee, vec![copy(1)], 9, 3))).unwrap(),
             );
@@ -56200,7 +56204,8 @@ mod tests {
         // A callee proved to leave the root stack as it found it does not
         // keep the bracket: `ll_append` spans `_ll_resize_ge` this way.
         let mut balanced = body_of(4, 4);
-        balanced.body[2].terminator.kind = call(3, vec![copy(5), copy(1)], 6, 6);
+        balanced.body[2].terminator.kind =
+            serde_json::value::to_raw_value(&call(3, vec![copy(5), copy(1)], 6, 6)).unwrap();
         balanced
             .body
             .push(serde_json::from_value(block(vec![], call(7, vec![copy(1)], 9, 3))).unwrap());
@@ -56255,7 +56260,8 @@ mod tests {
         // A pin saves the value, not the mutable MIR carrier that supplied
         // it. An assignment after the pin must not change get(base).
         let mut reassigned = body_of(4, 4);
-        reassigned.body[2].terminator.kind = call(3, vec![copy(5), copy(1)], 6, 6);
+        reassigned.body[2].terminator.kind =
+            serde_json::value::to_raw_value(&call(3, vec![copy(5), copy(1)], 6, 6)).unwrap();
         reassigned
             .body
             .push(serde_json::from_value(block(vec![], call(5, vec![], 1, 3))).unwrap());
@@ -56278,8 +56284,10 @@ mod tests {
         // The loop's producer returns a new value into _1 each iteration.
         // It is one static definition, so definition counting alone cannot
         // distinguish the first saved value from later ones.
-        repeated.body[1].terminator.kind = call(2, vec![copy(3)], 4, 6);
-        repeated.body[3].terminator.kind = call(4, vec![copy(7), copy(4)], 8, 6);
+        repeated.body[1].terminator.kind =
+            serde_json::value::to_raw_value(&call(2, vec![copy(3)], 4, 6)).unwrap();
+        repeated.body[3].terminator.kind =
+            serde_json::value::to_raw_value(&call(4, vec![copy(7), copy(4)], 8, 6)).unwrap();
         repeated
             .body
             .push(serde_json::from_value(block(vec![], call(5, vec![], 1, 2))).unwrap());
@@ -56319,7 +56327,8 @@ mod tests {
             .unwrap(),
         );
         nested.body.push(pin_outer);
-        nested.body[4].terminator.kind = drop_guard(9, 8);
+        nested.body[4].terminator.kind =
+            serde_json::value::to_raw_value(&drop_guard(9, 8)).unwrap();
         nested
             .body
             .push(serde_json::from_value(block(vec![], drop_guard(2, 5))).unwrap());
@@ -56536,8 +56545,8 @@ mod tests {
         // The restores are the only definitions inside the bracket, so every
         // read there still sees the pinned value.
         let mut restored = body_of(vec![copy(1), copy(2)]);
-        restored.body[3].terminator.kind = call(4, vec![copy(11), copy(12)], 1, 4);
-        restored.body[5].terminator.kind = call(4, vec![copy(14), mv(16)], 2, 6);
+        restored.body[3].set_terminator_kind(call(4, vec![copy(11), copy(12)], 1, 4));
+        restored.body[5].set_terminator_kind(call(4, vec![copy(14), mv(16)], 2, 6));
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &restored,
@@ -56555,8 +56564,8 @@ mod tests {
         // Any other write to a pinned local inside the bracket changes what a
         // later `get` would be answered with.
         let mut clobbered = body_of(vec![copy(1), copy(2)]);
-        clobbered.body[2].terminator.kind = call(5, vec![copy(1)], 1, 3);
-        clobbered.body[3].terminator.kind = call(4, vec![copy(11), copy(12)], 1, 4);
+        clobbered.body[2].set_terminator_kind(call(5, vec![copy(1)], 1, 3));
+        clobbered.body[3].set_terminator_kind(call(4, vec![copy(11), copy(12)], 1, 4));
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &clobbered,
@@ -56574,11 +56583,11 @@ mod tests {
         // open around it.
         let mut free = body_of(vec![mv(19), mv(20)]);
         free.body[1].statements.pop();
-        free.body[1].terminator.kind = call(6, vec![mv(9)], 5, 2);
+        free.body[1].set_terminator_kind(call(6, vec![mv(9)], 5, 2));
         free.body[3].statements.remove(0);
-        free.body[3].terminator.kind = call(7, vec![copy(12)], 13, 4);
+        free.body[3].set_terminator_kind(call(7, vec![copy(12)], 13, 4));
         free.body[4].statements.remove(0);
-        free.body[5].terminator.kind = call(7, vec![mv(16)], 17, 6);
+        free.body[5].set_terminator_kind(call(7, vec![mv(16)], 17, 6));
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &free,
@@ -56598,7 +56607,7 @@ mod tests {
 
         // A read of a slot some other guard's pin filled is not this one's.
         let mut stray = body_of(vec![mv(19), mv(20)]);
-        stray.body[3].terminator.kind = call(7, vec![copy(13)], 18, 4);
+        stray.body[3].set_terminator_kind(call(7, vec![copy(13)], 18, 4));
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &stray,
@@ -56784,7 +56793,9 @@ mod tests {
         unwinding.body.push(
             serde_json::from_value(block(vec![], serde_json::json!("UnwindResume"))).unwrap(),
         );
-        unwinding.body[0].terminator.kind["Call"]["on_unwind"] = serde_json::json!(resume);
+        let mut kind = unwinding.body[0].terminator.kind_value().clone();
+        kind["Call"]["on_unwind"] = serde_json::json!(resume);
+        unwinding.body[0].set_terminator_kind(kind);
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &unwinding,
