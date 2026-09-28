@@ -1021,6 +1021,9 @@ pub(crate) struct CrateLoweringState {
     atomic_load_decls: std::cell::RefCell<
         Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
     >,
+    /// Positional aggregate shapes the built graphs construct, recorded as
+    /// each body is built ([`record_positional_shapes`]).
+    positional_shapes: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 /// One artefact's lowering context: the artefact, the host addresses and
@@ -1186,6 +1189,7 @@ impl CrateLoweringState {
             spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
             skipped: std::cell::RefCell::new(Vec::new()),
             atomic_load_decls: std::cell::RefCell::new(Vec::new()),
+            positional_shapes: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
 }
@@ -1310,6 +1314,7 @@ impl<'l> CrateLowering<'l> {
             dont_look_inside,
             elidable_residual,
             spec,
+            positional_shapes,
             ..
         } = self.state;
         let Self {
@@ -1402,6 +1407,7 @@ impl<'l> CrateLowering<'l> {
                 });
             }
         };
+        record_positional_shapes(&graph, &mut positional_shapes.borrow_mut());
         Ok(header.into_function(graph))
     }
 
@@ -1425,6 +1431,7 @@ impl<'l> CrateLowering<'l> {
             spec,
             skipped,
             atomic_load_decls,
+            positional_shapes,
             ..
         } = self.state;
         let Self {
@@ -1511,6 +1518,7 @@ impl<'l> CrateLowering<'l> {
             }
         };
         graph.name = spec_segments(llbc, fd, &header.name).join("::");
+        record_positional_shapes(&graph, &mut positional_shapes.borrow_mut());
         // `FunctionDesc.cachedgraph` returns the specialized graph of the
         // same function object, so the copy keeps `_jit_look_inside_`.
         // `look_inside_graph` reads that hint off the callee.
@@ -1546,7 +1554,7 @@ impl CrateLoweringState {
         let skipped = self.skipped.take();
         let atomic_load_decls = self.atomic_load_decls.take();
         register_synthetic_positional_metadata(
-            &functions,
+            self.positional_shapes.take(),
             &mut known_struct_names,
             &mut struct_fields,
             &mut struct_field_attrs,
@@ -1847,8 +1855,38 @@ fn should_lower_function(
     function_filter.is_none_or(|names| names.contains(name))
 }
 
+/// Add to `shapes` every shaped MIR tuple or fixed-size array `graph`
+/// constructs, as the graph is built: `rtuple.py` makes a `TUPLE_TYPE` when
+/// the rtyper first meets the `SomeTuple`, not from a whole-program scan.
+fn record_positional_shapes(
+    graph: &FunctionGraph,
+    shapes: &mut std::collections::BTreeSet<String>,
+) {
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target:
+                CallTarget::SyntheticTransparentCtor {
+                    name, owner_path, ..
+                },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if owner_path.is_empty()
+            && args.is_empty()
+            && (majit_ir::descr::is_shaped_tuple_name(name)
+                || majit_ir::descr::is_shaped_array_name(name))
+        {
+            shapes.insert(name.clone());
+        }
+    }
+}
+
 /// Register the low-level struct identity and fields for every shaped MIR
-/// tuple or fixed-size array that survived into a translated graph.
+/// tuple or fixed-size array that survived into a translated graph
+/// ([`record_positional_shapes`]).
 ///
 /// RPython creates one distinct `GcStruct('tupleN', item0, item1, ...)` per
 /// [`SomeTuple`] representation (`rtyper/rtuple.py`), then
@@ -1864,41 +1902,12 @@ fn should_lower_function(
 /// template layout, but positional aggregates do not: item type and arity are
 /// part of their low-level allocation identity.
 fn register_synthetic_positional_metadata(
-    functions: &[crate::front::semantic::SemanticFunction],
+    shapes: std::collections::BTreeSet<String>,
     known_struct_names: &mut std::collections::HashSet<String>,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
     struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
 ) {
-    let mut shapes = std::collections::BTreeSet::new();
-    for function in functions {
-        for op in function
-            .graph()
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-        {
-            let OpKind::Call {
-                target:
-                    CallTarget::SyntheticTransparentCtor {
-                        name, owner_path, ..
-                    },
-                args,
-                ..
-            } = &op.kind
-            else {
-                continue;
-            };
-            if owner_path.is_empty()
-                && args.is_empty()
-                && (majit_ir::descr::is_shaped_tuple_name(name)
-                    || majit_ir::descr::is_shaped_array_name(name))
-            {
-                shapes.insert(name.clone());
-            }
-        }
-    }
-
     for shape in shapes {
         let items = if let Some(inner) = shape
             .strip_prefix("Tuple<")
@@ -51008,25 +51017,14 @@ mod tests {
                 true,
             );
         }
-        let functions = vec![crate::front::semantic::SemanticFunction {
-            name: "array_shapes".into(),
-            graph: crate::model::LazyGraph::built(graph),
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            module_path: String::new(),
-            hints: Vec::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        }];
+        let mut shapes = std::collections::BTreeSet::new();
+        super::record_positional_shapes(&graph, &mut shapes);
         let mut known = std::collections::HashSet::new();
         let mut fields = crate::front::semantic::StructFieldRegistry::default();
         let mut attrs = std::collections::HashMap::new();
         let mut ids = std::collections::HashMap::new();
         super::register_synthetic_positional_metadata(
-            &functions,
+            shapes,
             &mut known,
             &mut fields,
             &mut attrs,
