@@ -127,7 +127,8 @@ pub(crate) fn tyref_is_result_of_carrier(
     }
     let Some(err_slot) = body
         .get("Adt")
-        .and_then(|a| a.get("generics"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| crate::front::mir::type_decl_ref_generics(a, llbc))
         .and_then(|g| g.get("types"))
         .and_then(|t| t.get(1))
     else {
@@ -149,7 +150,8 @@ pub(crate) fn tyref_is_result_of_carrier(
         }
         let Some(inner) = err_body
             .get("Adt")
-            .and_then(|a| a.get("generics"))
+            .and_then(|a| a.as_object())
+            .and_then(|a| crate::front::mir::type_decl_ref_generics(a, llbc))
             .and_then(|g| g.get("types"))
             .and_then(|t| t.get(0))
             .and_then(|slot| ty_json_body(slot, llbc))
@@ -287,7 +289,8 @@ fn result_ok_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::V
         return None;
     }
     body.get("Adt")
-        .and_then(|a| a.get("generics"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| crate::front::mir::type_decl_ref_generics(a, llbc))
         .and_then(|g| g.get("types"))
         .and_then(|t| t.get(0))
 }
@@ -303,7 +306,8 @@ fn result_err_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::
         return None;
     }
     body.get("Adt")
-        .and_then(|a| a.get("generics"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| crate::front::mir::type_decl_ref_generics(a, llbc))
         .and_then(|g| g.get("types"))
         .and_then(|t| t.get(1))
 }
@@ -336,7 +340,8 @@ fn option_payload_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_js
         return None;
     }
     body.get("Adt")
-        .and_then(|a| a.get("generics"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| crate::front::mir::type_decl_ref_generics(a, llbc))
         .and_then(|g| g.get("types"))
         .and_then(|t| t.get(0))
 }

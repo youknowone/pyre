@@ -3196,9 +3196,15 @@ pub(crate) fn graph_name_of(llbc: &Llbc, fd: &FunDecl) -> String {
 
 /// The leaf a Charon-monomorphized copy registers and is called under:
 /// [`crate::front::clause_spec::spec_leaf`] of its template leaf and its
-/// instance arguments.  `None` for an item Charon did not instantiate.
+/// instance arguments.  `None` for an item Charon did not instantiate, and
+/// for an instance with no body in this LLBC: a foreign or std declaration
+/// is one external whatever it is instantiated at, so it keeps the template
+/// path, as an opaque callee does in `enqueue_spec`.
 fn instance_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     let args = fd.item_meta.instantiation()?;
+    if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+        return None;
+    }
     let name = fd.item_meta.name_path();
     let leaf = name.rsplit("::").next().unwrap_or(&name);
     Some(crate::front::clause_spec::spec_leaf(
@@ -10940,7 +10946,8 @@ impl<'a> Lowering<'a> {
             return false;
         }
         let Some(lit) = head
-            .get("generics")
+            .as_object()
+            .and_then(|head| type_decl_ref_generics(head, self.llbc))
             .and_then(|g| g.as_object())
             .and_then(|g| g.get("types"))
             .and_then(|t| t.as_array())
@@ -16842,7 +16849,10 @@ impl<'a> Lowering<'a> {
                             TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
                             TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
                         };
-                        let inner = body.get("Adt")?.get("generics")?.get("types")?.get(0)?;
+                        let inner =
+                            type_decl_ref_generics(body.get("Adt")?.as_object()?, self.llbc)?
+                                .get("types")?
+                                .get(0)?;
                         let inner_ty = serde_json::from_value::<TyRef>(inner.clone()).ok()?;
                         self.tyref_ref_adt_path(&inner_ty)
                     })
@@ -16862,7 +16872,9 @@ impl<'a> Lowering<'a> {
                     // `Option<(usize, I::Item)>` — the inner next yields
                     // `I::Item`, packed into the tuple on the Some arm.
                     let body = if enumerate_next {
-                        body.get("Adt")?.get("generics")?.get("types")?.get(1)?
+                        type_decl_ref_generics(body.get("Adt")?.as_object()?, self.llbc)?
+                            .get("types")?
+                            .get(1)?
                     } else {
                         body
                     };
@@ -21868,11 +21880,11 @@ impl<'a> Lowering<'a> {
     /// node back through [`TyRef`] so deduplicated and inline literal forms use
     /// the same width-atom helpers as top-level signature inputs/outputs.
     fn tyref_adt_type_arg(&self, ty: &TyRef, index: usize) -> Option<TyRef> {
-        let node = tyref_node(ty, self.llbc)?
+        let adt = tyref_node(ty, self.llbc)?
             .as_object()?
             .get("Adt")?
-            .as_object()?
-            .get("generics")?
+            .as_object()?;
+        let node = type_decl_ref_generics(adt, self.llbc)?
             .as_object()?
             .get("types")?
             .as_array()?
@@ -21969,7 +21981,9 @@ impl<'a> Lowering<'a> {
             TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
             TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
         };
-        let inner = body.get("Adt")?.get("generics")?.get("types")?.get(0)?;
+        let inner = type_decl_ref_generics(body.get("Adt")?.as_object()?, self.llbc)?
+            .get("types")?
+            .get(0)?;
         Some(tyref_enum_payload_value_type(
             &TyRef::Other(inner.clone()),
             self.llbc,
@@ -21986,12 +22000,15 @@ impl<'a> Lowering<'a> {
     /// consumes (`rpython/rtyper/rclass.py`).
     fn option_payload_instance_class_root(&self, option_ty: &TyRef) -> Option<String> {
         let payload = strip_ty_indirections(
-            tyref_node(option_ty, self.llbc)?
-                .as_object()?
-                .get("Adt")?
-                .get("generics")?
-                .get("types")?
-                .get(0)?,
+            type_decl_ref_generics(
+                tyref_node(option_ty, self.llbc)?
+                    .as_object()?
+                    .get("Adt")?
+                    .as_object()?,
+                self.llbc,
+            )?
+            .get("types")?
+            .get(0)?,
             self.llbc,
         )?;
         if let Some(root) =
@@ -22051,10 +22068,11 @@ impl<'a> Lowering<'a> {
         // receiver must key the same suffixed root instead of a bare GCREF.
         // Foreign value payloads (`BigInt` / `Wtf8Buf`, no registered root;
         // a non-split enum arg) still bail, keeping them classdef-less.
-        let payload = tyref_node(dest_ty, self.llbc)?
+        let adt = tyref_node(dest_ty, self.llbc)?
             .as_object()?
             .get("Adt")?
-            .get("generics")?
+            .as_object()?;
+        let payload = type_decl_ref_generics(adt, self.llbc)?
             .get("types")?
             .get(0)?;
         let payload_node = strip_ty_wrappers(payload, self.llbc)?;
@@ -22105,10 +22123,11 @@ impl<'a> Lowering<'a> {
         if !self.tyref_is_niche_option_ptr(option_ty) {
             return None;
         }
-        let payload = tyref_node(option_ty, self.llbc)?
+        let adt = tyref_node(option_ty, self.llbc)?
             .as_object()?
             .get("Adt")?
-            .get("generics")?
+            .as_object()?;
+        let payload = type_decl_ref_generics(adt, self.llbc)?
             .get("types")?
             .get(0)?;
         let stripped = strip_ty_wrappers(payload, self.llbc)?;
@@ -23631,7 +23650,8 @@ impl<'a> Lowering<'a> {
         let Some(payload) = tyref_node(option_ty, self.llbc)
             .and_then(|node| node.as_object())
             .and_then(|m| m.get("Adt"))
-            .and_then(|a| a.get("generics"))
+            .and_then(|a| a.as_object())
+            .and_then(|a| type_decl_ref_generics(a, self.llbc))
             .and_then(|g| g.get("types"))
             .and_then(|t| t.as_array())
             .and_then(|t| t.first())
@@ -23724,7 +23744,8 @@ impl<'a> Lowering<'a> {
         let Some(payload) = node
             .as_object()
             .and_then(|m| m.get("Adt"))
-            .and_then(|a| a.get("generics"))
+            .and_then(|a| a.as_object())
+            .and_then(|a| type_decl_ref_generics(a, self.llbc))
             .and_then(|g| g.get("types"))
             .and_then(|t| t.as_array())
             .and_then(|t| t.first())
@@ -32029,7 +32050,8 @@ fn field_ty_is_inline_vec(ty: &TyRef, llbc: &Llbc) -> bool {
     }
     let arity = obj
         .get("Adt")
-        .and_then(|adt| adt.get("generics"))
+        .and_then(|adt| adt.as_object())
+        .and_then(|adt| type_decl_ref_generics(adt, llbc))
         .and_then(|generics| generics.get("types"))
         .and_then(|types| types.as_array())
         .map(|types| types.len());
@@ -33233,9 +33255,7 @@ fn tyref_option_fieldless_niche(ty: &TyRef, llbc: &Llbc) -> Option<FieldlessOpti
         return None;
     }
     let option = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
-    let payload = option
-        .get("Adt")?
-        .get("generics")?
+    let payload = type_decl_ref_generics(option.get("Adt")?.as_object()?, llbc)?
         .get("types")?
         .as_array()?
         .first()?;
@@ -33512,8 +33532,7 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
     if !is_range {
         return false;
     }
-    let elem = adt
-        .get("generics")
+    let elem = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
@@ -33890,9 +33909,7 @@ fn tyref_atomic_arg<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json:
     if !in_atomic_mod {
         return None;
     }
-    let arg = node
-        .get("Adt")?
-        .get("generics")?
+    let arg = type_decl_ref_generics(node.get("Adt")?.as_object()?, llbc)?
         .get("types")?
         .as_array()?
         .first()?;
@@ -33982,8 +33999,7 @@ fn field_is_zst(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     let is_tuple = adt.get("builtin").and_then(|id| id.as_str()) == Some("Tuple");
-    let empty = adt
-        .get("generics")
+    let empty = type_decl_ref_generics(adt, llbc)
         .and_then(|generics| generics.get("types"))
         .and_then(|types| types.as_array())
         .is_some_and(|types| types.is_empty());
@@ -34382,6 +34398,33 @@ pub(crate) fn type_decl_ref_adt_id(
     }
 }
 
+/// The generic arguments of the type a `TypeDeclRef` names.  A
+/// Charon-monomorphized type, tuples included, is a decl of its own whose
+/// references carry no arguments; they are the arguments its name was
+/// instantiated at.
+pub(crate) fn type_decl_ref_generics<'a>(
+    tref: &'a serde_json::Map<String, serde_json::Value>,
+    llbc: &'a Llbc,
+) -> Option<&'a serde_json::Value> {
+    let own = tref.get("generics");
+    let own_has_args = own.is_some_and(|generics| {
+        ["types", "const_generics"].iter().any(|key| {
+            generics
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|args| !args.is_empty())
+        })
+    });
+    if own_has_args {
+        return own;
+    }
+    tref.get("id")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|id| llbc.type_by_id(id))
+        .and_then(|decl| decl.item_meta.instantiation())
+        .or(own)
+}
+
 /// The `builtin` tag of a `TypeDeclRef`: `"Tuple"`, `"Str"` or `"Box"`.
 pub(crate) fn type_decl_ref_builtin(tref: &serde_json::Value) -> Option<&str> {
     tref.get("builtin")?.as_str()
@@ -34396,8 +34439,7 @@ fn adt_node_class_root_with(
 ) -> Option<String> {
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let def_id = adt_node_def_id(node)?;
-    let has_type_args = adt
-        .get("generics")
+    let has_type_args = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
@@ -34805,7 +34847,10 @@ fn type_node_box_pointee<'l>(
         if !is_box {
             return None;
         }
-        return adt.get("generics")?.get("types")?.as_array()?.first();
+        return type_decl_ref_generics(adt, llbc)?
+            .get("types")?
+            .as_array()?
+            .first();
     }
     None
 }
@@ -35442,8 +35487,7 @@ fn tyref_is_tuple(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     let is_tuple = adt.get("builtin").and_then(|i| i.as_str()) == Some("Tuple");
-    let non_empty = adt
-        .get("generics")
+    let non_empty = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
@@ -35460,7 +35504,10 @@ fn tyref_checked_binop_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> 
     if adt.get("builtin").and_then(serde_json::Value::as_str) != Some("Tuple") {
         return None;
     }
-    let types = adt.get("generics")?.as_object()?.get("types")?.as_array()?;
+    let types = type_decl_ref_generics(adt, llbc)?
+        .as_object()?
+        .get("types")?
+        .as_array()?;
     if types.len() != 2 {
         return None;
     }
@@ -35509,8 +35556,7 @@ fn is_unit_type(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     let is_tuple = adt.get("builtin").and_then(|i| i.as_str()) == Some("Tuple");
-    let empty_types = adt
-        .get("generics")
+    let empty_types = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
@@ -36465,7 +36511,7 @@ fn render_adt_type_args(
     llbc: &Llbc,
     depth: usize,
 ) -> Vec<String> {
-    adt.get("generics")
+    type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
@@ -36751,7 +36797,8 @@ fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: &Llbc) -> String {
     };
     let Some(node) = body
         .get("Adt")
-        .and_then(|a| a.get("generics"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| type_decl_ref_generics(a, llbc))
         .and_then(|g| g.get("types"))
         .and_then(|t| t.get(0))
     else {
@@ -37152,7 +37199,7 @@ fn scalar_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<Str
         return None;
     }
     let mut path = crate::model::split_qualified_path(&owner);
-    path.push(method);
+    path.push(instance_leaf(llbc, declaration).unwrap_or(method));
     Some(path)
 }
 
@@ -40729,9 +40776,7 @@ fn substitute_typevar_field(
 ) -> Option<TyRef> {
     let node = tyref_node(field_ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
     if let Some(index) = typevar_bound_index(node) {
-        let arg = owner_adt
-            .get("Adt")?
-            .get("generics")?
+        let arg = type_decl_ref_generics(owner_adt.get("Adt")?.as_object()?, llbc)?
             .get("types")?
             .as_array()?
             .get(index as usize)?;

@@ -951,8 +951,7 @@ fn spec_raw_ptr(rp: &Value, llbc: &Llbc, depth: usize) -> String {
 }
 
 fn spec_adt(adt: &serde_json::Map<String, Value>, llbc: &Llbc, depth: usize) -> String {
-    let (types, consts) = adt
-        .get("generics")
+    let (types, consts) = crate::front::mir::type_decl_ref_generics(adt, llbc)
         .and_then(Value::as_object)
         .map(|args| spec_generic_args(args, llbc, depth))
         .unwrap_or_default();
@@ -1370,7 +1369,7 @@ mod tests {
     fn monomorphized_copy_takes_the_spec_leaf_of_its_template() {
         let ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let args = json!({"regions": [], "types": [ty], "trait_refs": [], "const_generics": []});
-        let decl = |def_id: u64, name: Value| {
+        let decl = |def_id: u64, name: Value, body: Value| {
             json!({
                 "def_id": def_id,
                 "item_meta": {
@@ -1381,9 +1380,10 @@ mod tests {
                     "is_local": true
                 },
                 "signature": {"is_unsafe": false, "inputs": [], "output": ty},
-                "body": null
+                "body": body
             })
         };
+        let unstructured = json!({"Unstructured": null});
         let template = json!([{"Ident": ["fixture", 0]}, {"Ident": ["m", 0]}, {"Ident": ["f", 0]}]);
         let mut instance = template.as_array().unwrap().clone();
         instance.push(
@@ -1394,7 +1394,11 @@ mod tests {
             "has_errors": false,
             "translated": {
                 "crate_name": "fixture",
-                "fun_decls": [decl(0, template), decl(1, Value::Array(instance))],
+                "fun_decls": [
+                    decl(0, template, unstructured.clone()),
+                    decl(1, Value::Array(instance.clone()), unstructured),
+                    decl(2, Value::Array(instance), json!("Opaque")),
+                ],
                 "files": []
             }
         });
@@ -1409,6 +1413,8 @@ mod tests {
             spec_leaf("f", 0, &args, &llbc),
             spec_leaf("f", 1, &args, &llbc)
         );
+        // An instance with no body is the external declaration itself.
+        assert_eq!(graph_name(2), "fixture::m::f");
     }
 
     /// `&T` stays distinct from `T`.
