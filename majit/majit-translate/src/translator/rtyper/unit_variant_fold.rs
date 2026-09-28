@@ -205,8 +205,8 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
             // walker refuses a null ref argument to a may-force call.
             //
             // Leaving it as an allocation is what
-            // `register_synthetic_positional_metadata` registers with zero rows
-            // and no collector-issued type id, which the walker rejects with
+            // `positional_shape_metadata` derives with zero rows and no
+            // collector-issued type id, which the walker rejects with
             // `UnregisteredNewGcType` after the descent has already run.
             if owner_path.is_empty()
                 && is_zero_length_shaped_aggregate(name)

@@ -1372,6 +1372,14 @@ impl ClassDesc {
             )?;
             assert!(super::model::s_none().contains(&s));
         }
+        // A positional aggregate class (`Tuple<A,B>` / `Array<T;N>`) is
+        // minted when annotation first meets it, after the session prologue
+        // projected every registered struct root. Project its item rows
+        // now, before any flow reads the class, as that prologue does for a
+        // registered root (`Bookkeeper::getuniqueclassdef_for_struct_root`).
+        if crate::front::mir::positional_shape_metadata(&qualname).is_some() {
+            bk.getuniqueclassdef_for_struct_root(&qualname)?;
+        }
         Ok(classdef)
     }
 

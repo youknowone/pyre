@@ -1021,9 +1021,6 @@ pub(crate) struct CrateLoweringState {
     atomic_load_decls: std::cell::RefCell<
         Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
     >,
-    /// Positional aggregate shapes the built graphs construct, recorded as
-    /// each body is built ([`record_positional_shapes`]).
-    positional_shapes: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 /// The declaration tables [`CrateLoweringState::finish`] hands to the
@@ -1207,7 +1204,6 @@ impl CrateLoweringState {
             spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
             skipped: std::cell::RefCell::new(Vec::new()),
             atomic_load_decls: std::cell::RefCell::new(Vec::new()),
-            positional_shapes: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
 }
@@ -1470,7 +1466,6 @@ impl<'l> CrateLowering<'l> {
             tombstoned_leaves,
             dont_look_inside,
             spec,
-            positional_shapes,
             ..
         } = self.state;
         let Self {
@@ -1524,7 +1519,6 @@ impl<'l> CrateLowering<'l> {
                 });
             }
         };
-        record_positional_shapes(&graph, &mut positional_shapes.borrow_mut());
         Ok(graph)
     }
 
@@ -1649,7 +1643,6 @@ impl<'l> CrateLowering<'l> {
             spec: spec_queue,
             skipped,
             atomic_load_decls,
-            positional_shapes,
             ..
         } = self.state;
         let Self {
@@ -1695,7 +1688,6 @@ impl<'l> CrateLowering<'l> {
             }
         };
         graph.name = spec.segments.join("::");
-        record_positional_shapes(&graph, &mut positional_shapes.borrow_mut());
         Some(graph)
     }
 }
@@ -1755,35 +1747,27 @@ impl DeclaredSpec {
 }
 
 impl CrateLoweringState {
-    /// `specialize.py default_specialize` and the positional-aggregate
-    /// layouts over the lowered set, the coverage report, and the program.
+    /// The coverage report over the lowered set, and the program.
     ///
     /// The program takes the tables only it reads. `known_trait_names` and
     /// `struct_field_attrs` are copied: a body lowered after this still
-    /// reads them, and the positional layouts below must not reach it.
+    /// reads them.
     pub(crate) fn finish(
         &self,
         functions: Vec<crate::front::semantic::SemanticFunction>,
     ) -> crate::front::semantic::SemanticProgram {
         let known_trait_names = self.known_trait_names.clone();
-        let mut struct_field_attrs = self.struct_field_attrs.clone();
+        let struct_field_attrs = self.struct_field_attrs.clone();
         let CrateExports {
-            mut known_struct_names,
-            mut struct_fields,
+            known_struct_names,
+            struct_fields,
             enum_variant_by_discriminant,
             struct_origins,
             exact_layouts,
-            mut struct_ids,
+            struct_ids,
         } = self.exports.take();
         let skipped = self.skipped.take();
         let atomic_load_decls = self.atomic_load_decls.take();
-        register_synthetic_positional_metadata(
-            self.positional_shapes.take(),
-            &mut known_struct_names,
-            &mut struct_fields,
-            &mut struct_field_attrs,
-            &mut struct_ids,
-        );
         // Coverage gate. Every `skipped` entry is a function whose MIR shape
         // the driver could not lower — already after the reverse-postorder
         // retry in `lower_fun_decl`. The tracked gaps are exactly the shapes
@@ -2146,75 +2130,20 @@ fn should_lower_function(
     function_filter.is_none_or(|names| names.contains(name))
 }
 
-/// Add to `shapes` every shaped MIR tuple or fixed-size array `graph`
-/// constructs, as the graph is built: `rtuple.py` makes a `TUPLE_TYPE` when
-/// the rtyper first meets the `SomeTuple`, not from a whole-program scan.
-fn record_positional_shapes(
-    graph: &FunctionGraph,
-    shapes: &mut std::collections::BTreeSet<String>,
-) {
-    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
-        let OpKind::Call {
-            target:
-                CallTarget::SyntheticTransparentCtor {
-                    name, owner_path, ..
-                },
-            args,
-            ..
-        } = &op.kind
-        else {
-            continue;
-        };
-        if owner_path.is_empty()
-            && args.is_empty()
-            && (majit_ir::descr::is_shaped_tuple_name(name)
-                || majit_ir::descr::is_shaped_array_name(name))
-        {
-            shapes.insert(name.clone());
-        }
-    }
-}
-
-/// Register the low-level struct identity and fields for every shaped MIR
-/// tuple or fixed-size array that survived into a translated graph
-/// ([`record_positional_shapes`]).
-///
-/// RPython creates one distinct `GcStruct('tupleN', item0, item1, ...)` per
-/// [`SomeTuple`] representation (`rtyper/rtuple.py`), then
-/// `TupleRepr.newtuple` allocates that struct and writes its fields
-/// (`rtuple.py`). Charon has no `TypeDecl` row for Rust's built-in
-/// tuple/array aggregate, so [`derive_program_metadata`] cannot discover
-/// these layouts from the declaration table. The graph is the authoritative
-/// rtyper input here: `front::mir` has already attached the complete
-/// `Tuple<T,...>` / `Array<T;N>` shape to the synthetic constructor and its
-/// `__pos_N` fields.
-///
-/// Each full shape gets its own [`StructId`]. Generic nominal ADTs share their
-/// template layout, but positional aggregates do not: item type and arity are
-/// part of their low-level allocation identity.
-fn register_synthetic_positional_metadata(
-    shapes: std::collections::BTreeSet<String>,
-    known_struct_names: &mut std::collections::HashSet<String>,
-    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
-    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
-    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
-) {
-    for shape in shapes {
-        let Some((rows, attrs)) = positional_shape_metadata(&shape) else {
-            continue;
-        };
-        let sid = majit_ir::descr::StructId::from_canonical(&shape);
-        known_struct_names.insert(shape.clone());
-        struct_fields.fields.insert(shape.clone(), rows);
-        struct_field_attrs.insert(shape.clone(), attrs);
-        record_struct_id(struct_ids, shape, sid);
-    }
-}
-
 /// The `__pos_N` rows and attribute shells of the positional aggregate
 /// `shape` (`Tuple<A,B>` / `Array<T;N>`), read off its spelling: one field
 /// per item, as `rtuple.py TupleRepr` lays out `TUPLE_TYPE`. `None` for a
 /// name that spells no shape, and for the empty tuple.
+///
+/// RPython makes one distinct `GcStruct('tupleN', item0, item1, ...)` per
+/// [`SomeTuple`] representation when the rtyper first asks for its repr
+/// (`rtuple.py`). Charon has no `TypeDecl` row for Rust's built-in
+/// tuple/array aggregate, and `front::mir` spells the complete
+/// `Tuple<T,...>` / `Array<T;N>` shape on the synthetic constructor and its
+/// `__pos_N` fields, so every lookup that names a shape derives it from the
+/// spelling. Each full shape has its own [`StructId`]
+/// (`positional_shape_id`): item type and arity are part of its low-level
+/// allocation identity.
 pub(crate) fn positional_shape_metadata(
     shape: &str,
 ) -> Option<(Vec<(String, String)>, Vec<(String, ValueType)>)> {
@@ -51339,47 +51268,18 @@ mod tests {
     }
 
     #[test]
-    fn positional_shapes_register_distinct_pointer_aware_struct_layouts() {
-        let mut graph = FunctionGraph::new("array_shapes");
-        let entry = graph.startblock;
-        for owner in ["Array<i64;1>", "Array<bool;2>", "Tuple<Union,Union>"] {
-            graph.push_op_var(
-                entry,
-                OpKind::Call {
-                    target: CallTarget::synthetic_transparent_ctor(owner),
-                    args: crate::model::call_args(vec![]),
-                    result_ty: ValueType::Ref(Some(owner.into())),
-                },
-                true,
-            );
-        }
-        let mut shapes = std::collections::BTreeSet::new();
-        super::record_positional_shapes(&graph, &mut shapes);
-        let mut known = std::collections::HashSet::new();
-        let mut fields = crate::front::semantic::StructFieldRegistry::default();
-        let mut attrs = std::collections::HashMap::new();
-        let mut ids = std::collections::HashMap::new();
-        super::register_synthetic_positional_metadata(
-            shapes,
-            &mut known,
-            &mut fields,
-            &mut attrs,
-            &mut ids,
-        );
-
+    fn positional_shapes_derive_distinct_pointer_aware_rows_from_the_spelling() {
+        let rows = |shape| super::positional_shape_metadata(shape).unwrap().0;
+        assert_eq!(rows("Array<i64;1>"), vec![("__pos_0".into(), "i64".into())]);
         assert_eq!(
-            fields.fields["Array<i64;1>"],
-            vec![("__pos_0".into(), "i64".into())]
-        );
-        assert_eq!(
-            fields.fields["Array<bool;2>"],
+            rows("Array<bool;2>"),
             vec![
                 ("__pos_0".into(), "bool".into()),
                 ("__pos_1".into(), "bool".into())
             ]
         );
         assert_eq!(
-            fields.fields["Tuple<Union,Union>"],
+            rows("Tuple<Union,Union>"),
             vec![
                 ("__pos_0".into(), "&Union".into()),
                 ("__pos_1".into(), "&Union".into())
@@ -51387,13 +51287,19 @@ mod tests {
             "instance-valued tuple items use the pointer repr recorded by their FORCE attrs",
         );
         assert_eq!(
-            attrs["Tuple<Union,Union>"],
+            super::positional_shape_metadata("Tuple<Union,Union>")
+                .unwrap()
+                .1,
             vec![
                 ("__pos_0".into(), ValueType::Ref(None)),
                 ("__pos_1".into(), ValueType::Ref(None))
             ],
         );
-        assert_ne!(ids["Array<i64;1>"], ids["Array<bool;2>"]);
+        assert_eq!(super::positional_shape_metadata("Tuple<>"), None);
+        assert_ne!(
+            majit_ir::descr::positional_shape_id("Array<i64;1>"),
+            majit_ir::descr::positional_shape_id("Array<bool;2>")
+        );
     }
 
     #[test]

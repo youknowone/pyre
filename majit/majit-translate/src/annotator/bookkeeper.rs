@@ -7451,21 +7451,11 @@ mod tests {
         );
         bk.set_struct_fields(Rc::new(reg));
 
+        // Minting the shape class projects its rows (`_init_classdef`), so
+        // the untyped force shell is already reset when the classdef is
+        // returned; a later projection is a no-op.
         let tuple_host = bk.intern_class_by_qualname(tuple);
         let tuple_cd = bk.getuniqueclassdef(&tuple_host).expect("tuple classdef");
-        {
-            let attrs = tuple_cd.borrow();
-            for field in ["__pos_0", "__pos_1"] {
-                let value = &attrs.attrs.get(field).expect("tuple field").s_value;
-                assert!(
-                    matches!(value, SomeValue::Instance(inst)
-                    if inst.classdef.is_none() && !inst.can_be_none
-                        && inst.flags.is_empty() && inst.base.const_box.is_none()),
-                    "{field} pre-seed must be untyped force shell, got {value:?}"
-                );
-                eprintln!("probe {field} after force seeding, before projection: {value:?}");
-            }
-        }
         bk.project_struct_rows(tuple).expect("tuple rows project");
         {
             let attrs = tuple_cd.borrow();
