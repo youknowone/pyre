@@ -5362,7 +5362,7 @@ fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize,
         if arity == 0 {
             continue;
         }
-        let label_descr = label_op.getdescr().map(|d| d.index());
+        let label_descr = label_op.getdescr().map(|d| majit_ir::descr_identity(&d));
         let back_jumps: Vec<usize> = ops
             .iter()
             .enumerate()
@@ -5370,7 +5370,10 @@ fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize,
                 if jump.opcode != OpCode::Jump || jump.num_args() != arity {
                     return false;
                 }
-                match (jump.getdescr().map(|d| d.index()), label_descr) {
+                match (
+                    jump.getdescr().map(|d| majit_ir::descr_identity(&d)),
+                    label_descr,
+                ) {
                     (Some(jump_descr), Some(label_descr)) => jump_descr == label_descr,
                     // A descr-less JUMP targets the backend's implicit loop
                     // block, which is the final LABEL only.
@@ -5442,9 +5445,9 @@ fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize,
         // its own OpRef to the kept back-edge args (a duplicated LABEL arg can
         // then escape).
         if any {
-            let local_label_descrs: IndexSet<u32> = label_indices
+            let local_label_descrs: IndexSet<usize> = label_indices
                 .iter()
-                .filter_map(|&li| ops[li].getdescr().map(|d| d.index()))
+                .filter_map(|&li| ops[li].getdescr().map(|d| majit_ir::descr_identity(&d)))
                 .collect();
             loop {
                 let mut escapes: IndexSet<u32> = IndexSet::new();
@@ -5456,7 +5459,7 @@ fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize,
                     let is_local_jump = is_back_jump
                         || op
                             .getdescr()
-                            .map(|d| local_label_descrs.contains(&d.index()))
+                            .map(|d| local_label_descrs.contains(&majit_ir::descr_identity(&d)))
                             .unwrap_or(false);
                     if !is_local_jump {
                         // External JUMP: lowered via the guard-exit path, whose
@@ -7765,51 +7768,40 @@ struct MergePlan {
     segments: Vec<MergeSegment>,
 }
 
-fn op_in_merge_segment(op_idx: usize, segments: &[MergeSegment]) -> bool {
-    segments.iter().any(|segment| op_idx >= segment.start_op)
+/// `(descr_identity, arity)` of every LABEL in `ops`.
+///
+/// `assembler.py closing_jump` jumps locally when `target_token in
+/// self.target_tokens_currently_compiling`: object identity. `Descr::index` is
+/// the per-loop token id, which every loop numbers from the same values, so it
+/// can name another loop's LABEL.
+fn label_arity_by_identity(ops: &[Op]) -> Vec<(usize, usize)> {
+    ops.iter()
+        .filter(|op| op.opcode == OpCode::Label)
+        .filter_map(|op| {
+            op.getdescr()
+                .map(|descr| (majit_ir::descr_identity(&descr), op.num_args()))
+        })
+        .collect()
 }
 
-/// A JUMP back to a LABEL of this function.
-///
-/// Loop jumps keep the `descr.index()` + arity rule. A jump that lives in a
-/// merged bridge segment matches a LABEL by `descr_identity` (Arc pointer
-/// identity) and equal arity: `index()` is not unique across target tokens.
-fn jump_is_local(
-    op: &Op,
-    ops: &[Op],
-    label_arity_by_descr: &IndexMap<u32, usize>,
-    bridge_jump: bool,
-) -> bool {
+/// A JUMP to a LABEL of this function: the same TargetToken object and the
+/// LABEL's arity. An arity mismatch lowers as an external jump (rewriter.py
+/// LABEL/JUMP redirect parity).
+fn jump_is_local(op: &Op, label_arity: &[(usize, usize)]) -> bool {
     if op.opcode != OpCode::Jump {
         return false;
     }
     let Some(descr) = op.getdescr() else {
         return false;
     };
-    if bridge_jump {
-        let id = majit_ir::descr_identity(&descr);
-        return ops.iter().any(|label| {
-            label.opcode == OpCode::Label
-                && label.num_args() == op.num_args()
-                && label
-                    .getdescr()
-                    .is_some_and(|label_descr| majit_ir::descr_identity(&label_descr) == id)
-        });
-    }
-    label_arity_by_descr
-        .get(&descr.index())
-        .is_some_and(|&arity| arity == op.num_args())
+    let id = majit_ir::descr_identity(&descr);
+    label_arity
+        .iter()
+        .any(|&(label_id, arity)| label_id == id && arity == op.num_args())
 }
 
-fn jump_is_external(
-    op: &Op,
-    ops: &[Op],
-    label_arity_by_descr: &IndexMap<u32, usize>,
-    bridge_jump: bool,
-) -> bool {
-    op.opcode == OpCode::Jump
-        && op.has_descr()
-        && !jump_is_local(op, ops, label_arity_by_descr, bridge_jump)
+fn jump_is_external(op: &Op, label_arity: &[(usize, usize)]) -> bool {
+    op.opcode == OpCode::Jump && op.has_descr() && !jump_is_local(op, label_arity)
 }
 
 /// Per-exit flags for skipping a positional fail-arg store.
@@ -7836,31 +7828,16 @@ fn record_entry_resident_failargs(
     merge_segments: &[MergeSegment],
 ) -> Vec<(usize, Vec<bool>)> {
     let num_inputs = inputargs.len();
-    let label_arity_by_descr: IndexMap<u32, usize> = ops
-        .iter()
-        .filter(|op| op.opcode == OpCode::Label)
-        .filter_map(|op| op.getdescr().map(|d| (d.index(), op.num_args())))
-        .collect();
-    // Same rule the JUMP emitter uses to pick a local target: the descr's
-    // `index()` names a LABEL of the same arity. `index()` is not unique
-    // within a trace, so every LABEL sharing it counts as targeted.
-    let mut jump_targets: Vec<u32> = Vec::new();
-    for (op_idx, op) in ops.iter().enumerate() {
-        if op.opcode != OpCode::Jump {
-            continue;
-        }
+    let label_arity = label_arity_by_identity(ops);
+    // Same rule the JUMP emitter uses to pick a local target.
+    let mut jump_targets: Vec<usize> = Vec::new();
+    for op in ops {
         let Some(descr) = op.getdescr() else {
             continue;
         };
-        let index = descr.index();
-        let local = jump_is_local(
-            op,
-            ops,
-            &label_arity_by_descr,
-            op_in_merge_segment(op_idx, merge_segments),
-        );
-        if local && !jump_targets.contains(&index) {
-            jump_targets.push(index);
+        let id = majit_ir::descr_identity(&descr);
+        if jump_is_local(op, &label_arity) && !jump_targets.contains(&id) {
+            jump_targets.push(id);
         }
     }
     // A JUMP with no descr targets `loop_block`: the last LABEL, or the
@@ -7899,7 +7876,7 @@ fn record_entry_resident_failargs(
             let targeted = implicit_loop_label == Some(Some(op_idx))
                 || op
                     .getdescr()
-                    .is_some_and(|descr| jump_targets.contains(&descr.index()));
+                    .is_some_and(|descr| jump_targets.contains(&majit_ir::descr_identity(&descr)));
             // What the fall-through path leaves in each slot: the entry
             // loader's or an earlier LABEL's contents, as long as no op since
             // wrote an output slot.
@@ -7955,12 +7932,7 @@ fn record_entry_resident_failargs(
 
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
-        let is_external_jump = jump_is_external(
-            op,
-            ops,
-            &label_arity_by_descr,
-            op_in_merge_segment(op_idx, merge_segments),
-        );
+        let is_external_jump = jump_is_external(op, &label_arity);
         if is_guard || is_finish || is_external_jump {
             let info = &mut guard_infos[info_idx];
             info.guaranteed_frame_depth = guaranteed_frame_depth;
@@ -11049,7 +11021,6 @@ impl CraneliftBackend {
             &constants_i64,
             attached_descrs,
             frame_value_count_fn,
-            merge_segments,
             merge.is_some(),
         )?;
         // RPython jitframe layout parity: ref_root slots start AFTER all
@@ -11566,16 +11537,13 @@ impl CraneliftBackend {
         }
         let debug_declares = std::env::var_os("MAJIT_DEBUG_DECLARES").is_some();
 
-        // descr.index() → label op's source-arity (args.len()).  Captured up
-        // front because Cranelift's FunctionBuilder may auto-promote `def_var`
+        // LABEL identity → source arity (args.len()).  Captured up front
+        // because Cranelift's FunctionBuilder may auto-promote `def_var`
         // chains into block params later, growing the block's runtime
         // num_block_params past the original label arity. Used by the
         // OpCode::Jump handler to detect arity-mismatched local jumps and
         // lower them as external jumps (rewriter.py LABEL/JUMP redirect parity).
-        let label_arity_by_descr: IndexMap<u32, usize> = label_indices
-            .iter()
-            .filter_map(|&li| ops[li].getdescr().map(|d| (d.index(), ops[li].num_args())))
-            .collect();
+        let label_arity = label_arity_by_identity(ops);
 
         // `loop_phi_keep_by_label` was computed and restricted above (before the
         // entry-prologue frame sizing, which reserves the non-ref home region).
@@ -11907,7 +11875,6 @@ impl CraneliftBackend {
         // a Cranelift block per LABEL descr.
 
         let mut label_blocks = Vec::with_capacity(label_indices.len());
-        let mut label_blocks_by_descr = IndexMap::new();
         for &label_idx in &label_indices {
             let block = builder.create_block();
             // Param type must match the bound variable's declared carrier type
@@ -11924,9 +11891,6 @@ impl CraneliftBackend {
                     .copied()
                     .unwrap_or_else(|| cl_type_for_opref(arg.to_opref()));
                 builder.append_block_param(block, ty);
-            }
-            if let Some(descr_index) = ops[label_idx].getdescr().map(|descr| descr.index()) {
-                label_blocks_by_descr.insert(descr_index, block);
             }
             label_blocks.push((label_idx, block));
         }
@@ -16705,28 +16669,19 @@ impl CraneliftBackend {
                     // into block params, so the runtime num_block_params is
                     // unreliable — compare against the arity captured before
                     // codegen).
-                    let bridge_jump = op_in_merge_segment(op_idx, merge_segments);
-                    let local_target_arity_matches =
-                        jump_is_local(op, ops, &label_arity_by_descr, bridge_jump);
-                    let target_block = if local_target_arity_matches {
-                        if bridge_jump {
-                            let id = majit_ir::descr_identity(
-                                &op.getdescr().expect("local bridge jump carries a descr"),
-                            );
-                            label_blocks
-                                .iter()
-                                .find(|(label_idx, _)| {
-                                    ops[*label_idx].num_args() == op.num_args()
-                                        && ops[*label_idx].getdescr().is_some_and(|descr| {
-                                            majit_ir::descr_identity(&descr) == id
-                                        })
-                                })
-                                .map(|(_, block)| *block)
-                        } else {
-                            op.getdescr().and_then(|descr| {
-                                label_blocks_by_descr.get(&descr.index()).copied()
+                    let target_block = if jump_is_local(op, &label_arity) {
+                        let id = majit_ir::descr_identity(
+                            &op.getdescr().expect("local jump carries a descr"),
+                        );
+                        label_blocks
+                            .iter()
+                            .find(|(label_idx, _)| {
+                                ops[*label_idx].num_args() == op.num_args()
+                                    && ops[*label_idx]
+                                        .getdescr()
+                                        .is_some_and(|descr| majit_ir::descr_identity(&descr) == id)
                             })
-                        }
+                            .map(|(_, block)| *block)
                     } else if op.has_descr() {
                         // Descr present but either points outside this function
                         // (bridge → main loop) or to a local label with
@@ -18601,31 +18556,13 @@ fn precompute_max_output_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     // Key by `descr_identity` (Arc allocation address) per
     // `history.py` TargetToken object-identity semantics: `d.index()`
     // is not unique across distinct TargetTokens in the same trace.
-    let label_arity_by_descr: Vec<(usize, usize)> = ops
-        .iter()
-        .filter(|op| op.opcode == OpCode::Label)
-        .filter_map(|op| {
-            op.getdescr()
-                .as_ref()
-                .map(|d| (majit_ir::descr_identity(d), op.num_args()))
-        })
-        .collect();
+    let label_arity = label_arity_by_identity(ops);
     let num_inputs = inputargs.len();
     let mut max_slots = num_inputs;
     for op in ops {
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
-        let is_external_jump = op.opcode == OpCode::Jump
-            && op.getdescr().as_ref().is_some_and(|d| {
-                let id = majit_ir::descr_identity(d);
-                match label_arity_by_descr
-                    .iter()
-                    .find(|(label_id, _)| *label_id == id)
-                {
-                    None => true,
-                    Some(&(_, arity)) => arity != op.num_args(),
-                }
-            });
+        let is_external_jump = jump_is_external(op, &label_arity);
         if !is_guard && !is_finish && !is_external_jump {
             continue;
         }
@@ -18662,7 +18599,6 @@ fn collect_guards(
     // `-live-` decoder for the `rd_numb` reads below.  `None` falls back to the
     // process-global callback.
     frame_value_count_fn: Option<fn(i32, i32) -> usize>,
-    merge_segments: &[MergeSegment],
     preserve_descrs: bool,
 ) -> Result<(), BackendError> {
     let type_index = OpTypeIndex::new(inputargs, ops);
@@ -18672,29 +18608,20 @@ fn collect_guards(
     // force guard's reference spills remain roots after FINISH.
     let mut finish_gcmap_slots = Vec::new();
 
-    // Map Label descr index → block arity, used to distinguish internal vs
-    // external JUMPs.  rewriter.py LABEL/JUMP redirect parity: a JUMP whose
-    // descr targets a Label in this function but with a *different* arg arity
+    // LABEL identity → arity, used to distinguish internal vs external
+    // JUMPs.  rewriter.py LABEL/JUMP redirect parity: a JUMP whose descr
+    // targets a Label in this function but with a *different* arg arity
     // also lowers as an external jump (the target's stack frame layout
     // doesn't match, so we exit this trace and re-enter the target via the
     // dispatcher instead of jumping locally).
-    let label_arity_by_descr: IndexMap<u32, usize> = ops
-        .iter()
-        .filter(|op| op.opcode == OpCode::Label)
-        .filter_map(|op| op.getdescr().map(|d| (d.index(), op.num_args())))
-        .collect();
+    let label_arity = label_arity_by_identity(ops);
 
     for (op_idx, op) in ops.iter().enumerate() {
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
         // External JUMP: target not in this function's Labels, or local
         // target with mismatched arity (treated as external for parity).
-        let is_external_jump = jump_is_external(
-            op,
-            ops,
-            &label_arity_by_descr,
-            op_in_merge_segment(op_idx, merge_segments),
-        );
+        let is_external_jump = jump_is_external(op, &label_arity);
 
         if !is_guard && !is_finish && !is_external_jump {
             continue;
@@ -22339,14 +22266,10 @@ mod tests {
         let carried = OpRef::ref_op(1);
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        let outer = make_label_descr(40);
         let ops = [
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
-            mk_op_with_descr(
-                OpCode::Label,
-                &[carried],
-                OpRef::NONE.raw(),
-                make_label_descr(40),
-            ),
+            mk_op_with_descr(OpCode::Label, &[carried], OpRef::NONE.raw(), outer.clone()),
             mk_op_with_descr(
                 OpCode::Label,
                 &[carried],
@@ -22354,12 +22277,7 @@ mod tests {
                 make_label_descr(41),
             ),
             guard,
-            mk_op_with_descr(
-                OpCode::Jump,
-                &[carried],
-                OpRef::NONE.raw(),
-                make_label_descr(40),
-            ),
+            mk_op_with_descr(OpCode::Jump, &[carried], OpRef::NONE.raw(), outer),
         ];
 
         let ops: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
@@ -22441,28 +22359,14 @@ mod tests {
         // Both LABELs carry the same descr so the single back-edge demotes the
         // position at each of them; the trace then reaches the second LABEL by
         // fall-through, with a collection in between.
+        let label = make_label_descr(60);
         let ops = vec![
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
-            mk_op_with_descr(
-                OpCode::Label,
-                &[carried],
-                OpRef::NONE.raw(),
-                make_label_descr(60),
-            ),
+            mk_op_with_descr(OpCode::Label, &[carried], OpRef::NONE.raw(), label.clone()),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 3),
-            mk_op_with_descr(
-                OpCode::Label,
-                &[carried],
-                OpRef::NONE.raw(),
-                make_label_descr(60),
-            ),
+            mk_op_with_descr(OpCode::Label, &[carried], OpRef::NONE.raw(), label.clone()),
             guard,
-            mk_op_with_descr(
-                OpCode::Jump,
-                &[carried],
-                OpRef::NONE.raw(),
-                make_label_descr(60),
-            ),
+            mk_op_with_descr(OpCode::Jump, &[carried], OpRef::NONE.raw(), label),
         ];
         backend.set_constants(indexmap::IndexMap::new());
 
@@ -23822,6 +23726,73 @@ mod tests {
         assert_eq!(target.ll_loop_code(), b_body);
         // `token_b` keeps B's assembler memory alive for the redirected entry.
         let _keep_b = token_b;
+    }
+
+    /// Every loop numbers its LABEL descrs from the same small token ids, so
+    /// a JUMP to another loop's LABEL can carry the same `Descr::index` and
+    /// arity as a LABEL of the loop being compiled. It still leaves the loop.
+    #[test]
+    fn jump_to_other_loops_label_with_same_index_is_external() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let label_a = make_label_descr(1);
+        let ops_a = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label_a.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        let token_a = JitCellToken::new(9104);
+        token_a.record_target_token(label_a.clone());
+        backend.compile_loop(&inputargs, &ops_a, &token_a).unwrap();
+
+        let label_b = make_label_descr(1);
+        assert_eq!(label_a.index(), label_b.index());
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::int_op(1))]);
+        let ops_b = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label_b.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(100)],
+                1,
+            ),
+            mk_op(
+                OpCode::IntLt,
+                &[OpRef::int_op(1), OpRef::const_int(1000)],
+                2,
+            ),
+            guard,
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label_a,
+            ),
+        ];
+        let token_b = JitCellToken::new(9105);
+        token_b.record_target_token(label_b);
+        backend.compile_loop(&inputargs, &ops_b, &token_b).unwrap();
+
+        // B adds 100 once and jumps into A, which adds 1 and finishes. Looping
+        // back to B's own LABEL would instead add 100 until the guard fails.
+        let frame = backend.execute_token(&token_b, &[Value::Int(0)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 101);
+        let _keep_a = token_a;
     }
 
     fn guard_op(
