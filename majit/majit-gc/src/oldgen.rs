@@ -44,10 +44,12 @@ pub struct OldGen {
     /// `old_rawmalloced_objects`.
     ///
     /// Upstream keeps only an address dict and recomputes the arena at free
-    /// time; `alloc::dealloc` needs the `Layout` the record carries, so
-    /// membership and the records are two structures here.
+    /// time; `alloc::dealloc` needs the `Layout` the record carries, so the
+    /// records are a `Vec` here.  Membership is not a second structure: it is
+    /// [`GcFlags::YOUNG_RAWMALLOC`] on the object, because an
+    /// `AddressSet` charged every birth -- every Python frame -- for a question
+    /// only the collector asks.
     young_rawmalloced_objects: Vec<RawMallocedObject>,
-    young_rawmalloced_payloads: AddressSet,
     /// incminimark.py start_free_rawmalloc_objects `raw_malloc_might_sweep`.  At sweep
     /// preparation the old rawmalloc stack is swapped into this one, isolating
     /// it from rawmalloc allocations made by minors between sweep steps.
@@ -96,7 +98,6 @@ impl OldGen {
             ),
             old_rawmalloced_objects: Vec::new(),
             young_rawmalloced_objects: Vec::new(),
-            young_rawmalloced_payloads: AddressSet::default(),
             raw_malloc_might_sweep: Vec::new(),
             rawmalloced_payloads: AddressSet::default(),
             rawmalloced_pages: Box::new([0; RAWMALLOC_PAGE_FILTER_WORDS]),
@@ -193,8 +194,8 @@ impl OldGen {
         let alloc_size = try_round_up(card_header_bytes.checked_add(obj_size)?)?;
         debug_assert_eq!(card_header_bytes % OBJECT_ALIGN, 0);
         let (header_ptr, record) = self.try_rawmalloc_block(alloc_size, card_header_bytes)?;
-        self.young_rawmalloced_payloads
-            .insert(header_ptr as usize + GcHeader::SIZE);
+        // `YOUNG_RAWMALLOC` records the membership, and
+        // `finish_alloc_young_nonmoving` sets it with the rest of the header.
         self.young_rawmalloced_objects.push(record);
         self.poison_if_enabled(header_ptr, obj_size);
         Some(header_ptr)
@@ -260,9 +261,18 @@ impl OldGen {
         self.young_rawmalloced_objects.is_empty()
     }
 
+    /// Askers pass an arbitrary address -- `classify_young_owner` hands over
+    /// embedder side-table keys that may name nothing in the heap -- so
+    /// ownership is established by `rawmalloced_contains` before the header is
+    /// read.  A freed payload loses its `rawmalloced_payloads` entry, so a
+    /// recycled address never reaches the flag test.
     pub fn young_rawmalloced_contains(&self, obj_addr: usize) -> bool {
-        !self.young_rawmalloced_payloads.is_empty()
-            && self.young_rawmalloced_payloads.contains(&obj_addr)
+        !self.young_rawmalloced_objects.is_empty()
+            && self.rawmalloced_contains(obj_addr)
+            && unsafe {
+                (*((obj_addr - GcHeader::SIZE) as *const GcHeader))
+                    .has_flag(GcFlags::YOUNG_RAWMALLOC)
+            }
     }
 
     /// `bool(self.young_rawmalloced_objects)` — the guard upstream puts in
@@ -284,12 +294,15 @@ impl OldGen {
     pub fn free_young_rawmalloced_objects(&mut self) {
         // Once, above the loop: see `sweep_arenas_step`.
         let log_free = crate::gc_lifetime_log_enabled();
+        // Taking the `Vec` is what ends the generation: every later
+        // `young_rawmalloced_contains` answers false on the emptiness guard,
+        // which is what clearing the old membership set did.
         let young = std::mem::take(&mut self.young_rawmalloced_objects);
-        self.young_rawmalloced_payloads.clear();
         for object in young {
             let hdr = unsafe { &mut *(object.header_addr as *mut GcHeader) };
             if hdr.has_flag(GcFlags::GCFLAG_VISITED_RMY) {
                 hdr.clear_flag(GcFlags::GCFLAG_VISITED_RMY);
+                hdr.clear_flag(GcFlags::YOUNG_RAWMALLOC);
                 self.old_rawmalloced_objects.push(object);
                 continue;
             }

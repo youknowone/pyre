@@ -4745,7 +4745,11 @@ mod tests {
             let addr = &marker as *const usize as usize;
             let got = dynasm_id_or_identityhash(addr);
             // `boehm.py` `ll_identityhash`: `h = ~cast_adr_to_int(addr)`.
-            if !majit_gc::gc_sync::is_initialized() {
+            // The function takes that arm on `!collector_installed()`, and
+            // another test in this binary can install the gcrootmap half of
+            // it at any time.  Both halves are set-only, so reading `false`
+            // after the call proves the call took the Boehm arm.
+            if !majit_gc::collector_installed() {
                 assert_eq!(got, !addr);
             }
         })

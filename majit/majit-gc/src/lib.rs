@@ -186,6 +186,32 @@ bitflags::bitflags! {
         /// queue enforce the contract for callers that cannot establish single
         /// registration statically.
         const FINALIZER_REGISTERED = 1 << 13;
+        /// A young raw-malloced object, i.e. one `external_malloc(...,
+        /// alloc_young=True)` produced and `free_young_rawmalloced_objects` has
+        /// not yet promoted or freed.
+        ///
+        /// Not an incminimark flag: upstream answers the same question with
+        /// `self.young_rawmalloced_objects`, an address dict it also iterates to
+        /// free the generation.  pyre needs the `Layout` `alloc::dealloc` wants,
+        /// so the iteration half is a `Vec<RawMallocedObject>` and the
+        /// membership half had to be a second structure -- an `AddressSet` whose
+        /// insert every young rawmalloc birth paid, which on a call-heavy
+        /// interpreted loop is every Python frame.  The state belongs on the
+        /// object, the way `GCFLAG_VISITED_RMY` keeps the survivor bit for the
+        /// same generation in the same function.  Bit 13 is
+        /// `_GCFLAG_FIRST_UNUSED` upstream and 13/14 are already claimed, so
+        /// this takes the next free position and disturbs no RPython one.
+        ///
+        /// The name carries no `GCFLAG_` prefix for the reason
+        /// `every_gcflag_is_the_bit_incminimark_gives_it` enforces: the prefix
+        /// is the claim that incminimark declares the flag, and this GC's own
+        /// flags are spelled without it.
+        ///
+        /// It is also the last position the header admits on wasm32:
+        /// `header.rs` gives flags `usize::BITS / 2` bits, so 16 there, and
+        /// `GcHeader::with_flags` asserts the fit.  A further flag needs a wider
+        /// wasm32 header word, not a higher bit.
+        const YOUNG_RAWMALLOC = 1 << 15;
         /// The object's finalizer has already run.
         ///
         /// Not an incminimark flag either -- the queue delivers an object once
