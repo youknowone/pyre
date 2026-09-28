@@ -501,7 +501,7 @@ fn unpoison_failed_subject_callees(
                 Some((source, signature))
             })
             .and_then(|(source, signature)| {
-                lift_callee_to_pygraph(source, signature.clone(), call_registry).ok()
+                lift_callee_to_pygraph(&source, signature.clone(), call_registry).ok()
             });
         match fresh {
             Some(fresh) => {
@@ -2085,7 +2085,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     let mut by_canonical_path: HashMap<Vec<String>, FunctionPathKey> = HashMap::new();
     for (path, graph) in function_graphs.iter_declared() {
         let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
-        let canonical_strip = canonical_dedup_key(path);
+        let canonical_strip = canonical_dedup_key(&path);
         // `pyre_object::lltype::malloc[_typed/_stable]` are GC allocation intrinsics,
         // recognised as host builtins (annotator `malloc_typed_alloc`, HOST_ENV
         // `pyre_object.lltype` module). Their real bodies enter the host
@@ -2216,7 +2216,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             entry.publish_exception_object_result_signature();
         }
         let body = function_graphs
-            .body(path)
+            .body(&path)
             .expect("a declared path names a funcobj");
         pending.push((key, graph, entry, signature, body));
     }
@@ -3977,7 +3977,7 @@ fn run_two_phase_prepass_inner(
             emit_determinism_trace("phaseA", index, &path.canonical_key());
         }
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drive_subject(legacy, call_registry, /* do_rtype = */ false)
+            drive_subject(&legacy, call_registry, /* do_rtype = */ false)
         }));
         match attempt {
             Ok(Ok((

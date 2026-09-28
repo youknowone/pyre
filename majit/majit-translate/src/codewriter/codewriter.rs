@@ -1112,7 +1112,11 @@ impl CodeWriter {
                 }
                 continue;
             }
-            let Some(graph) = callcontrol.function_graphs().get(&path).cloned() else {
+            let Some(graph) = callcontrol
+                .function_graphs()
+                .get(&path)
+                .map(|g| FunctionGraph::clone(&g))
+            else {
                 // RPython `enum_pending_graphs` (codewriter.py)
                 // never yields a jitcode whose graph is missing —
                 // `get_jitcode()` only allocates shells for paths that

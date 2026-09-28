@@ -312,7 +312,7 @@ pub fn decode_builtin_call(
             match call_control.get_oopspec_argnames(target) {
                 Some(argnames) => {
                     let argname_refs: Vec<&str> = argnames.iter().map(String::as_str).collect();
-                    let (oopspec_name, argtuple) = parse_oopspec(spec, &argname_refs);
+                    let (oopspec_name, argtuple) = parse_oopspec(&spec, &argname_refs);
                     let normalized = normalize_opargs(&argtuple, args);
                     (oopspec_name, normalized)
                 }
@@ -323,7 +323,7 @@ pub fn decode_builtin_call(
                     // wrapped as `Pass(Variable)` for the uniform return
                     // shape — matches `normalize_opargs()`'s pass-through
                     // behaviour when no argnames metadata exists.
-                    let oopspec_name = spec.split('(').next().unwrap_or(spec).trim().to_string();
+                    let oopspec_name = spec.split('(').next().unwrap_or(&spec).trim().to_string();
                     let opargs: Vec<NormalizedArg> = args
                         .iter()
                         .map(|var| NormalizedArg::Pass(var.clone()))

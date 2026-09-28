@@ -2599,7 +2599,9 @@ fn register_configured_jitdrivers(
                 call_control
                     .function_graphs()
                     .get(&previous.portal)
-                    .is_some_and(|previous_graph| std::ptr::eq(previous_graph, portal_graph))
+                    .is_some_and(|previous_graph| {
+                        std::rc::Rc::ptr_eq(&previous_graph, &portal_graph)
+                    })
             }),
             "duplicate JIT driver portal graph for `{}`; aliases of one graph \
              must share one JitDriverStaticData",
@@ -2704,7 +2706,7 @@ fn register_configured_jitdrivers(
             // producer stays as a real operation because operands are
             // Variables, so only the block is asserted.
             assert_eq!(
-                crate::codewriter::support::find_jit_merge_point(registered, driver_roots)
+                crate::codewriter::support::find_jit_merge_point(&registered, driver_roots)
                     .map(|(block, _)| block),
                 Some(split_start),
                 "registered portal path aliased away from the split graph body"
@@ -3434,7 +3436,7 @@ mod portal_driver_tests {
         assert!(split_graph.func.dont_inline);
         assert!(
             crate::codewriter::support::find_jit_merge_point(
-                split_graph,
+                &split_graph,
                 &GraphTransformConfig::default().jitdriver_receiver_roots,
             )
             .is_some()
