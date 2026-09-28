@@ -8,7 +8,7 @@ const SMALLBUF: usize = 4;
 const BUFMAX: usize = 32 * 1024 * 1024;
 
 #[crate::pyre_class("_io._WindowsConsoleIO")]
-pub struct W_WindowsConsoleIO {
+pub struct W_WinConsoleIO {
     // PyPy `W_WinConsoleIO.__init__`: all state belongs to the raw stream.
     // In particular the incomplete UTF-8 character is not a process-global or
     // thread-local side table; it resumes with this exact console frame.
@@ -24,7 +24,7 @@ pub struct W_WindowsConsoleIO {
     smallbuf: [u8; SMALLBUF],
 }
 
-impl Default for W_WindowsConsoleIO {
+impl Default for W_WinConsoleIO {
     fn default() -> Self {
         Self {
             ob: PyObject::default(),
@@ -74,7 +74,7 @@ pub(crate) fn pyio_get_console_type(path_or_fd: PyObjectRef) -> char {
     host_nt::console_type_from_name(&os_name.to_string_lossy())
 }
 
-impl W_WindowsConsoleIO {
+impl W_WinConsoleIO {
     fn self_obj(&self) -> PyObjectRef {
         self as *const Self as PyObjectRef
     }
@@ -144,10 +144,10 @@ impl W_WindowsConsoleIO {
 }
 
 #[crate::pyre_methods(base = super::raw_iobase_type(), weakrefable)]
-impl W_WindowsConsoleIO {
+impl W_WinConsoleIO {
     #[staticmethod]
     fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
-        let obj = W_WindowsConsoleIO::allocate_stable(W_WindowsConsoleIO::default());
+        let obj = W_WinConsoleIO::allocate_stable(W_WinConsoleIO::default());
         super::tag_io_instance(obj, cls)
     }
 

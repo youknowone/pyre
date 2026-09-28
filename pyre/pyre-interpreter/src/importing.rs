@@ -822,7 +822,7 @@ pub fn install_builtin_modules() {
     // `sys.builtin_module_names` on both CPython 3.14 and PyPy 8.0.0.
     // `moduledef.py applevel_name = 'winreg'` over `pypy/module/_winreg`.
     #[cfg(windows)]
-    pyre_install_module!(winreg);
+    pyre_install_module!("winreg"(_winreg));
     pyre_install_module!(_collections);
     pyre_install_module!(_ast);
     pyre_install_module!("_imp"(imp));

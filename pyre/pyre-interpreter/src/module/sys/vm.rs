@@ -4201,7 +4201,7 @@ fn raw_is_windows_console(raw: PyObjectRef) -> bool {
         return false;
     }
     let pytype: *const pyre_object::PyType =
-        <crate::module::_io::W_WindowsConsoleIO as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE;
+        <crate::module::_io::W_WinConsoleIO as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE;
     std::ptr::eq(unsafe { (*raw).ob_type }, pytype)
 }
 

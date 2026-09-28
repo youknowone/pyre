@@ -47,7 +47,7 @@ pub fn install_optional_modules() {
     );
     #[cfg(all(not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_ctypes", module::_ctypes::init);
-    pyre_interpreter::importing::register_builtin_module("_bz2", module::_bz2::init);
+    pyre_interpreter::importing::register_builtin_module("_bz2", module::bz2::init);
     pyre_interpreter::importing::register_builtin_module("_csv", module::_csv::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_cn", module::_codecs_cn::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_hk", module::_codecs_hk::init);
@@ -400,7 +400,7 @@ fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
     module::_json::gc_types(&mut types);
     module::_hashlib::gc_types(&mut types);
     module::zlib::gc_types(&mut types);
-    module::_bz2::gc_types(&mut types);
+    module::bz2::gc_types(&mut types);
     module::_lzma::gc_types(&mut types);
     module::_lsprof::gc_types(&mut types);
     module::_queue::gc_types(&mut types);
@@ -1177,9 +1177,8 @@ mod tests {
         let bindings: HashMap<&'static str, i64> =
             pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
         assert!(
-            bindings.contains_key(
-                "pyre_module::module::_bz2::compressor_methods::__majit_wrap___new__"
-            ),
+            bindings
+                .contains_key("pyre_module::module::bz2::compressor_methods::__majit_wrap___new__"),
             "moved _bz2 #[pyre_methods] wrappers must publish residual fnaddrs",
         );
     }

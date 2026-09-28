@@ -6086,8 +6086,8 @@ mod tests {
             "pyre_interpreter::module::_io::acquire_buffered_lock",
         ));
         assert!(are_alias_spellings(
-            "module::_io::stringio::type_object",
-            "pyre_interpreter::module::_io::stringio::type_object",
+            "module::_io::interp_stringio::type_object",
+            "pyre_interpreter::module::_io::interp_stringio::type_object",
         ));
         // An inner module's own path beside the re-export the enclosing
         // module publishes: `jit_libffi` defines its cfg-selected bodies in
