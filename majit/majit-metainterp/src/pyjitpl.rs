@@ -2761,6 +2761,11 @@ pub struct MetaInterp<M: Clone> {
     /// payload the old monolithic `abort_trace` produced.
     pub(crate) pending_abort_green_key: Option<u64>,
     pub(crate) pending_abort_permanent: bool,
+    /// `pyjitpl.py aborted_tracing`: `on_abort` runs only when
+    /// `current_merge_points` is non-empty. `abort_trace_live` takes the
+    /// trace context before `aborted_tracing`, so the emptiness is stashed
+    /// here. A bridge (empty) sets greenkey to None and does not call `on_abort`.
+    pub(crate) pending_abort_has_merge_points: bool,
 
     /// The `Counters.ABORT_*` reason a `CompileOutcome::Aborted` carries to
     /// the caller that performs the accounting. `raise SwitchToBlackhole(reason)`
@@ -4283,6 +4288,7 @@ impl<M: Clone> MetaInterp<M> {
             active_jitdriver_sd: None,
             aborted_tracing_greenkey: None,
             pending_abort_green_key: None,
+            pending_abort_has_merge_points: false,
             pending_abort_reason: None,
             pending_abort_permanent: false,
             interpret_framestack_for_abort: false,
@@ -6920,9 +6926,11 @@ impl<M: Clone> MetaInterp<M> {
         let raising_exception = switch.is_some_and(|switch| switch.raising_exception);
         ctx.synchronize_virtualizable_after_guard_failure();
         let vable = ctx.virtualizable_heap_ptr().map_or(0, |ptr| ptr as i64);
-        if reason == crate::counters::ABORT_TOO_LONG {
-            self.blackhole_if_trace_too_long();
-        }
+        // `pyjitpl.py run_blackhole_interp_to_cancel_tracing` is
+        // `aborted_tracing(reason)` then `convert_and_run_from_pyjitpl`.
+        // `blackhole_if_trace_too_long` already ran when the trace crossed
+        // the limit; calling it again bumps `trace_next_iteration` and
+        // `JC_DONT_TRACE_HERE` a second time.
         let vinfo = self.virtualizable_info().cloned();
         let last_exc_value = self.last_exc_value;
         self.stage_abort_reason(reason);
@@ -8184,7 +8192,11 @@ impl<M: Clone> MetaInterp<M> {
             // the key; stage it the way `finish_and_compile` does.
             self.pending_abort_reason = Some(reason);
             self.warm_state.abort_tracing(key, false);
-            self.pending_abort_green_key = Some(key);
+            self.pending_abort_has_merge_points = self
+                .compile_tracing
+                .as_ref()
+                .is_some_and(|ctx| !ctx.current_merge_points.is_empty());
+            self.pending_abort_green_key = self.pending_abort_has_merge_points.then_some(key);
             self.pending_abort_permanent = false;
             self.clear_trace_session();
             return CompileOutcome::Aborted;
@@ -11314,10 +11326,16 @@ impl<M: Clone> MetaInterp<M> {
             // Dropping `ctx` at end of scope releases the recorder.
             self.warm_state.abort_tracing(green_key, permanent);
             self.pending_token = None;
-            // Stash green_key / permanent for the subsequent
-            // `aborted_tracing` call so its hook fires with the upstream
-            // payload even though the ctx has been taken.
-            self.pending_abort_green_key = Some(green_key);
+            // `pyjitpl.py aborted_tracing`: a bridge has no merge points,
+            // so greenkey is None and `on_abort` is not called. Stash the
+            // emptiness with the key; `aborted_tracing` reads it after
+            // this context is taken.
+            self.pending_abort_has_merge_points = !ctx.current_merge_points.is_empty();
+            self.pending_abort_green_key = if self.pending_abort_has_merge_points {
+                Some(green_key)
+            } else {
+                None
+            };
             self.pending_abort_permanent = permanent;
             // RPython invariant: `tracing` (the tracer context) and
             // `active_trace_session` (the frontend meta envelope) share
@@ -11388,6 +11406,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn clear_pending_abort(&mut self) {
         self.pending_abort_green_key = None;
         self.pending_abort_permanent = false;
+        self.pending_abort_has_merge_points = false;
         self.pending_abort_reason = None;
     }
 
@@ -11499,7 +11518,11 @@ impl<M: Clone> MetaInterp<M> {
         {
             self.pending_abort_reason = Some(reason.as_int());
             self.warm_state.abort_tracing(green_key, false);
-            self.pending_abort_green_key = Some(green_key);
+            self.pending_abort_has_merge_points = self
+                .compile_tracing
+                .as_ref()
+                .is_some_and(|ctx| !ctx.current_merge_points.is_empty());
+            self.pending_abort_green_key = self.pending_abort_has_merge_points.then_some(green_key);
             self.pending_abort_permanent = false;
             return Err(SwitchToBlackhole::giveup());
         }
@@ -11632,12 +11655,12 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 self.warm_state.abort_tracing(green_key, false);
-                // pyjitpl.py aborted_tracing() reads greenkey from
-                // `current_merge_points`; pyre's analog reads it from
-                // pending_abort_{green_key,permanent} staged here so the
-                // caller-side `aborted_tracing(stb.reason)` hook payload
-                // carries the real trace key instead of 0.
-                self.pending_abort_green_key = Some(green_key);
+                // `pyjitpl.py aborted_tracing` reads greenkey from
+                // `current_merge_points` and skips `on_abort` when that
+                // list is empty (a bridge).
+                self.pending_abort_has_merge_points = !ctx.current_merge_points.is_empty();
+                self.pending_abort_green_key =
+                    self.pending_abort_has_merge_points.then_some(green_key);
                 self.pending_abort_permanent = false;
                 crate::mc_diag_bump(47);
                 return Err(SwitchToBlackhole::giveup());
@@ -11973,13 +11996,12 @@ impl<M: Clone> MetaInterp<M> {
                     cb(green_key, &msg);
                 }
                 self.warm_state.abort_tracing(green_key, false);
-                // pyjitpl.py/:2786 `aborted_tracing` is the single
-                // bump site for `stats.aborted()`; keep the increment
-                // there so the caller-side `aborted_tracing(stb.reason)`
-                // catch counts exactly once.  pyjitpl.py reads
-                // greenkey from the current merge-point state — pyre's
-                // analog is pending_abort_* staged here for the catch.
-                self.pending_abort_green_key = Some(green_key);
+                // `pyjitpl.py aborted_tracing` is the single bump site for
+                // `stats.aborted()`. `on_abort` runs only when
+                // `current_merge_points` is non-empty.
+                self.pending_abort_has_merge_points = !ctx.current_merge_points.is_empty();
+                self.pending_abort_green_key =
+                    self.pending_abort_has_merge_points.then_some(green_key);
                 self.pending_abort_permanent = false;
                 crate::mc_diag_bump(48);
                 return Err(SwitchToBlackhole::giveup());
@@ -13773,7 +13795,12 @@ impl<M: Clone> MetaInterp<M> {
                 .and_then(|layout| layout.recovery_layout.clone());
             let encoded = resume_data.encode();
             let mut layout = encoded.layout_summary();
-            let storage = encoded.to_resume_storage();
+            let Ok(storage) = encoded.to_resume_storage() else {
+                // `resume.py tag` raises `TagOverflow`; `compile.py giveup`
+                // abandons the compile. This injector is not that path, so
+                // a tag that does not fit is storage we do not attach.
+                return;
+            };
             compile::enrich_resume_layout_with_trace_metadata(
                 &mut layout,
                 trace_id,
@@ -18080,22 +18107,40 @@ impl<M: Clone> MetaInterp<M> {
         // `JitStatsCounters.loops_aborted` (separate from the
         // reason-keyed `profiler.abort_*`).
         self.stats.loops_aborted = self.stats.loops_aborted.saturating_add(1);
-        // pyjitpl.py:2770 on_abort hook payload — pyre's single hook
-        // receives (greenkey, permanent).  `abort_trace_live` stashes the
-        // greenkey / permanent from the consumed ctx so we can fire once
-        // here.  The reason is carried only through the eventual hook
-        // surface split; `_reason` is intentionally unused today.
-        let green_key = self.pending_abort_green_key.take().unwrap_or(0);
-        let permanent = std::mem::take(&mut self.pending_abort_permanent);
-        if let Some(ref hook) = self.hooks.on_trace_abort {
-            hook(green_key, permanent);
+        // `pyjitpl.py aborted_tracing`:
+        //   if not current_merge_points: greenkey = None  # bridge, no on_abort
+        //   else: on_abort(...); if aborted_tracing_jitdriver: on_trace_too_long
+        // pyre's hook surface is still the one `on_trace_abort` callback.
+        // `on_abort` is that callback and runs only with merge points.
+        // `on_trace_too_long` is the same callback and runs only when
+        // `aborted_tracing_jitdriver` is set, which upstream nests inside
+        // the merge-points branch.
+        let has_merge_points = std::mem::take(&mut self.pending_abort_has_merge_points)
+            || self
+                .tracing
+                .as_ref()
+                .is_some_and(|ctx| !ctx.current_merge_points.is_empty());
+        if has_merge_points {
+            let green_key = self.pending_abort_green_key.take().unwrap_or(0);
+            let permanent = std::mem::take(&mut self.pending_abort_permanent);
+            if let Some(ref hook) = self.hooks.on_trace_abort {
+                hook(green_key, permanent);
+            }
+            if self.aborted_tracing_jitdriver.is_some() {
+                if let (Some(ref hook), Some(greenkey)) = (
+                    self.hooks.on_trace_abort.as_ref(),
+                    self.aborted_tracing_greenkey.as_ref(),
+                ) {
+                    hook(greenkey.0, false);
+                }
+                self.aborted_tracing_jitdriver = None;
+                self.aborted_tracing_greenkey = None;
+            }
+        } else {
+            // Bridge: greenkey stays None. Do not call `on_abort`.
+            self.pending_abort_green_key = None;
+            self.pending_abort_permanent = false;
         }
-        // pyjitpl.py:2776-2785: on_trace_too_long clause — pyre folds it
-        // into the single hook above until a distinct hook surface is
-        // ported; clear the fields unconditionally so bookkeeping cannot
-        // leak into the next trace.
-        self.aborted_tracing_jitdriver = None;
-        self.aborted_tracing_greenkey = None;
     }
 
     /// pyjitpl.py `MetaInterp.clear_exception()`.
@@ -18551,7 +18596,10 @@ impl<M: Clone> MetaInterp<M> {
         mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
         frames: &[majit_ir::resumedata::RebuiltFrame],
         fail_values: &[i64],
-    ) {
+        materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
+        resume_liveness: &[u8],
+        resume_op_live: u8,
+    ) -> bool {
         // `rebuild_from_resumedata`: `jitcode = staticdata.jitcodes[jitcode_pos]`,
         // then `newframe(jitcode)` and `setup_resume_at_op(pc)`. Each section
         // carries its own jitcode; the portal jitcode is only the empty-stack
@@ -18564,13 +18612,19 @@ impl<M: Clone> MetaInterp<M> {
         if frames.is_empty() {
             let _ = self.newframe(mainjitcode, None);
         } else {
-            for section in frames {
+            for (section_i, section) in frames.iter().enumerate() {
                 // `staticdata.jitcodes[jitcode_pos]`. A missing entry still
                 // builds the frame rather than dropping the section.
+                // `frame_value_count_at` counts boxes on the materialized
+                // body; a skeleton at the same index decodes no `-live-`.
                 let jitcode = usize::try_from(section.jitcode_index)
                     .ok()
                     .and_then(|pos| jitcodes.jitcodes.get(pos).cloned())
                     .unwrap_or_else(|| mainjitcode.clone());
+                let jitcode = materialized
+                    .get(section_i)
+                    .and_then(|slot| slot.clone())
+                    .unwrap_or(jitcode);
                 let frame_index = self.newframe(jitcode, None);
                 let Ok(pc) = usize::try_from(section.pc) else {
                     continue;
@@ -18580,26 +18634,48 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        self.consume_portal_resume_boxes(frames, fail_values);
+        self.consume_portal_resume_boxes(
+            frames,
+            fail_values,
+            materialized,
+            resume_liveness,
+            resume_op_live,
+        )
     }
 
     /// `resume.py` `ResumeDataBoxReader.consume_boxes`: pair each section's
     /// rebuilt values with that jitcode's live registers and store the box.
     ///
-    /// A count mismatch leaves the frame's registers unset. Pairing them
-    /// anyway would write a value into a different register than
-    /// `enumerate_vars` named. A virtual stays unset; the guard-resume walk
-    /// allocates it through `materialize_bridge_virtual`.
+    /// `resume.py ResumeDataBoxReader.consume_boxes` always consumes the
+    /// section. A liveness/section length mismatch is a producer bug: the
+    /// bridge is not built and the caller falls back through the blackhole
+    /// path the other resume errors take. A virtual stays unset; the
+    /// guard-resume walk allocates it through `materialize_bridge_virtual`.
     fn consume_portal_resume_boxes(
         &mut self,
         frames: &[majit_ir::resumedata::RebuiltFrame],
         fail_values: &[i64],
-    ) {
+        materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
+        resume_liveness: &[u8],
+        resume_op_live: u8,
+    ) -> bool {
         // `rebuild_from_resumedata` reads `metainterp.staticdata` directly.
         // One `Arc` clone releases the borrow; the slices stay on that owner.
+        // `frame_value_count_at` counts on the published `liveness_info`
+        // (`resume.py` `metainterp_sd.liveness_info`). The metainterp copy
+        // can be a shorter snapshot, which makes `enumerate_vars` return
+        // empty banks while the section still holds those boxes.
         let staticdata = std::sync::Arc::clone(&self.staticdata);
-        let op_live = staticdata.op_live as u8;
-        let liveness = staticdata.liveness_info.as_slice();
+        let op_live = if resume_liveness.is_empty() {
+            staticdata.op_live as u8
+        } else {
+            resume_op_live
+        };
+        let liveness = if resume_liveness.is_empty() {
+            staticdata.liveness_info.as_slice()
+        } else {
+            resume_liveness
+        };
         let registered = staticdata.jitcodes.as_slice();
         let n = self.framestack.frames.len().min(frames.len());
         for i in 0..n {
@@ -18610,14 +18686,25 @@ impl<M: Clone> MetaInterp<M> {
             let Ok(pc) = usize::try_from(section.pc) else {
                 continue;
             };
-            let jitcode = registered
-                .get(section.jitcode_index as usize)
-                .cloned()
+            let jitcode = materialized
+                .get(i)
+                .and_then(|slot| slot.clone())
+                .or_else(|| registered.get(section.jitcode_index as usize).cloned())
                 .unwrap_or_else(|| self.framestack.frames[i].jitcode.clone());
             let indices =
                 crate::resume::read_frame_liveness_reg_indices(&jitcode, pc, op_live, &liveness);
             if indices.total_len() != section.values.len() {
-                continue;
+                // `resume.py consume_boxes` always consumes the section.
+                // A mismatch resumes with an empty register file, so the
+                // bridge is not built.
+                debug_assert!(
+                    false,
+                    "consume_boxes: liveness {} != section values {} at pc {}",
+                    indices.total_len(),
+                    section.values.len(),
+                    pc
+                );
+                return false;
             }
             let mut order = Vec::with_capacity(indices.total_len());
             for index in indices.int {
@@ -18653,6 +18740,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
+        true
     }
 
     /// pyjitpl.py `MetaInterp.is_main_jitcode(jitcode)`.
@@ -23267,6 +23355,8 @@ mod metainterp_static_data_tests {
             portal.set_index(0);
             portal.set_jitdriver_sd(0);
             let mut meta = MetaInterp::<()>::new(0);
+            // `jitdrivers_sd[0]` for the portal jitcode stamped above.
+            meta.ensure_default_driver_sd();
             meta.finish_setup_descrs_for_jitdrivers();
             meta.force_start_tracing(0, (0, 0), None, &[Value::Int(40), Value::Int(2)]);
             meta.initialize_state_from_start(
@@ -24251,6 +24341,9 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         meta.aborted_tracing_jitdriver = Some(7);
         meta.aborted_tracing_greenkey = Some((0xfeed, None));
+        // `on_trace_too_long` and the clear sit inside the merge-points
+        // branch of `aborted_tracing` (`pyjitpl.py`).
+        meta.pending_abort_has_merge_points = true;
         meta.aborted_tracing(0);
         assert!(meta.aborted_tracing_jitdriver.is_none());
         assert!(meta.aborted_tracing_greenkey.is_none());
@@ -29902,7 +29995,11 @@ mod tests {
         }
         assert_eq!(*trace_start_count.lock(), 1, "on_trace_start should fire");
 
-        // Abort the trace
+        // `aborted_tracing` calls `on_abort` only when `current_merge_points`
+        // is non-empty (`pyjitpl.py`). A header visit is that list.
+        if let Some(ctx) = meta.tracing.as_mut() {
+            ctx.add_merge_point_with_key(green_key, None, Vec::new(), 0);
+        }
         meta.abort_trace(false);
         assert_eq!(*trace_abort_count.lock(), 1, "on_trace_abort should fire");
         assert_eq!(
@@ -30122,7 +30219,10 @@ mod tests {
         }
         assert!(meta.tracing.is_some());
 
-        // Abort non-permanently
+        // `on_abort` runs only with merge points (`pyjitpl.py aborted_tracing`).
+        if let Some(ctx) = meta.tracing.as_mut() {
+            ctx.add_merge_point_with_key(green_key, None, Vec::new(), 0);
+        }
         meta.abort_trace(false);
         {
             let events = abort_events.lock();
@@ -30135,6 +30235,9 @@ mod tests {
             meta.on_back_edge(green_key, &[0]);
         }
         if meta.tracing.is_some() {
+            if let Some(ctx) = meta.tracing.as_mut() {
+                ctx.add_merge_point_with_key(green_key, None, Vec::new(), 0);
+            }
             meta.abort_trace(true);
             let events = abort_events.lock();
             assert_eq!(events.len(), 2);

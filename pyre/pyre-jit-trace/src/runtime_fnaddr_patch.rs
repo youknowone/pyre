@@ -91,7 +91,13 @@ fn build_time_fnaddr_bindings() -> Vec<(String, i64)> {
 pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
     let correspondence = &*FNADDR_CORRESPONDENCE;
 
-    if correspondence.is_empty() {
+    // An empty correspondence still leaves symbolic shell fnaddrs to resolve
+    // by path below.
+    if correspondence.is_empty()
+        && !jitcodes
+            .iter()
+            .any(|jc| majit_jitcode::codewriter::call::is_symbolic_fnaddr(jc.fnaddr))
+    {
         return;
     }
 

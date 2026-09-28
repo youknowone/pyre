@@ -198,6 +198,16 @@ pub struct CallControl {
     pub graph_jit_shapes: HashMap<usize, u8>,
 }
 
+/// Slot of `PyPyJitDriver` in `MetaInterpStaticData.jitdrivers_sd`.
+///
+/// `pypyjit_driver_descriptor` is registered first (`register_jitdriver_sd`),
+/// then `unpackiterable_driver_descriptor`, then
+/// `generatorentry_driver_descriptor`. A per-code body that is the pypyjit
+/// portal's `mainjitcode` for one green `pycode` stamps this slot
+/// (`call.py` `jd.mainjitcode.jitdriver_sd = jd`). The position in
+/// `CallControl.jitdrivers_sd` is a different list and is not a driver index.
+pub(crate) const PYPYJIT_DRIVER_SD_INDEX: usize = 0;
+
 /// The [`CallControl::graph_jit_shapes`] value recorded for a graph whose
 /// jitcode fails to assemble.
 ///
@@ -238,9 +248,10 @@ impl CallControl {
     /// PARITY: `JitDriverStaticData.mainjitcode` (call.py left-hand
     /// side) is assigned immediately from `get_jitcode`. The
     /// back-reference at call.py (`jd.mainjitcode.jitdriver_sd = jd`)
-    /// is stamped onto the populated runtime `JitCode` in
-    /// `CodeWriter::finalize_jitcode`, where the precise jdindex is known
-    /// from `CallControl.jitdrivers_sd`.
+    /// is the pypyjit driver slot [`PYPYJIT_DRIVER_SD_INDEX`], not this
+    /// list's position. `CallControl.jitdrivers_sd` records which code
+    /// objects are portal graphs; `MetaInterpStaticData.jitdrivers_sd`
+    /// is the table blackhole and `is_main_jitcode` index.
     pub fn grab_initial_jitcodes(&mut self) {
         // Index loop because get_jitcode borrows `self.jitcodes`
         // mutably, which would conflict with an immutable borrow over
@@ -272,7 +283,7 @@ impl CallControl {
                 // shared (e.g. `cc.jitcodes` and `jd.mainjitcode`).
                 let pyjitcode = std::sync::Arc::clone(slot);
                 if pyjitcode.jitcode.jitdriver_sd().is_none() {
-                    pyjitcode.jitcode.set_jitdriver_sd(i);
+                    pyjitcode.jitcode.set_jitdriver_sd(PYPYJIT_DRIVER_SD_INDEX);
                 }
                 self.jitdrivers_sd[i].mainjitcode = Some(std::sync::Arc::clone(slot));
             }

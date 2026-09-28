@@ -2838,8 +2838,13 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     //   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
     //   fnptr        = adr2int(jitdriver_sd.portal_runner_adr)
     //   calldescr    = jitdriver_sd.mainjitcode.calldescr
-    let jitdrivers_sd: std::sync::Arc<[majit_metainterp::blackhole::BhJitDriverSd]> =
-        std::sync::Arc::from([majit_metainterp::blackhole::BhJitDriverSd {
+    //
+    // The table keeps every driver at its own `jdindex`: a resumed jd1 or jd2
+    // jitcode still carries that index, so a one-slot table would leave its
+    // `handle_jitexc_from_bh` unreachable. Only jd0's slot is replaced.
+    let jitdrivers_sd: std::sync::Arc<[majit_metainterp::blackhole::BhJitDriverSd]> = {
+        let mut table = driver.meta_interp().staticdata.bh_jitdrivers_sd().to_vec();
+        let jd0 = majit_metainterp::blackhole::BhJitDriverSd {
             result_type: majit_metainterp::blackhole::BhReturnType::Ref,
             portal_runner_ptr: Some(bh_portal_runner_c),
             handle_jitexc_from_bh: driver
@@ -2877,7 +2882,13 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             // `portal_jd_for` from claiming a frame for a synthetic driver
             // assembled around whichever jitcode happened to be innermost when
             // the chain was built.
-        }]);
+        };
+        match table.first_mut() {
+            Some(slot) => *slot = jd0,
+            None => table.push(jd0),
+        }
+        std::sync::Arc::from(table)
+    };
     {
         let vinfo = bh.virtualizable_info;
         let mut current = Some(&mut *bh);
@@ -3881,10 +3892,44 @@ pub fn trace_and_compile_from_bridge(
                 .map(|result| result.frames.clone())
                 .unwrap_or_default()
         };
+        // `frame_value_count_at` materializes `jitcodes[jitcode_pos]` before
+        // it counts the section (`resume.py` `staticdata.jitcodes`). A
+        // skeleton at that index makes `read_frame_liveness_reg_indices`
+        // return empty banks, so `consume_boxes` sees a length mismatch.
+        let materialized: Vec<Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>>> =
+            resume_frames
+                .iter()
+                .map(|section| {
+                    usize::try_from(section.jitcode_index)
+                        .ok()
+                        .and_then(|index| {
+                            pyre_jit_trace::state::ensure_build_time_jitcode_at(index)
+                                .map(|payload| std::sync::Arc::clone(&payload.jitcode))
+                        })
+                })
+                .collect();
+        let resume_liveness = pyre_jit_trace::state::liveness_info_snapshot();
+        let resume_op_live = pyre_jit_trace::state::op_live();
         let (driver, _) = crate::eval::driver_pair();
-        driver
+        let consumed = driver
             .meta_interp_mut()
-            .rebuild_portal_framestack_from_resumedata(portal, &resume_frames, raw_values);
+            .rebuild_portal_framestack_from_resumedata(
+                portal,
+                &resume_frames,
+                raw_values,
+                &materialized,
+                &resume_liveness,
+                resume_op_live,
+            );
+        if !consumed {
+            // `resume.py consume_boxes` always consumes the section. A
+            // liveness/section length mismatch does not build the bridge;
+            // the same blackhole fallback as the other resume errors.
+            if driver.is_tracing() {
+                driver.meta_interp_mut().abort_trace(false);
+            }
+            return BridgeResolution::ResumeBlackhole;
+        }
     }
     // `_prepare_exception_resumption` (pyjitpl.py) +
     // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception

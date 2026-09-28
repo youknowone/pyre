@@ -73,13 +73,6 @@ cover the condition they diagnose.
 - What it does: `MAJIT_BH_NULL_ARG`: report a null ref argument about to be handed to a residual call, with the jitcode coordinate, before the callee can dereference it.  Some ABIs pass a legitimate null sentinel (e.g. the CallFn `null_or_self` slot), so this reports rather than aborts.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
-### `MAJIT_BH_PORTAL_SUBST`
-
-- Read sites: 1 — `majit/majit-metainterp/src/blackhole.rs`
-- Accessor: `portal_substitution_report()`, called from `portal_dispatch_for()`
-- What it does: `MAJIT_BH_PORTAL_SUBST`: name each recursive portal level that re-enters through a runner its own driver did not register.  `pyre_portal_runner` reads `all_r[1]` as a `PyFrame*`, so a substituted runner reached with another driver's reds is a type confusion that would surface as a bug in the substituted driver.  It is not reported as a fault because pyre registers one runner for many drivers by construction, so this makes the substitutions countable — separating the set that actually re-enters a portal from the set that merely resolves a hook it never calls.
-- Retirement condition: Remove when every portal driver index registers its own runner, so a substitution becomes a fault the dispatch path can refuse outright rather than a counted norm.
-
 ### `MAJIT_BRIDGE_BAIL`
 
 - Read sites: 1 — `pyre/pyre-jit/src/call_jit.rs`

@@ -1972,8 +1972,8 @@ impl EncodedResumeData {
     /// live descr Arc (`resume.py PENDINGFIELDSTRUCT.lldescr`), but
     /// this helper does not currently rebuild `GuardPendingFieldEntry`
     /// from them — the production path attaches that elsewhere.
-    pub fn to_resume_storage(&self) -> Arc<ResumeStorage> {
-        fn const_pool_tag(c: &Const, rd_consts: &mut Vec<Const>) -> i16 {
+    pub fn to_resume_storage(&self) -> Result<Arc<ResumeStorage>, TagOverflow> {
+        fn const_pool_tag(c: &Const, rd_consts: &mut Vec<Const>) -> Result<i16, TagOverflow> {
             let idx = rd_consts
                 .iter()
                 .position(|existing| existing == c)
@@ -1981,32 +1981,41 @@ impl EncodedResumeData {
                     rd_consts.push(*c);
                     rd_consts.len() - 1
                 });
-            tag((idx as i32) + TAG_CONST_OFFSET, TAGCONST).unwrap_or(UNASSIGNED)
+            tag((idx as i32) + TAG_CONST_OFFSET, TAGCONST)
         }
 
         fn source_tag(
             source: &ResumeValueSource,
             liveboxes: &[usize],
             rd_consts: &mut Vec<Const>,
-        ) -> i16 {
+        ) -> Result<i16, TagOverflow> {
             match source {
-                ResumeValueSource::FailArg(index) => liveboxes
-                    .iter()
-                    .position(|live| live == index)
-                    .and_then(|compact| tag(compact as i32, TAGBOX).ok())
-                    .unwrap_or(UNASSIGNED),
-                ResumeValueSource::Constant(Const::Int(value)) => i32::try_from(*value)
-                    .ok()
-                    .and_then(|v| tag(v, TAGINT).ok())
-                    .unwrap_or_else(|| const_pool_tag(&Const::Int(*value), rd_consts)),
-                ResumeValueSource::Constant(Const::Ref(gcref)) if gcref.is_null() => NULLREF,
-                ResumeValueSource::Constant(c) => const_pool_tag(c, rd_consts),
-                ResumeValueSource::Virtual(index) => {
-                    tag(*index as i32, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL)
+                ResumeValueSource::FailArg(index) => {
+                    // A fail arg that was never numbered is `UNASSIGNED`
+                    // (`resume.py` liveboxes miss). A numbered index that
+                    // does not fit the tag is `TagOverflow`, which
+                    // `compile.py giveup` turns into an abandoned compile.
+                    let Some(compact) = liveboxes.iter().position(|live| live == index) else {
+                        return Ok(UNASSIGNED);
+                    };
+                    tag(compact as i32, TAGBOX)
                 }
-                ResumeValueSource::Tagged(tagged) => *tagged,
-                ResumeValueSource::Uninitialized => UNINITIALIZED_TAG,
-                ResumeValueSource::Unavailable => UNASSIGNED,
+                ResumeValueSource::Constant(Const::Int(value)) => {
+                    // `resume.py getconst`: `tag(val, TAGINT)` and, on
+                    // `TagOverflow`, the constant pool (`_newconst`).
+                    if let Ok(v) = i32::try_from(*value)
+                        && let Ok(tagged) = tag(v, TAGINT)
+                    {
+                        return Ok(tagged);
+                    }
+                    const_pool_tag(&Const::Int(*value), rd_consts)
+                }
+                ResumeValueSource::Constant(Const::Ref(gcref)) if gcref.is_null() => Ok(NULLREF),
+                ResumeValueSource::Constant(c) => const_pool_tag(c, rd_consts),
+                ResumeValueSource::Virtual(index) => tag(*index as i32, TAGVIRTUAL),
+                ResumeValueSource::Tagged(tagged) => Ok(*tagged),
+                ResumeValueSource::Uninitialized => Ok(UNINITIALIZED_TAG),
+                ResumeValueSource::Unavailable => Ok(UNASSIGNED),
             }
         }
 
@@ -2014,7 +2023,7 @@ impl EncodedResumeData {
             sources: impl IntoIterator<Item = VirtualFieldSource>,
             liveboxes: &[usize],
             rd_consts: &mut Vec<Const>,
-        ) -> Vec<i16> {
+        ) -> Result<Vec<i16>, TagOverflow> {
             sources
                 .into_iter()
                 .map(|source| source_tag(&source, liveboxes, rd_consts))
@@ -2025,7 +2034,7 @@ impl EncodedResumeData {
             info: &VirtualInfo,
             liveboxes: &[usize],
             rd_consts: &mut Vec<Const>,
-        ) -> std::rc::Rc<majit_ir::RdVirtualInfo> {
+        ) -> Result<std::rc::Rc<majit_ir::RdVirtualInfo>, TagOverflow> {
             let rd = match info {
                 VirtualInfo::VirtualObj {
                     descr,
@@ -2043,7 +2052,7 @@ impl EncodedResumeData {
                         fields.iter().map(|(_, source)| source.clone()),
                         liveboxes,
                         rd_consts,
-                    ),
+                    )?,
                     descr_size: *descr_size,
                 },
                 VirtualInfo::VStruct {
@@ -2060,7 +2069,7 @@ impl EncodedResumeData {
                         fields.iter().map(|(_, source)| source.clone()),
                         liveboxes,
                         rd_consts,
-                    ),
+                    )?,
                     descr_size: *descr_size,
                 },
                 VirtualInfo::VArray {
@@ -2068,7 +2077,7 @@ impl EncodedResumeData {
                     clear,
                     items,
                 } => {
-                    let fieldnums = fieldnums(items.iter().cloned(), liveboxes, rd_consts);
+                    let fieldnums = fieldnums(items.iter().cloned(), liveboxes, rd_consts)?;
                     if *clear {
                         majit_ir::RdVirtualInfo::VArrayInfoClear {
                             arraydescr: arraydescr.clone(),
@@ -2094,7 +2103,7 @@ impl EncodedResumeData {
                             element.iter().map(|(_, source)| source.clone()),
                             liveboxes,
                             rd_consts,
-                        ));
+                        )?);
                     }
                     // resume.py:740 self.fielddescrs — live InteriorFieldDescr
                     // objects expose offset/field_size/field_type via the
@@ -2158,16 +2167,20 @@ impl EncodedResumeData {
                     size: *size,
                     offsets: offsets.clone(),
                     descrs: descrs.clone(),
-                    fieldnums: fieldnums(values.iter().cloned(), liveboxes, rd_consts),
+                    fieldnums: fieldnums(values.iter().cloned(), liveboxes, rd_consts)?,
                 },
                 VirtualInfo::VRawSlice { offset, parent } => {
                     majit_ir::RdVirtualInfo::VRawSliceInfo {
                         offset: *offset,
-                        fieldnums: fieldnums(std::iter::once(parent.clone()), liveboxes, rd_consts),
+                        fieldnums: fieldnums(
+                            std::iter::once(parent.clone()),
+                            liveboxes,
+                            rd_consts,
+                        )?,
                     }
                 }
                 VirtualInfo::VStrPlain { chars } => majit_ir::RdVirtualInfo::VStrPlainInfo {
-                    fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
+                    fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts)?,
                 },
                 VirtualInfo::VStrConcat { left, right, .. } => {
                     majit_ir::RdVirtualInfo::VStrConcatInfo {
@@ -2175,7 +2188,7 @@ impl EncodedResumeData {
                             [left.as_ref().clone(), right.as_ref().clone()],
                             liveboxes,
                             rd_consts,
-                        ),
+                        )?,
                     }
                 }
                 VirtualInfo::VStrSlice {
@@ -2192,10 +2205,10 @@ impl EncodedResumeData {
                         ],
                         liveboxes,
                         rd_consts,
-                    ),
+                    )?,
                 },
                 VirtualInfo::VUniPlain { chars } => majit_ir::RdVirtualInfo::VUniPlainInfo {
-                    fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
+                    fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts)?,
                 },
                 VirtualInfo::VUniConcat { left, right, .. } => {
                     majit_ir::RdVirtualInfo::VUniConcatInfo {
@@ -2203,7 +2216,7 @@ impl EncodedResumeData {
                             [left.as_ref().clone(), right.as_ref().clone()],
                             liveboxes,
                             rd_consts,
-                        ),
+                        )?,
                     }
                 }
                 VirtualInfo::VUniSlice {
@@ -2220,11 +2233,11 @@ impl EncodedResumeData {
                         ],
                         liveboxes,
                         rd_consts,
-                    ),
+                    )?,
                 },
                 VirtualInfo::Empty => majit_ir::RdVirtualInfo::Empty,
             };
-            std::rc::Rc::new(rd)
+            Ok(std::rc::Rc::new(rd))
         }
 
         let mut writer = crate::resumecode::Writer::new(self.rd_numb.len());
@@ -2236,14 +2249,14 @@ impl EncodedResumeData {
             .rd_virtuals
             .iter()
             .map(|info| rd_virtual(info, &self.liveboxes, &mut rd_consts))
-            .collect();
+            .collect::<Result<Vec<_>, TagOverflow>>()?;
 
-        ResumeStorage::new(
+        Ok(ResumeStorage::new(
             writer.create_numbering(),
             rd_consts,
             rd_virtuals,
             Vec::new(),
-        )
+        ))
     }
 
     /// resume.py number + resume.py finish
@@ -3995,19 +4008,16 @@ impl ResumeDataLoopMemo {
             let (_, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
                 // resume.py: index = assign_number_to_box; liveboxes[box] = tag(index, TAGBOX)
+                // `tag` raises `TagOverflow`; `compile.py giveup` abandons the compile.
                 let index = self.assign_number_to_box_opt(&box_id, &mut new_boxes_list);
-                if let Ok(t) = tag(index, TAGBOX) {
-                    new_liveboxes.insert(box_id, t);
-                }
+                new_liveboxes.insert(box_id, tag(index, TAGBOX)?);
                 count += 1;
             } else {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
                 if tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
                     // resume.py: index = assign_number_to_virtual; liveboxes[box] = tag(index, TAGVIRTUAL)
                     let index = self.assign_number_to_virtual(&box_id);
-                    if let Ok(t) = tag(index, TAGVIRTUAL) {
-                        new_liveboxes.insert(box_id, t);
-                    }
+                    new_liveboxes.insert(box_id, tag(index, TAGVIRTUAL)?);
                 }
             }
         }
@@ -4199,12 +4209,14 @@ impl ResumeDataLoopMemo {
             if tagged_eq(tagged, UNASSIGNED)
                 && let Some(&num) = self.cached_boxes.get(&b)
             {
-                return Ok(tag(num, TAGBOX).unwrap_or(UNASSIGNED));
+                // `resume.py tag` raises `TagOverflow`; `compile.py giveup`
+                // abandons the compile rather than writing `UNASSIGNED`.
+                return tag(num, TAGBOX);
             }
             if tagged_eq(tagged, UNASSIGNEDVIRTUAL)
                 && let Some(&num) = self.cached_virtuals.get(&b)
             {
-                return Ok(tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL));
+                return tag(num, TAGVIRTUAL);
             }
             return Ok(tagged);
         }
@@ -8345,34 +8357,22 @@ impl<'a> ResumeDataDirectReader<'a> {
                     idx += self.count;
                 }
                 let value = self.deadframe.get(idx as usize);
-                let slot_type = match self.deadframe_types {
-                    // resume.py has no `deadframe_types`: `cpu.get_ref_value`
-                    // reads a self-describing deadframe, so a ref slot always
-                    // holds a ref.  The vector exists only because pyre's
-                    // optimizer may unbox Ref→Int in deadframe slots; a
-                    // caller with no vector at all recorded no such unboxing.
-                    None => majit_ir::Type::Ref,
-                    // A vector that is present but too short is not that
-                    // state — it means the producer's compact fail args and
-                    // this decode disagree, and falling back to Ref would
-                    // hand `value` on as a pointer.
-                    Some(tys) => *tys.get(idx as usize).unwrap_or_else(|| {
+                // `resume.py decode_ref`: `cpu.get_ref_value(deadframe, num)`.
+                // The slot is a ref. An Int/Float here means `_number_boxes`
+                // put a non-ref into a ref position.
+                if let Some(tys) = self.deadframe_types {
+                    let slot_type = *tys.get(idx as usize).unwrap_or_else(|| {
                         panic!(
                             "decode_ref: deadframe_types has {} entries, slot {idx} requested",
                             tys.len()
                         )
-                    }),
-                };
-                match slot_type {
-                    majit_ir::Type::Ref => value,
-                    // RPython: decode_ref + TAGBOX always returns a GC
-                    // pointer via cpu.get_ref_value(). These Int/Float
-                    // branches are needed because the optimizer may
-                    // unbox Ref→Int in deadframe slots.
-                    majit_ir::Type::Int => self.allocator.box_int(value),
-                    majit_ir::Type::Float => self.allocator.box_float(value),
-                    majit_ir::Type::Void => value,
+                    });
+                    debug_assert!(
+                        slot_type == majit_ir::Type::Ref,
+                        "decode_ref TAGBOX saw {slot_type:?}; fix the encoder in `_number_boxes`"
+                    );
                 }
+                value
             }
             _ => {
                 // resume.py `assert tag == TAGBOX`: in a ref slot

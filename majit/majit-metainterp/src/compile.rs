@@ -3566,16 +3566,16 @@ fn build_vector_info_chain(chain: Vec<AccumInfo>) -> Option<Box<AccumInfo>> {
     current
 }
 
-/// Global counter for unique fail_index allocation.
-///
-/// Mirrors RPython's ResumeGuardDescr numbering — each guard in every
-/// compiled trace receives a unique fail_index so the backend can
-/// report exactly which guard failed.
-static NEXT_FAIL_INDEX: AtomicU32 = AtomicU32::new(1);
-
 /// Allocate the next unique fail_index.
+///
+/// `compile.py AbstractResumeGuardDescr` has no integer identity: the
+/// descr object is the guard. The backend still keys exits on an integer,
+/// so both mint sites (`ResumeGuardDescr` construction here and
+/// `alloc_fail_index` in `resume_guard_descr`) share that one counter.
+/// A second counter starting at 1 collides and a lookup by integer
+/// attaches the bridge to the wrong guard.
 fn alloc_fail_index() -> u32 {
-    NEXT_FAIL_INDEX.fetch_add(1, Ordering::SeqCst)
+    majit_backend::alloc_fail_index()
 }
 
 // `compile.py AbstractResumeGuardDescr` status-bit constants.
@@ -6523,13 +6523,27 @@ mod fail_descr_tests {
     }
 
     #[test]
+    fn test_fail_index_one_counter_across_modules() {
+        // `alloc_fail_index` (`resume_guard_descr`) and `compile.rs`'s
+        // mint both call that one counter. Two independent counters that
+        // both start at 1 hand the same integer to two guards.
+        let from_descr = majit_backend::alloc_fail_index();
+        let from_compile = alloc_fail_index();
+        assert_ne!(from_descr, from_compile);
+        let from_descr_again = majit_backend::alloc_fail_index();
+        assert_ne!(from_compile, from_descr_again);
+        assert_ne!(from_descr, from_descr_again);
+    }
+
+    #[test]
     fn test_fail_descr_unique_indices() {
-        // `NEXT_FAIL_INDEX` is a global atomic counter shared by every test
-        // that allocates a `FailDescr`. cargo test runs tests in parallel, so
-        // resetting the counter here would race against concurrent
-        // allocations in unrelated tests and let two descrs share the same
-        // fail_index. The check below only asserts pairwise uniqueness, so
-        // the starting value of the counter is irrelevant.
+        // The fail-index counter is `alloc_fail_index` in
+        // `resume_guard_descr`, shared by every test that allocates a
+        // `FailDescr`. cargo test runs tests in parallel, so resetting
+        // the counter here would race against concurrent allocations in
+        // unrelated tests and let two descrs share the same fail_index.
+        // The check below only asserts pairwise uniqueness, so the
+        // starting value of the counter is irrelevant.
         let d1 = make_fail_descr(2);
         let d2 = make_fail_descr(3);
         let d3 = make_fail_descr(1);
