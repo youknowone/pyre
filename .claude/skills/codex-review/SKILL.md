@@ -36,7 +36,7 @@ so Codex sees the diff and the `rpython/`/`pypy/` trees:
 
 ```bash
 PROMPT="$(cat .github/codex-review-prompt.md)"
-codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.6-terra \
+codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-6-sol \
   -C "$(git rev-parse --show-toplevel)" \
   --output-last-message .claude/codex-review-report.md \
   "$PROMPT" </dev/null
@@ -53,7 +53,7 @@ Notes:
   See the `/codex` command for the same pattern.
 - The prompt is read-only by construction (it asks Codex to *report*, not edit).
   Do not let Codex modify files in this step.
-- `-m gpt-5.6-terra` is the default; honor a `--model <name>` the user passes in their
+- `-m gpt-6-sol` is the default; honor a `--model <name>` the user passes in their
   invocation.
 - The diff base is `upstream/main` (the remote base, NOT local `main` or
   `origin/main`). This skill does **not** auto-fetch — `upstream/main` is
