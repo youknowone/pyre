@@ -3195,7 +3195,8 @@ impl MiniMarkGC {
         // that a card write on a still-young array is not silently dropped by
         // the barrier's TRACK_YOUNG_PTRS test.
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
-        *hdr = GcHeader::with_flags(type_id, extra_flags);
+        // `YOUNG_RAWMALLOC` is this generation's membership; see the flag.
+        *hdr = GcHeader::with_flags(type_id, extra_flags | GcFlags::YOUNG_RAWMALLOC);
         let obj_addr = (ptr as usize) + GcHeader::SIZE;
         if crate::gc_lifetime_log_enabled() {
             eprintln!(
