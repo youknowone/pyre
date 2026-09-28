@@ -6863,7 +6863,9 @@ fn init_list_type(ns: PyObjectRef) {
                     // it after `__index__` is a pre-move address.
                     let _roots = pyre_object::gc_roots::push_roots();
                     let base = pyre_object::gc_roots::pin_roots(args);
-                    let w_count = crate::baseobjspace::getindex_repeat(args[1])?;
+                    let w_count = crate::baseobjspace::getindex_repeat(
+                        pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    )?;
                     let w_list = pyre_object::gc_roots::shadow_stack_get(base);
                     unsafe {
                         crate::objspace::descroperation::list_inplace_repeat(w_list, w_count)?
@@ -6961,7 +6963,8 @@ fn list_descr_mul_impl(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, 
     // pre-move address.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
-    let w_count = crate::baseobjspace::getindex_repeat(args[1])?;
+    let w_count =
+        crate::baseobjspace::getindex_repeat(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     let w_list = pyre_object::gc_roots::shadow_stack_get(base);
     unsafe { crate::objspace::descroperation::list_repeat(w_list, w_count) }
 }
@@ -6973,12 +6976,14 @@ fn str_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 1)?;
     // unicodeobject.py descr_mul = getindex_w (no NotImplemented wrapper),
     // so a non-__index__ operand raises and a custom __index__ is honoured.
-    let w_count = if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
-        args[1]
+    let mut w_self = args[0];
+    let w_times = args[1];
+    let w_count = if unsafe { pyre_object::pyobject::is_int_or_long(w_times) } {
+        w_times
     } else {
-        crate::baseobjspace::getindex_repeat(args[1])?
+        pyre_object::with_roots!(w_self => crate::baseobjspace::getindex_repeat(w_times))?
     };
-    unsafe { crate::objspace::descroperation::str_repeat(args[0], w_count) }
+    unsafe { crate::objspace::descroperation::str_repeat(w_self, w_count) }
 }
 
 /// unicodeobject.py `descr_mod` — the formatter, reached directly.
@@ -10911,8 +10916,11 @@ fn tuple_descr_mul_impl(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef,
     crate::type_methods::arity_slot(args, 1)?;
     // tupleobject descr_mul routes the count through getindex_w, so a custom
     // __index__ repeats the tuple (and an out-of-range one overflows).
-    let w_count = crate::baseobjspace::getindex_repeat(args[1])?;
-    unsafe { crate::objspace::descroperation::tuple_repeat(args[0], w_count) }
+    let mut w_self = args[0];
+    let w_times = args[1];
+    let w_count =
+        pyre_object::with_roots!(w_self => crate::baseobjspace::getindex_repeat(w_times))?;
+    unsafe { crate::objspace::descroperation::tuple_repeat(w_self, w_count) }
 }
 
 // ── Int/Float/Bool TypeDef (minimal) ─────────────────────────────────
@@ -11790,8 +11798,10 @@ fn init_union_type(ns: PyObjectRef) {
                         return Err(crate::PyError::type_error("__or__ requires 2 arguments"));
                     }
                     if unsafe { pyre_object::is_str(args[1]) } {
-                        let other = crate::_pypy_generic_alias::typing_type_convert(args[1])?;
-                        crate::_pypy_generic_alias::union_from_items(&[args[0], other])
+                        let mut w_self = args[0];
+                        let w_other = args[1];
+                        let other = pyre_object::with_roots!(w_self => crate::_pypy_generic_alias::typing_type_convert(w_other))?;
+                        crate::_pypy_generic_alias::union_from_items(&[w_self, other])
                     } else {
                         crate::_pypy_generic_alias::create_union(args[0], args[1])
                     }
@@ -11812,8 +11822,10 @@ fn init_union_type(ns: PyObjectRef) {
                         return Err(crate::PyError::type_error("__ror__ requires 2 arguments"));
                     }
                     if unsafe { pyre_object::is_str(args[1]) } {
-                        let other = crate::_pypy_generic_alias::typing_type_convert(args[1])?;
-                        crate::_pypy_generic_alias::union_from_items(&[other, args[0]])
+                        let mut w_self = args[0];
+                        let w_other = args[1];
+                        let other = pyre_object::with_roots!(w_self => crate::_pypy_generic_alias::typing_type_convert(w_other))?;
+                        crate::_pypy_generic_alias::union_from_items(&[other, w_self])
                     } else {
                         crate::_pypy_generic_alias::create_union(args[1], args[0])
                     }
@@ -21314,8 +21326,10 @@ fn init_float_type(ns: PyObjectRef) {
                         // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
                         // Parse hexadecimal floating-point literals like '0x1.8p3'.
                         crate::type_methods::arity_exact(args, "fromhex", 1)?;
-                        let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
-                            unsafe { crate::baseobjspace::str_utf8_w(args[1])?.to_string() }
+                        let mut w_cls = args[0];
+                        let w_s = args[1];
+                        let s_arg = if unsafe { pyre_object::is_str(w_s) } {
+                            pyre_object::with_roots!(w_cls => crate::baseobjspace::str_utf8_w(w_s).map(str::to_owned))?
                         } else {
                             // `@unwrap_spec(s='text')` — the operand is rejected by
                             // `space.text_w`, which words it this way.
@@ -21330,12 +21344,13 @@ fn init_float_type(ns: PyObjectRef) {
                         // ASCII whitespace itself, and flags overflow distinctly.
                         match rustpython_common::float_ops::from_hex(&s_arg) {
                             Ok(v) => {
-                                let w_float = pyre_object::w_float_new(v);
+                                let w_float =
+                                    pyre_object::with_roots!(w_cls => pyre_object::w_float_new(v));
                                 // floatobject.py:419: return
                                 // space.call_function(w_cls, w_float).  This runs a
                                 // subclass's __new__ and __init__ rather than merely
                                 // retagging the parsed base float.
-                                crate::call::call_function_impl_result(args[0], &[w_float])
+                                crate::call::call_function_impl_result(w_cls, &[w_float])
                             }
                             Err(e) => {
                                 use rustpython_common::float_ops::HexFloatError;
@@ -23096,8 +23111,11 @@ fn init_bytes_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__buffer__",
                 |args| {
-                    let flags = crate::baseobjspace::c_int_w(args[1])?;
-                    crate::builtins::w_memoryview_new_native_with_flags(args[0], flags)
+                    let mut w_self = args[0];
+                    let w_flags = args[1];
+                    let flags =
+                        pyre_object::with_roots!(w_self => crate::baseobjspace::c_int_w(w_flags))?;
+                    crate::builtins::w_memoryview_new_native_with_flags(w_self, flags)
                 },
                 2,
             ),
@@ -23674,8 +23692,10 @@ fn init_bytes_type(ns: PyObjectRef) {
 
 fn bytes_descr_repeat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 1)?;
-    let count = crate::baseobjspace::getindex_repeat(args[1])?;
-    unsafe { crate::objspace::descroperation::bytes_repeat(args[0], count) }
+    let mut w_self = args[0];
+    let w_times = args[1];
+    let count = pyre_object::with_roots!(w_self => crate::baseobjspace::getindex_repeat(w_times))?;
+    unsafe { crate::objspace::descroperation::bytes_repeat(w_self, count) }
 }
 
 /// `stringmethods.py:_op_val(space, w_sub, allow_char=True)` — the
@@ -23729,24 +23749,25 @@ fn bytes_sub_arg(mut w_sub: PyObjectRef) -> Result<BytesSubArg, crate::PyError> 
 /// Argument-clinic `slice_index` conversion for bytes/bytearray search
 /// methods.  Conversion precedes the bytearray implementation's receiver
 /// export, so a re-entrant `__index__` may resize the receiver.
-fn bytes_idx_args(args: &[PyObjectRef]) -> Result<(Option<i64>, Option<i64>), crate::PyError> {
+fn bytes_idx_args(base: usize, len: usize) -> Result<(Option<i64>, Option<i64>), crate::PyError> {
     // Converted one bound at a time: the first `__index__` can collect, so
-    // the second bound (and the receiver the caller still holds) have to
-    // live on the shadow stack. Callers pin `args` for the whole body.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(args);
-    let convert = |index: usize| {
-        if args.len() <= index {
-            return Ok(None);
-        }
-        let value = pyre_object::gc_roots::shadow_stack_get(base + index);
-        if unsafe { pyre_object::is_none(value) } {
-            Ok(None)
-        } else {
-            crate::sliceobject::eval_slice_index(value).map(Some)
-        }
-    };
-    Ok((convert(2)?, convert(3)?))
+    // the second bound (and the receiver the caller still holds) are read
+    // from the caller's pinned slots `base..base + len`.
+    let start = bytes_idx_arg(base, len, 2)?;
+    let end = bytes_idx_arg(base, len, 3)?;
+    Ok((start, end))
+}
+
+fn bytes_idx_arg(base: usize, len: usize, index: usize) -> Result<Option<i64>, crate::PyError> {
+    if len <= index {
+        return Ok(None);
+    }
+    let value = pyre_object::gc_roots::shadow_stack_get(base + index);
+    if unsafe { pyre_object::is_none(value) } {
+        Ok(None)
+    } else {
+        crate::sliceobject::eval_slice_index(value).map(Some)
+    }
 }
 
 /// Normalize already-converted `start` / `end` against the receiver length
@@ -23813,7 +23834,7 @@ fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyErr
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     let load = |i: usize| pyre_object::gc_roots::shadow_stack_get(base + i);
-    let bounds = bytes_idx_args(args)?;
+    let bounds = bytes_idx_args(base, args.len())?;
     // CPython 3.14 bytearray search methods acquire the receiver before
     // converting `sub` (gh-142560), so re-entrant buffer conversion cannot
     // resize the storage under a borrowed slice.  Argument-clinic converted
@@ -23883,7 +23904,7 @@ fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     let load = |i: usize| pyre_object::gc_roots::shadow_stack_get(base + i);
-    let bounds = bytes_idx_args(args)?;
+    let bounds = bytes_idx_args(base, args.len())?;
     let receiver = crate::baseobjspace::simple_buffer_bytes(load(0))?
         .expect("bytes/bytearray receiver always exports a buffer");
     let sub = match bytes_sub_arg(load(1)) {
@@ -23918,7 +23939,7 @@ fn bytes_prefix_match(
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     let load = |i: usize| pyre_object::gc_roots::shadow_stack_get(base + i);
-    let bounds = bytes_idx_args(args)?;
+    let bounds = bytes_idx_args(base, args.len())?;
     let receiver = crate::baseobjspace::simple_buffer_bytes(load(0))?
         .expect("bytes/bytearray receiver always exports a buffer");
     let result = (|| {
@@ -26646,6 +26667,10 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // args[0] = cls. `bytes(source=b'', encoding=None, errors=None)` —
     // every parameter is positional-or-keyword (bytesobject.py descr_new);
     // `encoding`/`errors` are only valid with a str source.
+    // `args` is the gateway's native copy; cls is re-read from its slot after
+    // the conversions below collect.
+    let _cls_root = pyre_object::gc_roots::push_roots();
+    let cls_slot = _cls_root.pin_roots(&args[..1]);
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     // pos[0] is the class; `bytes(source, encoding, errors)` accepts at most
     // three further positional arguments.
@@ -26765,7 +26790,7 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         {
             let data = buffer.as_bytes().to_vec();
             buffer.release();
-            return Ok(new_bytes_like(args[0], &data));
+            return Ok(new_bytes_like(_cls_root.get(cls_slot), &data));
         }
     }
     // `_from_byte_sequence_loop`: iterate the source, coercing each element
@@ -27353,8 +27378,11 @@ fn init_bytearray_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__buffer__",
                 |args| {
-                    let flags = crate::baseobjspace::c_int_w(args[1])?;
-                    crate::builtins::w_memoryview_new_native_with_flags(args[0], flags)
+                    let mut w_self = args[0];
+                    let w_flags = args[1];
+                    let flags =
+                        pyre_object::with_roots!(w_self => crate::baseobjspace::c_int_w(w_flags))?;
+                    crate::builtins::w_memoryview_new_native_with_flags(w_self, flags)
                 },
                 2,
             ),
@@ -28206,13 +28234,14 @@ fn setlike_descr_isdisjoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             args[0], args[1],
         )?));
     }
-    let items = crate::builtins::collect_iterable(args[1])?;
+    let mut w_self = args[0];
+    let w_other = args[1];
+    let items = pyre_object::with_roots!(w_self => crate::builtins::collect_iterable(w_other))?;
     // `set_contains_checked` hashes the element, which runs a user `__hash__`
     // before the unhashable-type error can be raised — so the receiver and the
     // items still waiting in this native Vec both move under the loop.
     let _roots = pyre_object::gc_roots::push_roots();
-    let set_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(args[0]);
+    let set_slot = pyre_object::gc_roots::pin_roots(&[w_self]);
     let item_base = pyre_object::gc_roots::pin_roots(&items);
     for index in 0..items.len() {
         let receiver = pyre_object::gc_roots::shadow_stack_get(set_slot);
@@ -29431,9 +29460,11 @@ fn set_method_le(
         "set.issubset"
     };
     crate::type_methods::arity_exact(args, name, 1)?;
-    let w_other_as_set = set_operand_as_set(args[1])?;
+    let mut w_self = args[0];
+    let w_other = args[1];
+    let w_other_as_set = pyre_object::with_roots!(w_self => set_operand_as_set(w_other))?;
     Ok(pyre_object::w_bool_from(set_is_subset_of(
-        args[0],
+        w_self,
         w_other_as_set,
     )?))
 }
@@ -29449,10 +29480,12 @@ fn set_method_ge(
     crate::type_methods::arity_exact(args, name, 1)?;
     // `setobject.py descr_issuperset` — the operand becomes a set and
     // the subset test runs the other way round.
-    let w_other_as_set = set_operand_as_set(args[1])?;
+    let mut w_self = args[0];
+    let w_other = args[1];
+    let w_other_as_set = pyre_object::with_roots!(w_self => set_operand_as_set(w_other))?;
     Ok(pyre_object::w_bool_from(set_is_subset_of(
         w_other_as_set,
-        args[0],
+        w_self,
     )?))
 }
 
@@ -29544,9 +29577,12 @@ fn set_method_intersection_update(
     // re-read from the shadow stack before the storage swap
     // (`setobject.py` `descr_intersection_update`).
     let _roots = pyre_object::gc_roots::push_roots();
-    let self_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(args[0]);
-    let result = set_method_intersection(args)?;
+    let self_slot = pyre_object::gc_roots::pin_roots(args);
+    let mut operands = Vec::with_capacity(args.len());
+    for index in 0..args.len() {
+        operands.push(pyre_object::gc_roots::shadow_stack_get(self_slot + index));
+    }
+    let result = set_method_intersection(&operands)?;
     let result_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(result);
     unsafe {
@@ -29857,8 +29893,10 @@ fn init_set_type(ns: PyObjectRef) {
                 |args| {
                     crate::type_methods::require_set_receiver(args, "remove", true)?;
                     crate::type_methods::arity_exact(args, "remove", 1)?;
-                    if !set_discard_from_set(args[0], args[1])? {
-                        return Err(crate::PyError::key_error_with_key(args[1]));
+                    let w_set = args[0];
+                    let mut w_key = args[1];
+                    if !pyre_object::with_roots!(w_key => set_discard_from_set(w_set, w_key))? {
+                        return Err(crate::PyError::key_error_with_key(w_key));
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -33592,11 +33630,7 @@ pub(crate) fn itertools_tee(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         )));
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(positional[0]);
-    let source_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    if positional.len() == 2 {
-        let _ = pyre_object::gc_roots::pin_root(positional[1]);
-    }
+    let source_slot = pyre_object::gc_roots::pin_roots(positional);
     let n = if positional.len() == 2 {
         crate::builtins::space_index_w(unsafe {
             pyre_object::gc_roots::shadow_stack_get(source_slot + 1)
