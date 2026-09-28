@@ -521,8 +521,11 @@ fn raw_initial_state(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
             "_initial_state() requires 2 arguments",
         ));
     }
-    let name = pyre_interpreter::baseobjspace::text_w(positional[0])?;
-    let decoder = pyre_interpreter::baseobjspace::is_true(positional[1])?;
+    let w_name = positional[0];
+    let mut w_decoder = positional[1];
+    let name =
+        pyre_object::with_roots!(w_decoder => pyre_interpreter::baseobjspace::text_w(w_name))?;
+    let decoder = pyre_interpreter::baseobjspace::is_true(w_decoder)?;
     let codec = cjkcodecs::Codec::from_name(name).ok_or_else(|| {
         pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::LookupError,

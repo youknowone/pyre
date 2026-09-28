@@ -2593,20 +2593,25 @@ mod ssl_socket_methods {
         }
 
         fn read(&mut self, args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            ensure_connection(self)?;
+            // `args` is the gateway's native copy; a collection in
+            // `ensure_connection` or `int_w` does not forward it.
             let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+            let mut w_kwargs = kwargs.unwrap_or(PY_NULL);
+            let mut w_size = positional.get(1).copied().unwrap_or(PY_NULL);
+            let mut w_buffer = positional.get(2).copied().unwrap_or(PY_NULL);
+            pyre_object::with_roots!(w_kwargs, w_size, w_buffer => ensure_connection(self))?;
+            let kwargs = (!w_kwargs.is_null()).then_some(w_kwargs);
             if pyre_interpreter::builtins::has_real_kwargs(kwargs) || positional.len() > 3 {
                 return Err(pyre_interpreter::PyError::type_error(
                     "read() takes at most 2 arguments",
                 ));
             }
-            let requested = positional
-                .get(1)
-                .copied()
-                .map(pyre_interpreter::baseobjspace::int_w)
-                .transpose()?
-                .unwrap_or(1024);
-            let output_buffer = positional.get(2).copied();
+            let requested = if w_size.is_null() {
+                1024
+            } else {
+                pyre_object::with_roots!(w_buffer => pyre_interpreter::baseobjspace::int_w(w_size))?
+            };
+            let output_buffer = (!w_buffer.is_null()).then_some(w_buffer);
             if requested < 0 && output_buffer.is_none() {
                 return Err(pyre_interpreter::PyError::value_error(
                     "size should not be negative",
