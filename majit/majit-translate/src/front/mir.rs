@@ -1336,11 +1336,6 @@ impl<'l> CrateLowering<'l> {
 
     /// Record why the body of `fd` produced no graph.
     pub(crate) fn record_decl_failure(&self, fd: &FunDecl, error: DeclBuildError) {
-        let CrateLoweringState {
-            skipped,
-            atomic_load_decls,
-            ..
-        } = self.state;
         match error {
             DeclBuildError::NoBody => {
                 // A declaration with no unstructured body never becomes a
@@ -1355,17 +1350,11 @@ impl<'l> CrateLowering<'l> {
                     &decl_fn_path(&module_path, &name),
                 );
             }
-            DeclBuildError::Lower {
-                name,
-                error,
-                atomic_load_reason,
-            } => {
-                if let Some(reason) = atomic_load_reason {
-                    atomic_load_decls
-                        .borrow_mut()
-                        .push(declined_atomic_load_fun_decl(self.llbc, fd, reason));
-                }
-                skipped.borrow_mut().push((name, error.to_string()));
+            DeclBuildError::Lower { name, error } => {
+                self.state
+                    .skipped
+                    .borrow_mut()
+                    .push((name, error.to_string()));
             }
         }
     }
@@ -1493,7 +1482,6 @@ impl<'l> CrateLowering<'l> {
         // erroring out at program-build time.
         let accum = AccumulatorFacts::build(llbc, &body);
         let builder_mode = accum.has_builder;
-        let mut atomic_reasons = Vec::new();
         let graph = match lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             fd,
@@ -1505,7 +1493,6 @@ impl<'l> CrateLowering<'l> {
             tombstoned_leaves,
             builder_mode,
             &accum,
-            &mut atomic_reasons,
             root_stack,
             Some(spec),
             false,
@@ -1516,7 +1503,6 @@ impl<'l> CrateLowering<'l> {
                     name: instance_leaf(llbc, fd)
                         .unwrap_or_else(|| decl_module_path_and_name(fd).1),
                     error,
-                    atomic_load_reason: atomic_reasons.into_iter().next(),
                 });
             }
         };
@@ -1643,7 +1629,6 @@ impl<'l> CrateLowering<'l> {
             dont_look_inside,
             spec: spec_queue,
             skipped,
-            atomic_load_decls,
             ..
         } = self.state;
         let Self {
@@ -1659,7 +1644,6 @@ impl<'l> CrateLowering<'l> {
         let body = &spec.body;
         let accum = AccumulatorFacts::build(llbc, body);
         let builder_mode = accum.has_builder;
-        let mut atomic_reasons = Vec::new();
         let mut graph = match lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             fd,
@@ -1671,20 +1655,15 @@ impl<'l> CrateLowering<'l> {
             &tombstoned_leaves,
             builder_mode,
             &accum,
-            &mut atomic_reasons,
             &root_stack,
             Some(spec_queue),
             true,
         ) {
             Ok(g) => g,
             Err(e) => {
-                let msg = e.to_string();
-                if let Some(reason) = atomic_reasons.first() {
-                    atomic_load_decls
-                        .borrow_mut()
-                        .push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
-                }
-                skipped.borrow_mut().push((spec.name.clone(), msg));
+                skipped
+                    .borrow_mut()
+                    .push((spec.name.clone(), e.to_string()));
                 return None;
             }
         };
@@ -1876,13 +1855,8 @@ pub(crate) fn report_lowering_skips(skips: &LoweringSkips) {
 pub(crate) enum DeclBuildError {
     /// The declaration carries no `Unstructured` body.
     NoBody,
-    /// The body did not lower. `atomic_load_reason` is the first ordered
-    /// atomic load the lowering declined, if any.
-    Lower {
-        name: String,
-        error: LowerError,
-        atomic_load_reason: Option<String>,
-    },
+    /// The body did not lower.
+    Lower { name: String, error: LowerError },
 }
 
 /// A declaration's crate-stripped module path and bare leaf name. Each
@@ -3646,7 +3620,6 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     elaborate_explicit_root_closes(llbc, &mut u, &|reg| regular_call_name_path(reg, llbc));
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
-    let mut atomic_load_reasons = Vec::new();
     lower_unstructured_with_static_addrs_and_attrs(
         llbc,
         fd,
@@ -3658,7 +3631,6 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         &tombstoned_leaves,
         builder_mode,
         &accum,
-        &mut atomic_load_reasons,
         &RootStackAnalyzer::new(llbc, &RootStackState::new(llbc)),
         None,
         false,
@@ -3779,7 +3751,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // qualifying functions have one canonical marker-emitting graph.
     builder_mode: bool,
     accum: &AccumulatorFacts,
-    atomic_load_reasons: &mut Vec<String>,
     root_stack: &RootStackAnalyzer<'_>,
     spec: Option<&std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
     spec_body: bool,
@@ -4472,9 +4443,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                     eprintln!("[FRAMESTATE fallback] {:?}: {e:?}", name);
                 }
                 if std::env::var_os("MAJIT_MIR_FRAMESTATE_STRICT").is_some() {
-                    if atomic_load_reasons.is_empty() {
-                        atomic_load_reasons.extend(lo.ordered_atomic_load_reasons.iter().cloned());
-                    }
                     return Err(e);
                 }
             }
@@ -4543,12 +4511,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             finish(&mut lo)?;
             Ok(lo.graph)
         }
-        Err(e) => {
-            if atomic_load_reasons.is_empty() {
-                atomic_load_reasons.extend(lo.ordered_atomic_load_reasons.iter().cloned());
-            }
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -6540,9 +6503,6 @@ struct Lowering<'a> {
     /// variant a dropped barrier, so this map carries the single-assignment
     /// restriction for the same reason [`Lowering::atomic_ref_place`] does.
     atomic_ordering_locals: std::collections::HashMap<usize, String>,
-    /// Non-`Relaxed` `Atomic*::load` sites seen in the body, independent of
-    /// which lowering error is reported first.
-    ordered_atomic_load_reasons: Vec<String>,
     /// `FunctionDesc.cachedgraph` for this lowering. `None` outside the
     /// whole-program walk.
     spec: Option<&'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
@@ -7081,7 +7041,6 @@ impl<'a> Lowering<'a> {
             index_elem_alias: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
             atomic_ordering_locals: std::collections::HashMap::new(),
-            ordered_atomic_load_reasons: Vec::new(),
             spec: None,
             spec_body: false,
             const_discriminant_locals: std::collections::HashMap::new(),
@@ -7174,7 +7133,6 @@ impl<'a> Lowering<'a> {
     }
 
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
-        self.note_nonrelaxed_atomic_loads();
         // Each MIR basic block is a FlowGraph block.  Locals live across
         // a successor edge are explicit `Link.args` into the target
         // block's `inputargs`, mirroring FlowContext.mergeblock rather
@@ -7520,7 +7478,6 @@ impl<'a> Lowering<'a> {
     /// shape — so a back-edge into bb0 (which would demand reseeding the
     /// parameter slots as phis) declines to the monotonic fallback.
     fn lower_framestate(&mut self, loop_headers: &[bool]) -> Result<(), LowerError> {
-        self.note_nonrelaxed_atomic_loads();
         let n = self.body.body.len();
         if n == 0 {
             return Ok(());
@@ -20110,59 +20067,6 @@ impl<'a> Lowering<'a> {
 
     fn is_atomic_load(&self, reg: &RegularCall) -> bool {
         self.is_atomic_method(reg, "load")
-    }
-
-    /// Record every non-`Relaxed` atomic load in the body before lowering
-    /// stops at the first unsupported statement.
-    fn note_nonrelaxed_atomic_loads(&mut self) {
-        self.ordered_atomic_load_reasons.clear();
-        let mut ordering = std::collections::HashMap::<usize, String>::new();
-        for bb in &self.body.body {
-            for stmt in &bb.statements {
-                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
-                    continue;
-                };
-                let PlaceKind::Local(local) = place.kind else {
-                    continue;
-                };
-                if let Some(name) = self.atomic_ordering_variant(&rvalue) {
-                    ordering.insert(local as usize, name);
-                }
-            }
-        }
-        for bb in &self.body.body {
-            let Ok(term) = bb.term_ref(self.llbc) else {
-                continue;
-            };
-            let TermKind::Call { call, .. } = term else {
-                continue;
-            };
-            let CallFunc::Regular(reg) = &call.func else {
-                continue;
-            };
-            if call.args.len() != 2 || !self.is_atomic_load(reg) {
-                continue;
-            }
-            let ordering_name = call
-                .args
-                .get(1)
-                .and_then(|operand| match operand {
-                    Operand::Copy(place) | Operand::Move(place) => match place.kind {
-                        PlaceKind::Local(local) => Some(local as usize),
-                        _ => None,
-                    },
-                    Operand::Const(_) => None,
-                })
-                .and_then(|local| ordering.get(&local))
-                .map(String::as_str);
-            if ordering_name == Some("Relaxed") {
-                continue;
-            }
-            self.ordered_atomic_load_reasons.push(format!(
-                "unsupported MIR: atomic load ordering {} requires address-preserving ordered lowering",
-                ordering_name.unwrap_or("unknown")
-            ));
-        }
     }
 
     /// `<core::sync::atomic::Atomic*>::store(&self, value, ordering)` — the
@@ -32832,10 +32736,9 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     })
 }
 
-/// Signature row for a function the MIR loop already declined.
-///
-/// The decline string is the `LowerError` the lowering produced. This
-/// does not walk the body again.
+/// Signature row of a declaration the front end declares as an
+/// `rffi.llexternal` ([`CrateLowering::declare_llexternal`]); its body is
+/// never walked.
 fn declined_atomic_load_fun_decl(
     llbc: &Llbc,
     fd: &FunDecl,

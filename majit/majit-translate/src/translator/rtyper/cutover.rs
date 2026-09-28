@@ -8548,14 +8548,13 @@ mod tests {
         assert!(is_external_shaped_atomic_accessor(&decls[0]));
         assert_eq!(collect_atomic_load_llexternals(&decls).len(), 1);
 
+        // An unlisted path whose body does not lower declares nothing: a
+        // lowering failure is not an `llexternal` declaration.
         let pointer = atomic_load_llbc(Some("Acquire"), false);
         let decls = crate::front::mir::build_semantic_program_from_llbc(&pointer)
             .expect("pointer fixture lowers")
             .atomic_load_decls;
-        assert_eq!(decls.len(), 1);
-        assert_eq!(decls[0].arg_lltypes.len(), 1);
-        assert!(!is_external_shaped_atomic_accessor(&decls[0]));
-        assert!(collect_atomic_load_llexternals(&decls).is_empty());
+        assert!(decls.is_empty());
 
         // The path is declared an external whatever its body loads: an
         // `rffi.llexternal` is a declaration, not a lowering outcome.
