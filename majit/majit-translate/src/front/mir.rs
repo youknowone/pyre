@@ -1268,6 +1268,9 @@ impl<'l> CrateLowering<'l> {
         if !self.admit_decl(fd, module_filter, function_filter) {
             return None;
         }
+        if self.declare_llexternal(fd) {
+            return None;
+        }
         match self.build_decl(fd) {
             Ok(function) => Some(function),
             Err(error) => {
@@ -1308,6 +1311,30 @@ impl<'l> CrateLowering<'l> {
         }
         let fn_path = decl_fn_path(&module_path, &name);
         !self.state.not_rpython.contains(&fn_path)
+    }
+
+    /// Whether `fd` is declared as an `rffi.llexternal` word reader
+    /// ([`WORD_LOAD_LLEXTERNALS`]): a function object with no graph, whose
+    /// signature is recorded for the call registry's external.
+    ///
+    /// [`WORD_LOAD_LLEXTERNALS`]: crate::translator::rtyper::lltypesystem::module::ll_extaccessor::WORD_LOAD_LLEXTERNALS
+    pub(crate) fn declare_llexternal(&self, fd: &FunDecl) -> bool {
+        use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::WORD_LOAD_LLEXTERNALS;
+        let name_path = fd.item_meta.name_path();
+        let declared = WORD_LOAD_LLEXTERNALS
+            .iter()
+            .any(|row| row.segments.iter().copied().eq(name_path.split("::")));
+        if declared {
+            self.state
+                .atomic_load_decls
+                .borrow_mut()
+                .push(declined_atomic_load_fun_decl(
+                    self.llbc,
+                    fd,
+                    "rffi.llexternal declaration".to_string(),
+                ));
+        }
+        declared
     }
 
     /// Record why the body of `fd` produced no graph.

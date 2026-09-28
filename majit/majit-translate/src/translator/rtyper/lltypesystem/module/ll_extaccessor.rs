@@ -2,9 +2,10 @@
 //! walk, but whose address and scalar ABI are known.
 //!
 //! `extfunc.py` `register_external` / `ExtFuncEntry` is the owner: a residual
-//! call of the real function returns the runtime value.  Callers enumerate
-//! the functions `build_semantic_program` declined with `unsupported MIR:
-//! atomic load ordering`, and this module keeps only a word-only reader:
+//! call of the real function returns the runtime value.  The front end
+//! declares each [`WORD_LOAD_LLEXTERNALS`] path as a function object with no
+//! graph (`rffi.py` `llexternal`) and records its signature, and this module
+//! keeps only a word-only reader:
 //! a function that loads one word from a process-global `AtomicU32` and
 //! returns it, with no allocation, collection, blocking, or thread
 //! creation.

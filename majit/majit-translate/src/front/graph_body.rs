@@ -230,6 +230,9 @@ impl GraphBodyProvider {
                         return None;
                     };
                     let declared = Rc::new(declared);
+                    if lowering.declare_llexternal(fd) {
+                        return Some(header.into_semantic(LazyGraph::external(declared)));
+                    }
                     let (krate, tables, def_id) = (krate.clone(), self.tables.clone(), fd.def_id);
                     let graph = LazyGraph::deferred(declared.clone(), move || {
                         let graph = krate.build_decl_graph(&tables, def_id, &stamp, &declared);

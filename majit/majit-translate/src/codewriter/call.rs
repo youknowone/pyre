@@ -1550,6 +1550,9 @@ impl StoreCore {
             Some(built) => built.as_ref().map(|built| built.graph.clone()),
             None => {
                 let source = slot.source.as_ref()?;
+                if source.graph.is_graphless() {
+                    return None;
+                }
                 let mut header = FunctionGraph::clone(source.graph.header());
                 source.transform.apply(&mut header);
                 slot.attrs.apply(&mut header);

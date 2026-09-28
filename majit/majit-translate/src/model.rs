@@ -7062,6 +7062,22 @@ impl LazyGraph {
         }))
     }
 
+    /// A funcobj declared with no graph: an external function object
+    /// (`rffi.llexternal`), whose `header` is what it declares.
+    pub fn external(header: impl Into<std::rc::Rc<FunctionGraph>>) -> Self {
+        Self(std::rc::Rc::new(LazyGraphCell {
+            graph: std::cell::OnceCell::from(None),
+            build: std::cell::Cell::new(None),
+            header: Some(header.into()),
+        }))
+    }
+
+    /// Whether the funcobj is known to have no graph, read without building
+    /// one.
+    pub fn is_graphless(&self) -> bool {
+        matches!(self.0.graph.get(), Some(None))
+    }
+
     /// The funcobj identity, read without building the graph.
     pub fn graph_key(&self) -> GraphKey {
         self.header().graph_key()
