@@ -1515,6 +1515,49 @@ mod unroll_binding_tests {
     }
 
     /// No join follows a straight-line assignment, so the name rebinds.
+    fn loop_locals_with_green_found() -> LowererConfig {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.greens = vec![syn::parse_quote!(found)];
+        config
+    }
+
+    /// An inline dispatch arm (`pc_pinned`) writes a green's merge-point
+    /// register itself, so an arm-local write to the green moves into it
+    /// (aheui's `stackok = ...; can_enter_jit!(...); continue` arms).
+    #[test]
+    fn pinned_green_reassign_in_an_if_arm_writes_the_green_register() {
+        let config = loop_locals_with_green_found();
+        let mut lowerer = Lowerer::new(Some(&config));
+        bind_loop_locals(&mut lowerer);
+        lowerer.pc_pinned = true;
+        let expr: syn::ExprIf = syn::parse_quote! {
+            if i == 1 {
+                found = i + 1;
+            }
+        };
+        assert!(lowerer.lower_if_stmt(&expr).is_some());
+        assert_eq!(lowerer.bindings["found"].reg, 1);
+        assert!(
+            moves_into(&lowerer, 1) >= 1,
+            "the arm must move the green's new value into its register"
+        );
+    }
+
+    /// A sub-JitCode arm cannot carry a green write back to the caller, so
+    /// the arm refuses instead of dropping the write.
+    #[test]
+    fn unpinned_green_reassign_in_an_if_arm_refuses() {
+        let config = loop_locals_with_green_found();
+        let mut lowerer = Lowerer::new(Some(&config));
+        bind_loop_locals(&mut lowerer);
+        let expr: syn::ExprIf = syn::parse_quote! {
+            if i == 1 {
+                found = i + 1;
+            }
+        };
+        assert!(lowerer.lower_if_stmt(&expr).is_none());
+    }
+
     #[test]
     fn straight_line_reassign_rebinds_instead_of_moving() {
         let mut lowerer = Lowerer::new(None);
