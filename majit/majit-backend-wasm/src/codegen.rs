@@ -4381,6 +4381,8 @@ fn nursery_header_tid_store(
 
 /// `CALL_MALLOC_NURSERY_VARSIZE` slow arm: the arity-5 array helper
 /// (`wasm_jit_alloc_array(type_id, base_size, item_size, length, len_offset)`).
+/// x86 `MallocCondVarsizeSlowPath.generate_body` `push_gcmap`s before the
+/// call; the caller's `emit_reload_refs_from_homes` pops it.
 fn emit_alloc_array_helper(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -4392,6 +4394,8 @@ fn emit_alloc_array_helper(
     len_offset: i64,
     new_array_fn_ptr: i64,
     residual_type_base: u32,
+    site_gcmap: &[i64],
+    op_idx: usize,
 ) {
     sink.i64_const(type_id);
     sink.i64_const(base_size);
@@ -4399,6 +4403,7 @@ fn emit_alloc_array_helper(
     emit_resolve(sink, constants, value_types, length);
     sink.i64_const(len_offset);
     sink.i32_const(new_array_fn_ptr as i32);
+    emit_push_site(sink, site_gcmap, op_idx);
     sink.call_indirect(0, residual_type_base + 5);
 }
 
@@ -8799,6 +8804,8 @@ fn build_function(
                         len_offset,
                         alloc.new_array_fn_ptr,
                         base,
+                        &site_gcmap,
+                        op_idx,
                     );
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -8852,6 +8859,8 @@ fn build_function(
                         len_offset,
                         alloc.new_array_fn_ptr,
                         base,
+                        &site_gcmap,
+                        op_idx,
                     );
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -8903,6 +8912,8 @@ fn build_function(
                         len_offset,
                         alloc.new_array_fn_ptr,
                         base,
+                        &site_gcmap,
+                        op_idx,
                     );
                 }
                 if !OpRef::raw_is_constant(vi) {

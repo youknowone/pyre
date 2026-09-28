@@ -11436,6 +11436,88 @@ fn call_malloc_nursery_variants_lower() {
     );
 }
 
+/// assembler.py `malloc_cond_varsize`: the slow path `push_gcmap`s before
+/// calling the array helper, and a non-inlined `CALL_R` to the helper
+/// pushes it too (callbuilder.py `push_gcmap`). A Ref live across the
+/// allocation is then in `jf_gcmap` whenever the helper collects.
+#[test]
+fn call_malloc_nursery_varsize_helper_publishes_the_site_gcmap() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    let varsize = make_op(
+        OpCode::CallMallocNurseryVarsize,
+        &[
+            OpRef::const_int(0),
+            OpRef::const_int(8),
+            OpRef::input_arg_int(0),
+        ],
+        OpRef::ref_op(2),
+    );
+    varsize.setdescr(Arc::new(SimpleArrayDescr::new(1, 16, 8, 53, Type::Int)));
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(1))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(1))]);
+    for inlined in [true, false] {
+        let mut inputs = nursery_new_inputs(vec![varsize.clone(), finish.clone()], 53);
+        if !inlined {
+            inputs.nursery = None;
+        }
+        inputs.inputargs = vec![
+            InputArg::from_type_rc(Type::Int, 0),
+            InputArg::from_type_rc(Type::Ref, 1),
+        ];
+        inputs.frame = codegen::FrameGeometry::compact(
+            codegen::frame_value_slots(&inputs.inputargs, &inputs.ops),
+            codegen::count_ref_homes(&inputs.inputargs, &inputs.ops),
+            0,
+        );
+        inputs.ca.compute_home_gcmap = true;
+        inputs.ca.ca_reload_fn_ptr = 1;
+        let (bytes, _, _, _) =
+            codegen::build_wasm_module(&inputs).expect("varsize with a live Ref should lower");
+        validate_wasm(&bytes);
+        let gcmap_ofs = majit_backend::jitframe::JF_GCMAP_OFS as u64;
+        let mut helper_calls = 0usize;
+        for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+            let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() else {
+                continue;
+            };
+            let mut published = false;
+            let mut helper_pending = false;
+            let mut last_const = None;
+            for op in body.get_operators_reader().unwrap() {
+                match op.unwrap() {
+                    wasmparser::Operator::I32Const { value } => {
+                        helper_pending |= value == 0x22;
+                        last_const = Some(value as i64);
+                    }
+                    wasmparser::Operator::I64Const { value } => last_const = Some(value),
+                    wasmparser::Operator::I32Store { memarg }
+                    | wasmparser::Operator::I64Store { memarg }
+                        if memarg.offset == gcmap_ofs =>
+                    {
+                        published = last_const.is_some_and(|v| v != 0);
+                        last_const = None;
+                    }
+                    wasmparser::Operator::CallIndirect { .. } => {
+                        if helper_pending {
+                            helper_calls += 1;
+                            assert!(
+                                published,
+                                "array helper runs with jf_gcmap unset (inlined={inlined})"
+                            );
+                        }
+                        helper_pending = false;
+                        last_const = None;
+                    }
+                    _ => last_const = None,
+                }
+            }
+        }
+        assert_eq!(helper_calls, if inlined { 2 } else { 1 });
+    }
+}
+
 #[test]
 fn inline_nursery_new_elides_the_barrier_like_gen_malloc_nursery() {
     use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
