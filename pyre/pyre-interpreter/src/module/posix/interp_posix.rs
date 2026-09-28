@@ -501,55 +501,6 @@ fn register_at_fork(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(pyre_object::w_none())
 }
 
-/// `os.terminal_size` structseq — `(columns, lines)`.
-fn terminal_size_seq_type() -> PyObjectRef {
-    static T: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
-    T.get_or_init(|| crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"]))
-}
-
-/// `uname_result` structseq — `(sysname, nodename, release, version,
-/// machine)`.  `uname_result_desc` names the type after the module it is
-/// registered in, which is what pickle imports to resolve it: `posix` where
-/// this module is `posix`, `nt` on Windows, which has the type even though it
-/// has no `uname` to build one with.
-fn uname_result_seq_type() -> PyObjectRef {
-    static T: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
-    T.get_or_init(|| {
-        crate::_structseq::make_struct_seq(
-            if cfg!(windows) {
-                "nt.uname_result"
-            } else {
-                "posix.uname_result"
-            },
-            &["sysname", "nodename", "release", "version", "machine"],
-        )
-    })
-}
-
-/// `os.statvfs_result` structseq — 10 sequence slots with `f_fsid` as an
-/// extra named field (`n_sequence_fields=10`, `n_fields=11`).
-fn statvfs_result_seq_type() -> PyObjectRef {
-    static T: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
-    T.get_or_init(|| {
-        crate::_structseq::make_struct_seq_with_extra(
-            "os.statvfs_result",
-            &[
-                "f_bsize",
-                "f_frsize",
-                "f_blocks",
-                "f_bfree",
-                "f_bavail",
-                "f_files",
-                "f_ffree",
-                "f_favail",
-                "f_flag",
-                "f_namemax",
-            ],
-            &["f_fsid"],
-        )
-    })
-}
-
 /// `posix.waitid_result` structseq — the five `siginfo_t` fields `waitid`
 /// fills (`posixmodule.c waitid_result_fields`). The call is one
 /// `interp_posix.py:1722` names and does not carry, so the shape here is the
@@ -743,31 +694,6 @@ fn host_cpu_count() -> i64 {
     )))]
     let ncpu = 0i64;
     ncpu
-}
-
-/// `os.times_result` structseq — `(user, system, children_user,
-/// children_system, elapsed)`; repr renders "posix.times_result(...)", or
-/// "nt.times_result(...)" on the host whose module is spelled that way.  The
-/// name is the one `pickle` imports to resolve the type, so it has to be the
-/// module the host actually has.
-fn times_result_seq_type() -> PyObjectRef {
-    static T: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
-    T.get_or_init(|| {
-        crate::_structseq::make_struct_seq(
-            if cfg!(windows) {
-                "nt.times_result"
-            } else {
-                "posix.times_result"
-            },
-            &[
-                "user",
-                "system",
-                "children_user",
-                "children_system",
-                "elapsed",
-            ],
-        )
-    })
 }
 
 /// Split `path` into the root and everything after it, the way
@@ -4848,12 +4774,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(pyre_object::w_int_new(cols));
         fields.push(pyre_object::w_int_new(lines));
-        crate::_structseq::new_instance(terminal_size_seq_type(), fields.take())
+        crate::_structseq::new_instance(super::terminal_size_seq_type(), fields.take())
     }
-    crate::module_ns_store(ns, "terminal_size", terminal_size_seq_type());
-    crate::module_ns_store(ns, "statvfs_result", statvfs_result_seq_type());
-    crate::module_ns_store(ns, "times_result", times_result_seq_type());
-    crate::module_ns_store(ns, "uname_result", uname_result_seq_type());
+    crate::module_ns_store(ns, "terminal_size", super::terminal_size_seq_type());
+    crate::module_ns_store(ns, "statvfs_result", super::statvfs_result_seq_type());
+    crate::module_ns_store(ns, "times_result", super::times_result_seq_type());
+    crate::module_ns_store(ns, "uname_result", super::uname_result_seq_type());
 
     // `interp_posix.device_encoding`: only a terminal has one. UTF-8 mode
     // answers "utf-8"; otherwise the active locale's `nl_langinfo(CODESET)`,
@@ -6970,7 +6896,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 fields.push(pyre_object::w_str_new_managed(&version));
                 fields.push(pyre_object::w_str_new_managed(&machine));
                 Ok(crate::_structseq::new_instance(
-                    uname_result_seq_type(),
+                    super::uname_result_seq_type(),
                     fields.take(),
                 ))
             },
@@ -9623,7 +9549,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
 
         // os.statvfs(path) / os.fstatvfs(fd) -> statvfs_result
         #[cfg(not(target_os = "redox"))]
-        crate::module_ns_store(ns, "statvfs_result", statvfs_result_seq_type());
+        crate::module_ns_store(ns, "statvfs_result", super::statvfs_result_seq_type());
 
         #[cfg(not(target_os = "redox"))]
         fn statvfs_to_obj(
@@ -9644,7 +9570,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             fields.push(pyre_object::w_int_new(info.f_flag as i64));
             fields.push(pyre_object::w_int_new(info.f_namemax as i64));
             crate::_structseq::new_instance_with_extra(
-                statvfs_result_seq_type(),
+                super::statvfs_result_seq_type(),
                 fields.take(),
                 vec![("f_fsid", pyre_object::gc_roots::shadow_stack_get(fsid_slot))],
             )
@@ -10554,7 +10480,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     fields.push(pyre_object::w_float_new(t.children_system));
                     fields.push(pyre_object::w_float_new(t.elapsed));
                     Ok(crate::_structseq::new_instance(
-                        times_result_seq_type(),
+                        super::times_result_seq_type(),
                         fields.take(),
                     ))
                 },
@@ -13051,7 +12977,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // `GetProcessTimes` counts in hundreds of nanoseconds.
                     let seconds = |ticks: u64| pyre_object::w_float_new(ticks as f64 * 1e-7);
                     Ok(crate::_structseq::new_instance(
-                        times_result_seq_type(),
+                        super::times_result_seq_type(),
                         vec![
                             seconds(times.user),
                             seconds(times.system),
