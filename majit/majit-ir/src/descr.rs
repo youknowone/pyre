@@ -7573,7 +7573,11 @@ pub fn make_vtable_field_descr() -> DescrRef {
 /// `max_size_of_young_obj` is `large_object`. A test `GcConfig` whose nursery
 /// is smaller than one inline-allocatable object breaks the invariant: its
 /// slow path falls back to an old-generation object, and this store clears
-/// the `TRACK_YOUNG_PTRS` bit that birth set. On wasm32
+/// the `TRACK_YOUNG_PTRS` bit that birth set. The `CALL_ASSEMBLER` frame is
+/// the exception that stores only the type-id half (rewrite.rs
+/// `gen_initialize_tid_keep_flags`): a large frame's slow path returns a young
+/// raw-malloced object, and pyre keeps that generation's membership in the
+/// flags half. On wasm32
 /// the physical header keeps four more bytes of ABI padding after the
 /// word; the store leaves them alone. The header sits *before* the
 /// object pointer; `gen_initialize_tid` translates the descr's offset by

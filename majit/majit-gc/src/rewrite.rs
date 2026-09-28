@@ -3180,6 +3180,22 @@ impl GcRewriterImpl {
         st.emit(store);
     }
 
+    /// [`Self::gen_initialize_tid`] storing only the type-id half of
+    /// `HDR.tid`, so flags the slow-path allocator set survive.
+    fn gen_initialize_tid_keep_flags(&self, obj: Operand, tid: u32, st: &mut RewriteState<'_>) {
+        let Some(tid_fd_ref) = self.fielddescr_tid.as_ref() else {
+            return;
+        };
+        let tid_fd = tid_fd_ref
+            .as_field_descr()
+            .expect("gc_ll_descr.fielddescr_tid must be a FieldDescr");
+        let ofs = st.const_int(-(crate::header::GcHeader::SIZE as i64) + tid_fd.offset() as i64);
+        let tid_val = st.const_int(tid as i64);
+        let size = st.const_int((crate::header::TYPE_ID_BITS / 8) as i64);
+        let store = mk_op(OpCode::GcStore, &[obj, ofs, tid_val, size]);
+        st.emit(store);
+    }
+
     /// rewrite.py:479-484 gen_initialize_vtable parity.
     ///
     /// RPython: emit_setfield(obj, ConstInt(vtable), descr=fielddescr_vtable)
@@ -3298,8 +3314,15 @@ impl GcRewriterImpl {
             st.remember_wb(&frame);
         }
 
-        // rewrite.py — gen_initialize_tid(frame, descrs.arraydescr.tid)
-        self.gen_initialize_tid(frame.clone(), descrs.jitframe_tid, st);
+        // rewrite.py — gen_initialize_tid(frame, descrs.arraydescr.tid),
+        // narrowed to the type-id half of `HDR.tid`. A frame of
+        // `large_object` bytes or more comes back from the slow path as a
+        // young raw-malloced object, and pyre records that generation's
+        // membership as the `YOUNG_RAWMALLOC` header flag where incminimark
+        // keeps the `young_rawmalloced_objects` dict; a whole-word store would
+        // clear it and the minor collection would free a live frame. The fast
+        // path has already zeroed the header word.
+        self.gen_initialize_tid_keep_flags(frame.clone(), descrs.jitframe_tid, st);
 
         // rewrite.py — emit_setfield(frame, c_null, descr=jf_*)
         // with (_, size, _) = unpack_fielddescr(descr). jitframe.py:63-81
@@ -5190,6 +5213,16 @@ mod tests {
             .expect("rewritten CALL_ASSEMBLER");
         assert!(frame_idx < call_idx);
         assert_eq!(result[call_idx].num_args(), 1);
+        // A frame at or above `large_object` is a young raw-malloced object
+        // whose `YOUNG_RAWMALLOC` flag lives in the upper half of `HDR.tid`,
+        // so the frame's tid stamp covers the type-id half only.
+        let tid_store = &result[frame_idx + 1];
+        assert_eq!(tid_store.opcode, OpCode::GcStore);
+        assert_eq!(tid_store.arg(2).to_opref().inline_const_bits(), Some(7));
+        assert_eq!(
+            tid_store.arg(3).to_opref().inline_const_bits(),
+            Some((crate::header::TYPE_ID_BITS / 8) as i64)
+        );
         let null_before: Vec<i64> = result[..frame_idx]
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
