@@ -67,6 +67,9 @@ struct ProviderTables {
     /// it is built (`specialize.py default_specialize` runs as the annotator
     /// reaches the call).
     declarations: FuncObjDeclarations,
+    /// Where every crate logs a declaration whose body did not lower; the
+    /// pipeline reports it once the bodies it builds are built.
+    skipped: mir::LoweringSkips,
 }
 
 /// One lowered crate: its artefact and the lowering state its decls were
@@ -141,6 +144,7 @@ impl GraphBodyProvider {
         jitdriver_receiver_roots: &[String],
         func_hints: HashMap<String, Vec<String>>,
         declarations: FuncObjDeclarations,
+        skipped: mir::LoweringSkips,
     ) -> Self {
         let own = |rows: &[(&str, i64)]| -> Vec<(String, i64)> {
             rows.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
@@ -159,6 +163,7 @@ impl GraphBodyProvider {
                 .collect(),
             func_hints,
             declarations,
+            skipped,
         };
         Self {
             crates: Vec::new(),
@@ -178,8 +183,12 @@ impl GraphBodyProvider {
     ) -> SemanticProgram {
         let module_filter = mir::normalize_module_filter(module_paths);
         let paint_tombstones = mir::prelink_crate(&llbc, cross_tombstoned_leaves);
-        let state =
-            CrateLoweringState::new(&llbc, &paint_tombstones, self.tables.func_hints.clone());
+        let state = CrateLoweringState::new(
+            &llbc,
+            &paint_tombstones,
+            self.tables.func_hints.clone(),
+            self.tables.skipped.clone(),
+        );
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let functions = self.declare_crate(&krate, module_filter.as_ref());
         let first_spec = self.tables.declarations.len();
@@ -556,6 +565,7 @@ mod tests {
             &[],
             HashMap::new(),
             FuncObjDeclarations::default(),
+            Default::default(),
         );
         let program = provider.lower_prelinked_crate(llbc, &[], &HashSet::new());
         let mut compared = 0;
@@ -601,6 +611,7 @@ mod tests {
             &[],
             HashMap::new(),
             FuncObjDeclarations::default(),
+            Default::default(),
         )
         .lower_prelinked_crate(
             Llbc::load(CORPUS).expect("load corpus.ullbc"),
@@ -619,6 +630,7 @@ mod tests {
             &[],
             hints,
             FuncObjDeclarations::default(),
+            Default::default(),
         )
         .lower_prelinked_crate(
             Llbc::load(CORPUS).expect("load corpus.ullbc"),

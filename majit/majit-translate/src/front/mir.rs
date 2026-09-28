@@ -1017,7 +1017,7 @@ pub(crate) struct CrateLoweringState {
     /// brackets is analysed once (`GraphAnalyzer._analyzed_calls`).
     root_stack: RootStackState,
     spec: std::cell::RefCell<crate::front::clause_spec::SpecQueue>,
-    skipped: std::cell::RefCell<Vec<(String, String)>>,
+    skipped: LoweringSkips,
     atomic_load_decls: std::cell::RefCell<
         Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
     >,
@@ -1056,6 +1056,7 @@ impl CrateLoweringState {
         llbc: &Llbc,
         cross_tombstoned_leaves: &std::collections::HashSet<String>,
         func_hints: std::collections::HashMap<String, Vec<String>>,
+        skipped: LoweringSkips,
     ) -> Self {
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
@@ -1202,7 +1203,7 @@ impl CrateLoweringState {
             func_hints,
             root_stack: RootStackState::new(llbc),
             spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
-            skipped: std::cell::RefCell::new(Vec::new()),
+            skipped,
             atomic_load_decls: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -1747,7 +1748,7 @@ impl DeclaredSpec {
 }
 
 impl CrateLoweringState {
-    /// The coverage report over the lowered set, and the program.
+    /// The program.
     ///
     /// The program takes the tables only it reads. `known_trait_names` and
     /// `struct_field_attrs` are copied: a body lowered after this still
@@ -1766,54 +1767,7 @@ impl CrateLoweringState {
             exact_layouts,
             struct_ids,
         } = self.exports.take();
-        let skipped = self.skipped.take();
         let atomic_load_decls = self.atomic_load_decls.take();
-        // Coverage gate. Every `skipped` entry is a function whose MIR shape
-        // the driver could not lower — already after the reverse-postorder
-        // retry in `lower_fun_decl`. The tracked gaps are exactly the shapes
-        // `is_known_lowering_gap` recognises; its arms are the only statement
-        // of that set that cannot go stale. One of them, an "uninitialised local
-        // read" that even RPO could not bind, needs a genuine loop-carried def.
-        // PRE-EXISTING-ADAPTATION: unlike flowcontext.py
-        // FlowContext.record_block, this whole-program boundary does not
-        // propagate unsupported lowering. Both tracked and untracked failures
-        // omit a body; surviving callers need a valid residual target/ABI.
-        // The `regressions` bucket includes EVERY non-tracked skip, not only
-        // result-exception-lowering declines. #346 retires this fallback after
-        // ordinary lowering handles the reachable closure; check.py remains
-        // necessary but is not a proof that every omitted body is safe.
-        if !skipped.is_empty() {
-            let (tracked, regressions): (Vec<_>, Vec<_>) = skipped
-                .iter()
-                .partition(|(_, msg)| is_known_lowering_gap(msg));
-            if std::env::var("MAJIT_MIR_FRONTEND_DEBUG").is_ok() && !tracked.is_empty() {
-                eprintln!(
-                    "[mir-frontend] {} function(s) skipped via a shape \
-                     `is_known_lowering_gap` recognises; the per-function \
-                     message below names which one, and all degrade to a \
-                     residual call:",
-                    tracked.len()
-                );
-                for (name, msg) in tracked.iter().take(20) {
-                    eprintln!("  {name}: {msg}");
-                }
-            }
-            if !regressions.is_empty() {
-                let mut detail = String::new();
-                for (name, msg) in &regressions {
-                    detail.push_str(&format!("\n  - {name}: {msg}"));
-                }
-                // Report untracked body omissions too. No corresponding
-                // exception-to-residual catch exists in upstream
-                // ExceptionTransformer.transform_completely.
-                eprintln!(
-                    "[mir-coverage] {} function(s) with an unrecognised MIR shape \
-                     omitted; callers require a registered ABI-compatible residual; \
-                     shape-coverage gap:{detail}",
-                    regressions.len()
-                );
-            }
-        }
         crate::front::semantic::SemanticProgram {
             functions,
             harvested_hints: std::collections::HashMap::new(),
@@ -1847,15 +1801,77 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     function_filter: Option<&std::collections::HashSet<String>>,
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    let skips = LoweringSkips::default();
     let state = CrateLoweringState::new(
         llbc,
         cross_tombstoned_leaves,
         std::collections::HashMap::new(),
+        skips.clone(),
     );
     let functions = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state)
         .lower_all(module_filter, function_filter);
-    Ok(state.finish(functions))
+    let program = state.finish(functions);
+    report_lowering_skips(&skips);
+    Ok(program)
 }
+
+/// The declarations whose body did not lower, across every crate, in the
+/// order they were built. A body is built when something first asks for it,
+/// so the log is complete only once the pipeline has built every body it
+/// will; [`report_lowering_skips`] reads it then.
+pub(crate) type LoweringSkips = std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>;
+
+/// Report the logged lowering skips.
+pub(crate) fn report_lowering_skips(skips: &LoweringSkips) {
+    let skipped = skips.borrow();
+    // Coverage gate. Every `skipped` entry is a function whose MIR shape
+    // the driver could not lower — already after the reverse-postorder
+    // retry in `lower_fun_decl`. The tracked gaps are exactly the shapes
+    // `is_known_lowering_gap` recognises; its arms are the only statement
+    // of that set that cannot go stale. One of them, an "uninitialised local
+    // read" that even RPO could not bind, needs a genuine loop-carried def.
+    // PRE-EXISTING-ADAPTATION: unlike flowcontext.py
+    // FlowContext.record_block, this whole-program boundary does not
+    // propagate unsupported lowering. Both tracked and untracked failures
+    // omit a body; surviving callers need a valid residual target/ABI.
+    // The `regressions` bucket includes EVERY non-tracked skip, not only
+    // result-exception-lowering declines. #346 retires this fallback after
+    // ordinary lowering handles the reachable closure; check.py remains
+    // necessary but is not a proof that every omitted body is safe.
+    if !skipped.is_empty() {
+        let (tracked, regressions): (Vec<_>, Vec<_>) = skipped
+            .iter()
+            .partition(|(_, msg)| is_known_lowering_gap(msg));
+        if std::env::var("MAJIT_MIR_FRONTEND_DEBUG").is_ok() && !tracked.is_empty() {
+            eprintln!(
+                "[mir-frontend] {} function(s) skipped via a shape \
+                 `is_known_lowering_gap` recognises; the per-function \
+                 message below names which one, and all degrade to a \
+                 residual call:",
+                tracked.len()
+            );
+            for (name, msg) in tracked.iter().take(20) {
+                eprintln!("  {name}: {msg}");
+            }
+        }
+        if !regressions.is_empty() {
+            let mut detail = String::new();
+            for (name, msg) in &regressions {
+                detail.push_str(&format!("\n  - {name}: {msg}"));
+            }
+            // Report untracked body omissions too. No corresponding
+            // exception-to-residual catch exists in upstream
+            // ExceptionTransformer.transform_completely.
+            eprintln!(
+                "[mir-coverage] {} function(s) with an unrecognised MIR shape \
+                 omitted; callers require a registered ABI-compatible residual; \
+                 shape-coverage gap:{detail}",
+                regressions.len()
+            );
+        }
+    }
+}
+
 /// Why [`CrateLowering::build_decl`] produced no function.
 pub(crate) enum DeclBuildError {
     /// The declaration carries no `Unstructured` body.

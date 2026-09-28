@@ -205,6 +205,7 @@ fn build_semantic_program_via_active_frontend(
     jitdriver_receiver_roots: &[String],
     explicit_llbc_paths: Option<&[&str]>,
     funcobj_declarations: &call::FuncObjDeclarations,
+    lowering_skips: &front::mir::LoweringSkips,
     prof: &mut PhaseProfiler,
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
@@ -301,6 +302,7 @@ fn build_semantic_program_via_active_frontend(
                 jitdriver_receiver_roots,
                 hints.clone(),
                 funcobj_declarations.clone(),
+                lowering_skips.clone(),
             );
             let mut merged = None;
             let mut seen_function_keys = std::collections::HashSet::new();
@@ -1084,6 +1086,7 @@ fn analyze_pipeline_from_module_paths(
     // that name it: it is declared under that one path, with no alias
     // spelling, class member or indirect-call family row of its own.
     let funcobj_declarations = call::FuncObjDeclarations::default();
+    let lowering_skips = front::mir::LoweringSkips::default();
     // `rlib/jit.py`'s `hint` entry reads `classdesc.get_param('_virtualizable_')`
     // off the class before it mints `access_directly`. Pyre has no `ClassDesc`
     // at that point, so the declaration arrives with the config — and it is
@@ -1103,6 +1106,7 @@ fn analyze_pipeline_from_module_paths(
         &config.pipeline.transform.jitdriver_receiver_roots,
         explicit_llbc_paths,
         &funcobj_declarations,
+        &lowering_skips,
         &mut prof,
     );
     // Publish the `(bare struct leaf → defining crate-relative module
@@ -2473,6 +2477,8 @@ fn analyze_pipeline_from_module_paths(
     // remaining residual force ops. Looked-inside copies are already
     // deleted by `rewrite_op_jit_force_virtualizable`.
     call_control.finish();
+    // Every body the pipeline builds is built by now.
+    front::mir::report_lowering_skips(&lowering_skips);
     // callee census: how many callees the six `getcalldescr` analyzers answer as
     // upstream's declared-external arm without a declaration behind them.
     // Off by default — it is a whole extra walk of the registered universe,
