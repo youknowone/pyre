@@ -730,11 +730,10 @@ impl JitCode {
         // assert on `_alllabels is not None` — `pc in None` would raise
         // TypeError; the contract is that any jitcode reaching
         // `follow_jump` was assembled (so `_alllabels = Some(set)`).
-        // pyre is the untranslated analogue, so `assert position in
-        // self._alllabels` (`jitcode.py` `JitCode.follow_jump`) stays
-        // on in every build. `pc in None` is a TypeError upstream;
-        // a missing set panics here for the same reason.
-        assert!(
+        // `jitcode.py` `JitCode.follow_jump`: `if not we_are_translated():
+        // assert position in self._alllabels`. A release build is the
+        // translated image, so the check is a `debug_assert!`.
+        debug_assert!(
             self.alllabels
                 .as_ref()
                 .expect("follow_jump: _alllabels is None on a non-assembled jitcode")
@@ -768,11 +767,11 @@ impl JitCode {
     /// `all_liveness` table.
     pub fn get_live_vars_info(&self, pc: usize, op_live: u8) -> usize {
         // `jitcode.py` `JitCode.get_live_vars_info`: `if not
-        // we_are_translated(): assert pc in self._startpoints`. Pyre is
-        // the untranslated analogue, so the assert stays on in every
-        // build. PyPy does not gate on `_startpoints is not None` —
-        // `pc in None` would raise TypeError; a jitcode whose liveness
-        // is consulted was assembled (`_startpoints = Some(set)`).
+        // we_are_translated(): assert pc in self._startpoints`. A release
+        // build is the translated image, so the check is a
+        // `debug_assert!`. PyPy does not gate on `_startpoints is not
+        // None` — `pc in None` would raise TypeError; a jitcode whose
+        // liveness is consulted was assembled (`_startpoints = Some(set)`).
         self.assert_startpoint(pc);
         let mut pc = pc;
         if self.code[pc] != op_live {
@@ -790,9 +789,10 @@ impl JitCode {
         super::liveness::decode_offset(&self.code, pc + 1)
     }
 
-    /// `jitcode.py` `JitCode.get_live_vars_info`: `assert pc in self._startpoints`.
+    /// `jitcode.py` `JitCode.get_live_vars_info`: `if not
+    /// we_are_translated(): assert pc in self._startpoints`.
     fn assert_startpoint(&self, pc: usize) {
-        assert!(
+        debug_assert!(
             self.startpoints
                 .as_ref()
                 .expect("get_live_vars_info: _startpoints is None on a non-assembled jitcode")
