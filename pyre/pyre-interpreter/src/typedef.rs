@@ -23969,9 +23969,9 @@ fn bytes_prefix_match(
                     let mut item =
                         pyre_object::w_tuple_getitem(needle, i).expect("index is in range");
                     let Some(prefix) = pyre_object::with_roots!(item, needle =>
-                        crate::baseobjspace::simple_buffer_bytes(item).map(|buffer| {
-                            buffer.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)
-                        }))?
+                    crate::baseobjspace::simple_buffer_bytes(item).map(|buffer| {
+                        buffer.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)
+                    }))?
                     else {
                         return Err(crate::PyError::type_error(format!(
                             "a bytes-like object is required, not '{}'",
@@ -25474,13 +25474,13 @@ fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
     // every parsing/allocation error.  The export's bracket closes inside
     // the one rooting `a`.
     let Some(result) = pyre_object::with_roots!(a =>
-        crate::baseobjspace::simple_buffer_bytes(a).map(|buffer| {
-            buffer.map(|buffer| {
-                let result = parse_hex_bytes(buffer.as_bytes());
-                buffer.release();
-                result
-            })
-        }))?
+    crate::baseobjspace::simple_buffer_bytes(a).map(|buffer| {
+        buffer.map(|buffer| {
+            let result = parse_hex_bytes(buffer.as_bytes());
+            buffer.release();
+            result
+        })
+    }))?
     else {
         return Err(crate::PyError::type_error(format!(
             "fromhex() argument must be str or bytes-like, not {}",

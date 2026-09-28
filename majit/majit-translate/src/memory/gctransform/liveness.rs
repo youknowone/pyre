@@ -321,10 +321,7 @@ pub fn gc_slice_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64>
     let id_of = |v: &serde_json::Value| {
         v.get("Deduplicated")
             .and_then(serde_json::Value::as_u64)
-            .or_else(|| {
-                v.pointer("/Value/0")
-                    .and_then(serde_json::Value::as_u64)
-            })
+            .or_else(|| v.pointer("/Value/0").and_then(serde_json::Value::as_u64))
     };
     let body_of = |v: &serde_json::Value| {
         v.pointer("/Value/1")

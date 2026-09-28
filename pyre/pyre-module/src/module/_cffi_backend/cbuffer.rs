@@ -215,8 +215,7 @@ fn comparison(args: &[PyObjectRef], mode: fn(Ordering) -> bool) -> Result<PyObje
     let self_base = self_roots.pin_roots(&[w_self]);
     let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(w_other);
     w_self = self_roots.get(self_base);
-    let Some(other) = acquired?
-    else {
+    let Some(other) = acquired? else {
         return Ok(pyre_object::special::w_not_implemented());
     };
     let buffer = buffer_arg(w_self)?;

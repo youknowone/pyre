@@ -28963,7 +28963,9 @@ impl<'a> RootStackAnalyzer<'a> {
             .fn_by_id(*id)
             .and_then(|fd| fd.unstructured())
             .is_some_and(|body| {
-                body_returns_owned_scope(self.llbc, &body, &|reg| regular_call_name_path(reg, self.llbc))
+                body_returns_owned_scope(self.llbc, &body, &|reg| {
+                    regular_call_name_path(reg, self.llbc)
+                })
             });
         self.scope_constructors.borrow_mut().insert(*id, answer);
         answer
@@ -56274,8 +56276,13 @@ mod tests {
         };
 
         let run = body_of(vec![mv(19), mv(20)]);
-        let plan =
-            super::analyze_root_brackets_with(&fixture_llbc(), &run, &bit_set::BitSet::new(), name_of, touches);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &run,
+            &bit_set::BitSet::new(),
+            name_of,
+            touches,
+        );
         assert!(plan.scopes.contains(3), "a pin_roots run must be erased");
 
         assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
@@ -56289,8 +56296,13 @@ mod tests {
 
         // An element that is not a plain local leaves nothing to answer with.
         let constant = body_of(vec![mv(19), usize_lit(0)]);
-        let plan =
-            super::analyze_root_brackets_with(&fixture_llbc(), &constant, &bit_set::BitSet::new(), name_of, touches);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &constant,
+            &bit_set::BitSet::new(),
+            name_of,
+            touches,
+        );
         assert!(
             !plan.scopes.contains(3),
             "a constant element keeps the bracket"
@@ -56303,8 +56315,13 @@ mod tests {
         let mut restored = body_of(vec![copy(1), copy(2)]);
         restored.body[3].terminator.kind = call(4, vec![copy(11), copy(12)], 1, 4);
         restored.body[5].terminator.kind = call(4, vec![copy(14), mv(16)], 2, 6);
-        let plan =
-            super::analyze_root_brackets_with(&fixture_llbc(), &restored, &bit_set::BitSet::new(), name_of, touches);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &restored,
+            &bit_set::BitSet::new(),
+            name_of,
+            touches,
+        );
         assert!(
             plan.scopes.contains(3),
             "a restore into the pinned local must still be erased"
@@ -56318,7 +56335,8 @@ mod tests {
         clobbered.body[2].terminator.kind = call(5, vec![copy(1)], 1, 3);
         clobbered.body[3].terminator.kind = call(4, vec![copy(11), copy(12)], 1, 4);
         let plan = super::analyze_root_brackets_with(
-            &fixture_llbc(), &clobbered,
+            &fixture_llbc(),
+            &clobbered,
             &bit_set::BitSet::new(),
             name_of,
             touches,
@@ -56338,8 +56356,13 @@ mod tests {
         free.body[3].terminator.kind = call(7, vec![copy(12)], 13, 4);
         free.body[4].statements.remove(0);
         free.body[5].terminator.kind = call(7, vec![mv(16)], 17, 6);
-        let plan =
-            super::analyze_root_brackets_with(&fixture_llbc(), &free, &bit_set::BitSet::new(), name_of, touches);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &free,
+            &bit_set::BitSet::new(),
+            name_of,
+            touches,
+        );
         assert!(
             plan.scopes.contains(3),
             "a free pin_roots run must be erased"
@@ -56353,8 +56376,13 @@ mod tests {
         // A read of a slot some other guard's pin filled is not this one's.
         let mut stray = body_of(vec![mv(19), mv(20)]);
         stray.body[3].terminator.kind = call(7, vec![copy(13)], 18, 4);
-        let plan =
-            super::analyze_root_brackets_with(&fixture_llbc(), &stray, &bit_set::BitSet::new(), name_of, touches);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &stray,
+            &bit_set::BitSet::new(),
+            name_of,
+            touches,
+        );
         assert!(
             !plan.scopes.contains(3),
             "a free read at a slot this pass cannot name keeps the bracket"
@@ -56872,10 +56900,8 @@ mod tests {
         ];
         let llbc = llbc_with_types("pyre_object", vec![], funs);
         let direct = |id: u64| -> RegularCall {
-            serde_json::from_value(
-                serde_json::json!({"kind": {"Fun": id}, "generics": null}),
-            )
-            .expect("fixture call parses")
+            serde_json::from_value(serde_json::json!({"kind": {"Fun": id}, "generics": null}))
+                .expect("fixture call parses")
         };
         let analyzer = super::RootStackAnalyzer::new(&llbc);
         assert!(
@@ -56977,10 +57003,9 @@ mod tests {
             }
             llbc_with_types(krate, vec![], funs)
         };
-        let direct: RegularCall = serde_json::from_value(
-            serde_json::json!({"kind": {"Fun": 1}, "generics": null}),
-        )
-        .expect("fixture call parses");
+        let direct: RegularCall =
+            serde_json::from_value(serde_json::json!({"kind": {"Fun": 1}, "generics": null}))
+                .expect("fixture call parses");
         let method: RegularCall = serde_json::from_value(
             serde_json::json!({"kind": {"Trait": [{}, 0, 2]}, "generics": null}),
         )
@@ -57022,7 +57047,9 @@ mod tests {
             |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
         let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
         let move_into = |dest: u64, src: u64| {
-            stmt(serde_json::json!({"Assign": [place(dest), {"Use": [{"Move": place(src)}, "No"]}]}))
+            stmt(
+                serde_json::json!({"Assign": [place(dest), {"Use": [{"Move": place(src)}, "No"]}]}),
+            )
         };
         let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64, unwind: u64| {
             serde_json::json!({"Call": {
@@ -57134,15 +57161,17 @@ mod tests {
         ];
         let llbc = llbc_with_types("pyre_object", vec![], funs);
         let name_of = |reg: &RegularCall| super::regular_call_name_path(reg, &llbc);
-        let drop_place =
-            |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb].term(&llbc) {
-                Ok(TermKind::Drop { place, target, .. }) => match place.kind {
-                    PlaceKind::Local(l) => Some((l, target)),
-                    _ => None,
-                },
+        let drop_place = |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb]
+            .term(&llbc)
+        {
+            Ok(TermKind::Drop { place, target, .. }) => match place.kind {
+                PlaceKind::Local(l) => Some((l, target)),
                 _ => None,
-            };
-        let goto = |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb].term(&llbc)
+            },
+            _ => None,
+        };
+        let goto = |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb]
+            .term(&llbc)
         {
             Ok(TermKind::Goto { target }) => Some(target),
             _ => None,
@@ -57173,10 +57202,9 @@ mod tests {
         // The bracket closes every pin `operands` makes, so its caller sees
         // no change to the root stack.
         let analyzer = super::RootStackAnalyzer::new(&llbc);
-        let direct: RegularCall = serde_json::from_value(
-            serde_json::json!({"kind": {"Fun": 4}, "generics": null}),
-        )
-        .expect("fixture call parses");
+        let direct: RegularCall =
+            serde_json::from_value(serde_json::json!({"kind": {"Fun": 4}, "generics": null}))
+                .expect("fixture call parses");
         assert!(!analyzer.regular_call_touches_root_stack(&direct));
     }
 
