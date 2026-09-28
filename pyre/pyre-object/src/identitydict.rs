@@ -21,6 +21,7 @@ use crate::pyobject::PyObjectRef;
 /// PyPy's `mark_dict_non_null(d={})` (`:30-32`) — RPython resolves
 /// `{}` keyed on instance identity to an order-preserving identity
 /// hash table at translation time.
+#[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct IdentityKey(pub PyObjectRef);
 
@@ -187,8 +188,10 @@ pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
         roots.publish(&[object_key.obj, v]);
         next = i + 1;
     }
+    // Box the empty `RDict` before insert. A stack array would be unrooted
+    // across the stores (`_ll_malloc_entries` runs inside `insert`).
     let new_storage = crate::gc_storage::gc_alloc_storage_box(
-        crate::dictmultiobject::object_dict_storage_with_capacity(len),
+        crate::dictmultiobject::object_dict_storage_new(),
         crate::dictmultiobject::object_dict_storage_gc_type_id(),
     );
     let new_map = &mut *new_storage;
@@ -413,6 +416,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// same IdentityDictStrategy.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let storage = identity_storage(w_dict);
+        // `gc_alloc_storage_box` is a stable allocation and never collects.
         let new_storage = crate::gc_storage::gc_alloc_storage_box(
             storage.clone(),
             identity_dict_storage_gc_type_id(),
@@ -430,10 +434,11 @@ impl DictStrategy for IdentityDictStrategy {
     /// Trace key and value pointers so the GC updates them in place.
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = identity_storage_mut(w_dict);
-        for (k, v) in entries.iter_mut() {
+        for (k, v) in entries.iter_mut_for_trace() {
             let key_ptr = k as *const IdentityKey as *mut IdentityKey;
             visitor(std::ptr::addr_of_mut!((*key_ptr).0));
             visitor(v as *mut PyObjectRef);
         }
+        visitor(entries.entries_slot() as *mut PyObjectRef);
     }
 }

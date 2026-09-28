@@ -60,6 +60,7 @@ use crate::pyobject::*;
 /// `key.obj` only and leaves `key.hash` untouched.  See
 /// `identitydict.rs IdentityKey` for the contrasting *pointer-hashed*
 /// case where this property does NOT hold.
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ObjectKey {
     pub hash: i64,
@@ -1695,7 +1696,7 @@ pub fn w_dict_new_unmanaged_side_table_value() -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(&mut PyObjectRef)) {
     let entries = w_dict_object_storage_mut(obj);
-    for (key, value) in entries.iter_mut() {
+    for (key, value) in entries.iter_mut_for_trace() {
         // `ObjectKey.hash` is precomputed at insertion (`object_key_for`)
         // and stays valid across a GC move — Python's `__hash__` contract
         // is identity-stable for hashable (immutable) keys, which is the
@@ -1706,6 +1707,8 @@ pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(
         visitor(&mut (*key_ptr).obj);
         visitor(value);
     }
+    let slot = entries.entries_slot() as *mut PyObjectRef;
+    visitor(unsafe { &mut *slot });
 }
 
 /// Visit every GC-reference slot in a dict's strategy-owned storage.
@@ -2161,27 +2164,47 @@ pub unsafe fn w_module_dict_module_storage<'a>(
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
     lock_dict_refs!(_module_guard, obj);
-    let raw = &mut *(obj as *mut W_ModuleDictObject);
     if w_module_dict_is_object_strategy(obj) {
         return;
     }
     // The promotion mints young key objects into the fresh object storage
     // (prebuilt-family storage; see `w_module_dict_setitem_str_internal`).
     crate::gc_roots::mark_prebuilt_roots_dirty();
+    let roots = crate::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    let obj = roots.pin_root(obj);
+    let raw = &mut *(obj as *mut W_ModuleDictObject);
     let holder = &mut *raw.mstrategy;
     debug_assert_eq!(holder.strategy_kind(), StrategyKind::Module);
     let strategy = &mut *(holder.owner as *mut crate::celldict::ModuleDictStrategy);
     let storage = &mut *(raw.dstorage as *mut crate::celldict::ModuleDictStorage);
-    let mut new_storage = object_dict_storage_with_capacity(storage.entries.len());
+    let mut hashes = Vec::new();
+    let pairs_base = dict_slot + 1;
     for (k, v) in strategy
         .getiterkeys(storage)
         .zip(strategy.getitervalues(storage))
     {
         let key_obj = crate::celldict::_wrapkey(k);
-        new_storage.insert(object_key_for(key_obj), v);
+        let object_key = object_key_for(key_obj);
+        hashes.push(object_key.hash);
+        roots.publish(&[object_key.obj, v]);
     }
-    let new_storage =
-        crate::gc_storage::gc_alloc_storage_box(new_storage, object_dict_storage_gc_type_id());
+    // Box the empty `RDict` before insert, so `_ll_malloc_entries` stores
+    // the array into a collector-owned dict rather than a stack local.
+    let new_storage = crate::gc_storage::gc_alloc_storage_box(
+        object_dict_storage_new(),
+        object_dict_storage_gc_type_id(),
+    );
+    let new_map = &mut *new_storage;
+    for (i, &hash) in hashes.iter().enumerate() {
+        new_map.insert(
+            ObjectKey {
+                hash,
+                obj: roots.get(pairs_base + 2 * i),
+            },
+            roots.get(pairs_base + 2 * i + 1),
+        );
+    }
     // `celldict.py`: every live GlobalCache becomes invalid
     // because the strategy is being swapped out; the JIT must
     // recompile any trace keyed on the prior version.
@@ -2538,7 +2561,7 @@ pub unsafe fn w_module_dict_walk_gc_cells(
     let md = &mut *(obj as *mut W_ModuleDictObject);
     if w_module_dict_is_object_strategy(obj) {
         let object_storage = &mut *(md.dstorage as *mut ObjectDictStorage);
-        for (key, value) in object_storage.iter_mut() {
+        for (key, value) in object_storage.iter_mut_for_trace() {
             // ObjectKey.hash is precomputed and identity-stable across GC
             // moves, so writing through the raw obj slot does not desync
             // the IndexMap bucket index.
@@ -2546,15 +2569,17 @@ pub unsafe fn w_module_dict_walk_gc_cells(
             visitor(&mut (*key_ptr).obj);
             crate::celldict::walk_module_value_slot(value, visitor);
         }
+        visitor(unsafe { &mut *(object_storage.entries_slot() as *mut PyObjectRef) });
     } else {
         let storage = &mut *(md.dstorage as *mut crate::celldict::ModuleDictStorage);
-        for (key, value) in storage.entries.iter_mut() {
+        for (key, value) in storage.entries.iter_mut_for_trace() {
             // `ModuleDictStrategy` keys are the `str` block. The block does
             // not move; the visit keeps it alive.
             let key_ptr = key as *const crate::celldict::StrKey as *mut crate::celldict::StrKey;
             visitor(&mut *(std::ptr::addr_of_mut!((*key_ptr).0) as *mut PyObjectRef));
             crate::celldict::walk_module_value_slot(value, visitor);
         }
+        visitor(unsafe { &mut *(storage.entries.entries_slot() as *mut PyObjectRef) });
         w_module_dict_module_strategy_mut(obj).walk_cache_cells(visitor);
     }
 }
@@ -4497,13 +4522,16 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
 /// `dict` must point to a valid `W_DictObject` whose `dstorage` is an
 /// `RDict<K, PyObjectRef, S>`.
 unsafe fn typed_move_to_end<
-    K: std::hash::Hash + Eq + crate::rordereddict::EntryDummy,
+    K: std::hash::Hash + Eq + Copy + crate::rordereddict::EntryDummy,
     S: std::hash::BuildHasher,
 >(
     dict: *mut W_DictObject,
     k: &K,
     last: bool,
-) -> bool {
+) -> bool
+where
+    (K, PyObjectRef): crate::rordereddict::GcEntriesType,
+{
     let dict = &mut *dict;
     let entries = &mut *(dict.dstorage as *mut crate::rordereddict::RDict<K, PyObjectRef, S>);
     match entries.index_of(k) {
@@ -6824,7 +6852,7 @@ pub trait DictStrategy {
     /// PyObjectRef slot to relocate the referenced object during GC.
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = crate::dictmultiobject::w_dict_object_storage_mut(w_dict);
-        for (key, value) in entries.iter_mut() {
+        for (key, value) in entries.iter_mut_for_trace() {
             // See `w_dict_walk_entries_mut` — ObjectKey.hash is precomputed
             // and identity-stable across GC moves, so writing through the
             // raw obj slot does not desync the IndexMap bucket index.
@@ -6833,6 +6861,8 @@ pub trait DictStrategy {
             visitor(std::ptr::addr_of_mut!((*key_ptr).obj));
             visitor(value as *mut PyObjectRef);
         }
+        let slot = entries.entries_slot() as *mut PyObjectRef;
+        visitor(slot);
     }
 }
 
@@ -7607,6 +7637,7 @@ impl DictStrategy for ObjectDictStrategy {
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::ObjectDictStorage);
+        // `gc_alloc_storage_box` is a stable allocation and never collects.
         let new_storage = crate::gc_storage::gc_alloc_storage_box(
             storage.clone(),
             crate::dictmultiobject::object_dict_storage_gc_type_id(),
@@ -7808,12 +7839,13 @@ impl DictStrategy for BytesDictStrategy {
     /// are GC refs. The block does not move, and the visit keeps it alive.
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = crate::dictmultiobject::w_dict_bytes_storage_mut(w_dict);
-        for (key, value) in entries.iter_mut() {
+        for (key, value) in entries.iter_mut_for_trace() {
             let key_ptr = key as *const crate::dictmultiobject::BytesKey
                 as *mut crate::dictmultiobject::BytesKey;
             visitor(std::ptr::addr_of_mut!((*key_ptr).0) as *mut PyObjectRef);
             visitor(value as *mut PyObjectRef);
         }
+        visitor(entries.entries_slot() as *mut PyObjectRef);
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.copy` — clone
@@ -7823,6 +7855,7 @@ impl DictStrategy for BytesDictStrategy {
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::BytesDictStorage);
+        // `gc_alloc_storage_box` is a stable allocation and never collects.
         let new_storage = crate::gc_storage::gc_alloc_storage_box(
             storage.clone(),
             crate::dictmultiobject::bytes_dict_storage_gc_type_id(),
@@ -8076,6 +8109,7 @@ impl DictStrategy for UnicodeDictStrategy {
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::ObjectDictStorage);
+        // `gc_alloc_storage_box` is a stable allocation and never collects.
         let new_storage = crate::gc_storage::gc_alloc_storage_box(
             storage.clone(),
             crate::dictmultiobject::object_dict_storage_gc_type_id(),
@@ -8287,9 +8321,10 @@ impl DictStrategy for IntDictStrategy {
     /// that by skipping the i64 key half.
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = crate::dictmultiobject::w_dict_int_storage_mut(w_dict);
-        for value in entries.values_mut() {
+        for value in entries.values_mut_for_trace() {
             visitor(value as *mut PyObjectRef);
         }
+        visitor(entries.entries_slot() as *mut PyObjectRef);
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.copy` — clone
@@ -8298,6 +8333,7 @@ impl DictStrategy for IntDictStrategy {
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::IntDictStorage);
+        // `gc_alloc_storage_box` is a stable allocation and never collects.
         let new_storage = crate::gc_storage::gc_alloc_storage_box(
             storage.clone(),
             crate::dictmultiobject::int_dict_storage_gc_type_id(),

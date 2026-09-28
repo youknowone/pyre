@@ -832,6 +832,7 @@ pub unsafe fn w_set_copy_storage_from(dst: PyObjectRef, src: PyObjectRef) {
     let (_first_guard, _second_guard) = w_set_lock_pair(dst, src);
     let d = &mut *(dst as *mut W_SetObject);
     let copied = (*(*(src as *const W_SetObject)).items).clone();
+    // `gc_alloc_storage_box` is a stable allocation and never collects.
     d.items = crate::gc_storage::gc_alloc_storage_box(copied, set_items_gc_type_id());
     d.set_len_relaxed((*d.items).len());
     d.hash = -1;
@@ -1446,11 +1447,12 @@ pub unsafe fn w_set_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mut 
         return;
     }
     let entries = &mut *set.items;
-    for (key, _) in entries.iter_mut() {
+    for (key, _) in entries.iter_mut_for_trace() {
         let key_ptr = key as *const crate::dictmultiobject::ObjectKey
             as *mut crate::dictmultiobject::ObjectKey;
         visitor(std::ptr::addr_of_mut!((*key_ptr).obj) as *mut PyObjectRef);
     }
+    visitor(entries.entries_slot() as *mut PyObjectRef);
 }
 
 #[cfg(test)]
