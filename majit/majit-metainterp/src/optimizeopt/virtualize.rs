@@ -1677,6 +1677,15 @@ impl OptVirtualize {
         ]);
         // info.py AbstractStructPtrInfo stores no fielddescr side-list; the SizeDescr
         // (VRefSizeDescr.all_fielddescrs) is the authoritative view.
+        // virtualize.py: newop = ResOperation(rop.NEW_WITH_VTABLE, [],
+        // descr=vref_descr). It takes the VIRTUAL_REF's position, which
+        // resolves to it through `op.set_forwarded(newop)`.
+        let newop = majit_ir::OpRc::new(Op::with_descr(
+            OpCode::NewWithVtable,
+            &[],
+            vref_descr.clone(),
+        ));
+        newop.pos().set(op_rc.pos().get());
         let vinfo = VirtualInfo {
             descr: vref_descr,
             known_class,
@@ -1685,8 +1694,9 @@ impl OptVirtualize {
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
-        let b = Operand::from_bound_op(op_rc);
-        ctx.set_ptr_info(&b, PtrInfo::Virtual(vinfo));
+        // virtualize.py: op.set_forwarded(newop); newop.set_forwarded(vrefvalue)
+        Operand::from_bound_op(op_rc).set_forwarded_op(&newop);
+        ctx.set_ptr_info(&Operand::from_bound_op(&newop), PtrInfo::Virtual(vinfo));
 
         OptimizationResult::Remove
     }
@@ -4071,7 +4081,7 @@ mod tests {
             },
         )));
         let forced = opt.force_box(&vable_box, &mut ctx);
-        assert_eq!(forced, OpRef::input_arg_ref(0));
+        assert_eq!(forced.to_opref(), OpRef::input_arg_ref(0));
         assert!(
             ctx.new_operations.is_empty(),
             "standard virtualizable should not be forced to raw heap ops by optimizer"

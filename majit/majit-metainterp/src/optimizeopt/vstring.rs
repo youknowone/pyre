@@ -300,8 +300,7 @@ fn force_child_for_string(opref: &Operand, ctx: &mut OptContext) -> Operand {
         let resolved_box = resolved_box.expect("recorder-populated");
         let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
         let forced = info.force_box(&resolved_box, ctx);
-        let forced_box = ctx.materialize_operand_at(forced);
-        return ctx.resolve_operand_operand(&forced_box);
+        return ctx.resolve_operand_operand(&forced);
     }
     resolved
 }
@@ -397,7 +396,7 @@ impl OptString {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(&resolved_box, ctx);
-            return ctx.get_replacement_opref(forced);
+            return ctx.resolve_operand_operand(&forced).to_opref();
         }
         resolved
     }

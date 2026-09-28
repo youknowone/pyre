@@ -920,7 +920,7 @@ impl OptPure {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(&resolved_box, ctx);
-            return ctx.get_replacement_opref(forced);
+            return ctx.resolve_operand_operand(&forced).to_opref();
         }
         resolved
     }

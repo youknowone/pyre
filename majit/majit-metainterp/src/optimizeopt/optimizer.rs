@@ -2242,11 +2242,15 @@ impl Optimizer {
     /// reverse-lookup (`imported_short_source`) 3rd key is no longer needed.
     /// Mirrors force_box_inline (mod.rs) contract.
     /// `op = get_box_replacement(op)` walks the caller-held box.
-    pub fn force_box(&mut self, op: &majit_ir::operand::Operand, ctx: &mut OptContext) -> OpRef {
+    pub fn force_box(
+        &mut self,
+        op: &majit_ir::operand::Operand,
+        ctx: &mut OptContext,
+    ) -> majit_ir::operand::Operand {
         let opref = op.to_opref();
         // optimizer.py: op = get_box_replacement(op)
         if op.is_constant() {
-            return opref;
+            return op.clone();
         }
         let resolved_box = op.get_box_replacement(false);
         let resolved_op = Some(resolved_box);
@@ -2284,49 +2288,44 @@ impl Optimizer {
                 }
             }
         }
+        let resolved_box = resolved_op.expect("get_box_replacement is total");
         // `optimizer.py Optimizer.force_box` returns a Const unchanged after
         // the potential-extra-op lookup: Const carries no PtrInfo and cannot
-        // be virtual.  The flattened OpRef already carries its whole value,
-        // so resolving it back to an `Operand::Const` for the two impossible
-        // tests below only allocates an Rc that is immediately discarded.
-        if resolved.is_constant() {
-            return resolved;
+        // be virtual.
+        if resolved_box.is_constant() {
+            return resolved_box;
         }
         // optimizer.py:361-362: if op.type == 'i' and info.is_constant():
         //     return ConstInt(info.get_constant_int())
         // A forced operand whose IntBound is already constant materializes as a
         // ConstInt before the virtual-force branch. Read the bound without
         // installing one (peek), so a plain int box keeps flowing unchanged.
-        if let Some(rb) = resolved_op.as_ref()
-            && rb.const_value().is_none()
-            && rb.type_() == majit_ir::Type::Int
-            && let Some(bound) = ctx.peek_intbound_box(rb)
+        if resolved_box.type_() == majit_ir::Type::Int
+            && let Some(bound) = ctx.peek_intbound_box(&resolved_box)
             && bound.is_constant()
         {
-            return ctx.make_constant_int(bound.get_constant_int());
+            return majit_ir::operand::Operand::const_(majit_ir::Const::Int(
+                bound.get_constant_int(),
+            ));
         }
-        if resolved_op.as_ref().is_some_and(|b| ctx.is_virtual(b)) {
+        if ctx.is_virtual(&resolved_box) {
             // Virtualizable represents an existing heap object with tracked
             // fields — not a deferred allocation. force_box must not take
             // its PtrInfo. RPython parity: Virtualizable is never a "true"
             // virtual (no allocation to emit); it just tracks field state
             // for the standard frame. Calling force_box on it would destroy
             // the tracked state via take_ptr_info.
-            if resolved_op
-                .as_ref()
-                .is_some_and(|b| ctx.is_virtualizable(b))
-            {
-                return resolved;
+            if ctx.is_virtualizable(&resolved_box) {
+                return resolved_box;
             }
             // RPython: info.force_box() sets _is_virtual=False in-place.
             // Take ownership so the Virtual PtrInfo is removed. force_box_impl
             // installs a non-virtual (Instance/Struct) at the alloc_ref.
-            let resolved_op = resolved_op.expect("recorder-populated");
-            let mut info = ctx.take_ptr_info(&resolved_op).unwrap();
-            let forced = info.force_box(&resolved_op, ctx);
-            return ctx.get_replacement_opref(forced);
+            let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
+            let forced = info.force_box(&resolved_box, ctx);
+            return ctx.resolve_operand_operand(&forced);
         }
-        resolved
+        resolved_box
     }
 
     /// `optimizer.py` `force_box_for_end_of_preamble(box)`.
@@ -2472,7 +2471,7 @@ impl Optimizer {
             ctx.current_pass_idx = ctx.optearlyforce_idx;
             let result = self.force_box(&resolved, ctx);
             ctx.current_pass_idx = saved;
-            return ctx.get_box_replacement_operand(result);
+            return result;
         }
 
         resolved
@@ -3496,15 +3495,7 @@ impl Optimizer {
             }
             for i in force_needed {
                 let original = terminal_op.arg(i);
-                let forced = self.force_box(&original, &mut ctx);
-                // Operand writes carry the canonical box: resolve the chain
-                // terminal, materializing the host when the forced position
-                // has no producer yet (mirrors the materialize_operand_at arm
-                // above; never a position-only fabrication).
-                let b_forced = match ctx.get_box_replacement_operand_opt(forced) {
-                    Some(b) => b,
-                    None => ctx.materialize_operand_at(forced),
-                };
+                let b_forced = self.force_box(&original, &mut ctx);
                 terminal_op.setarg(i, b_forced);
             }
             if self.skip_flush {
@@ -5317,43 +5308,14 @@ impl Optimizer {
             return Err(e);
         }
 
-        // optimizer.py: force_box on every arg unconditionally,
-        // then store the CANONICAL box for the forced value (carrying its
-        // _forwarded chain) rather than a fresh from_opref box, so emitted
-        // ops and get_producing_op consumers can read info off op.arg(i) —
-        // the same canonicalization the pass-entry resolver applies.
+        // optimizer.py `_emit_operation`: `arg = self.force_box(op.getarg(i));
+        // op.setarg(i, arg)`. The forced box is the chain terminal carrying its
+        // `_forwarded` info, so emitted ops and get_producing_op consumers can
+        // read info off op.arg(i).
         for i in 0..op.num_args() {
-            let original_arg = op.arg(i);
-            let forced = self.force_box(&original_arg, ctx);
-            self.flush_queued_producer(forced, ctx)?;
-            let resolved = if original_arg.is_constant() && original_arg.to_opref() == forced {
-                // RPython `_emit_operation` calls `force_box` for Const too,
-                // but `get_box_replacement` returns the SAME Const object.
-                // Keep the Operand already stored on the op; round-tripping
-                // through pyre's flat OpRef adapter minted a new Rc-backed
-                // Const at every emitted use.
-                original_arg
-            } else if (original_arg.is_resop() || original_arg.is_inputarg())
-                && original_arg.get_box_replacement(false).to_opref() == forced
-            {
-                // The arg already carries the producer. A positional mint
-                // would be a second box at the same OpRef.
-                original_arg.get_box_replacement(false)
-            } else {
-                match ctx.get_box_replacement_operand_opt(forced) {
-                    Some(b) => b,
-                    None => ctx.materialize_operand_at(forced),
-                }
-            };
-            // The forced value is a chain terminal, so its canonical box's
-            // OpRef identity equals `forced`; OpRef-keyed consumers (the
-            // backend) see the same key, only the _forwarded info is added.
-            debug_assert_eq!(
-                resolved.to_opref(),
-                forced,
-                "emit_operation canonical box to_opref diverged from force_box",
-            );
-            op.setarg(i, resolved);
+            let arg = self.force_box(&op.arg(i), ctx);
+            self.flush_queued_producer(arg.to_opref(), ctx)?;
+            op.setarg(i, arg);
         }
         // force_box may force a virtual whose materialization defers an
         // `InvalidLoop`; abort before the emit / `expect` sites below.
@@ -7905,6 +7867,10 @@ mod tests {
                 .with_all_fielddescrs(vec![field_descr_typed]),
         );
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
+        // The virtual is the result of its NEW, which force_box emits.
+        let new_rc = OpRc::new(Op::with_descr(OpCode::New, &[], descr.clone()));
+        new_rc.pos().set(OpRef::ref_op(10));
+        ctx.register_extra_producer(&new_rc);
         let b10 = ctx.materialize_operand_at(OpRef::ref_op(10));
         // The field value box is materialized THROUGH the context so it binds
         // to the context's producer host; force_box's `resolve_operand_operand` then

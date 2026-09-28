@@ -2635,7 +2635,12 @@ impl OptContext {
             && !OpRc::ptr_eq(&superseded, op)
         {
             let carried = superseded.forwarded().borrow().clone();
-            *op.forwarded().borrow_mut() = carried;
+            // An Op redirect is not info to carry: when it names `op` (a
+            // stand-in already forwarded to the op now taking its position),
+            // copying it closes a one-node cycle.
+            if !matches!(carried, majit_ir::forwarding::Forwarded::Op(_)) {
+                *op.forwarded().borrow_mut() = carried;
+            }
             // replace_op_with parity (optimizer.py): forward the
             // superseded stand-in to `op`. A consumer dispatched before
             // this supersession bound its operand to `superseded` (the
@@ -7112,7 +7117,7 @@ impl OptContext {
                 .clone()
                 .expect("is_virtual implies resolved_op is Some");
             let forced = info.force_box(&resolved_op, self);
-            return self.get_replacement_opref(forced);
+            return self.resolve_operand_operand(&forced).to_opref();
         }
         resolved
     }
