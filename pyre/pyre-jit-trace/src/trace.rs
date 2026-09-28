@@ -2135,7 +2135,16 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             crate::jitcode_dispatch::census_record("P2Drain::RecipeNotProjectable");
             return p2_drain_abort();
         };
-        if backward_jump_reachable_from(unsafe { &*raw_code }, seed) {
+        // `for` reached from the resume is the double-advance this drain
+        // cannot roll back. A `while` (`JUMP_BACKWARD` only — `heapq._siftdown`)
+        // is a bridge back to its header; refusing it aborts every guard
+        // inside the inlined body. An unprojectable resume stays declined.
+        let code = unsafe { &*raw_code };
+        let unprojectable = seed >= pyre_interpreter::code_instructions_len(code);
+        let loop_bearing = unprojectable
+            || (backward_jump_reachable_from(code, seed)
+                && pyre_interpreter::code_has_for_iter(code));
+        if loop_bearing {
             // Kept permanently declined, as the whole-code test was: the churn
             // the `NoRecipes` arm measures is what a retryable decline of this
             // class costs, and narrowing which carriers reach here does not
