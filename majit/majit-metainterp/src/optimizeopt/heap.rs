@@ -4943,7 +4943,7 @@ mod tests {
             (outer_pos, heap_entry(outer, &outer_box)),
             (inner_pos, heap_entry(inner, &inner_box)),
         ];
-        let mut result_map = indexmap::IndexMap::new();
+        let mut result_map = indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         for &(source, _) in &short_boxes {
             result_map.insert(source, ctx.alloc_op_position_typed(Type::Ref));
         }
@@ -4954,7 +4954,6 @@ mod tests {
                 &[p0],
                 &short_boxes,
                 &result_map,
-                &mut indexmap::IndexMap::new(),
                 &indexmap::IndexMap::new(),
             )
         );
