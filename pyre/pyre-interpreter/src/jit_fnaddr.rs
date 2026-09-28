@@ -5219,6 +5219,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("pyobject::COMPLEX_TYPE", pyobject::COMPLEX_TYPE),
         pytype_addr!("pyobject::STR_TYPE", pyobject::STR_TYPE),
         pytype_addr!("pyobject::LIST_TYPE", pyobject::LIST_TYPE),
+        pytype_addr!("pyobject::LIST_USER_TYPE", pyobject::LIST_USER_TYPE),
         pytype_addr!("pyobject::TUPLE_TYPE", pyobject::TUPLE_TYPE),
         pytype_addr!("pyobject::DICT_TYPE", pyobject::DICT_TYPE),
         pytype_addr!("pyobject::LONG_TYPE", pyobject::LONG_TYPE),

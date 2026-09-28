@@ -17379,9 +17379,10 @@ fn the_decline_census_counts_a_record_from_another_thread() {
 /// The three receivers a traceback walk hops through — `traceback`, `frame`,
 /// `code` — refuse to be base classes and are not heap types, so `GuardClass`
 /// on the payload already establishes the Python-visible class and
-/// `walker_guard_exception_attr_slot` owes no second pin.  A subclassable
-/// builtin is the control: `list` keeps the pin because a `list` subclass
-/// shares the payload and retags `w_class`.
+/// `walker_guard_exception_attr_slot` owes no second pin.  `list` has a
+/// `_getusercls` typeptr, so its payload determines the class too.  A
+/// subclassable builtin without one is the control: `set` keeps the pin
+/// because a `set` subclass shares the payload and retags `w_class`.
 #[test]
 fn the_traceback_walk_receivers_pin_their_class_through_the_payload() {
     pyre_interpreter::typedef::init_typeobjects();
@@ -17401,12 +17402,23 @@ fn the_traceback_walk_receivers_pin_their_class_through_the_payload() {
 
     let list_type = &pyre_object::LIST_TYPE as *const pyre_object::PyType;
     assert!(
-        !unsafe {
+        unsafe {
             walker_payload_determines_w_class(
                 list_type,
                 pyre_object::pyobject::get_instantiate(&*list_type),
             )
         },
-        "list is acceptable as a base class, so its payload does not determine w_class",
+        "a list subclass instance carries LIST_USER_TYPE, so the list payload determines w_class",
+    );
+
+    let set_type = &pyre_object::setobject::SET_TYPE as *const pyre_object::PyType;
+    assert!(
+        !unsafe {
+            walker_payload_determines_w_class(
+                set_type,
+                pyre_object::pyobject::get_instantiate(&*set_type),
+            )
+        },
+        "set is acceptable as a base class, so its payload does not determine w_class",
     );
 }

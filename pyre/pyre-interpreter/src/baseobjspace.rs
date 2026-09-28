@@ -5963,9 +5963,6 @@ pub(crate) fn native_slot_get(
     if unsafe { pyre_object::interp_array::is_array(obj) } {
         return Ok(unsafe { pyre_object::interp_array::w_array_slot_get(obj, index as usize) });
     }
-    if unsafe { pyre_object::is_list(obj) } {
-        return Ok(unsafe { pyre_object::listobject::w_list_slot_get(obj, index as usize) });
-    }
     if crate::module::_collections::is_deque(obj) {
         return Ok(unsafe { crate::module::_collections::deque_slot_get(obj, index as usize) });
     }
@@ -5997,10 +5994,6 @@ pub(crate) fn native_slot_set(
         unsafe { pyre_object::interp_array::w_array_slot_set(obj, index as usize, value) };
         return Ok(true);
     }
-    if unsafe { pyre_object::is_list(obj) } {
-        unsafe { pyre_object::listobject::w_list_slot_set(obj, index as usize, value) };
-        return Ok(true);
-    }
     if crate::module::_collections::is_deque(obj) {
         unsafe { crate::module::_collections::deque_slot_set(obj, index as usize, value) };
         return Ok(true);
@@ -6028,9 +6021,6 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
     }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
         return Ok(unsafe { pyre_object::interp_array::w_array_slot_del(obj, index as usize) });
-    }
-    if unsafe { pyre_object::is_list(obj) } {
-        return Ok(unsafe { pyre_object::listobject::w_list_slot_del(obj, index as usize) });
     }
     if crate::module::_collections::is_deque(obj) {
         return Ok(unsafe { crate::module::_collections::deque_slot_del(obj, index as usize) });

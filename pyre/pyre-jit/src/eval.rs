@@ -1137,7 +1137,6 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let list_ptr = obj_addr as *mut pyre_object::listobject::W_ListObject;
     let list = unsafe { &mut *list_ptr };
     f(&mut list.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut list.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if matches!(
         list.strategy,
         pyre_object::listobject::ListStrategy::Size
@@ -1224,6 +1223,16 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
             }
         }
     }
+}
+
+unsafe fn list_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { list_object_custom_trace(obj_addr, f) };
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
 }
 
 /// Custom trace for `W_MemoryView`.  Its geometry and backing live in an
@@ -4024,8 +4033,26 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::bytearrayobject::BYTEARRAY_USER_TYPE as *const _ as usize,
         bytearray_user_tid,
     );
+    let list_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::listobject::W_LIST_USER_OBJECT_SIZE,
+        w_list_tid,
+        list_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        list_user_tid,
+        pyre_object::listobject::W_LIST_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::LIST_USER_TYPE as *const _ as usize,
+        list_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::LIST_USER_TYPE as *const _ as usize,
+        list_user_tid,
+    );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 165),
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 166),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,

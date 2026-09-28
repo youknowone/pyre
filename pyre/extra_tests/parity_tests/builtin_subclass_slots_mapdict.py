@@ -1,7 +1,7 @@
-# CPython-suite gap: no test stores __slots__ members on float/complex/str/bytearray subclasses under a hot loop.
+# CPython-suite gap: no test stores __slots__ members on float/complex/str/bytearray/list subclasses under a hot loop.
 # parity-tests reason: this targets the typedef.py _getusercls mapdict storage behind slot members.
 
-"""`__slots__` members of float/complex/str/bytearray subclasses.
+"""`__slots__` members of float/complex/str/bytearray/list subclasses.
 
 A slots-only subclass has no `__dict__`; a subclass that also asks for
 `__dict__` must still keep the slot value in the slot, not in the dict.
@@ -13,6 +13,7 @@ BASES = [
     (complex, (1 + 2j,)),
     (str, ("ab",)),
     (bytearray, (b"ab",)),
+    (list, ()),
 ]
 
 N = 2000

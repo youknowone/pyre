@@ -232,7 +232,7 @@ pub unsafe fn pytype_has_mapdict_mixin(obj: PyObjectRef) -> bool {
 /// True when `obj`'s Python class is exactly the builtin type for its
 /// layout — i.e. NOT a user subclass.
 ///
-/// A user subclass instance of `int`, `float`, `complex`, `str` or `tuple` carries the builtin's
+/// A user subclass instance of `int`, `float`, `complex`, `str`, `tuple` or `list` carries the builtin's
 /// `_getusercls` class as its typeptr, which alone decides exactness. A user
 /// subclass of any other builtin keeps the builtin `ob_type` (and therefore
 /// the builtin struct layout and the `is_list` / … layout predicates) while
@@ -384,7 +384,9 @@ pub static COMPLEX_USER_TYPE: PyType = new_user_pytype("complex", &COMPLEX_TYPE)
 pub static STR_TYPE: PyType = new_pytype_with_user_subclass("str", &STR_USER_TYPE);
 /// `W_UnicodeObjectUser` (`typedef.py _getusercls(W_UnicodeObject)`).
 pub static STR_USER_TYPE: PyType = new_user_pytype("str", &STR_TYPE);
-pub static LIST_TYPE: PyType = new_pytype("list");
+pub static LIST_TYPE: PyType = new_pytype_with_user_subclass("list", &LIST_USER_TYPE);
+/// `W_ListObjectUser` (`typedef.py _getusercls(W_ListObject)`).
+pub static LIST_USER_TYPE: PyType = new_user_pytype("list", &LIST_TYPE);
 pub static TUPLE_TYPE: PyType = new_pytype_with_user_subclass("tuple", &TUPLE_USER_TYPE);
 /// `W_TupleObjectUser` (`typedef.py _getusercls(W_TupleObject)`).
 pub static TUPLE_USER_TYPE: PyType = new_user_pytype("tuple", &TUPLE_TYPE);
@@ -774,8 +776,8 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (156, Some(0)),
     (157, Some(0)),
-    // 158-164 are `typedef.py` `_getusercls` layouts
-    // (int/str/tuple/float/complex/bytes/bytearray user), each an rclass
+    // 158-165 are `typedef.py` `_getusercls` layouts
+    // (int/str/tuple/float/complex/bytes/bytearray/list user), each an rclass
     // subclass of the builtin it was made from.
     (158, Some(1)),
     (159, Some(34)),
@@ -784,20 +786,21 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (162, Some(54)),
     (163, Some(27)),
     (164, Some(28)),
+    (165, Some(7)),
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail so its id stays 165 on every target.
-    (165, Some(0)),
-    // Native-only type IDs 166 and 167 represent `posix.DirEntry` and
+    // posix / console tail so its id stays 166 on every target.
+    (166, Some(0)),
+    // Native-only type IDs 167 and 168 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (166, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
     (167, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (168, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (168, Some(0)),
+    (169, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1339,6 +1342,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(162, &COMPLEX_USER_TYPE),
         subclass_range_alias(163, &crate::bytesobject::BYTES_USER_TYPE),
         subclass_range_alias(164, &crate::bytearrayobject::BYTEARRAY_USER_TYPE),
+        subclass_range_alias(165, &LIST_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
@@ -1573,7 +1577,7 @@ pub unsafe fn is_int_or_long(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_list(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &LIST_TYPE) }
+    unsafe { py_type_check(obj, &LIST_TYPE) || py_type_check(obj, &LIST_USER_TYPE) }
 }
 
 /// Recognise any of the four tuple variants —

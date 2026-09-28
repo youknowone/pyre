@@ -2630,17 +2630,6 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // `BaseUserClassMapdict.storage` equivalent for native list
-            // subclasses with `__slots__`. Mutable and instance-owned.
-            (
-                "W_ListObject.w_slots",
-                std::mem::offset_of!(W_ListObject, w_slots),
-                std::mem::size_of::<usize>(),
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
             // CPython 3.14 `PyListObject.allocated`.  The orthodox append
             // descent now walks `W_ListObject::sync_allocated`, so this field
             // must belong to the canonical list descr group just like every
@@ -4643,6 +4632,19 @@ static W_BYTEARRAY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::
     )
 });
 
+static W_LIST_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::listobject::W_LIST_USER_OBJECT_SIZE,
+        pyre_object::listobject::W_LIST_USER_GC_TYPE_ID,
+        &pyre_object::pyobject::LIST_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::listobject::W_ListObjectUser, map),
+        std::mem::offset_of!(pyre_object::listobject::W_ListObjectUser, storage),
+        "W_ListObjectUser",
+        "listobject::W_ListObjectUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x70,
+    )
+});
+
 /// `W_ObjectObject.map` (`objectobject.rs`) — the instance shape word,
 /// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). Read as an
 /// `Int` word so the LOAD_ATTR fast path can `guard_value` it to a constant map
@@ -4680,6 +4682,8 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_BYTES_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
         field_descr_from_group(&W_BYTEARRAY_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::is_list(obj) } {
+        field_descr_from_group(&W_LIST_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_complex(obj) } {
         field_descr_from_group(&W_COMPLEX_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_str(obj) } {
@@ -4707,6 +4711,8 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_BYTES_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
         field_descr_from_group(&W_BYTEARRAY_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::is_list(obj) } {
+        field_descr_from_group(&W_LIST_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_complex(obj) } {
         field_descr_from_group(&W_COMPLEX_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_str(obj) } {
@@ -4780,27 +4786,23 @@ pub fn list_float_items_block_descr() -> DescrRef {
 }
 
 pub fn list_bytes_items_len_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 10)
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 9)
 }
 
 pub fn list_bytes_items_block_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 11)
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 10)
 }
 
 pub fn list_ascii_items_len_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 12)
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 11)
 }
 
 pub fn list_ascii_items_block_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 13)
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 12)
 }
 
 pub fn list_w_class_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 7)
-}
-
-pub fn list_w_slots_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 8)
 }
 
 /// `Ptr(GcArray(OBJECTPTR))` — `wrappeditems` body per
@@ -6564,6 +6566,7 @@ mod tests {
             W_BYTEARRAY_USER_DESCR_GROUP.field_descrs[1].index(),
             0x6100_0061
         );
+        assert_eq!(W_LIST_USER_DESCR_GROUP.field_descrs[0].index(), 0x6100_0070);
         assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
             Type::Ref
@@ -7582,7 +7585,18 @@ mod tests {
             .iter()
             .map(|field| field.offset())
             .collect();
-        assert!(list_gc_offsets.contains(&std::mem::offset_of!(W_ListObject, w_slots)));
+        let user_size = W_LIST_USER_DESCR_GROUP.size_descr.clone();
+        let user_gc_offsets: Vec<_> = user_size
+            .as_size_descr()
+            .unwrap()
+            .gc_fielddescrs()
+            .iter()
+            .map(|field| field.offset())
+            .collect();
+        assert!(user_gc_offsets.contains(&std::mem::offset_of!(
+            pyre_object::listobject::W_ListObjectUser,
+            storage
+        )));
         assert!(list_gc_offsets.contains(
             &(std::mem::offset_of!(W_ListObject, bytes_items)
                 + pyre_object::bytes_array::BYTES_ARRAY_BLOCK_OFFSET)
@@ -8231,6 +8245,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("listobject::W_ListObject", || {
         LazyLock::force(&W_LIST_DESCR_GROUP);
+    }),
+    ("listobject::W_ListObjectUser", || {
+        LazyLock::force(&W_LIST_USER_DESCR_GROUP);
     }),
     ("tupleobject::W_TupleObject", || {
         LazyLock::force(&W_TUPLE_DESCR_GROUP);
@@ -8949,7 +8966,6 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     "strategy" => return list_strategy_descr(),
                     "length" => return list_length_descr(),
                     "items" => return list_items_descr(),
-                    "w_slots" => return list_w_slots_descr(),
                     _ => {}
                 }
             }
