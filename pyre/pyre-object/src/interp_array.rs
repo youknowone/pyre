@@ -2,13 +2,17 @@
 //!
 //! PyPy: pypy/module/array/interp_array.py
 //!
-//! A fixed `#[pyre_class]` header carrying the typecode and item size plus
-//! an off-GC `*mut Vec<u8>` element buffer (the `bytearray` storage model).
-//! Elements are unboxed scalars stored in native machine byte order, so the
-//! collector traces no inner pointers (zero GC ptr offsets).  Boxing an
-//! element back into a Python object (`w_array_unpack_item`) lives here;
-//! the reverse direction (range-checked packing of a Python object into
+//! A fixed header carrying the typecode and item size plus an off-GC
+//! `*mut Vec<u8>` element buffer. Elements are unboxed scalars stored in
+//! native machine byte order, so the collector traces no element pointers.
+//! Boxing an element back into a Python object (`w_array_unpack_item`) lives
+//! here; the reverse direction (range-checked packing of a Python object into
 //! bytes) needs `int_w`/`float_w` and so lives in the interpreter.
+//!
+//! `W_ArrayBase.typedef` installs `__weakref__` on the base class
+//! (`make_weakref_descr(W_ArrayBase)`), so the lifeline stays on `W_Array`.
+//! A user subclass is `typedef.py` `_getusercls`: `W_ArrayUser` appends
+//! `MapdictStorageMixin` and carries `__dict__` / `__slots__` there.
 
 use crate::pyobject::*;
 use majit_rlib::rbigint::RBigInt as BigInt;
@@ -19,20 +23,50 @@ use rustpython_wtf8::{CodePoint, Wtf8Buf};
 ///
 /// `data` points to a heap `Vec<u8>` holding `len * itemsize` bytes in
 /// native byte order; the live element count is `data.len() / itemsize`.
-#[pyre_class("array.array", static_name = "ARRAY")]
+/// `W_ArrayBase.typedef` installs `__weakref__` (`make_weakref_descr`), so
+/// the lifeline stays on this payload. A user subclass is `typedef.py`
+/// `_getusercls`: [`W_ArrayUser`] appends `MapdictStorageMixin`.
+#[pyre_class(
+    "array.array",
+    static_name = "ARRAY",
+    user_subclass = "ARRAY_USER_TYPE"
+)]
 pub struct W_Array {
     pub typecode: u8,
     pub itemsize: u8,
     pub data: *mut Vec<u8>,
     /// Number of active buffer exports.  Size-changing operations are
-    /// forbidden while this is non-zero (`interp_array.py::_check_resize`).
+    /// forbidden while this is non-zero (`interp_array.py` `_check_resize`).
     pub exports: i64,
-    /// Mapdict `dict` / weakref SPECIAL slots and indexed `__slots__`
-    /// storage for user subclasses.  PyPy's translated `W_ArrayBase`
-    /// receives these fields from its mapdict mixins.
-    pub w_dict: PyObjectRef,
+    /// `W_ArrayBase` weakref lifeline (`make_weakref_descr`).
     pub w_weakreflifeline: PyObjectRef,
-    pub w_slots: PyObjectRef,
+}
+
+/// `typedef.py` `_getusercls(W_ArrayBase)`: the base payload plus
+/// `MapdictStorageMixin`.
+#[repr(C)]
+pub struct W_ArrayUser {
+    pub base: W_Array,
+    pub map: usize,
+    pub storage: *mut crate::object_array::ItemsBlock,
+}
+
+/// User-subclass `array.array` typeptr (`typedef.py` `_getusercls`).
+/// Instances share `W_Array`'s payload and add mapdict `map` / `storage`.
+pub static ARRAY_USER_TYPE: PyType = new_user_pytype("array.array", &ARRAY_TYPE);
+
+/// User-subclass array layout (`typedef.py` `_getusercls`). Unconditional,
+/// so its tid sits with the other closed ids (176) ahead of the
+/// target-gated tail.
+pub const W_ARRAY_USER_GC_TYPE_ID: u32 = 167;
+pub const W_ARRAY_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_ArrayUser>();
+
+impl crate::lltype::GcType for W_ArrayUser {
+    #[inline(always)]
+    fn type_id() -> u32 {
+        W_ARRAY_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_ARRAY_USER_OBJECT_SIZE;
 }
 
 /// The supported typecodes, in Python 3.14's `array.typecodes` order.
@@ -69,9 +103,7 @@ pub fn w_array_new(typecode: u8, itemsize: u8) -> PyObjectRef {
         itemsize,
         data,
         exports: 0,
-        w_dict: PY_NULL,
         w_weakreflifeline: PY_NULL,
-        w_slots: PY_NULL,
     })
 }
 
@@ -88,10 +120,43 @@ pub fn w_array_from_bytes(typecode: u8, itemsize: u8, bytes: Vec<u8>) -> PyObjec
         itemsize,
         data,
         exports: 0,
-        w_dict: PY_NULL,
         w_weakreflifeline: PY_NULL,
-        w_slots: PY_NULL,
     })
+}
+
+/// `allocate_instance(W_ArrayUser, w_class)`: empty buffer, with `map` /
+/// `storage` at the `MapdictStorageMixin` initial state. The header is
+/// non-moving, the same allocator `W_Array::allocate_stable` uses.
+pub fn w_array_user_new(typecode: u8, itemsize: u8, w_class: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
+    let data = crate::lltype::malloc_raw(Vec::<u8>::new());
+    let raw =
+        crate::gc_hook::try_gc_alloc_stable_raw(W_ARRAY_USER_GC_TYPE_ID, W_ARRAY_USER_OBJECT_SIZE);
+    let body = W_ArrayUser {
+        base: W_Array {
+            ob: PyObject {
+                ob_type: &ARRAY_USER_TYPE as *const PyType,
+                w_class: crate::gc_roots::shadow_stack_get(class_slot),
+            },
+            typecode,
+            itemsize,
+            data,
+            exports: 0,
+            w_weakreflifeline: PY_NULL,
+        },
+        map: 0,
+        storage: std::ptr::null_mut(),
+    };
+    if raw.is_null() {
+        return Box::into_raw(Box::new(body)) as PyObjectRef;
+    }
+    unsafe {
+        std::ptr::write(raw as *mut W_ArrayUser, body);
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+    }
+    raw as PyObjectRef
 }
 
 /// `W_ArrayBase.__del__`: release the raw element buffer when the managed
@@ -112,23 +177,6 @@ pub unsafe fn w_array_dealloc(obj: PyObjectRef) {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_array_getdict(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_Array)).w_dict }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_array_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
-    unsafe { (*(obj as *mut W_Array)).w_dict = w_dict };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_getweakref(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Array)).w_weakreflifeline }
 }
@@ -142,37 +190,11 @@ pub unsafe fn w_array_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// Read one app-level `__slots__` entry from an array subclass.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_array_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    let slots = unsafe { (*(obj as *const W_Array)).w_slots };
-    unsafe { crate::slots::slot_get(slots, index) }
-}
-
-/// Write one app-level `__slots__` entry on an array subclass.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_array_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    crate::slot_set_direct!(obj, index, value, W_Array, w_slots)
-}
-
-/// Clear one app-level `__slots__` entry on an array subclass.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_array_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    let slots = unsafe { (*(obj as *const W_Array)).w_slots };
-    unsafe { crate::slots::slot_del(slots, index) }
-}
-
 /// # Safety
 /// `obj` must be a valid, non-null `PyObject` pointer.
 #[inline]
 pub unsafe fn is_array(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &ARRAY_TYPE) }
+    unsafe { py_type_check(obj, &ARRAY_TYPE) || py_type_check(obj, &ARRAY_USER_TYPE) }
 }
 
 /// # Safety
@@ -343,22 +365,51 @@ mod tests {
 
     #[test]
     fn w_array_gc_descriptor_traces_subclass_state() {
-        // Elements remain unboxed in the raw buffer; the traced edges are the
-        // header `w_class` one every `#[pyre_class]` type reports plus the
-        // mapdict, weakref, and indexed-slot fields.
+        // Elements remain unboxed in the raw buffer. The base layout traces
+        // the header `w_class` and `W_ArrayBase`'s weakref lifeline. Subclass
+        // `__dict__` / `__slots__` live on `W_ArrayUser`.
         assert_eq!(
             W_ARRAY_GC_PTR_OFFSETS,
             [
                 std::mem::offset_of!(W_Array, ob.w_class),
-                std::mem::offset_of!(W_Array, w_dict),
                 std::mem::offset_of!(W_Array, w_weakreflifeline),
-                std::mem::offset_of!(W_Array, w_slots),
             ]
         );
         assert_eq!(
             <W_Array as crate::lltype::GcType>::SIZE,
             W_ARRAY_OBJECT_SIZE
         );
+    }
+
+    /// `typedef.py` `_getusercls(W_ArrayBase)`: a subclass instance is
+    /// `W_ArrayUser` carrying `ARRAY_USER_TYPE`.
+    #[test]
+    fn array_subclass_instance_carries_user_typeptr() {
+        assert_eq!(W_ARRAY_USER_GC_TYPE_ID, 167);
+        assert_eq!(
+            W_ARRAY_OBJECT_SIZE,
+            std::mem::offset_of!(W_Array, w_weakreflifeline) + std::mem::size_of::<PyObjectRef>()
+        );
+        assert_eq!(
+            W_ARRAY_USER_OBJECT_SIZE,
+            W_ARRAY_OBJECT_SIZE
+                + std::mem::size_of::<usize>()
+                + std::mem::size_of::<*mut crate::object_array::ItemsBlock>()
+        );
+        let obj = w_array_new(b'i', 4);
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &ARRAY_TYPE));
+            assert!(is_array(obj));
+        }
+        unsafe { w_array_dealloc(obj) };
+        let obj = w_array_user_new(b'i', 4, get_instantiate(&ARRAY_TYPE));
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &ARRAY_USER_TYPE));
+            assert!(is_array(obj));
+            assert!(!crate::pyobject::is_exact_type(obj, &ARRAY_TYPE));
+            assert_eq!(w_array_len(obj), 0);
+            w_array_dealloc(obj);
+        }
     }
 
     #[test]

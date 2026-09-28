@@ -1347,6 +1347,13 @@ struct PyreClassAttrs {
     /// Specifying this lets the GC consts retain one prefix while the
     /// PyType keeps its historical name.
     pytype_static: Option<syn::LitStr>,
+    /// Optional name of the `_getusercls` typeptr static
+    /// (`typedef.py` `_getusercls`). When set, the PyType is built with
+    /// `new_pytype_with_user_subclass` and `from_obj` accepts that
+    /// typeptr as well as this class's own: a user-subclass layout
+    /// starts with the base payload. Example:
+    /// `user_subclass = "ARRAY_USER_TYPE"`.
+    user_subclass: Option<syn::LitStr>,
     /// CPython 3.14 constructs this module type with `PyType_From*Spec`.
     /// This is a public flag projection only; the PyPy TypeDef remains a
     /// builtin internally.
@@ -1359,11 +1366,12 @@ struct PyreClassAttrs {
 
 impl syn::parse::Parse for PyreClassAttrs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        // `"name.path"[, type_id = N][, static_name = "PREFIX"]`
+        // `"name.path"[, type_id = N][, static_name = "PREFIX"][, user_subclass = "IDENT"]`
         let name: syn::LitStr = input.parse()?;
         let mut type_id: Option<syn::LitInt> = None;
         let mut static_name: Option<syn::LitStr> = None;
         let mut pytype_static: Option<syn::LitStr> = None;
+        let mut user_subclass: Option<syn::LitStr> = None;
         let mut cpython_heaptype = false;
         let mut cpython_mutable = false;
         while !input.is_empty() {
@@ -1389,13 +1397,14 @@ impl syn::parse::Parse for PyreClassAttrs {
                 "type_id" => type_id = Some(input.parse()?),
                 "static_name" => static_name = Some(input.parse()?),
                 "pytype_static" => pytype_static = Some(input.parse()?),
+                "user_subclass" => user_subclass = Some(input.parse()?),
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "unknown `#[pyre_class]` key `{other}` — \
                              expected `type_id` / `static_name` / `pytype_static` / \
-                             `cpython_heaptype` / `cpython_mutable`",
+                             `user_subclass` / `cpython_heaptype` / `cpython_mutable`",
                         ),
                     ));
                 }
@@ -1406,6 +1415,7 @@ impl syn::parse::Parse for PyreClassAttrs {
             type_id,
             static_name,
             pytype_static,
+            user_subclass,
             cpython_heaptype,
             cpython_mutable,
         })
@@ -1460,6 +1470,10 @@ fn expand_pyre_class(
     let descriptor_static = format_ident!("W_{}_PYRE_CLASS_DESCRIPTOR", suffix);
     let descriptor_slice_elem = format_ident!("W_{}_PYRE_CLASS_DESCRIPTOR_SLICE", suffix);
     let descriptor_ctor_fn = format_ident!("__register_w_{}_pyre_class_descriptor", suffix);
+    let user_subclass = attrs
+        .user_subclass
+        .as_ref()
+        .map(|s| format_ident!("{}", s.value()));
 
     // When the user declared `type_id = N` we pre-initialize the cell
     // to `N` and additionally emit the legacy `pub const W_X_GC_TYPE_ID:
@@ -1468,10 +1482,29 @@ fn expand_pyre_class(
     // omitted `type_id`, the cell starts unassigned and the legacy
     // const is not emitted — callers must read the cell at runtime via
     // `<W_X as GcType>::type_id()` (which itself becomes `cell.get()`).
-    let pytype_ctor = if has_mapdict_mixin {
-        quote! { ::pyre_object::pyobject::new_pytype_with_mapdict_mixin }
-    } else {
-        quote! { ::pyre_object::pyobject::new_pytype }
+    // `user_subclass` names the `_getusercls` typeptr (`typedef.py`
+    // `_getusercls`); that wins over the mapdict-mixin constructor.
+    let pytype_init = match &user_subclass {
+        Some(ident) => quote! {
+            ::pyre_object::pyobject::new_pytype_with_user_subclass(#name_lit, &#ident)
+        },
+        None if has_mapdict_mixin => quote! {
+            ::pyre_object::pyobject::new_pytype_with_mapdict_mixin(#name_lit)
+        },
+        None => quote! {
+            ::pyre_object::pyobject::new_pytype(#name_lit)
+        },
+    };
+    let from_obj_type_check = match &user_subclass {
+        Some(ident) => quote! {
+            unsafe {
+                ::pyre_object::py_type_check(obj, &#pytype_static)
+                    || ::pyre_object::py_type_check(obj, &#ident)
+            }
+        },
+        None => quote! {
+            unsafe { ::pyre_object::py_type_check(obj, &#pytype_static) }
+        },
     };
 
     let (cell_init, legacy_const) = match attrs.type_id.as_ref() {
@@ -1549,7 +1582,7 @@ fn expand_pyre_class(
         #st
 
         #st_vis static #pytype_static: ::pyre_object::PyType =
-            #pytype_ctor(#name_lit);
+            #pytype_init;
 
         /// Runtime-resolved GC tid for this class.  Initialized either
         /// to the explicit `type_id = N` from the attribute (drift-
@@ -1635,7 +1668,7 @@ fn expand_pyre_class(
             pub fn from_obj(obj: ::pyre_object::PyObjectRef)
                 -> ::std::option::Option<&'static mut Self>
             {
-                if unsafe { ::pyre_object::py_type_check(obj, &#pytype_static) } {
+                if #from_obj_type_check {
                     ::std::option::Option::Some(unsafe { &mut *(obj as *mut Self) })
                 } else {
                     ::std::option::Option::None

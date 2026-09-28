@@ -937,6 +937,20 @@ unsafe fn array_object_destructor(obj_addr: usize) {
     }
 }
 
+/// `W_ArrayUser` (`typedef.py` `_getusercls`): the base array's inline edges
+/// plus mapdict `storage`.
+unsafe fn array_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    for offset in pyre_object::interp_array::W_ARRAY_GC_PTR_OFFSETS {
+        f((obj_addr + offset) as *mut majit_ir::GcRef);
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
 unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f) };
 }
@@ -3334,11 +3348,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_object::interp_itertools::W_Cycle
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // W_Array (`array.array`) — typed payload via `#[pyre_class]`
-    // in AUTO-ID mode. Its elements are unboxed scalars in a raw
-    // `*mut Vec<u8>` buffer, released by W_ArrayBase.__del__; the descriptor
-    // traces the object-resident mapdict, weakref, and indexed-slot fields.
-    // Tail of the tid chain.
+    // W_Array (`array.array`) — typed payload in AUTO-ID mode. Its elements
+    // are unboxed scalars in a raw `*mut Vec<u8>` buffer, released by
+    // W_ArrayBase.__del__; the descriptor traces the header `w_class` and
+    // the base weakref lifeline. Subclass `__dict__` / `__slots__` are the
+    // user tid's mapdict storage. Tail of the tid chain.
     {
         let array_descr = <pyre_object::interp_array::W_Array
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
@@ -4087,6 +4101,33 @@ fn build_gc() -> Box<MiniMarkGC> {
     pytype_to_tid.insert(
         &pyre_object::setobject::FROZENSET_USER_TYPE as *const _ as usize,
         set_user_tid,
+    );
+    // `W_ArrayUser` (`typedef.py` `_getusercls`). Subclass instances are a
+    // subclass-range child of the array tid, traced as an array plus its
+    // mapdict storage. The raw element buffer is released by the same
+    // `W_ArrayBase.__del__` destructor as the base tid.
+    let array_tid = <pyre_object::interp_array::W_Array as pyre_object::lltype::GcType>::type_id();
+    debug_assert_eq!(array_tid, 99);
+    let array_user_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            pyre_object::interp_array::W_ARRAY_USER_OBJECT_SIZE,
+            array_tid,
+            array_user_object_custom_trace,
+        )
+        .with_destructor_fn(array_object_destructor),
+    );
+    debug_assert_eq!(
+        array_user_tid,
+        pyre_object::interp_array::W_ARRAY_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::interp_array::ARRAY_USER_TYPE as *const _ as usize,
+        array_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::interp_array::ARRAY_USER_TYPE as *const _ as usize,
+        array_user_tid,
     );
 
     // `_sre.SRE_Template` — last unconditional interpreter class (tid 167),

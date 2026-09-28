@@ -5003,6 +5003,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         ),
         pytype_addr!("interp_array::ARRAY_TYPE", interp_array::ARRAY_TYPE),
         pytype_addr!(
+            "interp_array::ARRAY_USER_TYPE",
+            interp_array::ARRAY_USER_TYPE
+        ),
+        pytype_addr!(
             "celldict::OBJECT_MUTABLE_CELL_TYPE",
             celldict::OBJECT_MUTABLE_CELL_TYPE
         ),

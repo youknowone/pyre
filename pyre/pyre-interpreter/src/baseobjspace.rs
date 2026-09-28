@@ -5904,28 +5904,6 @@ pub fn getdict(mut obj: PyObjectRef) -> PyResult {
     if unsafe { pyre_object::is_exception(obj) } {
         return Ok(unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) });
     }
-    if unsafe { pyre_object::interp_array::is_array(obj) } {
-        let Some(w_type) = crate::typedef::r#type(obj) else {
-            return Ok(PY_NULL);
-        };
-        if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
-            let existing = unsafe { pyre_object::interp_array::w_array_getdict(obj) };
-            if !existing.is_null() {
-                return Ok(existing);
-            }
-            let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            let w_dict = pyre_object::w_dict_new();
-            unsafe {
-                pyre_object::interp_array::w_array_setdict(
-                    pyre_object::gc_roots::shadow_stack_get(root_base),
-                    w_dict,
-                )
-            };
-            return Ok(w_dict);
-        }
-    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => return Ok(pyre_object::PY_NULL),
@@ -5960,9 +5938,6 @@ pub(crate) fn native_slot_get(
         let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
         return Ok((!value.is_null()).then_some(value));
     }
-    if unsafe { pyre_object::interp_array::is_array(obj) } {
-        return Ok(unsafe { pyre_object::interp_array::w_array_slot_get(obj, index as usize) });
-    }
     if crate::module::_collections::is_deque(obj) {
         return Ok(unsafe { crate::module::_collections::deque_slot_get(obj, index as usize) });
     }
@@ -5990,10 +5965,6 @@ pub(crate) fn native_slot_set(
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, value) };
         return Ok(true);
     }
-    if unsafe { pyre_object::interp_array::is_array(obj) } {
-        unsafe { pyre_object::interp_array::w_array_slot_set(obj, index as usize, value) };
-        return Ok(true);
-    }
     if crate::module::_collections::is_deque(obj) {
         unsafe { crate::module::_collections::deque_slot_set(obj, index as usize, value) };
         return Ok(true);
@@ -6018,9 +5989,6 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
         }
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, pyre_object::PY_NULL) };
         return Ok(true);
-    }
-    if unsafe { pyre_object::interp_array::is_array(obj) } {
-        return Ok(unsafe { pyre_object::interp_array::w_array_slot_del(obj, index as usize) });
     }
     if crate::module::_collections::is_deque(obj) {
         return Ok(unsafe { crate::module::_collections::deque_slot_del(obj, index as usize) });
@@ -6100,11 +6068,6 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
     if unsafe { pyre_object::is_exception(obj) } {
         require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::interp_exceptions::w_exception_setdict(obj, w_dict) };
-        return Ok(());
-    }
-    if unsafe { pyre_object::interp_array::is_array(obj) } {
-        require_dict_for_setdict(w_dict)?;
-        unsafe { pyre_object::interp_array::w_array_setdict(obj, w_dict) };
         return Ok(());
     }
     // W_TypeObject and Module keep their namespace mappings as readonly
