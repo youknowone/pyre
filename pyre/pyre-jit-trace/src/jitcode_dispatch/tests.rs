@@ -5219,7 +5219,17 @@ fn replay_scan_treats_callee_frame_bookkeeping_as_call_owned() {
         make_fail_descr(1),
         field_descr_with_index(2),
     ];
-    let scan = fbw_callee_body_replay_scan(&code, &[], 0, &[0], 6, &[], &descrs, false);
+    let scan = fbw_callee_body_replay_scan(
+        &code,
+        &[],
+        0,
+        &[0],
+        6,
+        &[],
+        &descrs,
+        RawDescrPool::Global,
+        false,
+    );
     assert_eq!(scan.verdict(), CalleeReplaySafety::Clean);
     assert!(scan.poison.is_empty());
 }
@@ -5244,7 +5254,17 @@ fn replay_scan_does_not_transfer_frame_identity_across_register_overwrite() {
         field_descr_with_index(2),
     ];
 
-    let scan = fbw_callee_body_replay_scan(&code, &[], 0, &[0], 6, &[], &descrs, false);
+    let scan = fbw_callee_body_replay_scan(
+        &code,
+        &[],
+        0,
+        &[0],
+        6,
+        &[],
+        &descrs,
+        RawDescrPool::Global,
+        false,
+    );
 
     assert_eq!(scan.poison, vec![11]);
 }

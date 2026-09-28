@@ -13512,7 +13512,7 @@ pub(crate) unsafe fn get(
         }
         // typedef.py:511: w_result = w_obj.getslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
-        let found = if is_instance(obj) {
+        let found = if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
             crate::objspace::std::mapdict::getslotvalue(obj, index)
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
@@ -13608,7 +13608,7 @@ unsafe fn set(
         }
         // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
         let index = pyre_object::w_member_get_index(descr);
-        if is_instance(obj) {
+        if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
             crate::objspace::std::mapdict::setslotvalue(obj, index, value);
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
@@ -13669,7 +13669,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
         }
         // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
-        let removed = if is_instance(obj) {
+        let removed = if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
             crate::objspace::std::mapdict::delslotvalue(obj, index)
         } else {
             // Native-layout subclass instance — slot backed by __dict__.

@@ -857,7 +857,7 @@ pub unsafe fn instance_del_weakref_slot(obj: PyObjectRef) {
 #[majit_macros::dont_look_inside]
 pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectRef> {
     assert!(
-        unsafe { has_mapdict_storage(obj) },
+        unsafe { has_mapdict_layout(obj) },
         "W_Root.getslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);
@@ -883,7 +883,7 @@ pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectR
 #[majit_macros::dont_look_inside]
 pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRef) {
     assert!(
-        unsafe { has_mapdict_storage(obj) },
+        unsafe { has_mapdict_layout(obj) },
         "W_Root.setslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);
@@ -909,7 +909,7 @@ pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRe
 #[majit_macros::dont_look_inside]
 pub unsafe fn delslotvalue(obj: PyObjectRef, slotindex: u32) -> bool {
     assert!(
-        unsafe { has_mapdict_storage(obj) },
+        unsafe { has_mapdict_layout(obj) },
         "W_Root.delslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);

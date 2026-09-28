@@ -3756,7 +3756,8 @@ fn callee_body_commits_nothing(w_code: *const ()) -> bool {
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
         return false;
     };
-    let Some((descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code) else {
+    let Some((descr_refs, perfn_descrs, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
+    else {
         return false;
     };
     matches!(
@@ -3768,6 +3769,7 @@ fn callee_body_commits_nothing(w_code: *const ()) -> bool {
             body.num_regs_r,
             body.constants_r,
             &descr_refs,
+            RawDescrPool::PerFn(perfn_descrs),
             false,
         )
         .verdict(),
@@ -6853,6 +6855,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             body.num_regs_r,
             body.constants_r,
             callee_descr_refs,
+            RawDescrPool::PerFn(callee_perfn_descrs),
             method_form,
         );
         let safety = scan.verdict();
@@ -7149,6 +7152,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 body.num_regs_r,
                 body.constants_r,
                 callee_descr_refs,
+                RawDescrPool::PerFn(callee_perfn_descrs),
                 false,
             ))
         } else {
@@ -12721,7 +12725,9 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
         decline!(V::NoResumeEntry)
     };
     census.ops_to_yield = generator_resume_op_scan(body.code);
-    if let Some((descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_pycode) {
+    if let Some((descr_refs, perfn_descrs, _)) =
+        crate::state::sub_jitcode_descr_pool_for_code(w_pycode)
+    {
         let scan = fbw_callee_body_replay_scan(
             body.code,
             &[],
@@ -12730,6 +12736,7 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
             body.num_regs_r,
             body.constants_r,
             &descr_refs,
+            RawDescrPool::PerFn(perfn_descrs),
             false,
         );
         census.replay = Some(GeneratorResumeReplay {
