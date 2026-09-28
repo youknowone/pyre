@@ -111,6 +111,9 @@ pub struct SemanticFunction {
     /// `return_type` marker so the residual prefill projects a `Ref`
     /// result.
     pub returns_objectptr: bool,
+    /// The path a clause specialization's call sites name
+    /// (`FunctionPath(spec_segments)`); `None` for a declared function.
+    pub spec_path: Option<crate::parse::CallPath>,
 }
 
 impl SemanticFunction {
@@ -823,6 +826,7 @@ mod tests {
             trait_root: None,
             trait_qualified: None,
             returns_objectptr: false,
+            spec_path: None,
         }
     }
 

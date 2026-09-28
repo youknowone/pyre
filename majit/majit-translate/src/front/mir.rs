@@ -1609,12 +1609,14 @@ impl<'l> CrateLowering<'l> {
                 return None;
             }
         };
-        graph.name = spec_segments(llbc, fd, &header.name).join("::");
+        let segments = spec_segments(llbc, fd, &header.name);
+        graph.name = segments.join("::");
         record_positional_shapes(&graph, &mut positional_shapes.borrow_mut());
         // `FunctionDesc.cachedgraph` returns the specialized graph of the
         // same function object, so the copy keeps `_jit_look_inside_`.
         // `look_inside_graph` reads that hint off the callee.
         let mut lowered = header.into_function(graph);
+        lowered.spec_path = Some(crate::parse::CallPath::from_segments(segments));
         if dont_look_inside.contains(&policy_fn_path)
             && !lowered.hints.iter().any(|hint| hint == "dont_look_inside")
         {
@@ -1949,6 +1951,7 @@ impl SemanticFunctionHeader {
             trait_root: self.trait_root,
             trait_qualified: self.trait_qualified,
             returns_objectptr: self.returns_objectptr,
+            spec_path: None,
         }
     }
 }
