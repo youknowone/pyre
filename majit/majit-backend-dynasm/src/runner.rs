@@ -2590,53 +2590,16 @@ impl DynasmBackend {
 
     /// `llmodel.py get_latest_descr`: cast `jf_descr` through
     /// `AbstractDescr.show`. The word is a [`majit_ir::FailDescrCell`]
-    /// address for both guard cells and the cpu-attached singletons.
-    ///
-    /// `frame_ptr` is only for `PropagateExceptionDescr.handle_fail`:
-    /// read `jf_guard_exc`, clear it, stage it into `jf_frame[0]`, and
-    /// answer the exit-frame descr the toplevel consumer already matches.
-    fn find_descr_by_ptr(
-        &self,
-        ptr: usize,
-        frame_ptr: *mut JitFrame,
-    ) -> majit_backend::deadframe::ExitDescr {
+    /// address for both guard cells and the cpu-attached singletons,
+    /// `propagate_exception_descr` included: its `handle_fail` reads
+    /// `grab_exc_value` off the deadframe (`compile.py`
+    /// `PropagateExceptionDescr`).
+    fn find_descr_by_ptr(&self, ptr: usize) -> majit_backend::deadframe::ExitDescr {
         assert_ne!(
             ptr, 0,
             "find_descr_by_ptr: jf_descr was not written; refusing to recover a null FailDescrCell"
         );
-        let attached = self.descr_attachments.read().descr_ptrs();
-        let ptr = if ptr == attached.propagate_exception_descr {
-            Self::stage_propagate_exception(frame_ptr);
-            assert_ne!(
-                attached.exit_frame_with_exception_descr_ref, 0,
-                "Propagate path requires exit_frame_with_exception_descr_ref to be attached"
-            );
-            attached.exit_frame_with_exception_descr_ref
-        } else {
-            ptr
-        };
         unsafe { majit_backend::deadframe::ExitDescr::from_cell(ptr) }
-    }
-
-    /// `compile.py PropagateExceptionDescr.handle_fail`.
-    ///
-    /// `grab_exc_value` reads `jf_guard_exc`; the clear keeps a later grab
-    /// from seeing the same value. Empty falls back to `memory_error`.
-    /// The value is staged in `jf_frame[0]` so the exit-frame reader picks
-    /// it up through `get_ref_value(0)`.
-    fn stage_propagate_exception(frame_ptr: *mut JitFrame) {
-        let exc_val = unsafe {
-            let slot = &mut (*frame_ptr).jf_guard_exc;
-            let v = *slot;
-            *slot = 0;
-            v
-        };
-        let exc_val = if exc_val != 0 {
-            exc_val as i64
-        } else {
-            majit_backend::memory_error_singleton_ref()
-        };
-        unsafe { crate::llmodel::set_int_value(frame_ptr, 0, exc_val as isize) };
     }
 
     /// `rpython/jit/backend/x86/assembler.py:599` parity: store
@@ -2943,7 +2906,7 @@ impl DynasmBackend {
     /// host frame is owned, and its chain freed, by the deadframe.
     fn deadframe_from_run(&self, _token: &JitCellToken, ran: RanFrame) -> DeadFrame {
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(ran.tip) };
-        let descr = self.find_descr_by_ptr(jf_descr_raw, ran.tip);
+        let descr = self.find_descr_by_ptr(jf_descr_raw);
         let descr_fd = descr.as_fail_descr();
 
         if crate::majit_log_enabled() {
@@ -3791,13 +3754,17 @@ impl Backend for DynasmBackend {
         for (i, &val) in args.iter().enumerate() {
             unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), val as isize) };
         }
+        // llmodel.py `execute_token`: `llop.gc_writebarrier(ll_frame)`.
+        if gc_object {
+            with_gc_ll_descr(|gc| jitframe_write_barrier(gc, jf_ptr));
+        }
 
         let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
         let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
 
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) };
-        let descr = self.find_descr_by_ptr(jf_descr_raw, result_jf);
+        let descr = self.find_descr_by_ptr(jf_descr_raw);
         let descr_fd = descr.as_fail_descr();
 
         let fail_arg_types = descr_fd.fail_arg_types();
