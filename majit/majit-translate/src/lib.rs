@@ -295,8 +295,11 @@ fn build_semantic_program_via_active_frontend(
             let cross_tombstoned_leaves = duplicate_leaf_facts.tombstoned_leaves();
             crate::local_crates::register_local_crate_roots(crate_names);
 
-            let mut graph_bodies =
-                front::graph_body::GraphBodyProvider::new(static_addrs, jitdriver_receiver_roots);
+            let mut graph_bodies = front::graph_body::GraphBodyProvider::new(
+                static_addrs,
+                jitdriver_receiver_roots,
+                hints.clone(),
+            );
             let mut merged = None;
             let mut seen_function_keys = std::collections::HashSet::new();
             let mut seen_struct_names = std::collections::HashSet::new();
@@ -361,7 +364,7 @@ fn build_semantic_program_via_active_frontend(
                 &mut program.enum_variant_by_discriminant,
                 Some(&program.struct_ids),
             );
-            merge_hints_from_map(&mut program, &hints);
+            program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
@@ -379,67 +382,6 @@ fn build_semantic_program_via_active_frontend(
          `MAJIT_MIR_FRONTEND_LLBC` to an OS path-list \
          (`;`-separated on Windows, `:` elsewhere) explicitly."
     );
-}
-
-/// Merge JIT-hint markers harvested from the ullbc surrogate consts
-/// into a MIR-driven SemanticProgram.
-///
-/// `front::llbc_hints::harvest_hints_from_llbcs` reads the
-/// `#[doc(hidden)]` marker consts the `majit_macros` proc-macros emit
-/// (`_elidable_function_<NAME>`, `_jit_elidable_cannot_raise_<NAME>`,
-/// `_jit_cannot_raise_<NAME>`, `_jit_look_inside_<NAME>`, …) out of
-/// Charon's `global_decls`,
-/// keyed by the crate-stripped function path.  Each `SemanticFunction`
-/// is matched by its `{module_path}::{name}` path so same-named helpers
-/// in different modules cannot inherit each other's hints.
-#[cfg(feature = "mir-frontend")]
-#[allow(dead_code)] // llbc_hints harvest merged onto SemanticProgram
-fn merge_hints_from_llbcs(
-    program: &mut front::SemanticProgram,
-    llbcs: &[majit_charon_reader::Llbc],
-) {
-    let hints_by_path = front::llbc_hints::harvest_hints_from_llbcs(llbcs);
-    merge_hints_from_map(program, &hints_by_path);
-}
-
-#[cfg(feature = "mir-frontend")]
-fn merge_hints_from_map(
-    program: &mut front::SemanticProgram,
-    hints_by_path: &std::collections::HashMap<String, Vec<String>>,
-) {
-    program.harvested_hints.clone_from(hints_by_path);
-    for f in &mut program.functions {
-        let path = if f.module_path.is_empty() {
-            f.name.clone()
-        } else {
-            format!("{}::{}", f.module_path, f.name)
-        };
-        if let Some(h) = hints_by_path.get(&path) {
-            f.hints.clone_from(h);
-            // BFS reads `_jit_*_` off `FunctionGraph.hints`. Stamping
-            // the harvested bag here means the first
-            // `register_function_graph` already carries `unroll_safe`.
-            front::llbc_hints::merge_hints_into_graph(f.graph_mut(), h);
-            // A `dont_look_inside` callee returning `*mut PyObject`
-            // (`SemanticFunction::returns_objectptr`, set structurally by
-            // `front::mir::output_type_is_objectptr`) residualizes as an
-            // opaque call.  The MIR driver leaves `return_type` `None`,
-            // which the cutover residual prefill maps `None`→`Void` — a
-            // miscompile for a callee the caller reads as a pointer.
-            // Stamp the object-pointer marker so the residual reports a
-            // `Ref` result instead.  Gated on the hint so non-opaque
-            // object-pointer-returning fns keep `return_type == None`
-            // (the call-signature validator's TyRef-label-misclassify
-            // safeguard, `front::mir`).
-            if f.return_type.is_none()
-                && f.returns_objectptr
-                && h.iter().any(|hint| hint == "dont_look_inside")
-            {
-                f.return_type =
-                    Some(translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
-            }
-        }
-    }
 }
 
 /// `make_virtualizable_infos` constructor closure type — mirrors the

@@ -69,7 +69,7 @@ use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 /// The `graph.return_type` marker the front-end stamps on a
 /// `dont_look_inside` callee that returns `*mut PyObject` (a
 /// `PyObjectRef`).  `front::mir::output_type_is_objectptr` gates the
-/// stamp (`lib.rs merge_hints_from_llbcs`), so this string only ever
+/// stamp (`front::mir` `SemanticFunctionHeader::new`), so this string only ever
 /// labels a genuine object-pointer return; the residual prefill maps it
 /// to `OBJECTPTR` so the residualized constructor reports a `Ref` result
 /// rather than the `None`→`Void` default.  The literal doubles as the
@@ -2709,7 +2709,7 @@ pub(crate) fn default_someshell_for_lltype(
 /// at the same `space.newutf8` argument as a `String ∪ Instance` UnionError.
 ///
 /// The object-pointer marker (`OBJECTPTR_RETURN_TYPE`, stamped by
-/// `merge_hints_from_llbcs` for a `*mut PyObject`-returning opaque callee the
+/// `SemanticFunctionHeader::new` for a `*mut PyObject`-returning opaque callee the
 /// front-end left untokened) keeps the typed `OBJECTPTR` lltype so a caller
 /// reading the returned object's fields rtypes against the real struct.
 ///

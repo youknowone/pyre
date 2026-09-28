@@ -13,7 +13,7 @@
 //! That requires the LLBC set to stay alive past the whole-program build,
 //! which is what a [`GraphBodyProvider`] owns.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use majit_charon_reader::Llbc;
 
@@ -47,6 +47,9 @@ pub(crate) struct GraphBodyProvider {
     int_values: Vec<(String, i64)>,
     error_carrier: OwnedErrorCarrierSpec,
     scalar_field_stores: Vec<OwnedScalarFieldStore>,
+    /// The funcobj hint attributes harvested across the whole input; every
+    /// crate's headers read them ([`CrateLoweringState`]).
+    func_hints: HashMap<String, Vec<String>>,
 }
 
 /// One lowered crate: its artefact and the lowering state its decls were
@@ -119,6 +122,7 @@ impl GraphBodyProvider {
     pub(crate) fn new(
         static_addrs: crate::HostStaticAddrs<'_>,
         jitdriver_receiver_roots: &[String],
+        func_hints: HashMap<String, Vec<String>>,
     ) -> Self {
         let own = |rows: &[(&str, i64)]| -> Vec<(String, i64)> {
             rows.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
@@ -136,6 +140,7 @@ impl GraphBodyProvider {
                 .iter()
                 .map(OwnedScalarFieldStore::own)
                 .collect(),
+            func_hints,
         }
     }
 
@@ -151,7 +156,7 @@ impl GraphBodyProvider {
     ) -> SemanticProgram {
         let module_filter = mir::normalize_module_filter(module_paths);
         let paint_tombstones = mir::prelink_crate(&llbc, cross_tombstoned_leaves);
-        let mut state = CrateLoweringState::new(&llbc, &paint_tombstones);
+        let mut state = CrateLoweringState::new(&llbc, &paint_tombstones, self.func_hints.clone());
         let functions = self.with_static_addrs(|static_addrs| {
             CrateLowering::new(&llbc, static_addrs, &self.jitdriver_receiver_roots, &state)
                 .lower_all(module_filter.as_ref(), None)
@@ -357,7 +362,8 @@ mod tests {
     #[test]
     fn provider_reproduces_the_eagerly_lowered_body() {
         let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
-        let mut provider = GraphBodyProvider::new(crate::HostStaticAddrs::default(), &[]);
+        let mut provider =
+            GraphBodyProvider::new(crate::HostStaticAddrs::default(), &[], HashMap::new());
         let program = provider.lower_prelinked_crate(llbc, &[], &HashSet::new());
         let mut compared = 0;
         for f in &program.functions {
@@ -383,5 +389,46 @@ mod tests {
             compared += 1;
         }
         assert!(compared > 0, "corpus fixture lowered no bodies at all");
+    }
+
+    /// A funcobj's harvested `_jit_*_` attributes land on it and on its
+    /// graph when the header is built, with no pass over the program
+    /// afterwards.
+    #[test]
+    fn a_harvested_hint_is_stamped_as_the_funcobj_is_built() {
+        let fn_path = |f: &SemanticFunction| {
+            if f.module_path.is_empty() {
+                f.name.clone()
+            } else {
+                format!("{}::{}", f.module_path, f.name)
+            }
+        };
+        let unhinted =
+            GraphBodyProvider::new(crate::HostStaticAddrs::default(), &[], HashMap::new())
+                .lower_prelinked_crate(
+                    Llbc::load(CORPUS).expect("load corpus.ullbc"),
+                    &[],
+                    &HashSet::new(),
+                );
+        let target = unhinted
+            .functions
+            .iter()
+            .find(|f| f.hints.is_empty())
+            .map(fn_path)
+            .expect("corpus has an unhinted funcobj");
+        let hints = HashMap::from([(target.clone(), vec!["unroll_safe".to_string()])]);
+        let program = GraphBodyProvider::new(crate::HostStaticAddrs::default(), &[], hints)
+            .lower_prelinked_crate(
+                Llbc::load(CORPUS).expect("load corpus.ullbc"),
+                &[],
+                &HashSet::new(),
+            );
+        let f = program
+            .functions
+            .iter()
+            .find(|f| fn_path(f) == target)
+            .expect("the hinted funcobj still lowers");
+        assert_eq!(f.hints, vec!["unroll_safe".to_string()]);
+        assert!(f.graph().hints.iter().any(|h| h == "unroll_safe"));
     }
 }

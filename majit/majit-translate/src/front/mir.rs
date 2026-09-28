@@ -1013,6 +1013,12 @@ pub(crate) struct CrateLoweringState {
     dont_look_inside: std::collections::HashSet<String>,
     elidable_residual: std::collections::HashSet<String>,
     not_rpython: std::collections::HashSet<String>,
+    /// The `func._jit_*_` / `_elidable_function_` attributes of every
+    /// funcobj in the translation input, keyed by `{module_path}::{name}`
+    /// (`llbc_hints::harvest_hints_from_llbcs` across the whole set). The
+    /// header stamps a function's bag onto it as it is built, so the
+    /// attributes exist whether or not its body is.
+    func_hints: std::collections::HashMap<String, Vec<String>>,
     /// One root-stack analysis per artefact, so a callee shared by many
     /// brackets is analysed once (`GraphAnalyzer._analyzed_calls`).
     root_stack: RootStackState,
@@ -1044,6 +1050,7 @@ impl CrateLoweringState {
     pub(crate) fn new(
         llbc: &Llbc,
         cross_tombstoned_leaves: &std::collections::HashSet<String>,
+        func_hints: std::collections::HashMap<String, Vec<String>>,
     ) -> Self {
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
@@ -1140,9 +1147,9 @@ impl CrateLoweringState {
         // `result_ty` (`legacy_resolve.rs infer_concrete_from_op`), but the
         // real path stubs the opaque body and otherwise drops the residual
         // call result to void.  Harvest the marker set once (same
-        // `_jit_look_inside_` source as `merge_hints_from_llbcs`) so the
-        // per-fn push can stamp the matching `return_type` token, keyed by
-        // the identical `{module_path}::{name}` path the merge uses.
+        // `_jit_look_inside_` source as `func_hints`) so the per-fn push
+        // can stamp the matching `return_type` token, keyed by the
+        // identical `{module_path}::{name}` path.
         let harvested =
             crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
         let dont_look_inside: std::collections::HashSet<String> = harvested
@@ -1185,6 +1192,7 @@ impl CrateLoweringState {
             dont_look_inside,
             elidable_residual,
             not_rpython,
+            func_hints,
             root_stack: RootStackState::new(llbc),
             spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
             skipped: std::cell::RefCell::new(Vec::new()),
@@ -1313,6 +1321,7 @@ impl<'l> CrateLowering<'l> {
             tombstoned_leaves,
             dont_look_inside,
             elidable_residual,
+            func_hints,
             spec,
             positional_shapes,
             ..
@@ -1369,6 +1378,7 @@ impl<'l> CrateLowering<'l> {
             &known_trait_names,
             &dont_look_inside,
             &elidable_residual,
+            func_hints,
             static_addrs.error_carrier,
             &fn_path,
         );
@@ -1428,6 +1438,7 @@ impl<'l> CrateLowering<'l> {
             tombstoned_leaves,
             dont_look_inside,
             elidable_residual,
+            func_hints,
             spec,
             skipped,
             atomic_load_decls,
@@ -1483,6 +1494,7 @@ impl<'l> CrateLowering<'l> {
             &known_trait_names,
             &dont_look_inside,
             &elidable_residual,
+            func_hints,
             static_addrs.error_carrier,
             &policy_fn_path,
         );
@@ -1623,7 +1635,7 @@ impl CrateLoweringState {
             exact_layouts,
             struct_ids,
             // Populated post-build in `build_semantic_program_via_active_frontend`
-            // (it iterates the full LLBC set), mirroring `merge_hints_from_llbcs`.
+            // (it iterates the full LLBC set).
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls,
@@ -1639,7 +1651,11 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     function_filter: Option<&std::collections::HashSet<String>>,
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    let mut state = CrateLoweringState::new(llbc, cross_tombstoned_leaves);
+    let mut state = CrateLoweringState::new(
+        llbc,
+        cross_tombstoned_leaves,
+        std::collections::HashMap::new(),
+    );
     let functions = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state)
         .lower_all(module_filter, function_filter);
     Ok(state.finish(functions))
@@ -1711,6 +1727,7 @@ impl SemanticFunctionHeader {
         known_trait_names: &std::collections::HashSet<String>,
         dont_look_inside: &std::collections::HashSet<String>,
         elidable_residual: &std::collections::HashSet<String>,
+        func_hints: &std::collections::HashMap<String, Vec<String>>,
         error_carrier: crate::ErrorCarrierSpec<'_>,
         policy_fn_path: &str,
     ) -> Self {
@@ -1763,13 +1780,39 @@ impl SemanticFunctionHeader {
         } else {
             dont_look_inside_return_token(&signature.output, llbc, error_carrier)
         };
-        let return_type = if gcref_result || stamp_return_token {
+        let mut return_type = if gcref_result || stamp_return_token {
             signature_token
         } else if signature_token.as_deref().is_some_and(scalar_result_token) {
             signature_token
         } else {
             None
         };
+        // The funcobj's own `_jit_*_` attributes: `graph.func` carries them
+        // to `look_inside_graph` and the BFS, so the first registration
+        // already sees `unroll_safe`.
+        if let Some(own) = func_hints.get(&fn_path) {
+            for hint in own {
+                if !hints.contains(hint) {
+                    hints.push(hint.clone());
+                }
+            }
+            // A `dont_look_inside` callee returning `*mut PyObject`
+            // residualizes as an opaque call, and a `None` return type
+            // maps to `Void` in the cutover residual prefill — a
+            // miscompile for a callee the caller reads as a pointer.
+            // Stamp the object-pointer marker so the residual reports a
+            // `Ref` result. Gated on the hint so a non-opaque
+            // object-pointer-returning fn keeps `return_type == None` (the
+            // call-signature validator's TyRef-label-misclassify
+            // safeguard).
+            if return_type.is_none()
+                && returns_objectptr
+                && own.iter().any(|hint| hint == "dont_look_inside")
+            {
+                return_type =
+                    Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
+            }
+        }
         SemanticFunctionHeader {
             name,
             return_type,
