@@ -17,9 +17,19 @@
 // carries none of these; Pyre's metainterp descr is the single source
 // of truth for both the `_attrs_` set and the backend-only cells.
 use majit_backend::{ExitRecoveryLayout, TerminalExitLayout};
-use majit_ir::{DescrRef, Type};
+use majit_ir::{DescrRef, InputArgRc, Op, Type};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
+
+/// Inputs a later merged recompile (`assembler.py patch_jump_for_descr`)
+/// needs from one already-compiled function. The `Op`s are a fresh snapshot:
+/// they do not alias the `OpRc`s the metainterp keeps mutating. `None` on
+/// the owner when `merge_source_eligible` refuses the trace.
+pub struct MergeSource {
+    pub trace_id: u64,
+    pub inputargs: Vec<InputArgRc>,
+    pub ops: Vec<Op>,
+}
 
 // The process-global `FAIL_DESCR_REGISTRY_GLOBAL` Weak HashMap was
 // retired.  `history.py AbstractDescr.show(cpu, descr_gcref)
@@ -95,6 +105,9 @@ pub struct BridgeData {
     /// of them can dispatch to the bridge, not only while `original_token`
     /// lives. `None` when the bridge has no reference constants.
     pub gc_table: Option<Arc<majit_gc::GcTable>>,
+    /// Retained compile inputs for a merged recompile of this bridge.
+    /// `None` when `merge_source_eligible` refused the trace.
+    pub merge_source: Option<MergeSource>,
 }
 
 unsafe impl Send for BridgeData {}
