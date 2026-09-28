@@ -2798,7 +2798,7 @@ impl JitCodeBuilder {
         self.touch_reg(lhs);
         self.touch_reg(rhs);
         self.write_insn(key);
-        // RPython `assembler.py:165-174` argcode `ii>i` byte order:
+        // `assembler.py write_insn` argcode `ii>i` byte order:
         // `[lhs][rhs][dst]`, matching the canonical `bhhandler_ii_i!`
         // decoder.
         self.push_u8(lhs as u8);

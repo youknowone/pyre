@@ -1513,8 +1513,8 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
         };
         let pc_reg = pc.reg;
         // `int_add(pc_reg, Constant(N))`: the increment stays a constant
-        // operand. RPython `pyopcode.py:181` `next_instr += 2` is the
-        // canonical N=2 case.
+        // operand. `pyopcode.py dispatch_bytecode`'s `next_instr += 2` is
+        // the canonical N=2 case.
         lowerer.emit_op(
             OpMeta::linear(
                 OpKind::BinopI,
