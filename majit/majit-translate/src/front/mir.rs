@@ -18091,9 +18091,9 @@ impl<'a> Lowering<'a> {
                 // arguments (`PyError::type_error(msg)`) would
                 // otherwise thread its first argument as the getattr
                 // receiver and the annotator resolves the method name
-                // against that argument's type.  Compared by ADT
-                // def_id, not name leaf, so generic owners
-                // (`Result::branch` — `?`'s Try::branch) still match.
+                // against that argument's type.  Compared by nominal ADT,
+                // not name leaf, so generic owners (`Result::branch` —
+                // `?`'s Try::branch) still match.
                 let first_is_self = fd
                     .signature
                     .inputs
@@ -18101,7 +18101,7 @@ impl<'a> Lowering<'a> {
                     .and_then(|t| tyref_node(t, self.llbc))
                     .and_then(|n| strip_ty_wrappers(n, self.llbc))
                     .and_then(adt_node_def_id)
-                    .is_some_and(|id| id == adt_def_id);
+                    .is_some_and(|id| same_nominal_adt(self.llbc, id, adt_def_id));
                 if !first_is_self {
                     return None;
                 }
@@ -21615,7 +21615,8 @@ impl<'a> Lowering<'a> {
                     None => return false,
                 }
             }
-            return inline_adt_def_id(v) == Some(adt_def_id);
+            return inline_adt_def_id(v)
+                .is_some_and(|id| same_nominal_adt(self.llbc, id, adt_def_id));
         }
     }
 
@@ -31603,7 +31604,7 @@ fn first_input_is_adt_free(llbc: &Llbc, fd: &FunDecl, adt_def_id: u64) -> bool {
         .and_then(|t| tyref_node(t, llbc))
         .and_then(|n| strip_ty_wrappers(n, llbc))
         .and_then(adt_node_def_id)
-        .is_some_and(|id| id == adt_def_id)
+        .is_some_and(|id| same_nominal_adt(llbc, id, adt_def_id))
 }
 
 /// Faithful result `ValueType` for a residualized foreign-opaque method,
@@ -34396,6 +34397,21 @@ pub(crate) fn type_decl_ref_adt_id(
         None | Some("Box") => tref.get("id")?.as_u64(),
         Some(_) => None,
     }
+}
+
+/// Whether two ADT decl ids name one nominal type.  Charon's
+/// `--monomorphize` makes each instance of a generic ADT a decl of its own;
+/// the instances share the template path they were instantiated from.
+pub(crate) fn same_nominal_adt(llbc: &Llbc, a: u64, b: u64) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(x), Some(y)) = (llbc.type_by_id(a), llbc.type_by_id(b)) else {
+        return false;
+    };
+    x.item_meta.instantiation().is_some()
+        && y.item_meta.instantiation().is_some()
+        && x.item_meta.name_path() == y.item_meta.name_path()
 }
 
 /// The generic arguments of the type a `TypeDeclRef` names.  A
