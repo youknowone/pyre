@@ -29,9 +29,6 @@ pub const PYFRAME_FAILED_ATTR_CLEANUP_OFFSET: usize =
 /// Byte offset of `debugdata` in `PyFrame`.
 pub const PYFRAME_DEBUGDATA_OFFSET: usize = std::mem::offset_of!(PyFrame, debugdata);
 
-/// Byte offset of `lastblock` in `PyFrame`.
-pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrame, lastblock);
-
 /// Byte offset of `f_generator_wref` in `PyFrame`.
 pub const PYFRAME_F_GENERATOR_WREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_generator_wref);
 
@@ -67,7 +64,6 @@ const _: () = {
             == pyre_interpreter::pyframe::PYFRAME_LOCALS_CELLS_STACK_OFFSET
     );
     assert!(PYFRAME_DEBUGDATA_OFFSET == pyre_interpreter::pyframe::PYFRAME_DEBUGDATA_OFFSET);
-    assert!(PYFRAME_LASTBLOCK_OFFSET == pyre_interpreter::pyframe::PYFRAME_LASTBLOCK_OFFSET);
     assert!(
         PYFRAME_F_GENERATOR_WREF_OFFSET
             == pyre_interpreter::pyframe::PYFRAME_F_GENERATOR_WREF_OFFSET

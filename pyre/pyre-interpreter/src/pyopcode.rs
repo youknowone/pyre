@@ -60,49 +60,6 @@ pub struct SContinueLoop {
     pub jump_to: usize,
 }
 
-pub struct FrameBlock {
-    pub handlerposition: usize,
-    pub valuestackdepth: usize,
-    pub _opname: &'static str,
-}
-
-pub struct LoopBlock {
-    pub base: FrameBlock,
-}
-
-pub struct ExceptBlock {
-    pub base: FrameBlock,
-}
-
-pub struct FinallyBlock {
-    pub base: FrameBlock,
-}
-
-pub struct WithBlock {
-    pub base: FrameBlock,
-}
-
-impl FrameBlock {
-    pub fn new(
-        _frame: *mut crate::pyframe::PyFrame,
-        handlerposition: usize,
-        previous: *mut FrameBlock,
-    ) -> Self {
-        let _ = (_frame, previous);
-        Self {
-            handlerposition,
-            valuestackdepth: 0,
-            _opname: "",
-        }
-    }
-
-    pub fn cleanupstack(&self, frame: &mut crate::pyframe::PyFrame) {
-        while frame.valuestackdepth > self.valuestackdepth {
-            frame.popvalue_maybe_none();
-        }
-    }
-}
-
 #[inline]
 pub fn unaryoperation(_operationname: &str) -> PyUnaryOpHandler {
     let _ = _operationname;
@@ -1375,15 +1332,6 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     // ── Exception handling ──
-    fn setup_finally(&mut self, _handler: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("setup_finally not implemented"))
-    }
-    fn setup_except(&mut self, _handler: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("setup_except not implemented"))
-    }
-    fn pop_block(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("pop_block not implemented"))
-    }
     fn raise_varargs(&mut self, _argc: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("raise_varargs not implemented"))
     }

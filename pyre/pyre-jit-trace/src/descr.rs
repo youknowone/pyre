@@ -805,7 +805,7 @@ pub use pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
 // Appended tail registrations for PyFrame-owned auxiliary objects. These live
 // with their Rust layouts in pyre-interpreter and are re-exported here beside
 // PYFRAME_GC_TYPE_ID for the runtime registration census.
-pub use pyre_interpreter::pyframe::{FRAME_BLOCK_GC_TYPE_ID, FRAME_DEBUG_DATA_GC_TYPE_ID};
+pub use pyre_interpreter::pyframe::FRAME_DEBUG_DATA_GC_TYPE_ID;
 
 fn field_descr_from_group(group: &dyn FieldDescrGroup, index: usize) -> DescrRef {
     group
@@ -3158,15 +3158,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.debugdata",
                 crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
-                "PyFrame.lastblock",
-                crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET,
                 WORD,
                 Type::Ref,
                 false,
@@ -6235,22 +6226,22 @@ pub fn pyframe_debugdata_descr() -> DescrRef {
 }
 
 pub fn pyframe_f_generator_wref_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 5)
 }
 
 pub fn pyframe_w_yielding_from_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 7)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
 }
 
 pub fn pyframe_f_backref_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 8)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 7)
 }
 
 /// `pyframe.py PyFrame.get_builtin` — the per-frame builtin module selected
 /// when the frame is created.  IMPORT_NAME traces this ordinary field read
 /// before looking up `__import__` in the module dict.
 pub fn pyframe_w_builtin_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 9)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 8)
 }
 
 /// `PyFrame.flags` — the byte carrying `FLAG_ESCAPED`.  Read-or-written by the
@@ -6805,6 +6796,70 @@ mod tests {
             storage_array.non_moving(),
             "the mapdict custom tracer marks raw storage pointers but cannot rewrite them"
         );
+    }
+
+    /// The named `pyframe_*_descr` accessors pick their descr by position in
+    /// `PYFRAME_DESCR_GROUP`, so removing a field from the group shifts every
+    /// later position.  A stale index hands out a neighbouring field's descr:
+    /// after `lastblock` left the group, `pyframe_f_backref_descr` answered
+    /// `w_builtin`, and every JIT-built frame lost its caller chain and its
+    /// builtins.
+    #[test]
+    fn pyframe_field_descr_accessors_name_their_own_offsets() {
+        use crate::frame_layout as fl;
+        let offset = |descr: DescrRef| descr.as_field_descr().expect("PyFrame FieldDescr").offset();
+        let cases: [(&str, DescrRef, usize); 11] = [
+            (
+                "locals_cells_stack_w",
+                pyframe_locals_cells_stack_descr(),
+                fl::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+            ),
+            (
+                "valuestackdepth",
+                pyframe_stack_depth_descr(),
+                fl::PYFRAME_VALUESTACKDEPTH_OFFSET,
+            ),
+            (
+                "last_instr",
+                pyframe_next_instr_descr(),
+                fl::PYFRAME_LAST_INSTR_OFFSET,
+            ),
+            ("pycode", pyframe_code_descr(), fl::PYFRAME_PYCODE_OFFSET),
+            (
+                "debugdata",
+                pyframe_debugdata_descr(),
+                fl::PYFRAME_DEBUGDATA_OFFSET,
+            ),
+            (
+                "f_generator_wref",
+                pyframe_f_generator_wref_descr(),
+                fl::PYFRAME_F_GENERATOR_WREF_OFFSET,
+            ),
+            (
+                "w_yielding_from",
+                pyframe_w_yielding_from_descr(),
+                fl::PYFRAME_W_YIELDING_FROM_OFFSET,
+            ),
+            (
+                "f_backref",
+                pyframe_f_backref_descr(),
+                fl::PYFRAME_F_BACKREF_OFFSET,
+            ),
+            (
+                "w_builtin",
+                pyframe_w_builtin_descr(),
+                fl::PYFRAME_W_BUILTIN_OFFSET,
+            ),
+            ("flags", pyframe_flags_descr(), fl::PYFRAME_FLAGS_OFFSET),
+            (
+                "failed_attr_cleanup",
+                pyframe_failed_attr_cleanup_descr(),
+                fl::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
+            ),
+        ];
+        for (name, descr, want) in cases {
+            assert_eq!(offset(descr), want, "pyframe descr accessor for {name}");
+        }
     }
 
     #[test]

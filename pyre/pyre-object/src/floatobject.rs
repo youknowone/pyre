@@ -30,9 +30,9 @@ pub const FLOAT_FLOATVAL_OFFSET: usize = std::mem::offset_of!(W_FloatObject, flo
 /// allocation hook can reach it without a back-channel.
 pub const W_FLOAT_GC_TYPE_ID: u32 = 2;
 /// User-subclass float layout (`typedef.py` `_getusercls`). Unconditional,
-/// so its tid sits with the other closed ids (170) ahead of the
+/// so its tid sits with the other closed ids (169) ahead of the
 /// target-gated tail.
-pub const W_FLOAT_USER_GC_TYPE_ID: u32 = 170;
+pub const W_FLOAT_USER_GC_TYPE_ID: u32 = 169;
 pub const W_FLOAT_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_FloatObjectUser>();
 
 /// Fixed payload size for `W_FloatObject`, mirroring `info.fixedsize`

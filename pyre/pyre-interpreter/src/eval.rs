@@ -1349,13 +1349,6 @@ pub unsafe fn walk_pyframe_roots_area(
                     let hidden_operationerr_slot = &mut d.hidden_operationerr as *mut PyObjectRef;
                     visitor(&mut *(hidden_operationerr_slot as *mut majit_ir::GcRef));
                 }
-                if !(*frame).lastblock.is_null()
-                    && pyre_object::gc_hook::try_gc_owns_object((*frame).lastblock as *mut u8)
-                {
-                    let lastblock_slot =
-                        &mut (*frame).lastblock as *mut *mut crate::pyframe::FrameBlock;
-                    visitor(&mut *(lastblock_slot as *mut majit_ir::GcRef));
-                }
                 let live_obj = (*frame).get_w_globals();
                 // For a W_ModuleDictObject the LOAD_GLOBAL read path consults the
                 // authoritative `dstorage` cell map / `object_storage` /
@@ -1743,12 +1736,6 @@ pub fn walk_suspended_generator_frame(
             visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
             let hidden_operationerr_slot = &mut d.hidden_operationerr as *mut PyObjectRef;
             visitor(&mut *(hidden_operationerr_slot as *mut majit_ir::GcRef));
-        }
-        if !(*frame).lastblock.is_null()
-            && pyre_object::gc_hook::try_gc_owns_object((*frame).lastblock as *mut u8)
-        {
-            let lastblock_slot = &mut (*frame).lastblock as *mut *mut crate::pyframe::FrameBlock;
-            visitor(&mut *(lastblock_slot as *mut majit_ir::GcRef));
         }
     }
 }
@@ -4649,24 +4636,6 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── Exception handling ──
-
-    fn setup_finally(&mut self, handler: usize) -> Result<(), PyError> {
-        self.append_block(crate::pyframe::FrameBlock {
-            valuestackdepth: self.valuestackdepth,
-            handlerposition: handler,
-            previous: self.lastblock,
-        });
-        Ok(())
-    }
-
-    fn setup_except(&mut self, handler: usize) -> Result<(), PyError> {
-        self.setup_finally(handler)
-    }
-
-    fn pop_block(&mut self) -> Result<(), PyError> {
-        self.pop_block();
-        Ok(())
-    }
 
     fn raise_varargs(&mut self, argc: usize) -> Result<(), PyError> {
         match argc {

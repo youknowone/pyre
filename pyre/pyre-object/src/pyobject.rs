@@ -713,6 +713,7 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (99, Some(0)),
     (100, Some(0)),
     (101, Some(0)),
+    (104, Some(0)),
     (105, Some(0)),
     (106, Some(0)),
     (107, Some(0)),
@@ -757,53 +758,52 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (146, Some(0)),
     (147, Some(0)),
     (148, Some(0)),
-    (149, Some(0)),
-    (151, Some(0)),
+    (150, Some(0)),
     // `_thread` lock / RLock / handle, registered for the header `w_class`
     // edge (`all_w_class_only_descriptors`).
+    (151, Some(0)),
     (152, Some(0)),
     (153, Some(0)),
-    (154, Some(0)),
     // `__pypy__.Bufferable` is `allocate_stable` with no inline object
     // payload, so the header `w_class` is the only edge its marker forwards.
-    (155, Some(0)),
-    // `_io.BytesIO` follows the `rbigint` result pair, which holds 156 as a
+    (154, Some(0)),
+    // `_io.BytesIO` follows the `rbigint` result pair, which holds 155 as a
     // bare `with_gc_ptrs` id and is not an rclass.OBJECT type.
-    (157, Some(0)),
+    (156, Some(0)),
     // `_io.StringIO` follows `_io.BytesIO`.
-    (158, Some(0)),
+    (157, Some(0)),
     // `gc.GcRef` stores its raw referent as a traced wrapper edge.
-    (159, Some(0)),
+    (158, Some(0)),
     // `gc.hooks` keeps its three callback fields on W_AppLevelHooks.
-    (160, Some(0)),
+    (159, Some(0)),
     // `gc._get_stats()` returns a native W_GcStats with scalar-only payload.
-    (161, Some(0)),
+    (160, Some(0)),
     // The three walks over a code object.
+    (161, Some(0)),
     (162, Some(0)),
     (163, Some(0)),
-    (164, Some(0)),
     // The two `step == 1` range-iterator shapes, whose ids are explicit.
+    (164, Some(0)),
     (165, Some(0)),
-    (166, Some(0)),
-    // 167-171 are `typedef.py` `_getusercls` layouts
+    // 166-170 are `typedef.py` `_getusercls` layouts
     // (int/str/tuple/float/complex user), each an rclass subclass of the
     // builtin it was made from.
-    (167, Some(1)),
-    (168, Some(34)),
-    (169, Some(8)),
-    (170, Some(2)),
-    (171, Some(54)),
-    // Native-only type IDs 172 and 173 represent `posix.DirEntry` and
+    (166, Some(1)),
+    (167, Some(34)),
+    (168, Some(8)),
+    (169, Some(2)),
+    (170, Some(54)),
+    // Native-only type IDs 171 and 172 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (172, Some(0)),
+    (171, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (173, Some(0)),
+    (172, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (174, Some(0)),
+    (173, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1310,7 +1310,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(23, &crate::iterobject::SEQ_ITER_TYPE),
         // The producer-specific str/bytes/bytearray/memoryview/array iterator
         // identities all carry the `W_SeqIterObject` payload, so they share
-        // its GC type id the way the six dict view iterators share 115.
+        // its GC type id the way the six dict view iterators share 114.
         subclass_range_alias(23, &crate::iterobject::STR_ASCII_ITER_TYPE),
         subclass_range_alias(23, &crate::iterobject::STR_ITER_TYPE),
         subclass_range_alias(23, &crate::iterobject::BYTES_ITER_TYPE),
@@ -1320,29 +1320,29 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(24, typed::<crate::interp_itertools::W_Count>()),
         subclass_range_alias(25, typed::<crate::interp_itertools::W_Repeat>()),
         // `enumerate` W_Enumerate — auto-id `allocate_stable` registered at the
-        // tail of the JIT `register_pyre_class` chain (after W_Deque = 116).
-        subclass_range_alias(117, typed::<crate::functional::W_Enumerate>()),
+        // tail of the JIT `register_pyre_class` chain (after W_Deque = 115).
+        subclass_range_alias(116, typed::<crate::functional::W_Enumerate>()),
         // Formerly-immortal iterators converted to `allocate_stable` (managed),
         // registered at the tail of the JIT `register_pyre_class` chain in this
-        // exact order (after W_Enumerate = 117).
-        subclass_range_alias(118, typed::<crate::functional::W_Range>()),
-        subclass_range_alias(119, typed::<crate::functional::W_LongRangeIterator>()),
-        subclass_range_alias(120, typed::<crate::interp_itertools::W_TakeWhile>()),
-        subclass_range_alias(121, typed::<crate::interp_itertools::W_DropWhile>()),
-        subclass_range_alias(122, typed::<crate::interp_itertools::W_FilterFalse>()),
-        subclass_range_alias(123, typed::<crate::interp_itertools::W_Pairwise>()),
-        subclass_range_alias(124, typed::<crate::operation::_CallableIterator>()),
+        // exact order (after W_Enumerate = 116).
+        subclass_range_alias(117, typed::<crate::functional::W_Range>()),
+        subclass_range_alias(118, typed::<crate::functional::W_LongRangeIterator>()),
+        subclass_range_alias(119, typed::<crate::interp_itertools::W_TakeWhile>()),
+        subclass_range_alias(120, typed::<crate::interp_itertools::W_DropWhile>()),
+        subclass_range_alias(121, typed::<crate::interp_itertools::W_FilterFalse>()),
+        subclass_range_alias(122, typed::<crate::interp_itertools::W_Pairwise>()),
+        subclass_range_alias(123, typed::<crate::operation::_CallableIterator>()),
         // The two `step == 1` range-iterator shapes do not follow W_Range: they
         // register behind the unconditional code-object walks, the last block
         // before `build_gc`'s target-gated tail, so their ids are the same on
         // every target.
-        subclass_range_alias(165, typed::<crate::functional::W_IntRangeStepOneIterator>()),
-        subclass_range_alias(166, typed::<crate::functional::W_IntRangeOneArgIterator>()),
-        subclass_range_alias(167, &INT_USER_TYPE),
-        subclass_range_alias(168, &STR_USER_TYPE),
-        subclass_range_alias(169, &TUPLE_USER_TYPE),
-        subclass_range_alias(170, &FLOAT_USER_TYPE),
-        subclass_range_alias(171, &COMPLEX_USER_TYPE),
+        subclass_range_alias(164, typed::<crate::functional::W_IntRangeStepOneIterator>()),
+        subclass_range_alias(165, typed::<crate::functional::W_IntRangeOneArgIterator>()),
+        subclass_range_alias(166, &INT_USER_TYPE),
+        subclass_range_alias(167, &STR_USER_TYPE),
+        subclass_range_alias(168, &TUPLE_USER_TYPE),
+        subclass_range_alias(169, &FLOAT_USER_TYPE),
+        subclass_range_alias(170, &COMPLEX_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
@@ -1423,52 +1423,52 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(99, typed::<crate::interp_array::W_Array>()),
         subclass_range_alias(100, typed::<crate::interp_itertools::W_Chain>()),
         subclass_range_alias(101, typed::<crate::memoryview::W_MemoryView>()),
-        subclass_range_alias(105, typed::<crate::setobject::W_SetIterObject>()),
-        subclass_range_alias(106, typed::<crate::iterobject::W_ListIterObject>()),
-        subclass_range_alias(107, typed::<crate::iterobject::W_ListReverseIterObject>()),
-        subclass_range_alias(108, typed::<crate::iterobject::W_TupleIterObject>()),
-        subclass_range_alias(109, typed::<crate::interp_itertools::W_Compress>()),
-        subclass_range_alias(110, typed::<crate::interp_itertools::W_StarMap>()),
-        subclass_range_alias(111, typed::<crate::interp_itertools::W_Accumulate>()),
-        subclass_range_alias(112, typed::<crate::interp_itertools::W_ZipLongest>()),
-        subclass_range_alias(113, &crate::generator::COROUTINE_TYPE),
-        subclass_range_alias(114, typed::<crate::generator::CoroutineWrapper>()),
-        subclass_range_alias(115, &crate::dictmultiobject::DICT_KEYITERATOR_TYPE),
-        subclass_range_alias(115, &crate::dictmultiobject::DICT_VALUEITERATOR_TYPE),
-        subclass_range_alias(115, &crate::dictmultiobject::DICT_ITEMITERATOR_TYPE),
-        subclass_range_alias(115, &crate::dictmultiobject::DICT_REVERSEKEYITERATOR_TYPE),
-        subclass_range_alias(115, &crate::dictmultiobject::DICT_REVERSEVALUEITERATOR_TYPE),
-        subclass_range_alias(115, &crate::dictmultiobject::DICT_REVERSEITEMITERATOR_TYPE),
+        subclass_range_alias(104, typed::<crate::setobject::W_SetIterObject>()),
+        subclass_range_alias(105, typed::<crate::iterobject::W_ListIterObject>()),
+        subclass_range_alias(106, typed::<crate::iterobject::W_ListReverseIterObject>()),
+        subclass_range_alias(107, typed::<crate::iterobject::W_TupleIterObject>()),
+        subclass_range_alias(108, typed::<crate::interp_itertools::W_Compress>()),
+        subclass_range_alias(109, typed::<crate::interp_itertools::W_StarMap>()),
+        subclass_range_alias(110, typed::<crate::interp_itertools::W_Accumulate>()),
+        subclass_range_alias(111, typed::<crate::interp_itertools::W_ZipLongest>()),
+        subclass_range_alias(112, &crate::generator::COROUTINE_TYPE),
+        subclass_range_alias(113, typed::<crate::generator::CoroutineWrapper>()),
+        subclass_range_alias(114, &crate::dictmultiobject::DICT_KEYITERATOR_TYPE),
+        subclass_range_alias(114, &crate::dictmultiobject::DICT_VALUEITERATOR_TYPE),
+        subclass_range_alias(114, &crate::dictmultiobject::DICT_ITEMITERATOR_TYPE),
+        subclass_range_alias(114, &crate::dictmultiobject::DICT_REVERSEKEYITERATOR_TYPE),
+        subclass_range_alias(114, &crate::dictmultiobject::DICT_REVERSEVALUEITERATOR_TYPE),
+        subclass_range_alias(114, &crate::dictmultiobject::DICT_REVERSEITEMITERATOR_TYPE),
         // Async-generator support is appended after the interpreter-owned
         // FrameLocalsProxy (130) in build_gc: the shared generator payload
         // gets 131, followed by the three pyre_class helper awaitables.
-        subclass_range_alias(130, &crate::generator::ASYNC_GENERATOR_TYPE),
-        subclass_range_alias(131, typed::<crate::generator::AsyncGenValueWrapper>()),
-        subclass_range_alias(132, typed::<crate::generator::AsyncGenASend>()),
-        subclass_range_alias(133, typed::<crate::generator::AsyncGenAThrow>()),
+        subclass_range_alias(129, &crate::generator::ASYNC_GENERATOR_TYPE),
+        subclass_range_alias(130, typed::<crate::generator::AsyncGenValueWrapper>()),
+        subclass_range_alias(131, typed::<crate::generator::AsyncGenASend>()),
+        subclass_range_alias(132, typed::<crate::generator::AsyncGenAThrow>()),
         // W_ISlice is appended after the interpreter-owned W_Local (140) in
         // build_gc so every pre-existing Python-visible AUTO-ID stays stable.
-        subclass_range_alias(140, typed::<crate::interp_itertools::W_ISlice>()),
+        subclass_range_alias(139, typed::<crate::interp_itertools::W_ISlice>()),
         // W_Batched follows W_ISlice in the same append-only registration
         // chain.
-        subclass_range_alias(141, typed::<crate::interp_itertools::W_Batched>()),
-        subclass_range_alias(142, typed::<crate::interp_itertools::W_Product>()),
-        subclass_range_alias(143, typed::<crate::interp_itertools::W_Combinations>()),
+        subclass_range_alias(140, typed::<crate::interp_itertools::W_Batched>()),
+        subclass_range_alias(141, typed::<crate::interp_itertools::W_Product>()),
+        subclass_range_alias(142, typed::<crate::interp_itertools::W_Combinations>()),
         subclass_range_alias(
-            144,
+            143,
             typed::<crate::interp_itertools::W_CombinationsWithReplacement>(),
         ),
-        subclass_range_alias(145, typed::<crate::interp_itertools::W_Permutations>()),
-        subclass_range_alias(146, typed::<crate::interp_itertools::W_GroupBy>()),
-        subclass_range_alias(147, typed::<crate::interp_itertools::W_GroupByIterator>()),
+        subclass_range_alias(144, typed::<crate::interp_itertools::W_Permutations>()),
+        subclass_range_alias(145, typed::<crate::interp_itertools::W_GroupBy>()),
+        subclass_range_alias(146, typed::<crate::interp_itertools::W_GroupByIterator>()),
         subclass_range_alias(
-            148,
+            147,
             typed::<crate::interp_itertools::W_TeeChainedListNode>(),
         ),
-        subclass_range_alias(149, typed::<crate::interp_itertools::W_TeeIterable>()),
+        subclass_range_alias(148, typed::<crate::interp_itertools::W_TeeIterable>()),
         // `_buffer_wrapper` follows the deque's internal non-object Block
         // (151) at the append-only GC registration tail.
-        subclass_range_alias(151, typed::<crate::memoryview::W_BufferWrapper>()),
+        subclass_range_alias(150, typed::<crate::memoryview::W_BufferWrapper>()),
     ]
 }
 
