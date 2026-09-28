@@ -479,16 +479,30 @@ fn unwrap_arg(
 
     let slot = arg_slot(idx, rooted);
     let unwrap = unwrap_expr(ty, &slot, idx)?;
-    let reread = (rooted && arg_read(ty) == ArgRead::Ref).then(|| {
-        let value = if option_inner(unwrap_type_group(ty)).is_some() {
-            quote! { ::std::option::Option::Some(#slot) }
-        } else {
-            quote! { #slot }
-        };
-        quote! {
-            let #ident = if #idx < args.len() && !args[#idx].is_null() { #value } else { #ident };
+    let reread = match arg_read(ty) {
+        ArgRead::Ref if rooted => {
+            let value = if option_inner(unwrap_type_group(ty)).is_some() {
+                quote! { ::std::option::Option::Some(#slot) }
+            } else {
+                quote! { #slot }
+            };
+            Some(quote! {
+                let #ident = if #idx < args.len() && !args[#idx].is_null() { #value } else { #ident };
+            })
         }
-    });
+        // The whole slice is the native copy; rebuild it from the slots.
+        ArgRead::WholeSlice if rooted => Some(quote! {
+            let mut __pyre_live_args: ::std::vec::Vec<::pyre_object::PyObjectRef> =
+                ::std::vec::Vec::with_capacity(args.len());
+            let mut __pyre_live_i = 0usize;
+            while __pyre_live_i < args.len() {
+                __pyre_live_args.push(__pyre_arg_roots.get(__pyre_arg_base + __pyre_live_i));
+                __pyre_live_i += 1;
+            }
+            let #ident: &[::pyre_object::PyObjectRef] = &__pyre_live_args;
+        }),
+        _ => None,
+    };
     // A `&[PyObjectRef]` whole-slice parameter binds the entire `args`
     // slice — it has no per-slot index to bounds-check.  Other slice
     // element types (e.g. `&[u8]`) are positioned params indexing
@@ -2486,15 +2500,13 @@ fn expand_pyre_methods(
                 // argument slice is not itself a moving-GC root, so pin and
                 // reload it before stamping the result.
                 let __pyre_new_roots = ::pyre_object::gc_roots::push_roots();
-                let __pyre_cls_input = args.first().copied().unwrap_or(::pyre_object::PY_NULL);
-                let _ = ::pyre_object::gc_roots::pin_root(__pyre_cls_input);
-                let __pyre_cls_slot = ::pyre_object::gc_roots::shadow_stack_len() - 1;
+                let __pyre_cls_slot = __pyre_new_roots.pin_roots(&[__pyre_cls_input]);
                 let __pyre_obj: ::pyre_object::PyObjectRef = match { #body } {
                     ::std::result::Result::Ok(o) => o,
                     ::std::result::Result::Err(e) => return ::std::result::Result::Err(e),
                 };
                 if !__pyre_obj.is_null() {
-                    let __pyre_cls = ::pyre_object::gc_roots::shadow_stack_get(__pyre_cls_slot);
+                    let __pyre_cls = __pyre_new_roots.get(__pyre_cls_slot);
                     if !__pyre_cls.is_null() && unsafe { ::pyre_object::is_type(__pyre_cls) } {
                         let __pyre_static_tp = ::pyre_interpreter::typedef::gettypefor(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
@@ -2521,6 +2533,20 @@ fn expand_pyre_methods(
             body
         };
 
+        // `__new__` reads `cls` before the unwrap bracket closes: after the
+        // unwraps, `args` is stale wherever they could collect.
+        let cls_read = if is_new {
+            let cls_slot = arg_slot(0, rooted);
+            quote! {
+                let __pyre_cls_input = if args.is_empty() {
+                    ::pyre_object::PY_NULL
+                } else {
+                    #cls_slot
+                };
+            }
+        } else {
+            quote! {}
+        };
         let py_name = mname.to_string();
         let (roots_open, roots_close) = arg_roots_bracket(rooted);
         wrappers.push(quote! {
@@ -2539,6 +2565,7 @@ fn expand_pyre_methods(
                 // before borrowing the typed receiver, matching interp2app's
                 // unwrap-before-call boundary.
                 #preamble
+                #cls_read
                 #roots_close
                 #body
             }
