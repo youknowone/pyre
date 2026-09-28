@@ -18249,32 +18249,38 @@ fn groupby_step(obj: PyObjectRef) -> Result<(), PyError> {
     Ok(())
 }
 
+/// `iterobject.py` `W_FastListIterObject.descr_next`. Read the list's
+/// current length on every step so appends are observed and removals can
+/// end iteration. Exhaustion clears the source reference. A negative cursor
+/// is the `__setstate__` exhausted sentinel; it keeps the source list so an
+/// in-range `__setstate__` can revive the iterator.
+unsafe fn list_iter_descr_next(obj: PyObjectRef) -> PyResult {
+    let seq = pyre_object::w_list_iter_seq(obj);
+    if seq.is_null() {
+        return Err(PyError::stop_iteration());
+    }
+    let index = pyre_object::w_list_iter_index(obj);
+    if index < 0 {
+        return Err(PyError::stop_iteration());
+    }
+    // Scalar acquire/release (`w_list_lock` returns a guard the tracer
+    // cannot residualize). Same stripe lock `w_list_getitem` holds.
+    let lock = pyre_object::w_list_lock_acquire(seq);
+    let item = pyre_object::w_list_getitem_inner(seq, pyre_object::seq_index_to_i64(index));
+    pyre_object::w_list_lock_release(lock);
+    if let Some(item) = item {
+        pyre_object::w_list_iter_set_index(obj, index + 1);
+        return Ok(item);
+    }
+    pyre_object::w_list_iter_set_seq(obj, PY_NULL);
+    Err(PyError::stop_iteration())
+}
+
 /// `next(iterator)` — PyPy: space.next(w_iter)
 pub fn next(obj: PyObjectRef) -> PyResult {
     unsafe {
-        // iterobject.py W_FastListIterObject.descr_next — read the list's
-        // current length on every step so appends are observed and removals
-        // can end iteration. Exhaustion clears the source reference.
         if pyre_object::is_list_iter(obj) {
-            let seq = pyre_object::w_list_iter_seq(obj);
-            if seq.is_null() {
-                return Err(PyError::stop_iteration());
-            }
-            let index = pyre_object::w_list_iter_index(obj);
-            // A negative cursor is the `__setstate__` exhausted sentinel; it
-            // keeps the source list so an in-range `__setstate__` can revive
-            // the iterator, unlike running off the end.
-            if index < 0 {
-                return Err(PyError::stop_iteration());
-            }
-            if let Some(item) =
-                pyre_object::w_list_getitem(seq, pyre_object::seq_index_to_i64(index))
-            {
-                pyre_object::w_list_iter_set_index(obj, index + 1);
-                return Ok(item);
-            }
-            pyre_object::w_list_iter_set_seq(obj, PY_NULL);
-            return Err(PyError::stop_iteration());
+            return list_iter_descr_next(obj);
         }
         // iterobject.py W_ReverseSeqIterObject.descr_next. A list mutation
         // that removes the current index exhausts the iterator; growth at the

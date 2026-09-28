@@ -7908,6 +7908,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
+        // IntOrFloat (and any other list layout the hand fold declines)
+        // records `W_FastListIterObject.descr_next` by sub-walking the
+        // interpreter body. Not a spec-fold row.
+        if let Some(item_op) =
+            try_walker_orthodox_list_iter_next(ctx, op.pc, &r_args, dst, dst_bank)?
+        {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
         if let Some(inlined) = spec_gate(SpecFold::InstanceNext, || {
             try_walker_specialize_instance_next(
                 ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,

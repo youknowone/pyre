@@ -9960,6 +9960,117 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Descend `baseobjspace::list_iter_descr_next`
+/// (`iterobject.py` `W_FastListIterObject.descr_next`).
+///
+/// The graph key is the helper root registered in `prepass.rs`
+/// (`pyre_interpreter::baseobjspace::list_iter_descr_next`). The step
+/// (seq/index reads, bounds, index store) is the interpreter body. The
+/// traced index must stay a red getfield; a constant index makes the
+/// loaded element a loop constant.
+pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    _dst: usize,
+    dst_bank: char,
+) -> Result<Option<OpRef>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
+        return Ok(None);
+    }
+    let iter_op = r_args[0];
+    let Some(iter_obj) = walker_concrete_ref_object(ctx, iter_op) else {
+        return Ok(None);
+    };
+    if unsafe { !pyre_object::is_list_iter(iter_obj) } {
+        return Ok(None);
+    }
+    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::baseobjspace::list_iter_descr_next",
+    ) else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let index_before = unsafe { pyre_object::w_list_iter_index(iter_obj) };
+    let seq_before = unsafe { pyre_object::w_list_iter_seq(iter_obj) };
+    // A new consume completes the previous in-flight iteration before this
+    // step, the same mark the hand-written list FOR_ITER path takes.
+    let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
+        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
+    fbw_foriter_inflight_mark_attempt(body);
+    let iter_type_addr = &pyre_object::iterobject::LIST_ITER_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, iter_op, iter_type_addr)?;
+    ctx.trace_ctx.set_opref_concrete(
+        iter_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(iter_obj as usize)),
+    );
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "list_iter_descr_next_commit",
+        "list_iter_descr_next_call_site",
+        &[],
+        &[],
+        &[iter_op],
+        &[ConcreteValue::Ref(iter_obj)],
+        &[],
+    );
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] LIST-ITER-DESCR-NEXT pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    // `setfield_gc` into a pre-existing iterator is record-only. The helper
+    // body is the concrete `descr_next`, so the cursor has to move once here
+    // or the traced item is consumed again when the loop is closed.
+    let iter_now = walker_concrete_ref_object(ctx, iter_op).unwrap_or(iter_obj);
+    let index_after = unsafe { pyre_object::w_list_iter_index(iter_now) };
+    let seq_after = unsafe { pyre_object::w_list_iter_seq(iter_now) };
+    let cursor_unchanged = seq_after == seq_before && index_after == index_before;
+    if let Some(item) = walker_concrete_ref_object(ctx, result)
+        && !item.is_null()
+    {
+        if cursor_unchanged && !seq_before.is_null() && index_before >= 0 {
+            if ctx.trace_ctx.is_bridge_trace {
+                fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
+            }
+            unsafe { pyre_object::w_list_iter_set_index(iter_now, index_before + 1) };
+        }
+        fbw_foriter_inflight_capture(item, body, true);
+    }
+    Ok(Some(result))
+}
+
 /// Whether `callable` is the `dict.get` method object.
 ///
 /// The typedef registers the slot as
