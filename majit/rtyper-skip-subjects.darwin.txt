@@ -68,7 +68,6 @@ two-phase-never-a-subject	pyre_interpreter::argument::combine_starstarargs_wrapp
 two-phase-never-a-subject	pyre_interpreter::argument::combine_starstarargs_wrapped::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::<Impl>::jit_merge_point
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::<Impl>::release
-two-phase-never-a-subject	pyre_interpreter::baseobjspace::_check_len_result
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::_get_bases
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::_len
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::_unpackiterable_unknown_length
@@ -377,11 +376,6 @@ two-phase-never-a-subject	pyre_interpreter::importing::dunder_import
 two-phase-never-a-subject	pyre_interpreter::importing::dunder_import_inner
 two-phase-never-a-subject	pyre_interpreter::importing::dunder_import_inner::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::importing::dunder_import_w
-two-phase-never-a-subject	pyre_interpreter::importing::gcd_import_cache_probe
-two-phase-never-a-subject	pyre_interpreter::importing::gcd_import_cache_probe_after
-two-phase-never-a-subject	pyre_interpreter::importing::gcd_import_cache_probe_w
-two-phase-never-a-subject	pyre_interpreter::importing::gcd_import_fast
-two-phase-never-a-subject	pyre_interpreter::importing::gcd_import_fast_w
 two-phase-never-a-subject	pyre_interpreter::importing::get_builtin_module
 two-phase-never-a-subject	pyre_interpreter::importing::getbuiltinmodule
 two-phase-never-a-subject	pyre_interpreter::importing::mixedmodule_init
@@ -1872,6 +1866,5 @@ two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_ObjectKey
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_StrKey_PyObject_0002512fcef93ae1
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_i64_PyObject_aaa40259a54842f8
 two-phase-never-a-subject	setobject::callback_free_set_op__spec_bool_closure_ee601150793776bc
-two-phase-rtype-skipped	pyre_interpreter::builtins::split_builtin_kwargs
 two-phase-rtype-skipped	pyre_interpreter::module::__pypy__::interp_buffer::__majit_wrap___release_buffer__
 two-phase-rtype-skipped	pyre_interpreter::module::_pickle::pickler::__majit_wrap___persistent_id_default
