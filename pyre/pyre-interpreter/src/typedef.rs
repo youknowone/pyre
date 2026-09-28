@@ -29200,13 +29200,15 @@ pub(crate) fn set_method_difference(
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     let result = set_copy_real(pyre_object::gc_roots::shadow_stack_get(base));
+    let result_slot = pyre_object::gc_roots::shadow_stack_len();
     let result = pyre_object::gc_roots::pin_root(result);
     let mut update_args: Vec<pyre_object::PyObjectRef> = vec![result];
     for i in 1..args.len() {
         update_args.push(pyre_object::gc_roots::shadow_stack_get(base + i));
     }
     set_method_difference_update(&update_args)?;
-    Ok(result)
+    // The update ran Python, so the copy may have moved: answer the slot.
+    Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
 }
 
 pub(crate) fn set_method_symmetric_difference(
