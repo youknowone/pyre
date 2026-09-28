@@ -787,7 +787,8 @@ enum ValueBody {
 /// `Global` and the other const kinds). A layout scalar is the object
 /// `{"Constant": {"Value": [id, [literal, ty]]}}` and uses its own id
 /// space. An object body is otherwise a type, a trait ref (`"kind"`),
-/// or a span (`"data"`).
+/// or a span (`"data"`). A string body is a payload-free type kind,
+/// `"Never"`.
 fn classify_value_body(raw: &serde_json::value::RawValue) -> ValueBody {
     const TY_KINDS: &[&str] = &[
         "Scalar",
@@ -811,6 +812,12 @@ fn classify_value_body(raw: &serde_json::value::RawValue) -> ValueBody {
     };
     if first == b'[' {
         return ValueBody::Const;
+    }
+    if first == b'"' {
+        return match serde_json::from_str::<&str>(text) {
+            Ok(kind) if TY_KINDS.contains(&kind) => ValueBody::Ty,
+            _ => ValueBody::Other,
+        };
     }
     if first != b'{' {
         return ValueBody::Other;
@@ -937,6 +944,19 @@ mod tests {
         // string has to be tried first or this row reads as unnamed.
         let l = llbc(r#"[{"id":0,"name":"bare.rs"}]"#);
         assert_eq!(l.file_path(0), Some("bare.rs"));
+    }
+
+    #[test]
+    fn a_payload_free_type_kind_is_a_string_body() {
+        // `!` hash-conses as `{"Value": [id, "Never"]}`; a monomorphized
+        // `ControlFlow<Result<!, E>, T>` names it among its instance
+        // arguments, and an unresolved id renders that owner wrong.
+        let doc = r#"{"charon_version":"t","has_errors":false,
+            "translated":{"crate_name":"c","fun_decls":[]},
+            "pad":[{"Value":[3,"Never"]},{"Value":[4,"NotATypeKind"]}]}"#;
+        let l = Llbc::from_slice(doc.as_bytes()).expect("fixture parses");
+        assert_eq!(l.dedup_body(3), Some(&serde_json::json!("Never")));
+        assert_eq!(l.dedup_body(4), None);
     }
 
     #[test]
