@@ -11691,6 +11691,7 @@ mod tests {
             StructLayout {
                 size: 2 * word,
                 align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![StructFieldLayout {
                     name: "count".into(),
                     offset: 0,
@@ -11721,6 +11722,7 @@ mod tests {
                 StructLayout {
                     size: 32,
                     align: 8,
+                    gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                     fields: vec![
                         StructFieldLayout {
                             name: "word".into(),
@@ -11909,6 +11911,7 @@ mod tests {
             StructLayout {
                 size: 32,
                 align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![
                     StructFieldLayout {
                         name: "word".into(),
@@ -12098,6 +12101,7 @@ mod tests {
             StructLayout {
                 size: 24,
                 align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![
                     StructFieldLayout {
                         name: "cell".to_string(),
@@ -16429,6 +16433,7 @@ mod tests {
             crate::call::StructLayout {
                 size: 12,
                 align: 4,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![],
             },
         );

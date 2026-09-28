@@ -2733,6 +2733,11 @@ pub struct StructLayout {
     /// Alignment of the struct: Charon `TypeLayout.align` when the
     /// layout was registered, otherwise the max of the fields' alignments.
     pub align: usize,
+    /// `Struct._gckind` / `GcStruct._gckind`. `Gc` when the type implements
+    /// majit-gc `GcType`, or is field 0 of such a type (transitively).
+    /// `Raw` otherwise. Set when the layout is registered; readers must not
+    /// treat a missing layout as either kind.
+    pub gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
     /// Per-field layout: (field_name, offset, size, type).
     /// RPython: `symbolic.get_field_token(STRUCT, name, tsc) → (offset, size)`.
     pub fields: Vec<StructFieldLayout>,
@@ -2940,6 +2945,7 @@ impl StructLayout {
         StructLayout {
             size,
             align,
+            gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
             fields: layout_fields,
         }
     }
@@ -3427,6 +3433,15 @@ impl CallControl {
         ));
         self.struct_layouts.borrow_mut().insert(sid, layout.clone());
         Some(layout)
+    }
+
+    /// `Struct._gckind` for a type whose layout was registered.
+    /// `None` when `name` is not one analysed struct or enum.
+    pub fn declared_gckind_for(
+        &self,
+        name: &str,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::GcKind> {
+        Some(self.struct_layout_for(name)?.gckind)
     }
 
     /// Byte offset of the first item of a length-prefixed array whose length
@@ -15924,6 +15939,7 @@ mod tests {
             StructLayout {
                 size: 32,
                 align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![StructFieldLayout {
                     name: "x".to_string(),
                     offset: 16,

@@ -3012,6 +3012,162 @@ fn derive_program_metadata(
     )
 }
 
+/// Seeds and field-0 edges used to derive `Struct._gckind`.
+///
+/// A type is `Gc` when an impl of majit-gc's `GcType` names it as `Self`,
+/// or when it is field 0 (by value, transitively) of a `Gc` type. The
+/// trait is identified by the declaration's crate and name
+/// (`majit_gc` + `GcType`), not by a list of payload type names. The
+/// facts are folded into [`crate::call::StructLayout::gckind`]; they are
+/// not a lookup table.
+#[derive(Default)]
+pub(crate) struct DeclaredGcFacts {
+    seeds: Vec<majit_ir::descr::StructId>,
+    field0: Vec<(majit_ir::descr::StructId, majit_ir::descr::StructId)>,
+}
+
+impl DeclaredGcFacts {
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.seeds.extend(other.seeds);
+        self.field0.extend(other.field0);
+    }
+
+    /// `StructId`s whose declared kind is `Gc`. Every other analysed
+    /// struct or enum is `Raw`.
+    pub(crate) fn gc_struct_ids(&self) -> std::collections::HashSet<majit_ir::descr::StructId> {
+        let mut children: std::collections::HashMap<
+            majit_ir::descr::StructId,
+            Vec<majit_ir::descr::StructId>,
+        > = std::collections::HashMap::new();
+        for (owner, field0) in &self.field0 {
+            children.entry(*owner).or_default().push(*field0);
+        }
+        let mut gc = std::collections::HashSet::new();
+        let mut work = self.seeds.clone();
+        while let Some(id) = work.pop() {
+            if !gc.insert(id) {
+                continue;
+            }
+            if let Some(inner) = children.get(&id) {
+                work.extend(inner.iter().copied());
+            }
+        }
+        gc
+    }
+}
+
+fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
+    majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&td.item_meta.name_path()))
+}
+
+/// `true` when `path` is majit-gc's `GcType` declaration.
+///
+/// The crate is the first `name_path` segment and the name is the last,
+/// so `majit_gc::header::GcType` and a root re-export's
+/// `majit_gc::GcType` both match. `other_crate::GcType` does not.
+fn trait_path_is_majit_gc_gctype(path: &str) -> bool {
+    let crate_name = path.split("::").next();
+    let name = path.rsplit("::").next();
+    crate_name == Some("majit_gc") && name == Some("GcType")
+}
+
+/// By-value field 0 of a struct, when that field is itself a struct or enum.
+///
+/// A reference or raw pointer is not the inlined parent (`Struct.__init__`
+/// inlines a container only as the first field). `Ref` and `RawPtr` stay
+/// in place here; only an `Adt` node yields an id.
+fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::StructId> {
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return None;
+    };
+    let field = fields.first()?;
+    let node = strip_ty_indirections(tyref_node(&field.ty, llbc)?, llbc)?;
+    if node.get("Ref").is_some() || node.get("RawPtr").is_some() {
+        return None;
+    }
+    let inner = llbc.type_by_id(adt_node_def_id(node)?)?;
+    match &inner.kind {
+        TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_) => Some(struct_id_for_type_decl(inner)),
+        _ => None,
+    }
+}
+
+pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
+    let mut facts = DeclaredGcFacts::default();
+    for row in llbc.trait_impls_raw() {
+        let Some(impl_trait) = row.get("impl_trait") else {
+            continue;
+        };
+        let Some(trait_id) = impl_trait.get("id").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(decl) = llbc.trait_by_id(trait_id) else {
+            continue;
+        };
+        if !trait_path_is_majit_gc_gctype(&decl.item_meta.name_path()) {
+            continue;
+        }
+        let Some(self_ty) = impl_trait
+            .get("generics")
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+        else {
+            continue;
+        };
+        let Some(def_id) = resolve_tyexpr_to_adt_def_id_free(llbc, self_ty) else {
+            continue;
+        };
+        let Some(td) = llbc.type_by_id(def_id) else {
+            continue;
+        };
+        facts.seeds.push(struct_id_for_type_decl(td));
+    }
+    for td in llbc.iter_type_decls() {
+        if type_decl_is_builtin_adt(td) {
+            continue;
+        }
+        let Some(field0) = struct_field0_type_id(llbc, td) else {
+            continue;
+        };
+        facts.field0.push((struct_id_for_type_decl(td), field0));
+    }
+    facts
+}
+
+/// Declared `GcKind` of every struct and enum in `llbcs`, keyed by the
+/// crate-stripped type path. `Gc` follows [`DeclaredGcFacts::gc_struct_ids`];
+/// every other analysed struct or enum is `Raw`.
+pub(crate) fn declared_gckind_by_name(
+    llbcs: &[Llbc],
+) -> std::collections::HashMap<String, crate::translator::rtyper::lltypesystem::lltype::GcKind> {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    let mut facts = DeclaredGcFacts::default();
+    for llbc in llbcs {
+        facts.absorb(harvest_declared_gc_facts(llbc));
+    }
+    let gc = facts.gc_struct_ids();
+    let mut out = std::collections::HashMap::new();
+    for llbc in llbcs {
+        for td in llbc.iter_type_decls() {
+            if type_decl_is_builtin_adt(td) {
+                continue;
+            }
+            if !matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
+                continue;
+            }
+            let canon = strip_crate_prefix(&td.item_meta.name_path());
+            let kind = if gc.contains(&struct_id_for_type_decl(td)) {
+                GcKind::Gc
+            } else {
+                GcKind::Raw
+            };
+            out.insert(canon, kind);
+        }
+    }
+    out
+}
+
 /// Per-LLBC fragment of the duplicate-leaf verdict. The streaming frontend
 /// discovers one of these per artefact (the same pre-link shape as
 /// [`discover_foldable_const_lits`]), merges them, and only then lowers.
@@ -63785,5 +63941,78 @@ mod tests {
             "global_kind": "Static",
             "ty": u32_ty()
         })
+    }
+
+    /// `Gc` from a majit-gc `GcType` impl, from field 0 of that type
+    /// (and that field's own field 0), and `Raw` for a type with no impl
+    /// and for an impl of another crate's trait that is also named `GcType`.
+    #[test]
+    fn declared_gckind_follows_gctype_impl_and_field0_parent() {
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let meta = |segs: &[&str]| {
+            serde_json::json!({
+                "name": segs.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let adt = |id: u64| {
+            serde_json::json!({
+                "Value": [id, {"Adt": {"id": id, "generics": {
+                    "regions": [], "types": [], "const_generics": [], "trait_refs": []
+                }}}]
+            })
+        };
+        let struct_decl = |def_id: u64, segs: &[&str], field0: Option<u64>| {
+            let fields: Vec<serde_json::Value> = field0
+                .into_iter()
+                .map(|id| serde_json::json!({"name": "head", "ty": adt(id)}))
+                .collect();
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": meta(segs),
+                "kind": {"Struct": fields}
+            })
+        };
+        let trait_decl = |def_id: u64, segs: &[&str]| serde_json::json!({"def_id": def_id, "item_meta": meta(segs)});
+        let impl_row = |trait_id: u64, self_id: u64| {
+            serde_json::json!({
+                "impl_trait": {"id": trait_id, "generics": {"types": [adt(self_id)]}}
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    struct_decl(0, &["fixture", "ByImpl"], Some(1)),
+                    struct_decl(1, &["fixture", "Parent"], Some(2)),
+                    struct_decl(2, &["fixture", "Inner"], None),
+                    struct_decl(3, &["fixture", "RawOne"], None),
+                    struct_decl(4, &["fixture", "Foreign"], None),
+                ],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [
+                    trait_decl(0, &["majit_gc", "header", "GcType"]),
+                    trait_decl(1, &["other_crate", "GcType"]),
+                ],
+                "trait_impls": [impl_row(0, 0), impl_row(1, 4)]
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("fixture Llbc parses");
+        let kinds = super::declared_gckind_by_name(std::slice::from_ref(&llbc));
+        assert_eq!(kinds.get("ByImpl"), Some(&GcKind::Gc));
+        assert_eq!(kinds.get("Parent"), Some(&GcKind::Gc));
+        assert_eq!(kinds.get("Inner"), Some(&GcKind::Gc));
+        assert_eq!(kinds.get("RawOne"), Some(&GcKind::Raw));
+        assert_eq!(kinds.get("Foreign"), Some(&GcKind::Raw));
     }
 }

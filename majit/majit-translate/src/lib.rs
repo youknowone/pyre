@@ -207,7 +207,10 @@ fn build_semantic_program_via_active_frontend(
     funcobj_declarations: &call::FuncObjDeclarations,
     lowering_skips: &front::mir::LoweringSkips,
     prof: &mut PhaseProfiler,
-) -> front::SemanticProgram {
+) -> (
+    front::SemanticProgram,
+    std::collections::HashSet<majit_ir::descr::StructId>,
+) {
     #[cfg(feature = "mir-frontend")]
     {
         // Accept an OS path-list so a consumer can pass its LLBC set in one
@@ -308,9 +311,11 @@ fn build_semantic_program_via_active_frontend(
             let mut seen_function_keys = std::collections::HashSet::new();
             let mut seen_struct_names = std::collections::HashSet::new();
             let mut seen_trait_names = std::collections::HashSet::new();
+            let mut declared_gc = front::mir::DeclaredGcFacts::default();
             for (ord, p) in paths.iter().enumerate() {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                declared_gc.absorb(front::mir::harvest_declared_gc_facts(&llbc));
                 if !eval_hook_graphs.is_empty() {
                     llbc.set_eval_hook_graphs(eval_hook_graphs.clone());
                 }
@@ -372,7 +377,7 @@ fn build_semantic_program_via_active_frontend(
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
-            return program;
+            return (program, declared_gc.gc_struct_ids());
         }
     }
     let _ = module_paths; // silence unused warning when the feature is off
@@ -1100,7 +1105,7 @@ fn analyze_pipeline_from_module_paths(
     crate::virtualizable_decl::register_virtualizable_declarations(
         crate::virtualizable_decl::declarations_from_config(&config.pipeline.transform),
     );
-    let mut program = build_semantic_program_via_active_frontend(
+    let (mut program, declared_gc) = build_semantic_program_via_active_frontend(
         module_paths,
         static_addrs,
         &config.pipeline.transform.jitdriver_receiver_roots,
@@ -1610,7 +1615,12 @@ fn analyze_pipeline_from_module_paths(
             }
             None => provider.get_struct_layout(struct_name),
         };
-        if let Some(layout) = layout {
+        if let Some(mut layout) = layout {
+            layout.gckind = if declared_gc.contains(&sid) {
+                crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+            } else {
+                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+            };
             if census_struct_layouts {
                 let variants = struct_layout_variants.entry(sid).or_default();
                 if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
