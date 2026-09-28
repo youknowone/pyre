@@ -5895,7 +5895,7 @@ struct Lowering<'a> {
     /// dropped under an initialisation flag the artefact does not carry, so
     /// its bracket is left open rather than closed on a path that may not own
     /// it (see [`moved_out_locals`]).
-    root_scope_moved_locals: bit_set::BitSet,
+    root_scope_moved_locals: MovedOutLocals<'a>,
     /// Root brackets this body keeps out of its jitcode entirely
     /// (see [`RootBracketPlan`]).
     root_bracket: RootBracketPlan,
@@ -6418,7 +6418,7 @@ impl<'a> Lowering<'a> {
         // guard reaches no drop block's inputargs and the close has no place
         // to name.  `glue_call_drops` is the same fact for the `drop_in_place`
         // spelling #1689 already keeps live.
-        let root_scope_moved_locals = moved_out_locals(body);
+        let root_scope_moved_locals = MovedOutLocals::new(body);
         let root_bracket = analyze_root_brackets(body, llbc, &root_scope_moved_locals, root_stack);
         if extra_live.len() < body.body.len() {
             extra_live.resize(body.body.len(), Vec::new());
@@ -29414,7 +29414,7 @@ fn owned_root_scopes(
     name_of: &impl Fn(&RegularCall) -> Option<String>,
     returns_owned_scope: &impl Fn(&RegularCall) -> bool,
 ) -> OwnedRootScopes {
-    let moved = moved_out_locals(body);
+    let moved = MovedOutLocals::new(body);
     let mut opener = std::collections::HashMap::new();
     let mut twice = bit_set::BitSet::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -30080,7 +30080,7 @@ pub fn harvest_root_stack_touching_paths(llbc: &Llbc) -> Vec<String> {
 fn analyze_root_brackets(
     body: &Unstructured,
     llbc: &Llbc,
-    moved: &bit_set::BitSet,
+    moved: &MovedOutLocals<'_>,
     root_stack: &RootStackAnalyzer<'_>,
 ) -> RootBracketPlan {
     analyze_root_brackets_with(
@@ -30099,7 +30099,7 @@ fn analyze_root_brackets(
 /// close.  A test that counts closes needs this to tell that case from a close
 /// the lowering dropped on the floor.
 pub fn erased_root_bracket_guards(llbc: &Llbc, body: &Unstructured) -> Vec<usize> {
-    let moved = moved_out_locals(body);
+    let moved = MovedOutLocals::new(body);
     let root_stack = RootStackAnalyzer::new(llbc);
     analyze_root_brackets(body, llbc, &moved, &root_stack)
         .scopes
@@ -30113,7 +30113,7 @@ pub fn erased_root_bracket_guards(llbc: &Llbc, body: &Unstructured) -> Vec<usize
 fn analyze_root_brackets_with(
     llbc: &Llbc,
     body: &Unstructured,
-    moved: &bit_set::BitSet,
+    moved: &MovedOutLocals<'_>,
     name_of: impl Fn(&RegularCall) -> Option<String>,
     touches: impl Fn(&RegularCall) -> bool,
 ) -> RootBracketPlan {
@@ -31560,6 +31560,38 @@ fn local_move_counts(body: &Unstructured) -> std::collections::HashMap<usize, us
     out
 }
 
+/// [`moved_out_locals`] of one body, computed on the first query.  Only a
+/// body with a root-bracket guard asks, so the others never walk their
+/// operands for it.
+struct MovedOutLocals<'b> {
+    body: &'b Unstructured,
+    set: std::cell::OnceCell<bit_set::BitSet>,
+}
+
+impl<'b> MovedOutLocals<'b> {
+    fn new(body: &'b Unstructured) -> Self {
+        Self {
+            body,
+            set: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// A fixed answer for `body`, so a test can state the move set.
+    #[cfg(test)]
+    fn with_set(body: &'b Unstructured, set: bit_set::BitSet) -> Self {
+        Self {
+            body,
+            set: std::cell::OnceCell::from(set),
+        }
+    }
+
+    fn contains(&self, local: usize) -> bool {
+        self.set
+            .get_or_init(|| moved_out_locals(self.body))
+            .contains(local)
+    }
+}
+
 /// `(block, local)` for every drop of a root-bracket guard whose close this
 /// pass can emit — the guard's local, in the block that drops it.
 ///
@@ -31567,26 +31599,23 @@ fn local_move_counts(body: &Unstructured) -> std::collections::HashMap<usize, us
 fn root_scope_drop_sites(
     body: &Unstructured,
     llbc: &Llbc,
-    moved: &bit_set::BitSet,
+    moved: &MovedOutLocals<'_>,
 ) -> Vec<(usize, usize)> {
     let mut sites = Vec::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
-        let Ok(TermKind::Drop { place, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Drop { place, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let PlaceKind::Local(local) = place.kind else {
             continue;
         };
-        if moved.contains(local as usize) {
-            continue;
-        }
         let Some(def_id) = output_adt_def_id_free(&place.ty, llbc) else {
             continue;
         };
         let Some(decl) = llbc.type_by_id(def_id) else {
             continue;
         };
-        if gc_root_scope_type_path(&decl.item_meta.name_path()) {
+        if gc_root_scope_type_path(&decl.item_meta.name_path()) && !moved.contains(local as usize) {
             sites.push((bb_idx, local as usize));
         }
     }
@@ -56103,7 +56132,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &paired,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&paired, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56127,7 +56156,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &fake_read,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&fake_read, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56153,7 +56182,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &free_pin,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&free_pin, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56171,7 +56200,7 @@ mod tests {
             let plan = super::analyze_root_brackets_with(
                 &fixture_llbc(),
                 &foreign,
-                &bit_set::BitSet::new(),
+                &super::MovedOutLocals::with_set(&foreign, bit_set::BitSet::new()),
                 name_of,
                 touches,
             );
@@ -56192,7 +56221,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &balanced,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&balanced, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56226,7 +56255,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &through_copy,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&through_copy, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56248,7 +56277,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &reassigned,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&reassigned, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56274,7 +56303,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &repeated,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&repeated, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56322,7 +56351,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &nested,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&nested, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56337,7 +56366,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &unpaired,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&unpaired, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56351,7 +56380,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &escaped,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&escaped, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56744,7 +56773,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &two_pins,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&two_pins, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56779,7 +56808,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &unwinding,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&unwinding, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56797,7 +56826,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &one_pin,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&one_pin, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56816,7 +56845,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &maybe_pinned,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&maybe_pinned, bit_set::BitSet::new()),
             name_of,
             touches,
         );
@@ -56830,7 +56859,7 @@ mod tests {
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
             &two_pins,
-            &bit_set::BitSet::new(),
+            &super::MovedOutLocals::with_set(&two_pins, bit_set::BitSet::new()),
             name_of,
             |reg: &RegularCall| matches!(&reg.kind, CallKind::Fun(FunId::Regular { id: 5 })),
         );
@@ -56988,10 +57017,11 @@ mod tests {
         let name_of = |reg: &RegularCall| super::regular_call_name_path(reg, &llbc);
         let touches = |reg: &RegularCall| analyzer.regular_call_touches_root_stack(reg);
         for callee in [5, 6, 7] {
+            let body = spanning(callee);
             let plan = super::analyze_root_brackets_with(
                 &fixture_llbc(),
-                &spanning(callee),
-                &bit_set::BitSet::new(),
+                &body,
+                &super::MovedOutLocals::with_set(&body, bit_set::BitSet::new()),
                 name_of,
                 touches,
             );
@@ -57000,10 +57030,11 @@ mod tests {
                 "a bracket around free-pin callee {callee} must stay"
             );
         }
+        let body = spanning(8);
         let plan = super::analyze_root_brackets_with(
             &fixture_llbc(),
-            &spanning(8),
-            &bit_set::BitSet::new(),
+            &body,
+            &super::MovedOutLocals::with_set(&body, bit_set::BitSet::new()),
             name_of,
             touches,
         );
