@@ -856,24 +856,32 @@ impl Lock {
     /// is free and take it; otherwise take it only if it is free right now.
     /// Returns whether the lock is now held by the caller.
     pub fn acquire(&self, flag: bool) -> bool {
-        // `rthread.acquire_timed(..., intr_flag=1)` enters the external-call
-        // aroundstate before a potentially blocking native lock wait.  In
-        // free-threaded pyre that transition removes this mutator from the GC
-        // RUNNING census; otherwise an import-lock waiter can prevent an STW
-        // collector from completing while the lock owner is parked by that
-        // same STW.  The non-blocking form must remain a poll and needs no
-        // transition.
-        let _blocked = flag.then(crate::module::thread::before_external_block);
         let mut acquired = self.acquired.lock();
-        if !flag {
-            if *acquired {
+        while *acquired {
+            if !flag {
                 return false;
             }
-            *acquired = true;
-            return true;
-        }
-        while *acquired {
-            self.released.wait(&mut acquired);
+            drop(acquired);
+            // `rthread.acquire_timed(..., intr_flag=1)` enters the
+            // external-call aroundstate before a potentially blocking native
+            // lock wait.  In free-threaded pyre that transition removes this
+            // mutator from the GC RUNNING census; otherwise an import-lock
+            // waiter can prevent an STW collector from completing while the
+            // lock owner is parked by that same STW.
+            //
+            // The lock is claimed only after the aroundstate is left again.
+            // Leaving it is where a non-finalizing thread parks once teardown
+            // has begun (`park_if_finalizing`), and a thread parked there must
+            // not own the lock: the finalizing thread still takes the import
+            // lock and the buffered-stream locks.
+            {
+                let _blocked = crate::module::thread::before_external_block();
+                let mut waiting = self.acquired.lock();
+                while *waiting {
+                    self.released.wait(&mut waiting);
+                }
+            }
+            acquired = self.acquired.lock();
         }
         *acquired = true;
         true
@@ -889,7 +897,9 @@ impl Lock {
         let mut acquired = self.acquired.lock();
         assert!(*acquired, "the lock was not previously acquired");
         *acquired = false;
-        self.released.notify_one();
+        // Every waiter, because a woken one claims the lock only after
+        // leaving the external-call state, and may park instead of claiming.
+        self.released.notify_all();
     }
 }
 
