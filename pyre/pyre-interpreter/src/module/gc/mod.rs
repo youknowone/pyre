@@ -57,6 +57,16 @@ crate::py_module! {
             interp_gc::collect_step()
         }
 
+        fn enable_finalizers() -> Result<PyObjectRef, crate::PyError> {
+            interp_gc::enable_finalizers()?;
+            Ok(w_none())
+        }
+
+        fn disable_finalizers() -> Result<PyObjectRef, crate::PyError> {
+            interp_gc::disable_finalizers();
+            Ok(w_none())
+        }
+
         fn get_objects(
             #[default(w_none())] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
@@ -81,8 +91,6 @@ crate::py_module! {
         }
     },
     functions: {
-        "disable_finalizers"   / 0 = interp_gc::disable_finalizers,
-        "enable_finalizers"    / 0 = interp_gc::enable_finalizers,
         "disable"              / 0 = interp_gc::disable,
         "enable"               / 0 = interp_gc::enable,
         "isenabled"            / 0 = interp_gc::isenabled,

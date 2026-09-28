@@ -88,7 +88,7 @@ pub(super) fn is_done_states(oldstate: u8, newstate: u8) -> bool {
 /// observe `false` and start a major step.
 ///
 /// The USERDEL drain is the deliberate exception, and matches
-/// `StepCollector.do`: the flag stays set until `run_finalizers_now` returns,
+/// `StepCollector.do`: the flag stays set until `_run_finalizers` returns,
 /// so app-level `__del__` code can yield the GIL or re-enter `collect_step`.
 /// Both are safe because a queue entry is popped before its callback runs
 /// (`_run_finalizers` takes `next_dead()` first, and the collector's
@@ -105,36 +105,6 @@ fn user_del_action() -> Option<&'static mut crate::executioncontext::UserDelActi
         None
     } else {
         Some(unsafe { &mut *action })
-    }
-}
-
-fn unlock_finalizers(action: &mut crate::executioncontext::UserDelAction) {
-    if action.finalizers_lock_count == 0 {
-        return;
-    }
-    action.finalizers_lock_count -= 1;
-    if action.finalizers_lock_count == 0
-        && let Some(pending) = action.pending_with_disabled_del.take()
-    {
-        // The list just left its GC-visible UserDelAction slot; keep every
-        // entry rooted while the finalizers run (upstream clears the
-        // GC-visible list as it progresses, interp_gc.py:80-84).
-        let _roots = pyre_object::gc_roots::push_roots();
-        for &obj in pending.iter() {
-            let _ = pyre_object::gc_roots::pin_root(obj);
-        }
-        let root_end = pyre_object::gc_roots::shadow_stack_len();
-        let root_base = root_end - pending.len();
-        for index in 0..pending.len() {
-            action._call_finalizer(pyre_object::gc_roots::shadow_stack_get(root_base + index));
-        }
-    }
-}
-
-fn lock_finalizers(action: &mut crate::executioncontext::UserDelAction) {
-    action.finalizers_lock_count += 1;
-    if action.pending_with_disabled_del.is_none() {
-        action.pending_with_disabled_del = Some(Vec::new());
     }
 }
 
@@ -164,22 +134,37 @@ fn run_cpyext_deallocs_now() {}
 
 /// `interp_gc.py _run_finalizers`: run the queued finalizers now, re-enabling
 /// them for the duration when the app level disabled them.
+pub(super) fn _run_finalizers() -> Result<(), crate::PyError> {
+    let Some(uda) = user_del_action() else {
+        return Ok(());
+    };
+    let temp_reenable = !uda.enabled_at_app_level;
+    if temp_reenable {
+        enable_finalizers()?;
+    }
+    if let Some(uda) = user_del_action() {
+        uda._run_finalizers();
+    }
+    if temp_reenable {
+        disable_finalizers();
+    }
+    Ok(())
+}
+
+/// `_run_finalizers` for interpreter code outside this module.
 // Its work is `UserDelAction._run_finalizers`, which carries
 // `@jit.dont_look_inside` (executioncontext.py). The bracket around it reads
 // the space's `UserDelAction` through a process-global cell, runtime state the
 // translated trace cannot read, so the whole drain stays one residual call,
-// as for `executioncontext::may_ignore_finalizer`.
+// as for `executioncontext::may_ignore_finalizer`. A residual call has no
+// error channel, so when an app-level `enable_finalizers` already released
+// the lock `gc.disable` took, the queue drains under the lock depth it finds.
 #[majit_macros::dont_look_inside]
 pub(crate) fn run_finalizers_now() {
-    if let Some(action) = user_del_action() {
-        let temp_reenable = !action.enabled_at_app_level;
-        if temp_reenable {
-            unlock_finalizers(action);
-        }
-        action._run_finalizers();
-        if temp_reenable {
-            lock_finalizers(action);
-        }
+    if _run_finalizers().is_err()
+        && let Some(uda) = user_del_action()
+    {
+        uda._run_finalizers();
     }
 }
 
@@ -203,7 +188,7 @@ pub(super) fn collect(generation: PyObjectRef) -> Result<PyObjectRef, crate::PyE
     crate::baseobjspace::clear_method_cache();
     crate::objspace::std::mapdict::clear_map_attr_cache();
     pyre_object::gc_hook::try_gc_collect(generation);
-    run_finalizers_now();
+    _run_finalizers()?;
     run_cpyext_deallocs_now();
     // The return value is the caller-observable axis and is an int.
     // A collector that never counts unreachable objects has no count
@@ -218,7 +203,7 @@ pub(super) fn collect_step() -> Result<PyObjectRef, crate::PyError> {
     // is a virtual fifth state after the collector has returned to
     // SCANNING.
     if STEP_FINALIZING.load(Ordering::Acquire) {
-        run_finalizers_now();
+        _run_finalizers()?;
         STEP_FINALIZING.store(false, Ordering::Release);
         return new_collect_step_stats(STATE_USERDEL, STATE_SCANNING, true);
     }
@@ -235,11 +220,11 @@ pub(super) fn collect_step() -> Result<PyObjectRef, crate::PyError> {
 pub(super) fn enable(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     pyre_object::gc_hook::try_gc_set_enabled(true);
     GC_ENABLED.store(true, Ordering::Relaxed);
-    if let Some(action) = user_del_action()
-        && !action.enabled_at_app_level
+    if let Some(uda) = user_del_action()
+        && !uda.enabled_at_app_level
     {
-        action.enabled_at_app_level = true;
-        unlock_finalizers(action);
+        uda.enabled_at_app_level = true;
+        enable_finalizers()?;
     }
     Ok(w_none())
 }
@@ -248,11 +233,11 @@ pub(super) fn enable(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 pub(super) fn disable(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     pyre_object::gc_hook::try_gc_set_enabled(false);
     GC_ENABLED.store(false, Ordering::Relaxed);
-    if let Some(action) = user_del_action()
-        && action.enabled_at_app_level
+    if let Some(uda) = user_del_action()
+        && uda.enabled_at_app_level
     {
-        action.enabled_at_app_level = false;
-        lock_finalizers(action);
+        uda.enabled_at_app_level = false;
+        disable_finalizers();
     }
     Ok(w_none())
 }
@@ -267,34 +252,44 @@ pub(super) fn isenabled(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 }
 
 /// `interp_gc.py enable_finalizers`.
-pub(super) fn enable_finalizers(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `interp_gc.py`: unlike gc.enable(), an unmatched public
-    // enable is an error rather than a no-op.
-    let Some(action) = user_del_action() else {
-        // Before UserDelAction is installed there cannot have been a
-        // matching disable. Treat that as the same zero lock depth,
-        // not as a bootstrap-only silent success.
+pub(super) fn enable_finalizers() -> Result<(), crate::PyError> {
+    // Unlike gc.enable(), an unmatched enable is an error rather than a
+    // no-op. Before UserDelAction is installed there cannot have been a
+    // matching disable, so that is the same zero lock depth.
+    let Some(uda) = user_del_action().filter(|uda| uda.finalizers_lock_count > 0) else {
         return Err(crate::PyError::value_error(
             "finalizers are already enabled",
         ));
     };
-    if action.finalizers_lock_count == 0 {
-        return Err(crate::PyError::value_error(
-            "finalizers are already enabled",
-        ));
+    uda.finalizers_lock_count -= 1;
+    if uda.finalizers_lock_count == 0
+        && let Some(pending) = uda.pending_with_disabled_del.take()
+    {
+        // The list just left its GC-visible UserDelAction slot; keep every
+        // entry rooted while the finalizers run (upstream clears the
+        // GC-visible list as it progresses).
+        let _roots = pyre_object::gc_roots::push_roots();
+        for &obj in pending.iter() {
+            let _ = pyre_object::gc_roots::pin_root(obj);
+        }
+        let root_end = pyre_object::gc_roots::shadow_stack_len();
+        let root_base = root_end - pending.len();
+        for index in 0..pending.len() {
+            uda._call_finalizer(pyre_object::gc_roots::shadow_stack_get(root_base + index));
+        }
     }
-    unlock_finalizers(action);
-    Ok(w_none())
+    Ok(())
 }
 
 /// `interp_gc.py disable_finalizers`.
-pub(super) fn disable_finalizers(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `interp_gc.py disable_finalizers`: this lock is recursive and deliberately
-    // independent of gc.isenabled().
-    if let Some(action) = user_del_action() {
-        lock_finalizers(action);
+pub(super) fn disable_finalizers() {
+    // The lock is recursive and deliberately independent of gc.isenabled().
+    if let Some(uda) = user_del_action() {
+        uda.finalizers_lock_count += 1;
+        if uda.pending_with_disabled_del.is_none() {
+            uda.pending_with_disabled_del = Some(Vec::new());
+        }
     }
-    Ok(w_none())
 }
 
 // `set_threshold(threshold0, threshold1=None, threshold2=None)` — the
