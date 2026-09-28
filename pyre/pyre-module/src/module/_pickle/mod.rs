@@ -30,6 +30,11 @@ pub use pickler::{PicklerMemoProxy, W_Pickler};
 pub use unpickler::{UnpicklerMemoProxy, W_Unpickler};
 
 pub(crate) const HIGHEST_PROTOCOL: i64 = 5;
+// [3.14-spec] 5, where `interp_pickle.py DEFAULT_PROTOCOL` is 4. The protocol a
+// `Pickler` picks when the caller passes none is observable in the stream it
+// writes, and the pinned stdlib's `pickle.DEFAULT_PROTOCOL` is 5
+// (`lib-python/3/pickle.py`); a real `pypy3` reports 4. No JIT hint reads this
+// constant -- `interp_pickle.py` carries one only on `W_Pickler.write_binfloat`.
 pub(crate) const DEFAULT_PROTOCOL: i64 = 5;
 pub(crate) const FRAME_SIZE_MIN: usize = 4;
 pub(crate) const FRAME_SIZE_TARGET: usize = 64 * 1024;
