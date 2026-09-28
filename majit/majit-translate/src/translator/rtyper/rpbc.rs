@@ -34,6 +34,7 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::model::{
     BlockId, CallTarget, FunctionGraph as JitFunctionGraph, OpKind, SpaceOperation, ValueType,
 };
+use crate::parse::CallPath;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, DelayedPointer, FuncType, MallocFlavor, Ptr as LLPtr, PtrTarget, Struct,
@@ -333,13 +334,44 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
     lower_indirect_calls_with(graph, call_control, true);
 }
 
+/// What [`lower_indirect_calls_with`] reads to fill an indirect call's
+/// `c_graphs` row: the call family of each `(trait_root, method_name)`, the
+/// builtin-wrapper family, and the result type the family declares.
+pub(crate) trait IndirectCallFamilies {
+    fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath>;
+    fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath];
+    fn declared_result_type_for_indirect(
+        &self,
+        trait_root: &str,
+        method_name: &str,
+    ) -> Option<majit_ir::value::Type>;
+}
+
+impl IndirectCallFamilies for CallControl {
+    fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath> {
+        CallControl::all_impls_for_indirect(self, trait_root, method_name)
+    }
+
+    fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath] {
+        CallControl::builtin_wrapper_indirect_graphs(self)
+    }
+
+    fn declared_result_type_for_indirect(
+        &self,
+        trait_root: &str,
+        method_name: &str,
+    ) -> Option<majit_ir::value::Type> {
+        CallControl::declared_result_type_for_indirect(self, trait_root, method_name)
+    }
+}
+
 /// Same as [`lower_indirect_calls`]. `collapse_unresolved` rewrites an
 /// empty lookup to the unknown family (`graphs: None`). The in-place pass
 /// passes `false` and leaves that marker: the one empty family it still
 /// sees is not registered on any translated graph.
 pub(crate) fn lower_indirect_calls_with(
     graph: &mut JitFunctionGraph,
-    call_control: &CallControl,
+    call_control: &dyn IndirectCallFamilies,
     collapse_unresolved: bool,
 ) {
     // Generated gateway wrappers enter the MIR graph as a plain function-

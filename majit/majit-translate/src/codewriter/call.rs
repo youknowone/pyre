@@ -973,6 +973,11 @@ type GraphKey = (Option<String>, String);
 pub(crate) struct GraphStore {
     path_to_key: HashMap<CallPath, GraphKey>,
     graphs: HashMap<GraphKey, GraphSlot>,
+    /// Whole-store rewrites that have run, in order, with the inputs each
+    /// read. A slot built after a rewrite ran gets it when it is built, the
+    /// way `rtyper.py specialize_more_blocks` hands the graphs that appear
+    /// after a pass to that pass on arrival.
+    passes: Vec<StorePass>,
 }
 
 /// One source funcobj's stored graph plus the metadata derived from it at
@@ -984,16 +989,73 @@ pub(crate) struct GraphStore {
 /// callee's signature off the *code object* and never walks the built
 /// graph.  Pyre's lifted callees carry no `PyGraph` wrapper, so the
 /// signature is recovered from the startblock's `Input` ops
-/// ([`crate::model::FunctionGraph::value_name_for`]) — but once, here,
-/// while the body is in hand, rather than on every registry consumer.
+/// ([`crate::model::FunctionGraph::value_name_for`]) once, when the graph
+/// is built, rather than on every registry consumer.
 ///
-/// `graph` is shared with the call registry's pending lift of this body
-/// (`FunctionDesc::source_graph`), the body a funcobj's graph is built from
-/// on demand. A write while a pending lift still holds it copies the graph,
-/// so the lift reads the body as it was registered.
+/// `graph` is built on first demand from `build`
+/// (`description.py FunctionDesc.cachedgraph`); a build that produces no
+/// graph leaves the funcobj unregistered. Once built, the graph is shared
+/// with the call registry's pending lift of this body
+/// (`FunctionDesc::source_graph`). A write while a pending lift still holds
+/// it copies the graph, so the lift reads the body as it was registered.
 struct GraphSlot {
+    graph: std::cell::OnceCell<Option<BuiltGraph>>,
+    build: std::cell::Cell<Option<DeferredGraph>>,
+    /// Number of store passes that had run when the funcobj was
+    /// registered: its build catches up on the ones after.
+    since: usize,
+    /// Set while `build` runs, so the slot reads as absent to the store
+    /// passes the build catches up on, as it does while a whole-store pass
+    /// has taken it out of the store.
+    building: std::cell::Cell<bool>,
+}
+
+struct BuiltGraph {
     graph: std::rc::Rc<FunctionGraph>,
     signature: Signature,
+}
+
+/// The body of a funcobj whose graph has not been built yet.
+pub(crate) type DeferredGraph = Box<dyn FnOnce() -> Option<FunctionGraph>>;
+
+/// A whole-store rewrite [`GraphStore::run_pass`] ran, with the inputs it
+/// read at that point.
+#[derive(Clone)]
+enum StorePass {
+    /// [`CallControl::materialize_deferred_indirect_families`].
+    MaterializeIndirectFamilies(std::rc::Rc<TraitMethodImpls>),
+    /// [`CallControl::lower_registered_indirect_calls`].
+    LowerIndirectCalls {
+        trait_method_impls: std::rc::Rc<TraitMethodImpls>,
+        builtin_wrappers: std::rc::Rc<[CallPath]>,
+    },
+    /// [`CallControl::replace_force_virtualizable_with_call`].
+    ReplaceForceVirtualizable,
+}
+
+/// `(trait_root, method_name) -> impl owner roots`.
+type TraitMethodImpls = HashMap<(String, String), Vec<String>>;
+
+impl GraphSlot {
+    fn built(graph: std::rc::Rc<FunctionGraph>) -> Self {
+        let signature = GraphStore::signature_from_graph(&graph);
+        Self {
+            graph: std::cell::OnceCell::from(Some(BuiltGraph { graph, signature })),
+            build: std::cell::Cell::new(None),
+            since: 0,
+            building: std::cell::Cell::new(false),
+        }
+    }
+
+    #[cfg(test)]
+    fn deferred(build: DeferredGraph, since: usize) -> Self {
+        Self {
+            graph: std::cell::OnceCell::new(),
+            build: std::cell::Cell::new(Some(build)),
+            since,
+            building: std::cell::Cell::new(false),
+        }
+    }
 }
 
 impl GraphStore {
@@ -1019,6 +1081,82 @@ impl GraphStore {
         Signature::new(argnames, None, None)
     }
 
+    /// The slot's graph, built and caught up with every store pass on
+    /// first demand. `None` when the build produced no graph, or while the
+    /// slot's own build is running.
+    fn slot_graph<'s>(&'s self, slot: &'s GraphSlot) -> Option<&'s BuiltGraph> {
+        if slot.building.get() {
+            return None;
+        }
+        slot.graph
+            .get_or_init(|| {
+                let build = slot.build.take()?;
+                slot.building.set(true);
+                let built = build().map(|mut graph| {
+                    for pass in &self.passes[slot.since..] {
+                        self.apply_pass(pass, &mut graph);
+                    }
+                    graph
+                });
+                slot.building.set(false);
+                built.map(|graph| BuiltGraph {
+                    signature: Self::signature_from_graph(&graph),
+                    graph: std::rc::Rc::new(graph),
+                })
+            })
+            .as_ref()
+    }
+
+    /// Build every slot, so a whole-store reader sees every funcobj.
+    fn build_all(&self) {
+        for slot in self.graphs.values() {
+            self.slot_graph(slot);
+        }
+    }
+
+    fn apply_pass(&self, pass: &StorePass, graph: &mut FunctionGraph) {
+        match pass {
+            StorePass::MaterializeIndirectFamilies(trait_method_impls) => {
+                materialize_indirect_families(graph, trait_method_impls);
+            }
+            StorePass::LowerIndirectCalls {
+                trait_method_impls,
+                builtin_wrappers,
+            } => {
+                let families = StoreIndirectFamilies {
+                    store: self,
+                    trait_method_impls,
+                    builtin_wrappers,
+                };
+                crate::translator::rtyper::rpbc::lower_indirect_calls_with(graph, &families, false);
+            }
+            StorePass::ReplaceForceVirtualizable => {
+                replace_force_virtualizable_in(graph);
+            }
+        }
+    }
+
+    /// Run `pass` over every built graph and record it for the slots built
+    /// later. Each graph is taken out of the store while the pass rewrites
+    /// it, so the pass never reads the graph it is writing. A slot the pass
+    /// builds on the way (reading another funcobj) catches up on it there.
+    fn run_pass(&mut self, pass: StorePass) {
+        let keys: Vec<GraphKey> = self
+            .graphs
+            .iter()
+            .filter(|(_, slot)| slot.graph.get().is_some_and(Option::is_some))
+            .map(|(key, _)| key.clone())
+            .collect();
+        self.passes.push(pass.clone());
+        for key in keys {
+            let Some(mut graph) = self.take_graph(&key) else {
+                continue;
+            };
+            self.apply_pass(&pass, &mut graph);
+            self.restore_graph(key, graph);
+        }
+    }
+
     /// Register `graph` under `path`.  When another alias of the same
     /// source funcobj (same `GraphKey`) is already stored, keep the one
     /// shared graph object and fold this registration's attributes onto it
@@ -1036,11 +1174,18 @@ impl GraphStore {
                 .or_else(|| graph.owner_root.clone()),
             graph.name.clone(),
         );
-        match self.graphs.get_mut(&key) {
+        if let Some(slot) = self.graphs.get(&key) {
+            self.slot_graph(slot);
+        }
+        match self
+            .graphs
+            .get_mut(&key)
+            .and_then(|slot| slot.graph.get_mut())
+        {
             // Another alias of the very graph object already stored: the
             // fold below would be a no-op.
-            Some(existing) if std::rc::Rc::ptr_eq(&existing.graph, &graph) => {}
-            Some(existing) => {
+            Some(Some(existing)) if std::rc::Rc::ptr_eq(&existing.graph, &graph) => {}
+            Some(Some(existing)) => {
                 let existing = std::rc::Rc::make_mut(&mut existing.graph);
                 existing.func.merge_from(&graph.func);
                 // Monotonic, like `func`: upstream's aliases are the same
@@ -1058,12 +1203,21 @@ impl GraphStore {
                     existing.fun_decl_id = graph.fun_decl_id;
                 }
             }
-            None => {
-                let signature = Self::signature_from_graph(&graph);
-                self.graphs
-                    .insert(key.clone(), GraphSlot { graph, signature });
+            Some(None) | None => {
+                self.graphs.insert(key.clone(), GraphSlot::built(graph));
             }
         }
+        self.path_to_key.insert(path, key);
+    }
+
+    /// Register a funcobj whose graph is built on first demand under `key`.
+    /// A build that produces no graph leaves `path` unregistered.
+    #[cfg(test)]
+    pub(crate) fn insert_deferred(&mut self, path: CallPath, key: GraphKey, build: DeferredGraph) {
+        let since = self.passes.len();
+        self.graphs
+            .entry(key.clone())
+            .or_insert_with(|| GraphSlot::deferred(build, since));
         self.path_to_key.insert(path, key);
     }
 
@@ -1073,93 +1227,127 @@ impl GraphStore {
         self.path_to_key.get(path).cloned()
     }
 
+    fn built_for(&self, path: &CallPath) -> Option<&BuiltGraph> {
+        self.slot_graph(self.graphs.get(self.path_to_key.get(path)?)?)
+    }
+
     pub(crate) fn get(&self, path: &CallPath) -> Option<&FunctionGraph> {
-        self.graphs
-            .get(self.path_to_key.get(path)?)
-            .map(|s| &*s.graph)
+        self.built_for(path).map(|b| &*b.graph)
     }
 
     pub(crate) fn get_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
-        let key = self.path_to_key.get(path)?.clone();
-        self.graphs
-            .get_mut(&key)
-            .map(|s| std::rc::Rc::make_mut(&mut s.graph))
+        self.built_for(path)?;
+        let key = self.path_to_key.get(path)?;
+        let built = self.graphs.get_mut(key)?.graph.get_mut()?.as_mut()?;
+        Some(std::rc::Rc::make_mut(&mut built.graph))
     }
 
     /// The formal parameter [`Signature`] of the funcobj `path` names —
     /// the `FunctionDesc` signature upstream takes from `code.signature`.
     pub(crate) fn signature(&self, path: &CallPath) -> Option<&Signature> {
-        self.graphs
-            .get(self.path_to_key.get(path)?)
-            .map(|s| &s.signature)
+        self.built_for(path).map(|b| &b.signature)
     }
 
     pub(crate) fn contains_key(&self, path: &CallPath) -> bool {
-        self.path_to_key.contains_key(path)
+        self.built_for(path).is_some()
     }
 
     /// Every registered alias spelling (one entry per `CallPath`, not per
     /// shared graph) — matches the old `HashMap<CallPath, _>::keys()`.
     #[cfg(test)]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &CallPath> {
-        self.path_to_key.keys()
+        self.path_to_key
+            .iter()
+            .filter(|(_, k)| {
+                self.graphs
+                    .get(*k)
+                    .is_some_and(|slot| self.slot_graph(slot).is_some())
+            })
+            .map(|(p, _)| p)
     }
 
     /// `(alias path, shared graph)` for every registered spelling.  The
     /// same graph appears once per alias, mirroring the old per-path map.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&CallPath, &FunctionGraph)> {
-        self.path_to_key
-            .iter()
-            .filter_map(move |(p, k)| self.graphs.get(k).map(|s| (p, &*s.graph)))
+        self.iter_shared().map(|(p, g)| (p, &**g))
     }
 
     /// [`Self::iter`], handing out the shared graph a pending lift keeps.
     pub(crate) fn iter_shared(
         &self,
     ) -> impl Iterator<Item = (&CallPath, &std::rc::Rc<FunctionGraph>)> {
-        self.path_to_key
-            .iter()
-            .filter_map(move |(p, k)| self.graphs.get(k).map(|s| (p, &s.graph)))
+        self.build_all();
+        self.path_to_key.iter().filter_map(move |(p, k)| {
+            self.graphs
+                .get(k)
+                .and_then(|slot| slot.graph.get())
+                .and_then(Option::as_ref)
+                .map(|b| (p, &b.graph))
+        })
     }
 
-    /// Every source funcobj graph exactly once, irrespective of how many
-    /// alias paths name it.  Used by the rtyping boundary that attaches the
-    /// final PBC family to deferred indirect-call operations.
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut FunctionGraph> {
-        self.graphs
-            .values_mut()
-            .map(|slot| std::rc::Rc::make_mut(&mut slot.graph))
-    }
-
-    /// Source-funcobj identities, one per stored graph.
-    fn graph_keys(&self) -> Vec<GraphKey> {
-        self.graphs.keys().cloned().collect()
-    }
-
-    /// Remove one source graph so a caller can mutate it while still
+    /// Remove one built graph so a caller can mutate it while still
     /// borrowing the rest of the store. Alias paths keep their `GraphKey`.
     fn take_graph(&mut self, key: &GraphKey) -> Option<FunctionGraph> {
-        self.graphs
-            .remove(key)
-            .map(|slot| std::rc::Rc::unwrap_or_clone(slot.graph))
+        let slot = self.graphs.remove(key)?;
+        match slot.graph.into_inner() {
+            Some(Some(built)) => Some(std::rc::Rc::unwrap_or_clone(built.graph)),
+            other => {
+                // Not built: put it back untouched.
+                let slot = GraphSlot {
+                    graph: other.map_or_else(std::cell::OnceCell::new, std::cell::OnceCell::from),
+                    build: slot.build,
+                    since: slot.since,
+                    building: slot.building,
+                };
+                self.graphs.insert(key.clone(), slot);
+                None
+            }
+        }
     }
 
     /// Put back a graph taken by [`Self::take_graph`] under the same key.
     fn restore_graph(&mut self, key: GraphKey, graph: FunctionGraph) {
-        let signature = Self::signature_from_graph(&graph);
-        self.graphs.insert(
-            key,
-            GraphSlot {
-                graph: std::rc::Rc::new(graph),
-                signature,
-            },
-        );
+        self.graphs
+            .insert(key, GraphSlot::built(std::rc::Rc::new(graph)));
     }
 
     /// Number of registered alias spellings (path count), matching the old
     /// `HashMap<CallPath, _>::len()` so `iter()`-sized allocations stay correct.
     pub(crate) fn len(&self) -> usize {
         self.path_to_key.len()
+    }
+}
+
+/// [`crate::translator::rtyper::rpbc::IndirectCallFamilies`] as a store pass
+/// recorded them: the impl map and wrapper family it read, and the store's
+/// graphs for the declared result type.
+struct StoreIndirectFamilies<'a> {
+    store: &'a GraphStore,
+    trait_method_impls: &'a TraitMethodImpls,
+    builtin_wrappers: &'a [CallPath],
+}
+
+impl crate::translator::rtyper::rpbc::IndirectCallFamilies for StoreIndirectFamilies<'_> {
+    fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath> {
+        impls_for_indirect(self.trait_method_impls, trait_root, method_name)
+    }
+
+    fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath] {
+        self.builtin_wrappers
+    }
+
+    fn declared_result_type_for_indirect(
+        &self,
+        trait_root: &str,
+        method_name: &str,
+    ) -> Option<Type> {
+        declared_result_type(
+            trait_root,
+            method_name,
+            self.all_impls_for_indirect(trait_root, method_name),
+            |path| self.store.get(path),
+        )
     }
 }
 
@@ -3790,15 +3978,14 @@ impl CallControl {
     /// after the flowspace prepass (which still needs `family_key`) and
     /// before `transform_graph_to_jitcode`.
     pub(crate) fn lower_registered_indirect_calls(&mut self) {
-        let _frozen = self.builtin_wrapper_indirect_graphs();
-        let keys = self.function_graphs.graph_keys();
-        for key in keys {
-            let Some(mut graph) = self.function_graphs.take_graph(&key) else {
-                continue;
-            };
-            crate::translator::rtyper::rpbc::lower_indirect_calls_with(&mut graph, self, false);
-            self.function_graphs.restore_graph(key, graph);
-        }
+        let builtin_wrappers: std::rc::Rc<[CallPath]> =
+            self.builtin_wrapper_indirect_graphs().into();
+        let trait_method_impls = std::rc::Rc::new(self.trait_method_impls.clone());
+        self.function_graphs
+            .run_pass(StorePass::LowerIndirectCalls {
+                trait_method_impls,
+                builtin_wrappers,
+            });
     }
 
     /// Whether a graph is registered under `path`.
@@ -4563,31 +4750,9 @@ impl CallControl {
     /// keeps the helper Call and is stripped to the virtualizable
     /// argument (`op.args = [c_funcptr, op.args[0]]`). The residual
     /// helper is already `executioncontext::jit_force_virtualizable`.
-    fn replace_force_virtualizable_with_call(&mut self) -> usize {
-        let mut count = 0;
-        for graph in self.function_graphs.values_mut() {
-            for block in &mut graph.blocks {
-                let mut newops = Vec::with_capacity(block.operations.len());
-                for mut op in block.operations.drain(..) {
-                    if let OpKind::Call { target, args, .. } = &op.kind {
-                        if is_residual_jit_force_virtualizable(target) {
-                            if args.last().is_some_and(link_arg_access_directly) {
-                                continue;
-                            }
-                            if let OpKind::Call { args, .. } = &mut op.kind {
-                                if args.len() > 1 {
-                                    args.truncate(1);
-                                }
-                            }
-                            count += 1;
-                        }
-                    }
-                    newops.push(op);
-                }
-                block.operations = newops;
-            }
-        }
-        count
+    fn replace_force_virtualizable_with_call(&mut self) {
+        self.function_graphs
+            .run_pass(StorePass::ReplaceForceVirtualizable);
     }
 
     /// `Transformer.get_vinfo` name-token half. `is_vtypeptr` stays the
@@ -4751,43 +4916,9 @@ impl CallControl {
     /// and the recursive effect analyzers inspect the registered source graph
     /// first and would read `graphs: None` as an unknown family/top result.
     fn materialize_deferred_indirect_families(&mut self) {
-        let trait_method_impls = &self.trait_method_impls;
-        let function_graphs = &mut self.function_graphs;
-        for graph in function_graphs.values_mut() {
-            for op in graph
-                .blocks
-                .iter_mut()
-                .flat_map(|block| block.operations.iter_mut())
-            {
-                let OpKind::IndirectCall {
-                    graphs, family_key, ..
-                } = &mut op.kind
-                else {
-                    continue;
-                };
-                // Read the key without clearing it. The two-phase prepass runs
-                // after this fill on the same shared store, and its flowspace
-                // adapter needs the same `(trait_root, method_name)` to emit
-                // the pre-rtyper `getattr` + `simple_call` shape — an
-                // `indirect_call` op does not exist before rtyping. The later
-                // `rpbc::lower_indirect_calls` re-enters its own `take()` arm
-                // and recomputes `graphs` through `all_impls_for_indirect`,
-                // which is this same lookup over the same map, so the value it
-                // writes is unchanged.
-                let Some((trait_root, method_name)) = family_key.clone() else {
-                    continue;
-                };
-                let family = trait_method_impls
-                    .get(&(trait_root.clone(), method_name.clone()))
-                    .into_iter()
-                    .flatten()
-                    .map(|impl_type| {
-                        CallPath::for_impl_method(impl_type.as_str(), method_name.as_str())
-                    })
-                    .collect::<Vec<_>>();
-                *graphs = (!family.is_empty()).then_some(family);
-            }
-        }
+        let trait_method_impls = std::rc::Rc::new(self.trait_method_impls.clone());
+        self.function_graphs
+            .run_pass(StorePass::MaterializeIndirectFamilies(trait_method_impls));
     }
 
     fn find_all_graphs_bfs(&mut self, policy: &mut dyn JitPolicy, helper_roots: &[CallPath]) {
@@ -5457,24 +5588,116 @@ impl CallControl {
         trait_root: &str,
         method_name: &str,
     ) -> Option<Type> {
-        let mut declared = self
-            .all_impls_for_indirect(trait_root, method_name)
-            .into_iter()
-            .filter_map(|path| self.function_graphs.get(&path))
-            .filter_map(|graph| graph.return_type.as_ref())
-            .map(|result| {
-                let effective = crate::front::typestr::transparent_result_ok_type(result)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| result.clone());
-                return_type_string_to_value_type(Some(&effective))
-            });
-        let first = declared.next()?;
-        assert!(
-            declared.all(|result| result == first),
-            "indirect-call family {trait_root}::{method_name} has inconsistent result types"
-        );
-        Some(first)
+        declared_result_type(
+            trait_root,
+            method_name,
+            self.all_impls_for_indirect(trait_root, method_name),
+            |path| self.function_graphs.get(path),
+        )
     }
+}
+
+/// `CallPath`s of the impls `trait_method_impls` records for
+/// `(trait_root, method_name)`.
+fn impls_for_indirect(
+    trait_method_impls: &TraitMethodImpls,
+    trait_root: &str,
+    method_name: &str,
+) -> Vec<CallPath> {
+    trait_method_impls
+        .get(&(trait_root.to_string(), method_name.to_string()))
+        .into_iter()
+        .flatten()
+        .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name))
+        .collect()
+}
+
+/// The result type every registered member of an indirect-call family
+/// declares.
+fn declared_result_type<'g>(
+    trait_root: &str,
+    method_name: &str,
+    family: Vec<CallPath>,
+    graph_of: impl Fn(&CallPath) -> Option<&'g FunctionGraph>,
+) -> Option<Type> {
+    let mut declared = family
+        .into_iter()
+        .filter_map(|path| graph_of(&path))
+        .filter_map(|graph| graph.return_type.as_ref())
+        .map(|result| {
+            let effective = crate::front::typestr::transparent_result_ok_type(result)
+                .map(str::to_string)
+                .unwrap_or_else(|| result.clone());
+            return_type_string_to_value_type(Some(&effective))
+        });
+    let first = declared.next()?;
+    assert!(
+        declared.all(|result| result == first),
+        "indirect-call family {trait_root}::{method_name} has inconsistent result types"
+    );
+    Some(first)
+}
+
+/// [`CallControl::materialize_deferred_indirect_families`] on one graph.
+fn materialize_indirect_families(graph: &mut FunctionGraph, trait_method_impls: &TraitMethodImpls) {
+    for op in graph
+        .blocks
+        .iter_mut()
+        .flat_map(|block| block.operations.iter_mut())
+    {
+        let OpKind::IndirectCall {
+            graphs, family_key, ..
+        } = &mut op.kind
+        else {
+            continue;
+        };
+        // Read the key without clearing it. The two-phase prepass runs
+        // after this fill on the same shared store, and its flowspace
+        // adapter needs the same `(trait_root, method_name)` to emit
+        // the pre-rtyper `getattr` + `simple_call` shape — an
+        // `indirect_call` op does not exist before rtyping. The later
+        // `rpbc::lower_indirect_calls` re-enters its own `take()` arm
+        // and recomputes `graphs` through `all_impls_for_indirect`,
+        // which is this same lookup over the same map, so the value it
+        // writes is unchanged.
+        let Some((trait_root, method_name)) = family_key.clone() else {
+            continue;
+        };
+        let family = trait_method_impls
+            .get(&(trait_root.clone(), method_name.clone()))
+            .into_iter()
+            .flatten()
+            .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name.as_str()))
+            .collect::<Vec<_>>();
+        *graphs = (!family.is_empty()).then_some(family);
+    }
+}
+
+/// [`CallControl::replace_force_virtualizable_with_call`] on one graph.
+/// Returns how many residual forces it kept.
+fn replace_force_virtualizable_in(graph: &mut FunctionGraph) -> usize {
+    let mut count = 0;
+    for block in &mut graph.blocks {
+        let mut newops = Vec::with_capacity(block.operations.len());
+        for mut op in block.operations.drain(..) {
+            if let OpKind::Call { target, args, .. } = &op.kind {
+                if is_residual_jit_force_virtualizable(target) {
+                    if args.last().is_some_and(link_arg_access_directly) {
+                        continue;
+                    }
+                    if let OpKind::Call { args, .. } = &mut op.kind {
+                        if args.len() > 1 {
+                            args.truncate(1);
+                        }
+                    }
+                    count += 1;
+                }
+            }
+            newops.push(op);
+        }
+        block.operations = newops;
+    }
+    count
 }
 
 /// Map a Rust return-type string to the BhCallDescr kind char used by
@@ -6252,12 +6475,7 @@ impl CallControl {
     /// where the goal is to reject mixed `_elidable_function_` etc.
     /// even among residual members (`call.py:259-280`).
     pub fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath> {
-        self.trait_method_impls
-            .get(&(trait_root.to_string(), method_name.to_string()))
-            .into_iter()
-            .flatten()
-            .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name))
-            .collect()
+        impls_for_indirect(&self.trait_method_impls, trait_root, method_name)
     }
 
     /// Candidate PBC family for the generated `BuiltinCode.func`
@@ -13304,7 +13522,7 @@ mod tests {
         graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["residual_force"]);
         cc.register_function_graph(path.clone(), graph);
-        assert_eq!(cc.replace_force_virtualizable_with_call(), 2);
+        cc.replace_force_virtualizable_with_call();
         let ops = &cc
             .function_graphs()
             .get(&path)
@@ -13439,6 +13657,112 @@ mod tests {
             Some(2),
             "the registered source graph must carry the complete PBC family"
         );
+    }
+
+    fn deferred_family_caller(name: &str) -> FunctionGraph {
+        let mut caller = FunctionGraph::new(name);
+        let funcptr = caller.alloc_value_var();
+        caller
+            .block_mut(caller.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::IndirectCall {
+                    funcptr,
+                    args: Vec::new(),
+                    graphs: None,
+                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    result_ty: ValueType::Void,
+                },
+            });
+        caller
+    }
+
+    fn handler_call_control() -> CallControl {
+        let mut cc = CallControl::new();
+        for owner in ["A", "B"] {
+            cc.register_function_graph(
+                CallPath::for_impl_method(owner, "run"),
+                FunctionGraph::new(format!("{owner}::run")),
+            );
+            cc.register_trait_family_member("run", "Handler", owner);
+        }
+        cc
+    }
+
+    fn first_op_kind(cc: &CallControl, path: &CallPath) -> String {
+        let graph = cc.function_graphs.get(path).expect("registered graph");
+        let OpKind::IndirectCall {
+            graphs, family_key, ..
+        } = &graph.block(graph.startblock).operations[0].kind
+        else {
+            panic!("the caller's operation must stay an indirect call");
+        };
+        format!("graphs: {graphs:?}, family_key: {family_key:?}")
+    }
+
+    /// A funcobj registered before the store passes ran and built after
+    /// them reads the same graph as one built at registration: its build
+    /// catches up on every pass, in order, with the inputs each pass read.
+    #[test]
+    fn a_deferred_slot_catches_up_on_the_store_passes() {
+        let eager_path = CallPath::from_segments(["eager"]);
+        let lazy_path = CallPath::from_segments(["lazy"]);
+        let mut cc = handler_call_control();
+        cc.register_function_graph(eager_path.clone(), deferred_family_caller("caller"));
+        let mut lazy = handler_call_control();
+        lazy.function_graphs.insert_deferred(
+            lazy_path.clone(),
+            (None, "caller".to_string()),
+            Box::new(|| Some(deferred_family_caller("caller"))),
+        );
+        for cc in [&mut cc, &mut lazy] {
+            cc.materialize_deferred_indirect_families();
+            cc.lower_registered_indirect_calls();
+            cc.replace_force_virtualizable_with_call();
+        }
+        assert!(
+            lazy.function_graphs.graphs[&(None, "caller".to_string())]
+                .graph
+                .get()
+                .is_none(),
+            "no pass may build a slot nobody asked for"
+        );
+        assert_eq!(
+            first_op_kind(&lazy, &lazy_path),
+            first_op_kind(&cc, &eager_path)
+        );
+    }
+
+    /// A pass that has run is not replayed on a funcobj registered after
+    /// it: that graph never went through it.
+    #[test]
+    fn a_slot_registered_after_a_pass_does_not_get_it() {
+        let path = CallPath::from_segments(["late"]);
+        let mut cc = handler_call_control();
+        cc.materialize_deferred_indirect_families();
+        cc.function_graphs.insert_deferred(
+            path.clone(),
+            (None, "late".to_string()),
+            Box::new(|| Some(deferred_family_caller("late"))),
+        );
+        let kind = first_op_kind(&cc, &path);
+        assert!(kind.contains("graphs: None"), "{kind}");
+    }
+
+    /// A funcobj whose build produces no graph is not registered.
+    #[test]
+    fn a_slot_whose_build_fails_is_unregistered() {
+        let path = CallPath::from_segments(["broken"]);
+        let mut cc = CallControl::new();
+        cc.function_graphs.insert_deferred(
+            path.clone(),
+            (None, "broken".to_string()),
+            Box::new(|| None),
+        );
+        assert!(!cc.function_graphs.contains_key(&path));
+        assert!(cc.function_graphs.get(&path).is_none());
+        assert!(cc.function_graphs.signature(&path).is_none());
     }
 
     /// `graphs_from(op)` for an `OpKind::IndirectCall` must filter by
