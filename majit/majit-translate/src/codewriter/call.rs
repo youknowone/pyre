@@ -2617,8 +2617,11 @@ pub struct CallControl {
     /// When registered, provides exact (offset, size) for struct fields,
     /// bypassing the type-string heuristic. The runtime/proc-macro populates
     /// this via `set_struct_layout()`. Writes go through that setter so
-    /// `fielddescrof_memo` is dropped with the layout.
-    struct_layouts: HashMap<majit_ir::descr::StructId, StructLayout>,
+    /// `fielddescrof_memo` is dropped with the layout. A positional
+    /// aggregate's layout is filled on its first lookup
+    /// ([`Self::layout_of`]).
+    struct_layouts:
+        std::cell::RefCell<HashMap<majit_ir::descr::StructId, std::rc::Rc<StructLayout>>>,
     /// Consumer-supplied low-level storage kind, keyed by the same nominal
     /// struct identity as `struct_layouts`. RPython stores this on the lltype
     /// STRUCT; the Rust source declaration alone cannot distinguish a host
@@ -2713,8 +2716,7 @@ pub struct CallControl {
 /// `get_size`) when they reach constant emission.
 impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for CallControl {
     fn field_offset(&self, struct_name: &str, fldname: &str) -> Option<i64> {
-        let sid = majit_ir::descr::struct_id_for_name(struct_name)?;
-        let layout = self.struct_layouts.get(&sid)?;
+        let layout = self.struct_layout_for(struct_name)?;
         layout
             .fields
             .iter()
@@ -2723,8 +2725,7 @@ impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for CallCon
     }
 
     fn struct_size(&self, struct_name: &str) -> Option<i64> {
-        let sid = majit_ir::descr::struct_id_for_name(struct_name)?;
-        self.struct_layouts.get(&sid).map(|l| l.size as i64)
+        self.struct_layout_for(struct_name).map(|l| l.size as i64)
     }
 }
 
@@ -2805,7 +2806,7 @@ fn is_known_by_value_struct(
     {
         return false;
     }
-    known_structs.contains(type_name)
+    known_structs.contains(type_name) || majit_ir::descr::positional_shape_id(type_name).is_some()
 }
 
 /// Layout-transparent `core::sync::atomic` wrappers. `AtomicI64` occupies
@@ -3208,7 +3209,7 @@ impl CallControl {
             // = sizeof(Signed) = WORD. Standard GcArray has a length field before items.
             //
             array_header_size: crate::layout::target_word_size(),
-            struct_layouts: HashMap::new(),
+            struct_layouts: Default::default(),
             immutable_fields_by_struct: HashMap::new(),
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
@@ -3344,7 +3345,9 @@ impl CallControl {
         struct_id: majit_ir::descr::StructId,
         layout: StructLayout,
     ) {
-        self.struct_layouts.insert(struct_id, layout);
+        self.struct_layouts
+            .get_mut()
+            .insert(struct_id, std::rc::Rc::new(layout));
         self.clear_fielddescrof_memo();
     }
 
@@ -3395,9 +3398,39 @@ impl CallControl {
     /// `None` for an unknown or cross-module-ambiguous name — the layout
     /// channel is keyed by object identity, so a name that does not
     /// resolve to one identity has no layout.
-    pub fn struct_layout_for(&self, name: &str) -> Option<&StructLayout> {
+    pub fn struct_layout_for(&self, name: &str) -> Option<std::rc::Rc<StructLayout>> {
         let sid = majit_ir::descr::struct_id_for_name(name)?;
-        self.struct_layouts.get(&sid)
+        self.layout_of(sid, name)
+    }
+
+    /// The layout stored under `sid`, whose spelling is `name`. A
+    /// positional aggregate (`Tuple<A,B>` / `Array<T;N>`) has no layout
+    /// until something asks for it: `TupleRepr` lays out `TUPLE_TYPE` from
+    /// its items on demand (`rtuple.py`) and `symbolic.get_size` /
+    /// `get_field_token` size it when the backend first asks
+    /// (`symbolic.py`). Every item row is a scalar, a pointer or an inline
+    /// array, so the layout depends on the spelling alone.
+    fn layout_of(
+        &self,
+        sid: majit_ir::descr::StructId,
+        name: &str,
+    ) -> Option<std::rc::Rc<StructLayout>> {
+        if let Some(layout) = self.struct_layouts.borrow().get(&sid) {
+            return Some(layout.clone());
+        }
+        if majit_ir::descr::positional_shape_id(name) != Some(sid) {
+            return None;
+        }
+        let rows = crate::front::mir::positional_shape_rows(name)?;
+        let layout = std::rc::Rc::new(StructLayout::from_type_strings(
+            rows,
+            &self.known_struct_names,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        ));
+        self.struct_layouts.borrow_mut().insert(sid, layout.clone());
+        Some(layout)
     }
 
     /// Byte offset of the first item of a length-prefixed array whose length
@@ -4031,10 +4064,12 @@ impl CallControl {
                 let (struct_size, struct_size_path) =
                     compute_struct_size_with_path(self, owner_root);
                 let offset_of = |sid| {
-                    self.struct_layouts
-                        .get(&sid)
-                        .and_then(|l| l.fields.iter().find(|f| f.name.as_str() == field_name))
-                        .map(|f| f.offset)
+                    self.layout_of(sid, owner_root).and_then(|l| {
+                        l.fields
+                            .iter()
+                            .find(|f| f.name.as_str() == field_name)
+                            .map(|f| f.offset)
+                    })
                 };
                 let concrete_offset = owner_id.and_then(offset_of);
                 let template_offset = if concrete_offset.is_none() {

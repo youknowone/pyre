@@ -2200,19 +2200,42 @@ fn register_synthetic_positional_metadata(
     struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
 ) {
     for shape in shapes {
-        let items = if let Some(inner) = shape
-            .strip_prefix("Tuple<")
-            .and_then(|rest| rest.strip_suffix('>'))
-        {
-            split_top_level_type_args(inner)
-        } else if let Some((item, len)) = shaped_array_parts(&shape) {
-            vec![item; len]
-        } else {
+        let Some((rows, attrs)) = positional_shape_metadata(&shape) else {
             continue;
         };
-        if items.is_empty() && majit_ir::descr::is_shaped_tuple_name(&shape) {
-            continue;
-        }
+        let sid = majit_ir::descr::StructId::from_canonical(&shape);
+        known_struct_names.insert(shape.clone());
+        struct_fields.fields.insert(shape.clone(), rows);
+        struct_field_attrs.insert(shape.clone(), attrs);
+        record_struct_id(struct_ids, shape, sid);
+    }
+}
+
+/// The `__pos_N` rows and attribute shells of the positional aggregate
+/// `shape` (`Tuple<A,B>` / `Array<T;N>`), read off its spelling: one field
+/// per item, as `rtuple.py TupleRepr` lays out `TUPLE_TYPE`. `None` for a
+/// name that spells no shape, and for the empty tuple.
+pub(crate) fn positional_shape_metadata(
+    shape: &str,
+) -> Option<(Vec<(String, String)>, Vec<(String, ValueType)>)> {
+    if !majit_ir::descr::is_shaped_tuple_name(shape)
+        && !majit_ir::descr::is_shaped_array_name(shape)
+    {
+        return None;
+    }
+    let items = if let Some(inner) = shape
+        .strip_prefix("Tuple<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        split_top_level_type_args(inner)
+    } else {
+        let (item, len) = shaped_array_parts(shape)?;
+        vec![item; len]
+    };
+    if items.is_empty() && majit_ir::descr::is_shaped_tuple_name(shape) {
+        return None;
+    }
+    {
         let attrs: Vec<(String, ValueType)> = items
             .iter()
             .enumerate()
@@ -2232,12 +2255,26 @@ fn register_synthetic_positional_metadata(
             .enumerate()
             .map(|(index, ty)| (format!("__pos_{index}"), positional_field_type(ty)))
             .collect();
-        let sid = majit_ir::descr::StructId::from_canonical(&shape);
-        known_struct_names.insert(shape.clone());
-        struct_fields.fields.insert(shape.clone(), rows);
-        struct_field_attrs.insert(shape.clone(), attrs);
-        record_struct_id(struct_ids, shape, sid);
+        Some((rows, attrs))
     }
+}
+
+/// [`positional_shape_metadata`]'s rows, made once per shape for the
+/// process: a pure function of the spelling, so the memo cannot change
+/// what any reader sees.
+pub(crate) fn positional_shape_rows(shape: &str) -> Option<&'static Vec<(String, String)>> {
+    type Rows = &'static Vec<(String, String)>;
+    static ROWS: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<String, Option<Rows>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    if !majit_ir::descr::is_shaped_tuple_name(shape)
+        && !majit_ir::descr::is_shaped_array_name(shape)
+    {
+        return None;
+    }
+    *ROWS.lock().entry(shape.to_string()).or_insert_with(|| {
+        positional_shape_metadata(shape).map(|(rows, _)| &*Box::leak(Box::new(rows)))
+    })
 }
 
 /// Byte size of the explicit `Result` / `Option` shell that carries

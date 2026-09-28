@@ -237,6 +237,20 @@ impl FieldRows {
         self.key_fp.get()
     }
 
+    /// The rows registered under `key`, or, for a positional aggregate
+    /// spelling (`Tuple<A,B>` / `Array<T;N>`), the rows its spelling
+    /// derives: `TupleRepr` builds `TUPLE_TYPE` from the items whenever the
+    /// rtyper asks (`rtuple.py`), so a shape needs no prior registration.
+    pub fn get(&self, key: &str) -> Option<&Vec<(String, String)>> {
+        self.map
+            .get(key)
+            .or_else(|| crate::front::mir::positional_shape_rows(key))
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
     pub fn insert(
         &mut self,
         key: String,

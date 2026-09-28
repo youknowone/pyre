@@ -1846,13 +1846,21 @@ fn wide_inline_borrow_offset(
     let owner = field.owner_root.as_deref()?;
     let row = cc
         .and_then(|cc| cc.struct_layout_for(owner))
-        .and_then(|layout| layout.fields.iter().find(|row| row.name == field.name));
+        .and_then(|layout| {
+            layout
+                .fields
+                .iter()
+                .find(|row| row.name == field.name)
+                .cloned()
+        });
     // An inline aggregate (`descr.py` `get_type_flag` → `FLAG_STRUCT`)
     // wider than one word. A scalar is one register value at any size:
     // an `i64` on a 32-bit target is still `FLAG_SIGNED`.
     let word = crate::layout::target_word_size();
     let wider = field.inline_vec
-        || row.is_some_and(|row| row.flag == majit_ir::descr::ArrayFlag::Struct && row.size > word);
+        || row
+            .as_ref()
+            .is_some_and(|row| row.flag == majit_ir::descr::ArrayFlag::Struct && row.size > word);
     if !wider {
         return None;
     }
