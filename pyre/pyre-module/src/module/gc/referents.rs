@@ -12,19 +12,21 @@ use super::interp_gc::NUM_GENERATIONS;
 pub mod gcref {
     use super::*;
 
-    #[crate::pyre_class("GcRef")]
+    #[pyre_interpreter::pyre_class("GcRef")]
     pub struct W_GcRef {
         pub gcref: PyObjectRef,
     }
 
-    #[crate::pyre_methods]
+    #[pyre_interpreter::pyre_methods]
     impl W_GcRef {
         #[staticmethod]
         fn __new__(
             _cls: PyObjectRef,
             _args: &[PyObjectRef],
-        ) -> Result<PyObjectRef, crate::PyError> {
-            Err(crate::PyError::type_error("GcRef() takes no arguments"))
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            Err(pyre_interpreter::PyError::type_error(
+                "GcRef() takes no arguments",
+            ))
         }
     }
 
@@ -57,7 +59,7 @@ pub mod gcref {
 pub mod stats {
     use super::*;
 
-    #[crate::pyre_class("GcStats")]
+    #[pyre_interpreter::pyre_class("GcStats")]
     pub struct W_GcStats {
         pub(in crate::module::gc) total_memory_pressure: i64,
         pub(in crate::module::gc) total_gc_memory: i64,
@@ -74,14 +76,14 @@ pub mod stats {
         pub(in crate::module::gc) total_gc_time: i64,
     }
 
-    #[crate::pyre_methods]
+    #[pyre_interpreter::pyre_methods]
     impl W_GcStats {
         #[staticmethod]
         fn __new__(
             _cls: PyObjectRef,
             _args: &[PyObjectRef],
-        ) -> Result<PyObjectRef, crate::PyError> {
-            Err(crate::PyError::type_error(
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            Err(pyre_interpreter::PyError::type_error(
                 "object.__new__(GcStats) is not safe, use GcStats.__new__()",
             ))
         }
@@ -186,7 +188,7 @@ fn pin_object(object: majit_ir::GcRef) {
 /// as `interp_gc::is_tracked`.
 fn pin_cpython_tracked_object(object: majit_ir::GcRef) {
     let w_obj = object.0 as PyObjectRef;
-    if crate::typedef::cpython_object_is_gc(w_obj) {
+    if pyre_interpreter::typedef::cpython_object_is_gc(w_obj) {
         let _ = pyre_object::gc_roots::pin_root(w_obj);
     }
 }
@@ -323,10 +325,10 @@ fn pin_referents(w_obj: PyObjectRef) {
 /// is why `gc.get_referents(1)` is empty.
 fn pin_heaptype_referent(source_slot: usize) {
     let w_obj = pyre_object::gc_roots::shadow_stack_get(source_slot);
-    if w_obj.is_null() || !crate::typedef::cpython_object_is_gc(w_obj) {
+    if w_obj.is_null() || !pyre_interpreter::typedef::cpython_object_is_gc(w_obj) {
         return;
     }
-    let Some(w_type) = crate::typedef::r#type(w_obj) else {
+    let Some(w_type) = pyre_interpreter::typedef::r#type(w_obj) else {
         return;
     };
     let w_type = w_type.as_ptr();
@@ -402,47 +404,50 @@ fn list_from_roots(first: usize) -> PyObjectRef {
 
 #[cfg(feature = "sandbox")]
 fn heap_dump_write_via_host(fd: i32, bytes: &[u8]) -> Result<isize, i32> {
-    crate::host_seam::raw_heap_dump_write(fd, bytes)
+    pyre_interpreter::host_seam::raw_heap_dump_write(fd, bytes)
         .map(|written| written as isize)
         // A non-OS seam failure still needs an errno. Use the collector's code
         // for targets and failure modes that cannot supply one.
         .map_err(|error| match error {
-            crate::host_seam::SeamError::Os(errno) => errno,
+            pyre_interpreter::host_seam::SeamError::Os(errno) => errno,
             _ => majit_gc::HEAP_DUMP_EIO,
         })
 }
 
-pub(super) fn dump_rpy_heap_fd(fd: i32) -> Result<(), crate::PyError> {
+pub(super) fn dump_rpy_heap_fd(fd: i32) -> Result<(), pyre_interpreter::PyError> {
     #[cfg(feature = "sandbox")]
     majit_gc::set_heap_dump_write(Some(heap_dump_write_via_host));
     match majit_gc::dump_rpy_heap(fd) {
         Ok(true) => Ok(()),
-        Ok(false) => Err(crate::PyError::not_implemented(
+        Ok(false) => Err(pyre_interpreter::PyError::not_implemented(
             "operation not implemented by this GC",
         )),
-        Err(errno) => Err(crate::PyError::os_error_with_errno(
+        Err(errno) => Err(pyre_interpreter::PyError::os_error_with_errno(
             errno,
             "raw_os_write failed",
         )),
     }
 }
 
-fn typeids_z_bytes() -> Result<Vec<u8>, crate::PyError> {
+fn typeids_z_bytes() -> Result<Vec<u8>, pyre_interpreter::PyError> {
     use rustpython_common::compression::zlib;
 
-    let text = majit_gc::get_typeids_text()
-        .ok_or_else(|| crate::PyError::not_implemented("operation not implemented by this GC"))?;
+    let text = majit_gc::get_typeids_text().ok_or_else(|| {
+        pyre_interpreter::PyError::not_implemented("operation not implemented by this GC")
+    })?;
     zlib::compress(&text, 9, zlib::MAX_WBITS).map_err(|error| {
         let message = match error {
             zlib::InitError::InvalidOption => "Invalid initialization option".to_owned(),
             zlib::InitError::Zlib(message) => message,
         };
-        crate::PyError::os_error(message)
+        pyre_interpreter::PyError::os_error(message)
     })
 }
 
 /// `referents.py get_objects`.
-pub(super) fn get_objects(generation: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_objects(
+    generation: PyObjectRef,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // `referents.py get_objects` returns "a list of all
     // app-level objects" and takes no generation, but `do_get_objects`
     // already filters by one: -1 is every object, 0 is the nursery, 2
@@ -454,21 +459,23 @@ pub(super) fn get_objects(generation: PyObjectRef) -> Result<PyObjectRef, crate:
     let _generation_root = pyre_object::gc_roots::push_roots();
     let generation_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(generation);
-    crate::module::sys::vm::audit("gc.get_objects", &[w_int_new(-1)])?;
+    pyre_interpreter::module::sys::vm::audit("gc.get_objects", &[w_int_new(-1)])?;
     let generation = pyre_object::gc_roots::shadow_stack_get(generation_slot);
     let generation = if unsafe { is_none(generation) } {
         -1
     } else {
-        crate::baseobjspace::int_w(crate::baseobjspace::space_index(generation)?)?
+        pyre_interpreter::baseobjspace::int_w(pyre_interpreter::baseobjspace::space_index(
+            generation,
+        )?)?
     };
     if generation >= NUM_GENERATIONS {
-        return Err(crate::PyError::value_error(format!(
+        return Err(pyre_interpreter::PyError::value_error(format!(
             "generation parameter must be less than the number of \
              available generations ({NUM_GENERATIONS})"
         )));
     }
     if generation < -1 {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "generation parameter cannot be negative",
         ));
     }
@@ -480,7 +487,9 @@ pub(super) fn get_objects(generation: PyObjectRef) -> Result<PyObjectRef, crate:
 
 /// `referents.py get_referrers`: list every app-level object, then keep the
 /// ones whose direct referents include an argument.
-pub(super) fn get_referrers(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_referrers(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // The argument scan at `referents.py` has no `break`, and
     // the multiplicity that follows from that is the contract: an
     // object referring to the same argument twice is reported once
@@ -491,7 +500,7 @@ pub(super) fn get_referrers(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let args_base = pyre_object::gc_roots::pin_roots(args);
     let mut rooted_args = vec![std::ptr::null_mut(); args.len()];
     pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut rooted_args);
-    crate::module::sys::vm::audit("gc.get_referrers", &rooted_args)?;
+    pyre_interpreter::module::sys::vm::audit("gc.get_referrers", &rooted_args)?;
     let all_first = pyre_object::gc_roots::shadow_stack_len();
     majit_gc::get_objects(-1, pin_cpython_tracked_object);
     let all_last = pyre_object::gc_roots::shadow_stack_len();
@@ -518,12 +527,14 @@ pub(super) fn get_referrers(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 /// `referents.py get_referents`.
-pub(super) fn get_referents(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_referents(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let args_base = pyre_object::gc_roots::pin_roots(args);
     let mut rooted_args = vec![std::ptr::null_mut(); args.len()];
     pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut rooted_args);
-    crate::module::sys::vm::audit("gc.get_referents", &rooted_args)?;
+    pyre_interpreter::module::sys::vm::audit("gc.get_referents", &rooted_args)?;
     let first = pyre_object::gc_roots::shadow_stack_len();
     for index in 0..args.len() {
         let w_obj = pyre_object::gc_roots::shadow_stack_get(args_base + index);
@@ -533,11 +544,13 @@ pub(super) fn get_referents(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 /// `referents.py get_rpy_roots`.
-pub(super) fn get_rpy_roots(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_rpy_roots(
+    _args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let first = pyre_object::gc_roots::shadow_stack_len();
     if !majit_gc::get_rpy_roots(pin_object) {
-        return Err(crate::PyError::not_implemented(
+        return Err(pyre_interpreter::PyError::not_implemented(
             "operation not implemented by this GC",
         ));
     }
@@ -546,14 +559,16 @@ pub(super) fn get_rpy_roots(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 }
 
 /// `referents.py get_rpy_referents`.
-pub(super) fn get_rpy_referents(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_rpy_referents(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(args[0]);
     let raw = gcref::unwrap(pyre_object::gc_roots::shadow_stack_get(obj_slot));
     let first = pyre_object::gc_roots::shadow_stack_len();
     if !majit_gc::get_rpy_referents(raw, pin_object) {
-        return Err(crate::PyError::not_implemented(
+        return Err(pyre_interpreter::PyError::not_implemented(
             "operation not implemented by this GC",
         ));
     }
@@ -564,46 +579,59 @@ pub(super) fn get_rpy_referents(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
 /// `referents.py get_rpy_memory_usage` / `inspector.py get_rpy_memory_usage`.
 /// The size is just the translated object itself: no GC header and no
 /// reachable internal storage.
-pub(super) fn get_rpy_memory_usage(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_rpy_memory_usage(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(args[0]);
     let raw = gcref::unwrap(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-    let size = majit_gc::get_rpy_memory_usage(raw)
-        .ok_or_else(|| crate::PyError::not_implemented("operation not implemented by this GC"))?;
+    let size = majit_gc::get_rpy_memory_usage(raw).ok_or_else(|| {
+        pyre_interpreter::PyError::not_implemented("operation not implemented by this GC")
+    })?;
     Ok(w_int_new(size as i64))
 }
 
 /// `referents.py get_rpy_type_index`: a positive index into the translated
 /// type-info group (index zero is the upstream dummy member).
-pub(super) fn get_rpy_type_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_rpy_type_index(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(args[0]);
     let raw = gcref::unwrap(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-    let index = majit_gc::get_rpy_type_index(raw)
-        .ok_or_else(|| crate::PyError::not_implemented("operation not implemented by this GC"))?;
+    let index = majit_gc::get_rpy_type_index(raw).ok_or_else(|| {
+        pyre_interpreter::PyError::not_implemented("operation not implemented by this GC")
+    })?;
     Ok(w_int_new(index as i64))
 }
 
 /// `referents.py _dump_rpy_heap`.
-pub(super) fn _dump_rpy_heap(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let fd = crate::baseobjspace::int_w(args[0])? as i32;
+pub(super) fn _dump_rpy_heap(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let fd = pyre_interpreter::baseobjspace::int_w(args[0])? as i32;
     dump_rpy_heap_fd(fd)?;
     Ok(w_none())
 }
 
 /// `referents.py get_typeids_z`.
-pub(super) fn get_typeids_z(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_typeids_z(
+    _args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(
         &typeids_z_bytes()?,
     ))
 }
 
 /// `referents.py get_typeids_list`.
-pub(super) fn get_typeids_list(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let list = majit_gc::get_typeids_list()
-        .ok_or_else(|| crate::PyError::not_implemented("operation not implemented by this GC"))?;
+pub(super) fn get_typeids_list(
+    _args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let list = majit_gc::get_typeids_list().ok_or_else(|| {
+        pyre_interpreter::PyError::not_implemented("operation not implemented by this GC")
+    })?;
     // Each `w_int_new` can collect, so pin as we go: an int built by an
     // earlier iteration would otherwise live only in a `Vec`.
     let _roots = pyre_object::gc_roots::push_roots();

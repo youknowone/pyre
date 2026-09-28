@@ -3,8 +3,8 @@
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
 # corpus=795d74324a03a761 platform=linux
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_random::<Impl>::new_instance
 two-phase-never-a-subject	argument::raise_type_error__spec_String_f3a4935218b38edd
+two-phase-never-a-subject	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
 two-phase-never-a-subject	error::PyError::oefmt_name_error_text__spec_String_0f8488b534c96dc1
 two-phase-never-a-subject	error::write_exception__spec_Global__4755b4afeb6210aa
@@ -51,7 +51,7 @@ two-phase-never-a-subject	module::_io::interp_bufferedio::W_BufferedReader::with
 two-phase-never-a-subject	module::_json::with_marker__spec_closure_1_093e8fe65c62b0d6
 two-phase-never-a-subject	module::_json::with_marker__spec_closure_2_be051343f8cc84d0
 two-phase-never-a-subject	module::_json::with_marker__spec_closure_c6c1c277beec8e45
-two-phase-never-a-subject	module::_pickle::pickling_error__spec__str_7b409ed089793193
+two-phase-never-a-subject	module::_pickle::pickling_error__spec__str_3f8edc0698dcf6a6
 two-phase-never-a-subject	module::_ssl::ssl_error__spec__str_812f252fe316a586
 two-phase-never-a-subject	pyre_interpreter::_pypy_generic_alias::create_union
 two-phase-never-a-subject	pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem
@@ -63,6 +63,7 @@ two-phase-never-a-subject	pyre_interpreter::app_functional::is_published_sorted
 two-phase-never-a-subject	pyre_interpreter::argument::<Impl>::_combine_wrapped
 two-phase-never-a-subject	pyre_interpreter::argument::<Impl>::new
 two-phase-never-a-subject	pyre_interpreter::argument::<Impl>::positional_only
+two-phase-never-a-subject	pyre_interpreter::argument::check_not_duplicate_kwargs
 two-phase-never-a-subject	pyre_interpreter::argument::combine_starargs_wrapped
 two-phase-never-a-subject	pyre_interpreter::argument::combine_starstarargs_wrapped
 two-phase-never-a-subject	pyre_interpreter::argument::combine_starstarargs_wrapped::<Impl>::call
@@ -1425,6 +1426,11 @@ two-phase-never-a-subject	pyre_module::module::_lzma::decompressor_methods::__ma
 two-phase-never-a-subject	pyre_module::module::_lzma::decompressor_methods::__majit_wrap_unused_data
 two-phase-never-a-subject	pyre_module::module::_lzma::optional_filter_chain
 two-phase-never-a-subject	pyre_module::module::_lzma::uint32_w
+two-phase-never-a-subject	pyre_module::module::_pickle::pickler::<Impl>::__new__
+two-phase-never-a-subject	pyre_module::module::_pickle::pickler::<Impl>::memo
+two-phase-never-a-subject	pyre_module::module::_pickle::pickler::__majit_wrap_memo
+two-phase-never-a-subject	pyre_module::module::_pickle::unpickler::<Impl>::memo
+two-phase-never-a-subject	pyre_module::module::_pickle::unpickler::__majit_wrap_memo
 two-phase-never-a-subject	pyre_module::module::_queue::<Impl>::default
 two-phase-never-a-subject	pyre_module::module::_queue::parse_timeout
 two-phase-never-a-subject	pyre_module::module::_queue::simplequeue_get
@@ -1437,6 +1443,7 @@ two-phase-never-a-subject	pyre_module::module::_queue::simplequeue_methods::__ma
 two-phase-never-a-subject	pyre_module::module::_queue::simplequeue_methods::__majit_wrap_get
 two-phase-never-a-subject	pyre_module::module::_queue::simplequeue_methods::__majit_wrap_get_nowait
 two-phase-never-a-subject	pyre_module::module::_queue::simplequeue_methods::__majit_wrap_put
+two-phase-never-a-subject	pyre_module::module::_random::<Impl>::new_instance
 two-phase-never-a-subject	pyre_module::module::_ssl::allocate_ssl_session
 two-phase-never-a-subject	pyre_module::module::_ssl::certificate_methods::<Impl>::__hash__
 two-phase-never-a-subject	pyre_module::module::_ssl::certificate_methods::<Impl>::__repr__
@@ -1900,5 +1907,9 @@ two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_ObjectKey
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_StrKey_PyObject_0002512fcef93ae1
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_i64_PyObject_aaa40259a54842f8
 two-phase-never-a-subject	setobject::callback_free_set_op__spec_bool_closure_ee601150793776bc
+two-phase-rtype-skipped	pyre_interpreter::builtins::split_builtin_kwargs
 two-phase-rtype-skipped	pyre_interpreter::module::__pypy__::interp_buffer::__majit_wrap___release_buffer__
+two-phase-rtype-skipped	pyre_interpreter::module::_io::buffered_random::<Impl>::__new__
 two-phase-rtype-skipped	pyre_interpreter::module::_pickle::pickler::__majit_wrap___persistent_id_default
+two-phase-rtype-skipped	pyre_interpreter::type_methods::list_method_extend
+two-phase-rtype-skipped	pyre_interpreter::type_methods::reject_kwargs

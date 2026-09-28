@@ -99,8 +99,8 @@ pub(super) fn is_done_states(oldstate: u8, newstate: u8) -> bool {
 /// never reacquire the GIL.
 static STEP_FINALIZING: AtomicBool = AtomicBool::new(false);
 
-fn user_del_action() -> Option<&'static mut crate::executioncontext::UserDelAction> {
-    let action = crate::executioncontext::space_user_del_action();
+fn user_del_action() -> Option<&'static mut pyre_interpreter::executioncontext::UserDelAction> {
+    let action = pyre_interpreter::executioncontext::space_user_del_action();
     if action.is_null() {
         None
     } else {
@@ -120,7 +120,7 @@ fn user_del_action() -> Option<&'static mut crate::executioncontext::UserDelActi
     any(target_os = "macos", target_os = "linux")
 ))]
 fn run_cpyext_deallocs_now() {
-    crate::cpyext::pyobject::drain_dead();
+    pyre_interpreter::cpyext::pyobject::drain_dead();
 }
 
 /// The builds with no mirrors to release — upstream reaches its
@@ -134,7 +134,7 @@ fn run_cpyext_deallocs_now() {}
 
 /// `interp_gc.py _run_finalizers`: run the queued finalizers now, re-enabling
 /// them for the duration when the app level disabled them.
-pub(super) fn _run_finalizers() -> Result<(), crate::PyError> {
+pub(super) fn _run_finalizers() -> Result<(), pyre_interpreter::PyError> {
     let Some(uda) = user_del_action() else {
         return Ok(());
     };
@@ -169,7 +169,7 @@ pub(crate) fn run_finalizers_now() {
 }
 
 /// `interp_gc.py collect`.
-pub(super) fn collect(generation: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn collect(generation: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // `interp_gc.py collect` unwraps the optional generation as an int
     // and then ignores it, because the frontend it belongs to has no
     // generations to select between.  This one does: `NUM_GENERATIONS`
@@ -181,12 +181,14 @@ pub(super) fn collect(generation: PyObjectRef) -> Result<PyObjectRef, crate::PyE
     //
     // The default is the oldest generation, so a bare `gc.collect()`
     // is the full collection it has always been.
-    let generation = crate::baseobjspace::int_w(crate::baseobjspace::space_index(generation)?)?;
+    let generation = pyre_interpreter::baseobjspace::int_w(
+        pyre_interpreter::baseobjspace::space_index(generation)?,
+    )?;
     if !(0..NUM_GENERATIONS).contains(&generation) {
-        return Err(crate::PyError::value_error("invalid generation"));
+        return Err(pyre_interpreter::PyError::value_error("invalid generation"));
     }
-    crate::baseobjspace::clear_method_cache();
-    crate::objspace::std::mapdict::clear_map_attr_cache();
+    pyre_interpreter::baseobjspace::clear_method_cache();
+    pyre_interpreter::objspace::std::mapdict::clear_map_attr_cache();
     pyre_object::gc_hook::try_gc_collect(generation);
     _run_finalizers()?;
     run_cpyext_deallocs_now();
@@ -198,7 +200,7 @@ pub(super) fn collect(generation: PyObjectRef) -> Result<PyObjectRef, crate::PyE
 }
 
 /// `interp_gc.py collect_step`, running `StepCollector.do`.
-pub(super) fn collect_step() -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn collect_step() -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // interp_gc.py StepCollector: the app-level finalizer drain
     // is a virtual fifth state after the collector has returned to
     // SCANNING.
@@ -217,7 +219,7 @@ pub(super) fn collect_step() -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `interp_gc.py enable`.
-pub(super) fn enable(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn enable(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     pyre_object::gc_hook::try_gc_set_enabled(true);
     GC_ENABLED.store(true, Ordering::Relaxed);
     if let Some(uda) = user_del_action()
@@ -230,7 +232,7 @@ pub(super) fn enable(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 }
 
 /// `interp_gc.py disable`.
-pub(super) fn disable(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn disable(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     pyre_object::gc_hook::try_gc_set_enabled(false);
     GC_ENABLED.store(false, Ordering::Relaxed);
     if let Some(uda) = user_del_action()
@@ -243,7 +245,7 @@ pub(super) fn disable(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 /// `interp_gc.py isenabled`.
-pub(super) fn isenabled(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn isenabled(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let enabled = match user_del_action() {
         Some(action) => action.enabled_at_app_level,
         None => GC_ENABLED.load(Ordering::Relaxed),
@@ -252,12 +254,12 @@ pub(super) fn isenabled(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 }
 
 /// `interp_gc.py enable_finalizers`.
-pub(super) fn enable_finalizers() -> Result<(), crate::PyError> {
+pub(super) fn enable_finalizers() -> Result<(), pyre_interpreter::PyError> {
     // Unlike gc.enable(), an unmatched enable is an error rather than a
     // no-op. Before UserDelAction is installed there cannot have been a
     // matching disable, so that is the same zero lock depth.
     let Some(uda) = user_del_action().filter(|uda| uda.finalizers_lock_count > 0) else {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "finalizers are already enabled",
         ));
     };
@@ -295,10 +297,12 @@ pub(super) fn disable_finalizers() {
 // `set_threshold(threshold0, threshold1=None, threshold2=None)` — the
 // optional tail leaves no single natural arity, so the body enforces
 // the count itself.
-pub(super) fn set_threshold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
+pub(super) fn set_threshold(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
+        return Err(pyre_interpreter::PyError::type_error(
             "set_threshold() takes no keyword arguments",
         ));
     }
@@ -306,7 +310,7 @@ pub(super) fn set_threshold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     // threshold2]])` writes only the positions it was given, and
     // parses every argument before writing any of them.
     if positional.is_empty() || positional.len() > 3 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "gc.set_threshold requires 1 to 3 arguments",
         ));
     }
@@ -317,7 +321,7 @@ pub(super) fn set_threshold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     for &w_value in positional {
         // The index protocol, so an object carrying only `__int__` is
         // a TypeError rather than a silent conversion.
-        given.push(crate::builtins::space_index_w(w_value)?);
+        given.push(pyre_interpreter::builtins::space_index_w(w_value)?);
     }
     for (slot, value) in GC_THRESHOLD.iter().zip(given) {
         slot.store(value, Ordering::Relaxed);
@@ -325,7 +329,9 @@ pub(super) fn set_threshold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     Ok(w_none())
 }
 
-pub(super) fn get_threshold(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_threshold(
+    _args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(w_tuple_new(
         GC_THRESHOLD
             .iter()
@@ -362,7 +368,7 @@ pub(super) fn get_threshold(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 // code allocates without passing any counter site, and a virtualized
 // allocation is removed outright.  Counting by walking instead is what
 // `gc.get_objects` costs, four orders of magnitude above this call.
-pub(super) fn get_count(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_count(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let mut fields = pyre_object::gc_roots::RootedItems::new();
     fields.push(w_int_new(0));
     fields.push(w_int_new(
@@ -372,31 +378,33 @@ pub(super) fn get_count(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     Ok(w_tuple_new(fields.take()))
 }
 
-pub(super) fn get_debug(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_debug(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(w_int_new(GC_DEBUG.load(Ordering::Relaxed)))
 }
 
-pub(super) fn set_debug(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn set_debug(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // `gc_set_debug_impl` parses a C int through the index protocol.
     // Convert before storing so a failed conversion leaves the old
     // process-wide word untouched.
-    let flags = crate::baseobjspace::c_int_w(crate::baseobjspace::space_index(args[0])?)?;
+    let flags = pyre_interpreter::baseobjspace::c_int_w(
+        pyre_interpreter::baseobjspace::space_index(args[0])?,
+    )?;
     GC_DEBUG.store(flags as i64, Ordering::Relaxed);
     Ok(w_none())
 }
 
-pub(super) fn is_tracked(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn is_tracked(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // CPython 3.14 `PyObject_GC_IsTracked` first requires
     // `_PyObject_IS_GC`, then asks the collector's tracked state. Host
     // fallback objects are outside MiniMark and retain their type-level
     // answer; managed objects must not bypass `GCBase.is_tracked`.
-    let eligible = crate::typedef::cpython_object_is_gc(args[0]);
+    let eligible = pyre_interpreter::typedef::cpython_object_is_gc(args[0]);
     let tracked = !majit_gc::gc_owns_object(args[0] as usize)
         || majit_gc::is_tracked(majit_ir::GcRef(args[0] as usize));
     Ok(w_bool_from(eligible && tracked))
 }
 
-pub(super) fn is_finalized(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn is_finalized(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(w_bool_from(majit_gc::gc_finalizer_has_run(
         args[0] as usize,
     )))
@@ -414,14 +422,16 @@ pub(super) fn is_finalized(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 // immortal until `unfreeze` and has its `__del__` deferred until then.
 // That is a third behaviour, matching neither side, and the whole live
 // set is what it would apply to.
-pub(super) fn freeze(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn freeze(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(w_none())
 }
 
-pub(super) fn unfreeze(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn unfreeze(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(w_none())
 }
 
-pub(super) fn get_freeze_count(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn get_freeze_count(
+    _args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(w_int_new(0))
 }

@@ -1,4 +1,5 @@
 # pyre-check: no-cpython
+# pyre-check: requires-modules=gc
 # pyre-check: skip-backends=wasm
 # The wasm guest has no OS-thread implementation, while this fixture verifies
 # which native mutator dispatches an object-space GC action.

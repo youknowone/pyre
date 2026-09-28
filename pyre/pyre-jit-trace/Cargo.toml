@@ -82,3 +82,7 @@ insta = { workspace = true }
 # compiling pyre-interpreter under `cfg(test)`; enable its `test-hooks` feature
 # so the thread-local dict hash hook is installed on the test threads.
 pyre-interpreter = { workspace = true, features = ["host_env", "test-hooks"] }
+# `_random` lives in `pyre-module`, so the residual address its jitcodes call
+# is published by that crate's optional-module hooks rather than by the
+# interpreter's own table.
+pyre-module = { workspace = true, features = ["host_env"] }

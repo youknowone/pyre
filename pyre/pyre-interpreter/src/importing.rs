@@ -511,6 +511,9 @@ pub enum ModuleGcLayout {
     /// An `rclass.OBJECT` subclass walked by its own trace hook
     /// (`rgc.register_custom_trace_hook`).
     CustomTrace(majit_gc::trace::CustomTraceFn),
+    /// Inline pointer offsets only. The type has no Python-visible vtable and
+    /// no `pytype_to_tid` entry (`TypeInfo::with_gc_ptrs`).
+    WithGcPtrs,
 }
 
 /// One GC type a module owns: its layout and, when it holds native state,
@@ -578,6 +581,12 @@ pub struct OptionalModuleHooks {
     pub libffi_cif_shape: unsafe fn(usize) -> Option<LibffiCifShape>,
     /// The name of the canonical `math` builtin a callable is, if any.
     pub math_builtin_name: fn(PyObjectRef) -> Option<&'static str>,
+    /// `interp_gc.py`'s app-level hook object, installed once when the
+    /// execution context binds the shared action flag.
+    pub gc_initialize: fn(PyObjectRef, &mut (dyn crate::executioncontext::ActionFlagOps + 'static)),
+    /// `interp_gc.py _run_finalizers`, with the enable/disable bracket the
+    /// module keeps around `UserDelAction._run_finalizers`.
+    pub gc_run_finalizers_now: fn(),
 }
 
 static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();
@@ -842,8 +851,8 @@ pub fn install_builtin_modules() {
 
     // Host-access modules — arbitrary FFI (`_ctypes`), real signals.
     // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp`, `errno`, `_stat`,
-    // `_pypy_generic_alias`, and the Windows host modules other than `winreg`
-    // live in `pyre-module`.  None of the host
+    // `_pypy_generic_alias`, `gc`, `_pickle`, `_random`, and the Windows host
+    // modules other than `winreg` live in `pyre-module`.  None of the host
     // ones belong to the mediated ll_os/ll_time surface, so the sandbox
     // interpreter omits them entirely: `import _ctypes` then raises
     // ModuleNotFoundError, as in a build whose syscall code is absent.
@@ -857,11 +866,8 @@ pub fn install_builtin_modules() {
         pyre_install_module!("_signal"(signal));
     }
     pyre_install_module!(_locale);
-    pyre_install_module!(_random);
-    pyre_install_module!(_pickle);
     register_collectible_builtin_module("_struct", crate::module::r#struct::init);
     pyre_install_module!(marshal);
-    pyre_install_module!(gc);
 
     // Modules whose stdlib wrapper does `import X` + attribute access or
     // `from X import *` are deliberately NOT stubbed here: an empty stub

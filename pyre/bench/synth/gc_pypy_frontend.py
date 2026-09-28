@@ -1,3 +1,4 @@
+# pyre-check: requires-modules=gc
 # pyre-check: no-cpython
 # pyre-check: jitstats-band=guard_failures=8
 # The `<module>` list comprehension over gc.get_rpy_roots() is hot in pyre

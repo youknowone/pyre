@@ -648,7 +648,13 @@ fn eval_loop_custom_match_gets_catch_and_rewrap() {
 /// Count the raise-path calls in `name`'s lowered graph: fused, unfused
 /// materialisations, and surviving `PyError` constructors.
 fn raise_path_calls(name: &str) -> (usize, usize, usize) {
-    let graph = lower_function(interp(), name).unwrap_or_else(|e| panic!("lower {name}: {e:?}"));
+    raise_path_calls_in(interp(), name)
+}
+
+/// The same count against a named artefact, for a wrapper whose module is not
+/// in `pyre-interpreter`.
+fn raise_path_calls_in(llbc: &'static Llbc, name: &str) -> (usize, usize, usize) {
+    let graph = lower_function(llbc, name).unwrap_or_else(|e| panic!("lower {name}: {e:?}"));
     let (mut fused, mut materialise, mut ctors) = (0, 0, 0);
     for block in &graph.blocks {
         for op in &block.operations {
@@ -742,10 +748,15 @@ fn gateway_wrapper_refusals_all_residualize() {
     // reports a runtime receiver type, so unlike its two neighbours it could
     // never have been a literal, and left transparent it put one
     // materialisation in the wrapper per call site.
-    for name in ["__majit_wrap_random", "__majit_wrap_getvalue"] {
-        let (fused, materialise, ctors) = raise_path_calls(name);
+    // `_random` lives in `pyre-module`, so `__majit_wrap_random`'s graph is in
+    // that artefact rather than the interpreter's.
+    for (llbc, name) in [
+        (optional_module(), "__majit_wrap_random"),
+        (interp(), "__majit_wrap_getvalue"),
+    ] {
+        let (fused, materialise, ctors) = raise_path_calls_in(llbc, name);
         assert_eq!((fused, materialise, ctors), (0, 0, 0), "{name}");
-        let graph = lower_function(interp(), name).expect("lower");
+        let graph = lower_function(llbc, name).expect("lower");
         let residuals = graph
             .blocks
             .iter()

@@ -15,8 +15,6 @@ pub mod _immutables_map;
 pub mod _io;
 pub mod _locale;
 pub mod _opcode;
-pub mod _pickle;
-pub mod _random;
 pub mod _sre;
 pub mod _stat;
 pub mod _structseq;
@@ -35,7 +33,6 @@ pub mod atexit;
 pub mod errno;
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 pub mod faulthandler;
-pub mod gc;
 pub mod imp;
 pub mod importlib;
 pub mod itertools;

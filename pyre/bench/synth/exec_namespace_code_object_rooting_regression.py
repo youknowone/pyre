@@ -1,5 +1,7 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=warm
+# pyre-check: requires-modules=gc
+# The guard forces the collection it checks with `gc.collect`.
 # Self-checking regression guard for the operands `exec` / `eval` thread from
 # the code object's construction to the frame that runs it.
 #
