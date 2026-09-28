@@ -362,6 +362,9 @@ fn layout_measure(llbc: &crate::Llbc, raw: &str, target: &str, field: &str) -> O
     layout_u64_resolved(llbc, entry.get("value")?.get(field)?, 0)
 }
 
+/// A layout expression (`size` / `align`). Its `Deduplicated` ids index the
+/// layout-expression table; the payload of a `Constant` is a constant
+/// expression, whose ids index the const table instead.
 fn layout_u64_resolved(llbc: &crate::Llbc, v: &Value, depth: u8) -> Option<u64> {
     if depth > 24 {
         return None;
@@ -370,13 +373,8 @@ fn layout_u64_resolved(llbc: &crate::Llbc, v: &Value, depth: u8) -> Option<u64> 
         return Some(n);
     }
     if let Some(id) = v.get("Deduplicated").and_then(Value::as_u64) {
-        if let Some(body) = llbc.layout_scalar_body(id)
-            && let Some(n) = layout_u64_resolved(llbc, body, depth + 1)
-        {
-            return Some(n);
-        }
         return llbc
-            .dedup_const_body(id)
+            .layout_scalar_body(id)
             .and_then(|body| layout_u64_resolved(llbc, body, depth + 1));
     }
     if let Some(chosen) = v.get("chosen") {
@@ -390,11 +388,35 @@ fn layout_u64_resolved(llbc: &crate::Llbc, v: &Value, depth: u8) -> Option<u64> 
         return layout_u64_resolved(llbc, body, depth + 1);
     }
     if let Some(constant) = v.get("Constant") {
-        return layout_u64_resolved(llbc, constant, depth + 1);
+        return layout_const_u64(llbc, constant, depth + 1);
+    }
+    None
+}
+
+/// A constant expression `[kind, ty]`, inline, as `{"Value": [id, [kind,
+/// ty]]}`, or as `{"Deduplicated": id}` in the const table.
+fn layout_const_u64(llbc: &crate::Llbc, v: &Value, depth: u8) -> Option<u64> {
+    if depth > 24 {
+        return None;
+    }
+    if let Some(n) = layout_u64_literal(v) {
+        return Some(n);
+    }
+    if let Some(id) = v.get("Deduplicated").and_then(Value::as_u64) {
+        return llbc
+            .dedup_const_body(id)
+            .and_then(|body| layout_const_u64(llbc, body, depth + 1));
+    }
+    if let Some(body) = v
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|a| a.get(1))
+    {
+        return layout_const_u64(llbc, body, depth + 1);
     }
     v.as_array()
         .and_then(|a| a.first())
-        .and_then(|b| layout_u64_resolved(llbc, b, depth + 1))
+        .and_then(|kind| layout_const_u64(llbc, kind, depth + 1))
 }
 
 impl TypeLayout {
