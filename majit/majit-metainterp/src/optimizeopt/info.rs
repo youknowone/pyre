@@ -1150,7 +1150,7 @@ fn force_box_impl(
     // When called from EarlyForce pass, current_pass_idx == earlyforce_idx
     // so emit_extra automatically routes from earlyforce.next.
     // When called from _emit_operation, in_final_emission=true → direct.
-    let emit_op = |ctx: &mut crate::optimizeopt::OptContext, op: Op| -> OpRef {
+    let emit_op = |ctx: &mut crate::optimizeopt::OptContext, op: Op| -> majit_ir::OpRc {
         if ctx.in_final_emission {
             // optimizer.py `Optimizer.emit_extra` → `emit` →
             // `_emit_operation`: `arg = self.force_box(op.getarg(i))`.
@@ -1164,9 +1164,13 @@ fn force_box_impl(
                     op.setarg(i, forced_box);
                 }
             }
-            ctx.emit(op)
+            let op = majit_ir::OpRc::new(op);
+            ctx.emit_rc(op.clone());
+            op
         } else {
-            ctx.emit_extra(ctx.current_pass_idx, op)
+            let op = majit_ir::OpRc::new(op);
+            ctx.emit_extra_rc(ctx.current_pass_idx, op.clone());
+            op
         }
     };
 
@@ -1283,7 +1287,8 @@ fn force_box_impl(
             // about the same concrete allocation.
             new_op.pos().set(opref);
             new_op.setdescr(vinfo.descr.clone());
-            let alloc_ref = emit_op(ctx, new_op);
+            let alloc_rc = emit_op(ctx, new_op);
+            let alloc_ref = alloc_rc.pos().get();
             // info.py `newop.set_forwarded(self)` — unconditional.
             // The just-emitted alloc op is bound, so its resolved box
             // carries the PtrInfo install.
@@ -1315,7 +1320,7 @@ fn force_box_impl(
                 if w_class_store_is_covered_by_alloc(&vinfo.descr, &descr, &value_ref, ctx) {
                     continue;
                 }
-                let arg_alloc = ctx.materialize_operand_at(alloc_ref);
+                let arg_alloc = Operand::from_bound_op(&alloc_rc);
                 let arg_value = ctx.resolve_operand_operand(&value_ref);
                 let mut set_op =
                     Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
@@ -1349,7 +1354,8 @@ fn force_box_impl(
             // about the same concrete allocation.
             new_op.pos().set(opref);
             new_op.setdescr(vinfo.descr.clone());
-            let alloc_ref = emit_op(ctx, new_op);
+            let alloc_rc = emit_op(ctx, new_op);
+            let alloc_ref = alloc_rc.pos().get();
             // info.py `newop.set_forwarded(self)` — unconditional.
             if let Some(b) = ctx.get_box_replacement_operand_opt(alloc_ref) {
                 ctx.set_ptr_info(&b, preserved);
@@ -1387,7 +1393,7 @@ fn force_box_impl(
                 if w_class_store_is_covered_by_alloc(&vinfo.descr, &descr, &value_ref, ctx) {
                     continue;
                 }
-                let arg_alloc = ctx.materialize_operand_at(alloc_ref);
+                let arg_alloc = Operand::from_bound_op(&alloc_rc);
                 let arg_value = ctx.resolve_operand_operand(&value_ref);
                 let mut set_op =
                     Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
@@ -1412,13 +1418,13 @@ fn force_box_impl(
                 last_guard_pos: -1,
             });
 
-            let len_ref = ctx.make_constant_int(len as i64);
+            let len_ref = Operand::const_(majit_ir::Const::Int(len as i64));
             let alloc_opcode = if vinfo.clear {
                 OpCode::NewArrayClear
             } else {
                 OpCode::NewArray
             };
-            let arg_len = ctx.materialize_operand_at(len_ref);
+            let arg_len = len_ref.clone();
             let mut alloc_op = Op::new(alloc_opcode, std::slice::from_ref(&arg_len));
             alloc_op.pos().set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
@@ -1464,9 +1470,9 @@ fn force_box_impl(
                     }
                 }
                 let subbox = force_child(&item_ref, ctx);
-                let idx_ref = ctx.make_constant_int(i as i64);
-                let arg_alloc = ctx.materialize_operand_at(alloc_ref);
-                let arg_idx = ctx.materialize_operand_at(idx_ref);
+                let idx_ref = Operand::const_(majit_ir::Const::Int(i as i64));
+                let arg_alloc = Operand::from_bound_op(&alloc_rc);
+                let arg_idx = idx_ref.clone();
                 let arg_sub = ctx.resolve_operand_operand(&subbox);
                 let mut set_op = Op::new(
                     OpCode::SetarrayitemGc,
@@ -1505,12 +1511,13 @@ fn force_box_impl(
                 last_guard_pos: -1,
             });
 
-            let len_ref = ctx.make_constant_int(num_elements as i64);
-            let arg_len = ctx.materialize_operand_at(len_ref);
+            let len_ref = Operand::const_(majit_ir::Const::Int(num_elements as i64));
+            let arg_len = len_ref.clone();
             let mut alloc_op = Op::new(OpCode::NewArrayClear, std::slice::from_ref(&arg_len));
             alloc_op.pos().set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
-            let alloc_ref = emit_op(ctx, alloc_op);
+            let alloc_rc = emit_op(ctx, alloc_op);
+            let alloc_ref = alloc_rc.pos().get();
             // Install before the interior stores. A child that points back
             // at this box must see the non-virtual array, and `make_equal_to`
             // copies whatever info `op` still holds onto the allocation.
@@ -1542,14 +1549,14 @@ fn force_box_impl(
             //               optforce.emit_extra(setfieldop)
             //           i += 1
             for (elem_idx, fields) in element_fields.into_iter().enumerate() {
-                let idx_ref = ctx.make_constant_int(elem_idx as i64);
+                let idx_ref = Operand::const_(majit_ir::Const::Int(elem_idx as i64));
                 for (field_idx, value_ref) in fields {
                     if value_ref.is_none() {
                         continue;
                     }
                     let subbox = force_child(&value_ref, ctx);
-                    let arg_alloc = ctx.materialize_operand_at(alloc_ref);
-                    let arg_idx = ctx.materialize_operand_at(idx_ref);
+                    let arg_alloc = Operand::from_bound_op(&alloc_rc);
+                    let arg_idx = idx_ref.clone();
                     let arg_sub = ctx.resolve_operand_operand(&subbox);
                     let mut set_op = Op::new(
                         OpCode::SetinteriorfieldGc,
@@ -1572,16 +1579,17 @@ fn force_box_impl(
             let calldescr = vinfo.calldescr.take();
 
             // info.py:148: emit CALL_I(func, ConstInt(size), descr=calldescr)
-            let func_ref = ctx.make_constant_int(func);
-            let size_ref = ctx.make_constant_int(size as i64);
-            let arg_func = ctx.materialize_operand_at(func_ref);
-            let arg_size = ctx.materialize_operand_at(size_ref);
+            let func_ref = Operand::const_(majit_ir::Const::Int(func));
+            let size_ref = Operand::const_(majit_ir::Const::Int(size as i64));
+            let arg_func = func_ref.clone();
+            let arg_size = size_ref.clone();
             let mut call_op = Op::new(OpCode::CallI, &[arg_func.clone(), arg_size.clone()]);
             call_op.pos().set(opref);
             if let Some(d) = calldescr {
                 call_op.setdescr(d);
             }
-            let alloc_ref = emit_op(ctx, call_op);
+            let alloc_rc = emit_op(ctx, call_op);
+            let alloc_ref = alloc_rc.pos().get();
 
             // info.py:152/421 set_forwarded(self). RPython keeps the SAME
             // RawBufferPtrInfo on the forced op and flips it non-virtual via
@@ -1610,7 +1618,7 @@ fn force_box_impl(
             }
 
             // info.py:425: CHECK_MEMORY_ERROR
-            let arg_alloc = ctx.materialize_operand_at(alloc_ref);
+            let arg_alloc = Operand::from_bound_op(&alloc_rc);
             let check_op = Op::new(OpCode::CheckMemoryError, std::slice::from_ref(&arg_alloc));
             emit_op(ctx, check_op);
 
@@ -1624,9 +1632,9 @@ fn force_box_impl(
             // constant-bound int, neither of which upstream does here.
             for (offset, _length, descr, value) in entries {
                 let value_box = ctx.materialize_operand_at(value);
-                let offset_ref = ctx.make_constant_int(offset);
-                let arg_alloc = ctx.materialize_operand_at(alloc_ref);
-                let arg_offset = ctx.materialize_operand_at(offset_ref);
+                let offset_ref = Operand::const_(majit_ir::Const::Int(offset));
+                let arg_alloc = Operand::from_bound_op(&alloc_rc);
+                let arg_offset = offset_ref.clone();
                 let arg_value = ctx.resolve_operand_operand(&value_box);
                 let mut store_op = Op::new(
                     OpCode::RawStore,
@@ -1661,12 +1669,13 @@ fn force_box_impl(
             // raw-slice identity and mis-route any later
             // `get_virtual_fields` / raw-guard path.
             let parent_forced = force_child(&slice.parent, ctx);
-            let offset_ref = ctx.make_constant_int(slice.offset);
+            let offset_ref = Operand::const_(majit_ir::Const::Int(slice.offset));
             let arg_parent = ctx.resolve_operand_operand(&parent_forced);
-            let arg_offset = ctx.materialize_operand_at(offset_ref);
+            let arg_offset = offset_ref.clone();
             let mut add_op = Op::new(OpCode::IntAdd, &[arg_parent.clone(), arg_offset.clone()]);
             add_op.pos().set(opref);
-            let new_ref = emit_op(ctx, add_op);
+            let new_rc = emit_op(ctx, add_op);
+            let new_ref = new_rc.pos().get();
             // Preserve raw-slice identity; mark non-virtual via
             // `parent = OpRef::NONE` (RPython `self.parent = None`).
             // info.py:152 unconditional set_forwarded — the emitted
@@ -1744,7 +1753,8 @@ fn force_box_impl(
             let arg_length = ctx.materialize_operand_at(lengthbox);
             let mut newstr_op = Op::new(new_opcode, std::slice::from_ref(&arg_length));
             newstr_op.pos().set(opref);
-            let newop = emit_op(ctx, newstr_op);
+            let newop_rc = emit_op(ctx, newstr_op);
+            let newop = newop_rc.pos().get();
 
             // vstring.py:98: newop.set_forwarded(self) — unconditional.
             if let Some(b) = ctx.get_box_replacement_operand_opt(newop) {
@@ -1769,7 +1779,7 @@ fn force_box_impl(
             }
 
             // vstring.py: initialize_forced_string(op, optstring, op, CONST_0, mode)
-            let zero = ctx.make_constant_int(0);
+            let zero = Operand::const_(majit_ir::Const::Int(0));
             let set_opcode = if is_unicode {
                 OpCode::Unicodesetitem
             } else {
@@ -1779,15 +1789,15 @@ fn force_box_impl(
             match variant {
                 VStringVariant::Plain(info) => {
                     // vstring.py VStringPlainInfo.initialize_forced_string
-                    let mut offset = ctx.materialize_operand_at(zero);
-                    let one = ctx.make_constant_int(1);
-                    let one = ctx.materialize_operand_at(one);
+                    let mut offset = zero.clone();
+                    let one = Operand::const_(majit_ir::Const::Int(1));
+                    let one = one.clone();
                     for ch in &info._chars {
                         if let Some(ch_ref) = ch {
                             // vstring.py initialize_forced_string get_box_replacement(charbox) — walk the
                             // char operand's own forwarding (object-native).
                             let ch_resolved = ctx.resolve_operand_operand(ch_ref).to_opref();
-                            let arg_newop = ctx.materialize_operand_at(newop);
+                            let arg_newop = Operand::from_bound_op(&newop_rc);
                             let arg_offset = ctx.resolve_operand_operand(&offset);
                             let arg_ch = ctx.materialize_operand_at(ch_resolved);
                             let setitem_op = Op::new(
@@ -1801,8 +1811,8 @@ fn force_box_impl(
                 }
                 VStringVariant::Concat(info) => {
                     // vstring.py VStringConcatInfo.string_copy_parts
-                    let newop_box = ctx.materialize_operand_at(newop);
-                    let zero_box = ctx.materialize_operand_at(zero);
+                    let newop_box = Operand::from_bound_op(&newop_rc);
+                    let zero_box = zero.clone();
                     let offset = crate::optimizeopt::vstring::string_copy_parts(
                         &info.vleft.clone(),
                         &newop_box,
@@ -1820,8 +1830,8 @@ fn force_box_impl(
                 }
                 VStringVariant::Slice(info) => {
                     // vstring.py VStringSliceInfo.string_copy_parts
-                    let newop_box = ctx.materialize_operand_at(newop);
-                    let zero_box = ctx.materialize_operand_at(zero);
+                    let newop_box = Operand::from_bound_op(&newop_rc);
+                    let zero_box = zero.clone();
                     crate::optimizeopt::vstring::copy_str_content(
                         ctx,
                         &info.s.clone(),

@@ -1654,8 +1654,8 @@ impl OptVirtualize {
         let vref_descr: DescrRef = self.vrefinfo.descr.clone();
 
         // virtualize.py:127: token = ResOperation(rop.FORCE_TOKEN, [])
-        let token_op = Op::new(OpCode::ForceToken, &[]);
-        let token_ref = ctx.emit_extra(ctx.current_pass_idx, token_op);
+        let token_op = majit_ir::OpRc::new(Op::new(OpCode::ForceToken, &[]));
+        let token_ref = ctx.emit_extra_rc(ctx.current_pass_idx, token_op.clone());
         if let Some(b) = ctx.get_box_replacement_operand_opt(token_ref) {
             ctx.set_ptr_info(&b, PtrInfo::nonnull());
         }
@@ -1668,7 +1668,7 @@ impl OptVirtualize {
         let fields = majit_ir::ptr_info::VirtualFieldList::from_iter([
             (
                 VREF_VIRTUAL_TOKEN_FIELD_INDEX,
-                ctx.materialize_operand_at(token_ref),
+                Operand::from_bound_op(&token_op),
             ),
             (
                 VREF_FORCED_FIELD_INDEX,

@@ -52,8 +52,7 @@ pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand
             .resolve_operand_operand_opt(box2)
             .and_then(|cb| cb.const_int())
         {
-            let __c = ctx.make_constant_int(v1 + v2);
-            return ctx.materialize_operand_at(__c);
+            return Operand::const_(Const::Int(v1 + v2));
         }
     } else if ctx
         .resolve_operand_operand_opt(box2)
@@ -64,10 +63,10 @@ pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand
     }
     let arg1 = ctx.resolve_operand_operand(box1);
     let arg2 = ctx.resolve_operand_operand(box2);
-    let op = Op::new(OpCode::IntAdd, &[arg1, arg2]);
+    let op = majit_ir::OpRc::new(Op::new(OpCode::IntAdd, &[arg1, arg2]));
     // vstring.py:380 optstring.optimizer.send_extra_operation(op).
-    let __r = ctx.send_extra_operation(op);
-    ctx.materialize_operand_at(__r)
+    ctx.send_extra_operation_rc(op.clone());
+    Operand::from_bound_op(&op)
 }
 
 /// vstring.py copy_str_content(optstring, srcbox, targetbox,
@@ -133,10 +132,7 @@ pub fn copy_str_content(
             // emitting STRGETITEM.
             let mut src_offset = srcoffsetbox.clone();
             let mut dst_offset = offsetbox.clone();
-            let one = {
-                let __one = ctx.make_constant_int(1);
-                ctx.materialize_operand_at(__one)
-            };
+            let one = Operand::const_(Const::Int(1));
             for _i in 0..length {
                 // vstring.py: charbox = optstring.strgetitem(None,
                 // srcbox, srcoffsetbox, mode). OptString is a ZST, so a local
@@ -254,10 +250,7 @@ pub fn string_copy_parts(
         Action::Plain(chars) => {
             // vstring.py VStringPlainInfo.initialize_forced_string
             let mut offset = offsetbox.clone();
-            let one = {
-                let __one = ctx.make_constant_int(1);
-                ctx.materialize_operand_at(__one)
-            };
+            let one = Operand::const_(Const::Int(1));
             for ch in &chars {
                 if let Some(ch_ref) = ch {
                     let arg_char = ctx.resolve_operand_operand(ch_ref);
@@ -513,8 +506,7 @@ impl OptString {
         // index becomes a box: a non-constant INT_ADD when the slice start is
         // not constant, and `start + 0` collapses back to `start`.
         let resolved_s = ctx.resolve_operand_operand(s);
-        let index_const = ctx.make_constant_int(index);
-        let index_const_box = ctx.materialize_operand_at(index_const);
+        let index_const_box = Operand::const_(Const::Int(index));
         let (strbox, index_box) = if let Some(slice) = self.get_slice_info(&resolved_s, ctx) {
             let index_box = _int_add(&slice.start, &index_const_box, ctx);
             (ctx.resolve_operand_operand(&slice.s), index_box)
@@ -902,10 +894,9 @@ impl OptString {
                     dst_chars.push(Some(char_ref));
                 } else {
                     // vstring.py:585-589: self.emit_extra(new_op)
-                    let dst_index_ref = ctx.make_constant_int(dst_start + index);
                     let pass_idx = ctx.current_pass_idx;
                     let arg_dst = ctx.materialize_operand_at(dst_ref.to_opref());
-                    let arg_dst_index = ctx.materialize_operand_at(dst_index_ref);
+                    let arg_dst_index = Operand::const_(Const::Int(dst_start + index));
                     let arg_char = ctx.materialize_operand_at(char_ref);
                     ctx.emit_extra(
                         pass_idx,
@@ -981,16 +972,15 @@ impl OptString {
                 .resolve_operand_operand_opt(a)
                 .and_then(|cb| cb.const_int())
             {
-                let __c = ctx.make_constant_int(va - vb);
-                return ctx.materialize_operand_at(__c);
+                return Operand::const_(Const::Int(va - vb));
             }
         }
         let arg_a = ctx.resolve_operand_operand(a);
         let arg_b = ctx.resolve_operand_operand(b);
-        let op = Op::new(OpCode::IntSub, &[arg_a.clone(), arg_b.clone()]);
+        let op = majit_ir::OpRc::new(Op::new(OpCode::IntSub, &[arg_a.clone(), arg_b.clone()]));
         // `optimizer.send_extra_operation` re-dispatches from `first_optimization`.
-        let __r = ctx.send_extra_operation(op);
-        ctx.materialize_operand_at(__r)
+        ctx.send_extra_operation_rc(op.clone());
+        Operand::from_bound_op(&op)
     }
 
     /// vstring.py: postprocess — after STRLEN on a known-length string,
@@ -1329,9 +1319,8 @@ impl OptString {
                 return Some(OptimizationResult::Remove);
             }
             // vstring.py:784: PTR_EQ against CONST_NULL (ref-null, not int-zero)
-            let null_const = ctx.make_constant_ref(majit_ir::GcRef::NULL);
             let arg_a = ctx.materialize_operand_at(arg1.to_opref());
-            let arg_null = ctx.materialize_operand_at(null_const);
+            let arg_null = Operand::const_(Const::Ref(majit_ir::GcRef::NULL));
             let mut eq_op = Op::new(OpCode::PtrEq, &[arg_a.clone(), arg_null.clone()]);
             eq_op.pos().set(op.pos().get());
             // vstring.py:785-786: replace_op_with(PTR_EQ, ...) then self.emit(op)
