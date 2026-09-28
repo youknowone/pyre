@@ -7068,12 +7068,12 @@ impl LazyGraph {
     }
 
     /// What the funcobj declares, read without building the graph: the
-    /// built graph when there is one, else the declared header.
+    /// declared header, or the graph of one built from the start.
     pub fn header(&self) -> &FunctionGraph {
-        match (self.0.graph.get(), &self.0.header) {
-            (Some(Some(graph)), _) => graph,
-            (_, Some(header)) => header,
-            (_, None) => unreachable!("a built LazyGraph holds its graph"),
+        match (&self.0.header, self.0.graph.get()) {
+            (Some(header), _) => header,
+            (None, Some(Some(graph))) => graph,
+            (None, _) => unreachable!("a LazyGraph without a header is built"),
         }
     }
 

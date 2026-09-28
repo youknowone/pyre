@@ -962,8 +962,61 @@ use crate::model::GraphKey;
 /// from the retired per-effect `GraphId` surrogate: effects live on
 /// `graph.func` inside the shared graph, never in a side table keyed by a
 /// surrogate token.
+///
+/// The store is shared with the call registry's pending lifts
+/// ([`StoredBody`]), the way `FunctionDesc.buildgraph` reaches the
+/// translator's graphs through the bookkeeper. A write while a pending lift
+/// still holds the store copies it, so the lift reads the store as it was
+/// when the registry was populated.
 #[derive(Default)]
-pub(crate) struct GraphStore {
+pub(crate) struct GraphStore(std::rc::Rc<StoreCore>);
+
+impl std::ops::Deref for GraphStore {
+    type Target = StoreCore;
+
+    fn deref(&self) -> &StoreCore {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for GraphStore {
+    fn deref_mut(&mut self) -> &mut StoreCore {
+        std::rc::Rc::make_mut(&mut self.0)
+    }
+}
+
+impl GraphStore {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The graph of the funcobj `path` names, for a reader that outlives
+    /// this borrow of the store.
+    pub(crate) fn body(&self, path: &CallPath) -> Option<StoredBody> {
+        Some(StoredBody {
+            store: std::rc::Rc::clone(&self.0),
+            key: self.path_to_key.get(path)?.clone(),
+        })
+    }
+}
+
+/// A funcobj's graph as its [`GraphStore`] builds it on first demand.
+#[derive(Clone)]
+pub(crate) struct StoredBody {
+    store: std::rc::Rc<StoreCore>,
+    key: GraphKey,
+}
+
+impl StoredBody {
+    /// The funcobj's graph; `None` when its build produced no graph.
+    pub(crate) fn graph(&self) -> Option<std::rc::Rc<FunctionGraph>> {
+        let slot = self.store.graphs.get(&self.key)?;
+        self.store.slot_graph(slot).map(|built| built.graph.clone())
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct StoreCore {
     path_to_key: HashMap<CallPath, GraphKey>,
     graphs: HashMap<GraphKey, GraphSlot>,
     /// Whole-store rewrites that have run, in order, with the inputs each
@@ -991,6 +1044,7 @@ pub(crate) struct GraphStore {
 /// with the call registry's pending lift of this body
 /// (`FunctionDesc::source_graph`). A write while a pending lift still holds
 /// it copies the graph, so the lift reads the body as it was registered.
+#[derive(Clone)]
 struct GraphSlot {
     graph: std::cell::OnceCell<Option<BuiltGraph>>,
     /// The funcobj the graph is built from; `None` for a slot registered
@@ -1009,11 +1063,13 @@ struct GraphSlot {
     building: std::cell::Cell<bool>,
 }
 
+#[derive(Clone)]
 struct SlotSource {
     graph: crate::model::LazyGraph,
     transform: GraphTransform,
 }
 
+#[derive(Clone)]
 struct BuiltGraph {
     graph: std::rc::Rc<FunctionGraph>,
     signature: Signature,
@@ -1062,7 +1118,7 @@ impl GraphTransform {
 
 /// `graph.func` attributes, hints and return type written onto a funcobj
 /// whose graph is not built yet, folded onto the graph when it is.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FuncObjAttrs {
     func: crate::model::FuncEffects,
     hints: Vec<String>,
@@ -1110,7 +1166,7 @@ type TraitMethodImpls = HashMap<(String, String), Vec<String>>;
 
 impl GraphSlot {
     fn built(graph: std::rc::Rc<FunctionGraph>) -> Self {
-        let signature = GraphStore::signature_from_graph(&graph);
+        let signature = StoreCore::signature_from_graph(&graph);
         Self {
             graph: std::cell::OnceCell::from(Some(BuiltGraph { graph, signature })),
             source: None,
@@ -1185,15 +1241,11 @@ impl<'a> AttrsMut<'a> {
     }
 }
 
-impl GraphStore {
-    fn new() -> Self {
-        Self::default()
-    }
-
+impl StoreCore {
     /// Derive a funcobj's parameter [`Signature`] from its startblock
     /// inputargs.  `varargname` / `kwargname` are `None`: a Rust-source
     /// funcobj has no `*args` / `**kwargs` formal.
-    fn signature_from_graph(graph: &FunctionGraph) -> Signature {
+    pub(crate) fn signature_from_graph(graph: &FunctionGraph) -> Signature {
         let startblock = graph.block(graph.startblock);
         let argnames: Vec<String> = startblock
             .inputargs
@@ -1235,6 +1287,27 @@ impl GraphStore {
                 })
             })
             .as_ref()
+    }
+
+    /// What the slot's funcobj declares, read without building its graph:
+    /// the built graph, or the header the funcobj was declared with under
+    /// this registration's stamps and the attributes written onto it. The
+    /// store passes rewrite operations only, so the header needs none of
+    /// them. `None` when the build produced no graph.
+    fn slot_declaration(&self, slot: &GraphSlot) -> Option<std::rc::Rc<FunctionGraph>> {
+        if slot.building.get() {
+            return None;
+        }
+        match slot.graph.get() {
+            Some(built) => built.as_ref().map(|built| built.graph.clone()),
+            None => {
+                let source = slot.source.as_ref()?;
+                let mut header = FunctionGraph::clone(source.graph.header());
+                source.transform.apply(&mut header);
+                slot.attrs.apply(&mut header);
+                Some(std::rc::Rc::new(header))
+            }
+        }
     }
 
     /// Build every slot, so a whole-store reader sees every funcobj.
@@ -1512,6 +1585,18 @@ impl GraphStore {
         })
     }
 
+    /// `(alias path, declaration)` for every registered spelling, without
+    /// building a graph: the `code` object each `FunctionDesc` is made
+    /// from (`bookkeeper.py getdesc`), its graph built at `cachedgraph`.
+    pub(crate) fn iter_declared(
+        &self,
+    ) -> impl Iterator<Item = (&CallPath, std::rc::Rc<FunctionGraph>)> {
+        self.path_to_key.iter().filter_map(move |(p, k)| {
+            let slot = self.graphs.get(k)?;
+            Some((p, self.slot_declaration(slot)?))
+        })
+    }
+
     /// Remove one built graph so a caller can mutate it while still
     /// borrowing the rest of the store. Alias paths keep their `GraphKey`.
     fn take_graph(&mut self, key: &GraphKey) -> Option<FunctionGraph> {
@@ -1547,7 +1632,7 @@ impl GraphStore {
 /// recorded them: the impl map and wrapper family it read, and the store's
 /// graphs for the declared result type.
 struct StoreIndirectFamilies<'a> {
-    store: &'a GraphStore,
+    store: &'a StoreCore,
     trait_method_impls: &'a TraitMethodImpls,
     builtin_wrappers: &'a [CallPath],
 }

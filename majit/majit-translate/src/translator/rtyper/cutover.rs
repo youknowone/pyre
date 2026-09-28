@@ -2071,9 +2071,10 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     }
     let mut pending: Vec<(
         FunctionPathKey,
-        &Rc<LegacyGraph>,
+        Rc<LegacyGraph>,
         Rc<FunctionEntry>,
-        &Signature,
+        Signature,
+        crate::codewriter::call::StoredBody,
     )> = Vec::with_capacity(function_graphs.len());
     // `by_canonical_path` tracks the canonical `FunctionPathKey` of
     // the first-encountered alias for each canonical-stripped key.
@@ -2082,7 +2083,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // gets exactly one row per distinct callable, with `aliases`
     // carrying the indirection.
     let mut by_canonical_path: HashMap<Vec<String>, FunctionPathKey> = HashMap::new();
-    for (path, graph) in function_graphs.iter_shared() {
+    for (path, graph) in function_graphs.iter_declared() {
         let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
         let canonical_strip = canonical_dedup_key(path);
         // `pyre_object::lltype::malloc[_typed/_stable]` are GC allocation intrinsics,
@@ -2175,9 +2176,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             );
             continue;
         }
-        let signature = function_graphs
-            .signature(path)
-            .expect("iter() path resolves to a stored slot");
+        let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
         let entry = if let Some(canonical_key) = by_canonical_path.get(&canonical_strip) {
             if canonical_key != &key {
                 registry.alias(key.clone(), canonical_key);
@@ -2190,7 +2189,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
                 registry.get_or_register_with_func(
                     key.clone(),
                     signature.clone(),
-                    source_graph_func(graph),
+                    source_graph_func(&graph),
                 )
             });
             by_canonical_path.insert(canonical_strip, key.clone());
@@ -2216,9 +2215,12 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         {
             entry.publish_exception_object_result_signature();
         }
-        pending.push((key, graph, entry, signature));
+        let body = function_graphs
+            .body(path)
+            .expect("a declared path names a funcobj");
+        pending.push((key, graph, entry, signature, body));
     }
-    // `function_graphs.iter_shared()` (`GraphStore` over `path_to_key:
+    // `function_graphs.iter_declared()` (`GraphStore` over `path_to_key:
     // HashMap<CallPath, _>`) yields entries in `std::HashMap` order, which
     // varies run-to-run; sorting by the path key makes the passes below
     // reproducible.
@@ -2295,7 +2297,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     {
         let mut seeded: HashSet<*const FunctionEntry> =
             HashSet::with_capacity(by_canonical_path.len());
-        for (_key, graph, entry, _signature) in &pending {
+        for (_key, graph, entry, _signature, _body) in &pending {
             if !seeded.insert(Rc::as_ptr(entry)) {
                 continue;
             }
@@ -2304,7 +2306,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             }
         }
     }
-    for (key, graph, entry, signature) in &pending {
+    for (key, graph, entry, signature, body) in &pending {
         let entry_ptr = Rc::as_ptr(entry);
         if !lifted.insert(entry_ptr) {
             continue;
@@ -2353,7 +2355,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             if let Some(result_shell) = result_shell {
                 let stub = build_stub_pygraph_with_result_shell(
                     graph.name.clone(),
-                    (*signature).clone(),
+                    signature.clone(),
                     result_shell,
                 );
                 entry.prefill_default_cache(stub);
@@ -2365,8 +2367,8 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             .user_function()
             .expect("registered source callable")
             .clone();
-        let source = Rc::clone(graph);
-        let signature = (*signature).clone();
+        let body = body.clone();
+        let signature = signature.clone();
         // The registry is the body's global namespace; the entry it owns
         // must not keep it alive.
         let globals = Rc::downgrade(registry);
@@ -2375,6 +2377,9 @@ pub(crate) fn populate_call_registry_from_call_graphs(
                 let registry = globals
                     .upgrade()
                     .ok_or_else(|| "the call registry was dropped".to_string())?;
+                let source = body
+                    .graph()
+                    .ok_or_else(|| "the funcobj's graph build produced no graph".to_string())?;
                 lift_callee_to_pygraph_with_func(&source, signature, &registry, func)
                     .map_err(|e| format!("{e}"))
             }),
@@ -2399,7 +2404,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // same-named instance field wins — a function source for a field
     // attribute would union-conflict in `generalize_attr`.
     let bk = registry.bookkeeper();
-    for (key, _graph, entry, _signature) in &pending {
+    for (key, _graph, entry, _signature, _body) in &pending {
         // `CallPath::for_impl_method` splits the module-qualified owner
         // ("pyframe::PyFrame" → [pyframe, PyFrame, method]), so the
         // owner is the second-to-last segment.  Free-function paths
