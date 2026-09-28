@@ -440,9 +440,9 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // A `bytes` source hands back an interior pointer, and the size argument's
     // `__int__` runs arbitrary Python, so the source is pinned across it.
     let roots = pyre_object::gc_roots::push_roots();
-    let src_slot = roots.base();
-    let _ = roots.pin_root(args[1]);
-    let n = pyre_interpreter::baseobjspace::int_w(args[2])?;
+    let args_base = roots.pin_roots(&[args[0], args[1], args[2]]);
+    let src_slot = args_base + 1;
+    let n = pyre_interpreter::baseobjspace::int_w(roots.get(args_base + 2))?;
     if n < 0 {
         return Err(PyError::value_error("negative size"));
     }
@@ -451,11 +451,11 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let n = usize::try_from(n)
         .map_err(|_| PyError::value_error("size does not fit in a machine word"))?;
     let mut dest_buffer = None;
-    let dest = if let Some(cdata) = W_CData::from_obj(args[0]) {
+    let w_dest = roots.get(args_base);
+    let dest = if let Some(cdata) = W_CData::from_obj(w_dest) {
         unsafe_escaping_ptr_for_ptr_or_array(cdata)?
     } else {
-        dest_buffer =
-            Some(unsafe { pyre_interpreter::builtins::WritableBuffer::acquire(args[0]) }?);
+        dest_buffer = Some(unsafe { pyre_interpreter::builtins::WritableBuffer::acquire(w_dest) }?);
         let slice = unsafe { dest_buffer.as_mut().expect("just filled").as_mut_slice() };
         // `_fetch_as_write_buffer`'s non-raw arm writes with `setitem`, which
         // refuses an index past the end, so a request longer than the buffer
@@ -548,8 +548,10 @@ pub fn new_pointer_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `newtype.py new_array_type`.
 pub fn new_array_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let length = newtype::array_length_arg(args[1])?;
-    newtype::new_array_type(args[0], length)
+    let mut w_ctptr = args[0];
+    let w_length = args[1];
+    let length = pyre_object::with_roots!(w_ctptr => newtype::array_length_arg(w_length))?;
+    newtype::new_array_type(w_ctptr, length)
 }
 
 /// `newtype.py new_struct_type`.
@@ -601,8 +603,14 @@ pub fn complete_struct_or_union(args: &[PyObjectRef]) -> Result<PyObjectRef, PyE
 
 /// `newtype.py new_enum_type`.
 pub fn new_enum_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let name = pyre_interpreter::baseobjspace::text_w(args[0])?;
-    newtype::new_enum_type(name, args[1], args[2], args[3])
+    let w_name = args[0];
+    let mut w_enumerators = args[1];
+    let mut w_enumvalues = args[2];
+    let mut w_basectype = args[3];
+    let name = pyre_object::with_roots!(w_enumerators, w_enumvalues, w_basectype =>
+        pyre_interpreter::baseobjspace::text_w(w_name)
+    )?;
+    newtype::new_enum_type(name, w_enumerators, w_enumvalues, w_basectype)
 }
 
 /// `newtype.py new_function_type`.

@@ -846,8 +846,9 @@ fn cdata_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `W_CData.descr_enter`.
 fn cdata_enter(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    enter_exit(args[0], false)?;
-    Ok(args[0])
+    let mut w_self = args[0];
+    pyre_object::with_roots!(w_self => enter_exit(w_self, false))?;
+    Ok(w_self)
 }
 
 /// `W_CData.descr_exit`.
@@ -963,7 +964,8 @@ pub fn maximum_buffer_size(w_cdata: PyObjectRef) -> Result<i64, PyError> {
 
 /// `W_CData.iter`.
 fn cdata_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let cdata = cdata_arg(args[0])?;
+    let mut w_self = args[0];
+    let cdata = pyre_object::with_roots!(w_self => cdata_arg(w_self))?;
     let ct = cdata.ctype_ref()?;
     if ct.kind != ctypeobj::KIND_ARRAY {
         return Err(PyError::type_error(format!(
@@ -971,7 +973,7 @@ fn cdata_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             ct.name()
         )));
     }
-    super::ctypearray::new_cdata_iter(args[0])
+    super::ctypearray::new_cdata_iter(w_self)
 }
 
 /// `W_CData.call`.
@@ -1011,10 +1013,13 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 
 /// `W_CData.getattr`.
 fn cdata_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let cdata = cdata_arg(args[0])?;
+    let mut w_self = args[0];
+    let mut w_name = args[1];
+    let cdata = pyre_object::with_roots!(w_self, w_name => cdata_arg(w_self))?;
     let ct = cdata.ctype_ref()?;
-    let field = ctypeobj::getcfield(ct, pyre_interpreter::baseobjspace::text_w(args[1])?, "read")?;
-    unsafe { super::ctypestruct::read(field, cdata.ptr as *mut u8, args[0]) }
+    let name = pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::text_w(w_name))?;
+    let field = pyre_object::with_roots!(w_self => ctypeobj::getcfield(ct, name, "read"))?;
+    unsafe { super::ctypestruct::read(field, cdata.ptr as *mut u8, w_self) }
 }
 
 /// `W_CData.setattr`.
@@ -1022,13 +1027,13 @@ fn cdata_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // The value outlives a conversion that runs arbitrary Python, so it is
     // read back out of its slot.
     let roots = pyre_object::gc_roots::push_roots();
-    let value_slot = roots.base();
-    let _ = roots.pin_root(args[2]);
-    let cdata = cdata_arg(args[0])?;
+    let args_base = roots.pin_roots(&[args[0], args[1], args[2]]);
+    let value_slot = args_base + 2;
+    let cdata = cdata_arg(roots.get(args_base))?;
     let ct = cdata.ctype_ref()?;
     let field = ctypeobj::getcfield(
         ct,
-        pyre_interpreter::baseobjspace::text_w(args[1])?,
+        pyre_interpreter::baseobjspace::text_w(roots.get(args_base + 1))?,
         "write",
     )?;
     unsafe { super::ctypestruct::write(field, cdata.ptr as *mut u8, roots.get(value_slot))? };

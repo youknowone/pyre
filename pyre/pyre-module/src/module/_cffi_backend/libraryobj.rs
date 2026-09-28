@@ -172,12 +172,12 @@ fn write_variable(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // The conversion runs arbitrary Python, so the value is read back out of
     // its slot rather than out of the native argument array.
     let roots = pyre_object::gc_roots::push_roots();
-    let value_slot = roots.base();
-    let _ = roots.pin_root(args[3]);
-    let lib = library_arg(args[0])?;
+    let args_base = roots.pin_roots(&[args[0], args[1], args[2], args[3]]);
+    let value_slot = args_base + 3;
+    let lib = library_arg(roots.get(args_base))?;
     lib.check_closed()?;
-    let ct = ctypeobj::ctype_arg(args[1])?;
-    let name = pyre_interpreter::baseobjspace::text_w(args[2])?;
+    let ct = ctypeobj::ctype_arg(roots.get(args_base + 1))?;
+    let name = pyre_interpreter::baseobjspace::text_w(roots.get(args_base + 2))?;
     let address = variable_address(lib, name)?;
     unsafe {
         ctypeobj::convert_from_object(ct, address.cast_mut() as usize, roots.get(value_slot))?
