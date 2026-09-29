@@ -687,7 +687,10 @@ fn ref_enum_instantiation_of_adt(
     let suffix = adt_head_instantiation_suffix(adt, llbc)?;
     let def_id = type_decl_ref_adt_id(adt)?;
     let name_path = llbc.type_by_id(def_id)?.item_meta.name_path();
-    let args = render_adt_type_args(adt, llbc, 0);
+    // Payload rows, not the `<…>` class suffix. The suffix stays the
+    // rendered argument (`PyError`); a handle's row is `*mut` of its
+    // `Deref::Target` class so the payload attr and the cast agree.
+    let args = render_adt_payload_type_args(adt, llbc, 0);
     Some(RefEnumInst {
         def_id,
         name_path,
@@ -766,6 +769,12 @@ fn substitute_field_type(ty: &TyRef, args: &[String], llbc: &Llbc) -> String {
             .get(idx as usize)
             .cloned()
             .unwrap_or_else(|| "??typevar_oob".to_string());
+    }
+    // A concrete payload that is itself the handle (a monomorphized
+    // `Result::Err` field) has to name the same class the cast writes.
+    // A type variable already carries that spelling in `args`.
+    if let Some(spelling) = transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves()) {
+        return spelling;
     }
     tyref_to_ast_string(ty, llbc)
 }
@@ -22089,7 +22098,10 @@ impl<'a> Lowering<'a> {
                 if fd.first_arg_local_name().is_some_and(|n| n != "self") {
                     return None;
                 }
-                owner
+                // The ADT id above is still the wrapper. The name the
+                // codewriter falls back to is the class the value carries.
+                gc_handle_method_class_root(self.llbc, fd, adt_def_id, no_tombstoned_leaves())
+                    .unwrap_or(owner)
             }
             // Non-ADT `Self` (primitive / raw pointer / slice): Charon leaves
             // the impl owner type unresolved, so the ADT table has no entry.
@@ -25993,6 +26005,16 @@ impl<'a> Lowering<'a> {
             .get(0)?,
             self.llbc,
         )?;
+        // `Option<PyError>` carries the handle by value. Its class is the
+        // `Deref::Target`, the same root [`enum_payload_instance_class_root`]
+        // paints on `Result::Err`.
+        if let Some(root) = transparent_deref_target_class(
+            &TyRef::Other(payload.clone()),
+            self.llbc,
+            self.tombstoned_leaves,
+        ) {
+            return Some(root);
+        }
         if let Some(root) =
             raw_ptr_pointee_class_root_with(payload, self.llbc, self.tombstoned_leaves)
         {
@@ -27070,6 +27092,9 @@ impl<'a> Lowering<'a> {
             call_result_ty: ValueType::Ref(None),
             call_result_class: None,
             carrier_recv,
+            recv_niche: false,
+            result_niche: false,
+            niche_null_cast: None,
         };
 
         if is_option {
@@ -27079,6 +27104,8 @@ impl<'a> Lowering<'a> {
             site.recv_tag1_owner = some_owner;
             site.payload1_ty = payload_ty;
             site.payload1_class = self.option_payload_instance_class_root(&recv_ty);
+            site.recv_niche = self.tyref_is_niche_option_ptr(&recv_ty);
+            site.niche_null_cast = self.option_niche_null_cast(&recv_ty);
         } else {
             let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
                 self.resolve_result_owners(&recv_ty)?;
@@ -27122,6 +27149,10 @@ impl<'a> Lowering<'a> {
                 site.result_tag1_owner = some_owner;
                 site.result_payload1_ty = payload_ty;
                 site.result_payload1_class = self.option_payload_instance_class_root(dest_ty);
+                site.result_niche = self.tyref_is_niche_option_ptr(dest_ty);
+                if let Some(cast) = self.option_niche_null_cast(dest_ty) {
+                    site.niche_null_cast = Some(cast);
+                }
                 site.call_result_ty = ValueType::Bool;
                 site.args_tuple_suffix = option_payload_tuple_suffix(&recv_ty, self.llbc);
             }
@@ -38311,6 +38342,41 @@ fn fundecl_module(fd: &FunDecl) -> Option<String> {
     (!segs.is_empty()).then(|| segs.join("::"))
 }
 
+/// Class a `repr(transparent)` GC handle's methods are registered on.
+///
+/// `tyref_class_root_with` paints the handle as
+/// [`transparent_deref_target_class`]. `seed_struct_root_method_members`
+/// installs the method on this owner, and `MethodDesc.func_args` prepends
+/// that class (`description.py`), discarding the receiver variable's
+/// annotation. The subject seed binds the same `class_root`. Registering
+/// the method on the wrapper makes `mergeinputargs` union the wrapper
+/// with its `Deref::Target`.
+///
+/// Only a `self` receiver moves. An associated function
+/// (`PyError::from_exc_object`, `PyError::type_error`) stays on the
+/// wrapper path `catch_and_rewrap` looks up. The caller applies
+/// `impl_atomic_alias_leaf` first, so `Atomic<T>` is not retargeted.
+/// The ADT-id check stays on the wrapper: the signature input is still
+/// that type.
+fn gc_handle_method_class_root(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    adt_def_id: u64,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if !first_input_is_adt_free(llbc, fd, adt_def_id) {
+        return None;
+    }
+    // `W_Range::allocate(payload: Self)` presents the owner as its first
+    // input under the source name. Only `self` (or an unnamed monomorphised
+    // receiver) is the method `func_args` rewrites.
+    if fd.first_arg_local_name().is_some_and(|name| name != "self") {
+        return None;
+    }
+    let first = fd.signature.inputs.first()?;
+    transparent_deref_target_class(first, llbc, tombstoned)
+}
+
 fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, String)> {
     let segs = &fd.item_meta.name;
     let last_idx = segs
@@ -38343,7 +38409,8 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
                     Some((module, _)) => format!("{module}::{alias}"),
                     None => alias,
                 },
-                None => owner,
+                None => gc_handle_method_class_root(llbc, fd, adt_def_id, no_tombstoned_leaves())
+                    .unwrap_or(owner),
             }
         }
         // Non-ADT `Self` has no TypeDecl and no `CallTarget::Method`
@@ -44631,6 +44698,13 @@ fn tyref_class_root_with(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    // `OperationError` (`pypy/interpreter/error.py`) carries `w_type` and
+    // `_w_value`. A transparent GC handle is that `Deref::Target`'s class,
+    // not the wrapper's leaf. A bare ADT node takes the same path in
+    // [`adt_node_class_root_with`].
+    if let Some(root) = transparent_deref_target_class(ty, llbc, tombstoned) {
+        return Some(root);
+    }
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     adt_node_class_root_with(node, llbc, tombstoned)
         .or_else(|| raw_ptr_pointee_class_root_with(node, llbc, tombstoned))
@@ -45030,14 +45104,38 @@ fn deref_impl_target_bind(row: &serde_json::Value, trait_id: u64) -> DerefTarget
     }
 }
 
+/// Class root of a type expression that does not re-enter
+/// [`transparent_deref_target_class`]. A `Deref::Target` is already a
+/// struct; its class is the nominal leaf, tombstone spelling included.
+fn nominal_adt_class_root(
+    ty: &serde_json::Value,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let tyref = TyRef::Other(ty.clone());
+    let node = strip_ty_wrappers(tyref_node(&tyref, llbc)?, llbc)?.clone();
+    if let Some(root) = adt_node_class_root_leaf(&node, llbc, tombstoned) {
+        return Some(root);
+    }
+    let raw_pointee = node
+        .as_object()?
+        .get("RawPtr")?
+        .as_array()?
+        .first()?
+        .clone();
+    let pointee = strip_ty_wrappers(&raw_pointee, llbc)?.clone();
+    adt_node_class_root_leaf(&pointee, llbc, tombstoned)
+}
+
 /// Class of a `repr(transparent)` one-field GC handle's `Deref::Target`.
 ///
 /// The field must already be a `Ref` (including `Ref(None)`). `Target`
-/// must be one struct decl; its class is [`tyref_class_root_with`], so a
-/// tombstoned leaf stays disambiguated. No impl, a non-struct `Target`,
-/// or two struct targets with different classes keep the transparent peel.
-/// A struct `Target` with no class root does not apply. Two impls that
-/// name the same class do.
+/// must be one struct decl; its class is [`nominal_adt_class_root`], so a
+/// tombstoned leaf stays disambiguated and the target lookup does not
+/// re-enter this rule. No impl, a non-struct `Target`, or two struct
+/// targets with different classes keep the transparent peel. A struct
+/// `Target` with no class root does not apply. Two impls that name the
+/// same class do.
 fn transparent_deref_target_class(
     ty: &TyRef,
     llbc: &Llbc,
@@ -45101,9 +45199,10 @@ fn transparent_deref_target_class(
             continue;
         }
         // A struct whose class root is `None` (core/std/alloc with type
-        // arguments, via `adt_node_class_root_with`) does not apply.
-        let Some(root) = tyref_class_root_with(&TyRef::Other(target_ty.clone()), llbc, tombstoned)
-        else {
+        // arguments, via the nominal leaf) does not apply. The nominal
+        // root keeps a handle `Target` from re-entering this function
+        // through [`adt_node_class_root_with`].
+        let Some(root) = nominal_adt_class_root(target_ty, llbc, tombstoned) else {
             return None;
         };
         match &class {
@@ -45113,6 +45212,28 @@ fn transparent_deref_target_class(
         }
     }
     class
+}
+
+/// Field-row spelling of a transparent GC handle, or of a raw pointer to one.
+///
+/// `project_struct_field_type` turns the row into the payload class, and
+/// `field_metadata` sizes it. The cast writes the `Deref::Target` class
+/// (`OperationError` carries `w_type` and `_w_value`). A bare class name is
+/// a by-value nested struct of that object's full size; `*mut {class}`
+/// projects to the same class and stays one pointer word.
+fn transparent_handle_field_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if let Some(root) = transparent_deref_target_class(ty, llbc, tombstoned) {
+        return Some(format!("*mut {root}"));
+    }
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = node.as_object()?.get("RawPtr")?.as_array()?.first()?;
+    let pointee_ty = TyRef::Other(pointee.clone());
+    let root = transparent_deref_target_class(&pointee_ty, llbc, tombstoned)?;
+    Some(format!("*mut {root}"))
 }
 
 fn tyref_transparent_inner_value_type(
@@ -45531,7 +45652,30 @@ pub(crate) fn type_decl_ref_builtin(tref: &serde_json::Value) -> Option<&str> {
 
 /// The monomorphic-ADT class root of an (already wrapper-stripped)
 /// type node, or `None` for non-ADTs and generic instantiations.
+///
+/// A `repr(transparent)` GC handle answers with its `Deref::Target`
+/// class (`OperationError` carries `w_type` and `_w_value`). The leaf
+/// below is what a non-handle ADT paints, and what the target itself
+/// resolves to.
 fn adt_node_class_root_with(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if let Some(def_id) = adt_node_def_id(node)
+        && llbc
+            .type_by_id(def_id)
+            .is_some_and(TypeDecl::is_repr_transparent)
+        && let Some(root) =
+            transparent_deref_target_class(&TyRef::Other(node.clone()), llbc, tombstoned)
+    {
+        return Some(root);
+    }
+    adt_node_class_root_leaf(node, llbc, tombstoned)
+}
+
+/// Nominal leaf of an ADT node. Does not apply the `Deref::Target` rule.
+fn adt_node_class_root_leaf(
     node: &serde_json::Value,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
@@ -47039,6 +47183,13 @@ fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
 }
 
 fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
+    // A transparent GC handle is one pointer to its `Deref::Target`.
+    // Spell that pointer before the reference / transparent-scalar arms:
+    // the bare wrapper leaf would project as the wrapper's class, and
+    // the target's own name would be laid out as the whole object.
+    if let Some(spelling) = transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves()) {
+        return spelling;
+    }
     // A reference field is one pointer repr, not an inline copy of its
     // referent.  `tyref_to_ast_string` intentionally erases `&T` for nominal
     // annotation lookup, but feeding that erased spelling to the physical
@@ -47863,6 +48014,39 @@ fn render_adt_type_args(
         .unwrap_or_default()
 }
 
+/// Payload-row spellings of an ADT head's type arguments.
+///
+/// Same order and `Global` / `RandomState` filter as
+/// [`render_adt_type_args`] (that one still spells the `<…>` class
+/// suffix). A transparent GC handle is [`transparent_handle_field_spelling`]
+/// so a substituted `Err` payload projects to the cast's class.
+fn render_adt_payload_type_args(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    depth: usize,
+) -> Vec<String> {
+    type_decl_ref_generics(adt, llbc)
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
+                    if rendered == "Global" || rendered == "RandomState" {
+                        return None;
+                    }
+                    let ty = TyRef::Other(t.clone());
+                    Some(
+                        transparent_handle_field_spelling(&ty, llbc, no_tombstoned_leaves())
+                            .unwrap_or(rendered),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A non-empty synthetic tuple aggregate's classdef carries a `<T0,T1,…>`
 /// suffix rendered from its element types, so `(BigInt,BigInt)` and `(f64,f64)`
 /// get distinct classdefs instead of colliding on the shared `__pos_N`
@@ -48194,6 +48378,13 @@ fn enum_payload_instance_class_root(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    // The payload class and the value's class are one root. A transparent
+    // GC handle stored here is its `Deref::Target`, matching
+    // [`tyref_class_root_with`]. A pointer payload still goes through
+    // [`adt_node_class_root_with`] below.
+    if let Some(root) = transparent_deref_target_class(payload, llbc, tombstoned) {
+        return Some(root);
+    }
     let payload = strip_ty_indirections(tyref_node(payload, llbc)?, llbc)?;
     if let Some(root) = raw_ptr_pointee_class_root_with(payload, llbc, tombstoned) {
         return Some(root);
@@ -51301,6 +51492,14 @@ struct DiscCombinatorSite {
     /// rewrapped like any other `match` on it, and the built `Ok`/`Err`
     /// shells reach the callee rule.
     carrier_recv: bool,
+    /// Receiver is a one-word niche `Option` (nullable pointer). Its tag is
+    /// a null test, and the `Some` payload is the pointer itself.
+    recv_niche: bool,
+    /// The combinator's result is that same nullable pointer.
+    result_niche: bool,
+    /// `None` narrowed to the payload class, when the null must share it
+    /// (`option_niche_null_cast`).
+    niche_null_cast: Option<(String, ValueType)>,
 }
 
 #[derive(Clone)]
@@ -51783,7 +51982,13 @@ fn rewire_option_filter_diamond(
     let (some_bb, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());
     let (none_bb, none_inputs) = graph.create_block_with_arg_vars(none_sources.len());
 
-    let none = emit_option_variant(graph, none_bb, &site.result_owner, 0, None);
+    // A niche result is the pointer or null. An aggregate `None` would make
+    // the caller's null test read a live object.
+    let none = if site.result_niche {
+        emit_niche_null(graph, none_bb, &site.niche_null_cast)
+    } else {
+        emit_option_variant(graph, none_bb, &site.result_owner, 0, None)
+    };
     let none_args = reproduce_exit_args(
         &saved_exit,
         &flow_result,
@@ -51797,13 +52002,19 @@ fn rewire_option_filter_diamond(
     let recv_in = map_source(&some_sources, &some_inputs, &recv)
         .ok_or_else(|| format!("{name}: filter receiver not threaded"))?;
     let env_in = disc_callable_env(site, &some_sources, &some_inputs, env.as_ref(), name)?;
-    let payload = emit_payload_read(
-        graph,
-        some_bb,
-        recv_in,
-        &site.recv_tag1_owner,
-        site.payload1_ty.clone(),
-    );
+    // Niche `Some` stores the pointer in the option word. `__pos_0` would
+    // load a field of that object.
+    let payload = if site.recv_niche {
+        recv_in
+    } else {
+        emit_payload_read(
+            graph,
+            some_bb,
+            recv_in,
+            &site.recv_tag1_owner,
+            site.payload1_ty.clone(),
+        )
+    };
     let pred = emit_disc_callable(
         graph,
         some_bb,
@@ -51825,18 +52036,26 @@ fn rewire_option_filter_diamond(
         .cloned()
         .ok_or_else(|| format!("{name}: filter keep arm missing payload"))?;
     let keep_payload = emit_narrow(graph, keep_bb, keep_payload, &site.result_payload1_class);
-    let some = emit_option_variant(
-        graph,
-        keep_bb,
-        &site.result_owner,
-        1,
-        Some((
-            &site.result_tag1_owner,
-            keep_payload,
-            site.result_payload1_ty.clone(),
-        )),
-    );
-    let drop_none = emit_option_variant(graph, drop_bb, &site.result_owner, 0, None);
+    let some = if site.result_niche {
+        keep_payload
+    } else {
+        emit_option_variant(
+            graph,
+            keep_bb,
+            &site.result_owner,
+            1,
+            Some((
+                &site.result_tag1_owner,
+                keep_payload,
+                site.result_payload1_ty.clone(),
+            )),
+        )
+    };
+    let drop_none = if site.result_niche {
+        emit_niche_null(graph, drop_bb, &site.niche_null_cast)
+    } else {
+        emit_option_variant(graph, drop_bb, &site.result_owner, 0, None)
+    };
 
     let mut keep_exit = Vec::new();
     let mut drop_exit = Vec::new();
@@ -51879,7 +52098,13 @@ fn rewire_option_filter_diamond(
     for _ in ci..=remove_upto {
         graph.blocks[a].operations.remove(ci);
     }
-    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    // Niche tag is `ptr` is not null (`Some` = 1). A `__discriminant`
+    // field read loads the object header.
+    let disc = if site.recv_niche {
+        emit_niche_some_tag(graph, a_id, recv, &site.niche_null_cast)
+    } else {
+        emit_enum_disc_read(graph, a_id, recv, &site.recv_owner)
+    };
     graph.set_branch(a_id, disc, some_bb, some_sources, none_bb, none_sources);
     Ok(())
 }
@@ -52644,6 +52869,63 @@ fn drop_rebuilt_receiver_shell(
         vec![Link::new_mixed(e_exit_args, arm.raise.target, None)],
     );
     Ok(())
+}
+
+/// `Some` tag of a niche `Option`: `eq(is_(ptr, null), false)`.
+///
+/// `is_` is the null test. `ne` compares string and list values, so it is
+/// not a discriminant. The `None` null shares the payload class when
+/// `null_cast` is set (`push_niche_null_ptr`).
+fn emit_niche_some_tag(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    recv: Variable,
+    null_cast: &Option<(String, ValueType)>,
+) -> Variable {
+    let null = emit_niche_null(graph, block, null_cast);
+    let is_none = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(is_none.clone()),
+        kind: OpKind::BinOp {
+            op: "is_".to_string(),
+            lhs: recv,
+            rhs: null,
+            result_ty: ValueType::Int,
+        },
+    });
+    let false_var = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(false_var.clone()),
+        kind: OpKind::ConstBool(false),
+    });
+    let disc = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(disc.clone()),
+        kind: OpKind::BinOp {
+            op: "eq".to_string(),
+            lhs: is_none,
+            rhs: false_var,
+            result_ty: ValueType::Int,
+        },
+    });
+    disc
+}
+
+fn emit_niche_null(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    null_cast: &Option<(String, ValueType)>,
+) -> Variable {
+    let null = graph.push_null_mut_ptr(block);
+    let Some((root, ty)) = null_cast else {
+        return null;
+    };
+    let narrowed = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(narrowed.clone()),
+        kind: crate::model::cast_instance_call_result(root.clone(), null, ty.clone()),
+    });
+    narrowed
 }
 
 fn emit_enum_disc_read(
@@ -57316,6 +57598,9 @@ mod tests {
             call_result_ty: ValueType::Int,
             call_result_class: None,
             carrier_recv: false,
+            recv_niche: false,
+            result_niche: false,
+            niche_null_cast: None,
         };
         let live_before: std::collections::HashSet<_> =
             graph.blocks.iter().map(|block| block.id).collect();
@@ -63811,11 +64096,11 @@ mod tests {
         })
     }
 
-    fn paint_handle(
+    fn load_handle(
         type_decls: Vec<(u64, serde_json::Value)>,
         trait_impls: serde_json::Value,
         query: u64,
-    ) -> ValueType {
+    ) -> (Llbc, TyRef) {
         let file = serde_json::json!({
             "charon_version": "0.1.201",
             "has_errors": false,
@@ -63842,7 +64127,28 @@ mod tests {
             "Value": [9000 + query, adt_body(query)]
         }))
         .expect("query TyRef parses");
+        (llbc, ty)
+    }
+
+    fn paint_handle(
+        type_decls: Vec<(u64, serde_json::Value)>,
+        trait_impls: serde_json::Value,
+        query: u64,
+    ) -> ValueType {
+        let (llbc, ty) = load_handle(type_decls, trait_impls, query);
         super::tyref_to_value_type(&ty, &llbc)
+    }
+
+    fn assert_handle_class(llbc: &Llbc, ty: &TyRef, class: Option<&str>) {
+        let tomb = no_tombstoned_leaves();
+        assert_eq!(
+            super::tyref_class_root_with(ty, llbc, tomb).as_deref(),
+            class
+        );
+        assert_eq!(
+            super::enum_payload_instance_class_root(ty, llbc, tomb).as_deref(),
+            class
+        );
     }
 
     fn pointer_handle_decls() -> Vec<(u64, serde_json::Value)> {
@@ -63921,12 +64227,34 @@ mod tests {
                 "skip_binder": {"value": adt_body(4)}
             }]
         });
-        let painted = paint_handle(
+        let (llbc, ty) = load_handle(
             decls.clone(),
             serde_json::json!([null, blanket, pyerror_deref_impl(23, 2)]),
             3,
         );
-        assert_eq!(painted, ValueType::Ref(Some("PyErrorObject".into())));
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Ref(Some("PyErrorObject".into()))
+        );
+        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
+        // The payload row is one pointer to that class. A bare
+        // `PyErrorObject` would be laid out as the whole object.
+        assert_eq!(
+            super::tyref_to_field_layout_string(&ty, &llbc),
+            "*mut PyErrorObject"
+        );
+        let ptr = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [9103, {"RawPtr": [adt_body(3), "Mut"]}]
+        }))
+        .expect("pointer TyRef parses");
+        assert_eq!(
+            super::enum_payload_instance_class_root(&ptr, &llbc, no_tombstoned_leaves()).as_deref(),
+            Some("PyErrorObject")
+        );
+        assert_eq!(
+            super::tyref_to_field_layout_string(&ptr, &llbc),
+            "*mut PyErrorObject"
+        );
 
         let same_class = paint_handle(
             decls.clone(),
@@ -63935,20 +64263,24 @@ mod tests {
         );
         assert_eq!(same_class, ValueType::Ref(Some("PyErrorObject".into())));
 
-        let peeled = paint_handle(decls.clone(), serde_json::json!([null]), 3);
-        assert_eq!(peeled, ValueType::Ref(None));
+        let (llbc, ty) = load_handle(decls.clone(), serde_json::json!([null]), 3);
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
+        assert_handle_class(&llbc, &ty, Some("PyError"));
+        assert_eq!(super::tyref_to_field_layout_string(&ty, &llbc), "PyError");
 
         let mut scalar_decls = decls.clone();
         scalar_decls[2] = (
             3,
             struct_decl(3, ident_path(&["fixture", "Word"]), i64_field(), true),
         );
-        let scalar = paint_handle(
+        let (llbc, ty) = load_handle(
             scalar_decls,
             serde_json::json!([pyerror_deref_impl(23, 2)]),
             3,
         );
-        assert_eq!(scalar, ValueType::Int);
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
+        assert_handle_class(&llbc, &ty, Some("Word"));
+        assert_eq!(super::tyref_to_field_layout_string(&ty, &llbc), "i64");
 
         let split = paint_handle(
             decls.clone(),
@@ -64042,10 +64374,12 @@ mod tests {
                 serde_json::json!({"Value": [23, adt_body(2)]}),
             ],
         );
+        let (llbc, ty) = load_handle(copies, serde_json::json!([copy_impl]), 7);
         assert_eq!(
-            paint_handle(copies, serde_json::json!([copy_impl]), 7),
+            super::tyref_to_value_type(&ty, &llbc),
             ValueType::Ref(Some("PyErrorObject".into()))
         );
+        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
     }
 
     #[test]
@@ -76519,6 +76853,9 @@ mod tests {
             call_result_ty: ValueType::Int,
             call_result_class: None,
             carrier_recv: false,
+            recv_niche: false,
+            result_niche: false,
+            niche_null_cast: None,
         }
     }
 
@@ -76623,6 +76960,62 @@ mod tests {
             .filter(|block| block.exits.len() == 2 && block.id != graph.startblock)
             .count();
         assert_eq!(pred_branches, 1, "the Some arm switches on the predicate");
+    }
+
+    /// `Option<*mut PyObject>::filter` is a nullable pointer. The tag is
+    /// `is_` against null, and `Some` is that pointer — not `__discriminant`
+    /// / `__pos_0` of the object.
+    #[test]
+    fn niche_option_filter_is_a_null_test() {
+        let mut graph = FunctionGraph::new("test_niche_filter");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let env = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("filter", Some("Option".into())),
+                    args: crate::model::call_args(vec![recv, env]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let mut site = option_disc_site(super::DiscCombinator::OptionFilter, result);
+        site.recv_niche = true;
+        site.result_niche = true;
+        site.niche_null_cast = Some(("pyobject::PyObject".into(), ValueType::Ref(None)));
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[site],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "filter"), 0);
+        let mut saw_disc = false;
+        let mut saw_pos0 = false;
+        let mut saw_is = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
+                        saw_disc = true;
+                    }
+                    OpKind::FieldRead { field, .. } if field.name == "__pos_0" => {
+                        saw_pos0 = true;
+                    }
+                    OpKind::BinOp { op, .. } if op == "is_" => saw_is = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(!saw_disc, "niche filter read __discriminant");
+        assert!(!saw_pos0, "niche filter read __pos_0");
+        assert!(saw_is, "niche filter did not null-test the pointer");
     }
 
     #[test]
