@@ -726,6 +726,9 @@ fn handle_fail_resume_guard(
     // The receiver reads `jf_guard_exc` (`grab_exc_value`).
     let blackhole = CA_BLACKHOLE_FN.get();
     let bh_result = blackhole.and_then(|blackhole| blackhole(descr_raw, frame_ptr));
+    // `jit_blackhole_resume_from_guard` can collect in `to_exc_object`
+    // and return None. The owner root moved; this copy did not.
+    frame_ptr = current_frame(&frame_root, frame_ptr);
     if let Some(bh_result) = bh_result {
         if majit_log_enabled() {
             eprintln!(
