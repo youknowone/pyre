@@ -2130,7 +2130,7 @@ impl UnrollOptimizer {
                     // InvalidLoop; this function returns Result, so `?`
                     // carries it out (final_ctx is abandoned with the
                     // discarded trace).
-                    opt_p2.send_extra_operation(&end_jump, &mut final_ctx)?;
+                    opt_p2.send_extra_operation(&OpRc::new(end_jump.clone()), &mut final_ctx)?;
                     let redirected_tail_ops: Vec<majit_ir::OpRc> = final_ctx.take_new_operations();
                     opt_p2.final_ctx = Some(final_ctx);
                     body_ops = splice_redirected_tail(&body_ops, &redirected_tail_ops);
@@ -3844,7 +3844,7 @@ impl OptUnroll {
                     )
                 });
                 let rd_resume_position = patch.rd_resume_position();
-                for mut guard_op in emitted {
+                for guard_op in emitted {
                     if crate::log_jtet_enabled() {
                         let arg_values: Vec<_> = guard_op
                             .args_slice()
@@ -4083,7 +4083,7 @@ impl OptUnroll {
                     load.setdescr(descr);
                     load.pos().set(ctx.reserve_pos_typed(tp));
                     let loaded = load.pos().get();
-                    if let Err(e) = optimizer.send_extra_operation(&load, ctx) {
+                    if let Err(e) = optimizer.send_extra_operation(&OpRc::new(load), ctx) {
                         ctx.signal_invalid_loop(e.0);
                         return None;
                     }
@@ -4102,7 +4102,7 @@ impl OptUnroll {
             // the flag into the Err, so re-defer it for the caller's
             // take_invalid_loop barrier (the None return below then reads as an
             // aborted jump rather than a successful one).
-            if let Err(e) = optimizer.send_extra_operation(&jump, ctx) {
+            if let Err(e) = optimizer.send_extra_operation(&OpRc::new(jump), ctx) {
                 ctx.signal_invalid_loop(e.0);
             }
             return None; // successfully jumped (or aborted via deferred InvalidLoop)
@@ -4382,7 +4382,7 @@ impl OptUnroll {
                 // unmapped-arg signals above); propagate consumed the flag into
                 // the Err, so re-defer it for the caller's take_invalid_loop
                 // barrier and bail to jump_to_preamble.
-                if let Err(e) = optimizer.send_extra_operation(&new_op, ctx) {
+                if let Err(e) = optimizer.send_extra_operation(&OpRc::new(new_op), ctx) {
                     ctx.signal_invalid_loop(e.0);
                     return Vec::new();
                 }

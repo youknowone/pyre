@@ -3,7 +3,8 @@
 //! RPython parity target:
 //! `rpython/jit/metainterp/optimizeopt/rawbuffer.py`.
 
-use crate::{DescrRef, GcRef, OpRef};
+use crate::operand::Operand;
+use crate::{DescrRef, GcRef};
 
 /// rawbuffer.py RawBuffer — 4 parallel lists: offsets, lengths, descrs, values.
 /// Sorted by offset. Invariant: offsets[i]+lengths[i] <= offsets[i+1].
@@ -20,7 +21,7 @@ pub struct RawBuffer {
     /// rawbuffer.py:16: self.descrs — per-entry ArrayDescr.
     descrs: Vec<DescrRef>,
     /// rawbuffer.py:17: self.values
-    values: Vec<OpRef>,
+    values: Vec<Operand>,
 }
 
 /// rawbuffer.py `InvalidRawOperation` — base class caught by the optimizer.
@@ -99,30 +100,28 @@ impl RawBuffer {
         &self.descrs
     }
 
-    pub fn values(&self) -> Vec<OpRef> {
-        self.values.clone()
+    pub fn values(&self) -> &[Operand] {
+        &self.values
     }
 
     /// Forward each stored value's inline `ConstPtr` gcref in place.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        for value in &mut self.values {
-            if let OpRef::ConstPtr(gcref) = value {
-                visitor(gcref);
-            }
+        for value in &self.values {
+            value.walk_const_ptr_refs(visitor);
         }
     }
 
-    pub fn iter_entries(&self) -> impl Iterator<Item = (i64, usize, &DescrRef, OpRef)> + '_ {
+    pub fn iter_entries(&self) -> impl Iterator<Item = (i64, usize, &DescrRef, &Operand)> + '_ {
         self.offsets
             .iter()
             .copied()
             .zip(self.lengths.iter().copied())
             .zip(self.descrs.iter())
-            .zip(self.values.iter().copied())
+            .zip(self.values.iter())
             .map(|(((offset, length), descr), value)| (offset, length, descr, value))
     }
 
-    pub fn drain_entries(&mut self) -> Vec<(i64, usize, DescrRef, OpRef)> {
+    pub fn drain_entries(&mut self) -> Vec<(i64, usize, DescrRef, Operand)> {
         let offsets = std::mem::take(&mut self.offsets);
         let lengths = std::mem::take(&mut self.lengths);
         let descrs = std::mem::take(&mut self.descrs);
@@ -160,7 +159,7 @@ impl RawBuffer {
         offset: i64,
         length: usize,
         descr: DescrRef,
-        value: OpRef,
+        value: Operand,
     ) -> Result<(), InvalidRawOperation> {
         // RPython rawbuffer.py uses unbounded-int `length`. The pyre
         // length is `usize`; on 64-bit platforms `usize > i64::MAX`
@@ -255,7 +254,7 @@ impl RawBuffer {
         offset: i64,
         length: usize,
         descr: &DescrRef,
-    ) -> Result<OpRef, InvalidRawOperation> {
+    ) -> Result<Operand, InvalidRawOperation> {
         for i in 0..self.offsets.len() {
             if self.offsets[i] == offset {
                 if self.lengths[i] != length || !Self::descrs_are_compatible(descr, &self.descrs[i])
@@ -267,7 +266,7 @@ impl RawBuffer {
                     }
                     .into());
                 }
-                return Ok(self.values[i]);
+                return Ok(self.values[i].clone());
             }
         }
         Err(InvalidRawRead::UninitializedRead { offset, length }.into())
@@ -283,6 +282,7 @@ impl Default for RawBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OpRef;
 
     /// Create an int ArrayDescr for tests (base_size=0, item_size=8, Int).
     fn int_descr() -> DescrRef {
@@ -303,25 +303,65 @@ mod tests {
         let mut buf = make_buf(32);
         let d = int_descr();
         let d4 = int_descr_sz(4);
-        buf.write_value(0, 8, d.clone(), OpRef::int_op(10)).unwrap();
-        buf.write_value(8, 4, d4.clone(), OpRef::int_op(20))
-            .unwrap();
-        buf.write_value(16, 8, d.clone(), OpRef::int_op(30))
-            .unwrap();
+        buf.write_value(
+            0,
+            8,
+            d.clone(),
+            Operand::bound_from_opref(OpRef::int_op(10)),
+        )
+        .unwrap();
+        buf.write_value(
+            8,
+            4,
+            d4.clone(),
+            Operand::bound_from_opref(OpRef::int_op(20)),
+        )
+        .unwrap();
+        buf.write_value(
+            16,
+            8,
+            d.clone(),
+            Operand::bound_from_opref(OpRef::int_op(30)),
+        )
+        .unwrap();
 
-        assert_eq!(buf.read_value(0, 8, &d).unwrap(), OpRef::int_op(10));
-        assert_eq!(buf.read_value(8, 4, &d4).unwrap(), OpRef::int_op(20));
-        assert_eq!(buf.read_value(16, 8, &d).unwrap(), OpRef::int_op(30));
+        assert_eq!(
+            buf.read_value(0, 8, &d).unwrap().to_opref(),
+            OpRef::int_op(10)
+        );
+        assert_eq!(
+            buf.read_value(8, 4, &d4).unwrap().to_opref(),
+            OpRef::int_op(20)
+        );
+        assert_eq!(
+            buf.read_value(16, 8, &d).unwrap().to_opref(),
+            OpRef::int_op(30)
+        );
     }
 
     #[test]
     fn rawbuffer_update_same_offset() {
         let mut buf = make_buf(16);
         let d = int_descr();
-        buf.write_value(0, 8, d.clone(), OpRef::int_op(10)).unwrap();
-        buf.write_value(0, 8, d.clone(), OpRef::int_op(99)).unwrap();
+        buf.write_value(
+            0,
+            8,
+            d.clone(),
+            Operand::bound_from_opref(OpRef::int_op(10)),
+        )
+        .unwrap();
+        buf.write_value(
+            0,
+            8,
+            d.clone(),
+            Operand::bound_from_opref(OpRef::int_op(99)),
+        )
+        .unwrap();
 
-        assert_eq!(buf.read_value(0, 8, &d).unwrap(), OpRef::int_op(99));
+        assert_eq!(
+            buf.read_value(0, 8, &d).unwrap().to_opref(),
+            OpRef::int_op(99)
+        );
         assert_eq!(buf.offsets().len(), 1);
     }
 
@@ -329,10 +369,21 @@ mod tests {
     fn rawbuffer_overlap_next() {
         let mut buf = make_buf(32);
         let d = int_descr();
-        buf.write_value(8, 8, d.clone(), OpRef::int_op(10)).unwrap();
+        buf.write_value(
+            8,
+            8,
+            d.clone(),
+            Operand::bound_from_opref(OpRef::int_op(10)),
+        )
+        .unwrap();
         // Write at offset 4 with length 8 overlaps [8, 16)
         let err = buf
-            .write_value(4, 8, d.clone(), OpRef::int_op(20))
+            .write_value(
+                4,
+                8,
+                d.clone(),
+                Operand::bound_from_opref(OpRef::int_op(20)),
+            )
             .unwrap_err();
         assert!(matches!(
             err,
@@ -345,9 +396,17 @@ mod tests {
         let mut buf = make_buf(32);
         let d = int_descr();
         let d4 = int_descr_sz(4);
-        buf.write_value(0, 8, d.clone(), OpRef::int_op(10)).unwrap();
+        buf.write_value(
+            0,
+            8,
+            d.clone(),
+            Operand::bound_from_opref(OpRef::int_op(10)),
+        )
+        .unwrap();
         // Write at offset 4 overlaps with [0, 8)
-        let err = buf.write_value(4, 4, d4, OpRef::int_op(20)).unwrap_err();
+        let err = buf
+            .write_value(4, 4, d4, Operand::bound_from_opref(OpRef::int_op(20)))
+            .unwrap_err();
         assert!(matches!(
             err,
             InvalidRawOperation::InvalidRawWrite(InvalidRawWrite::OverlappingWrite { .. })
@@ -359,8 +418,11 @@ mod tests {
         let mut buf = make_buf(16);
         let d = int_descr();
         let d4 = int_descr_sz(4);
-        buf.write_value(0, 8, d, OpRef::int_op(10)).unwrap();
-        let err = buf.write_value(0, 4, d4, OpRef::int_op(20)).unwrap_err();
+        buf.write_value(0, 8, d, Operand::bound_from_opref(OpRef::int_op(10)))
+            .unwrap();
+        let err = buf
+            .write_value(0, 4, d4, Operand::bound_from_opref(OpRef::int_op(20)))
+            .unwrap_err();
         assert!(matches!(
             err,
             InvalidRawOperation::InvalidRawWrite(InvalidRawWrite::OverlappingWrite { .. })
@@ -386,7 +448,8 @@ mod tests {
         let mut buf = make_buf(16);
         let d = int_descr();
         let d4 = int_descr_sz(4);
-        buf.write_value(0, 8, d, OpRef::int_op(10)).unwrap();
+        buf.write_value(0, 8, d, Operand::bound_from_opref(OpRef::int_op(10)))
+            .unwrap();
         let err = buf.read_value(0, 4, &d4).unwrap_err();
         assert_eq!(
             err,
@@ -402,12 +465,27 @@ mod tests {
     fn rawbuffer_sorted_insertion() {
         let mut buf = make_buf(32);
         let d4 = int_descr_sz(4);
-        buf.write_value(16, 4, d4.clone(), OpRef::int_op(30))
-            .unwrap();
-        buf.write_value(0, 4, d4.clone(), OpRef::int_op(10))
-            .unwrap();
-        buf.write_value(8, 4, d4.clone(), OpRef::int_op(20))
-            .unwrap();
+        buf.write_value(
+            16,
+            4,
+            d4.clone(),
+            Operand::bound_from_opref(OpRef::int_op(30)),
+        )
+        .unwrap();
+        buf.write_value(
+            0,
+            4,
+            d4.clone(),
+            Operand::bound_from_opref(OpRef::int_op(10)),
+        )
+        .unwrap();
+        buf.write_value(
+            8,
+            4,
+            d4.clone(),
+            Operand::bound_from_opref(OpRef::int_op(20)),
+        )
+        .unwrap();
 
         // Entries should be sorted by offset
         assert_eq!(buf.offsets()[0], 0);
@@ -419,8 +497,13 @@ mod tests {
     fn rawbuffer_walk_const_ptr_refs_forwards_value() {
         let mut buf = make_buf(16);
         let d = int_descr();
-        buf.write_value(0, 8, d.clone(), OpRef::const_ptr(GcRef(0x10)))
-            .unwrap();
+        buf.write_value(
+            0,
+            8,
+            d.clone(),
+            Operand::bound_from_opref(OpRef::const_ptr(GcRef(0x10))),
+        )
+        .unwrap();
 
         buf.walk_const_ptr_refs(&mut |gcref| {
             if *gcref == GcRef(0x10) {
@@ -429,7 +512,7 @@ mod tests {
         });
 
         assert_eq!(
-            buf.read_value(0, 8, &d).unwrap(),
+            buf.read_value(0, 8, &d).unwrap().to_opref(),
             OpRef::const_ptr(GcRef(0x20))
         );
     }
@@ -473,30 +556,48 @@ mod tests {
         let mut buf = make_buf(16);
 
         // Write with ArrayS_8_1
-        buf.write_value(0, 4, array_s_8_1.clone(), OpRef::int_op(10))
-            .unwrap();
+        buf.write_value(
+            0,
+            4,
+            array_s_8_1.clone(),
+            Operand::bound_from_opref(OpRef::int_op(10)),
+        )
+        .unwrap();
 
         // Read with same descr
         assert_eq!(
-            buf.read_value(0, 4, &array_s_8_1).unwrap(),
+            buf.read_value(0, 4, &array_s_8_1).unwrap().to_opref(),
             OpRef::int_op(10)
         );
         // Read with non-identical but compatible descr
         assert_eq!(
-            buf.read_value(0, 4, &array_s_8_2).unwrap(),
+            buf.read_value(0, 4, &array_s_8_2).unwrap().to_opref(),
             OpRef::int_op(10)
         );
 
         // Overwrite with non-identical compatible descr
-        buf.write_value(0, 4, array_s_8_2.clone(), OpRef::int_op(20))
-            .unwrap();
+        buf.write_value(
+            0,
+            4,
+            array_s_8_2.clone(),
+            Operand::bound_from_opref(OpRef::int_op(20)),
+        )
+        .unwrap();
         assert_eq!(
-            buf.read_value(0, 4, &array_s_8_1).unwrap(),
+            buf.read_value(0, 4, &array_s_8_1).unwrap().to_opref(),
             OpRef::int_op(20)
         );
 
         // Incompatible descr (unsigned) must fail
         assert!(buf.read_value(0, 4, &array_u_8).is_err());
-        assert!(buf.write_value(0, 4, array_u_8, OpRef::int_op(30)).is_err());
+        assert!(
+            buf.write_value(
+                0,
+                4,
+                array_u_8,
+                Operand::bound_from_opref(OpRef::int_op(30))
+            )
+            .is_err()
+        );
     }
 }

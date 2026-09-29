@@ -2209,16 +2209,15 @@ impl Optimizer {
     /// inject additional operations.
     pub fn send_extra_operation(
         &mut self,
-        op: &Op,
+        op_rc: &OpRc,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        let op_rc = OpRc::new(op.clone());
         // Register the producer for op_rc.pos before dispatch so a pass that
         // folds it via make_equal_to(from_bound_op(op_rc), ..) writes the
         // forwarding onto a host find_producer_op can reach (the normal trace
         // path registers via bind_input_resops; emit_extra does the same).
-        ctx.register_extra_producer(&op_rc);
-        self.propagate_from_pass(0, &op_rc, ctx)
+        ctx.register_extra_producer(op_rc);
+        self.propagate_from_pass(0, op_rc, ctx)
     }
 
     /// RPython optimizer.py: emit_extra(op, emit=False) parity.
@@ -3503,7 +3502,7 @@ impl Optimizer {
                 self.terminal_op = Some(terminal_op);
             } else {
                 // flush=True: send through passes (optimizer.py).
-                self.send_extra_operation(&terminal_op, &mut ctx)?;
+                self.send_extra_operation(&OpRc::new(terminal_op.clone()), &mut ctx)?;
             }
         }
 
@@ -4777,7 +4776,7 @@ impl Optimizer {
             .first()
             .map(|token| token.as_jump_target_descr());
         let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, Some(preamble));
-        self.send_extra_operation(&jump_op, ctx)?;
+        self.send_extra_operation(&OpRc::new(jump_op.clone()), ctx)?;
         optimized_ops.append(&mut ctx.new_operations);
         Ok((optimized_ops, false))
     }
