@@ -2837,7 +2837,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `jit_bigint_{and,or,xor,sub,mul}` residualize the Rust RBigInt binary
     // operators (`<BigInt as BitAnd>::bitand`, …) the `front::mir` retarget
     // (`front::bigint_binop`) redirects when both operands are the opaque
-    // `BigInt` ADT.  Each returns a fresh `*mut BigInt` (as i64), bound by path.
+    // `BigInt` ADT.  Operands are `*const BigInt`; each returns
+    // `JitBigIntResult`, bound by path.
     cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_and",

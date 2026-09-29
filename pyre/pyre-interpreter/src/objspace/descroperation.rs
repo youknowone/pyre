@@ -511,9 +511,10 @@ pub extern "C" fn jit_bigint_mod_floor(
 // retargets each such call — guarded on both operands resolving to the
 // opaque `BigInt` ADT — to the matching residual below. Both operands and
 // the result are the classdef-less `*mut BigInt` GcRef the front models a
-// `BigInt` as: the operands arrive as i64-encoded pointers (a faithful ABI
-// pass) and the result pointer is returned in the same uniform i64 word ABI;
-// the retarget preserves the front's `Ref(None)` result type. Each
+// `BigInt` as. Operands are `*const BigInt`, so `FUNC.ARGS` is Ref —
+// `history.getkind` banks a GC pointer as `"ref"`. The result is
+// `JitBigIntResult`. wasm32 still passes that pointer in the uniform i64
+// word (`WordArg::from_word`); the word is the call ABI, not `FUNC.ARGS`. Each
 // allocates the fresh result in the collecting nursery, its operand pointers
 // rooted across the alloc. These wrappers retain RPython's elidable effect:
 // allocation-only operations use `EF_ELIDABLE_OR_MEMORYERROR`.
@@ -1628,8 +1629,8 @@ fn bigint_rshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
 /// gcmap-rooted residual `CallR` holding no unrooted pointer across the alloc).
 /// `EF_ELIDABLE_CAN_RAISE`.
 ///
-/// # Safety note: `extern "C"` over `i64`-encoded `*const BigInt` operands, live
-/// for the duration of the call.
+/// # Safety note: both operands are live GC `rbigint`s (`*const BigInt`) for
+/// the duration of the call. The `i64` result is that pointer word.
 #[majit_macros::elidable]
 pub extern "C" fn jit_bigint_floordiv(a: *const BigInt, b: *const BigInt) -> i64 {
     let (a, b) = unsafe { (&*(a), &*(b)) };
