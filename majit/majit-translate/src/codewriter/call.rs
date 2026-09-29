@@ -6181,6 +6181,23 @@ impl CallControl {
         Some(return_type_string_to_kind(s))
     }
 
+    /// `call.py` `get_jitcode_calldescr`: non-void `FUNC.ARGS` kind chars.
+    /// `None` when this path has no registered function graph.
+    pub(crate) fn declared_non_void_arg_classes(&self, path: &CallPath) -> Option<String> {
+        let graph = self.function_graphs.get(path)?;
+        let mut classes = String::new();
+        for ty in graph_non_void_arg_types(graph) {
+            let class = match ty {
+                Type::Int => 'i',
+                Type::Ref => 'r',
+                Type::Float => 'f',
+                Type::Void => continue,
+            };
+            classes.push(class);
+        }
+        Some(classes)
+    }
+
     /// The callee's post-`?` declared `RESULT` type (`call.py:222
     /// FUNC.RESULT`) for a direct-call `target` — the same value
     /// `getcalldescr`'s direct arm derives as `expected_result`.  The
@@ -6457,12 +6474,26 @@ fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
             // `CallControl.getcalldescr` records Bool in `FUNC.ARGS` under the
             // same `'i'` register kind as `Signed`. Bool aliases to Int so the
             // wildcard does not silently re-classify it as Ref.
-            crate::model::ValueType::Int | crate::model::ValueType::Bool => Some(Type::Int),
-            crate::model::ValueType::Ref(_) => Some(Type::Ref),
+            // `history.getkind`: Unsigned and SingleFloat bank as `'int'`.
+            // Int128 / UInt128 are too wide and `getkind` raises.
+            crate::model::ValueType::Int
+            | crate::model::ValueType::Bool
+            | crate::model::ValueType::Unsigned
+            | crate::model::ValueType::SingleFloat => Some(Type::Int),
+            // `Str` / `StringBuilder` are GC pointers (`getkind` → `'ref'`).
+            crate::model::ValueType::Ref(_)
+            | crate::model::ValueType::Str
+            | crate::model::ValueType::StringBuilder => Some(Type::Ref),
             crate::model::ValueType::Float => Some(Type::Float),
             crate::model::ValueType::Void => None,
-            // Unknown / State — default to Ref.
-            _ => Some(Type::Ref),
+            // `history.getkind` raises NotImplementedError for a type that
+            // is neither Void, a supported Primitive, nor a Ptr.
+            crate::model::ValueType::Int128
+            | crate::model::ValueType::UInt128
+            | crate::model::ValueType::Unknown
+            | crate::model::ValueType::State => {
+                panic!("getkind: type {ty:?} not supported")
+            }
         })
         .collect()
 }
@@ -6598,6 +6629,13 @@ impl CallControl {
                 // call.py jitdriver_sd_from_portal_runner_ptr(funcptr)
                 if self.is_portal_recursive_call(p) {
                     return CallKind::Recursive;
+                }
+                // call.py `guess_call_kind`: `rposix._get_errno` /
+                // `_set_errno` (`majit_rlib::rposix`) stay below the JIT.
+                if is_rposix_errno_helper(p) {
+                    panic!(
+                        "the JIT must never come close to _get_errno() or _set_errno(); it should all be done at a lower level"
+                    );
                 }
                 // call.py:129-134 _gctransformer_hint_close_stack_ → 'residual'
                 if self.func_effects(p).is_some_and(|f| f.close_stack) {
@@ -8765,88 +8803,32 @@ impl CallControl {
                 // encapsulates the convention so direct-call validation matches
                 // upstream's hard-fail semantics.
                 if let Some((_, graph)) = self.target_to_path_and_graph(target) {
-                    {
-                        let expected_arg_types = graph_non_void_arg_types(&graph);
-                        // RPython call.py:223-228 compares the full
-                        // `concretetype` list. Pyre's caller-side
-                        // `arg_types` comes from `resolve_non_void_arg_types`
-                        // which falls back to `Type::Ref` whenever
-                        // `FunctionGraph::concretetype_of(&v)` returns `Unknown`.
-                        // Trait-method test fixtures
-                        // (`transform_all_handlers_to_jitcode`) hit that
-                        // path because they construct `CallControl` without
-                        // populating each Variable's `concretetype`, so
-                        // the kind tail of every arg appears as `Ref`
-                        // even when the callee declares `Int`.  Hard-fail
-                        // only on arity mismatch — the kind tail surfaces
-                        // as a soft signal until full `Variable.concretetype`
-                        // propagation lands (`call.py` parity).
-                        if arg_types.len() != expected_arg_types.len() {
+                    let expected_arg_types = graph_non_void_arg_types(&graph);
+                    // call.py `getcalldescr`: NON_VOID_ARGS != FUNC.ARGS
+                    // (voids dropped) raises. Kinds, not only arity.
+                    if arg_types != expected_arg_types {
+                        panic!(
+                            "operation calling {target}: calling a function with signature {expected_arg_types:?}, but passing actual arguments (ignoring voids) of types {arg_types:?}",
+                        );
+                    }
+                    // call.py `getcalldescr`: RESULT != FUNC.RESULT raises.
+                    // `return_type` stays `None` for ordinary fns (`front::mir`
+                    // leaves the Charon `TyRef::Deduplicated` unresolved).
+                    // That absence is not `lltype.Void`; treating it as Void
+                    // panics `compare_slot_rest` (call result `Ref`, stamp
+                    // missing). The stamp, when present, is checked.
+                    // `Result<T, E>` is the success type `T` (`FUNC.RESULT`).
+                    if let Some(declared) = graph.return_type.as_ref() {
+                        let effective_declared =
+                            crate::front::typestr::transparent_result_ok_type(declared)
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| declared.clone());
+                        let expected_result =
+                            return_type_string_to_value_type(Some(&effective_declared));
+                        if result_type != expected_result {
                             panic!(
-                                "in operation calling {target}: calling a \
-                                 function with non-void arg kinds \
-                                 {expected_arg_types:?}, but passing actual \
-                                 arg kinds {arg_types:?}",
+                                "operation calling {target}: calling a function with signature {expected_result:?}, but the actual return type is {result_type:?}",
                             );
-                        }
-                        // RPython call.py:230-234 `if RESULT != FUNC.RESULT:
-                        // raise` only validates when the callee's signature
-                        // is known. call.py:222/231 reads `FUNC.RESULT`
-                        // directly off the callee's funcptr type, so every
-                        // graph carries its result type intrinsically. Pyre's
-                        // source is `graph.return_type`, stamped at
-                        // registration from the parsed Rust signature for
-                        // free functions, trait/default methods, and inherent
-                        // methods (lib.rs).
-                        //
-                        // The check stays conditional for the same reason the
-                        // arg-kind check above is arity-only: the *caller*-side
-                        // `result_type` is not yet fully resolved from each
-                        // Variable's concretetype, so it can surface as the
-                        // `Ref` fallback even when the callee declares `Void`
-                        // (a void method has `return_type == None`, which maps
-                        // to `Void`). Validating unconditionally then fails
-                        // spuriously on call sites whose `result_type` defaulted
-                        // to `Ref` (e.g. the real handler bodies exercised by
-                        // `transform_all_handlers_to_jitcode`). Making this arm
-                        // always-on (full parity with call.py:231) requires the
-                        // same complete `Variable.concretetype` propagation the
-                        // arg-kind comment depends on; until then the direct arm
-                        // skips an un-typed callee while the indirect arm
-                        // validates unconditionally (a family always resolves a
-                        // typed witness).
-                        let declared = graph.return_type.as_ref();
-                        if let Some(declared) = declared {
-                            // RPython has no `Result<T, E>` type — its
-                            // rtyper extracts the exception via
-                            // `OperationError` propagation and presents
-                            // `op.result.concretetype` as the success
-                            // type alone. Pyre models RPython's
-                            // `bool` + `raise oefmt(...)` shape as
-                            // `Result<bool, PyError>` and threads
-                            // exceptions through `?`. When validating
-                            // the call's `result_type` (already
-                            // unwrapped through `?` at the `front::mir`
-                            // lowerer) against the declared signature, project
-                            // the declared `Result<T, E>` to `T` so the
-                            // comparison happens in the rtyper-derived
-                            // shape upstream uses (call.py:222 `FUNC.RESULT`).
-                            let effective_declared =
-                                crate::front::typestr::transparent_result_ok_type(declared)
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| declared.clone());
-                            let expected_result =
-                                return_type_string_to_value_type(Some(&effective_declared));
-                            // RPython call.py:220 hard-fails when
-                            // `RESULT != FUNC.RESULT`.
-                            if result_type != expected_result {
-                                panic!(
-                                    "in operation calling {target}: calling a \
-                                     function with return type \
-                                     {expected_result:?}, but the actual \
-                                     return type is {result_type:?}",
-                                );
-                            }
                         }
                     }
                 }
@@ -8965,6 +8947,10 @@ impl CallControl {
                     }
                 }
             } else {
+                // `declares_cannot_raise` stands in for `call.py` `_canraise`
+                // returning False (`pseudo_call_cannot_raise`). It is consulted
+                // only while `extraeffect is None`, so `EF_RANDOM_EFFECTS`
+                // and a caller-supplied effect are left alone.
                 match shape {
                     CallShape::Direct(target) if self.declares_cannot_raise(target) => {
                         ExtraEffect::CannotRaise
@@ -9127,6 +9113,14 @@ fn user_path_behind_majit_call_target(path: &CallPath) -> Option<CallPath> {
     let mut segments = path.segments.clone();
     *segments.last_mut()? = user.to_string();
     Some(CallPath { segments })
+}
+
+/// `call.py` `guess_call_kind` rejects `rposix._get_errno` and
+/// `rposix._set_errno` by function-object identity. Those helpers live at
+/// `majit_rlib::rposix::{_get_errno,_set_errno}`.
+fn is_rposix_errno_helper(path: &CallPath) -> bool {
+    let errno = matches!(path.last_segment(), Some("_get_errno") | Some("_set_errno"));
+    errno && path.segments.iter().any(|seg| seg == "rposix")
 }
 
 pub(crate) fn is_dont_look_inside_residual_helper(path: &CallPath) -> bool {
@@ -11595,6 +11589,86 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "the JIT must never come close to _get_errno() or _set_errno()")]
+    fn guess_call_kind_rejects_rposix_get_errno() {
+        let cc = CallControl::new();
+        let target = CallTarget::function_path(["majit_rlib", "rposix", "_get_errno"]);
+        let _ = cc.guess_call_kind(&direct_call_op(target));
+    }
+
+    #[test]
+    #[should_panic(expected = "the JIT must never come close to _get_errno() or _set_errno()")]
+    fn guess_call_kind_rejects_rposix_set_errno() {
+        let cc = CallControl::new();
+        let target = CallTarget::function_path(["majit_rlib", "rposix", "_set_errno"]);
+        let _ = cc.guess_call_kind(&direct_call_op(target));
+    }
+
+    #[test]
+    fn guess_call_kind_allows_unrelated_get_errno_leaf() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["other", "_get_errno"]);
+        cc.register_function_graph(path, FunctionGraph::new("_get_errno"));
+        cc.find_all_graphs_for_tests();
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::function_path([
+                "other",
+                "_get_errno"
+            ]))),
+            CallKind::Regular
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "passing actual arguments (ignoring voids)")]
+    fn getcalldescr_rejects_direct_arg_kind_mismatch() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["takes_int"]);
+        let mut graph = FunctionGraph::new("takes_int");
+        let arg = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, arg.clone());
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "n".to_string(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+            arg,
+        );
+        graph.set_return(graph.startblock, None);
+        cc.register_function_graph(path, graph.with_return_type("i64"));
+        let mut cache = AnalysisCache::default();
+        let _ = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["takes_int"])),
+            vec![Type::Ref],
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "the actual return type is")]
+    fn getcalldescr_rejects_direct_result_kind_mismatch() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["returns_int"]);
+        cc.register_function_graph(path, simple_graph("returns_int").with_return_type("i64"));
+        let mut cache = AnalysisCache::default();
+        let _ = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["returns_int"])),
+            Vec::new(),
+            Type::Ref,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+    }
+
+    #[test]
     fn direct_call_omits_actual_for_declared_void_parameter() {
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["closure_call_once"]);
@@ -12514,6 +12588,15 @@ mod tests {
         let mut graph = FunctionGraph::new("forcer");
         let frame_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "frame".to_string(),
+                ty: ValueType::Ref(None),
+                class_root: None,
+            },
+            frame_var.clone(),
+        );
         graph.push_op_var(
             graph.startblock,
             OpKind::VableForce { base: frame_var },
@@ -12967,7 +13050,7 @@ mod tests {
     }
 
     #[test]
-    fn cannot_raise_assertion_overrides_random_effects() {
+    fn cannot_raise_assertion_does_not_override_random_effects() {
         let mut cc = CallControl::new();
         let callee = CallPath::from_segments(["engine", "Engine", "track_operation"]);
         let helper = CallPath::from_segments(["grain", "vm", "jit", "track_operation_abi"]);
@@ -15090,7 +15173,10 @@ mod tests {
 
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["chaotic"]);
-        cc.register_function_graph(path.clone(), raising_graph("chaotic"));
+        cc.register_function_graph(
+            path.clone(),
+            raising_graph("chaotic").with_return_type("i64"),
+        );
         cc.find_all_graphs_for_tests();
 
         let extra0: DescrRef = Arc::new(StubDescr(90));
