@@ -15,8 +15,10 @@
 #
 # The substitution is not a fold: a miss stays a MayForce residual because
 # hashing the element can run a user `__hash__`. A plain int already stored in
-# an integer-strategy set records a cannot-collect contains check instead.
-# `hot_add` saturates and takes that path. `hot_add_user_hash` stays on the
+# an integer-strategy set records a cannot-collect contains check. A set whose
+# only element is that int guards the unboxed intval, set_id and content_gen
+# instead. `hot_add` saturates past one element and takes the contains check.
+# `hot_add_user_hash` stays on the
 # MayForce residual -- the element's `__hash__` and `__eq__` are Python, so the
 # call really does force -- and `hot_add_raising_hash` walks the exception
 # channel out of the substituted residual, which has to reach the `except` in
