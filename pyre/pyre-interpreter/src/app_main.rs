@@ -1,10 +1,96 @@
 //! `pypy/interpreter/app_main.py` — the startup steps every launcher runs
-//! between registering `__main__` and running the program: the
-//! `__main__.__loader__` seed, `-X faulthandler`, `import site`, the startup
-//! `sys.path[0]` and the warnings bootstrap.  `pyrex` and the `pyre-wasm`
+//! around the program: creating and registering `__main__` with its identity
+//! attributes, the `__main__.__loader__` seed, `-X faulthandler`,
+//! `import site`, the startup `sys.path[0]` and the warnings bootstrap.  `pyrex` and the `pyre-wasm`
 //! guest both call them, so the two entry points start the same way.
 
 use crate::importing;
+
+/// `app_main.py` `run_command_line` — `mainmodule = type(sys)('__main__')`
+/// and `sys.modules['__main__'] = mainmodule`.  The module aliases the fresh
+/// globals dict, so `__main__.__dict__` and the program's `globals()` are one
+/// object.  Returns `(globals, module)`.
+#[majit_macros::not_rpython]
+pub fn prepare_main_module(
+    execution_context: &crate::PyExecutionContext,
+) -> (pyre_object::PyObjectRef, pyre_object::PyObjectRef) {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let globals_slot = shadow_stack_len();
+    let _ = pin_root(execution_context.fresh_module_globals());
+    let name_slot = shadow_stack_len();
+    let _ = pin_root(pyre_object::w_str_new("__main__"));
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            shadow_stack_get(globals_slot),
+            "__name__",
+            shadow_stack_get(name_slot),
+        )
+    };
+    let module_slot = shadow_stack_len();
+    let _ = pin_root(pyre_object::module::w_module_new_aliasing_dict(
+        "__main__",
+        shadow_stack_get(globals_slot),
+    ));
+    importing::set_sys_module("__main__", shadow_stack_get(module_slot));
+    (
+        shadow_stack_get(globals_slot),
+        shadow_stack_get(module_slot),
+    )
+}
+
+/// Seed the module-identity attributes every `__main__` namespace carries
+/// (`type(sys)('__main__')` leaves them `None`; `runpy` does the `-m` case).
+/// Without them a bare `__spec__` / `__package__` / `__doc__` reference falls
+/// through to the `builtins` module and returns its values, so
+/// `if __spec__ is None` main-detection (multiprocessing spawn, runpy, pytest)
+/// inverts.
+///
+/// A script run by path also gets `__file__` / `__cached__`; the
+/// `-c "<string>"` command path does not.  `main_file` is the absolutized
+/// path, while `sys.argv[0]` keeps the literal command-line spelling.
+#[majit_macros::not_rpython]
+pub fn seed_main_module_attrs(
+    canonical: pyre_object::PyObjectRef,
+    main_module: pyre_object::PyObjectRef,
+    main_file: Option<&str>,
+) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            canonical,
+            "__spec__",
+            pyre_object::w_none(),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            canonical,
+            "__package__",
+            pyre_object::w_none(),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            canonical,
+            "__doc__",
+            pyre_object::w_none(),
+        );
+    }
+    if let Some(file) = main_file {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let module_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(main_module);
+        let file_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(file));
+        let _ = crate::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+            "__file__",
+            pyre_object::gc_roots::shadow_stack_get(file_slot),
+        );
+        let _ = crate::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+            "__cached__",
+            pyre_object::w_none(),
+        );
+    }
+}
 
 /// `add_main_module` / `set_main_loader` — seed `__main__.__loader__`.
 ///

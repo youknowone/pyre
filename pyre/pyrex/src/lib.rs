@@ -1675,25 +1675,6 @@ fn runpy_run_module_as_main(
     Ok(())
 }
 
-fn prepare_main_module(
-    execution_context: &Rc<PyExecutionContext>,
-) -> (pyre_object::PyObjectRef, pyre_object::PyObjectRef) {
-    let w_globals = execution_context.fresh_module_globals();
-    let _root = pyre_object::gc_roots::push_roots();
-    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str(
-            w_globals,
-            "__name__",
-            pyre_object::w_str_new("__main__"),
-        )
-    };
-    let canonical = w_globals;
-    let main_module = pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
-    importing::set_sys_module("__main__", main_module);
-    (canonical, main_module)
-}
-
 fn handle_main_error(
     e: pyre_interpreter::PyError,
     canonical: pyre_object::PyObjectRef,
@@ -1829,51 +1810,7 @@ fn eval_program_in_main(
     // The frame below takes the context by value; the prompt needs it too.
     let session_context = Rc::clone(&execution_context);
 
-    // Seed the module-identity attributes every `__main__` namespace carries
-    // (pythonrun.c seeds these; `runpy` does the `-m` case). Without them a
-    // bare `__spec__` / `__package__` / `__doc__` reference falls through to
-    // the `builtins` module and returns its values, so `if __spec__ is None`
-    // main-detection (multiprocessing spawn, runpy, pytest) inverts.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str(
-            canonical,
-            "__spec__",
-            pyre_object::w_none(),
-        );
-        pyre_object::dictmultiobject::w_dict_setitem_str(
-            canonical,
-            "__package__",
-            pyre_object::w_none(),
-        );
-        pyre_object::dictmultiobject::w_dict_setitem_str(
-            canonical,
-            "__doc__",
-            pyre_object::w_none(),
-        );
-    }
-
-    // A script run by path gets `__file__` / `__cached__` in `__main__`;
-    // the `-c "<string>"` command path does not. `__file__` is absolutized
-    // while `sys.argv[0]` keeps the literal command-line path. A stdin run
-    // records the literal `<stdin>`: there is no path to absolutize and no
-    // file to bind a `SourceFileLoader` to.
-    if let Some(file) = main_file {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let module_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(main_module);
-        let file_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(file));
-        let _ = pyre_interpreter::baseobjspace::setattr_str(
-            pyre_object::gc_roots::shadow_stack_get(module_slot),
-            "__file__",
-            pyre_object::gc_roots::shadow_stack_get(file_slot),
-        );
-        let _ = pyre_interpreter::baseobjspace::setattr_str(
-            pyre_object::gc_roots::shadow_stack_get(module_slot),
-            "__cached__",
-            pyre_object::w_none(),
-        );
-    }
+    pyre_interpreter::app_main::seed_main_module_attrs(canonical, main_module, main_file);
     let script_file = if filename == "<stdin>" {
         None
     } else {
@@ -2090,7 +2027,8 @@ fn run_script_path(
 ) -> Option<MainSession> {
     let execution_context = setup_exec_context();
     let ec_ptr = Rc::as_ptr(&execution_context);
-    let (canonical, main_module) = prepare_main_module(&execution_context);
+    let (canonical, main_module) =
+        pyre_interpreter::app_main::prepare_main_module(&execution_context);
 
     let result = (|| -> Result<bool, pyre_interpreter::PyError> {
         // Import `sys` up front so its creation flushes the native search-path
@@ -2197,7 +2135,8 @@ fn run_source(
     let filename = main_file.as_deref().unwrap_or(filename);
     let execution_context = setup_exec_context();
     let ec_ptr = Rc::as_ptr(&execution_context);
-    let (canonical, main_module) = prepare_main_module(&execution_context);
+    let (canonical, main_module) =
+        pyre_interpreter::app_main::prepare_main_module(&execution_context);
 
     // Import `sys` up front so its creation flushes the native search-path seed
     // into `sys.path` before `site` and user code read it.

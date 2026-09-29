@@ -1030,22 +1030,6 @@ fn run_python_impl(source: &str) -> String {
     ERR_BUF.with(|buf| buf.borrow_mut().clear());
     EXIT_CODE.with(|c| c.set(0));
 
-    let filename = SCRIPT_PATH.with(|p| p.borrow().clone());
-    let filename = filename.as_deref().unwrap_or("<string>");
-    let code =
-        match compile_source_with_filename(source, Mode::Exec, filename) {
-            Ok(code) => code,
-            Err(e) => {
-                // `pyrex::run_source` renders the same `File "…", line N` + caret
-                // banner on stderr and exits 1.
-                pyre_interpreter::eprint_syntax_error(
-                    &pyre_interpreter::compile_err_to_syntax_error(e, source, Mode::Exec),
-                );
-                EXIT_CODE.with(|c| c.set(1));
-                return String::new();
-            }
-        };
-
     let execution_context = std::rc::Rc::new(PyExecutionContext::default());
     // Seed the TLS execution-context slot (pyrex real_main does the same at
     // boot). `getexecutioncontext().gettopframe()` must be live so a residual
@@ -1074,49 +1058,16 @@ fn run_python_impl(source: &str) -> String {
     // Register the __build_class__ callback. Class construction resolves the
     // live frame from the execution-context slot seeded above.
     pyre_interpreter::call::register_build_class();
-    let mut frame =
-        match pyre_interpreter::pyframe::PyFrame::new_with_context(code, execution_context) {
-            Ok(frame) => frame,
-            Err(e) => return format!("Error: {e}"),
-        };
-    // Nothing reaches a GC frame but the `CURRENT_FRAME` / `f_backref` chain,
-    // which this one joins only when `eval_with_jit` installs it; the module
-    // registration below allocates and can collect in between. Publish it for
-    // that span (pyrex `run_source` does the same).
-    let _main_frame_root = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(
-        &*frame as *const pyre_interpreter::pyframe::PyFrame as pyre_object::PyObjectRef,
-    );
-
-    // Register the `__main__` module in sys.modules (pyrex real_main does the
-    // same), reusing the canonical globals dict so `__main__.__dict__`,
-    // `globals()`, and `function.__globals__` share one identity. Without this,
-    // `sys.modules['__main__']` / `import __main__` raise KeyError.
-    let canonical = frame.get_w_globals();
-    let main_module = pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
-    pyre_interpreter::importing::set_sys_module("__main__", main_module);
+    // `app_main.py` creates `__main__` and registers it in `sys.modules`
+    // before anything else runs, as `pyrex run_source` does: the module
+    // aliases the globals dict the program will run in, so
+    // `__main__.__dict__`, `globals()` and `function.__globals__` share one
+    // identity, and `sys.modules['__main__']` / `import __main__` resolve.
+    let (canonical, main_module) =
+        pyre_interpreter::app_main::prepare_main_module(&execution_context);
 
     let script_path = SCRIPT_PATH.with(|p| p.borrow().clone());
-    #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
     let main_file = script_path.clone();
-
-    // `__main__.__file__` — `pymain_run_file` publishes the script's own path
-    // in the module it runs it as, and `unittest`'s discovery, `inspect` and
-    // traceback rendering all read it back off `__main__`.
-    if let Some(path) = script_path.as_deref() {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let globals_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(canonical);
-        let key_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("__file__"));
-        let path_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(path));
-        let _ = pyre_interpreter::baseobjspace::setitem(
-            pyre_object::gc_roots::shadow_stack_get(globals_slot),
-            pyre_object::gc_roots::shadow_stack_get(key_slot),
-            pyre_object::gc_roots::shadow_stack_get(path_slot),
-        );
-    }
 
     // `sys.argv[0]` is the script, as `pymain_run_file` sets it, and `''` when
     // the guest was handed source with no name -- which is what `Py_Initialize`
@@ -1161,6 +1112,14 @@ fn run_python_impl(source: &str) -> String {
         );
     }
 
+    // `__spec__` / `__package__` / `__doc__`, and `__file__` / `__cached__`
+    // for a script run by path.
+    pyre_interpreter::app_main::seed_main_module_attrs(
+        canonical,
+        main_module,
+        main_file.as_deref(),
+    );
+
     // `app_main.py` binds `__main__.__loader__` and then imports `site` before
     // the program runs, as `pyrex run_source` does.
     #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
@@ -1181,6 +1140,41 @@ fn run_python_impl(source: &str) -> String {
             return OUTPUT_BUF.with(|buf| buf.borrow().clone());
         }
     }
+
+    let filename = SCRIPT_PATH.with(|p| p.borrow().clone());
+    let filename = filename.as_deref().unwrap_or("<string>");
+    // Source is compiled only once startup is complete, the order
+    // `pymain_run_python` runs in: `site` is imported ahead of every path that
+    // reaches user source.
+    let code =
+        match compile_source_with_filename(source, Mode::Exec, filename) {
+            Ok(code) => code,
+            Err(e) => {
+                // `pyrex::run_source` renders the same `File "…", line N` + caret
+                // banner on stderr and exits 1.
+                pyre_interpreter::eprint_syntax_error(
+                    &pyre_interpreter::compile_err_to_syntax_error(e, source, Mode::Exec),
+                );
+                EXIT_CODE.with(|c| c.set(1));
+                return String::new();
+            }
+        };
+
+    let mut frame = match pyre_interpreter::pyframe::PyFrame::new_with_context_and_globals(
+        code,
+        execution_context,
+        canonical,
+    ) {
+        Ok(frame) => frame,
+        Err(e) => return format!("Error: {e}"),
+    };
+    // Nothing reaches a GC frame but the `CURRENT_FRAME` / `f_backref` chain,
+    // which this one joins only when `eval_with_jit` installs it. Publish it
+    // until then (pyrex `run_source` does the same).
+    let _main_frame_root = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(
+        &*frame as *const pyre_interpreter::pyframe::PyFrame as pyre_object::PyObjectRef,
+    );
 
     // catch_unwind to capture panics from JIT as error messages
     let eval_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1221,7 +1215,7 @@ fn run_python_impl(source: &str) -> String {
     // one interpreter alive across `run_python` calls.
     #[cfg(feature = "wasm-host")]
     pyre_interpreter::shutdown::finalize_runtime(
-        canonical,
+        frame.get_w_globals(),
         pyre_interpreter::call::getexecutioncontext(),
     );
 
