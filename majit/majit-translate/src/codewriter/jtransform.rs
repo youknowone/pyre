@@ -4612,20 +4612,28 @@ impl<'a> Transformer<'a> {
         owner: &str,
         zero: bool,
     ) -> RewriteResult {
-        let size = {
+        let layout = {
             let cc = self.callcontrol.as_deref().unwrap_or_else(|| {
                 panic!(
                     "raw malloc of {owner} has no CallControl; size comes from CallControl::struct_layout_for"
                 )
             });
-            cc.struct_layout_for(owner)
-                .map(|layout| layout.size)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "raw malloc of {owner} has no StructLayout; size comes from CallControl::struct_layout_for"
-                    )
-                })
+            cc.struct_layout_for(owner).unwrap_or_else(|| {
+                panic!(
+                    "raw malloc of {owner} has no StructLayout; size comes from CallControl::struct_layout_for"
+                )
+            })
         };
+        // `support.py build_ll_0_raw_malloc_fixedsize` calls
+        // `lltype.malloc(STRUCT, flavor='raw')`, which is C `malloc`.
+        // `malloc` aligns the result for `max_align_t` (16 bytes).
+        if layout.align > 16 {
+            panic!(
+                "raw malloc of {owner} requires alignment {}, above malloc's 16-byte guarantee",
+                layout.align
+            );
+        }
+        let size = layout.size;
         assert!(
             op.result.is_some(),
             "raw malloc of {owner} has no result variable"
