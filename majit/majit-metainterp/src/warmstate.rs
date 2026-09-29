@@ -1212,7 +1212,12 @@ impl WarmEnterState {
             let flags = cell.flags;
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
             if is_compiled {
-                let cell_key = hash;
+                // `compiled_loops` is filed under this cell's assigned key.
+                // `install_new_cell` mints `BaseJitCell::cell_key` when
+                // `get_uhash` is already taken, and `maybe_compile_and_run_step`
+                // resolves that same number with `cell_key_for` after
+                // `RunCompiled`. The raw hash names the bucket's first cell.
+                let cell_key = cell.cell_key.unwrap_or(hash);
                 if has_compiled_meta(cell_key) {
                     // warmstate.py:501 — see `maybe_compile_decision`, whose
                     // position this is the typed twin of.
@@ -7036,6 +7041,53 @@ mod tests {
         assert!(
             Arc::ptr_eq(&by_bucket_hash, &head_token),
             "the raw hash names the bucket's first occupant, as it always did",
+        );
+    }
+
+    /// Two typed keys share `get_uhash()`. The second cell's compiled token
+    /// is reachable only through the key `install_new_cell` minted for it.
+    /// `maybe_compile_and_run_step` asks `has_compiled_meta` with that key
+    /// (`compiled_loops.contains_key`) and then reads it back with
+    /// `cell_key_for`. A decision that hands the raw hash to the callback
+    /// misses the token and falls through to the counter.
+    #[test]
+    fn maybe_compile_decision_with_key_runs_the_colliding_cell_under_its_minted_key() {
+        let mut ws = WarmEnterState::new(100);
+        let head = GreenKey::new(vec![2100, 2200]);
+        let second = GreenKey::new(vec![2300, colliding_last_green(&head, 2300)]);
+        let hash = head.get_uhash();
+        assert_eq!(
+            second.get_uhash(),
+            hash,
+            "fixture: the two keys must share get_uhash()",
+        );
+        assert_ne!(head, second, "fixture: and they must be different keys");
+
+        ws.ensure_cell_for_key(&head);
+        ws.ensure_cell_for_key(&second);
+        let minted = ws
+            .cell_key_for(&second)
+            .expect("the second key owns a cell");
+        assert_ne!(
+            minted, hash,
+            "the second cell must carry the key install_new_cell minted once \
+             the raw hash was taken",
+        );
+
+        let token = token_with_compiled_code(&mut ws);
+        attach_alive_for_key(&mut ws, &second, token);
+        assert!(
+            ws.lookup_chain_with_key(&second)
+                .is_some_and(|cell| cell.is_compiled()),
+            "fixture: the second cell holds a live compiled token",
+        );
+
+        assert!(
+            matches!(
+                ws.maybe_compile_decision_with_key(&second, |cell_key| cell_key == minted),
+                HotResult::RunCompiled
+            ),
+            "the second cell's compiled metadata lives under its minted key",
         );
     }
 

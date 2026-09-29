@@ -1675,7 +1675,7 @@ impl TraceCtx {
     /// the same list.  Read the address back through `concrete_of_opref` —
     /// pyre's `getref_base()` — so a pair that has moved still matches, and
     /// keep the pushed copy only for an entry carrying no stamp at all.
-    fn virtualref_entry_ptr(&self, entry: (OpRef, usize)) -> usize {
+    pub fn virtualref_entry_ptr(&self, entry: (OpRef, usize)) -> usize {
         match self.concrete_of_opref(entry.0) {
             Some(Value::Ref(r)) => r.as_usize(),
             _ => entry.1,

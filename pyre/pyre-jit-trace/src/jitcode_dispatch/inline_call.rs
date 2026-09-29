@@ -4681,6 +4681,12 @@ pub(crate) fn walker_ec_leave(
 /// Undo the concrete `topframeref` this enter installed and drop the
 /// tracing-only vref pair. Do not record `VIRTUAL_REF_FINISH` or
 /// `LEAVE_PORTAL_FRAME`: the trace is discarded whole.
+///
+/// `concrete_frame` is dereferenced (`f_backref`, `escaped`). Callers pass
+/// the live address from [`TraceCtx::virtualref_entry_ptr`]: the `usize`
+/// `opimpl_virtual_ref` stored beside the pair is the address at the push,
+/// and a moving collection forwards the stamp through `concrete_of_opref`
+/// while leaving that copy behind.
 pub(crate) fn abandon_entered_frame(
     ctx: &mut TraceCtx,
     concrete_frame: *mut pyre_interpreter::PyFrame,
@@ -4714,15 +4720,12 @@ pub(crate) fn unwind_entered_scopes_above<Sym: WalkSym>(
 ) {
     let concrete_ec = sym.concrete_execution_context() as *mut pyre_interpreter::PyExecutionContext;
     while ctx.virtualref_boxes_len() > entry_depth {
-        let Some((_, frame_ptr)) = ctx.innermost_virtualref_virtual() else {
+        let Some(entry) = ctx.innermost_virtualref_virtual() else {
             break;
         };
+        let frame_ptr = ctx.virtualref_entry_ptr(entry) as *mut pyre_interpreter::PyFrame;
         let before = ctx.virtualref_boxes_len();
-        abandon_entered_frame(
-            ctx,
-            frame_ptr as *mut pyre_interpreter::PyFrame,
-            concrete_ec,
-        );
+        abandon_entered_frame(ctx, frame_ptr, concrete_ec);
         if ctx.virtualref_boxes_len() == before {
             break;
         }
@@ -9060,9 +9063,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // `enter` already ran. `SwitchToBlackhole` never reaches `leave`,
             // so restore the concrete chain without recording the finish.
             if entered_ec.is_some() {
+                let frame_ptr = sub_wc
+                    .trace_ctx
+                    .virtualref_entry_ptr((ca_callee_frame, ca_concrete_frame as usize))
+                    as *mut pyre_interpreter::PyFrame;
                 abandon_entered_frame(
                     sub_wc.trace_ctx,
-                    ca_concrete_frame,
+                    frame_ptr,
                     pyre_interpreter::call::getexecutioncontext()
                         as *mut pyre_interpreter::PyExecutionContext,
                 );
@@ -9100,9 +9107,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // and `ExecutionContext.leave` are after that point and must not run.
         if let Err(error @ DispatchError::TraceTooLong { .. }) = result {
             if entered_ec.is_some() {
+                let frame_ptr = sub_wc
+                    .trace_ctx
+                    .virtualref_entry_ptr((ca_callee_frame, ca_concrete_frame as usize))
+                    as *mut pyre_interpreter::PyFrame;
                 abandon_entered_frame(
                     sub_wc.trace_ctx,
-                    ca_concrete_frame,
+                    frame_ptr,
                     pyre_interpreter::call::getexecutioncontext()
                         as *mut pyre_interpreter::PyExecutionContext,
                 );
