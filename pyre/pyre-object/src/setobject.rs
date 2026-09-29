@@ -409,9 +409,10 @@ pub static ASCII_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
 
 /// Python set object.
 ///
-/// Layout: `[ob_header | sstorage | strategy | len | hash]`, the
-/// `W_BaseSetObject` slots `sstorage` and `strategy` (`setobject.py`) plus the
-/// atomic count and the frozenset hash cache. `sstorage` is the erased box;
+/// Layout: `[ob_header | sstorage | strategy | len | hash | set_id | content_gen]`,
+/// the `W_BaseSetObject` slots `sstorage` and `strategy` (`setobject.py`) plus
+/// the atomic count, the frozenset hash cache, and the two words the integer
+/// `add` hit guard reads. `sstorage` is the erased box;
 /// [`SetItemsStorage`] (`ObjectSetStrategy.unerase`), [`IntSetStorage`]
 /// (`IntegerSetStrategy.unerase`), [`BytesSetStorage`]
 /// (`BytesSetStrategy.unerase`), or [`AsciiSetStorage`]
@@ -444,6 +445,14 @@ pub struct W_SetObject {
     pub len: AtomicUsize,
     /// setobject.py `W_FrozensetObject.hash = DEFAULT_HASH`.
     pub hash: i64,
+    /// Identity assigned once by [`fresh_set_id`]. A nursery collection
+    /// moves the object address; this word does not.
+    pub set_id: usize,
+    /// Bumped by [`W_SetObject::set_len_relaxed`] and [`set_write_barrier`]
+    /// when membership or storage changes. A plain-int `add` that finds the
+    /// key already stored does not reach either, so the word stays put.
+    /// Relaxed, same as `len`.
+    pub content_gen: AtomicUsize,
 }
 
 impl W_SetObject {
@@ -453,10 +462,29 @@ impl W_SetObject {
         self.len.load(Ordering::Relaxed)
     }
 
-    /// `FT_ATOMIC_STORE_SSIZE_RELAXED(so->used, n)`.
+    /// `FT_ATOMIC_STORE_SSIZE_RELAXED(so->used, n)`. Also bumps
+    /// [`Self::content_gen`]: every length publish is a membership change.
     #[inline]
     pub fn set_len_relaxed(&self, n: usize) {
         self.len.store(n, Ordering::Relaxed);
+        self.bump_content_gen();
+    }
+
+    /// Relaxed load of [`Self::content_gen`].
+    #[inline]
+    pub fn content_gen_relaxed(&self) -> usize {
+        self.content_gen.load(Ordering::Relaxed)
+    }
+
+    /// Advance [`Self::content_gen`] by one. Load then store, not
+    /// `fetch_add`: `len` already rtypes those two atomics. Under the stripe
+    /// lock the pair is race-free for this set. Two racers that both store
+    /// the same successor still move the word off the value a hit guard
+    /// traced, so the guard fails closed.
+    #[inline]
+    fn bump_content_gen(&self) {
+        let n = self.content_gen.load(Ordering::Relaxed);
+        self.content_gen.store(n.wrapping_add(1), Ordering::Relaxed);
     }
 }
 
@@ -2034,6 +2062,9 @@ fn set_write_barrier(obj: PyObjectRef) {
         return;
     }
     let set = unsafe { &*(obj as *const W_SetObject) };
+    // Storage replacement is a membership change for every strategy,
+    // including an integer set whose kind returns below.
+    set.bump_content_gen();
     // `EmptySetStrategy.get_empty_storage` is null. Kind and storage are
     // read together; an empty set has nothing to remember.
     if set.strategy.kind != SetStrategyKind::Object {
@@ -2146,6 +2177,16 @@ fn set_items_write_barrier(items: *mut SetItemsStorage) {
     crate::gc_hook::try_gc_write_barrier(items as *mut u8);
 }
 
+/// Process-wide source of [`W_SetObject::set_id`].
+///
+/// [`next_version_tag_serial`] is the same shape: a `static` atomic has no
+/// llop, so the bump stays residual and the id is not a traced constant.
+#[majit_macros::dont_look_inside]
+fn fresh_set_id() -> usize {
+    static NEXT_SET_ID: AtomicUsize = AtomicUsize::new(1);
+    NEXT_SET_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Allocate an empty `set`.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
@@ -2189,6 +2230,8 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
         strategy: &EMPTY_SET_STRATEGY_REF,
         len: crate::object_array::length_cell(0),
         hash: -1,
+        set_id: fresh_set_id(),
+        content_gen: crate::object_array::length_cell(0),
     };
     if !raw.is_null() {
         unsafe {
@@ -3766,6 +3809,55 @@ mod tests {
             SetStrategyKind::Object
         );
         assert!(!plain_int_already_in_int_set(s, one));
+    }
+
+    #[test]
+    fn content_gen_is_stable_across_a_hit_add() {
+        install_test_hash_hook();
+        let a = w_set_new();
+        let b = w_set_new();
+        unsafe {
+            let a_obj = &*(a as *const W_SetObject);
+            let b_obj = &*(b as *const W_SetObject);
+            assert_ne!(a_obj.set_id, 0);
+            assert_ne!(a_obj.set_id, b_obj.set_id);
+            let id = a_obj.set_id;
+            let gen_empty = a_obj.content_gen_relaxed();
+
+            w_set_add(a, w_int_new(1));
+            let gen_inserted = (*(a as *const W_SetObject)).content_gen_relaxed();
+            assert_ne!(gen_inserted, gen_empty);
+            assert_eq!((*(a as *const W_SetObject)).set_id, id);
+
+            w_set_add(a, w_int_new(1));
+            assert_eq!(
+                (*(a as *const W_SetObject)).content_gen_relaxed(),
+                gen_inserted
+            );
+            assert!(plain_int_already_in_int_set(a, w_int_new(1)));
+
+            w_set_discard(a, w_int_new(1));
+            let gen_removed = (*(a as *const W_SetObject)).content_gen_relaxed();
+            assert_ne!(gen_removed, gen_inserted);
+
+            w_set_add(a, w_int_new(2));
+            let gen_readded = (*(a as *const W_SetObject)).content_gen_relaxed();
+            w_set_clear(a);
+            assert_ne!(
+                (*(a as *const W_SetObject)).content_gen_relaxed(),
+                gen_readded
+            );
+            assert_eq!((*(a as *const W_SetObject)).set_id, id);
+
+            w_set_add(a, crate::w_str_new("a"));
+            let gen_str = (*(a as *const W_SetObject)).content_gen_relaxed();
+            w_set_add(a, crate::w_str_new("a"));
+            assert_eq!((*(a as *const W_SetObject)).content_gen_relaxed(), gen_str);
+            assert_eq!(
+                (*(a as *const W_SetObject)).strategy.kind,
+                SetStrategyKind::Ascii
+            );
+        }
     }
 
     #[test]

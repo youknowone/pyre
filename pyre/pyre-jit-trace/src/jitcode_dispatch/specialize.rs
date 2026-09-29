@@ -14864,9 +14864,32 @@ pub(crate) enum SetAddMethodSpec {
     /// MayForce [`pyre_interpreter::runtime_ops::jit_set_add_method`]. The
     /// generic tail still executes it.
     Subst(DirectResidualSubst),
-    /// The traced element is already in an integer-strategy set. The contains
-    /// check and `GuardTrue` stand in for the insert.
+    /// The traced element is already in an integer-strategy set. The intval,
+    /// `set_id`, and `content_gen` guards stand in for the insert.
     Elided,
+}
+
+/// Pin `op` to `expected` unless the trace already folded it to that
+/// constant. `GUARD_VALUE` of a constant the optimizer has proved is
+/// `InvalidLoop` (`optimize_GUARD_VALUE`). A constant that is some other
+/// int is not guarded and not treated as pinned: the caller falls through
+/// to the real `set.add` residual.
+fn pin_int_guard_value<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op: OpRef,
+    expected: i64,
+) -> Result<bool, DispatchError> {
+    if op.is_constant() {
+        let pinned = matches!(
+            ctx.trace_ctx.box_value(op),
+            Some(majit_ir::Value::Int(n)) if n == expected
+        );
+        return Ok(pinned);
+    }
+    let expected_op = ctx.trace_ctx.const_int(expected);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[op, expected_op])?;
+    Ok(true)
 }
 
 /// `s.add(x)`: record the direct `set_add` residual the SET_ADD accumulator
@@ -14891,15 +14914,17 @@ pub(crate) enum SetAddMethodSpec {
 /// half of the gap against `list.append` (`GuardNotForced`, which even the
 /// dispatch-free comprehension carries), and this arm does not claim it.
 ///
-/// A hit does not hash.  When the traced value is a plain int
+/// A hit does not hash.  When the traced value is an exact `int`
 /// [`pyre_object::plain_int_already_in_int_set`] already finds in an
-/// [`pyre_object::setobject::IntegerSetStrategy`] set, the arm records
-/// [`pyre_interpreter::runtime_ops::jit_int_set_add_already_present`] as a
-/// cannot-collect call plus `GuardTrue`, and writes `None`.  The helper does
-/// not insert.  A later miss fails the guard and resumes at this call, so the
-/// interpreter performs the real add.  The traced iteration itself must be a
-/// hit: recording the guard around a concrete miss would compile a loop that
-/// side-exits every time.
+/// [`pyre_object::setobject::IntegerSetStrategy`] set, the arm guards the
+/// unboxed intval, [`pyre_object::setobject::W_SetObject::set_id`], and
+/// [`pyre_object::setobject::W_SetObject::content_gen`], then writes `None`.
+/// No helper runs.  A later miss, a different int, or a membership change
+/// fails a guard and resumes at this call, so the interpreter performs the
+/// real add.  The traced iteration itself must be a hit: a concrete miss
+/// stays the MayForce substitution below.  A fitting `W_LongObject` is stored
+/// unboxed too, but it is not a `W_IntObject`, so it keeps that
+/// substitution.
 ///
 /// Recognition declines before emitting IR, and what it admits is deliberately
 /// the builtin's own predicate: `require_set_receiver` is `is_set`, an
@@ -15001,23 +15026,35 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
         .heap_cache_mut()
         .class_now_known(self_ref, set_type_addr);
 
-    if already {
-        let mut effect = majit_metainterp::cannot_raise_effect_info();
-        effect.can_collect = false;
-        let present = ctx.trace_ctx.call_typed_with_effect(
-            OpCode::CallI,
-            pyre_interpreter::runtime_ops::jit_int_set_add_already_present as *const (),
-            &[self_ref, r_args[2]],
-            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-            majit_ir::Type::Int,
-            effect,
-        );
-        ctx.trace_ctx
-            .set_opref_concrete(present, majit_ir::Value::Int(1));
-        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[present])?;
-        let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
-        return Ok(Some(SetAddMethodSpec::Elided));
+    // `is_plain_int1` also accepts a fitting long. `walker_unbox_int` reads
+    // `W_IntObject.intval`, so only an exact int is pinned here.
+    if already && unsafe { pyre_object::is_int(value) } {
+        let (traced_int, traced_id, traced_gen) = unsafe {
+            let n = pyre_object::w_int_get_value(value);
+            let set = &*(inner_self as *const pyre_object::setobject::W_SetObject);
+            (n, set.set_id as i64, set.content_gen_relaxed() as i64)
+        };
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        let raw = walker_unbox_int(ctx, op.pc, r_args[2], int_type_addr)?;
+        if pin_int_guard_value(ctx, op.pc, raw, traced_int)? {
+            let id_op = crate::state::opimpl_getfield_gc_i(
+                ctx.trace_ctx,
+                self_ref,
+                crate::descr::set_id_descr(),
+            );
+            if pin_int_guard_value(ctx, op.pc, id_op, traced_id)? {
+                let gen_op = crate::state::opimpl_getfield_gc_i(
+                    ctx.trace_ctx,
+                    self_ref,
+                    crate::descr::set_content_gen_descr(),
+                );
+                if pin_int_guard_value(ctx, op.pc, gen_op, traced_gen)? {
+                    let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+                    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
+                    return Ok(Some(SetAddMethodSpec::Elided));
+                }
+            }
+        }
     }
 
     let funcptr = ctx
