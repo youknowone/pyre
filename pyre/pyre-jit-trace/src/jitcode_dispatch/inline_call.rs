@@ -12967,6 +12967,12 @@ pub(super) fn generator_resume_yield<Sym: WalkSym>(
         "last_instr",
         resume.yield_py_pc as i64,
     );
+    // `popvalue` (`pyframe.py`) nulls the slot it pops. The depth store above
+    // is that pop's index write; the yielded int is still in the slot, and
+    // the next `pushvalue_none` requires it to be None.
+    unsafe {
+        (*(resume.frame as *mut pyre_interpreter::PyFrame)).set_locals_w(top, std::ptr::null_mut());
+    }
     Ok(Some(store.value))
 }
 
@@ -13998,7 +14004,16 @@ fn walk_generator_resume<Sym: WalkSym>(
     // `last_instr + 1`.  Arm the durable undo first so a declined walk
     // puts the frame back whole.
     fbw_arm_durable_frame_undo(gen_frame as usize);
-    unsafe { (*gen_frame).pushvalue_none() };
+    unsafe {
+        // `pushvalue_none` (`pyframe.py`) counts a slot that `popvalue` already
+        // set to None. A traced yield publishes the depth and leaves the
+        // yielded int in that slot; clear it before the count.
+        let depth = (*gen_frame).valuestackdepth;
+        if !(*(*gen_frame).locals_cells_stack_w).as_slice()[depth].is_null() {
+            (*gen_frame).set_locals_w(depth, std::ptr::null_mut());
+        }
+        (*gen_frame).pushvalue_none();
+    };
 
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
@@ -17330,6 +17345,11 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         })? {
             let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
             write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            // `pyjitpl.py finishframe` clears `last_exc_value` before popframe
+            // on a non-exceptional return. This emit replaces that inline
+            // call, so the following `opimpl_catch_exception` sees a clear
+            // slot the way the residual success arm does.
+            ctx.clear_last_exc_value();
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         // Inside a transparent helper subwalk this frame already walks the

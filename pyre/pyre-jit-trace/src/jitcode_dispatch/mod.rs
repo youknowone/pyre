@@ -5084,6 +5084,27 @@ fn write_ref_reg<Sym: WalkSym>(
     Ok(())
 }
 
+/// Write a Ref register for a link renaming (`flatten.py insert_renamings`:
+/// `ref_copy` / `ref_pop`) without stamping operand TOS.
+///
+/// A renaming moves a value that is already live into the target block's
+/// register; it is not the result of the Python opcode it happens to be
+/// flattened into.  The opcode's own push stamped `vstack_last_ref` at its
+/// `setarrayitem_vable_r` or residual result, and a following renaming of an
+/// unrelated local (a loop-carried constant, say) must not replace it.
+fn write_renaming_ref_reg<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    dst: usize,
+    value: OpRef,
+    concrete: ConcreteValue,
+) -> Result<(), DispatchError> {
+    let saved = ctx.frame_state.borrow().vstack_last_ref;
+    write_ref_reg(ctx, pc, dst, value, concrete)?;
+    ctx.frame_state.borrow_mut().vstack_last_ref = saved;
+    Ok(())
+}
+
 /// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
 ///
 /// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
@@ -13887,7 +13908,7 @@ fn handle<Sym: WalkSym>(
                 (val, concrete)
             };
             let dst = code[op.pc + 1] as usize;
-            write_ref_reg(ctx, op.pc, dst, val, concrete)?;
+            write_renaming_ref_reg(ctx, op.pc, dst, val, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "int_push/i" => {
@@ -13969,7 +13990,7 @@ fn handle<Sym: WalkSym>(
             // the guard.
             let src_concrete = read_ref_reg_concrete(code, op, 0, ctx);
             let dst = code[op.pc + 2] as usize;
-            write_ref_reg(ctx, op.pc, dst, src_val, src_concrete)?;
+            write_renaming_ref_reg(ctx, op.pc, dst, src_val, src_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_return/r" => {
