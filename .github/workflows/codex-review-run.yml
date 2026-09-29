@@ -324,7 +324,7 @@ jobs:
           # the diff under review is untrusted and a review only needs to read.
           # The sandbox denies the model's shell commands network access, which
           # is what stops an injected prompt from exfiltrating the credential.
-          codex exec -s workspace-write -m gpt-5.6-terra \
+          codex exec -s workspace-write -m gpt-6-sol \
             --output-last-message report.md \
             "$PROMPT" </dev/null > codex.log 2>&1
           status=$?
