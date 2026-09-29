@@ -1,0 +1,527 @@
+//! `rpython/rtyper/lltypesystem/rffi.py` — C types, `llexternal`, the errno
+//! flags an external call saves, and the runtime string/buffer helpers.
+//!
+//! `ExternalCompilationInfo` is `rpython/translator/tool/cbuild.py`.
+
+#![allow(non_camel_case_types)]
+
+pub use majit_jitcode::rffi::{
+    RFFI_ALT_ERRNO, RFFI_ERR_ALL, RFFI_ERR_NONE, RFFI_FULL_ERRNO, RFFI_FULL_ERRNO_ZERO,
+    RFFI_FULL_LASTERROR, RFFI_READSAVED_ERRNO, RFFI_READSAVED_LASTERROR, RFFI_SAVE_ERRNO,
+    RFFI_SAVE_LASTERROR, RFFI_SAVE_WSALASTERROR, RFFI_ZERO_ERRNO_BEFORE,
+};
+pub use majit_macros::{
+    call_aroundstate_target, external_compilation_info, jit_close_stack, llexternal,
+};
+
+/// `rffi.CHAR`.
+pub type CHAR = std::ffi::c_char;
+/// `rffi.UCHAR`.
+pub type UCHAR = std::ffi::c_uchar;
+/// `rffi.SHORT`.
+pub type SHORT = std::ffi::c_short;
+/// `rffi.USHORT`.
+pub type USHORT = std::ffi::c_ushort;
+/// `rffi.INT`.
+pub type INT = std::ffi::c_int;
+/// `rffi.UINT`.
+pub type UINT = std::ffi::c_uint;
+/// `rffi.LONG`.
+pub type LONG = std::ffi::c_long;
+/// `rffi.ULONG`.
+pub type ULONG = std::ffi::c_ulong;
+/// `rffi.LONGLONG`.
+pub type LONGLONG = std::ffi::c_longlong;
+/// `rffi.ULONGLONG`.
+pub type ULONGLONG = std::ffi::c_ulonglong;
+/// `rffi.SIZE_T`.
+pub type SIZE_T = usize;
+/// `rffi.SSIZE_T`.
+pub type SSIZE_T = isize;
+/// `rffi.SIGNED` (`lltype.Signed`).
+pub type SIGNED = isize;
+/// `rffi.UNSIGNED` (`lltype.Unsigned`).
+pub type UNSIGNED = usize;
+/// `rffi.DOUBLE`.
+pub type DOUBLE = std::ffi::c_double;
+/// `rffi.FLOAT`.
+pub type FLOAT = std::ffi::c_float;
+/// `rffi.VOIDP`.
+pub type VOIDP = *mut std::ffi::c_void;
+/// `rffi.CONST_VOIDP`.
+pub type CONST_VOIDP = *const std::ffi::c_void;
+/// `rffi.CCHARP`.
+pub type CCHARP = *mut std::ffi::c_char;
+/// `rffi.CONST_CCHARP`.
+pub type CONST_CCHARP = *const std::ffi::c_char;
+/// `rffi.CCHARPP`.
+pub type CCHARPP = *mut *mut std::ffi::c_char;
+/// `wchar_t` behind [`CWCHARP`]. wasm32-unknown-unknown has no `libc`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) type Wchar = libc::wchar_t;
+/// `wchar_t` behind [`CWCHARP`]. wasm32-unknown-unknown has no `libc`.
+#[cfg(target_arch = "wasm32")]
+pub(super) type Wchar = i32;
+/// `rffi.CWCHARP` (`wchar_t *`).
+pub type CWCHARP = *mut Wchar;
+/// `rffi.CWCHARPP`.
+pub type CWCHARPP = *mut CWCHARP;
+
+mod buffer;
+mod convert;
+
+pub use crate::getintfield;
+pub use crate::offsetof;
+pub use crate::setintfield;
+pub use buffer::*;
+pub use convert::*;
+
+// `rffi.c_memcpy` / `rffi.c_memset`: `releasegil=False`, `calling_conv='c'`,
+// `_nowrapper=True`. The result type is `lltype.Void`.
+llexternal!(
+    pub c_memcpy = "memcpy",
+    [VOIDP, CONST_VOIDP, SIZE_T],
+    (),
+    releasegil = false,
+    _nowrapper = true,
+    calling_conv = "c",
+);
+llexternal!(
+    pub c_memset = "memset",
+    [VOIDP, SIGNED, SIZE_T],
+    (),
+    releasegil = false,
+    _nowrapper = true,
+    calling_conv = "c",
+);
+
+/// `ExternalCompilationInfo` (`cbuild.py`).
+///
+/// Slices stay `'static` so a declaration is a const.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternalCompilationInfo {
+    pub pre_include_bits: &'static [&'static str],
+    pub includes: &'static [&'static str],
+    pub include_dirs: &'static [&'static str],
+    pub post_include_bits: &'static [&'static str],
+    pub libraries: &'static [&'static str],
+    pub library_dirs: &'static [&'static str],
+    pub separate_module_sources: &'static [&'static str],
+    pub separate_module_files: &'static [&'static str],
+    pub compile_extra: &'static [&'static str],
+    pub link_extra: &'static [&'static str],
+    pub frameworks: &'static [&'static str],
+    pub link_files: &'static [&'static str],
+    pub testonly_libraries: &'static [&'static str],
+    pub use_cpp_linker: bool,
+}
+
+impl ExternalCompilationInfo {
+    pub const DEFAULT: Self = Self {
+        pre_include_bits: &[],
+        includes: &[],
+        include_dirs: &[],
+        post_include_bits: &[],
+        libraries: &[],
+        library_dirs: &[],
+        separate_module_sources: &[],
+        separate_module_files: &[],
+        compile_extra: &[],
+        link_extra: &[],
+        frameworks: &[],
+        link_files: &[],
+        testonly_libraries: &[],
+        use_cpp_linker: false,
+    };
+
+    pub const fn new() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl Default for ExternalCompilationInfo {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static GIL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static HELD_DURING: AtomicBool = AtomicBool::new(false);
+
+    struct GilHold;
+    impl Drop for GilHold {
+        fn drop(&mut self) {
+            if majit_gc::rgil::am_i_holding_the_gil() {
+                majit_gc::rgil::release();
+            }
+        }
+    }
+
+    fn hold_gil() -> (std::sync::MutexGuard<'static, ()>, GilHold) {
+        let guard = GIL_LOCK.lock().unwrap();
+        majit_gc::rgil::allocate();
+        if !majit_gc::rgil::am_i_holding_the_gil() {
+            majit_gc::rgil::acquire();
+        }
+        (guard, GilHold)
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn majit_rffi_t1_gil_probe() -> i32 {
+        HELD_DURING.store(majit_gc::rgil::am_i_holding_the_gil(), Ordering::SeqCst);
+        7
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn majit_rffi_t1_set_errno(value: i32) -> i32 {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        unsafe {
+            *libc::__error() = value;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        unsafe {
+            *libc::__errno_location() = value;
+        }
+        #[cfg(windows)]
+        unsafe {
+            *_errno() = value;
+        }
+        value
+    }
+
+    #[cfg(windows)]
+    unsafe extern "C" {
+        fn _errno() -> *mut i32;
+    }
+
+    external_compilation_info! {
+        const EMPTY_ECI = {};
+    }
+
+    #[cfg(unix)]
+    external_compilation_info! {
+        const LIBC_ECI = {
+            libraries: ["c"],
+            includes: ["errno.h"],
+        };
+    }
+
+    llexternal!(
+        gil_probe = "majit_rffi_t1_gil_probe",
+        [],
+        i32,
+        compilation_info = EMPTY_ECI
+    );
+    llexternal!(
+        gil_probe_direct = "majit_rffi_t1_gil_probe",
+        [],
+        i32,
+        _nowrapper = true
+    );
+    llexternal!(
+        gil_probe_macro = "majit_rffi_t1_gil_probe",
+        [],
+        i32,
+        macro = majit_rffi_t1_gil_probe,
+        sandboxsafe = true
+    );
+    llexternal!(
+        set_errno_ext = "majit_rffi_t1_set_errno",
+        [i32],
+        i32,
+        save_err = RFFI_SAVE_ERRNO
+    );
+    llexternal!(
+        pub pub_gil_probe = "majit_rffi_t1_gil_probe",
+        [],
+        i32,
+        sandboxsafe = true
+    );
+    #[cfg(unix)]
+    llexternal!(
+        fcntl_int = "fcntl",
+        [INT, INT, INT],
+        INT,
+        natural_arity = 2,
+        save_err = RFFI_SAVE_ERRNO
+    );
+
+    #[test]
+    fn gil_is_released_during_the_call_and_held_after() {
+        let (_lock, _hold) = hold_gil();
+        assert!(majit_gc::rgil::am_i_holding_the_gil());
+        let value = unsafe { gil_probe() };
+        assert_eq!(value, 7);
+        assert!(!HELD_DURING.load(Ordering::SeqCst));
+        assert!(majit_gc::rgil::am_i_holding_the_gil());
+    }
+
+    #[test]
+    fn nowrapper_calls_the_funcptr_without_releasing_the_gil() {
+        let (_lock, _hold) = hold_gil();
+        let value = unsafe { gil_probe_direct() };
+        assert_eq!(value, 7);
+        assert!(HELD_DURING.load(Ordering::SeqCst));
+        assert!(majit_gc::rgil::am_i_holding_the_gil());
+    }
+
+    #[test]
+    fn macro_path_calls_that_function() {
+        let (_lock, _hold) = hold_gil();
+        let value = unsafe { gil_probe_macro() };
+        assert_eq!(value, 7);
+        assert!(HELD_DURING.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn save_errno_is_visible_to_get_saved_errno() {
+        let (_lock, _hold) = hold_gil();
+        crate::rposix::set_saved_errno(0);
+        let value = unsafe { set_errno_ext(123) };
+        assert_eq!(value, 123);
+        assert_eq!(crate::rposix::get_saved_errno(), 123);
+        assert!(majit_gc::rgil::am_i_holding_the_gil());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn variadic_fcntl_matches_libc_and_saves_ebadf() {
+        let (_lock, _hold) = hold_gil();
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let expected = unsafe { libc::fcntl(fds[0], libc::F_GETFD) };
+        assert!(expected >= 0);
+        assert_eq!(unsafe { fcntl_int(fds[0], libc::F_GETFD, 0) }, expected);
+        let with_cloexec = expected | libc::FD_CLOEXEC;
+        assert_eq!(unsafe { fcntl_int(fds[0], libc::F_SETFD, with_cloexec) }, 0);
+        assert_eq!(unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, with_cloexec);
+        assert_eq!(unsafe { libc::close(fds[0]) }, 0);
+        crate::rposix::set_saved_errno(0);
+        assert!(unsafe { fcntl_int(fds[0], libc::F_GETFD, 0) } < 0);
+        assert_eq!(crate::rposix::get_saved_errno(), libc::EBADF);
+        unsafe { libc::close(fds[1]) };
+    }
+
+    #[test]
+    fn empty_compilation_info_starts_empty() {
+        assert!(EMPTY_ECI.libraries.is_empty());
+        assert!(!EMPTY_ECI.use_cpp_linker);
+        assert_eq!(
+            ExternalCompilationInfo::new(),
+            ExternalCompilationInfo::DEFAULT
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(LIBC_ECI.libraries, ["c"]);
+            assert_eq!(LIBC_ECI.includes, ["errno.h"]);
+        }
+    }
+
+    #[test]
+    fn str2charp_round_trip_and_embedded_nul() {
+        let owned = str2charp(b"hello", true);
+        assert_eq!(unsafe { charp2str(owned) }, b"hello");
+        unsafe { free_charp(owned, true) };
+
+        let untracked = str2charp(b"x", false);
+        assert_eq!(unsafe { charp2str(untracked) }, b"x");
+        unsafe { free_charp(untracked, false) };
+
+        // The copy keeps the interior NUL; `charp2str` stops, `charpsize2str` does not.
+        let raw = str2charp(b"ab\0cd", true);
+        assert_eq!(unsafe { charp2str(raw) }, b"ab");
+        assert_eq!(unsafe { charpsize2str(raw, 5) }, b"ab\0cd");
+        assert_eq!(unsafe { charp2strn(raw, 4) }, b"ab");
+        assert_eq!(unsafe { charp2strn(raw, 1) }, b"a");
+        let whole = str2charp(b"abcdef", true);
+        assert_eq!(unsafe { charp2strn(whole, 3) }, b"abc");
+        assert_eq!(unsafe { charp2strn(whole, 100) }, b"abcdef");
+        unsafe { free_charp(raw, true) };
+        unsafe { free_charp(whole, true) };
+
+        let cp = str2constcharp(b"hi", true);
+        assert_eq!(unsafe { constcharp2str(cp) }, b"hi");
+        assert_eq!(unsafe { constcharpsize2str(cp, 2) }, b"hi");
+        unsafe { free_charp(cast::<CCHARP>(cp), true) };
+    }
+
+    #[test]
+    fn str2chararray_and_str2rawmem_copy_a_slice() {
+        let (buf, gc, case) = alloc_buffer(8);
+        assert_eq!(case, 2);
+        unsafe {
+            c_memset(cast::<VOIDP>(buf), 0xFF, 8);
+            assert_eq!(str2chararray(b"hello", buf, 3), 3);
+            assert_eq!(charpsize2str(buf, 4), b"hel\xFF");
+            str2rawmem(b"abcdef", buf, 2, 4);
+            assert_eq!(charpsize2str(buf, 4), b"cdef");
+            keep_buffer_alive_until_here(buf, gc, case);
+        }
+    }
+
+    #[test]
+    fn liststr2charpp_round_trip() {
+        let pp = liststr2charpp(&[b"one", b"two", b""]);
+        let got = unsafe { charpp2liststr(pp) };
+        assert_eq!(got, vec![b"one".to_vec(), b"two".to_vec(), b"".to_vec()]);
+        unsafe { free_charpp(pp) };
+
+        let empty = liststr2charpp(&[]);
+        assert!(unsafe { charpp2liststr(empty) }.is_empty());
+        unsafe { free_charpp(empty) };
+    }
+
+    #[test]
+    fn alloc_buffer_str_from_buffer_and_scoped_drop() {
+        let (raw, gc, case) = alloc_buffer(8);
+        unsafe {
+            c_memset(cast::<VOIDP>(raw), 0x41, 8);
+            assert_eq!(str_from_buffer(raw, gc, case, 8, 3), b"AAA");
+            keep_buffer_alive_until_here(raw, gc, case);
+        }
+
+        let staged = scoped_alloc_buffer::new(8);
+        assert_eq!(staged.size, 8);
+        assert_eq!(staged.case_num, 2);
+        unsafe { c_memset(cast::<VOIDP>(staged.raw), 0x42, 8) };
+        assert_eq!(staged.str(2), b"BB");
+        drop(staged);
+
+        let view = scoped_view_charp::new(b"ab\0c");
+        assert_eq!(view.flag, 0x06);
+        assert_eq!(unsafe { charp2str(view.buf) }, b"ab");
+        assert_eq!(unsafe { charpsize2str(view.buf, 4) }, b"ab\0c");
+        drop(view);
+
+        let moving = scoped_nonmovingbuffer::new(b"xyz");
+        assert_eq!(moving.flag, 0x06);
+        assert_eq!(unsafe { charpsize2str(moving.buf, 3) }, b"xyz");
+        drop(moving);
+
+        let none = scoped_str2charp::new(None);
+        assert!(none.buf.is_null());
+        drop(none);
+        let some = scoped_str2charp::new(Some(b"zz"));
+        assert_eq!(unsafe { charp2str(some.buf) }, b"zz");
+        drop(some);
+    }
+
+    #[test]
+    fn cast_truncates_and_sign_extends() {
+        assert_eq!(cast::<u8>(0x1_ABCDi32), 0xCDu8);
+        assert_eq!(cast::<i8>(-1i32), -1i8);
+        assert_eq!(cast::<i16>(0x1_0005i32), 5i16);
+        assert_eq!(cast::<i64>(-1i8), -1i64);
+        assert_eq!(cast::<u64>(-1i8), u64::MAX);
+        assert_eq!(cast::<i32>(65535u16), 65535i32);
+
+        let p = str2charp(b"z", true);
+        let addr = cast::<usize>(p);
+        assert_eq!(cast::<CCHARP>(addr), p);
+        unsafe { free_charp(p, true) };
+
+        assert_eq!(size_and_sign::<INT>(), (4, false));
+        assert_eq!(size_and_sign::<UINT>(), (4, true));
+        assert_eq!(sizeof::<FLOAT>(), 4);
+        assert_eq!(size_and_sign::<DOUBLE>(), (8, false));
+        assert_eq!(size_and_sign::<CCHARP>().0, core::mem::size_of::<CCHARP>());
+        assert!(!size_and_sign::<CCHARP>().1);
+
+        #[repr(C)]
+        struct OffSample {
+            a: u8,
+            b: u32,
+        }
+        assert_eq!(offsetof!(OffSample, b), core::mem::offset_of!(OffSample, b));
+
+        struct Rec {
+            v: i16,
+        }
+        let mut rec = Rec { v: 0 };
+        setintfield!(&mut rec, v, -1i64);
+        assert_eq!(rec.v, -1);
+        assert_eq!(getintfield!(&rec, v), -1isize);
+        setintfield!(&mut rec, v, 0x1_0005i32);
+        assert_eq!(rec.v, 5);
+        assert_eq!(getintfield!(&rec, v), 5isize);
+
+        let (base, gc, case) = alloc_buffer(4);
+        unsafe {
+            c_memset(cast::<VOIDP>(base), 0, 4);
+            *base = 1;
+            *ptradd(base, 2) = 3;
+            assert_eq!(ptradd(ptradd(base, 2), -2), base);
+            assert_eq!(charpsize2str(base, 4), vec![1, 0, 3, 0]);
+            keep_buffer_alive_until_here(base, gc, case);
+        }
+    }
+
+    #[test]
+    fn utf8_wchar_round_trip_includes_non_bmp() {
+        let text = "hé你😀";
+        let bytes = text.as_bytes();
+        let n = text.chars().count();
+        let w = utf82wcharp(bytes, n, true);
+        let wide = unsafe { core::mem::size_of_val(&*w) } >= 4;
+        let (back, count) = unsafe { wcharp2utf8(w).unwrap() };
+        let (cut, cut_n) = unsafe { wcharp2utf8n(w, 3).unwrap() };
+        let sized = unsafe { wcharpsize2utf8(w, n).unwrap() };
+        unsafe { free_wcharp(w, false) };
+        assert_eq!(count, n);
+        assert_eq!(cut_n, 3);
+        if wide {
+            assert_eq!(back, bytes);
+            assert_eq!(sized, bytes);
+            assert_eq!(cut, "hé你".as_bytes());
+        }
+
+        let with_nul = b"a\0b";
+        let w = utf82wcharp(with_nul, 3, true);
+        let (stopped, nzero) = unsafe { wcharp2utf8(w).unwrap() };
+        let full = unsafe { wcharpsize2utf8(w, 3).unwrap() };
+        unsafe { free_wcharp(w, true) };
+        assert_eq!((stopped.as_slice(), nzero), (&b"a"[..], 1));
+        assert_eq!(full, b"a\0b");
+
+        if wide {
+            let w = utf82wcharp(b"", 0, true);
+            unsafe { core::ptr::write(w.cast::<i32>(), 0x110000) };
+            assert_eq!(unsafe { wcharpsize2utf8(w, 1) }.unwrap_err().code, 0x110000);
+            unsafe { free_wcharp(w, true) };
+        }
+
+        let scoped = scoped_utf82wcharp::new(Some(bytes), -1);
+        let (again, again_n) = unsafe { wcharp2utf8(scoped.buf).unwrap() };
+        assert_eq!(again_n, n);
+        if wide {
+            assert_eq!(again, bytes);
+        }
+        let absent = scoped_utf82wcharp::new(None, -1);
+        assert!(absent.buf.is_null());
+    }
+
+    #[test]
+    fn c_memcpy_and_c_memset_fill_a_raw_buffer() {
+        let (buf, gc, case) = alloc_buffer(8);
+        unsafe {
+            c_memset(cast::<VOIDP>(buf), 0x11, 8);
+            assert_eq!(charpsize2str(buf, 8), vec![0x11; 8]);
+            let src = str2charp(b"abcd", true);
+            c_memcpy(cast::<VOIDP>(buf), cast::<CONST_VOIDP>(src), 4);
+            assert_eq!(charpsize2str(buf, 8), b"abcd\x11\x11\x11\x11");
+            free_charp(src, true);
+            keep_buffer_alive_until_here(buf, gc, case);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn pub_wrapper_is_visible_from_the_parent() {
+    let _probe: unsafe fn() -> i32 = tests::pub_gil_probe;
+}
