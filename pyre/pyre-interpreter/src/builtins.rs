@@ -2681,7 +2681,7 @@ fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             pyre_object::gc_roots::shadow_stack_get(mv_slot),
         )
     };
-    let result = crate::typedef::bytes_method_hex(&fwd);
+    let result = crate::typedef::descr_hex(&fwd);
     let mv = pyre_object::gc_roots::shadow_stack_get(mv_slot);
     unsafe { pyre_object::memoryview::w_memoryview_exports_decref(mv) };
     result
@@ -9841,14 +9841,14 @@ fn exc_gs_get_dict(args: &[PyObjectRef]) -> crate::PyResult {
     crate::baseobjspace::exception_descr_get_dict(args[1])
 }
 fn exc_gs_set_dict(args: &[PyObjectRef]) -> crate::PyResult {
-    crate::baseobjspace::exception_descr_set_dict(args[1], args[2])
+    crate::baseobjspace::descr_set_dict(args[1], args[2])
 }
 fn exc_gs_del_dict(args: &[PyObjectRef]) -> crate::PyResult {
-    crate::baseobjspace::exception_descr_del_dict(args[1])
+    crate::baseobjspace::descr_del_dict(args[1])
 }
 
 fn exc_gs_get_args(args: &[PyObjectRef]) -> crate::PyResult {
-    crate::baseobjspace::exception_descr_getargs(args[1])
+    crate::baseobjspace::descr_getargs(args[1])
 }
 fn exc_gs_set_args(args: &[PyObjectRef]) -> crate::PyResult {
     exception_getset_store(args, "args")
@@ -9868,7 +9868,7 @@ fn exc_gs_del_cause(_args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn exc_gs_get_context(args: &[PyObjectRef]) -> crate::PyResult {
-    crate::baseobjspace::exception_descr_getcontext(args[1])
+    crate::baseobjspace::descr_getcontext(args[1])
 }
 fn exc_gs_set_context(args: &[PyObjectRef]) -> crate::PyResult {
     exception_getset_store(args, "__context__")
@@ -9903,7 +9903,7 @@ fn exc_gs_del_written(args: &[PyObjectRef]) -> crate::PyResult {
     exception_getset_finish(
         w_obj,
         "characters_written",
-        crate::baseobjspace::exception_descr_del_written(w_obj),
+        crate::baseobjspace::descr_del_written(w_obj),
     )
 }
 
@@ -12149,7 +12149,7 @@ pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         if let Some(e) = w_errors {
             decode_args.push(e);
         }
-        return crate::typedef::bytes_method_decode(&decode_args);
+        return crate::typedef::descr_decode(&decode_args);
     }
     // A tagged `int` immediate stringifies to its decimal value; format it
     // before `is_str` / `ob_type` touch it as a pointer.
@@ -13477,7 +13477,7 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     for (i, arg) in args_w[..args.len()].iter_mut().enumerate() {
         *arg = unsafe { pyre_object::gc_roots::shadow_stack_get(save_point + i) };
     }
-    super_descr_init(w_self, &args_w[..args.len()])?;
+    descr_init(w_self, &args_w[..args.len()])?;
     Ok(unsafe { pyre_object::gc_roots::shadow_stack_get(save_point + args.len()) })
 }
 
@@ -13498,10 +13498,7 @@ fn super_init_args(args: &[PyObjectRef]) -> Result<&[PyObjectRef], crate::PyErro
 }
 
 /// `descriptor.py W_Super.descr_init`: validate before replacing self's fields.
-pub(crate) fn super_descr_init(
-    w_self: PyObjectRef,
-    args: &[PyObjectRef],
-) -> Result<(), crate::PyError> {
+pub(crate) fn descr_init(w_self: PyObjectRef, args: &[PyObjectRef]) -> Result<(), crate::PyError> {
     let args = super_init_args(args)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
@@ -22435,7 +22432,7 @@ fn fd_bytes_to_obj(
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&encoding));
         let err_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
-        crate::typedef::bytes_method_decode(&[
+        crate::typedef::descr_decode(&[
             pyre_object::gc_roots::shadow_stack_get(bytes_slot),
             pyre_object::gc_roots::shadow_stack_get(enc_slot),
             pyre_object::gc_roots::shadow_stack_get(err_slot),

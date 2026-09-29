@@ -5345,8 +5345,8 @@ fn super_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(value)
 }
 
-fn super_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::builtins::super_descr_init(args[0], args.get(1..).unwrap_or(&[]))?;
+fn descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::builtins::descr_init(args[0], args.get(1..).unwrap_or(&[]))?;
     Ok(w_none())
 }
 
@@ -5436,7 +5436,7 @@ fn init_super_type(ns: PyObjectRef) {
             "__init__",
             crate::gateway::make_builtin_function_with_text_signature(
                 "__init__",
-                super_descr_init,
+                descr_init,
                 "($self, /, *args, **kwargs)",
             ),
         ),
@@ -5509,7 +5509,7 @@ fn range_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 }
 
 /// `functional.py W_Range.descr_getitem`.
-fn range_descr_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn descr_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::baseobjspace::getitem(args[0], args[1])
 }
 
@@ -5576,7 +5576,7 @@ fn range_descr_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `functional.py W_Range.descr_bool`.
-fn range_descr_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn descr_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_bool_from(unsafe { pyre_object::w_range_bool(args[0]) }))
 }
 
@@ -5623,7 +5623,7 @@ fn init_range_type(ns: PyObjectRef) {
         ),
         (
             "__getitem__",
-            make_range_method("__getitem__", range_descr_getitem, 2, "($self, key, /)"),
+            make_range_method("__getitem__", descr_getitem, 2, "($self, key, /)"),
         ),
         (
             "__iter__",
@@ -5695,7 +5695,7 @@ fn init_range_type(ns: PyObjectRef) {
         ),
         (
             "__bool__",
-            make_range_method("__bool__", range_descr_bool, 1, "($self, /)"),
+            make_range_method("__bool__", descr_bool, 1, "($self, /)"),
         ),
         (
             "count",
@@ -6582,14 +6582,14 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "copy",
-            make_builtin_function_with_arity("copy", crate::type_methods::list_method_copy, 1),
+            make_builtin_function_with_arity("copy", crate::type_methods::descr_copy, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "insert",
-            make_builtin_function_with_arity("insert", crate::type_methods::list_method_insert, 3),
+            make_builtin_function_with_arity("insert", crate::type_methods::descr_insert, 3),
         )
     };
     unsafe {
@@ -6603,18 +6603,14 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "clear",
-            make_builtin_function_with_arity("clear", crate::type_methods::list_method_clear, 1),
+            make_builtin_function_with_arity("clear", crate::type_methods::descr_clear, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "reverse",
-            make_builtin_function_with_arity(
-                "reverse",
-                crate::type_methods::list_method_reverse,
-                1,
-            ),
+            make_builtin_function_with_arity("reverse", crate::type_methods::descr_reverse, 1),
         )
     };
     unsafe {
@@ -6653,7 +6649,7 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "remove",
-            make_builtin_function_with_arity("remove", crate::type_methods::list_method_remove, 2),
+            make_builtin_function_with_arity("remove", crate::type_methods::descr_remove, 2),
         )
     };
     // Container slots exposed as callable dunders.  `__getitem__` binds the
@@ -7175,14 +7171,14 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "partition",
-            make_builtin_function("partition", crate::type_methods::str_method_partition),
+            make_builtin_function("partition", crate::type_methods::descr_partition),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "rpartition",
-            make_builtin_function("rpartition", crate::type_methods::str_method_rpartition),
+            make_builtin_function("rpartition", crate::type_methods::descr_rpartition),
         )
     };
     unsafe {
@@ -7203,21 +7199,21 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "swapcase",
-            make_builtin_function("swapcase", crate::type_methods::str_method_swapcase),
+            make_builtin_function("swapcase", crate::type_methods::descr_swapcase),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "expandtabs",
-            make_builtin_function("expandtabs", crate::type_methods::str_method_expandtabs),
+            make_builtin_function("expandtabs", crate::type_methods::descr_expandtabs),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "format_map",
-            make_builtin_function("format_map", crate::type_methods::str_method_format_map),
+            make_builtin_function("format_map", crate::type_methods::descr_format_map),
         )
     };
     unsafe {
@@ -7286,7 +7282,7 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "rindex",
-            make_builtin_function("rindex", crate::type_methods::str_method_rindex),
+            make_builtin_function("rindex", crate::type_methods::descr_rindex),
         )
     };
     unsafe {
@@ -7315,7 +7311,7 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "format",
-            make_builtin_function("format", crate::type_methods::str_method_format),
+            make_builtin_function("format", crate::type_methods::descr_format),
         )
     };
     unsafe {
@@ -7374,7 +7370,7 @@ fn init_str_type(ns: PyObjectRef) {
             "isidentifier",
             make_builtin_function_with_arity(
                 "isidentifier",
-                crate::type_methods::str_method_isidentifier,
+                crate::type_methods::descr_isidentifier,
                 1,
             ),
         )
@@ -7404,7 +7400,7 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "title",
-            make_builtin_function_with_arity("title", crate::type_methods::str_method_title, 1),
+            make_builtin_function_with_arity("title", crate::type_methods::descr_title, 1),
         )
     };
     unsafe {
@@ -7413,7 +7409,7 @@ fn init_str_type(ns: PyObjectRef) {
             "capitalize",
             make_builtin_function_with_arity(
                 "capitalize",
-                crate::type_methods::str_method_capitalize,
+                crate::type_methods::descr_capitalize,
                 1,
             ),
         )
@@ -7422,11 +7418,7 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "swapcase",
-            make_builtin_function_with_arity(
-                "swapcase",
-                crate::type_methods::str_method_swapcase,
-                1,
-            ),
+            make_builtin_function_with_arity("swapcase", crate::type_methods::descr_swapcase, 1),
         )
     };
     unsafe {
@@ -7440,21 +7432,21 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "ljust",
-            make_builtin_function("ljust", crate::type_methods::str_method_ljust),
+            make_builtin_function("ljust", crate::type_methods::descr_ljust),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "rjust",
-            make_builtin_function("rjust", crate::type_methods::str_method_rjust),
+            make_builtin_function("rjust", crate::type_methods::descr_rjust),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "isspace",
-            make_builtin_function_with_arity("isspace", crate::type_methods::str_method_isspace, 1),
+            make_builtin_function_with_arity("isspace", crate::type_methods::descr_isspace, 1),
         )
     };
     unsafe {
@@ -7463,7 +7455,7 @@ fn init_str_type(ns: PyObjectRef) {
             "isprintable",
             make_builtin_function_with_arity(
                 "isprintable",
-                crate::type_methods::str_method_isprintable,
+                crate::type_methods::descr_isprintable,
                 1,
             ),
         )
@@ -7472,39 +7464,35 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "isupper",
-            make_builtin_function_with_arity("isupper", crate::type_methods::str_method_isupper, 1),
+            make_builtin_function_with_arity("isupper", crate::type_methods::descr_isupper, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "islower",
-            make_builtin_function_with_arity("islower", crate::type_methods::str_method_islower, 1),
+            make_builtin_function_with_arity("islower", crate::type_methods::descr_islower, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "isalnum",
-            make_builtin_function_with_arity("isalnum", crate::type_methods::str_method_isalnum, 1),
+            make_builtin_function_with_arity("isalnum", crate::type_methods::descr_isalnum, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "isascii",
-            make_builtin_function_with_arity("isascii", crate::type_methods::str_method_isascii, 1),
+            make_builtin_function_with_arity("isascii", crate::type_methods::descr_isascii, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "partition",
-            make_builtin_function_with_arity(
-                "partition",
-                crate::type_methods::str_method_partition,
-                2,
-            ),
+            make_builtin_function_with_arity("partition", crate::type_methods::descr_partition, 2),
         )
     };
     unsafe {
@@ -7513,7 +7501,7 @@ fn init_str_type(ns: PyObjectRef) {
             "rpartition",
             make_builtin_function_with_arity(
                 "rpartition",
-                crate::type_methods::str_method_rpartition,
+                crate::type_methods::descr_rpartition,
                 2,
             ),
         )
@@ -7531,7 +7519,7 @@ fn init_str_type(ns: PyObjectRef) {
             "removeprefix",
             make_builtin_function_with_arity(
                 "removeprefix",
-                crate::type_methods::str_method_removeprefix,
+                crate::type_methods::descr_removeprefix,
                 2,
             ),
         )
@@ -7542,7 +7530,7 @@ fn init_str_type(ns: PyObjectRef) {
             "removesuffix",
             make_builtin_function_with_arity(
                 "removesuffix",
-                crate::type_methods::str_method_removesuffix,
+                crate::type_methods::descr_removesuffix,
                 2,
             ),
         )
@@ -7551,7 +7539,7 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "expandtabs",
-            make_builtin_function("expandtabs", crate::type_methods::str_method_expandtabs),
+            make_builtin_function("expandtabs", crate::type_methods::descr_expandtabs),
         )
     };
     unsafe {
@@ -11186,7 +11174,7 @@ fn slice_descr_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// sliceobject.py `descr_lt` — lexicographic on (start, stop, step).
-fn slice_descr_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn descr_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     slice_descr_richcompare(args, crate::baseobjspace::CompareOp::Lt)
 }
 
@@ -11307,7 +11295,7 @@ fn init_slice_type(ns: PyObjectRef) {
     for (name, func) in [
         ("__eq__", slice_descr_eq as DunderFn),
         ("__ne__", slice_descr_ne),
-        ("__lt__", slice_descr_lt),
+        ("__lt__", descr_lt),
         ("__le__", slice_descr_le),
         ("__gt__", slice_descr_gt),
         ("__ge__", slice_descr_ge),
@@ -17169,7 +17157,7 @@ fn bind_classmethod_descriptor(
     w_type: PyObjectRef,
 ) -> crate::PyResult {
     classmethod_descriptor_function(descr, "__get__")?;
-    classmethod_descr_get(&[descr, obj, w_type])
+    descr_classmethod_get(&[descr, obj, w_type])
 }
 
 fn init_classmethod_descriptor_type(ns: PyObjectRef) {
@@ -18443,7 +18431,7 @@ fn staticmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 /// function.py `descr_staticmethod_get`.
-fn staticmethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
+fn descr_staticmethod_get(args: &[PyObjectRef]) -> crate::PyResult {
     let sm = staticmethod_require(args.first().copied().unwrap_or(PY_NULL), "__get__")?;
     let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
     Ok(if function.is_null() {
@@ -18454,7 +18442,7 @@ fn staticmethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 /// function.py `descr_call` / CPython 3.14 `sm_call`.
-fn staticmethod_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
+fn descr_call(args: &[PyObjectRef]) -> crate::PyResult {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let sm = staticmethod_require(positional.first().copied().unwrap_or(PY_NULL), "__call__")?;
     let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
@@ -18634,17 +18622,14 @@ fn init_staticmethod_type(ns: PyObjectRef) {
         ),
         (
             "__get__",
-            make_builtin_function("__get__", staticmethod_descr_get),
+            make_builtin_function("__get__", descr_staticmethod_get),
         ),
         ("__new__", make_new_descr(staticmethod_descr_new)),
         (
             "__init__",
             make_builtin_function("__init__", staticmethod_descr_init),
         ),
-        (
-            "__call__",
-            make_builtin_function("__call__", staticmethod_descr_call),
-        ),
+        ("__call__", make_builtin_function("__call__", descr_call)),
         (
             "__func__",
             pyre_object::w_member_new_direct(
@@ -18792,7 +18777,7 @@ fn classmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
 /// function.py `descr_classmethod_get`. Python 3.14's `cm_descr_get`
 /// binds the stored callable directly to the selected class; it no longer
 /// invokes a descriptor nested inside classmethod.
-fn classmethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
+fn descr_classmethod_get(args: &[PyObjectRef]) -> crate::PyResult {
     let cm = classmethod_require(args.first().copied().unwrap_or(PY_NULL), "__get__")?;
     let w_obj = args.get(1).copied().unwrap_or(PY_NULL);
     let mut w_klass = args.get(2).copied().unwrap_or(PY_NULL);
@@ -18956,7 +18941,7 @@ fn init_classmethod_type(ns: PyObjectRef) {
         ),
         (
             "__get__",
-            make_builtin_function("__get__", classmethod_descr_get),
+            make_builtin_function("__get__", descr_classmethod_get),
         ),
         ("__new__", make_new_descr(classmethod_descr_new)),
         (
@@ -23149,7 +23134,7 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "decode",
-            make_builtin_function("decode", bytes_method_decode),
+            make_builtin_function("decode", descr_decode),
         )
     };
     unsafe {
@@ -23170,7 +23155,7 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "hex",
-            make_builtin_function("hex", bytes_method_hex),
+            make_builtin_function("hex", descr_hex),
         )
     };
     unsafe {
@@ -23233,7 +23218,7 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "lower",
-            make_builtin_function("lower", bytes_method_lower),
+            make_builtin_function("lower", descr_lower),
         )
     };
     unsafe {
@@ -23338,7 +23323,7 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "isascii",
-            make_builtin_function("isascii", bytes_method_isascii),
+            make_builtin_function("isascii", descr_isascii),
         )
     };
     unsafe {
@@ -24093,7 +24078,7 @@ fn bytes_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 }
 
 /// `bytesobject.py descr_lower` — ASCII-only case mapping.
-fn bytes_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn descr_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     bytes_require_no_args(args, "lower")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) }.to_vec();
     let out: Vec<u8> = data.iter().map(|b| b.to_ascii_lowercase()).collect();
@@ -24823,7 +24808,7 @@ fn bytes_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// `bytes.isascii` / `bytearray.isascii` — every byte is <= 0x7F.
 /// An empty buffer is ASCII (`descr_isascii` returns True on no bytes).
-fn bytes_method_isascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn descr_isascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     bytes_require_no_args(args, "isascii")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     Ok(pyre_object::w_bool_from(data.is_ascii()))
@@ -25728,7 +25713,7 @@ fn bytearray_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 ///
 /// Returns a string of hex pairs.  Optional `sep` (single byte/char)
 /// inserts between pairs; `bytes_per_sep` controls the grouping.
-pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn descr_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "hex")?;
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::clinic_arity(
@@ -26464,7 +26449,7 @@ pub(crate) fn decode_utf8_with_errors_incremental(
 }
 
 /// bytesobject.py descr_decode → stringmethods.py decode_object
-pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn descr_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "decode")?;
     // `bytes.decode(encoding='utf-8', errors='strict')` — both parameters
     // are positional-or-keyword, so accept them from either side.
@@ -26891,7 +26876,7 @@ fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 }
 
 /// `bytearrayobject.py:descr_append` — append one byte in place.
-fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn descr_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_exact(args, "append", 1)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
@@ -27078,7 +27063,7 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 /// `bytearrayobject.py:descr_reverse` — reverse the bytes in place.
-fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn descr_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "reverse")?;
     crate::type_methods::arity_no_args(args, "reverse")?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).reverse() };
@@ -27086,7 +27071,7 @@ fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 /// `bytearrayobject.py:descr_clear` — empty the bytearray in place.
-fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn descr_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "clear")?;
     crate::type_methods::arity_no_args(args, "clear")?;
     let ba = unsafe { crate::builtins::bytearray_check_exports(args[0])? };
@@ -27439,13 +27424,13 @@ fn init_bytearray_type(ns: PyObjectRef) {
         )
     };
     // `bytearrayobject.py W_BytearrayObject.descr_decode` shares the
-    // bytes decode machinery — `bytes_method_decode` already pulls the
+    // bytes decode machinery — `descr_decode` already pulls the
     // payload via `bytes_like_data`, which handles both kinds.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "decode",
-            make_builtin_function("decode", bytes_method_decode),
+            make_builtin_function("decode", descr_decode),
         )
     };
     // The scalar-returning read-only methods (int / bool results) read
@@ -27532,7 +27517,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "isascii",
-            make_builtin_function("isascii", bytes_method_isascii),
+            make_builtin_function("isascii", descr_isascii),
         )
     };
     unsafe {
@@ -27652,7 +27637,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "lower",
-            make_builtin_function("lower", bytes_method_lower),
+            make_builtin_function("lower", descr_lower),
         )
     };
     unsafe {
@@ -27799,7 +27784,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "hex",
-            make_builtin_function("hex", bytes_method_hex),
+            make_builtin_function("hex", descr_hex),
         )
     };
     unsafe {
@@ -27823,7 +27808,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "append",
-            make_builtin_function("append", bytearray_method_append),
+            make_builtin_function("append", descr_append),
         )
     };
     unsafe {
@@ -27858,14 +27843,14 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "reverse",
-            make_builtin_function("reverse", bytearray_method_reverse),
+            make_builtin_function("reverse", descr_reverse),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "clear",
-            make_builtin_function("clear", bytearray_method_clear),
+            make_builtin_function("clear", descr_clear),
         )
     };
     unsafe {

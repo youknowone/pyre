@@ -844,7 +844,7 @@ fn do_extend_from_iterable(
 }
 
 /// PyPy: listobject.py descr_insert — list.insert(index, item)
-pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "insert", true)?;
     arity_exact_unpack(args, "insert", 2)?;
     // `@unwrap_spec(index='index')` → getindex_w(index, OverflowError): coerce
@@ -878,7 +878,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     arity_at_most(args, "pop", 1)?;
     // `@unwrap_spec(index='index')` → getindex_w(index, OverflowError): coerce
     // through `__index__`.
-    // Rooted as `list_method_insert`: the receiver read out of `args` after
+    // Rooted as `descr_insert`: the receiver read out of `args` after
     // `__index__` has run is a pre-move address.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
@@ -920,7 +920,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 /// PyPy: listobject.py descr_clear — list.clear()
-pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "clear", true)?;
     arity_no_args(args, "clear")?;
     unsafe { pyre_object::listobject::w_list_clear(args[0]) };
@@ -928,7 +928,7 @@ pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 }
 
 /// PyPy: listobject.py descr_copy — list.copy()
-pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "copy", true)?;
     arity_no_args(args, "copy")?;
     let mut list = args[0];
@@ -960,7 +960,7 @@ pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 /// PyPy: listobject.py descr_reverse — list.reverse()
-pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "reverse", true)?;
     arity_no_args(args, "reverse")?;
     unsafe { pyre_object::listobject::w_list_reverse(args[0]) };
@@ -1049,7 +1049,7 @@ pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 }
 
 /// listobject.py `descr_remove` — list.remove(value).
-pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "remove", true)?;
     arity_exact(args, "remove", 1)?;
     crate::listobject::w_list_remove(args[0], args[1])?;
@@ -1467,7 +1467,7 @@ pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `keys()` (the previous implementation) breaks `defaultdict`,
 /// custom `Mapping` subclasses, and any object that only implements
 /// `__getitem__`.
-pub fn str_method_format_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_format_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "format_map", 1)?;
     str_method_format_core(args[0], &[], None, Some(args[1]))
 }
@@ -2152,7 +2152,7 @@ pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// PyPy: unicodeobject.py descr_format
 /// Requires format spec parser — correct for no-arg case only.
 /// `str.format(*args)` — PyPy: unicodeobject.py descr_format → newformat.py
-pub fn str_method_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "format")?;
     // `pypy/objspace/std/newformat.py Formatter.format` —
     // positional args are slots 1.. of the receiver; keyword args
@@ -5247,7 +5247,7 @@ pub fn str_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 /// PyPy: unicodeobject.py descr_isidentifier
-pub fn str_method_isidentifier(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_isidentifier(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "isidentifier")?;
     // An identifier cannot contain a lone surrogate, so a non-UTF-8
     // backing is never an identifier.
@@ -5492,7 +5492,7 @@ pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `unicodeobject.py descr_rindex` — like rfind, but raises ValueError
 /// when the substring is absent.
 /// unicodeobject.py descr_rindex
-pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rindex", 1)?;
     arity_at_most(args, "rindex", 3)?;
     require_str_sub(args, "rindex")?;
@@ -5510,7 +5510,7 @@ unsafe fn title_unicode(obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// PyPy: unicodeobject.py descr_title
-pub fn str_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "title")?;
     Ok(unsafe { title_unicode(args[0]) })
 }
@@ -5523,7 +5523,7 @@ unsafe fn capitalize_unicode(obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// PyPy: unicodeobject.py descr_capitalize
-pub fn str_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "capitalize")?;
     Ok(unsafe { capitalize_unicode(args[0]) })
 }
@@ -5536,7 +5536,7 @@ unsafe fn swapcase_unicode(obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// PyPy: unicodeobject.py descr_swapcase
-pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "swapcase")?;
     Ok(unsafe { swapcase_unicode(args[0]) })
 }
@@ -5686,7 +5686,7 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 }
 
 /// PyPy: unicodeobject.py descr_ljust
-pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "ljust", 1)?;
     arity_at_most(args, "ljust", 2)?;
     let _roots = pyre_object::gc_roots::push_roots();
@@ -5712,7 +5712,7 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 /// PyPy: unicodeobject.py descr_rjust
-pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rjust", 1)?;
     arity_at_most(args, "rjust", 2)?;
     let _roots = pyre_object::gc_roots::push_roots();
@@ -5749,7 +5749,7 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 ///
 /// Empty string returns True per CPython.  Delegates the per-character
 /// category check to `classify::is_printable`.
-pub fn str_method_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "isprintable")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     // Empty returns True (vacuous); a lone surrogate is not printable.
@@ -5761,7 +5761,7 @@ pub fn str_method_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 }
 
 /// PyPy: unicodeobject.py descr_isspace
-pub fn str_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "isspace")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
@@ -5811,21 +5811,21 @@ fn wtf8_cased_all(s: &Wtf8, want_upper: bool) -> bool {
 }
 
 /// PyPy: unicodeobject.py descr_isupper
-pub fn str_method_isupper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_isupper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "isupper")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     Ok(w_bool_from(wtf8_cased_all(s, true)))
 }
 
 /// PyPy: unicodeobject.py descr_islower
-pub fn str_method_islower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_islower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "islower")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     Ok(w_bool_from(wtf8_cased_all(s, false)))
 }
 
 /// PyPy: unicodeobject.py descr_isalnum
-pub fn str_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "isalnum")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
@@ -5836,7 +5836,7 @@ pub fn str_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 /// PyPy: unicodeobject.py descr_isascii
-pub fn str_method_isascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_isascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "isascii")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
@@ -5907,7 +5907,7 @@ fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> (Wtf8Buf,
 }
 
 /// PyPy: unicodeobject.py descr_partition
-pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "partition", 1)?;
     if !unsafe { pyre_object::is_str(args[1]) } {
         return Err(crate::PyError::type_error(format!(
@@ -5956,7 +5956,7 @@ pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 /// PyPy: unicodeobject.py descr_rpartition
-pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "rpartition", 1)?;
     if !unsafe { pyre_object::is_str(args[1]) } {
         return Err(crate::PyError::type_error(format!(
@@ -6090,7 +6090,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 }
 
 /// PyPy: unicodeobject.py descr_removeprefix (Python 3.9+)
-pub fn str_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (pos, _) = crate::builtins::split_builtin_kwargs(args);
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
@@ -6118,7 +6118,7 @@ pub fn str_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 }
 
 /// PyPy: unicodeobject.py descr_removesuffix (Python 3.9+)
-pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (pos, _) = crate::builtins::split_builtin_kwargs(args);
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
@@ -6154,7 +6154,7 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 }
 
 /// PyPy: unicodeobject.py descr_expandtabs
-pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn descr_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `tabsize` is positional-or-keyword (default 8).
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     if pos.len() > 2 {
