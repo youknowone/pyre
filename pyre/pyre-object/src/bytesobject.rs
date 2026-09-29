@@ -10,7 +10,11 @@ use crate::pyobject::*;
 pub static BYTES_TYPE: PyType =
     crate::pyobject::new_pytype_with_user_subclass("bytes", &BYTES_USER_TYPE);
 /// `W_BytesObjectUser` (`typedef.py _getusercls(W_BytesObject)`).
-pub static BYTES_USER_TYPE: PyType = crate::pyobject::new_user_pytype("bytes", &BYTES_TYPE);
+pub static BYTES_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
+    "bytes",
+    &BYTES_TYPE,
+    std::mem::offset_of!(W_BytesObjectUser, map),
+);
 
 /// GC-managed byte buffer behind a `bytearray` body.
 ///
@@ -278,6 +282,13 @@ pub struct W_BytesObjectUser {
     pub map: usize,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_BytesObjectUser, storage)
+            == std::mem::offset_of!(W_BytesObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
 
 /// `W_BytesObject.data` — the pointer to the block holding the bytes.
 pub const BYTES_DATA_OFFSET: usize = std::mem::offset_of!(W_BytesObject, data);

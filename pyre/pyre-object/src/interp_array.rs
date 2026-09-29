@@ -51,9 +51,20 @@ pub struct W_ArrayUser {
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_ArrayUser, storage)
+            == std::mem::offset_of!(W_ArrayUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
 /// User-subclass `array.array` typeptr (`typedef.py` `_getusercls`).
 /// Instances share `W_Array`'s payload and add mapdict `map` / `storage`.
-pub static ARRAY_USER_TYPE: PyType = new_user_pytype("array.array", &ARRAY_TYPE);
+pub static ARRAY_USER_TYPE: PyType = new_user_pytype(
+    "array.array",
+    &ARRAY_TYPE,
+    std::mem::offset_of!(W_ArrayUser, map),
+);
 
 /// User-subclass array layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (176) ahead of the

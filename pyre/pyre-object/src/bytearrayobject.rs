@@ -8,8 +8,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub static BYTEARRAY_TYPE: PyType =
     crate::pyobject::new_pytype_with_user_subclass("bytearray", &BYTEARRAY_USER_TYPE);
 /// `W_BytearrayObjectUser` (`typedef.py _getusercls(W_BytearrayObject)`).
-pub static BYTEARRAY_USER_TYPE: PyType =
-    crate::pyobject::new_user_pytype("bytearray", &BYTEARRAY_TYPE);
+pub static BYTEARRAY_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
+    "bytearray",
+    &BYTEARRAY_TYPE,
+    std::mem::offset_of!(W_BytearrayObjectUser, map),
+);
 
 /// Python bytearray object.
 ///
@@ -66,6 +69,13 @@ pub struct W_BytearrayObjectUser {
     pub map: usize,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_BytearrayObjectUser, storage)
+            == std::mem::offset_of!(W_BytearrayObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
 
 /// GC type id assigned to `W_BytearrayObject` at JitDriver init time.
 pub const W_BYTEARRAY_GC_TYPE_ID: u32 = 28;

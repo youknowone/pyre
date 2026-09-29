@@ -170,6 +170,13 @@ pub struct W_UnicodeObjectUser {
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_UnicodeObjectUser, storage)
+            == std::mem::offset_of!(W_UnicodeObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
 /// Field offset of `value` within `W_UnicodeObject`, for JIT field access.
 pub const UNICODE_VALUE_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, value);
 /// Field offset of `byte_len` (UTF-8 byte count) for STR STRLEN parity.

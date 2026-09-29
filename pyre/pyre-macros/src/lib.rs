@@ -1484,16 +1484,34 @@ fn expand_pyre_class(
     // `<W_X as GcType>::type_id()` (which itself becomes `cell.get()`).
     // `user_subclass` names the `_getusercls` typeptr (`typedef.py`
     // `_getusercls`); that wins over the mapdict-mixin constructor.
+    // A struct with `map` and `storage` records `map`'s byte offset on
+    // the typeptr (`MapdictStorageMixin`); `storage` is the next word.
     let pytype_init = match &user_subclass {
         Some(ident) => quote! {
             ::pyre_object::pyobject::new_pytype_with_user_subclass(#name_lit, &#ident)
         },
         None if has_mapdict_mixin => quote! {
-            ::pyre_object::pyobject::new_pytype_with_mapdict_mixin(#name_lit)
+            ::pyre_object::pyobject::new_pytype_with_mapdict_mixin(
+                #name_lit,
+                ::std::mem::offset_of!(#st_name, map),
+            )
         },
         None => quote! {
             ::pyre_object::pyobject::new_pytype(#name_lit)
         },
+    };
+    let mapdict_adjacency_assert = if has_mapdict_mixin {
+        quote! {
+            const _: () = {
+                assert!(
+                    ::std::mem::offset_of!(#st_name, storage)
+                        == ::std::mem::offset_of!(#st_name, map)
+                            + ::std::mem::size_of::<usize>()
+                );
+            };
+        }
+    } else {
+        quote! {}
     };
     let from_obj_type_check = match &user_subclass {
         Some(ident) => quote! {
@@ -1580,6 +1598,8 @@ fn expand_pyre_class(
 
     Ok(quote! {
         #st
+
+        #mapdict_adjacency_assert
 
         #st_vis static #pytype_static: ::pyre_object::PyType =
             #pytype_init;

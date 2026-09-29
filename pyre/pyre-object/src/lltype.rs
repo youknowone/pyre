@@ -371,8 +371,8 @@ pub trait PyreClassPyTypeOf {
     /// extension heap types carry both; a few (for example `_random.Random`)
     /// are mutable.
     const CPYTHON_IMMUTABLETYPE: bool;
-    /// The storage class imported `MapdictStorageMixin` (`map`/`storage`
-    /// at `W_ObjectObject` offsets). `typedef._getusercls` /
+    /// The storage class imported `MapdictStorageMixin` (`map` followed by
+    /// `storage`). `typedef._getusercls` /
     /// `import_from_mixin(MapdictStorageMixin)`.
     const HAS_MAPDICT_MIXIN: bool;
 }

@@ -22,6 +22,13 @@ pub struct W_FloatObjectUser {
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_FloatObjectUser, storage)
+            == std::mem::offset_of!(W_FloatObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
 /// Field offset of `floatval` within `W_FloatObject`, for JIT field access.
 pub const FLOAT_FLOATVAL_OFFSET: usize = std::mem::offset_of!(W_FloatObject, floatval);
 

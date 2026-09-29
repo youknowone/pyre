@@ -261,6 +261,13 @@ pub struct W_ListObjectUser {
     pub storage: *mut ItemsBlock,
 }
 
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_ListObjectUser, storage)
+            == std::mem::offset_of!(W_ListObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
 /// GC type id assigned to `W_ListObject` at `JitDriver` init time.
 /// Held as a constant here (rather than runtime-queried) so
 /// pyre-object's host-side allocator can reach it without a

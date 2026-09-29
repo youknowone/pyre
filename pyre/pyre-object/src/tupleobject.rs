@@ -85,6 +85,13 @@ pub struct W_TupleObjectUser {
     pub storage: *mut ItemsBlock,
 }
 
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_TupleObjectUser, storage)
+            == std::mem::offset_of!(W_TupleObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
 /// GC type id assigned to `W_TupleObject` at `JitDriver` init time.
 /// Held as a constant here (rather than runtime-queried) so
 /// pyre-object's host-side allocator can reach it without a

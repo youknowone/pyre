@@ -120,10 +120,20 @@ pub struct W_WeakrefUser {
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_WeakrefUser, storage)
+            == std::mem::offset_of!(W_WeakrefUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
 /// User-subclass `weakref.ref` typeptr (`typedef.py` `_getusercls`).
 /// Instances share `W_Weakref`'s payload and add mapdict `map` / `storage`.
-pub static WEAKREF_LAYOUT_USER_TYPE: PyType =
-    new_user_pytype("weakref.ReferenceType", &WEAKREF_LAYOUT_TYPE);
+pub static WEAKREF_LAYOUT_USER_TYPE: PyType = new_user_pytype(
+    "weakref.ReferenceType",
+    &WEAKREF_LAYOUT_TYPE,
+    std::mem::offset_of!(W_WeakrefUser, map),
+);
 
 /// User-subclass weakref layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (177) ahead of the

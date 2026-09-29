@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
     "subclassrange_max",
     "name",
     "instantiate",
+    "mapdict_offset",
     "user_subclass",
     "user_base"
 )]
@@ -52,11 +53,14 @@ pub struct PyType {
     /// this cached pointer to set `w_class` at allocation time.
     /// Null until `init_typeobjects()` runs.
     pub instantiate: AtomicPtr<PyObject>,
-    /// Instances of this storage class carry `MapdictStorageMixin`
-    /// (`mapdict.py` `import_from_mixin` / `typedef._getusercls`).
-    /// The bit lives on the typeptr, the RPython class, not on a
-    /// caller-side type whitelist.
-    pub has_mapdict_mixin: bool,
+    /// Byte offset from the object start of the `MapdictStorageMixin`
+    /// `map` word (`mapdict.py` `import_from_mixin` /
+    /// `typedef._getusercls`). `storage` is the next word, at
+    /// `mapdict_offset + size_of::<usize>()`. `0` means the class has no
+    /// mixin: offset 0 is the header's `ob_type`, so it cannot be a real
+    /// mixin offset. The offset lives on the typeptr, the RPython class,
+    /// not on a caller-side type whitelist.
+    pub mapdict_offset: usize,
     /// `typedef.py get_unique_interplevel_subclass(space, cls)` answered
     /// ahead of time: the class every user subclass instance of this
     /// builtin carries as its typeptr (`_unique_subclass_cache[cls]`).  Null
@@ -143,21 +147,24 @@ pub const PY_NULL: PyObjectRef = std::ptr::null_mut();
 /// Construct a PyType with zeroed subclass ranges.
 /// Ranges are assigned at init time by `assign_subclass_range()`.
 pub const fn new_pytype(name: &'static str) -> PyType {
-    new_pytype_kind(name, false)
+    new_pytype_kind(name, 0)
 }
 
 /// [`new_pytype`] for a storage class that imported `MapdictStorageMixin`.
-pub const fn new_pytype_with_mapdict_mixin(name: &'static str) -> PyType {
-    new_pytype_kind(name, true)
+/// `mapdict_offset` is the byte offset of the mixin's `map` word;
+/// `storage` follows at the next word.
+pub const fn new_pytype_with_mapdict_mixin(name: &'static str, mapdict_offset: usize) -> PyType {
+    assert!(mapdict_offset != 0);
+    new_pytype_kind(name, mapdict_offset)
 }
 
-const fn new_pytype_kind(name: &'static str, has_mapdict_mixin: bool) -> PyType {
+const fn new_pytype_kind(name: &'static str, mapdict_offset: usize) -> PyType {
     PyType {
         subclassrange_min: AtomicI64::new(0),
         subclassrange_max: AtomicI64::new(0),
         name,
         instantiate: AtomicPtr::new(std::ptr::null_mut()),
-        has_mapdict_mixin,
+        mapdict_offset,
         user_subclass: std::ptr::null(),
         user_base: std::ptr::null(),
     }
@@ -169,15 +176,21 @@ pub const fn new_pytype_with_user_subclass(
     name: &'static str,
     user_subclass: &'static PyType,
 ) -> PyType {
-    let mut tp = new_pytype_kind(name, false);
+    let mut tp = new_pytype_kind(name, 0);
     tp.user_subclass = user_subclass;
     tp
 }
 
 /// The `_getusercls` class made from `base`: it imports
-/// `MapdictStorageMixin` after `base`'s payload.
-pub const fn new_user_pytype(name: &'static str, base: &'static PyType) -> PyType {
-    let mut tp = new_pytype_kind(name, true);
+/// `MapdictStorageMixin` after `base`'s payload. `mapdict_offset` is the
+/// byte offset of that mixin's `map` word.
+pub const fn new_user_pytype(
+    name: &'static str,
+    base: &'static PyType,
+    mapdict_offset: usize,
+) -> PyType {
+    assert!(mapdict_offset != 0);
+    let mut tp = new_pytype_kind(name, mapdict_offset);
     tp.user_base = base;
     tp
 }
@@ -226,7 +239,7 @@ pub fn get_instantiate(tp: &PyType) -> PyObjectRef {
 #[inline]
 pub unsafe fn pytype_has_mapdict_mixin(obj: PyObjectRef) -> bool {
     let tp = unsafe { (*obj).ob_type };
-    !tp.is_null() && unsafe { (*tp).has_mapdict_mixin }
+    !tp.is_null() && unsafe { (*tp).mapdict_offset != 0 }
 }
 
 /// True when `obj`'s Python class is exactly the builtin type for its
@@ -376,23 +389,47 @@ const _: () = {
 
 pub static INT_TYPE: PyType = new_pytype_with_user_subclass("int", &INT_USER_TYPE);
 /// `W_IntObjectUser` (`typedef.py _getusercls(W_IntObject)`).
-pub static INT_USER_TYPE: PyType = new_user_pytype("int", &INT_TYPE);
+pub static INT_USER_TYPE: PyType = new_user_pytype(
+    "int",
+    &INT_TYPE,
+    std::mem::offset_of!(crate::intobject::W_IntObjectUser, map),
+);
 pub static BOOL_TYPE: PyType = new_pytype("bool");
 pub static FLOAT_TYPE: PyType = new_pytype_with_user_subclass("float", &FLOAT_USER_TYPE);
 /// `W_FloatObjectUser` (`typedef.py _getusercls(W_FloatObject)`).
-pub static FLOAT_USER_TYPE: PyType = new_user_pytype("float", &FLOAT_TYPE);
+pub static FLOAT_USER_TYPE: PyType = new_user_pytype(
+    "float",
+    &FLOAT_TYPE,
+    std::mem::offset_of!(crate::floatobject::W_FloatObjectUser, map),
+);
 pub static COMPLEX_TYPE: PyType = new_pytype_with_user_subclass("complex", &COMPLEX_USER_TYPE);
 /// `W_ComplexObjectUser` (`typedef.py _getusercls(W_ComplexObject)`).
-pub static COMPLEX_USER_TYPE: PyType = new_user_pytype("complex", &COMPLEX_TYPE);
+pub static COMPLEX_USER_TYPE: PyType = new_user_pytype(
+    "complex",
+    &COMPLEX_TYPE,
+    std::mem::offset_of!(crate::complexobject::W_ComplexObjectUser, map),
+);
 pub static STR_TYPE: PyType = new_pytype_with_user_subclass("str", &STR_USER_TYPE);
 /// `W_UnicodeObjectUser` (`typedef.py _getusercls(W_UnicodeObject)`).
-pub static STR_USER_TYPE: PyType = new_user_pytype("str", &STR_TYPE);
+pub static STR_USER_TYPE: PyType = new_user_pytype(
+    "str",
+    &STR_TYPE,
+    std::mem::offset_of!(crate::unicodeobject::W_UnicodeObjectUser, map),
+);
 pub static LIST_TYPE: PyType = new_pytype_with_user_subclass("list", &LIST_USER_TYPE);
 /// `W_ListObjectUser` (`typedef.py _getusercls(W_ListObject)`).
-pub static LIST_USER_TYPE: PyType = new_user_pytype("list", &LIST_TYPE);
+pub static LIST_USER_TYPE: PyType = new_user_pytype(
+    "list",
+    &LIST_TYPE,
+    std::mem::offset_of!(crate::listobject::W_ListObjectUser, map),
+);
 pub static TUPLE_TYPE: PyType = new_pytype_with_user_subclass("tuple", &TUPLE_USER_TYPE);
 /// `W_TupleObjectUser` (`typedef.py _getusercls(W_TupleObject)`).
-pub static TUPLE_USER_TYPE: PyType = new_user_pytype("tuple", &TUPLE_TYPE);
+pub static TUPLE_USER_TYPE: PyType = new_user_pytype(
+    "tuple",
+    &TUPLE_TYPE,
+    std::mem::offset_of!(crate::tupleobject::W_TupleObjectUser, map),
+);
 pub static DICT_TYPE: PyType = new_pytype("dict");
 pub static LONG_TYPE: PyType = new_pytype("int");
 pub static NONE_TYPE: PyType = new_pytype("NoneType");
@@ -401,7 +438,10 @@ pub static ELLIPSIS_TYPE: PyType = new_pytype("ellipsis");
 pub static MODULE_TYPE: PyType = new_pytype("module");
 pub static MAPPING_PROXY_TYPE: PyType = new_pytype("mappingproxy");
 pub static TYPE_TYPE: PyType = new_pytype("type");
-pub static INSTANCE_TYPE: PyType = new_pytype_with_mapdict_mixin("object");
+pub static INSTANCE_TYPE: PyType = new_pytype_with_mapdict_mixin(
+    "object",
+    std::mem::offset_of!(crate::objectobject::W_ObjectObject, map),
+);
 
 /// Field offset of `ob_type` within PyObject, for JIT field access.
 pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);

@@ -21,13 +21,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub static SET_TYPE: PyType = crate::pyobject::new_pytype_with_user_subclass("set", &SET_USER_TYPE);
 /// `W_SetObjectUser` (`typedef.py` `_getusercls(W_SetObject)`).
-pub static SET_USER_TYPE: PyType = crate::pyobject::new_user_pytype("set", &SET_TYPE);
+pub static SET_USER_TYPE: PyType =
+    crate::pyobject::new_user_pytype("set", &SET_TYPE, std::mem::offset_of!(W_SetObjectUser, map));
 pub static FROZENSET_TYPE: PyType =
     crate::pyobject::new_pytype_with_user_subclass("frozenset", &FROZENSET_USER_TYPE);
 /// `W_SetObjectUser` for `frozenset` (`typedef.py` `_getusercls`). The two
 /// user typeptrs share one payload layout and one GC tid.
-pub static FROZENSET_USER_TYPE: PyType =
-    crate::pyobject::new_user_pytype("frozenset", &FROZENSET_TYPE);
+pub static FROZENSET_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
+    "frozenset",
+    &FROZENSET_TYPE,
+    std::mem::offset_of!(W_SetObjectUser, map),
+);
 
 /// setobject.py `W_SetIterObject`.  Unlike the old sequence-iterator
 /// adapter this keeps the live set, so a size change is observed by next().
@@ -505,6 +509,13 @@ pub struct W_SetObjectUser {
     pub map: usize,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_SetObjectUser, storage)
+            == std::mem::offset_of!(W_SetObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
 
 /// GC type id assigned to `W_SetObject` at JitDriver init time.
 pub const W_SET_GC_TYPE_ID: u32 = 30;
