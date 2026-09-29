@@ -634,24 +634,24 @@ impl VirtualState {
 
     /// Counts the leaves in a single top-level state entry, deduping shared
     /// `Rc<VirtualStateInfoNode>` subtrees via the caller-supplied visited map.
-    /// The visited map (Rc::as_ptr → first imported OpRef, NONE for the
+    /// The visited map (Rc::as_ptr → first imported box, NONE for the
     /// counting path) must be threaded across all top-level state entries
     /// in a single VirtualState walk so cross-entry shared substates are
     /// counted exactly once. Both the top-level Rc identity and the
     /// recursive nested Rcs participate in the dedup.
     pub fn count_forced_boxes_for_entry_static(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut crate::FxIndexMap<usize, OpRef>,
+        visited: &mut crate::FxIndexMap<usize, majit_ir::operand::Operand>,
     ) -> usize {
         // RPython virtualstate.py enum first-visit guard via
         // `position == -1` — every visited node is recorded so a later
         // visit returns 0 without re-counting. Pyre's parallel:
         //
-        // - If the entry is already present (real OpRef from
+        // - If the entry is already present (real box from
         //   `import_virtual_state_from_label_args_recurse`
         //   in `optimizer.rs`, or `NONE` from a prior counting visit),
         //   return 0. unroll.py `setinfo_from_preamble` parity:
-        //   preserve the existing real OpRef rather than overwriting.
+        //   preserve the existing real box rather than overwriting.
         // - Otherwise insert `NONE` to mark this node visited, then
         //   recurse. Without this insert, repeated top-level visits
         //   to leaf variants (Unknown/NonNull/IntBounded/KnownClass)
@@ -662,13 +662,13 @@ impl VirtualState {
         if visited.contains_key(&key) {
             return 0;
         }
-        visited.insert(key, OpRef::NONE);
+        visited.insert(key, majit_ir::operand::Operand::None);
         Self::count_forced_boxes_for_entry(rc, visited)
     }
 
     fn count_forced_boxes_for_entry(
         info: &VirtualStateInfo,
-        visited: &mut crate::FxIndexMap<usize, OpRef>,
+        visited: &mut crate::FxIndexMap<usize, majit_ir::operand::Operand>,
     ) -> usize {
         match info {
             VirtualStateInfo::Constant(_) => 0,
@@ -700,19 +700,19 @@ impl VirtualState {
     ///
     /// virtualstate.py `enum()` returns without touching
     /// `self.position` when `position != -1`; pyre must preserve any
-    /// real OpRef the caller already wrote into `visited` (e.g. from
+    /// real box the caller already wrote into `visited` (e.g. from
     /// `import_virtual_state_from_label_args_recurse`). A blind
-    /// `insert(.., NONE)` would overwrite that real OpRef before the
+    /// `insert(.., NONE)` would overwrite that real box before the
     /// `is_some()` check, leaking NONE into downstream lookups.
     fn count_forced_boxes_for_entry_rc(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut crate::FxIndexMap<usize, OpRef>,
+        visited: &mut crate::FxIndexMap<usize, majit_ir::operand::Operand>,
     ) -> usize {
         let key = Rc::as_ptr(rc) as usize;
         if visited.contains_key(&key) {
             return 0;
         }
-        visited.insert(key, OpRef::NONE);
+        visited.insert(key, majit_ir::operand::Operand::None);
         Self::count_forced_boxes_for_entry(rc, visited)
     }
 
