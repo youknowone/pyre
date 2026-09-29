@@ -307,26 +307,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // integer arm first, on `PyIndex_Check`.
                 if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
                     let data = arg_readbuf(w_arg, "fcntl")?;
-                    let Some(mut buf) = stage_arg(data) else {
+                    if data.len() > ARG_BUFSZ {
                         return Err(pyre_interpreter::PyError::value_error(
                             "fcntl argument 3 is too long",
                         ));
-                    };
+                    }
+                    // `scoped_str2charp` owns the copy. The call sees that
+                    // copy followed by the overflow guard, in a block from
+                    // `scoped_alloc_buffer`; `charpsize2str` is the result.
+                    let src = majit_rlib::rffi::scoped_str2charp::new(Some(data));
+                    let total = ARG_BUFSZ + ARG_GUARD.len();
+                    let staged = majit_rlib::rffi::scoped_alloc_buffer::new(total);
+                    unsafe { fill_guarded(staged.raw, src.buf, data.len(), total) };
                     loop {
-                        let rv = unsafe {
-                            ll::fcntl_str(
-                                fd,
-                                cmd,
-                                buf.as_mut_ptr().cast::<majit_rlib::rffi::CHAR>(),
-                            )
-                        };
+                        let rv = unsafe { ll::fcntl_str(fd, cmd, staged.raw) };
                         if rv < 0 {
                             raise_error_maybe("fcntl")?;
                         } else {
-                            guard_intact(&buf, data.len())?;
-                            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-                                &buf[..data.len()],
-                            ));
+                            guard_intact(staged.raw, data.len())?;
+                            let out =
+                                unsafe { majit_rlib::rffi::charpsize2str(staged.raw, data.len()) };
+                            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&out));
                         }
                     }
                 }
@@ -564,8 +565,45 @@ const ARG_BUFSZ: usize = 1024;
 /// it, and that is the only way the overrun can be seen at all — so the bytes
 /// are the module's, verbatim, starting with the NUL the staged copy is
 /// terminated by.
+///
+/// [3.14-spec] guard at `len` ↔ interp_fcntl.py `ioctl` (no guard; stages
+/// `max(IOCTL_BUFSZ, len)` and returns `len` bytes) — a write past the
+/// argument raises SystemError "buffer overflow"; evidence: fcntlmodule.c
+/// `fcntl_ioctl_impl` / `fcntl_fcntl_impl` `memcmp(buf + len, guard, GUARDSZ)`.
 #[cfg(all(unix, feature = "host_env"))]
 const ARG_GUARD: [u8; 8] = [0x00, 0xfa, 0x69, 0xc4, 0x67, 0xa3, 0x6c, 0x58];
+
+/// `str2charp` freed on every exit, including the syscall's error path.
+#[cfg(all(unix, feature = "host_env"))]
+struct FreeCharp(majit_rlib::rffi::CCHARP);
+
+#[cfg(all(unix, feature = "host_env"))]
+impl Drop for FreeCharp {
+    fn drop(&mut self) {
+        unsafe { majit_rlib::rffi::free_charp(self.0, true) };
+    }
+}
+
+/// Zero `total` bytes, copy `len` bytes from `src`, then the overflow guard.
+#[cfg(all(unix, feature = "host_env"))]
+unsafe fn fill_guarded(
+    dst: majit_rlib::rffi::CCHARP,
+    src: majit_rlib::rffi::CCHARP,
+    len: usize,
+    total: usize,
+) {
+    use majit_rlib::rffi::{CONST_VOIDP, VOIDP, c_memcpy, c_memset, cast};
+    debug_assert!(total >= len + ARG_GUARD.len());
+    unsafe {
+        c_memset(cast::<VOIDP>(dst), 0, total);
+        c_memcpy(cast::<VOIDP>(dst), cast::<CONST_VOIDP>(src), len);
+        c_memcpy(
+            cast::<VOIDP>(dst.add(len)),
+            cast::<CONST_VOIDP>(ARG_GUARD.as_ptr()),
+            ARG_GUARD.len(),
+        );
+    }
+}
 
 /// The third argument as `PyArg_Parse(arg, "s*")` reads it: any readable
 /// buffer, or a `str`'s UTF-8, which `readbuf_w` alone does not accept.
@@ -603,25 +641,43 @@ fn ioctl_ptr(
     }
 }
 
-/// A staging buffer holding `arg` followed by the guard, or `None` when `arg`
-/// is longer than the staging buffer and has to be handed over as it is.
 #[cfg(all(unix, feature = "host_env"))]
-fn stage_arg(arg: &[u8]) -> Option<Vec<u8>> {
-    if arg.len() > ARG_BUFSZ {
-        return None;
+fn guard_intact(
+    buf: majit_rlib::rffi::CCHARP,
+    len: usize,
+) -> Result<(), pyre_interpreter::PyError> {
+    let intact = unsafe {
+        let got = std::slice::from_raw_parts(buf.add(len).cast::<u8>(), ARG_GUARD.len());
+        got == ARG_GUARD
+    };
+    if intact {
+        Ok(())
+    } else {
+        Err(pyre_interpreter::PyError::system_error("buffer overflow"))
     }
-    let mut buf = vec![0u8; ARG_BUFSZ + ARG_GUARD.len()];
-    buf[..arg.len()].copy_from_slice(arg);
-    buf[arg.len()..arg.len() + ARG_GUARD.len()].copy_from_slice(&ARG_GUARD);
-    Some(buf)
 }
 
+/// `str2charp` + `scoped_alloc_buffer(max(ARG_BUFSZ, len))` with the guard
+/// after the argument, `c_memcpy`, `charpsize2str`. `free_charp` runs on drop.
+/// Syscall failure is the OSError; a guard mismatch is reported by the caller
+/// so a mutable buffer can be written back first.
 #[cfg(all(unix, feature = "host_env"))]
-fn guard_intact(buf: &[u8], len: usize) -> Result<(), pyre_interpreter::PyError> {
-    if buf[len..len + ARG_GUARD.len()] == ARG_GUARD {
-        return Ok(());
+fn stage_ioctl(
+    fd: i32,
+    request: majit_rlib::rffi::UINT,
+    arg: &[u8],
+) -> Result<(i32, Vec<u8>, bool), pyre_interpreter::PyError> {
+    let ll_arg = FreeCharp(majit_rlib::rffi::str2charp(arg, true));
+    let total = ARG_BUFSZ.max(arg.len()) + ARG_GUARD.len();
+    let buf = majit_rlib::rffi::scoped_alloc_buffer::new(total);
+    unsafe { fill_guarded(buf.raw, ll_arg.0, arg.len(), total) };
+    let rv = unsafe { ll::ioctl_str(fd, request, buf.raw) };
+    if rv < 0 {
+        return Err(raise_error_always("ioctl"));
     }
-    Err(pyre_interpreter::PyError::system_error("buffer overflow"))
+    let bytes = unsafe { majit_rlib::rffi::charpsize2str(buf.raw, arg.len()) };
+    let overflow = guard_intact(buf.raw, arg.len()).is_err();
+    Ok((rv, bytes, overflow))
 }
 
 /// The writable-exporter arm: the kernel's answer lands back in the caller's
@@ -634,13 +690,17 @@ fn ioctl_mutable(
     request: majit_rlib::rffi::UINT,
     arg: &mut [u8],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    let Some(mut buf) = stage_arg(arg) else {
+    if arg.len() > ARG_BUFSZ {
         let ret = ioctl_ptr(fd, request, arg.as_mut_ptr())?;
         return Ok(pyre_object::w_int_new(ret as i64));
-    };
-    let ret = ioctl_ptr(fd, request, buf.as_mut_ptr())?;
-    arg.copy_from_slice(&buf[..arg.len()]);
-    guard_intact(&buf, arg.len())?;
+    }
+    let (ret, bytes, overflow) = stage_ioctl(fd, request, arg)?;
+    // Write-back happens before the guard is consulted: a detected overrun
+    // still leaves the caller's bytes updated.
+    arg.copy_from_slice(&bytes);
+    if overflow {
+        return Err(pyre_interpreter::PyError::system_error("buffer overflow"));
+    }
     Ok(pyre_object::w_int_new(ret as i64))
 }
 
@@ -653,14 +713,14 @@ fn ioctl_readonly(
     request: majit_rlib::rffi::UINT,
     arg: &[u8],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    let Some(mut buf) = stage_arg(arg) else {
+    if arg.len() > ARG_BUFSZ {
         return Err(pyre_interpreter::PyError::value_error(
             "ioctl argument 3 is too long",
         ));
-    };
-    ioctl_ptr(fd, request, buf.as_mut_ptr())?;
-    guard_intact(&buf, arg.len())?;
-    Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-        &buf[..arg.len()],
-    ))
+    }
+    let (_ret, bytes, overflow) = stage_ioctl(fd, request, arg)?;
+    if overflow {
+        return Err(pyre_interpreter::PyError::system_error("buffer overflow"));
+    }
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
 }

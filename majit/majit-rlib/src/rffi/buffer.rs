@@ -1,0 +1,685 @@
+//! String and buffer helpers from `make_string_mappings` and the wchar/utf8
+//! conversions next to it. "str" is a byte string (`&[u8]` / `Vec<u8>`).
+
+use super::{CCHARP, CONST_CCHARP, CWCHARP, Wchar, cast};
+
+/// `get_nonmovingbuffer_ll` flag: the pointer is inside a nonmovable object.
+/// Nothing to free.
+const FLAG_INSIDE_NONMOVABLE: u8 = 0x04;
+/// `llobj` was pinned. Release unpins it.
+const FLAG_PINNED: u8 = 0x05;
+/// Pinning failed. The pointer is a raw malloc; release frees it.
+const FLAG_RAW_COPY: u8 = 0x06;
+
+/// `alloc_buffer` case: the pointer is inside an unpinned, non-moving GC buffer.
+const CASE_INSIDE: isize = 0;
+/// `alloc_buffer` case: the GC buffer was pinned.
+const CASE_PINNED: isize = 1;
+/// `alloc_buffer` case: raw `malloc` fallback.
+const CASE_RAW_MALLOC: isize = 2;
+
+/// Code point `wcharpsize2utf8` / `wcharp2utf8` refuse (`rutf8.OutOfRange`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutOfRange {
+    pub code: u32,
+}
+
+/// `str2charp`. Copies `s` into a fresh NUL-terminated `malloc` block.
+///
+/// `track_allocation` is `lltype.malloc(..., track_allocation=...)`. Both arms
+/// allocate with `malloc`; the flag only selects the debug tracker upstream.
+pub fn str2charp(s: &[u8], track_allocation: bool) -> CCHARP {
+    let _ = track_allocation;
+    let bytes = s.len().checked_add(1).expect("str2charp length overflow");
+    unsafe {
+        let array = raw_malloc(bytes).cast::<super::CHAR>();
+        copy_bytes(s.as_ptr(), array.cast(), s.len());
+        *array.add(s.len()) = 0;
+        array
+    }
+}
+
+/// `free_charp`. `free` of a block from [`str2charp`].
+///
+/// # Safety
+/// `cp` is null or a pointer returned by [`str2charp`] / [`str2constcharp`]
+/// that has not been freed.
+pub unsafe fn free_charp(cp: CCHARP, track_allocation: bool) {
+    let _ = track_allocation;
+    unsafe { raw_free(cp.cast()) }
+}
+
+/// `str2chararray`. Copies `min(len(s), maxsize)` bytes into `array` and
+/// returns that count. Does not write a NUL.
+///
+/// # Safety
+/// `array` has room for `min(s.len(), maxsize)` bytes.
+pub unsafe fn str2chararray(s: &[u8], array: CCHARP, maxsize: usize) -> usize {
+    let length = s.len().min(maxsize);
+    unsafe { copy_bytes(s.as_ptr(), array.cast(), length) };
+    length
+}
+
+/// `str2rawmem`. Copies `s[start..start+length]` into `array`, NULs included.
+///
+/// # Safety
+/// `array` has room for `length` bytes.
+pub unsafe fn str2rawmem(s: &[u8], array: CCHARP, start: usize, length: usize) {
+    let src = &s[start..start + length];
+    unsafe { copy_bytes(src.as_ptr(), array.cast(), length) };
+}
+
+/// `charp2str`. Reads up to the first NUL. Does not free `cp`.
+///
+/// # Safety
+/// `cp` points at a NUL-terminated byte sequence.
+pub unsafe fn charp2str(cp: CCHARP) -> Vec<u8> {
+    let mut size = 0;
+    unsafe {
+        while *cp.add(size) != 0 {
+            size += 1;
+        }
+        charpsize2str(cp, size)
+    }
+}
+
+/// `charp2strn`. Like [`charp2str`], but stops after `maxlen` bytes.
+///
+/// # Safety
+/// `cp` is readable for `maxlen` bytes or up to a NUL, whichever comes first.
+pub unsafe fn charp2strn(cp: CCHARP, maxlen: usize) -> Vec<u8> {
+    let mut size = 0;
+    unsafe {
+        while size < maxlen && *cp.add(size) != 0 {
+            size += 1;
+        }
+        charpsize2str(cp, size)
+    }
+}
+
+/// `charpsize2str`. Copies `size` bytes, NULs included. Does not free `cp`.
+///
+/// # Safety
+/// `cp` is readable for `size` bytes.
+pub unsafe fn charpsize2str(cp: CCHARP, size: usize) -> Vec<u8> {
+    let mut out = vec![0u8; size];
+    unsafe { copy_bytes(cp.cast(), out.as_mut_ptr(), size) };
+    out
+}
+
+/// `constcharp2str`. [`charp2str`] for a `CONST_CCHARP`.
+///
+/// # Safety
+/// `cp` points at a NUL-terminated byte sequence.
+pub unsafe fn constcharp2str(cp: CONST_CCHARP) -> Vec<u8> {
+    unsafe { charp2str(cast::<CCHARP>(cp)) }
+}
+
+/// `constcharpsize2str`. [`charpsize2str`] for a `CONST_CCHARP`.
+///
+/// # Safety
+/// `cp` is readable for `size` bytes.
+pub unsafe fn constcharpsize2str(cp: CONST_CCHARP, size: usize) -> Vec<u8> {
+    unsafe { charpsize2str(cast::<CCHARP>(cp), size) }
+}
+
+/// `str2constcharp`. [`str2charp`] cast to `CONST_CCHARP`.
+pub fn str2constcharp(s: &[u8], track_allocation: bool) -> CONST_CCHARP {
+    cast::<CONST_CCHARP>(str2charp(s, track_allocation))
+}
+
+/// `get_nonmovingbuffer_ll`.
+///
+/// Upstream returns `(char*, llobj, flag)`:
+/// * `\x04` — no pin; the pointer is inside a nonmovable `llobj` (nothing to free)
+/// * `\x05` — `llobj` was pinned (unpin on release)
+/// * `\x06` — pinning failed; the pointer is a raw malloc (free on release)
+///
+/// Byte storage can move with the nursery, and a borrowed `&[u8]` carries no
+/// pin, so this is only the `\x06` arm: `malloc` of `len + 1` bytes. The extra
+/// byte is left uninitialized; [`get_nonmovingbuffer_ll_final_null`] writes the
+/// NUL. The `llobj` place is `()` because the copy does not retain a GC string.
+pub fn get_nonmovingbuffer_ll(data: &[u8]) -> (CCHARP, (), u8) {
+    let count = data.len();
+    // `count + (TYPEP is CCHARP)`: a byte string gets one extra byte.
+    let bytes = count
+        .checked_add(1)
+        .expect("get_nonmovingbuffer_ll length overflow");
+    unsafe {
+        let buf = raw_malloc(bytes).cast::<super::CHAR>();
+        copy_bytes(data.as_ptr(), buf.cast(), count);
+        (buf, (), FLAG_RAW_COPY)
+    }
+}
+
+/// `get_nonmovingbuffer_ll_final_null`. Writes the NUL at `len(data)`.
+pub fn get_nonmovingbuffer_ll_final_null(data: &[u8]) -> (CCHARP, (), u8) {
+    let (buf, llobj, flag) = get_nonmovingbuffer_ll(data);
+    unsafe { *buf.add(data.len()) = 0 };
+    (buf, llobj, flag)
+}
+
+/// `free_nonmovingbuffer_ll`.
+///
+/// `\x05` would unpin `llobj`. `\x06` frees the raw copy. `\x04` does nothing.
+/// Nothing is ever pinned here, so only `\x06` releases a block.
+///
+/// # Safety
+/// `(buf, llobj, flag)` came from [`get_nonmovingbuffer_ll`] or
+/// [`get_nonmovingbuffer_ll_final_null`] and has not been released.
+pub unsafe fn free_nonmovingbuffer_ll(buf: CCHARP, llobj: (), flag: u8) {
+    let _keepalive = llobj;
+    let _inside = flag == FLAG_INSIDE_NONMOVABLE;
+    if flag == FLAG_PINNED {
+        // `rgc.unpin(llobj)`. This port never pins.
+    }
+    if flag == FLAG_RAW_COPY {
+        unsafe { raw_free(buf.cast()) };
+    }
+}
+
+/// `alloc_buffer`.
+///
+/// Upstream returns `(raw_buf, gc_buf, case_num)`:
+/// * `0` — the pointer is inside an unpinned, non-moving GC buffer
+/// * `1` — the GC buffer was pinned
+/// * `2` — raw `malloc` of `count` bytes; [`keep_buffer_alive_until_here`] frees it
+///
+/// There is no pin for this buffer, so `case_num` is `2` and `gc_buf` is `()`.
+pub fn alloc_buffer(count: usize) -> (CCHARP, (), isize) {
+    let _ = (CASE_INSIDE, CASE_PINNED);
+    unsafe {
+        let raw_buf = raw_malloc(count).cast::<super::CHAR>();
+        (raw_buf, (), CASE_RAW_MALLOC)
+    }
+}
+
+/// `str_from_buffer`. Copies `needed_size` bytes out of the raw block.
+///
+/// `allocated_size >= needed_size`. Case `2` is the copy; cases `0` and `1`
+/// would return the GC buffer, which this port does not create.
+///
+/// # Safety
+/// `raw_buf` is readable for `needed_size` bytes.
+pub unsafe fn str_from_buffer(
+    raw_buf: CCHARP,
+    gc_buf: (),
+    case_num: isize,
+    allocated_size: usize,
+    needed_size: usize,
+) -> Vec<u8> {
+    let _ = gc_buf;
+    assert!(allocated_size >= needed_size);
+    if case_num == CASE_RAW_MALLOC {
+        unsafe { charpsize2str(raw_buf, needed_size) }
+    } else {
+        // `shrink_array` needs the GC string `alloc_buffer` did not create.
+        panic!("alloc_buffer only produces case_num 2");
+    }
+}
+
+/// `keep_buffer_alive_until_here`.
+///
+/// Case `1` would unpin. Case `2` frees the raw block. `gc_buf` is kept alive
+/// for the call (it is `()` in the raw-malloc case).
+///
+/// # Safety
+/// `(raw_buf, gc_buf, case_num)` came from [`alloc_buffer`] and has not been
+/// released.
+pub unsafe fn keep_buffer_alive_until_here(raw_buf: CCHARP, gc_buf: (), case_num: isize) {
+    let _keepalive = gc_buf;
+    if case_num == CASE_PINNED {
+        // `rgc.unpin(gc_buf)`. This port never pins.
+    }
+    if case_num == CASE_RAW_MALLOC {
+        unsafe { raw_free(raw_buf.cast()) };
+    }
+}
+
+/// `liststr2charpp`. NULL-terminated `char**`; each entry is a [`str2charp`].
+pub fn liststr2charpp(list: &[&[u8]]) -> super::CCHARPP {
+    let n = list.len();
+    let bytes = n
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(core::mem::size_of::<CCHARP>()))
+        .expect("liststr2charpp length overflow");
+    unsafe {
+        let array = raw_malloc(bytes).cast::<CCHARP>();
+        for (i, item) in list.iter().enumerate() {
+            *array.add(i) = str2charp(item, true);
+        }
+        *array.add(n) = core::ptr::null_mut();
+        array
+    }
+}
+
+/// `free_charpp`. Frees each entry, then the pointer array.
+///
+/// # Safety
+/// `charpp` came from [`liststr2charpp`] and has not been freed.
+pub unsafe fn free_charpp(charpp: super::CCHARPP) {
+    unsafe {
+        let mut i = 0;
+        while !(*charpp.add(i)).is_null() {
+            free_charp(*charpp.add(i), true);
+            i += 1;
+        }
+        raw_free(charpp.cast());
+    }
+}
+
+/// `charpp2liststr`. Does not free `charpp`.
+///
+/// # Safety
+/// `charpp` is a NULL-terminated array of NUL-terminated `char*`.
+pub unsafe fn charpp2liststr(charpp: super::CCHARPP) -> Vec<Vec<u8>> {
+    let mut result = Vec::new();
+    unsafe {
+        let mut i = 0;
+        while !(*charpp.add(i)).is_null() {
+            result.push(charp2str(*charpp.add(i)));
+            i += 1;
+        }
+    }
+    result
+}
+
+/// `wcharpsize2utf8`. Encodes `size` code units, NULs included.
+///
+/// `rutf8.unichr_as_utf8_append(..., allow_surrogates=True)`. A code above
+/// `0x10FFFF` is [`OutOfRange`].
+///
+/// # Safety
+/// `w` is readable for `size` `wchar_t`s.
+pub unsafe fn wcharpsize2utf8(w: CWCHARP, size: usize) -> Result<Vec<u8>, OutOfRange> {
+    let mut out = Vec::new();
+    for i in 0..size {
+        push_utf8(&mut out, unsafe { wchar_ord(w, i) })?;
+    }
+    Ok(out)
+}
+
+/// `wcharp2utf8`. Stops at the first zero code unit.
+///
+/// Returns the UTF-8 bytes and the number of `wchar_t`s read, not counting
+/// the terminator.
+///
+/// # Safety
+/// `w` is NUL-terminated.
+pub unsafe fn wcharp2utf8(w: CWCHARP) -> Result<(Vec<u8>, usize), OutOfRange> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    unsafe {
+        while wchar_ord(w, i) != 0 {
+            push_utf8(&mut out, wchar_ord(w, i))?;
+            i += 1;
+        }
+    }
+    Ok((out, i))
+}
+
+/// `wcharp2utf8n`. Like [`wcharp2utf8`], but stops after `maxlen` units.
+///
+/// # Safety
+/// `w` is readable for `maxlen` units or up to a zero unit, whichever is first.
+pub unsafe fn wcharp2utf8n(w: CWCHARP, maxlen: usize) -> Result<(Vec<u8>, usize), OutOfRange> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    unsafe {
+        while i < maxlen && wchar_ord(w, i) != 0 {
+            push_utf8(&mut out, wchar_ord(w, i))?;
+            i += 1;
+        }
+    }
+    Ok((out, i))
+}
+
+/// `utf82wcharp`. One `wchar_t` per code point, then a zero unit.
+///
+/// Allocates `utf8len + 2` units (`utf82wcharp`: one for the terminator, one
+/// for a trailing incomplete sequence). `utf8len` is the code-point count, not
+/// the byte length. Writes stop at `utf8len` so a short count cannot walk off
+/// the block. `track_allocation` is the same debug-tracker flag as [`str2charp`].
+pub fn utf82wcharp(utf8: &[u8], utf8len: usize, track_allocation: bool) -> CWCHARP {
+    let _ = track_allocation;
+    let chars = utf8len.checked_add(2).expect("utf82wcharp length overflow");
+    let bytes = chars
+        .checked_mul(core::mem::size_of::<Wchar>())
+        .expect("utf82wcharp size overflow");
+    unsafe {
+        let w = raw_malloc(bytes).cast::<Wchar>();
+        let mut index = 0;
+        let mut pos = 0;
+        while index < utf8len {
+            let Some(ch) = next_codepoint(utf8, &mut pos) else {
+                break;
+            };
+            *w.add(index) = ch as Wchar;
+            index += 1;
+        }
+        *w.add(index) = 0;
+        w
+    }
+}
+
+/// `utf82wcharp_ex`. Like [`utf82wcharp`], but a code point above `0xffff`
+/// becomes a surrogate pair, the layout a 2-byte `wchar_t` needs. Surrogates
+/// in the input pass through. `unilen` is accepted and unused, and the block
+/// holds `wlen + 3` units, where `wlen` counts the units written before the
+/// zero terminator.
+pub fn utf82wcharp_ex(utf8: &[u8], unilen: usize, track_allocation: bool) -> CWCHARP {
+    let _ = (unilen, track_allocation);
+    let mut wlen: usize = 0;
+    let mut pos = 0;
+    while let Some(ch) = next_codepoint(utf8, &mut pos) {
+        if ch > 0xffff {
+            wlen += 1;
+        }
+        wlen += 1;
+    }
+    let bytes = wlen
+        .checked_add(3)
+        .and_then(|n| n.checked_mul(core::mem::size_of::<Wchar>()))
+        .expect("utf82wcharp_ex size overflow");
+    unsafe {
+        let w = raw_malloc(bytes).cast::<Wchar>();
+        let mut index = 0;
+        let mut pos = 0;
+        while let Some(ch) = next_codepoint(utf8, &mut pos) {
+            if ch > 0xffff {
+                *w.add(index) = (0xD800 | ((ch - 0x10000) >> 10)) as Wchar;
+                index += 1;
+                *w.add(index) = (0xDC00 | ((ch - 0x10000) & 0x3FF)) as Wchar;
+            } else {
+                *w.add(index) = ch as Wchar;
+            }
+            index += 1;
+        }
+        *w.add(index) = 0;
+        assert_eq!(wlen, index);
+        w
+    }
+}
+
+/// `free_wcharp`. `free` of a block from [`utf82wcharp`].
+///
+/// # Safety
+/// `cp` is null or a pointer returned by [`utf82wcharp`] or [`utf82wcharp_ex`]
+/// that has not been freed.
+pub unsafe fn free_wcharp(cp: CWCHARP, track_allocation: bool) {
+    let _ = track_allocation;
+    unsafe { raw_free(cp.cast()) }
+}
+
+/// `scoped_str2charp`. `buf` is what `__enter__` yields. `None` yields NULL.
+/// [`Drop`] is `__exit__` and frees a non-null buffer.
+#[derive(Debug)]
+pub struct scoped_str2charp {
+    pub buf: CCHARP,
+}
+
+impl scoped_str2charp {
+    pub fn new(value: Option<&[u8]>) -> Self {
+        let buf = match value {
+            Some(s) => str2charp(s, true),
+            None => core::ptr::null_mut(),
+        };
+        Self { buf }
+    }
+}
+
+impl Drop for scoped_str2charp {
+    fn drop(&mut self) {
+        if !self.buf.is_null() {
+            unsafe { free_charp(self.buf, true) };
+            self.buf = core::ptr::null_mut();
+        }
+    }
+}
+
+/// `scoped_nonmovingbuffer`. [`Drop`] calls [`free_nonmovingbuffer_ll`].
+#[derive(Debug)]
+pub struct scoped_nonmovingbuffer {
+    pub buf: CCHARP,
+    pub llobj: (),
+    pub flag: u8,
+}
+
+impl scoped_nonmovingbuffer {
+    pub fn new(data: &[u8]) -> Self {
+        let (buf, llobj, flag) = get_nonmovingbuffer_ll(data);
+        Self { buf, llobj, flag }
+    }
+}
+
+impl Drop for scoped_nonmovingbuffer {
+    fn drop(&mut self) {
+        unsafe { free_nonmovingbuffer_ll(self.buf, self.llobj, self.flag) };
+        self.flag = FLAG_INSIDE_NONMOVABLE;
+        self.buf = core::ptr::null_mut();
+    }
+}
+
+/// `scoped_view_charp`. Same as [`scoped_nonmovingbuffer`], but the buffer is
+/// NUL-terminated (`get_nonmovingbuffer_ll_final_null`).
+#[derive(Debug)]
+pub struct scoped_view_charp {
+    pub buf: CCHARP,
+    pub llobj: (),
+    pub flag: u8,
+}
+
+impl scoped_view_charp {
+    pub fn new(data: &[u8]) -> Self {
+        let (buf, llobj, flag) = get_nonmovingbuffer_ll_final_null(data);
+        Self { buf, llobj, flag }
+    }
+}
+
+impl Drop for scoped_view_charp {
+    fn drop(&mut self) {
+        unsafe { free_nonmovingbuffer_ll(self.buf, self.llobj, self.flag) };
+        self.flag = FLAG_INSIDE_NONMOVABLE;
+        self.buf = core::ptr::null_mut();
+    }
+}
+
+/// `scoped_alloc_buffer`. `__enter__` returns the guard (`raw`, `size`,
+/// [`Self::str`]). [`Drop`] runs [`keep_buffer_alive_until_here`].
+#[derive(Debug)]
+pub struct scoped_alloc_buffer {
+    pub raw: CCHARP,
+    pub gc_buf: (),
+    pub case_num: isize,
+    pub size: usize,
+}
+
+impl scoped_alloc_buffer {
+    pub fn new(size: usize) -> Self {
+        let (raw, gc_buf, case_num) = alloc_buffer(size);
+        Self {
+            raw,
+            gc_buf,
+            case_num,
+            size,
+        }
+    }
+
+    /// `scoped_alloc_buffer.str`.
+    pub fn str(&self, length: usize) -> Vec<u8> {
+        unsafe { str_from_buffer(self.raw, self.gc_buf, self.case_num, self.size, length) }
+    }
+}
+
+impl Drop for scoped_alloc_buffer {
+    fn drop(&mut self) {
+        unsafe { keep_buffer_alive_until_here(self.raw, self.gc_buf, self.case_num) };
+        self.case_num = CASE_INSIDE;
+        self.raw = core::ptr::null_mut();
+    }
+}
+
+/// `scoped_utf82wcharp`. `unicode_len < 0` counts code points in `value`.
+/// `None` yields NULL. [`Drop`] frees a non-null buffer with [`free_wcharp`].
+#[derive(Debug)]
+pub struct scoped_utf82wcharp {
+    pub buf: CWCHARP,
+}
+
+impl scoped_utf82wcharp {
+    pub fn new(value: Option<&[u8]>, unicode_len: isize) -> Self {
+        let buf = match value {
+            None => core::ptr::null_mut(),
+            Some(utf8) => {
+                let n = if unicode_len < 0 {
+                    codepoint_len(utf8)
+                } else {
+                    unicode_len as usize
+                };
+                utf82wcharp(utf8, n, true)
+            }
+        };
+        Self { buf }
+    }
+}
+
+impl Drop for scoped_utf82wcharp {
+    fn drop(&mut self) {
+        if !self.buf.is_null() {
+            unsafe { free_wcharp(self.buf, true) };
+            self.buf = core::ptr::null_mut();
+        }
+    }
+}
+
+fn codepoint_len(utf8: &[u8]) -> usize {
+    let mut pos = 0;
+    let mut n = 0;
+    while next_codepoint(utf8, &mut pos).is_some() {
+        n += 1;
+    }
+    n
+}
+
+/// `Utf8StringIterator.next` for a byte slice. A truncated tail yields the
+/// lead byte instead of reading off the end of the slice.
+fn next_codepoint(utf8: &[u8], pos: &mut usize) -> Option<u32> {
+    if *pos >= utf8.len() {
+        return None;
+    }
+    let b1 = utf8[*pos] as u32;
+    if b1 <= 0x7F {
+        *pos += 1;
+        return Some(b1);
+    }
+    if *pos + 1 >= utf8.len() {
+        *pos += 1;
+        return Some(b1);
+    }
+    let b2 = utf8[*pos + 1] as u32;
+    if b1 <= 0xDF {
+        *pos += 2;
+        return Some((b1 << 6) + b2 - ((0xC0 << 6) + 0x80));
+    }
+    if *pos + 2 >= utf8.len() {
+        *pos += 1;
+        return Some(b1);
+    }
+    let b3 = utf8[*pos + 2] as u32;
+    if b1 <= 0xEF {
+        *pos += 3;
+        return Some((b1 << 12) + (b2 << 6) + b3 - ((0xE0 << 12) + (0x80 << 6) + 0x80));
+    }
+    if *pos + 3 >= utf8.len() {
+        *pos += 1;
+        return Some(b1);
+    }
+    let b4 = utf8[*pos + 3] as u32;
+    *pos += 4;
+    Some(
+        (b1 << 18) + (b2 << 12) + (b3 << 6) + b4
+            - ((0xF0 << 18) + (0x80 << 12) + (0x80 << 6) + 0x80),
+    )
+}
+
+/// `unichr_as_utf8_append(..., allow_surrogates=True)`.
+fn push_utf8(out: &mut Vec<u8>, code: u32) -> Result<(), OutOfRange> {
+    if code <= 0x7F {
+        out.push(code as u8);
+    } else if code <= 0x07FF {
+        out.push((0xC0 | (code >> 6)) as u8);
+        out.push((0x80 | (code & 0x3F)) as u8);
+    } else if code <= 0xFFFF {
+        out.push((0xE0 | (code >> 12)) as u8);
+        out.push((0x80 | ((code >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (code & 0x3F)) as u8);
+    } else if code <= 0x10FFFF {
+        out.push((0xF0 | (code >> 18)) as u8);
+        out.push((0x80 | ((code >> 12) & 0x3F)) as u8);
+        out.push((0x80 | ((code >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (code & 0x3F)) as u8);
+    } else {
+        return Err(OutOfRange { code });
+    }
+    Ok(())
+}
+
+unsafe fn wchar_ord(w: CWCHARP, index: usize) -> u32 {
+    unsafe { *w.add(index) as u32 }
+}
+
+unsafe fn copy_bytes(src: *const u8, dst: *mut u8, n: usize) {
+    if n > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(src, dst, n) };
+    }
+}
+
+/// `lltype.malloc(..., flavor='raw')` / `lltype.free(..., flavor='raw')`:
+/// `malloc` / `free`. A zero-byte request still returns a unique block;
+/// `malloc(0)` is implementation-defined and a later `offset` on NULL is not.
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn raw_malloc(size: usize) -> *mut u8 {
+    let request = size.max(1);
+    let p = unsafe { libc::malloc(request) };
+    if p.is_null() {
+        std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(request, 1).unwrap());
+    }
+    p.cast()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn raw_free(ptr: *mut u8) {
+    unsafe { libc::free(ptr.cast()) }
+}
+
+/// wasm32-unknown-unknown does not link `libc`. The size sits in front of the
+/// payload so [`raw_free`] can hand the block back to the global allocator.
+#[cfg(target_arch = "wasm32")]
+unsafe fn raw_malloc(size: usize) -> *mut u8 {
+    let payload = size.max(1);
+    let header = core::mem::size_of::<usize>();
+    let align = core::mem::align_of::<usize>();
+    let total = header + payload;
+    let layout = std::alloc::Layout::from_size_align(total, align).unwrap();
+    let base = unsafe { std::alloc::alloc(layout) };
+    if base.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    unsafe {
+        base.cast::<usize>().write(payload);
+        base.add(header)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+unsafe fn raw_free(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    let header = core::mem::size_of::<usize>();
+    let base = unsafe { ptr.sub(header) };
+    let payload = unsafe { base.cast::<usize>().read() };
+    let align = core::mem::align_of::<usize>();
+    let layout = std::alloc::Layout::from_size_align(header + payload, align).unwrap();
+    unsafe { std::alloc::dealloc(base, layout) }
+}
