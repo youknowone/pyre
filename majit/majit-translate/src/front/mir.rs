@@ -3516,8 +3516,17 @@ pub(crate) fn harden_duplicate_leaf_metadata(
             // type-vs-variant name collision, leaving every other
             // variant-leaf bucket (whose withdrawal the resume numbering
             // depends on) intact.
+            //
+            // The same holds for a variant leaf that names a struct: a
+            // variant publishes only `{Enum}::{Variant}` spellings, so a
+            // bare `leaf` key was published by the type declaration alone
+            // and denotes that one class.  `SpaceCacheInstance::SysState`
+            // (rows `[__pos_0]`) otherwise withdraws and tombstones
+            // `module::sys::state::SysState`'s bare alias, and the
+            // `ObjSpace.sys_state: SysState` row projects to no class.
             if cached_enum_base(struct_fields, head, &mut enum_base_memo)
-                && cached_enum_base(struct_fields, leaf, &mut enum_base_memo)
+                && (cached_enum_base(struct_fields, leaf, &mut enum_base_memo)
+                    || struct_fields.fields.contains_key(leaf))
             {
                 continue;
             }
@@ -57591,6 +57600,44 @@ mod tests {
             reg.fields.get("Status::Active"),
             Some(&shape_s),
             "shape-identical variant duplicate keeps its bare alias"
+        );
+    }
+
+    #[test]
+    fn harden_keeps_a_struct_leaf_that_only_a_variant_shares() {
+        let mut reg = crate::front::semantic::StructFieldRegistry::default();
+        let state = rows(&[("int_max_str_digits", "i32")]);
+        reg.fields
+            .insert("module::sys::state::SysState".to_string(), state.clone());
+        reg.fields.insert("SysState".to_string(), state.clone());
+        let base = rows(&[("__discriminant", "i64")]);
+        reg.fields
+            .insert("baseobjspace::SpaceCacheInstance".to_string(), base.clone());
+        reg.fields.insert("SpaceCacheInstance".to_string(), base);
+        let variant = rows(&[("__pos_0", "RetainedSpaceCache<SysState>")]);
+        reg.fields.insert(
+            "baseobjspace::SpaceCacheInstance::SysState".to_string(),
+            variant.clone(),
+        );
+        reg.fields
+            .insert("SpaceCacheInstance::SysState".to_string(), variant);
+        let mut origins = std::collections::HashMap::from([(
+            "SysState".to_string(),
+            "module::sys::state".to_string(),
+        )]);
+        let mut enums = std::collections::HashMap::new();
+
+        let tombstoned = harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
+
+        assert_eq!(
+            reg.fields.get("SysState"),
+            Some(&state),
+            "a variant does not publish the bare leaf, so it cannot make the struct's alias ambiguous"
+        );
+        assert!(!tombstoned.contains("SysState"));
+        assert_eq!(
+            origins.get("SysState").map(String::as_str),
+            Some("module::sys::state")
         );
     }
 

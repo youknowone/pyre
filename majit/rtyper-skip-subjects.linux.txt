@@ -1039,7 +1039,6 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_reflec
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::tuple_concat_type_error
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor_impl
-two-phase-never-a-subject	pyre_interpreter::objspace::std::classdict::class_dict_for_type
 two-phase-never-a-subject	pyre_interpreter::objspace::std::classdict::type_setdictvalue_wtf8
 two-phase-never-a-subject	pyre_interpreter::objspace::std::formatting::bytes_format_percent
 two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::has_mapdict_layout

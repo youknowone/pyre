@@ -1040,7 +1040,6 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_reflec
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::tuple_concat_type_error
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor_impl
-two-phase-never-a-subject	pyre_interpreter::objspace::std::classdict::class_dict_for_type
 two-phase-never-a-subject	pyre_interpreter::objspace::std::classdict::type_setdictvalue_wtf8
 two-phase-never-a-subject	pyre_interpreter::objspace::std::formatting::bytes_format_percent
 two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::has_mapdict_layout
@@ -1917,4 +1916,3 @@ two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_StrKey_Py
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_i64_PyObject_aaa40259a54842f8
 two-phase-never-a-subject	setobject::callback_free_set_op__spec_bool_closure_ee601150793776bc
 two-phase-rtype-skipped	pyre_interpreter::module::__pypy__::interp_buffer::__majit_wrap___release_buffer__
-two-phase-rtype-skipped	pyre_interpreter::module::_pickle::pickler::__majit_wrap___persistent_id_default
