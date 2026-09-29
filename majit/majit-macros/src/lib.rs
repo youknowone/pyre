@@ -737,104 +737,90 @@ fn helper_call_target_fn_name(path: &Path) -> syn::Result<Ident> {
 /// `_jit_cannot_raise_` alongside `_jit_look_inside_` so graph-pipeline
 /// residual calls retain the declared exception effect.
 ///
-/// Receiver methods get the `elidable` / `elidable_cannot_raise` /
-/// `elidable_or_memerror` / `dont_look_inside` markers as associated
-/// consts: those attributes already emit a `__majit_call_policy_`
-/// associated fn next to the method, so the surrounding `impl` is
-/// necessarily inherent (a trait impl would reject the foreign
-/// associated fn at compile time).  `jit_elidable` (a pure pass-through)
-/// and `look_inside` emit no policy fn and so stay free-fn-only, to avoid
-/// placing a foreign associated const inside a trait impl.
+/// Every function carries its markers as body-local consts, which Charon
+/// promotes under the function's own path
+/// (`<fn>::_jit_look_inside_<fn>`); `llbc_hints::marker_path_to_fn_path`
+/// attaches such a marker to its parent function.  A body-local item takes
+/// no generics from the function around it, so a method of a generic impl
+/// keeps its marker in a monomorphized extraction, which instantiates only
+/// the method and drops an associated const of the impl.  A body-local
+/// const is also legal in a trait impl, where a foreign associated const is
+/// not.
 ///
-/// `jit_loop_invariant` is also free-fn-only here and NOT for that
-/// reason.  It is expanded by `expand_call_surface_attr`, which calls
-/// `emit_helper_policy_fn` unconditionally and only afterwards consults
-/// this table, so a policy fn *is* emitted beside it — carrying an
-/// `UNSUPPORTED` body when a receiver makes `emit_helper_call_target_fn`
-/// decline.  What justifies its `false` is not recorded; it is at worst
-/// conservative, since the policy fn would already be rejected inside a
-/// trait impl.  Do not read that entry as "emits no policy fn".
-///
-/// Which attributes emit a policy fn is decided by the call sites of
-/// `emit_helper_policy_fn` and by nothing here.  Derive the set from
-/// them: a list restated beside them goes stale the moment an expander
-/// starts or stops calling one, which is what happened to this
-/// paragraph.
-///
-/// Where to start looking, since the previous paragraph is useless
-/// without it: the expanders calling `emit_helper_policy_fn` are
-/// `expand_elidable_attribute`, `expand_dont_look_inside_attribute`,
-/// `expand_call_surface_attr` and `elidable_promote`, and the spellings
-/// each one covers are the `#[proc_macro_attribute]` fns that reach it
-/// — several attributes share an expander, so the spellings outnumber
-/// the expanders and only the wrappers name them all.  That is an entry
-/// point and not the authority: a fifth expander would not appear in
-/// this sentence, so search for the call sites rather than trusting the
-/// four named here.
+/// A function without a receiver additionally gets the sibling const
+/// (`rpython_attribute_const_for`), so `rg _jit_look_inside_` still finds
+/// the parity counterpart next to it.
+fn rpython_attribute_markers(attr_name: &str) -> Option<&'static [(&'static str, bool)]> {
+    Some(match attr_name {
+        "elidable" | "jit_elidable" => &[("_elidable_function_", true)],
+        "elidable_cannot_raise" => &[
+            ("_elidable_function_", true),
+            ("_jit_elidable_cannot_raise_", true),
+        ],
+        "elidable_or_memerror" => &[
+            ("_elidable_function_", true),
+            ("_jit_elidable_or_memerror_", true),
+        ],
+        "dont_look_inside" => &[("_jit_look_inside_", false)],
+        "dont_look_inside_cannot_raise" => {
+            &[("_jit_look_inside_", false), ("_jit_cannot_raise_", true)]
+        }
+        "look_inside" => &[("_jit_look_inside_", true)],
+        "jit_loop_invariant" => &[
+            ("_jit_loop_invariant_", true),
+            // rlib/jit.py loop_invariant calls dont_look_inside(func):
+            // the attribute implies the callee is opaque to the tracer.
+            ("_jit_look_inside_", false),
+        ],
+        "unroll_safe" => &[("_jit_unroll_safe_", true)],
+        _ => return None,
+    })
+}
+
+/// The module-level sibling marker consts of a function without a
+/// receiver.  `None` for a method, whose markers are body-local only
+/// (`rpython_attribute_body_markers`).
 fn rpython_attribute_const_for(
     attr_name: &str,
     sig: &syn::Signature,
     vis: &syn::Visibility,
 ) -> Option<proc_macro2::TokenStream> {
-    let is_method = sig.receiver().is_some();
+    if sig.receiver().is_some() {
+        return None;
+    }
     let fn_ident = &sig.ident;
-    // `(marker-prefix, value, method_ok)`.  `method_ok` records whether the
-    // attribute also emits a `__majit_call_policy_` associated fn next to
-    // the method (proving the impl is inherent), so a same-impl const is
-    // legal; attributes that emit no policy fn stay free-fn-only.
-    let markers: &[(&str, bool, bool)] = match attr_name {
-        // `elidable` emits a `__majit_call_policy_` fn (inherent-impl /
-        // free-fn only), so the method const inherits that constraint and
-        // is safe.  `jit_elidable` is a pure pass-through with no policy
-        // fn — it is the attribute used on trait-impl methods, where a
-        // foreign associated const would be rejected — so it stays
-        // free-fn-only.
-        "elidable" => &[("_elidable_function_", true, true)],
-        "jit_elidable" => &[("_elidable_function_", true, false)],
-        "elidable_cannot_raise" => &[
-            ("_elidable_function_", true, true),
-            ("_jit_elidable_cannot_raise_", true, true),
-        ],
-        "elidable_or_memerror" => &[
-            ("_elidable_function_", true, true),
-            ("_jit_elidable_or_memerror_", true, true),
-        ],
-        "dont_look_inside" => &[("_jit_look_inside_", false, true)],
-        "dont_look_inside_cannot_raise" => &[
-            ("_jit_look_inside_", false, true),
-            ("_jit_cannot_raise_", true, true),
-        ],
-        "look_inside" => &[("_jit_look_inside_", true, false)],
-        "jit_loop_invariant" => &[
-            ("_jit_loop_invariant_", true, false),
-            // rlib/jit.py loop_invariant calls dont_look_inside(func):
-            // the attribute implies the callee is opaque to the tracer.
-            ("_jit_look_inside_", false, false),
-        ],
-        // `rlib/jit.py def unroll_safe` emits no policy fn, so a
-        // sibling const would be rejected in a trait impl — `unroll_safe`
-        // decorates those (`majit-macros/tests/macros.rs` `NameCollider`).
-        // It stays free-fn-only here and reaches methods through the
-        // body-local marker instead, as `jit_elidable` does.
-        "unroll_safe" => &[("_jit_unroll_safe_", true, false)],
-        _ => return None,
-    };
-    let consts: Vec<proc_macro2::TokenStream> = markers
+    let consts = rpython_attribute_markers(attr_name)?
         .iter()
-        .filter(|(_, _, method_ok)| !is_method || *method_ok)
-        .map(|(prefix, value, _)| {
+        .map(|(prefix, value)| {
             let const_name = format_ident!("{}{}", prefix, fn_ident);
             quote! {
                 #[doc(hidden)]
                 #[allow(non_upper_case_globals)]
                 #vis const #const_name: bool = #value;
             }
-        })
-        .collect();
-    if consts.is_empty() {
-        return None;
-    }
+        });
     Some(quote! { #(#consts)* })
+}
+
+/// The body-local marker consts of `sig`'s function, spliced at the head
+/// of its body.
+fn rpython_attribute_body_markers(
+    attr_name: &str,
+    sig: &syn::Signature,
+) -> proc_macro2::TokenStream {
+    let fn_ident = &sig.ident;
+    let consts = rpython_attribute_markers(attr_name)
+        .unwrap_or_default()
+        .iter()
+        .map(|(prefix, value)| {
+            let const_name = format_ident!("{}{}", prefix, fn_ident);
+            quote! {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                const #const_name: bool = #value;
+            }
+        });
+    quote! { #(#consts)* }
 }
 
 fn primitive_type_ident(ty: &Type) -> Option<&Ident> {
@@ -1955,6 +1941,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
         Err(err) => return err.to_compile_error().into(),
     };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
+    let body_markers = rpython_attribute_body_markers(attr_name, sig);
 
     let expanded = quote! {
         #(#attrs)*
@@ -1965,6 +1952,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
             #[doc(hidden)]
             #[allow(dead_code)]
             const _MAJIT_ELIDABLE: bool = true;
+            #body_markers
             #block
         }
 
@@ -2009,6 +1997,7 @@ pub fn look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
     let rpython_attribute_const = rpython_attribute_const_for("look_inside", sig, vis);
+    let body_markers = rpython_attribute_body_markers("look_inside", sig);
 
     let expanded = quote! {
         #(#attrs)*
@@ -2018,6 +2007,7 @@ pub fn look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             #[allow(dead_code)]
             const _MAJIT_LOOK_INSIDE: bool = true;
+            #body_markers
             #block
         }
 
@@ -2076,6 +2066,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
         Err(err) => return err.to_compile_error().into(),
     };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
+    let body_markers = rpython_attribute_body_markers(attr_name, sig);
 
     // No-op inline-prebuild fn.  A residual (opaque) helper has no inline
     // body, hence no per-marker `-live-` triples to pre-register.  But a
@@ -2132,6 +2123,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
             #[doc(hidden)]
             #[allow(dead_code)]
             const _MAJIT_OPAQUE: bool = true;
+            #body_markers
             #block
         }
 
@@ -2181,6 +2173,7 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
     };
 
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
+    let body_markers = rpython_attribute_body_markers(attr_name, sig);
 
     // `jit_may_force` and `loop_invariant` keep `#[inline(never)]` for the
     // reason recorded on [`elidable`]: their bodies are past the inlining
@@ -2195,6 +2188,7 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
             #[doc(hidden)]
             #[allow(dead_code)]
             const #marker: bool = true;
+            #body_markers
             #block
         }
 
@@ -2366,22 +2360,28 @@ pub fn jit_elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let vis = &func.vis;
             let sig = &func.sig;
             let block = &func.block;
-            let marker = format_ident!("_elidable_function_{}", sig.ident);
+            let body_markers = rpython_attribute_body_markers("jit_elidable", sig);
             return quote! {
                 #(#attrs)*
                 #vis #sig {
-                    #[doc(hidden)]
-                    #[allow(non_upper_case_globals, dead_code)]
-                    const #marker: bool = true;
+                    #body_markers
                     #block
                 }
             }
             .into();
         }
+        let attrs = &func.attrs;
         let vis = &func.vis;
-        let rpython_attribute_const = rpython_attribute_const_for("jit_elidable", &func.sig, vis);
+        let sig = &func.sig;
+        let block = &func.block;
+        let body_markers = rpython_attribute_body_markers("jit_elidable", sig);
+        let rpython_attribute_const = rpython_attribute_const_for("jit_elidable", sig, vis);
         return quote! {
-            #func
+            #(#attrs)*
+            #vis #sig {
+                #body_markers
+                #block
+            }
             #rpython_attribute_const
         }
         .into();
@@ -2399,13 +2399,11 @@ pub fn jit_elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let defaultness = &method.defaultness;
         let sig = &method.sig;
         let block = &method.block;
-        let marker = format_ident!("_elidable_function_{}", sig.ident);
+        let body_markers = rpython_attribute_body_markers("jit_elidable", sig);
         return quote! {
             #(#attrs)*
             #vis #defaultness #sig {
-                #[doc(hidden)]
-                #[allow(non_upper_case_globals, dead_code)]
-                const #marker: bool = true;
+                #body_markers
                 #block
             }
         }
@@ -2636,7 +2634,7 @@ pub fn unroll_safe(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // `llbc_hints::marker_path_to_fn_path` already resolves that spelling.
     // A free function additionally gets the module-level sibling, so
     // `rg _jit_unroll_safe_` still finds the parity counterpart there.
-    let marker = format_ident!("_jit_unroll_safe_{}", sig.ident);
+    let body_markers = rpython_attribute_body_markers("unroll_safe", sig);
     let unroll_safe_const = rpython_attribute_const_for("unroll_safe", sig, vis);
 
     let expanded = quote! {
@@ -2644,9 +2642,7 @@ pub fn unroll_safe(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         #vis #sig {
-            #[doc(hidden)]
-            #[allow(non_upper_case_globals, dead_code)]
-            const #marker: bool = true;
+            #body_markers
             #block
         }
 
@@ -2860,6 +2856,8 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         None
     };
 
+    let orig_body_markers = rpython_attribute_body_markers("elidable", &orig_func.sig);
+
     let expanded = quote! {
         // rlib/jit.py — elidable(func); original body hidden
         #[inline(never)]
@@ -2869,6 +2867,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             #[allow(dead_code)]
             const _MAJIT_ELIDABLE: bool = true;
+            #orig_body_markers
             #block
         }
 
