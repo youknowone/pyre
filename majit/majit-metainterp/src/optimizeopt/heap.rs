@@ -872,7 +872,7 @@ pub struct OptHeap {
     /// Set to true when `_optimize_CALL_DICT_LOOKUP` folds a lookup;
     /// read by `optimize_GUARD_NO_EXCEPTION` to suppress the trailing guard.
     last_emitted_removed: bool,
-    /// heap.py:337: cached_dict_reads — descr_identity(extradescrs[0]) → { [dict,key] → result box }.
+    /// heap.py OptHeap.cached_dict_reads: cached_dict_reads — descr_identity(extradescrs[0]) → { [dict,key] → result box }.
     /// Consecutive dict lookups on the same dict+key are deduplicated.
     /// Inner key uses `DictArgKey` so Const args compare by value
     /// (util.py args_dict / args_eq via history.py same_box).
