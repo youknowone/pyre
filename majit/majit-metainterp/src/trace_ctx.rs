@@ -789,8 +789,32 @@ pub struct TraceCtx {
     pub(crate) bridge_grab_seeded: bool,
     /// `prepare_resume_from_failure` already recorded `RESTORE_EXCEPTION`
     /// and `handle_possible_exception`. The walker must not emit that
-    /// sequence again, and must resume at the handler pc it was given.
+    /// sequence again. The walk of the framestack-top jitcode starts at
+    /// `bridge_exception_resume_pc` and stamps that guard.
     pub(crate) bridge_exception_resume_prepared: bool,
+    /// Top `MIFrame.pc` before `handle_possible_exception`. The guard's
+    /// resume snapshot is this coordinate; `finishframe_exception` may
+    /// move the frame afterwards.
+    pub(crate) bridge_exception_source_pc: Option<usize>,
+    /// `JitCode` index of the frame that held `bridge_exception_source_pc`.
+    pub(crate) bridge_exception_source_jitcode: Option<i32>,
+    /// Top `MIFrame.pc` after `handle_possible_exception`.
+    /// `finishframe_exception` has already moved it to the handler on
+    /// `ChangeFrame`; otherwise it is the resume pc. Only the walk of
+    /// `bridge_exception_resume_jitcode` starts there.
+    pub(crate) bridge_exception_resume_pc: Option<usize>,
+    /// `JitCode` index of the frame that holds `bridge_exception_resume_pc`.
+    pub(crate) bridge_exception_resume_jitcode: Option<i32>,
+    /// `num_guards()` just after `handle_possible_exception` recorded its
+    /// guard (1-based). Later walks stamp that guard, not whichever guard
+    /// was recorded most recently.
+    pub(crate) bridge_exception_guard_ordinal: Option<usize>,
+    /// The walker snapshot for `bridge_exception_guard_ordinal` is attached.
+    pub(crate) bridge_exception_guard_snapshotted: bool,
+    /// `SAVE_EXCEPTION` op from `_prepare_exception_resumption`. The
+    /// walker reads it as the handler's exception box when the guard
+    /// was already recorded.
+    pub(crate) bridge_saved_exc_op: Option<OpRef>,
     /// Set when a bridge-entry resume replay ran as the applying reader and
     /// met a write it could not apply. The trace then holds recorded writes
     /// whose heap half did not happen, so the entry that asked for that reader
@@ -809,13 +833,12 @@ pub struct TraceCtx {
 /// A decoded-but-not-yet-built description of one inlined
 /// callee frame (`resume_data.frames[i]`, `i >= 1`) for a multi-frame
 /// bridge. `setup_bridge_sym` decodes the resume stream into this recipe
-/// while the resume data / rd_virtuals cache are in scope; `trace_bytecode`
-/// then assembles each recipe into a `PyFrame` + `PyreSym` and pushes it via
-/// `push_inline_frame` — RIGHT before `interpret()`, with the root concrete
-/// frame's EC available and immediate GC-rooting (`rebuild_from_resumedata`
-/// resume.py rebuilds frames and immediately interprets; pyre
-/// defers the build to the drain so the reconstructed locals are never held
-/// unrooted across an arbitrary collection — the #1 SIGSEGV subsystem).
+/// while the resume data / rd_virtuals cache are in scope. On an
+/// exception-guard bridge the trace ops that allocate this callee's
+/// `PyFrame` are recorded into `rebuilt_frame` before
+/// `prepare_resume_from_failure` (`pyjitpl.py` `rebuild_from_resumedata`
+/// then `prepare_resume_from_failure`). The concrete `PyFrame` stays
+/// deferred to the drain so it is not held unrooted across a collection.
 ///
 /// The bank vectors are indexed by pyre's semantic register index: pyre
 /// traces Python bytecode, so these are `locals_cells_stack_w` positions,
@@ -854,6 +877,16 @@ pub struct ReconstructRecipe {
     /// `bh_len_tail` on the callee's return. `capture_resumedata`
     /// (`pyjitpl.py`) keeps that graph on the framestack.
     pub len_tail: bool,
+    /// `NewWithVtable` of this frame on an exception-guard bridge, recorded
+    /// while the framestack is rebuilt and before
+    /// `prepare_resume_from_failure` records that guard. `None` for a level
+    /// that builds no frame, and for a bridge whose source guard is not an
+    /// exception guard: that bridge records no guard between the rebuild and
+    /// the walk, and the walk emits the frame. The walk reuses this box; it
+    /// does not emit another one after the guard.
+    pub rebuilt_frame: Option<OpRef>,
+    /// Execution-context box paired with [`Self::rebuilt_frame`].
+    pub rebuilt_ec: Option<OpRef>,
 }
 
 /// The decoded inline-callee recipes for one multi-frame
@@ -2084,6 +2117,13 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             bridge_exception_resume_prepared: false,
+            bridge_exception_source_pc: None,
+            bridge_exception_source_jitcode: None,
+            bridge_exception_resume_pc: None,
+            bridge_exception_resume_jitcode: None,
+            bridge_exception_guard_ordinal: None,
+            bridge_exception_guard_snapshotted: false,
+            bridge_saved_exc_op: None,
             replace_frames: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
@@ -2163,6 +2203,13 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             bridge_exception_resume_prepared: false,
+            bridge_exception_source_pc: None,
+            bridge_exception_source_jitcode: None,
+            bridge_exception_resume_pc: None,
+            bridge_exception_resume_jitcode: None,
+            bridge_exception_guard_ordinal: None,
+            bridge_exception_guard_snapshotted: false,
+            bridge_saved_exc_op: None,
             replace_frames: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
@@ -2227,6 +2274,77 @@ impl TraceCtx {
     /// resume ops. The walker resumes at the handler it was given.
     pub fn bridge_exception_resume_prepared(&self) -> bool {
         self.bridge_exception_resume_prepared
+    }
+
+    /// `MIFrame.pc` after `prepare_resume_from_failure`.
+    pub fn bridge_exception_resume_pc(&self) -> Option<usize> {
+        self.bridge_exception_resume_pc
+    }
+
+    /// JitCode index of the frame `bridge_exception_resume_pc` belongs to.
+    pub fn bridge_exception_resume_jitcode(&self) -> Option<i32> {
+        self.bridge_exception_resume_jitcode
+    }
+
+    /// JitCode index of the frame whose pc the guard was recorded against.
+    pub fn bridge_exception_source_jitcode(&self) -> Option<i32> {
+        self.bridge_exception_source_jitcode
+    }
+
+    /// `MIFrame.pc` before `handle_possible_exception`. `generate_guard`
+    /// captures the resume snapshot at this coordinate.
+    pub fn bridge_exception_source_pc(&self) -> Option<usize> {
+        self.bridge_exception_source_pc
+    }
+
+    /// Handler pc for a walk of `jitcode_index` entering at `position`.
+    ///
+    /// `None` when this walk is a different frame than the one
+    /// `finishframe_exception` left on top: an inner jitcode pc must not
+    /// be executed as an offset in the outer body.
+    pub fn prepared_handler_pc_for(&self, jitcode_index: i32, position: usize) -> Option<usize> {
+        if !self.bridge_exception_resume_prepared {
+            return None;
+        }
+        if self.bridge_exception_resume_jitcode != Some(jitcode_index) {
+            return None;
+        }
+        let prepared = self.bridge_exception_resume_pc?;
+        if prepared == position {
+            return None;
+        }
+        let same_body = self.bridge_exception_source_jitcode == Some(jitcode_index);
+        let at_source = self.bridge_exception_source_pc == Some(position);
+        if same_body {
+            let moved = self.bridge_exception_source_pc != Some(prepared);
+            if moved && !at_source {
+                return None;
+            }
+            return Some(prepared);
+        }
+        if self.bridge_exception_source_jitcode.is_some() {
+            return Some(prepared);
+        }
+        None
+    }
+
+    /// Guards recorded after `handle_possible_exception`'s guard.
+    pub fn bridge_exception_guard_from_end(&self) -> Option<usize> {
+        let ordinal = self.bridge_exception_guard_ordinal?;
+        Some(self.num_guards().saturating_sub(ordinal))
+    }
+
+    pub fn bridge_exception_guard_snapshotted(&self) -> bool {
+        self.bridge_exception_guard_snapshotted
+    }
+
+    pub fn mark_bridge_exception_guard_snapshotted(&mut self) {
+        self.bridge_exception_guard_snapshotted = true;
+    }
+
+    /// `SAVE_EXCEPTION` recorded by `_prepare_exception_resumption`.
+    pub fn bridge_saved_exc_op(&self) -> Option<OpRef> {
+        self.bridge_saved_exc_op
     }
 
     /// Get or create a constant OpRef for a given i64 value.
@@ -2683,6 +2801,10 @@ impl TraceCtx {
 
     pub fn guard_op_opcode_from_end(&self, from_end: usize) -> Option<OpCode> {
         self.recorder.guard_op_opcode_from_end(from_end)
+    }
+
+    pub fn guard_op_resume_position_from_end(&self, from_end: usize) -> Option<i32> {
+        self.recorder.guard_op_resume_position_from_end(from_end)
     }
 
     /// The structured green key values, if provided.

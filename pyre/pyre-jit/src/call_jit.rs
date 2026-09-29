@@ -3851,7 +3851,6 @@ pub fn trace_and_compile_from_bridge(
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().pending_guard_exc = guard_exc;
         driver.start_bridge_tracing(
             descr_arc,
             &mut jit_state,
@@ -3927,14 +3926,25 @@ pub fn trace_and_compile_from_bridge(
             }
             return BridgeResolution::ResumeBlackhole;
         }
-        // `pyjitpl.py _handle_guard_failure`: framestack is rebuilt, so
-        // `prepare_resume_from_failure` can record `RESTORE_EXCEPTION` and
-        // `handle_possible_exception` before `interpret`.
-        driver.meta_interp_mut().prepare_resume_from_failure();
     }
-    {
+    // `pyjitpl.py _handle_guard_failure` calls `prepare_resume_from_failure`
+    // once, after `rebuild_from_resumedata`. The same call covers the path
+    // with no portal jitcode: there is no framestack to rebuild, and the
+    // exception resume still has to run before the walk.
+    let keep_walking = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().prepare_resume_from_failure();
+        driver.meta_interp_mut().prepare_resume_from_failure()
+    };
+    if !keep_walking {
+        // `finishframe_exception` drained the framestack and
+        // `compile_exit_frame_with_exception` already closed the bridge,
+        // or that compile raised `SwitchToBlackhole`.
+        let (driver, _) = crate::eval::driver_pair();
+        if driver.is_tracing() {
+            driver.meta_interp_mut().abort_trace(false);
+            return BridgeResolution::ResumeBlackhole;
+        }
+        return BridgeResolution::CompiledContinue;
     }
     // `_prepare_exception_resumption` (pyjitpl.py) +
     // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception
@@ -4080,6 +4090,9 @@ pub fn trace_and_compile_from_bridge(
         // Publish the grabbed exception (`cpu.grab_exc_value` result) so the
         // walker's `seed_standing_exception_for_walk` threads it into
         // `sym.last_exc_box`, which the handler's `last_exc_value/>r` reads.
+        // Re-read `GUARD_EXC_VALUE`: `guard_exc` is the pre-move copy, and
+        // resume rebuild above allocates.
+        let guard_exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(guard_exc));
     } else if !pending_exc {
         // No standing exception at this bridge's source guard (e.g. a
@@ -4093,7 +4106,11 @@ pub fn trace_and_compile_from_bridge(
         // no-exception continuation.
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     }
-    if pending_exc && !route_exc_edge {
+    let exception_resume_prepared = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp().exception_resume_was_prepared()
+    };
+    if pending_exc && !route_exc_edge && !exception_resume_prepared {
         // Uncaught: `finishframe_exception` would
         // `compile_exit_frame_with_exception`.  That Finish(exc) close is
         // not wired on this walk yet, so this failure blackholes —
@@ -4905,9 +4922,10 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             savedata,
         } => {
             // This `guard_exc` is a copy of `grab_exc_value` (`llmodel.py`).
-            // The wasm frame's own slot is not what this function holds, so
-            // root the copy while the bridge-compile hook and the blackhole
-            // run. Inert today (wasm host allocations never collect).
+            // Park it in `GUARD_EXC_VALUE` so `_prepare_exception_resumption`
+            // reads the forwarded address, and keep the local rooted for the
+            // blackhole resume after the bridge attempt.
+            let _parked_guard_exc = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
             let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
             let _deadframe_roots = unsafe {
                 majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {

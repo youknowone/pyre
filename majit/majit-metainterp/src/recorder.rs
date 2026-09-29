@@ -1517,6 +1517,27 @@ impl Trace {
             .map(|op| op.opcode)
     }
 
+    /// Resume position of the guard [`set_guard_op_resume_position_from_end`]
+    /// would stamp, selected by the same walk. `None` when `from_end` does
+    /// not name a recorded guard.
+    pub fn guard_op_resume_position_from_end(&self, from_end: usize) -> Option<i32> {
+        if let Some(slot) = self
+            .slots
+            .iter()
+            .rev()
+            .filter(|s| s.opcode.is_guard())
+            .nth(from_end)
+        {
+            return Some(slot.resume.get());
+        }
+        self.ops
+            .iter()
+            .rev()
+            .filter(|op| op.opcode.is_guard())
+            .nth(from_end)
+            .map(|op| op.rd_resume_position())
+    }
+
     /// Replace the descriptor on the guard `from_end` guards back from the
     /// most recently recorded one.
     pub fn set_guard_op_descr_from_end(&mut self, from_end: usize, descr: DescrRef) {

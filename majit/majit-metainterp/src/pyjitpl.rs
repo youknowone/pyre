@@ -2764,12 +2764,9 @@ pub struct MetaInterp<M: Clone> {
 
     /// `pyjitpl.py _prepare_exception_resumption` result, held until
     /// `prepare_resume_from_failure` records `RESTORE_EXCEPTION`.
-    /// `(exception, SAVE_EXC_CLASS op, SAVE_EXCEPTION op)`.
-    exc_resume: Option<(i64, OpRef, OpRef)>,
-    /// Exception grabbed from the failing deadframe, read by
-    /// `handle_guard_failure` when the bridge entry does not pass it
-    /// as its own argument.
-    pub pending_guard_exc: i64,
+    /// `(SAVE_EXC_CLASS op, SAVE_EXCEPTION op)`. The exception object
+    /// itself stays in `GUARD_EXC_VALUE` and is re-read at use.
+    exc_resume: Option<(OpRef, OpRef)>,
 
     /// pyjitpl.py:2405 `self.aborted_tracing_jitdriver = None`.
     ///
@@ -4333,7 +4330,6 @@ impl<M: Clone> MetaInterp<M> {
             portal_trace_positions: Some(Vec::new()),
             last_exc_value: 0,
             exc_resume: None,
-            pending_guard_exc: 0,
             aborted_tracing_jitdriver: None,
             active_jitdriver_sd: None,
             aborted_tracing_greenkey: None,
@@ -17344,6 +17340,11 @@ impl<M: Clone> MetaInterp<M> {
     /// The body is `start_retrace_from_guard` (history + resumekey), then
     /// `_prepare_exception_resumption`. `prepare_resume_from_failure` and
     /// `interpret` run once the framestack has been rebuilt.
+    ///
+    /// The exception is `cpu.grab_exc_value(deadframe)`, read inside
+    /// `_prepare_exception_resumption` from `GUARD_EXC_VALUE` after the
+    /// history allocation. A word captured before that allocation is stale
+    /// once the nursery moves.
     pub fn handle_guard_failure(
         &mut self,
         descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
@@ -17351,11 +17352,10 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
         fail_values: &[i64],
-        guard_exc: i64,
     ) -> Option<BridgeRetraceResult> {
         let retrace =
             self.start_retrace_from_guard(descr_arc, green_key, trace_id, fail_index, fail_values)?;
-        self.prepare_exception_resumption(guard_exc, retrace.is_exception_guard);
+        self.prepare_exception_resumption(retrace.is_exception_guard);
         Some(retrace)
     }
 
@@ -17363,12 +17363,16 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Records `SAVE_EXC_CLASS` + `SAVE_EXCEPTION` at the start of an
     /// exception-guard bridge. The history must still be empty.
-    pub fn prepare_exception_resumption(&mut self, exception: i64, is_exc_guard: bool) {
+    ///
+    /// `exception = self.cpu.grab_exc_value(deadframe)` is read here, from
+    /// the rooted `GUARD_EXC_VALUE` cell the bridge entry parked, not from
+    /// an `i64` copied before `create_history`.
+    pub fn prepare_exception_resumption(&mut self, is_exc_guard: bool) {
         if !is_exc_guard {
-            debug_assert_eq!(exception, 0);
             self.exc_resume = None;
             return;
         }
+        let exception = crate::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get());
         let exc_class = if exception != 0 {
             self.read_typeptr_from_exception(exception)
         } else {
@@ -17380,57 +17384,91 @@ impl<M: Clone> MetaInterp<M> {
         let op1 = ctx.save_exc_class();
         ctx.set_opref_concrete(op1, majit_ir::Value::Int(exc_class));
         let op2 = ctx.save_exception();
+        // Re-read after the SAVE ops allocate. `exception` above was only
+        // used for the class word, which was copied out before that.
+        let exception = crate::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get());
         if exception != 0 {
             ctx.set_opref_concrete(
                 op2,
                 majit_ir::Value::Ref(majit_ir::GcRef(exception as usize)),
             );
         }
-        self.exc_resume = Some((exception, op1, op2));
+        ctx.bridge_saved_exc_op = Some(op2);
+        self.exc_resume = Some((op1, op2));
     }
 
     /// `pyjitpl.py MetaInterp.prepare_resume_from_failure`.
     ///
     /// `RESTORE_EXCEPTION`, then `execute_ll_raised` / `clear_exception`,
-    /// then `handle_possible_exception` when the resumed frame's next
-    /// opcode is `catch_exception`. That is the exception path. A frame
-    /// whose jitcode catch sits behind the fallthrough is routed by the
-    /// bridge walker, which must not emit this sequence a second time
-    /// once `bridge_exception_resume_prepared` is set.
-    pub fn prepare_resume_from_failure(&mut self) {
-        let Some((exception, op1, op2)) = self.exc_resume.take() else {
-            return;
+    /// then `handle_possible_exception`. `ChangeFrame` means
+    /// `finishframe_exception` moved the resumed frame to its handler.
+    /// `ExitFrameWithExceptionRef` means that compile already ran.
+    ///
+    /// Returns whether the caller should keep interpreting. `false` when
+    /// the bridge already finished on the escaping exception.
+    ///
+    /// The exception word is re-read from `GUARD_EXC_VALUE` here: resume
+    /// rebuild allocates between `_prepare_exception_resumption` and this
+    /// call.
+    ///
+    /// `handle_possible_exception` records the guard before the walker
+    /// runs. The walker attaches its resume snapshot to that guard
+    /// (`bridge_exception_guard_ordinal`) and continues the matching
+    /// jitcode at `bridge_exception_resume_pc`.
+    pub fn prepare_resume_from_failure(&mut self) -> bool {
+        let Some((op1, op2)) = self.exc_resume.take() else {
+            return true;
         };
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.restore_exception(op1, op2);
         }
+        let exception = crate::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get());
         if exception != 0 {
             self.execute_ll_raised(exception, true);
         } else {
             self.clear_exception();
         }
-        // The production walker records `GUARD_EXCEPTION` /
-        // `GUARD_NO_EXCEPTION` with a resume snapshot
-        // (`handle_possible_exception`). Emitting that guard here, before
-        // a resume position exists, stores `resume_pos == -1`.
-        let _ = exception;
+        // Snapshot coordinate is the rebuilt frame's pc. `finishframe_exception`
+        // may then move that same frame, or pop it and land on a caller.
+        let (source_pc, source_jitcode) = match self.framestack.frames.last() {
+            Some(frame) => (
+                Some(frame.pc),
+                frame.jitcode.try_index().map(|index| index as i32),
+            ),
+            None => (None, None),
+        };
+        let guards_before = self.tracing.as_ref().map(|ctx| ctx.num_guards());
+        let keep_walking = match self.handle_possible_exception() {
+            Ok(()) | Err(FinishframeExceptionSignal::ChangeFrame) => true,
+            Err(FinishframeExceptionSignal::ExitFrameWithExceptionRef(_)) => false,
+        };
+        if keep_walking && let Some(ctx) = self.tracing.as_mut() {
+            ctx.bridge_exception_resume_prepared = true;
+            ctx.bridge_exception_source_pc = source_pc;
+            ctx.bridge_exception_source_jitcode = source_jitcode;
+            if let Some(frame) = self.framestack.frames.last() {
+                ctx.bridge_exception_resume_pc = Some(frame.pc);
+                ctx.bridge_exception_resume_jitcode =
+                    frame.jitcode.try_index().map(|index| index as i32);
+            }
+            if let Some(before) = guards_before {
+                let after = ctx.num_guards();
+                if after > before {
+                    // The first guard `handle_possible_exception` recorded.
+                    ctx.bridge_exception_guard_ordinal = Some(before + 1);
+                }
+            }
+        }
+        keep_walking
     }
 
-    #[allow(dead_code)]
-    fn framestack_has_immediate_catch(&self) -> bool {
-        let Some(frame) = self.framestack.frames.last() else {
-            return false;
-        };
-        let code = &frame.jitcode.code;
-        let mut position = if frame.pc != 0 || frame.code_cursor == 0 {
-            frame.pc
-        } else {
-            frame.code_cursor
-        };
-        if position < code.len() && code[position] == crate::jitcode::insns::BC_LIVE {
-            position += majit_jitcode::liveness::OFFSET_SIZE + 1;
-        }
-        position < code.len() && code[position] == crate::jitcode::insns::BC_CATCH_EXCEPTION
+    /// `prepare_resume_from_failure` already ran `handle_possible_exception`
+    /// for this bridge. An in-frame handler was found, or there was no
+    /// exception; the walk must not decline as uncaught.
+    pub fn exception_resume_was_prepared(&self) -> bool {
+        self.tracing
+            .as_ref()
+            .is_some_and(|ctx| ctx.bridge_exception_resume_prepared())
     }
 
     /// `pyjitpl.py MetaInterp.initialize_state_from_guard_failure`.
@@ -17452,7 +17490,14 @@ impl<M: Clone> MetaInterp<M> {
         sym: &mut S,
         portal_pc: usize,
     ) -> crate::TraceAction {
-        self.prepare_resume_from_failure();
+        if !self.prepare_resume_from_failure() {
+            return crate::TraceAction::Finish {
+                finish_args: self.last_exc_box.into_iter().collect(),
+                finish_arg_types: vec![majit_ir::Type::Ref],
+                exit_with_exception: true,
+                exc_value: self.last_exc_value,
+            };
+        }
         self.interpret(sym, portal_pc)
     }
 

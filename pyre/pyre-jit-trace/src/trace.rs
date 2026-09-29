@@ -2064,11 +2064,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         return p2_drain_abort();
     };
 
-    // `setup_reconstructed_callee_frame` emits the callee frame vable into the
-    // trace and returns `argboxes_r` seeding the portal reds + in-flight
-    // operand-stack temps; the `_pending` callee sym is unused on the sub-walk
-    // path (the sub-walk drives the callee body off `argboxes_r` + the emitted
-    // frame vable, not a callee MIFrame).
+    // `setup_reconstructed_callee_frame` binds the callee frame recorded while
+    // the framestack was rebuilt and returns `argboxes_r` seeding the portal
+    // reds + in-flight operand-stack temps. The sub-walk drives the callee
+    // body off `argboxes_r` and that frame, not a callee MIFrame.
     let Some((pending, argboxes_r)) = crate::state::setup_reconstructed_callee_frame(
         ctx,
         is_being_profiled,

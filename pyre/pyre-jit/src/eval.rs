@@ -7741,12 +7741,22 @@ fn drive_portal_metatrace(
                     level_recursion.borrow_mut().pop();
                 }
             };
+            let reason = meta
+                .last_interpret_abort_reason
+                .unwrap_or(majit_metainterp::counters::ABORT_BAD_LOOP);
+            // `history.py SwitchToBlackhole`: `raising_exception` is the
+            // flag the raise site passed. Both `ABORT_ESCAPE` raises in
+            // `pyjitpl.py` (`vable_after_residual_call`,
+            // `do_not_in_trace_call`) pass `raising_exception=True`. Any
+            // other abort leaves it false, so a saved `last_exc_value`
+            // is `exception_last_value` on the first blackhole frame
+            // (`blackhole.py convert_and_run_from_pyjitpl`) rather than
+            // the exception `_run_forever` raises immediately.
             let outcome = meta.run_blackhole_interp_to_cancel_tracing(
                 majit_metainterp::SwitchToBlackhole {
-                    reason: meta
-                        .last_interpret_abort_reason
-                        .unwrap_or(majit_metainterp::counters::ABORT_BAD_LOOP),
-                    raising_exception: meta.last_exc_value != 0,
+                    reason,
+                    raising_exception: meta.last_exc_value != 0
+                        && reason == majit_metainterp::counters::ABORT_ESCAPE,
                 },
                 &mut builder,
                 Some(per_frame.as_slice()),

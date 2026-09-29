@@ -10491,18 +10491,16 @@ impl<S: JitState> JitDriver<S> {
             return false;
         };
 
-        let guard_exc = if descr_arc.is_guard_exc() {
-            self.meta.pending_guard_exc
-        } else {
-            0
-        };
+        // `pyjitpl.py _prepare_exception_resumption` reads
+        // `cpu.grab_exc_value(deadframe)` itself. The bridge entry parked
+        // that word in `GUARD_EXC_VALUE` (`GuardExcRoot`); this call does
+        // not take a copied `i64`.
         let retrace = match self.meta.handle_guard_failure(
             descr_arc.clone(),
             green_key,
             trace_id,
             fail_index,
             frontend_fail_values,
-            guard_exc,
         ) {
             Some(r) => r,
             None => return false,
