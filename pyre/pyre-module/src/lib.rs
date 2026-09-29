@@ -81,7 +81,7 @@ pub fn install_optional_modules() {
     ))]
     pyre_interpreter::importing::register_builtin_module(
         "_minimal_curses",
-        module::_minimal_curses::init,
+        module::_minimal_curses::moduledef::init,
     );
     pyre_interpreter::importing::register_builtin_module(
         "_multibytecodec",
@@ -106,7 +106,7 @@ pub fn install_optional_modules() {
         module::_pypy_generic_alias::init,
     );
     pyre_interpreter::importing::register_builtin_module("_queue", module::_queue::init);
-    pyre_interpreter::importing::register_builtin_module("gc", module::gc::init);
+    pyre_interpreter::importing::register_builtin_module("gc", module::gc::moduledef::init);
     pyre_interpreter::importing::register_builtin_module_with_startup(
         "array",
         module::array::init_array_module,
@@ -151,7 +151,10 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("termios", module::termios::init);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("winsound", module::winsound::init);
-    pyre_interpreter::importing::register_builtin_module("unicodedata", module::unicodedata::init);
+    pyre_interpreter::importing::register_builtin_module(
+        "unicodedata",
+        module::unicodedata::moduledef::init,
+    );
     pyre_interpreter::importing::register_builtin_module("zlib", module::zlib::init);
 }
 
@@ -442,7 +445,7 @@ unsafe fn hook_libffi_cif_shape(
 fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
     let mut types = Vec::new();
     module::_tokenize::gc_types(&mut types);
-    module::unicodedata::gc_types(&mut types);
+    module::unicodedata::moduledef::gc_types(&mut types);
     module::_json::gc_types(&mut types);
     module::_hashlib::gc_types(&mut types);
     module::zlib::gc_types(&mut types);
@@ -450,7 +453,7 @@ fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
     module::_lzma::gc_types(&mut types);
     module::_lsprof::gc_types(&mut types);
     module::_queue::gc_types(&mut types);
-    module::gc::gc_types(&mut types);
+    module::gc::moduledef::gc_types(&mut types);
     module::_pickle::gc_types(&mut types);
     module::_random::gc_types(&mut types);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]

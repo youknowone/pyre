@@ -230,6 +230,8 @@ mod tests {
             for modname in ["unicodedata", "gc", "_minimal_curses"] {
                 assert!(looks_inside(&format!("{root}{modname}")));
                 assert!(!looks_inside(&format!("{root}{modname}::interp")));
+                // `moduledef.py` is `pypy.module.<name>.moduledef`.
+                assert!(!looks_inside(&format!("{root}{modname}::moduledef")));
             }
         }
     }
