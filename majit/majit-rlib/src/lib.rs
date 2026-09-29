@@ -12,7 +12,7 @@
 
 extern crate self as majit_rlib;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(unix, windows))]
 #[allow(non_snake_case)]
 pub mod _rsocket_rffi;
 pub mod cache;
@@ -22,6 +22,10 @@ pub mod lltypesystem;
 pub mod nonconst;
 pub mod rbigint;
 pub mod rffi;
+#[cfg(unix)]
+pub mod rmmap;
+#[cfg(unix)]
+pub mod rpoll;
 pub mod rposix;
 #[cfg(unix)]
 pub mod rtermios;

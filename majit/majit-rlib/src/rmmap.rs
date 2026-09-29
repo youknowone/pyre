@@ -1,0 +1,157 @@
+//! `rpython/rlib/rmmap.py` — the POSIX `mmap` externals.
+//!
+//! `external` builds an unsafe/safe pair. The module calls the unsafe half of
+//! `mmap` and `msync` (`save_err=RFFI_SAVE_ERRNO`) and the safe half of
+//! `munmap` (`__del__`) and `madvise` (`_nowrapper=True`). `os.dup`,
+//! `os.fstat`, `os.ftruncate` and `os.close` are the calls `rmmap.mmap` and
+//! `resize` make around those. Windows `winexternal` stays with the module.
+
+#![cfg(unix)]
+
+use crate::rffi::{INT, RFFI_SAVE_ERRNO};
+
+crate::rffi::external_compilation_info! {
+    const ECI = {
+        includes: ["sys/mman.h", "sys/types.h", "sys/stat.h", "unistd.h", "fcntl.h"],
+    };
+}
+
+pub use libc::{
+    MADV_DONTNEED, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANON,
+    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MS_SYNC, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE,
+};
+
+#[cfg(target_vendor = "apple")]
+pub use libc::{MADV_FREE, MAP_HASSEMAPHORE, MAP_JIT, MAP_NOCACHE, MAP_NOEXTEND, MAP_NORESERVE};
+
+// `<sys/mman.h>` names Darwin publishes that this libc crate leaves out.
+// The values are the header's.
+#[cfg(target_vendor = "apple")]
+pub const MAP_RESILIENT_CODESIGN: libc::c_int = 0x2000;
+#[cfg(target_vendor = "apple")]
+pub const MAP_RESILIENT_MEDIA: libc::c_int = 0x4000;
+#[cfg(target_vendor = "apple")]
+pub const MAP_32BIT: libc::c_int = 0x8000;
+#[cfg(target_vendor = "apple")]
+pub const MAP_TRANSLATED_ALLOW_EXECUTE: libc::c_int = 0x20000;
+#[cfg(target_vendor = "apple")]
+pub const MAP_UNIX03: libc::c_int = 0x40000;
+#[cfg(target_vendor = "apple")]
+pub const MAP_TPRO: libc::c_int = 0x80000;
+
+pub type Ptr = *mut libc::c_void;
+
+// `libc` renames `mmap` (`mmap$UNIX2003` / `mmap64`). `macro = libc::mmap`
+// calls that declaration. `c_mmap` is the unsafe half.
+crate::rffi::llexternal!(
+    pub c_mmap = "mmap",
+    [Ptr, libc::size_t, INT, INT, INT, libc::off_t],
+    Ptr,
+    compilation_info = ECI,
+    save_err = RFFI_SAVE_ERRNO,
+    macro = libc::mmap
+);
+
+// Safe half: `sandboxsafe=True, releasegil=False`. `__del__` calls this.
+crate::rffi::llexternal!(
+    pub c_munmap_safe = "munmap",
+    [Ptr, libc::size_t],
+    INT,
+    compilation_info = ECI,
+    sandboxsafe = true,
+    releasegil = false,
+    macro = libc::munmap
+);
+
+crate::rffi::llexternal!(
+    pub c_msync = "msync",
+    [Ptr, libc::size_t, INT],
+    INT,
+    compilation_info = ECI,
+    save_err = RFFI_SAVE_ERRNO,
+    macro = libc::msync
+);
+
+// Safe half with `_nowrapper=True`: the call is direct, errno stays live.
+crate::rffi::llexternal!(
+    pub c_madvise_safe = "madvise",
+    [Ptr, libc::size_t, INT],
+    INT,
+    compilation_info = ECI,
+    sandboxsafe = true,
+    releasegil = false,
+    _nowrapper = true,
+    macro = libc::madvise
+);
+
+// `os.dup` / `os.fstat` / `os.ftruncate` / `os.close` as `rmmap.mmap` uses them.
+crate::rffi::llexternal!(
+    pub c_dup = "dup",
+    [INT],
+    INT,
+    compilation_info = ECI,
+    save_err = RFFI_SAVE_ERRNO,
+    macro = libc::dup
+);
+crate::rffi::llexternal!(
+    pub c_fstat = "fstat",
+    [INT, *mut libc::stat],
+    INT,
+    compilation_info = ECI,
+    save_err = RFFI_SAVE_ERRNO,
+    macro = libc::fstat
+);
+crate::rffi::llexternal!(
+    pub c_ftruncate = "ftruncate",
+    [INT, libc::off_t],
+    INT,
+    compilation_info = ECI,
+    save_err = RFFI_SAVE_ERRNO,
+    macro = libc::ftruncate
+);
+// `releasegil=False`, like a close from `__del__`.
+crate::rffi::llexternal!(
+    pub c_close = "close",
+    [INT],
+    INT,
+    compilation_info = ECI,
+    releasegil = false,
+    macro = libc::close
+);
+
+/// `getpagesize`. POSIX allocation granularity is the same value.
+pub fn page_size() -> usize {
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if n < 0 { 0 } else { n as usize }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_map_stores_a_byte_and_unmaps() {
+        let len = page_size().max(4096);
+        let ptr = unsafe {
+            c_mmap(
+                core::ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(
+            ptr,
+            libc::MAP_FAILED,
+            "mmap errno {}",
+            crate::rposix::get_saved_errno()
+        );
+        unsafe {
+            *ptr.cast::<u8>() = 0x5a;
+            assert_eq!(*ptr.cast::<u8>(), 0x5a);
+            assert_eq!(c_munmap_safe(ptr, len), 0);
+        }
+    }
+}

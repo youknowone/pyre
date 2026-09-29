@@ -130,14 +130,8 @@ impl W_Kevent {
     fn __init__(
         &mut self,
         w_ident: PyObjectRef,
-        #[default(pyre_object::w_int_new(
-            rustpython_host_env::select::kqueue::DEFAULT_FILTER as i64
-        ))]
-        mut w_filter: PyObjectRef,
-        #[default(pyre_object::w_int_new(
-            rustpython_host_env::select::kqueue::DEFAULT_FLAGS as i64
-        ))]
-        mut w_flags: PyObjectRef,
+        #[default(pyre_object::w_int_new(libc::EVFILT_READ as i64))] mut w_filter: PyObjectRef,
+        #[default(pyre_object::w_int_new(libc::EV_ADD as i64))] mut w_flags: PyObjectRef,
         #[default(pyre_object::w_int_new(0))] mut w_fflags: PyObjectRef,
         #[default(pyre_object::w_int_new(0))] mut w_data: PyObjectRef,
         #[default(pyre_object::w_int_new(0))] mut w_udata: PyObjectRef,

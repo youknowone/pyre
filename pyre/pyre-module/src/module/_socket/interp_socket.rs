@@ -1220,9 +1220,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     );
     // `sethostname` alone stays POSIX-only: WinSock has no counterpart and
     // `moduledef.py` does not export it where rsocket cannot provide it.
-    #[cfg(all(unix, feature = "host_env"))]
+    #[cfg(unix)]
     {
-        // sethostname(name) → None  (host_env::socket-backed)
+        // sethostname(name) → None
         pyre_interpreter::module_ns_store(
             ns,
             "sethostname",
@@ -1256,7 +1256,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     // `interp_func.py:412` audits the argument as it was
                     // passed, after the conversion and before the syscall.
                     pyre_interpreter::module::sys::vm::audit("socket.sethostname", &[w_name])?;
-                    rustpython_host_env::socket::sethostname(&name).map_err(|e| {
+                    rffi::sethostname(&name).map_err(|e| {
                         pyre_interpreter::PyError::os_error_with_errno(
                             e.raw_os_error().unwrap_or(0),
                             format!("sethostname: {e}"),
@@ -1670,25 +1670,21 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
             pyre_interpreter::make_builtin_function_with_arity(
                 "if_nameindex",
                 |_| {
-                    #[cfg(all(feature = "host_env", any(target_os = "dragonfly", target_os = "freebsd", target_os = "fuchsia", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "netbsd", target_os = "openbsd")))]
-                    let interfaces = rustpython_host_env::socket::if_nameindex()
-                        .map_err(socket_io_err)?
-                        .into_iter()
-                        .map(|(index, name)| (index, name.into_bytes()))
-                        .collect::<Vec<_>>();
-                    #[cfg(not(all(feature = "host_env", any(target_os = "dragonfly", target_os = "freebsd", target_os = "fuchsia", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "netbsd", target_os = "openbsd"))))]
+                    // Names are copied out before `if_freenameindex`. The
+                    // array itself is libc storage, not a Python object.
                     let interfaces = unsafe {
-                        let head = libc::if_nameindex();
+                        let head = majit_rlib::_rsocket_rffi::if_nameindex();
                         if head.is_null() {
                             return Err(socket_last_error());
                         }
                         let mut interfaces = Vec::new();
                         let mut p = head;
                         while (*p).if_index != 0 && !(*p).if_name.is_null() {
-                            interfaces.push(((*p).if_index, std::ffi::CStr::from_ptr((*p).if_name).to_bytes().to_vec()));
+                            let name = std::ffi::CStr::from_ptr((*p).if_name).to_bytes().to_vec();
+                            interfaces.push(((*p).if_index, name));
                             p = p.add(1);
                         }
-                        libc::if_freenameindex(head);
+                        majit_rlib::_rsocket_rffi::if_freenameindex(head);
                         interfaces
                     };
                     let mut result_w = pyre_object::gc_roots::RootedItems::new();
@@ -2005,16 +2001,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     unsafe { pyre_object::w_int_get_value(args[2]) as libc::c_int }
                 };
                 let mut fds = [0 as libc::c_int; 2];
-                let r = unsafe { libc::socketpair(family, ty, proto, fds.as_mut_ptr()) };
+                let r = unsafe {
+                    majit_rlib::_rsocket_rffi::socketpair(family, ty, proto, fds.as_mut_ptr())
+                };
                 if r != 0 {
                     return Err(socket_last_error());
                 }
-                // `rsocket.py:socketpair(inheritable=False)` — every
-                // socket pyre creates from the module starts with
-                // FD_CLOEXEC set, matching CPython's PEP 446 default.
+                // `socketpair(inheritable=False)` — every socket pyre creates
+                // from the module starts with FD_CLOEXEC set.
                 unsafe {
-                    libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
-                    libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+                    majit_rlib::_rsocket_rffi::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+                    majit_rlib::_rsocket_rffi::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
                 }
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
                 fields.push(socket_from_fd(fds[0], family, ty, proto)?);
@@ -2039,12 +2036,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                         return Err(pyre_interpreter::PyError::type_error("dup: fd must be an integer"));
                     }
                     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                    let n = unsafe { libc::dup(fd) };
+                    let n = unsafe { majit_rlib::_rsocket_rffi::dup(fd) };
                     if n < 0 {
                         return Err(socket_last_error());
                     }
                     unsafe {
-                        libc::fcntl(n, libc::F_SETFD, libc::FD_CLOEXEC);
+                        majit_rlib::_rsocket_rffi::fcntl(n, libc::F_SETFD, libc::FD_CLOEXEC);
                     }
                     Ok(pyre_object::w_int_new(n as i64))
                 },
@@ -2086,12 +2083,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 } else {
                     0
                 };
-                let new_fd = unsafe { libc::dup(fd) };
+                let new_fd = unsafe { majit_rlib::_rsocket_rffi::dup(fd) };
                 if new_fd < 0 {
                     return Err(socket_last_error());
                 }
                 unsafe {
-                    libc::fcntl(new_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    majit_rlib::_rsocket_rffi::fcntl(new_fd, libc::F_SETFD, libc::FD_CLOEXEC);
                 }
                 socket_from_fd(new_fd, family, ty, proto)
             }),
@@ -2381,10 +2378,9 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 .map(|c| c.as_ptr())
                 .unwrap_or(std::ptr::null());
             // A name lookup goes to the resolver and can take seconds.
-            let rc = {
-                let _blocked = pyre_interpreter::module::thread::before_external_block();
-                unsafe { rffi::getaddrinfo(host_ptr, port_ptr, &hints, &mut res) }
-            };
+            // Unix releases inside the `llexternal`; Windows releases inside
+            // `rffi::getaddrinfo`.
+            let rc = unsafe { rffi::getaddrinfo(host_ptr, port_ptr, &hints, &mut res) };
             if rc != 0 {
                 return Err(set_gaierror(rc));
             }
@@ -2517,9 +2513,8 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 hints.ai_socktype = rffi::SOCK_DGRAM;
                 hints.ai_flags = rffi::AI_NUMERICHOST;
                 let mut res: *mut rffi::addrinfo = std::ptr::null_mut();
-                let rc = {
-                    let _blocked = pyre_interpreter::module::thread::before_external_block();
-                    unsafe { rffi::getaddrinfo(c_host.as_ptr(), c_port.as_ptr(), &hints, &mut res) }
+                let rc = unsafe {
+                    rffi::getaddrinfo(c_host.as_ptr(), c_port.as_ptr(), &hints, &mut res)
                 };
                 if rc != 0 {
                     return Err(set_gaierror(rc));
@@ -2569,19 +2564,16 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 let mut host_buf = [0 as libc::c_char; rffi::NI_MAXHOST as usize];
                 let mut serv_buf = [0 as libc::c_char; 32];
                 // A reverse lookup goes to the resolver and can take seconds.
-                let nrc = {
-                    let _blocked = pyre_interpreter::module::thread::before_external_block();
-                    unsafe {
-                        rffi::getnameinfo(
-                            &resolved as *const _ as *const rffi::sockaddr,
-                            resolved_len as rffi::SockLen,
-                            host_buf.as_mut_ptr(),
-                            host_buf.len() as rffi::SockLen,
-                            serv_buf.as_mut_ptr(),
-                            serv_buf.len() as rffi::SockLen,
-                            flags,
-                        )
-                    }
+                let nrc = unsafe {
+                    rffi::getnameinfo(
+                        &resolved as *const _ as *const rffi::sockaddr,
+                        resolved_len as rffi::SockLen,
+                        host_buf.as_mut_ptr(),
+                        host_buf.len() as rffi::SockLen,
+                        serv_buf.as_mut_ptr(),
+                        serv_buf.len() as rffi::SockLen,
+                        flags,
+                    )
                 };
                 unsafe { rffi::freeaddrinfo(head) };
                 if nrc != 0 {
@@ -2663,9 +2655,14 @@ fn socket_last_error() -> pyre_interpreter::PyError {
     socket_io_err(rffi::last_error())
 }
 
-/// `call_external_function` with the failure code the socket API reports.
-/// That helper reads the C runtime's `errno`, which WinSock never writes —
-/// it keeps its own last-error slot — so the code has to come from `rffi`.
+/// Run a socket call and return the failure code it reported.
+///
+/// Unix `llexternal`s already release the interpreter and store `errno`, so
+/// this only reads that slot. WinSock never writes the C runtime's `errno`;
+/// the release stays here and the code comes from `rffi::last_error_code`.
+/// `recvmsg` / `sendmsg` are separate C helpers and do not come through here:
+/// they still use `call_external_function`, which reads the live `errno`
+/// inside the released window.
 #[cfg(any(unix, windows))]
 fn socket_call<R>(f: impl FnOnce() -> R) -> (R, i32) {
     #[cfg(windows)]
@@ -2676,7 +2673,8 @@ fn socket_call<R>(f: impl FnOnce() -> R) -> (R, i32) {
     }
     #[cfg(not(windows))]
     {
-        pyre_interpreter::module::thread::call_external_function(f)
+        let result = f();
+        (result, majit_rlib::rposix::get_saved_errno())
     }
 }
 
@@ -2954,21 +2952,31 @@ pub(crate) fn socket_fd(obj: pyre_object::PyObjectRef) -> Result<rffi::Socket, p
 }
 
 /// `send` with nothing around it: no interpreter release, and the failure code
-/// handed back rather than turned into an exception.  A caller that is already
-/// inside a released region has neither the interpreter it would need to build
-/// one nor a second release to spend.  `_ssl` drives its TLS exchanges from
-/// here.
+/// handed back rather than turned into an exception.  `_ssl`'s record pump
+/// already released the interpreter for the whole exchange, so the unix body
+/// calls `libc::send` and reads the live `errno`.  Socket methods go through
+/// `rffi::send`, the releasing `llexternal`.
 #[cfg(any(unix, windows))]
 pub(crate) fn socket_send_raw(
     fd: rffi::Socket,
     buf: &[u8],
     flags: libc::c_int,
 ) -> Result<isize, i32> {
+    #[cfg(unix)]
+    let sent = unsafe { libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags) };
+    #[cfg(windows)]
     let sent = unsafe { rffi::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags) };
     if sent >= 0 {
         Ok(sent)
     } else {
-        Err(rffi::last_error_code())
+        #[cfg(unix)]
+        {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
+        #[cfg(windows)]
+        {
+            Err(rffi::last_error_code())
+        }
     }
 }
 
@@ -2979,11 +2987,21 @@ pub(crate) fn socket_recv_raw(
     buf: &mut [u8],
     flags: libc::c_int,
 ) -> Result<usize, i32> {
+    #[cfg(unix)]
+    let read = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), flags) };
+    #[cfg(windows)]
     let read = unsafe { rffi::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), flags) };
     if read >= 0 {
         Ok(read as usize)
     } else {
-        Err(rffi::last_error_code())
+        #[cfg(unix)]
+        {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
+        #[cfg(windows)]
+        {
+            Err(rffi::last_error_code())
+        }
     }
 }
 
@@ -2999,7 +3017,23 @@ pub(crate) fn socket_send_bytes(
     flags: libc::c_int,
 ) -> Result<isize, pyre_interpreter::PyError> {
     loop {
-        match socket_call(|| socket_send_raw(fd, buf, flags)).0 {
+        let outcome = {
+            #[cfg(unix)]
+            {
+                let sent =
+                    unsafe { rffi::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags) };
+                if sent >= 0 {
+                    Ok(sent)
+                } else {
+                    Err(rffi::last_error_code())
+                }
+            }
+            #[cfg(windows)]
+            {
+                socket_call(|| socket_send_raw(fd, buf, flags)).0
+            }
+        };
+        match outcome {
             Ok(sent) => return Ok(sent),
             Err(errno) if !rffi::error_is_interrupted(errno) => {
                 return Err(socket_error_for_operation(obj, errno));
@@ -3021,7 +3055,24 @@ pub(crate) fn socket_recv_bytes(
     flags: libc::c_int,
 ) -> Result<usize, pyre_interpreter::PyError> {
     loop {
-        match socket_call(|| socket_recv_raw(fd, buf, flags)).0 {
+        let outcome = {
+            #[cfg(unix)]
+            {
+                let read = unsafe {
+                    rffi::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), flags)
+                };
+                if read >= 0 {
+                    Ok(read as usize)
+                } else {
+                    Err(rffi::last_error_code())
+                }
+            }
+            #[cfg(windows)]
+            {
+                socket_call(|| socket_recv_raw(fd, buf, flags)).0
+            }
+        };
+        match outcome {
             Ok(read) => return Ok(read),
             Err(errno) if !rffi::error_is_interrupted(errno) => {
                 return Err(socket_error_for_operation(obj, errno));
@@ -3707,10 +3758,7 @@ fn resolve_ip_host(
     };
     let mut result: *mut rffi::addrinfo = std::ptr::null_mut();
     // A name lookup goes to the resolver and can take seconds.
-    let rc = {
-        let _blocked = pyre_interpreter::module::thread::before_external_block();
-        unsafe { rffi::getaddrinfo(name_ptr, service_ptr, &hints, &mut result) }
-    };
+    let rc = unsafe { rffi::getaddrinfo(name_ptr, service_ptr, &hints, &mut result) };
     if rc != 0 {
         return Err(set_gaierror(rc));
     }
@@ -4192,13 +4240,15 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 if proto == -1 {
                     proto = 0;
                 }
-                let fd = { rffi::socket(family, ty, proto) };
+                // `socket` and the cloexec `fcntl` release the interpreter.
+                // `obj` is reloaded before `socket_init_state` writes it.
+                let fd = pyre_object::with_roots!(obj => rffi::socket(family, ty, proto));
                 if rffi::is_invalid(fd) {
                     return Err(socket_last_error());
                 }
-                // `rsocket.py:RSocket.__init__` keeps every newly created
-                // socket out of an exec'd child (PEP 446).
-                rffi::set_cloexec(fd);
+                // `RSocket.__init__` keeps every newly created socket out of
+                // an exec'd child (PEP 446).
+                pyre_object::with_roots!(obj => rffi::set_cloexec(fd));
                 socket_init_state(obj, fd, family, ty, proto)?;
                 return Ok(pyre_object::w_none());
             }
@@ -5199,7 +5249,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                     msg.msg_controllen = ancbufsize as _;
                 }
-                let (r, errno) = socket_call(|| {
+                let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| {
                     libc::recvmsg(fd, &mut msg, flags)
                 });
                 if r >= 0 {
@@ -5383,7 +5433,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                     msg.msg_controllen = ancbufsize as _;
                 }
-                let (r, errno) = socket_call(|| {
+                let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| {
                     libc::recvmsg(fd, &mut msg, flags)
                 });
                 if r >= 0 {
@@ -5668,7 +5718,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
 
             socket_wait_writable(obj, fd)?;
             let sent = loop {
-                let (r, errno) = socket_call(|| {
+                let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| {
                     libc::sendmsg(fd, &msg, flags)
                 });
                 if r >= 0 {
@@ -5799,7 +5849,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         core::mem::size_of::<libc::c_int>() as rffi::SockLen,
                     )
                 } else if pyre_object::bytesobject::is_bytes_like(val) {
-                    let data = pyre_object::bytesobject::bytes_like_data(val);
+                    // Copied before the call: `setsockopt` releases the
+                    // interpreter, and the bytes object can move.
+                    let data = pyre_object::bytesobject::bytes_like_data(val).to_vec();
                     rffi::setsockopt(
                         fd,
                         level,

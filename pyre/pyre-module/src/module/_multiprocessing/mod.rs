@@ -2,8 +2,8 @@
 //!
 //! Exposes `SemLock(kind, value, maxvalue, name, unlink)` and
 //! `sem_unlink(name)`, plus the three socket calls `connection.py` reaches for
-//! on Windows.  Backed by `rustpython_host_env::multiprocessing` — libc
-//! `sem_t` on unix, a `CreateSemaphoreW` handle on Windows; host_env only, so
+//! on Windows.  POSIX calls `sem_open` and the other `external()` symbols.
+//! Windows stays on `CreateSemaphoreW`. Either path needs `host_env`, so
 //! other platforms get an empty module and `import _multiprocessing`
 //! still succeeds.
 //!
@@ -14,12 +14,229 @@
 //! bookkeeping `_ismine` reads.  A dict-backed field is also readable as a
 //! plain attribute, which is wider than the typedef; the alternative — a
 //! handle-keyed side table — has no upstream counterpart.
+//!
+//! POSIX semaphores are `interp_semaphore.py external()` (`sem_open` and the
+//! rest). Windows stays on `CreateSemaphore` / `WaitForSingleObject`.
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 use pyre_object::*;
 
-#[cfg(all(any(unix, windows), feature = "host_env"))]
+#[cfg(all(windows, feature = "host_env"))]
 use rustpython_host_env::multiprocessing as host_mp;
+
+/// `interp_semaphore.py external()` — POSIX `sem_*`.
+#[cfg(all(unix, feature = "host_env"))]
+mod ll {
+    use majit_rlib::rffi::{INT, RFFI_SAVE_ERRNO, UINT};
+
+    // Darwin links nothing; every other POSIX target links `rt` (`libraries`).
+    #[cfg(target_vendor = "apple")]
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["sys/time.h", "limits.h", "semaphore.h"],
+        };
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["sys/time.h", "limits.h", "semaphore.h"],
+            libraries: ["rt"],
+        };
+    }
+
+    // `libc::gettimeofday`'s second argument is `*mut timezone` on Linux glibc
+    // and `*mut c_void` on Darwin. Callers pass null either way.
+    unsafe fn gettimeofday_tz(tp: *mut libc::timeval, tz: *mut libc::c_void) -> libc::c_int {
+        unsafe { libc::gettimeofday(tp, tz.cast()) }
+    }
+
+    // `sem_open` is variadic. `macro = libc::sem_open` keeps the renamed
+    // symbol and always receives the four arguments `sem_open` passes.
+    majit_rlib::rffi::llexternal!(
+        pub(super) _sem_open = "sem_open",
+        [*const libc::c_char, INT, INT, UINT],
+        *mut libc::sem_t,
+        compilation_info = ECI,
+        save_err = RFFI_SAVE_ERRNO,
+        macro = libc::sem_open
+    );
+    majit_rlib::rffi::llexternal!(
+        pub(super) _sem_close_no_errno = "sem_close",
+        [*mut libc::sem_t],
+        INT,
+        compilation_info = ECI,
+        releasegil = false,
+        macro = libc::sem_close
+    );
+    majit_rlib::rffi::llexternal!(
+        pub(super) _sem_close = "sem_close",
+        [*mut libc::sem_t],
+        INT,
+        compilation_info = ECI,
+        releasegil = false,
+        save_err = RFFI_SAVE_ERRNO,
+        macro = libc::sem_close
+    );
+    majit_rlib::rffi::llexternal!(
+        pub(super) _sem_unlink = "sem_unlink",
+        [*const libc::c_char],
+        INT,
+        compilation_info = ECI,
+        save_err = RFFI_SAVE_ERRNO,
+        macro = libc::sem_unlink
+    );
+    // `sem_wait` is `sem_wait$UNIX2003` on macOS x86. `macro = libc::sem_wait`.
+    majit_rlib::rffi::llexternal!(
+        pub(super) _sem_wait = "sem_wait",
+        [*mut libc::sem_t],
+        INT,
+        compilation_info = ECI,
+        save_err = RFFI_SAVE_ERRNO,
+        macro = libc::sem_wait
+    );
+    majit_rlib::rffi::llexternal!(
+        pub(super) _sem_trywait = "sem_trywait",
+        [*mut libc::sem_t],
+        INT,
+        compilation_info = ECI,
+        save_err = RFFI_SAVE_ERRNO,
+        macro = libc::sem_trywait
+    );
+    majit_rlib::rffi::llexternal!(
+        pub(super) _sem_post = "sem_post",
+        [*mut libc::sem_t],
+        INT,
+        compilation_info = ECI,
+        releasegil = false,
+        save_err = RFFI_SAVE_ERRNO,
+        macro = libc::sem_post
+    );
+    // Darwin has no `sem_getvalue` (`HAVE_BROKEN_SEM_GETVALUE`).
+    #[cfg(not(target_vendor = "apple"))]
+    majit_rlib::rffi::llexternal!(
+        pub(super) _sem_getvalue = "sem_getvalue",
+        [*mut libc::sem_t, *mut INT],
+        INT,
+        compilation_info = ECI,
+        save_err = RFFI_SAVE_ERRNO,
+        macro = libc::sem_getvalue
+    );
+    // Darwin has no `sem_timedwait`. The substitute is `_sem_timedwait_save`.
+    #[cfg(not(target_vendor = "apple"))]
+    majit_rlib::rffi::llexternal!(
+        pub(super) _sem_timedwait = "sem_timedwait",
+        [*mut libc::sem_t, *const libc::timespec],
+        INT,
+        compilation_info = ECI,
+        save_err = RFFI_SAVE_ERRNO,
+        macro = libc::sem_timedwait
+    );
+    majit_rlib::rffi::llexternal!(
+        pub(super) _gettimeofday = "gettimeofday",
+        [*mut libc::timeval, *mut libc::c_void],
+        INT,
+        compilation_info = ECI,
+        save_err = RFFI_SAVE_ERRNO,
+        macro = gettimeofday_tz
+    );
+
+    /// `interp_semaphore.py _sem_timedwait_save`. `sem_trywait`, then a
+    /// `select` sleep whose delay grows by 1000µs and caps at 20000µs.
+    /// The deadline's nanoseconds are compared with `gettimeofday`'s
+    /// microseconds, and the difference mixes those units; both are upstream.
+    #[cfg(target_vendor = "apple")]
+    pub(super) unsafe fn _sem_timedwait_save(
+        sem: *mut libc::sem_t,
+        deadline: libc::timespec,
+    ) -> INT {
+        let mut delay: i64 = 0;
+        loop {
+            if unsafe { _sem_trywait(sem) } == 0 {
+                return 0;
+            }
+            if majit_rlib::rposix::get_saved_errno() != libc::EAGAIN {
+                return -1;
+            }
+            let mut now = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            };
+            if unsafe { _gettimeofday(&mut now, core::ptr::null_mut()) } < 0 {
+                return -1;
+            }
+            let c_tv_sec = deadline.tv_sec as i64;
+            let c_tv_nsec = deadline.tv_nsec as i64;
+            let now_sec = now.tv_sec as i64;
+            let now_usec = now.tv_usec as i64;
+            if c_tv_sec < now_sec || (c_tv_sec == now_sec && c_tv_nsec <= now_usec) {
+                majit_rlib::rposix::set_saved_errno(libc::ETIMEDOUT);
+                return -1;
+            }
+            let difference = (c_tv_sec - now_sec) * 1_000_000 + (c_tv_nsec - now_usec);
+            if delay > 20_000 {
+                delay = 20_000;
+            }
+            if delay > difference {
+                delay = difference;
+            }
+            delay += 1000;
+            let mut tv = libc::timeval {
+                tv_sec: (delay / 1_000_000) as _,
+                tv_usec: (delay % 1_000_000) as _,
+            };
+            // `select` is already a `save_err` external. Do not release again.
+            if unsafe {
+                majit_rlib::_rsocket_rffi::select(
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &mut tv,
+                )
+            } < 0
+            {
+                return -1;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn sem_open_trywait_post_close_unlink() {
+            let name =
+                std::ffi::CString::new(format!("/pyre-rffi-{}", std::process::id())).unwrap();
+            struct Cleanup(std::ffi::CString, *mut libc::sem_t);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    unsafe {
+                        if !self.1.is_null() && self.1 != libc::SEM_FAILED {
+                            _sem_close_no_errno(self.1);
+                        }
+                        _sem_unlink(self.0.as_ptr());
+                    }
+                }
+            }
+            unsafe { _sem_unlink(name.as_ptr()) };
+            let sem = unsafe { _sem_open(name.as_ptr(), libc::O_CREAT | libc::O_EXCL, 0o600, 0) };
+            let mut cleanup = Cleanup(name, sem);
+            assert_ne!(
+                sem,
+                libc::SEM_FAILED,
+                "sem_open errno {}",
+                majit_rlib::rposix::get_saved_errno()
+            );
+            assert_eq!(unsafe { _sem_trywait(sem) }, -1);
+            assert_eq!(majit_rlib::rposix::get_saved_errno(), libc::EAGAIN);
+            assert_eq!(unsafe { _sem_post(sem) }, 0);
+            assert_eq!(unsafe { _sem_trywait(sem) }, 0);
+            assert_eq!(unsafe { _sem_close(sem) }, 0);
+            cleanup.1 = core::ptr::null_mut();
+        }
+    }
+}
 
 /// The platform's semaphore, as the instance stores it: an integer `handle`
 /// that `_rebuild` takes back.  Both spellings are raw pointers, so the
@@ -109,51 +326,57 @@ fn semlock_ismine(mut obj: PyObjectRef) -> bool {
         && pyre_interpreter::module::thread::current_ident() == semlock_get_i64(obj, "last_tid")
 }
 
-/// The stored integer is the semaphore. `SemHandle`'s drop closes it, and
-/// that close stays with the Python object, so the view must not drop.
 #[cfg(all(unix, feature = "host_env"))]
-fn sem_view(handle: SemRaw) -> core::mem::ManuallyDrop<host_mp::SemHandle> {
-    // SAFETY: the Python object still owns the close; `from_raw` only
-    // rebuilds a view, and `ManuallyDrop` stops `SemHandle`'s Drop.
-    core::mem::ManuallyDrop::new(unsafe { host_mp::SemHandle::from_raw(handle) })
+fn sem_oserror(ctx: &str) -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::os_error_with_errno(majit_rlib::rposix::get_saved_errno(), ctx)
 }
 
+#[cfg(all(unix, feature = "host_env"))]
+fn sem_c_name(name: &str) -> Result<std::ffi::CString, pyre_interpreter::PyError> {
+    std::ffi::CString::new(name)
+        .map_err(|_| pyre_interpreter::PyError::value_error("embedded null character"))
+}
+
+/// `sem_post`. `releasegil=False`, so a successful release does not drop the GIL.
 #[cfg(all(unix, feature = "host_env"))]
 fn semlock_post(handle: SemRaw) -> Result<(), pyre_interpreter::PyError> {
-    sem_view(handle).post().map_err(|error| {
-        pyre_interpreter::PyError::os_error_with_errno(error.raw_os_error(), "sem_post")
-    })
+    if unsafe { ll::_sem_post(handle) } < 0 {
+        Err(sem_oserror("sem_post"))
+    } else {
+        Ok(())
+    }
 }
 
-/// `interp_semaphore.py semlock_getvalue`.  Not built on darwin, where
-/// `sem_getvalue` always fails (`HAVE_BROKEN_SEM_GETVALUE`,
-/// `interp_semaphore.py`) and the `sem_trywait` fallbacks run instead.
+/// `sem_getvalue`. Not built on darwin (`HAVE_BROKEN_SEM_GETVALUE`); the
+/// `sem_trywait` fallbacks run instead. A negative waiter count clamps to 0.
 #[cfg(all(unix, feature = "host_env", not(target_vendor = "apple")))]
 fn semlock_getvalue(handle: SemRaw) -> Result<i64, pyre_interpreter::PyError> {
-    // The host helper also clamps implementations that report the number of
-    // waiters as a negative value.
-    sem_view(handle).value().map(i64::from).map_err(|error| {
-        pyre_interpreter::PyError::os_error_with_errno(error.raw_os_error(), "sem_getvalue")
-    })
+    let mut sval: libc::c_int = 0;
+    if unsafe { ll::_sem_getvalue(handle, &mut sval) } < 0 {
+        return Err(sem_oserror("sem_getvalue"));
+    }
+    let val = i64::from(sval);
+    Ok(if val < 0 { 0 } else { val })
 }
 
-/// `interp_semaphore.py semlock_iszero`.
+/// `semlock_iszero`. Darwin (`HAVE_BROKEN_SEM_GETVALUE`) probes with
+/// `sem_trywait` and posts back. EINTR is an error here, not a retry.
 #[cfg(all(unix, feature = "host_env"))]
 fn semlock_iszero(handle: SemRaw) -> Result<bool, pyre_interpreter::PyError> {
     #[cfg(target_vendor = "apple")]
     {
-        match sem_view(handle).trywait() {
-            host_mp::TryAcquireStatus::Acquired => {
-                semlock_post(handle)?;
-                Ok(false)
-            }
-            host_mp::TryAcquireStatus::WouldBlock => Ok(true),
-            host_mp::TryAcquireStatus::Interrupted => Err(
-                pyre_interpreter::PyError::os_error_with_errno(libc::EINTR, "sem_trywait"),
-            ),
-            host_mp::TryAcquireStatus::Error(error) => Err(
-                pyre_interpreter::PyError::os_error_with_errno(error.raw_os_error(), "sem_trywait"),
-            ),
+        if unsafe { ll::_sem_trywait(handle) } == 0 {
+            semlock_post(handle)?;
+            return Ok(false);
+        }
+        let errno = majit_rlib::rposix::get_saved_errno();
+        if errno == libc::EAGAIN {
+            Ok(true)
+        } else {
+            Err(pyre_interpreter::PyError::os_error_with_errno(
+                errno,
+                "sem_trywait",
+            ))
         }
     }
     #[cfg(not(target_vendor = "apple"))]
@@ -165,7 +388,7 @@ fn semlock_iszero(handle: SemRaw) -> Result<bool, pyre_interpreter::PyError> {
 /// The value the semaphore currently holds, for `_get_value`.
 #[cfg(all(unix, feature = "host_env"))]
 fn semlock_value(handle: SemRaw) -> Result<i64, pyre_interpreter::PyError> {
-    // interp_semaphore.py:432-434.
+    // `semlock_getvalue`: `HAVE_BROKEN_SEM_GETVALUE` raises.
     #[cfg(target_vendor = "apple")]
     {
         let _ = handle;
@@ -280,8 +503,12 @@ fn semlock_release(
     })
 }
 
-/// The semaphore a `SemLock()` call is built on, and the name the instance
-/// then reports (`None` once it has been unlinked).
+/// `create_semaphore`: `sem_open(name, O_CREAT|O_EXCL, 0600, value)`.
+/// The name is passed through; a missing leading `/` is not added. `unlink`
+/// then calls `sem_unlink` and the instance reports no name. A failed unlink
+/// closes the semaphore with `_sem_close_no_errno` because the caller never
+/// receives the handle. There is no finalizer (`delete_semaphore` is upstream
+/// and this object still has no typed payload).
 #[cfg(all(unix, feature = "host_env"))]
 fn semlock_create(
     name: &str,
@@ -290,18 +517,24 @@ fn semlock_create(
     unlink: bool,
 ) -> Result<(SemRaw, Option<String>), pyre_interpreter::PyError> {
     let _ = maxvalue;
-    let (handle, kept_name) = host_mp::SemHandle::create(name, value as libc::c_uint, unlink)
-        .map_err(|error| {
-            pyre_interpreter::PyError::os_error_with_errno(
-                error.raw_os_error(),
-                error.description(),
-            )
-        })?;
-    let raw = handle.as_handle_int() as usize as SemRaw;
-    // SemHandle::Drop closes the semaphore. Ownership belongs to the Python
-    // W_SemLock until its registered finalizer grows a typed payload.
-    core::mem::forget(handle);
-    Ok((raw, kept_name))
+    let c_name = sem_c_name(name)?;
+    let kept_name = if unlink { None } else { Some(name.to_owned()) };
+    let handle = unsafe {
+        ll::_sem_open(
+            c_name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL,
+            0o600,
+            value as libc::c_uint,
+        )
+    };
+    if handle == libc::SEM_FAILED {
+        return Err(sem_oserror("sem_open failed"));
+    }
+    if unlink && unsafe { ll::_sem_unlink(c_name.as_ptr()) } < 0 {
+        unsafe { ll::_sem_close_no_errno(handle) };
+        return Err(sem_oserror("sem_unlink failed"));
+    }
+    Ok((handle, kept_name))
 }
 
 /// A Windows semaphore is anonymous — `CreateSemaphoreW` takes the two counts
@@ -336,21 +569,17 @@ fn semlock_rebuild_raw(
     name: Option<&str>,
 ) -> Result<SemRaw, pyre_interpreter::PyError> {
     match name {
-        // interp_semaphore.py:550-555 — with a name, reopen it and ignore
-        // `w_handle`.
+        // `W_SemLock.rebuild`: a name reopens with `sem_open(name, 0, 0600, 0)`
+        // and ignores `w_handle`.
         Some(name) => {
-            let handle = host_mp::SemHandle::open_existing(name).map_err(|error| {
-                pyre_interpreter::PyError::os_error_with_errno(
-                    error.raw_os_error(),
-                    error.description(),
-                )
-            })?;
-            let raw = handle.as_handle_int() as usize as SemRaw;
-            core::mem::forget(handle);
-            Ok(raw)
+            let c_name = sem_c_name(name)?;
+            let handle = unsafe { ll::_sem_open(c_name.as_ptr(), 0, 0o600, 0) };
+            if handle == libc::SEM_FAILED {
+                return Err(sem_oserror("sem_open failed"));
+            }
+            Ok(handle)
         }
-        // interp_semaphore.py `handle = handle_w(space, w_handle)`
-        // (`:223-224`).
+        // `handle_w`: the integer stored on the instance.
         None => Ok(pyre_interpreter::baseobjspace::int_w(w_handle)? as usize as SemRaw),
     }
 }
@@ -366,122 +595,111 @@ fn semlock_rebuild_raw(
     Ok(pyre_interpreter::baseobjspace::int_w(w_handle)? as usize as SemRaw)
 }
 
-/// `interp_semaphore.py semlock_acquire` — the platform wait alone.
-/// Upstream bumps `self.last_tid`/`self.count` here (`:395-396`); the receiver
-/// stays with the caller instead, which does it on the success return.
+/// `semlock_acquire` builds the deadline the way `semlock_acquire` does:
+/// `int(timeout)` truncates toward 0, `int(1e9 * (timeout - sec) + 0.5)`,
+/// then `gettimeofday`, then carry nanoseconds. A non-finite or overflowing
+/// timeout is `OverflowError`. A negative timeout is not clamped to zero.
+#[cfg(all(unix, feature = "host_env"))]
+fn sem_deadline(timeout: f64) -> Result<libc::timespec, pyre_interpreter::PyError> {
+    if !timeout.is_finite() || timeout > i64::MAX as f64 || timeout < i64::MIN as f64 {
+        return Err(pyre_interpreter::PyError::overflow_error(
+            "timeout is too large",
+        ));
+    }
+    let sec = timeout as i64;
+    let nsec_f = 1e9 * (timeout - sec as f64) + 0.5;
+    if !nsec_f.is_finite() || nsec_f > i64::MAX as f64 || nsec_f < i64::MIN as f64 {
+        return Err(pyre_interpreter::PyError::overflow_error(
+            "timeout is too large",
+        ));
+    }
+    let nsec = nsec_f as i64;
+    let mut now = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    if unsafe { ll::_gettimeofday(&mut now, core::ptr::null_mut()) } < 0 {
+        return Err(sem_oserror("gettimeofday failed"));
+    }
+    let dl_nsec = (now.tv_usec as i64)
+        .checked_mul(1000)
+        .and_then(|usec| usec.checked_add(nsec))
+        .ok_or_else(|| pyre_interpreter::PyError::overflow_error("timeout is too large"))?;
+    // `c_tv_nsec / 1000000000` and `%` in `semlock_acquire` are floor division.
+    let carry = if dl_nsec % 1_000_000_000 < 0 {
+        dl_nsec / 1_000_000_000 - 1
+    } else {
+        dl_nsec / 1_000_000_000
+    };
+    let dl_sec = (now.tv_sec as i64)
+        .checked_add(sec)
+        .and_then(|sum| sum.checked_add(carry))
+        .ok_or_else(|| pyre_interpreter::PyError::overflow_error("timeout is too large"))?;
+    let dl_nsec = if dl_nsec % 1_000_000_000 < 0 {
+        dl_nsec % 1_000_000_000 + 1_000_000_000
+    } else {
+        dl_nsec % 1_000_000_000
+    };
+    Ok(libc::timespec {
+        tv_sec: dl_sec as _,
+        tv_nsec: dl_nsec as _,
+    })
+}
+
+/// `semlock_acquire` — the platform wait alone. `last_tid` / `count` stay
+/// with the caller, which updates them on the success return. EINTR runs
+/// pending signals and retries the whole call (the Darwin poll delay is local
+/// to `_sem_timedwait_save`, so it starts again). EAGAIN and ETIMEDOUT return
+/// false. The externals release the GIL themselves.
 #[cfg(all(unix, feature = "host_env"))]
 fn semlock_acquire(
     handle: SemRaw,
     block: bool,
     timeout: Option<f64>,
 ) -> Result<bool, pyre_interpreter::PyError> {
-    // PEP 475 — sem_wait/sem_trywait retry on EINTR; otherwise
-    // EAGAIN (only meaningful for trywait) yields False and the
-    // remaining errnos propagate as OSError instead of being
-    // silently mapped to False.
-    // `interp_semaphore.py semlock_acquire` — on EINTR deliver
-    // a pending signal then retry; on success deliver one too before
-    // returning (`_check_signals(space)`).
-    if block && timeout.is_none() {
-        loop {
-            let status = {
-                let _blocked = pyre_interpreter::module::thread::before_external_block();
-                sem_view(handle).wait(None)
-            };
-            match status {
-                host_mp::WaitStatus::Acquired => break,
-                host_mp::WaitStatus::Interrupted => {
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                }
-                host_mp::WaitStatus::TimedOut => unreachable!("untimed sem_wait timed out"),
-                host_mp::WaitStatus::Error(error) => {
-                    return Err(pyre_interpreter::PyError::os_error_with_errno(
-                        error.raw_os_error(),
-                        "sem_wait",
-                    ));
-                }
-            }
-        }
-        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-        Ok(true)
-    } else if !block {
-        loop {
-            match sem_view(handle).trywait() {
-                host_mp::TryAcquireStatus::Acquired => {
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                    return Ok(true);
-                }
-                host_mp::TryAcquireStatus::WouldBlock => return Ok(false),
-                host_mp::TryAcquireStatus::Interrupted => {
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                }
-                host_mp::TryAcquireStatus::Error(error) => {
-                    return Err(pyre_interpreter::PyError::os_error_with_errno(
-                        error.raw_os_error(),
-                        "sem_trywait",
-                    ));
-                }
-            }
+    let deadline = if block {
+        match timeout {
+            Some(timeout) => Some(sem_deadline(timeout)?),
+            None => None,
         }
     } else {
-        let deadline = rustpython_host_env::multiprocessing::deadline_from_timeout(
-            timeout.unwrap(),
-        )
-        .map_err(|error| {
-            pyre_interpreter::PyError::os_error_with_errno(
-                error.raw_os_error(),
-                error.description(),
-            )
-        })?;
-        #[cfg(target_vendor = "apple")]
-        {
-            let mut delay = 0;
-            loop {
-                use rustpython_host_env::multiprocessing::PollWaitStep;
-                // The poll step sleeps between `sem_trywait` attempts.
-                let step = {
-                    let _blocked = pyre_interpreter::module::thread::before_external_block();
-                    sem_view(handle).poll_wait_step(&deadline, delay)
-                };
-                match step.map_err(|error| {
-                    pyre_interpreter::PyError::os_error_with_errno(
-                        error.raw_os_error(),
-                        error.description(),
-                    )
-                })? {
-                    PollWaitStep::Acquired => {
-                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                        return Ok(true);
-                    }
-                    PollWaitStep::Timeout => return Ok(false),
-                    PollWaitStep::Continue(next_delay) => delay = next_delay,
-                }
+        None
+    };
+    let op = if !block {
+        "sem_trywait"
+    } else if deadline.is_none() {
+        "sem_wait"
+    } else {
+        "sem_timedwait"
+    };
+    loop {
+        let rc = if !block {
+            unsafe { ll::_sem_trywait(handle) }
+        } else if let Some(deadline) = deadline {
+            #[cfg(target_vendor = "apple")]
+            {
+                unsafe { ll::_sem_timedwait_save(handle, deadline) }
             }
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        loop {
-            use rustpython_host_env::multiprocessing::WaitStatus;
-            let status = {
-                let _blocked = pyre_interpreter::module::thread::before_external_block();
-                sem_view(handle).wait(Some(&deadline))
-            };
-            match status {
-                WaitStatus::Acquired => {
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                    return Ok(true);
-                }
-                WaitStatus::TimedOut => return Ok(false),
-                WaitStatus::Interrupted => {
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                }
-                WaitStatus::Error(error) => {
-                    return Err(pyre_interpreter::PyError::os_error_with_errno(
-                        error.raw_os_error(),
-                        error.description(),
-                    ));
-                }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                unsafe { ll::_sem_timedwait(handle, &deadline) }
             }
+        } else {
+            unsafe { ll::_sem_wait(handle) }
+        };
+        if rc == 0 {
+            pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+            return Ok(true);
         }
+        let errno = majit_rlib::rposix::get_saved_errno();
+        if errno == libc::EINTR {
+            pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+            continue;
+        }
+        if errno == libc::EAGAIN || errno == libc::ETIMEDOUT {
+            return Ok(false);
+        }
+        return Err(pyre_interpreter::PyError::os_error_with_errno(errno, op));
     }
 }
 
@@ -500,30 +718,20 @@ fn semlock_release(
         // `HAVE_BROKEN_SEM_GETVALUE`: only the maxvalue == 1 case can be
         // checked properly.
         if maxvalue == 1 {
-            // make sure that already locked
-            match sem_view(handle).trywait() {
-                host_mp::TryAcquireStatus::Acquired => {
-                    // it was not locked so undo wait and raise
-                    let _ = sem_view(handle).post();
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "semaphore or lock released too many times",
-                    ));
-                }
-                host_mp::TryAcquireStatus::WouldBlock => {}
-                host_mp::TryAcquireStatus::Interrupted => {
-                    return Err(pyre_interpreter::PyError::os_error_with_errno(
-                        libc::EINTR,
-                        "sem_trywait",
-                    ));
-                }
-                host_mp::TryAcquireStatus::Error(error) => {
-                    return Err(pyre_interpreter::PyError::os_error_with_errno(
-                        error.raw_os_error(),
-                        "sem_trywait",
-                    ));
-                }
+            if unsafe { ll::_sem_trywait(handle) } == 0 {
+                // it was not locked, so undo the wait and raise
+                semlock_post(handle)?;
+                return Err(pyre_interpreter::PyError::value_error(
+                    "semaphore or lock released too many times",
+                ));
             }
-            // it is already locked as expected
+            let errno = majit_rlib::rposix::get_saved_errno();
+            if errno != libc::EAGAIN {
+                return Err(pyre_interpreter::PyError::os_error_with_errno(
+                    errno,
+                    "sem_trywait",
+                ));
+            }
         }
     }
     #[cfg(not(target_vendor = "apple"))]
@@ -711,7 +919,10 @@ fn semlock_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpret
     if kind != RECURSIVE_MUTEX && kind != SEMAPHORE {
         return Err(pyre_interpreter::PyError::value_error("unrecognized kind"));
     }
-    let (raw, kept_name) = semlock_create(&name, value, maxvalue, unlink)?;
+    // `sem_open` releases the GIL. `w_subtype` is a heap class and can move.
+    let (raw, kept_name) = pyre_object::with_roots!(w_subtype => {
+        semlock_create(&name, value, maxvalue, unlink)
+    })?;
     semlock_instance(w_subtype, raw, kind, maxvalue, kept_name)
 }
 
@@ -827,8 +1038,11 @@ pyre_interpreter::py_class! {
 fn sem_unlink(name: &str) -> Result<(), pyre_interpreter::PyError> {
     #[cfg(unix)]
     {
-        host_mp::sem_unlink(name)
-            .map_err(|_| pyre_interpreter::PyError::os_error("sem_unlink failed"))
+        let c_name = sem_c_name(name)?;
+        if unsafe { ll::_sem_unlink(c_name.as_ptr()) } < 0 {
+            return Err(sem_oserror("sem_unlink failed"));
+        }
+        Ok(())
     }
     // A Windows semaphore has no name in the filesystem sense, so there is
     // nothing to remove and `SEM_UNLINK` is the constant success the call
@@ -903,7 +1117,14 @@ pyre_interpreter::py_module! {
             // POSIX limit, or `LONG_MAX` where `CreateSemaphoreW` takes the
             // maximum as its own argument.
             #[cfg(unix)]
-            let value_max = i64::from(host_mp::sem_value_max());
+            let value_max = {
+                let n = unsafe { libc::sysconf(libc::_SC_SEM_VALUE_MAX) };
+                if n < 0 || n > i32::MAX as libc::c_long {
+                    i64::from(i32::MAX)
+                } else {
+                    n as i64
+                }
+            };
             #[cfg(windows)]
             let value_max = i64::from(i32::MAX);
             let sem_value_max = w_int_new(value_max);
