@@ -1750,6 +1750,14 @@ fn expand_pyre_class(
                     let _roots = ::pyre_object::gc_roots::push_roots();
                     let __refs = [w_subtype, #(payload.#ptr_field_idents),*];
                     let __base = ::pyre_object::gc_roots::pin_roots(&__refs);
+                    let type_id = match <#user_struct_name as ::pyre_object::lltype::GcType>::type_id() {
+                        ::pyre_object::lltype::TypeIdCell::UNASSIGNED => 0,
+                        id => id,
+                    };
+                    let raw = ::pyre_object::gc_hook::try_gc_alloc_stable_raw(
+                        type_id,
+                        ::std::mem::size_of::<#user_struct_name>(),
+                    );
                     let w_subtype = ::pyre_object::gc_roots::shadow_stack_get(__base);
                     #(#payload_restores)*
                     let user = #user_struct_name {
@@ -1763,8 +1771,16 @@ fn expand_pyre_class(
                         map: 0,
                         storage: ::std::ptr::null_mut(),
                     };
-                    let obj = ::pyre_object::lltype::malloc_typed_stable(user)
-                        as ::pyre_object::PyObjectRef;
+                    let obj = if raw.is_null() {
+                        ::pyre_object::lltype::malloc_typed(user)
+                            as ::pyre_object::PyObjectRef
+                    } else {
+                        unsafe {
+                            ::std::ptr::write(raw as *mut #user_struct_name, user);
+                            ::pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
+                            raw as ::pyre_object::PyObjectRef
+                        }
+                    };
                     ::pyre_object::gc_hook::maybe_register_finalizer(obj);
                     obj
                 }

@@ -2014,17 +2014,26 @@ fn build_gc() -> Box<MiniMarkGC> {
          descr: &'static pyre_object::lltype::PyreClassDescriptor,
          memory_pressure_offset: Option<usize>|
          -> u32 {
+            let parent_tid = if descr.mapdict_user_layout {
+                let base = unsafe { pyre_object::layout_base(descr.pytype_ptr) };
+                pytype_to_tid
+                    .get(&(base as usize))
+                    .copied()
+                    .unwrap_or(object_tid)
+            } else {
+                object_tid
+            };
             let mut type_info = if descr.mapdict_user_layout {
                 TypeInfo::object_subclass_with_gc_ptrs_and_custom_trace(
                     descr.object_size,
-                    object_tid,
+                    parent_tid,
                     descr.ptr_offsets.to_vec(),
                     pyre_class_user_layout_custom_trace,
                 )
             } else {
                 TypeInfo::object_subclass_with_gc_ptrs(
                     descr.object_size,
-                    object_tid,
+                    parent_tid,
                     descr.ptr_offsets.to_vec(),
                 )
             };

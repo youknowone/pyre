@@ -4690,6 +4690,97 @@ static W_WEAKREF_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::ne
     )
 });
 
+static W_ENUMERATE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::functional::W_EnumerateUser>(),
+        pyre_object::functional::W_ENUMERATE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::functional::ENUMERATE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::functional::W_EnumerateUser, map),
+        std::mem::offset_of!(pyre_object::functional::W_EnumerateUser, storage),
+        "W_EnumerateUser",
+        "functional::W_EnumerateUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xB0,
+    )
+});
+
+static W_MAP_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::functional::W_MapUser>(),
+        pyre_object::functional::W_MAP_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::functional::MAP_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::functional::W_MapUser, map),
+        std::mem::offset_of!(pyre_object::functional::W_MapUser, storage),
+        "W_MapUser",
+        "functional::W_MapUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xC0,
+    )
+});
+
+static W_FILTER_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::functional::W_FilterUser>(),
+        pyre_object::functional::W_FILTER_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::functional::FILTER_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::functional::W_FilterUser, map),
+        std::mem::offset_of!(pyre_object::functional::W_FilterUser, storage),
+        "W_FilterUser",
+        "functional::W_FilterUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xD0,
+    )
+});
+
+static W_ZIP_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::functional::W_ZipUser>(),
+        pyre_object::functional::W_ZIP_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::functional::ZIP_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::functional::W_ZipUser, map),
+        std::mem::offset_of!(pyre_object::functional::W_ZipUser, storage),
+        "W_ZipUser",
+        "functional::W_ZipUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xE0,
+    )
+});
+
+static W_REVERSED_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::functional::W_ReversedIteratorUser>(),
+        pyre_object::functional::W_REVERSED_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::functional::REVERSED_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::functional::W_ReversedIteratorUser, map),
+        std::mem::offset_of!(pyre_object::functional::W_ReversedIteratorUser, storage),
+        "W_ReversedIteratorUser",
+        "functional::W_ReversedIteratorUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF0,
+    )
+});
+
+static W_SUPER_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::descriptor::W_SuperUser>(),
+        pyre_object::descriptor::W_SUPER_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::descriptor::SUPER_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::descriptor::W_SuperUser, map),
+        std::mem::offset_of!(pyre_object::descriptor::W_SuperUser, storage),
+        "W_SuperUser",
+        "descriptor::W_SuperUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x100,
+    )
+});
+
+static W_PROPERTY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::descriptor::W_PropertyUser>(),
+        pyre_object::descriptor::W_PROPERTY_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::descriptor::PROPERTY_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::descriptor::W_PropertyUser, map),
+        std::mem::offset_of!(pyre_object::descriptor::W_PropertyUser, storage),
+        "W_PropertyUser",
+        "descriptor::W_PropertyUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x110,
+    )
+});
+
 /// `W_ObjectObject.map` (`objectobject.rs`) — the instance shape word,
 /// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). Read as an
 /// `Int` word so the LOAD_ATTR fast path can `guard_value` it to a constant map
@@ -4744,6 +4835,20 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
             && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj)
     } {
         field_descr_from_group(&W_TUPLE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::functional::is_enumerate(obj) } {
+        field_descr_from_group(&W_ENUMERATE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::functional::is_map(obj) } {
+        field_descr_from_group(&W_MAP_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::functional::is_filter(obj) } {
+        field_descr_from_group(&W_FILTER_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::functional::is_zip(obj) } {
+        field_descr_from_group(&W_ZIP_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::functional::is_reversed(obj) } {
+        field_descr_from_group(&W_REVERSED_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::descriptor::is_super(obj) } {
+        field_descr_from_group(&W_SUPER_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::descriptor::is_property(obj) } {
+        field_descr_from_group(&W_PROPERTY_USER_DESCR_GROUP, 0)
     } else {
         object_map_descr()
     }
@@ -4779,6 +4884,20 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
             && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj)
     } {
         field_descr_from_group(&W_TUPLE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::functional::is_enumerate(obj) } {
+        field_descr_from_group(&W_ENUMERATE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::functional::is_map(obj) } {
+        field_descr_from_group(&W_MAP_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::functional::is_filter(obj) } {
+        field_descr_from_group(&W_FILTER_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::functional::is_zip(obj) } {
+        field_descr_from_group(&W_ZIP_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::functional::is_reversed(obj) } {
+        field_descr_from_group(&W_REVERSED_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::descriptor::is_super(obj) } {
+        field_descr_from_group(&W_SUPER_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::descriptor::is_property(obj) } {
+        field_descr_from_group(&W_PROPERTY_USER_DESCR_GROUP, 1)
     } else {
         object_storage_descr()
     }
@@ -6634,6 +6753,34 @@ mod tests {
             0x6100_00A0
         );
         assert_eq!(
+            W_ENUMERATE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_00B0
+        );
+        assert_eq!(
+            W_MAP_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_00C0
+        );
+        assert_eq!(
+            W_FILTER_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_00D0
+        );
+        assert_eq!(
+            W_ZIP_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_00E0
+        );
+        assert_eq!(
+            W_REVERSED_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_00F0
+        );
+        assert_eq!(
+            W_SUPER_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0100
+        );
+        assert_eq!(
+            W_PROPERTY_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0110
+        );
+        assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
             Type::Ref
         );
@@ -8323,6 +8470,27 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("weakref::W_WeakrefUser", || {
         LazyLock::force(&W_WEAKREF_USER_DESCR_GROUP);
+    }),
+    ("functional::W_EnumerateUser", || {
+        LazyLock::force(&W_ENUMERATE_USER_DESCR_GROUP);
+    }),
+    ("functional::W_MapUser", || {
+        LazyLock::force(&W_MAP_USER_DESCR_GROUP);
+    }),
+    ("functional::W_FilterUser", || {
+        LazyLock::force(&W_FILTER_USER_DESCR_GROUP);
+    }),
+    ("functional::W_ZipUser", || {
+        LazyLock::force(&W_ZIP_USER_DESCR_GROUP);
+    }),
+    ("functional::W_ReversedIteratorUser", || {
+        LazyLock::force(&W_REVERSED_USER_DESCR_GROUP);
+    }),
+    ("descriptor::W_SuperUser", || {
+        LazyLock::force(&W_SUPER_USER_DESCR_GROUP);
+    }),
+    ("descriptor::W_PropertyUser", || {
+        LazyLock::force(&W_PROPERTY_USER_DESCR_GROUP);
     }),
     ("tupleobject::W_TupleObject", || {
         LazyLock::force(&W_TUPLE_DESCR_GROUP);

@@ -1894,6 +1894,9 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
     }
     unsafe {
         std::ptr::write(raw as *mut W_ListObjectUser, body);
+        if needs_write_barrier {
+            crate::gc_hook::try_gc_write_barrier_managed(raw);
+        }
     }
     raw as PyObjectRef
 }
