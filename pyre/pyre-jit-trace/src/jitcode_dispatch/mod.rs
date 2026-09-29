@@ -3735,6 +3735,534 @@ pub(crate) fn take_exc_edge_discarded_levels() -> Vec<(usize, usize)> {
     FBW_EXC_EDGE_DISCARDED_LEVELS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
+/// Kind bank a `GreenType` / `Type` reads. `Void` consumes nothing
+/// (`history.py getkind` drops void arguments).
+fn recursive_call_bank(ty: majit_ir::Type) -> Option<char> {
+    match ty {
+        majit_ir::Type::Int => Some('i'),
+        majit_ir::Type::Ref => Some('r'),
+        majit_ir::Type::Float => Some('f'),
+        majit_ir::Type::Void => None,
+    }
+}
+
+fn take_banked(
+    bank: char,
+    i: &mut usize,
+    r: &mut usize,
+    f: &mut usize,
+    ii: &[OpRef],
+    rr: &[OpRef],
+    ff: &[OpRef],
+) -> Option<OpRef> {
+    let slot = match bank {
+        'i' => {
+            let op = *ii.get(*i)?;
+            *i += 1;
+            op
+        }
+        'r' => {
+            let op = *rr.get(*r)?;
+            *r += 1;
+            op
+        }
+        'f' => {
+            let op = *ff.get(*f)?;
+            *f += 1;
+            op
+        }
+        _ => return None,
+    };
+    Some(slot)
+}
+
+fn opref_as_i64<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, op: OpRef) -> i64 {
+    match ctx.trace_ctx.concrete_of_opref(op) {
+        Some(majit_ir::Value::Int(n)) => n,
+        Some(majit_ir::Value::Ref(g)) => g.0 as i64,
+        Some(majit_ir::Value::Float(n)) => n.to_bits() as i64,
+        _ => 0,
+    }
+}
+
+fn opref_concrete(ctx_value: Option<majit_ir::Value>) -> crate::state::ConcreteValue {
+    match ctx_value {
+        Some(majit_ir::Value::Int(n)) => crate::state::ConcreteValue::Int(n),
+        Some(majit_ir::Value::Float(n)) => crate::state::ConcreteValue::Float(n),
+        Some(majit_ir::Value::Ref(g)) => {
+            crate::state::ConcreteValue::Ref(g.0 as pyre_object::PyObjectRef)
+        }
+        _ => crate::state::ConcreteValue::Null,
+    }
+}
+
+fn portal_mainjitcode_index(jd_index: usize) -> Option<usize> {
+    let key = match jd_index {
+        0 => {
+            return crate::jitcode_runtime::portal_jitcode().map(|jc| jc.index());
+        }
+        1 => "baseobjspace::unpackiterable_portal",
+        2 => "baseobjspace::generatorentry_portal",
+        _ => return None,
+    };
+    crate::jitcode_runtime::portal_jitcode_for_key(key).map(|jc| jc.index())
+}
+
+/// `pyjitpl.py _opimpl_recursive_call` inline / assembler arms.
+///
+/// `None` means the residual `do_recursive_call(assembler_call=False)`
+/// arm still has to run (`inlining` false is not the production case;
+/// a missing token or portal body falls through to it).
+fn recursive_call_inline_or_assembler<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    jd_index: usize,
+    dst_bank: char,
+    dst: usize,
+    call_opcode: OpCode,
+    greens_i: &[OpRef],
+    greens_r: &[OpRef],
+    greens_f: &[OpRef],
+    reds_i: &[OpRef],
+    reds_r: &[OpRef],
+    reds_f: &[OpRef],
+    adr: i64,
+    descr: &majit_ir::DescrRef,
+    call_descr: &dyn majit_ir::descr::CallDescr,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some((driver, _)) = crate::driver::try_driver_pair() else {
+        return Ok(None);
+    };
+    let (green_spec, red_types) = {
+        let Some(jd) = driver.meta_interp().staticdata.jitdrivers_sd.get(jd_index) else {
+            return Ok(None);
+        };
+        (jd.green_args_spec(), jd.red_arg_types_as_ir_types())
+    };
+    let mut gi = 0usize;
+    let mut gr = 0usize;
+    let mut gf = 0usize;
+    let mut green_ops = Vec::with_capacity(green_spec.len());
+    let mut green_values = Vec::with_capacity(green_spec.len());
+    let mut green_types = Vec::with_capacity(green_spec.len());
+    for spec in &green_spec {
+        let Some(bank) = recursive_call_bank(majit_ir::green_type_to_ir(*spec)) else {
+            continue;
+        };
+        let Some(opref) = take_banked(
+            bank, &mut gi, &mut gr, &mut gf, greens_i, greens_r, greens_f,
+        ) else {
+            return Ok(None);
+        };
+        green_values.push(opref_as_i64(ctx, opref));
+        green_types.push(*spec);
+        green_ops.push(opref);
+    }
+    let mut ri = 0usize;
+    let mut rr = 0usize;
+    let mut rf = 0usize;
+    let mut red_ops = Vec::with_capacity(red_types.len());
+    for ty in &red_types {
+        let Some(bank) = recursive_call_bank(*ty) else {
+            continue;
+        };
+        let Some(opref) = take_banked(bank, &mut ri, &mut rr, &mut rf, reds_i, reds_r, reds_f)
+        else {
+            return Ok(None);
+        };
+        red_ops.push(opref);
+    }
+    let green_key =
+        majit_ir::GreenKey::with_types(green_values.clone(), green_types.iter().copied());
+    let pycode_key = greens_r
+        .first()
+        .copied()
+        .map(|op| opref_as_i64(ctx, op) as usize)
+        .unwrap_or(0);
+    let max_unroll = driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .max_unroll_recursion() as usize;
+    let can_inline = driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .can_inline_callable_for_key(&green_key);
+    let count = if pycode_key == 0 {
+        0
+    } else {
+        fbw_state::fbw_inline_recursion_count(ctx, pycode_key)
+    };
+    // `pyjitpl.py` `count >= memmgr.max_unroll_recursion` → `dont_trace_here`.
+    if can_inline && count >= max_unroll {
+        driver
+            .meta_interp_mut()
+            .warm_state_mut()
+            .disable_noninlinable_function_for_key(&green_key);
+    }
+    let inline = can_inline && count < max_unroll;
+    if inline {
+        if let Some(index) = portal_mainjitcode_index(jd_index) {
+            if let Some(body) = sub_jitcode_body_by_index(index) {
+                let int_args: Vec<OpRef> = greens_i
+                    .iter()
+                    .copied()
+                    .chain(reds_i.iter().copied())
+                    .collect();
+                let ref_args: Vec<OpRef> = greens_r
+                    .iter()
+                    .copied()
+                    .chain(reds_r.iter().copied())
+                    .collect();
+                let float_args: Vec<OpRef> = greens_f
+                    .iter()
+                    .copied()
+                    .chain(reds_f.iter().copied())
+                    .collect();
+                let int_concretes: Vec<crate::state::ConcreteValue> = int_args
+                    .iter()
+                    .map(|op| opref_concrete(ctx.trace_ctx.concrete_of_opref(*op)))
+                    .collect();
+                let ref_concretes: Vec<crate::state::ConcreteValue> = ref_args
+                    .iter()
+                    .map(|op| opref_concrete(ctx.trace_ctx.concrete_of_opref(*op)))
+                    .collect();
+                // `pyjitpl.py newframe`: portal_call_depth, call_ids, ENTER_PORTAL_FRAME.
+                // After the call bridge has already crossed `trace_limit`,
+                // do not open the callee's portal frame first.
+                abort_before_portal_entry_if_too_long(ctx, op.pc)?;
+                let subwalk_jd = crate::state::note_inline_subwalk_start(
+                    (green_key.get_uhash(), Some(green_key.clone())),
+                    ctx.trace_ctx.get_trace_position(),
+                );
+                let walked = match inline_call::run_sub_jitcode_walk(
+                    ctx,
+                    op.pc,
+                    &body,
+                    &int_args,
+                    &int_concretes,
+                    &ref_args,
+                    &ref_concretes,
+                    &float_args,
+                ) {
+                    // `popframe` records `LEAVE_PORTAL_FRAME`. The raise has
+                    // already left `_interpret`, so the close must not run.
+                    Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
+                    other => other,
+                };
+                if let Some(jd_no) = subwalk_jd {
+                    crate::state::note_inline_subwalk_end(
+                        jd_no,
+                        ctx.trace_ctx.get_trace_position(),
+                    );
+                }
+                let walked = walked?;
+                return Ok(Some(finish_recursive_inline(
+                    ctx, op, dst, dst_bank, walked,
+                )?));
+            }
+        }
+    }
+    // `do_recursive_call(assembler_call=True)` → `direct_assembler_call`.
+    let greenboxes: Vec<majit_ir::Value> = green_ops
+        .iter()
+        .zip(green_types.iter())
+        .map(|(opref, spec)| match majit_ir::green_type_to_ir(*spec) {
+            majit_ir::Type::Int => majit_ir::Value::Int(opref_as_i64(ctx, *opref)),
+            majit_ir::Type::Float => {
+                majit_ir::Value::Float(f64::from_bits(opref_as_i64(ctx, *opref) as u64))
+            }
+            majit_ir::Type::Ref => {
+                majit_ir::Value::Ref(majit_ir::GcRef(opref_as_i64(ctx, *opref) as usize))
+            }
+            majit_ir::Type::Void => majit_ir::Value::Void,
+        })
+        .collect();
+    let Some(token) = driver
+        .meta_interp_mut()
+        .get_or_make_jitdriver_assembler_token_arc(
+            jd_index,
+            green_key.get_uhash(),
+            &greenboxes,
+            &red_types,
+        )
+    else {
+        return Ok(None);
+    };
+    let funcbox = ctx.trace_ctx.const_int(adr);
+    let mut allboxes = Vec::with_capacity(
+        1 + greens_i.len()
+            + greens_r.len()
+            + greens_f.len()
+            + reds_i.len()
+            + reds_r.len()
+            + reds_f.len(),
+    );
+    allboxes.push(funcbox);
+    allboxes.extend_from_slice(greens_i);
+    allboxes.extend_from_slice(greens_r);
+    allboxes.extend_from_slice(greens_f);
+    allboxes.extend_from_slice(reds_i);
+    allboxes.extend_from_slice(reds_r);
+    allboxes.extend_from_slice(reds_f);
+    maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+    // Concrete portal runner first (`do_recursive_call`), then the
+    // recorded op is `CALL_ASSEMBLER` (`direct_assembler_call`).
+    // `OpRef::NONE` lets `vrefs_after_residual_call` finish before the
+    // assembler op is recorded (`try_execute_residual_call_via_executor`).
+    let exec = try_execute_residual_call_via_executor(
+        ctx,
+        call_opcode,
+        &allboxes,
+        call_descr,
+        OpRef::NONE,
+        op.pc,
+        None,
+        false,
+    )?;
+    let (concrete, raised) = match exec {
+        ResidualExecOutcome::Executed(Ok(result)) => (result, 0i64),
+        ResidualExecOutcome::Executed(Err(exc)) => (0, exc),
+        ResidualExecOutcome::Declined(cause) => {
+            fbw_state::fbw_mark_unjournaled_effect(cause);
+            let recorded =
+                ctx.trace_ctx
+                    .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
+            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        }
+    };
+    let recorded = match dst_bank {
+        'r' => ctx
+            .trace_ctx
+            .call_assembler_ref_arc_typed(token, &red_ops, &red_types),
+        'i' => ctx
+            .trace_ctx
+            .call_assembler_int_arc_typed(token, &red_ops, &red_types),
+        'f' => ctx
+            .trace_ctx
+            .call_assembler_float_arc_typed(token, &red_ops, &red_types),
+        'v' => {
+            ctx.trace_ctx
+                .call_assembler_void_arc_typed(token, &red_ops, &red_types);
+            OpRef::NONE
+        }
+        _ => unreachable!("dst_bank matched above"),
+    };
+    if recorded != OpRef::NONE && concrete != 0 {
+        let value = match dst_bank {
+            'i' => majit_ir::Value::Int(concrete),
+            'f' => majit_ir::Value::Float(f64::from_bits(concrete as u64)),
+            _ => majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+        };
+        ctx.trace_ctx.set_opref_concrete(recorded, value);
+    }
+    if recorded != OpRef::NONE {
+        write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
+    }
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    if raised != 0 {
+        let exc = ctx.trace_ctx.const_ref(raised);
+        let exc_concrete = crate::state::ConcreteValue::Ref(raised as pyre_object::PyObjectRef);
+        ctx.set_last_exc_value(exc, exc_concrete);
+        walker_record_guard_exception(ctx, op.pc);
+        return Ok(Some((
+            DispatchOutcome::SubRaise { exc, exc_concrete },
+            op.next_pc,
+        )));
+    }
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+}
+
+fn finish_recursive_inline<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    dst_bank: char,
+    walked: DispatchOutcome,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    match walked {
+        DispatchOutcome::SubReturn { result } => {
+            if let Some(result) = result {
+                write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, result)?;
+            }
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+            ctx.set_last_exc_value(exc, exc_concrete);
+            Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
+        }
+        other => Ok((other, op.next_pc)),
+    }
+}
+
+/// `pyjitpl.py _opimpl_recursive_call` / `do_recursive_call`.
+///
+/// The original portal graph ends in this op (`warmspot.py
+/// rewrite_jit_merge_point`). The call target is `portal_runner_adr`,
+/// not the portal jitcode, so the walk records the runner call instead
+/// of the evaluator body.
+fn dispatch_recursive_call<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let jd_box = read_int_reg(code, op, 0, ctx)?;
+    let jd_index = match ctx.trace_ctx.concrete_of_opref(jd_box) {
+        Some(Value::Int(index)) if index >= 0 => index as usize,
+        _ => {
+            return Err(DispatchError::UnsupportedOpname {
+                pc: op.pc,
+                key: op.key,
+            });
+        }
+    };
+    let mut offset = 1usize;
+    let (greens_i, width) = read_int_var_list(code, op, offset, ctx)?;
+    offset += width;
+    let (greens_r, width) = read_ref_var_list(code, op, offset, ctx)?;
+    offset += width;
+    let (greens_f, width) = read_float_var_list(code, op, offset, ctx)?;
+    offset += width;
+    let (reds_i, width) = read_int_var_list(code, op, offset, ctx)?;
+    offset += width;
+    let (reds_r, width) = read_ref_var_list(code, op, offset, ctx)?;
+    offset += width;
+    let (reds_f, width) = read_float_var_list(code, op, offset, ctx)?;
+    let _ = (offset, width);
+    let dst_bank = match op.opname {
+        "recursive_call_i" => 'i',
+        "recursive_call_r" => 'r',
+        "recursive_call_f" => 'f',
+        "recursive_call_v" => 'v',
+        _ => {
+            return Err(DispatchError::UnsupportedOpname {
+                pc: op.pc,
+                key: op.key,
+            });
+        }
+    };
+    let dst = if dst_bank == 'v' {
+        0
+    } else {
+        code[op.next_pc - 1] as usize
+    };
+    let (adr, descr) = {
+        let (driver, _) = crate::driver::driver_pair();
+        let Some(jd) = driver.meta_interp().staticdata.jitdrivers_sd.get(jd_index) else {
+            return Err(DispatchError::UnsupportedOpname {
+                pc: op.pc,
+                key: op.key,
+            });
+        };
+        let Some(descr) = jd.portal_calldescr.clone() else {
+            return Err(DispatchError::UnsupportedOpname {
+                pc: op.pc,
+                key: op.key,
+            });
+        };
+        if jd.portal_runner_adr == 0 {
+            return Err(DispatchError::UnsupportedOpname {
+                pc: op.pc,
+                key: op.key,
+            });
+        }
+        (jd.portal_runner_adr, descr)
+    };
+    let descr_for_record = descr.clone();
+    let Some(call_descr) = descr.as_call_descr() else {
+        return Err(DispatchError::UnsupportedOpname {
+            pc: op.pc,
+            key: op.key,
+        });
+    };
+    let call_opcode = match dst_bank {
+        'r' => OpCode::CallMayForceR,
+        'i' => OpCode::CallMayForceI,
+        'f' => OpCode::CallMayForceF,
+        'v' => OpCode::CallMayForceN,
+        _ => unreachable!("dst_bank matched above"),
+    };
+    // `pyjitpl.py _opimpl_recursive_call`: `can_inline_callable` then
+    // `perform_call`, otherwise `do_recursive_call(assembler_call=True)`.
+    if let Some(done) = recursive_call_inline_or_assembler(
+        ctx,
+        op,
+        jd_index,
+        dst_bank,
+        dst,
+        call_opcode,
+        &greens_i,
+        &greens_r,
+        &greens_f,
+        &reds_i,
+        &reds_r,
+        &reds_f,
+        adr,
+        &descr,
+        call_descr,
+    )? {
+        return Ok(done);
+    }
+    let funcbox = ctx.trace_ctx.const_int(adr);
+    let mut allboxes = Vec::with_capacity(
+        1 + greens_i.len()
+            + greens_r.len()
+            + greens_f.len()
+            + reds_i.len()
+            + reds_r.len()
+            + reds_f.len(),
+    );
+    allboxes.push(funcbox);
+    allboxes.extend(greens_i);
+    allboxes.extend(greens_r);
+    allboxes.extend(greens_f);
+    allboxes.extend(reds_i);
+    allboxes.extend(reds_r);
+    allboxes.extend(reds_f);
+    maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+    let recorded = ctx
+        .trace_ctx
+        .record_op_with_descr(call_opcode, &allboxes, descr_for_record);
+    let exec = try_execute_residual_call_via_executor(
+        ctx,
+        call_opcode,
+        &allboxes,
+        call_descr,
+        recorded,
+        op.pc,
+        Some((op.next_pc, dst_bank, dst)),
+        false,
+    )?;
+    let raised = match exec {
+        ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::Declined(cause) => {
+            fbw_state::fbw_mark_unjournaled_effect(cause);
+            false
+        }
+    };
+    write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    if raised {
+        walker_record_guard_exception(ctx, op.pc);
+        let exc = ctx
+            .last_exc_value()
+            .expect("recursive_call raise seeds last_exc_value");
+        let exc_concrete = ctx.last_exc_value_concrete();
+        return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
+    }
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
 /// next pc. Side effects reach `ctx.trace_ctx` only for opnames whose
 /// handler explicitly records (e.g. `ref_return/r` calls
@@ -3804,6 +4332,33 @@ pub fn step<Sym: WalkSym>(
         });
     }
     result
+}
+
+/// `pyjitpl.py` `_interpret` raises `SwitchToBlackhole(ABORT_TOO_LONG)`
+/// before `perform_call` / `newframe` once `history.length()` has passed
+/// `trace_limit`. Opening a portal frame after that point makes
+/// `find_biggest_function` name a callee the trace had already overflowed
+/// before entering, so the next attempt drops the inline and compiles the
+/// caller. Upstream leaves that caller on `prepare_trace_segmenting`.
+pub(crate) fn abort_before_portal_entry_if_too_long<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    if !ctx.trace_ctx.is_too_long() {
+        return Ok(());
+    }
+    let latched = residual_call::latch_abort_blackhole(ctx, pc, "pre-portal");
+    if !latched && fbw_state::fbw_executed_effect_count() != 0 {
+        majit_metainterp::mc_diag_bump(26);
+        return Ok(());
+    }
+    let ops = ctx.trace_ctx.num_recorded_ops();
+    crate::state::note_root_trace_too_long(
+        ctx.trace_ctx.current_merge_points_first_green_key_pair(),
+        ctx.trace_ctx.resumekey_original_loop_token().cloned(),
+    );
+    ctx.session.borrow_mut().trace_too_long = true;
+    Err(DispatchError::TraceTooLong { pc, ops })
 }
 
 /// Walk the code from `start_pc` until a terminating opcode fires.
@@ -3994,37 +4549,6 @@ pub fn walk<Sym: WalkSym>(
         // fallback because replay would apply an irreversible effect twice.
         // The remaining overshoot is tallied so an unsupported multi-frame
         // shape cannot silently become unbounded.
-        // A translated builtin gateway is transparent to the Python MIFrame
-        // stack and has no blackhole entry point of its own.  Its bytecode is
-        // one implementation detail of the enclosing Python CALL step, so do
-        // not split the trace in the middle of it: doing so would have to pair
-        // helper registers (r0 is commonly an args slice) with a Python
-        // JitCode's red-frame register.  Finish the helper and let the
-        // enclosing Python `walk()` perform this same post-step limit check at
-        // its real per-frame coordinate, matching RPython's one-red-frame
-        // ownership.
-        //
-        // The exemption defers the abort, it does not drop it, and the deferral
-        // is bounded by one descent:
-        //
-        // * `run_sub_jitcode_walk` is the only site that sets the flag, and the
-        //   Python-callee sub-walk merely inherits it, which extends the exempt
-        //   region downward.  Every walk ROOT is built with it clear
-        //   (`bridge_subwalk.rs`), so an exempt descent always has a non-exempt
-        //   Python frame above it.
-        // * `is_too_long` is a `num_ops > trace_limit` comparison over the
-        //   shared `TraceCtx`, not an edge, so it still holds when the helper
-        //   returns and the enclosing frame runs this check.
-        //
-        // The exposure is therefore the ops one helper body records after
-        // crossing the limit.  Over the 373 synth fixtures two reach it at all:
-        // `trace_too_long_inline_multiframe` ends at 100 ops against a limit of
-        // 70, and `trace_too_long_effect_replay` at 115 against 100.  The size
-        // of that overshoot is a property of the base, not of this exemption —
-        // it moves whenever the walk records a different number of ops per
-        // helper — so re-measure it rather than inheriting the numbers.
-        // `helper_descent_defers_the_limit_check_to_the_enclosing_frame` pins
-        // both halves.
         // pyjitpl.py raises out of `debug_merge_point`, i.e. from
         // INSIDE the step, so `blackhole_if_trace_too_long` (pyjitpl.py)
         // never sees a segmented trace. When a walk crosses a merge point
@@ -4036,7 +4560,12 @@ pub fn walk<Sym: WalkSym>(
         if let DispatchOutcome::SegmentTrace { .. } = outcome {
             return Ok((outcome, pc));
         }
-        if !ctx.fbw_mode.transparent_helper_subwalk && ctx.trace_ctx.is_too_long() {
+        // `_interpret` calls `run_one_step` then `blackhole_if_trace_too_long`
+        // for whatever MIFrame is current, including an inlined callee and a
+        // translated helper. Deferring the check until the helper returns
+        // records past `trace_limit` and can `newframe` a callee that
+        // `find_biggest_function` then names, which upstream never entered.
+        if ctx.trace_ctx.is_too_long() {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their
             // frame transition: in particular, `SubRaise` may enter this
@@ -15201,6 +15730,7 @@ fn handle<Sym: WalkSym>(
                 Ok((DispatchOutcome::Continue, op.next_pc))
             }
         }
+        key if key.starts_with("recursive_call_") => dispatch_recursive_call(code, op, ctx),
         other => Err(DispatchError::UnsupportedOpname {
             pc: op.pc,
             key: other,

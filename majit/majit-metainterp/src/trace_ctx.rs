@@ -1638,6 +1638,28 @@ impl TraceCtx {
         (len >= 2).then(|| self.virtualref_boxes[len - 2])
     }
 
+    /// Drop the innermost `[virtualbox, vrefbox]` when it names `frame_ptr`.
+    ///
+    /// `blackhole_if_trace_too_long` raises `SwitchToBlackhole` out of
+    /// `_interpret`, so `virtual_ref_finish` does not run and must not record.
+    /// The pair is tracing-only state of the trace being discarded. A pair
+    /// that names a different frame stays, so a still-live outer scope is not
+    /// eaten.
+    pub fn discard_innermost_virtualref_if_frame(&mut self, frame_ptr: usize) -> bool {
+        let len = self.virtualref_boxes.len();
+        if frame_ptr == 0 || len < 2 {
+            return false;
+        }
+        let virtual_entry = self.virtualref_boxes[len - 2];
+        let live = self.virtualref_entry_ptr(virtual_entry);
+        if live != frame_ptr && virtual_entry.1 != frame_ptr {
+            return false;
+        }
+        self.virtualref_boxes.pop();
+        self.virtualref_boxes.pop();
+        true
+    }
+
     /// The innermost still-open scope's `vrefbox` —
     /// `virtualref_boxes[-1]`.
     pub fn innermost_virtualref_vref(&self) -> Option<(OpRef, usize)> {
@@ -1759,7 +1781,7 @@ impl TraceCtx {
         let Some((vrefbox, vref_ptr)) = self.virtualref_boxes.pop() else {
             return false;
         };
-        let (lastbox, lastbox_ptr) = self
+        let (lastbox, _lastbox_ptr) = self
             .virtualref_boxes
             .pop()
             .expect("opimpl_virtual_ref_finish: vrefbox without its virtualbox");
@@ -1790,7 +1812,8 @@ impl TraceCtx {
             // RPython's plain `assert` fires in both untranslated and
             // translated builds, so this is an `assert_eq!`: a release build
             // must fail at the divergence rather than silently corrupt the
-            // vref stack.
+            // vref stack. `SwitchToBlackhole` never reaches this finish;
+            // a mismatched pair is a walker that kept recording after the raise.
             assert_eq!(
                 r.as_usize(),
                 last.as_usize(),

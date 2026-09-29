@@ -8203,13 +8203,12 @@ fn portal_dispatch_for(
     let Some(jd_index) = portal_jd_for(bh) else {
         return (None, None);
     };
+    // A codewriter `setup_jitdriver` for a plain function stamps a private
+    // index that is not a runtime `jitdrivers_sd` slot. That frame is not a
+    // portal (`call.py` stamps only `jd.mainjitcode`). An index the table
+    // does not hold has no `handle_jitexc_from_bh`.
     let Some(jd) = bh.jitdrivers_sd.get(jd_index) else {
-        panic!(
-            "blackhole: jitcode `{}` is stamped with jitdrivers_sd[{jd_index}] \
-             but the table has {} slot(s)",
-            bh.jitcode.name,
-            bh.jitdrivers_sd.len(),
-        );
+        return (None, None);
     };
     (jd.handle_jitexc_from_bh, Some(jd.result_type))
 }
@@ -11330,6 +11329,12 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     ] {
         insns.insert(key.to_string(), byte);
     }
+    // `handle_recursive_call` emits `recursive_call_v/iIRFIRF`. The
+    // assembler gives that key a dynamic byte (`get_opnum`); this build's
+    // `pipeline.insns` assigns 34. `handler_recursive_call_v` is wired
+    // below and no-ops until the key is in this map (`blackhole.py
+    // bhimpl_recursive_call_v`).
+    insns.insert("recursive_call_v/iIRFIRF".to_string(), 34);
     builder.setup_insns(&insns);
     // `setup_insns` already derives `op_live` and `op_catch_exception`
     // from the registered canonical subset above.  `rvmprof_code/ii` is

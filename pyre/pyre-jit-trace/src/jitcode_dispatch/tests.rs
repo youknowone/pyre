@@ -13395,18 +13395,13 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     // this fixture.
 }
 
-/// The post-step trace-limit check (`pyjitpl.py _interpret`) is skipped
-/// inside a canonical helper descent, which has no blackhole entry point to
-/// abort at, and runs on the enclosing Python frame instead.
-///
-/// Both halves are load-bearing and only their composition bounds the trace:
-/// exempting the descent without the enclosing frame still checking would let a
-/// helper record past `trace_limit` with nothing to stop it.  The caller here is
-/// one `inline_call_r_v/dR` — the descent — followed by its terminator, walked
-/// with the limit already crossed, so the two settings of the flag differ in
-/// exactly the frame that owns the check.
+/// `_interpret` calls `blackhole_if_trace_too_long` after every
+/// `run_one_step`, including a translated helper MIFrame. The caller here is
+/// one `inline_call_r_v/dR` followed by its terminator, walked with the limit
+/// already crossed, so the helper's own first instruction is where the limit
+/// fires — not after the helper has returned to its caller.
 #[test]
-fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
+fn helper_descent_checks_the_limit_on_its_own_instructions() {
     fn walk_past_the_limit(
         transparent_helper_subwalk: bool,
     ) -> Result<(DispatchOutcome, usize), DispatchError> {
@@ -13500,22 +13495,19 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
         walk(&caller_code, 0, &mut wc)
     }
 
-    // The descent runs inside the caller's first step, so the abort coordinate
-    // states which frame took it: pc 0 is the `inline_call_r_v/dR` itself, and
-    // the callee body — whose own offsets index a different JitCode — is never
-    // a legal abort pc for the enclosing walk.
+    // The helper body runs inside the caller's first step and is already over
+    // `trace_limit`, so its own `void_return/` (pc 0 of that JitCode) is the
+    // instruction `blackhole_if_trace_too_long` refuses. The caller's flag
+    // does not defer that check.
     assert_eq!(
         walk_past_the_limit(false),
         Err(DispatchError::TraceTooLong { pc: 0, ops: 1 }),
-        "an enclosing Python frame must abort at its own step",
+        "the helper MIFrame aborts on its own first instruction",
     );
-
-    assert!(
-        matches!(
-            walk_past_the_limit(true),
-            Ok((DispatchOutcome::Terminate { .. }, _))
-        ),
-        "a helper descent must finish its body and leave the check to its caller",
+    assert_eq!(
+        walk_past_the_limit(true),
+        Err(DispatchError::TraceTooLong { pc: 0, ops: 1 }),
+        "a helper descent does not finish its body past trace_limit",
     );
 }
 

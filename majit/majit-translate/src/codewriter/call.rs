@@ -7344,6 +7344,10 @@ impl CallControl {
         &self.function_graphs
     }
 
+    pub(crate) fn function_graphs_mut(&mut self) -> &mut GraphStore {
+        &mut self.function_graphs
+    }
+
     /// The portal-rooted candidate closure (`find_all_graphs_bfs` result).
     /// Used by the two-phase rtyper driver to annotate-all over exactly the
     /// set the drain visits — the upstream `task_annotate` entry-point

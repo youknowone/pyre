@@ -4573,6 +4573,10 @@ fn walker_ec_enter(
 /// of the callee level — normal return, raised exception, or a declined
 /// sub-walk — has to reach it, or `virtualref_boxes` is left unbalanced and the
 /// loop header trips `assert len(self.virtualref_boxes) == 0`.
+///
+/// `SwitchToBlackhole(ABORT_TOO_LONG)` is the exception. It leaves `_interpret`
+/// before `leave`, and the trace is discarded whole, so that path uses
+/// [`abandon_entered_frame`] and must not reach this function.
 pub(crate) fn walker_ec_leave(
     ctx: &mut TraceCtx,
     callee_frame: OpRef,
@@ -4671,6 +4675,58 @@ pub(crate) fn walker_ec_leave(
     }
     // `jit.virtual_ref_finish(frame_vref, frame)`.
     ctx.opimpl_virtual_ref_finish(callee_frame);
+}
+
+/// `SwitchToBlackhole` leaves `_interpret` without `ExecutionContext.leave`.
+/// Undo the concrete `topframeref` this enter installed and drop the
+/// tracing-only vref pair. Do not record `VIRTUAL_REF_FINISH` or
+/// `LEAVE_PORTAL_FRAME`: the trace is discarded whole.
+pub(crate) fn abandon_entered_frame(
+    ctx: &mut TraceCtx,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
+    concrete_ec: *mut pyre_interpreter::PyExecutionContext,
+) {
+    if concrete_frame.is_null() || concrete_ec.is_null() {
+        return;
+    }
+    unsafe {
+        let frame_vref = (*concrete_ec).topframeref;
+        let concrete_f_backref = (*concrete_frame).f_backref;
+        (*concrete_ec).topframeref = concrete_f_backref;
+        if (*concrete_frame).escaped() {
+            let f_back = (*concrete_frame).get_f_back();
+            if !f_back.is_null() {
+                (*f_back).mark_as_escaped();
+            }
+            let _ = pyre_interpreter::executioncontext::force_vref(frame_vref);
+        }
+    }
+    ctx.discard_innermost_virtualref_if_frame(concrete_frame as usize);
+}
+
+/// Concrete-unwind vref scopes this walk opened, without recording a leave.
+/// A scope whose pair does not name the frame it claims stops the loop so an
+/// outer scope is not popped.
+pub(crate) fn unwind_entered_scopes_above<Sym: WalkSym>(
+    ctx: &mut TraceCtx,
+    sym: &Sym,
+    entry_depth: usize,
+) {
+    let concrete_ec = sym.concrete_execution_context() as *mut pyre_interpreter::PyExecutionContext;
+    while ctx.virtualref_boxes_len() > entry_depth {
+        let Some((_, frame_ptr)) = ctx.innermost_virtualref_virtual() else {
+            break;
+        };
+        let before = ctx.virtualref_boxes_len();
+        abandon_entered_frame(
+            ctx,
+            frame_ptr as *mut pyre_interpreter::PyFrame,
+            concrete_ec,
+        );
+        if ctx.virtualref_boxes_len() == before {
+            break;
+        }
+    }
 }
 
 /// `executioncontext.py ExecutionContext.enter`'s frame-chain half, recorded
@@ -8783,6 +8839,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 immediate_inline_caller_py_pc: immediate_inline_caller_py_pc(ctx, op.pc),
                 instance_next_foriter_green_key,
                 instance_next_foriter_census_active: instance_next_seeded_route,
+                // Callee MIFrame. `_interpret` runs `blackhole_if_trace_too_long`
+                // after every one of its `run_one_step`s, so this walk must not
+                // inherit a helper's deferred limit check.
+                transparent_helper_subwalk: false,
+                transparent_helper_jitcode_index: None,
                 ..ctx.fbw_mode
             },
             session: ctx.session,
@@ -8985,6 +9046,29 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `can_inline_callable` never found, the same callee was re-inlined on
         // the next attempt, and the root took neither the disable nor
         // `prepare_trace_segmenting`'s permanent stamp.
+        // `_interpret` checks `blackhole_if_trace_too_long` after the
+        // `run_one_step` that `newframe`s, before the callee's first
+        // instruction. A zero-size just-opened frame does not win
+        // `find_biggest_function` (`size > max_size`).
+        if sub_wc.trace_ctx.is_too_long() {
+            let ops = sub_wc.trace_ctx.num_recorded_ops();
+            crate::state::note_root_trace_too_long(
+                sub_wc.trace_ctx.current_merge_points_first_green_key_pair(),
+                sub_wc.trace_ctx.resumekey_original_loop_token().cloned(),
+            );
+            sub_wc.session.borrow_mut().trace_too_long = true;
+            // `enter` already ran. `SwitchToBlackhole` never reaches `leave`,
+            // so restore the concrete chain without recording the finish.
+            if entered_ec.is_some() {
+                abandon_entered_frame(
+                    sub_wc.trace_ctx,
+                    ca_concrete_frame,
+                    pyre_interpreter::call::getexecutioncontext()
+                        as *mut pyre_interpreter::PyExecutionContext,
+                );
+            }
+            return Err(DispatchError::TraceTooLong { pc: op.pc, ops });
+        }
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
             (
                 callee_green_key.get_uhash(),
@@ -9012,6 +9096,19 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 crate::trace::InlineRegisterBankGuard::enter(sub_wc.registers_r);
             walk(body.code, 0, &mut sub_wc)
         };
+        // `blackhole_if_trace_too_long` raises out of `_interpret`. `popframe`
+        // and `ExecutionContext.leave` are after that point and must not run.
+        if let Err(error @ DispatchError::TraceTooLong { .. }) = result {
+            if entered_ec.is_some() {
+                abandon_entered_frame(
+                    sub_wc.trace_ctx,
+                    ca_concrete_frame,
+                    pyre_interpreter::call::getexecutioncontext()
+                        as *mut pyre_interpreter::PyExecutionContext,
+                );
+            }
+            return Err(error);
+        }
         if let Some(jd_no) = subwalk_jd_no {
             crate::state::note_inline_subwalk_end(jd_no, sub_wc.trace_ctx.get_trace_position());
         }
@@ -12275,6 +12372,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     );
     let inline_resume_pc = match inline {
         Ok(Some((DispatchOutcome::Continue, next))) => next,
+        Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
         outcome => {
             // The same odometer the `__next__` route reads: once the sub-walk
             // has executed a concrete effect, `cut_trace_with_snapshots`
@@ -12455,6 +12553,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     );
     let inline_resume_pc = match inline {
         Ok(Some((DispatchOutcome::Continue, next))) => next,
+        Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
         outcome => {
             // Rewinding the emission and falling through to the caller's
             // residual re-runs the whole `__next__`.  The sibling decline that
@@ -13697,6 +13796,7 @@ fn walk_generator_resume<Sym: WalkSym>(
 
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
+        Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
         Err(error) => {
             if fbw_debug_abort_enabled() {
                 eprintln!(
@@ -14325,6 +14425,10 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     // entries survive into the optimizer, which remaps every published
     // snapshot and resolves the stale `OpRef` against a position the cut has
     // since handed to another operation.
+    let descent = match descent {
+        Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
+        other => other,
+    };
     let refused_a_commit = rewind_guard.as_ref().is_some_and(|g| g.refused());
     drop(rewind_guard);
     if refused_a_commit {
@@ -14600,6 +14704,10 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     // entries survive into the optimizer, which remaps every published
     // snapshot and resolves the stale `OpRef` against a position the cut has
     // since handed to another operation.
+    let descent = match descent {
+        Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
+        other => other,
+    };
     let refused_a_commit = rewind_guard.as_ref().is_some_and(|g| g.refused());
     drop(rewind_guard);
     if refused_a_commit {
@@ -15829,6 +15937,19 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
             self.exchange.completed_cursor = 0;
             let driven = frame.drive(trace_ctx);
             match driven {
+                // `SwitchToBlackhole` unwinds `_interpret`. Replaying the
+                // parent CALL would record another step after the raise.
+                Err(error @ DispatchError::TraceTooLong { .. }) => {
+                    // `frame` is `&mut` into `self.frames`. Moving the
+                    // reference ends that borrow so the stack can be popped.
+                    // `drop` on a reference does not.
+                    let _ = frame;
+                    self.exchange.completed.clear();
+                    while !self.frames.is_empty() {
+                        let _ = self.pop_frame();
+                    }
+                    return Err(error);
+                }
                 Err(DispatchError::SubWalkSuspended { pc }) => {
                     assert_eq!(
                         fbw_executed_effect_count(),

@@ -3878,8 +3878,10 @@ pub(crate) fn note_root_trace_too_long(
 /// [`note_root_trace_too_long`] does.
 ///
 /// Returns the owning driver when this is a recursive portal activation.
-/// The caller pairs every such decision with [`note_inline_subwalk_end`],
-/// including an abort that retires the log before the close.
+/// A normal exit pairs with [`note_inline_subwalk_end`]. `TraceTooLong` does
+/// not: `popframe` would record `LEAVE_PORTAL_FRAME` after
+/// `SwitchToBlackhole`, and the next trace's `initialize_state_from_start`
+/// clears the framestack.
 pub(crate) fn note_inline_subwalk_start(
     green_key: majit_metainterp::PortalGreenKey,
     _pos: majit_metainterp::recorder::TracePosition,

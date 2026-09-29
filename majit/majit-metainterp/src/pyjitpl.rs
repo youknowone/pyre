@@ -6087,6 +6087,9 @@ impl<M: Clone> MetaInterp<M> {
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
+        // Kept aside: the arm below rebinds `green_key` to the cell's minted
+        // identity, which does not bucket to `make_green_key(green_key_raw)`.
+        let entry_hash = green_key;
 
         // Force-start via the typed greenkey when the raw (code, pc) is
         // present so the function-entry cell carries a `comparekey`;
@@ -6160,10 +6163,17 @@ impl<M: Clone> MetaInterp<M> {
                 ctx.attach_live_byte_recorder();
                 // pyjitpl.py `_compile_and_run_once` — see `setup_tracing`.
                 ctx.seed_compile_and_run_once_merge_point();
-                // warmstate.py:439 `force_finish_trace=bool(cell.flags &
-                // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky
-                // upstream (no clear in rpython/jit/metainterp/).
-                self.force_finish_trace = self.warm_state.should_force_finish_tracing(green_key);
+                // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
+                // & JC_FORCE_FINISH)` on the cell `maybe_compile_and_run` already
+                // matched. The typed door is that cell; the hash read misses it
+                // when the bucket has two owners.
+                self.force_finish_trace = {
+                    let hashed = self.warm_state.should_force_finish_tracing(green_key);
+                    let typed = Self::with_typed_decision_key(entry_hash, green_key_raw, |key| {
+                        self.warm_state.should_force_finish_tracing_for_key(key)
+                    });
+                    typed.unwrap_or(false) || hashed
+                };
                 ctx.set_force_finish(self.force_finish_trace);
                 // pyjitpl.py _opimpl_getfield_gc_any_pureornot `self.metainterp.cpu` analog —
                 // see `setup_tracing` for the contract on raw-pointer
@@ -6509,6 +6519,18 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
 
+        // warmstate.py `bound_reached` reads `JC_FORCE_FINISH` off the cell
+        // `maybe_compile_and_run` matched. Do it before `green_key_values`
+        // moves into the trace. The typed cell is the one
+        // `mark_force_finish_tracing_for_key` wrote; the hash read is the
+        // fallback when this entry has no greens.
+        let force_finish = match green_key_values.as_ref() {
+            Some(key) => {
+                self.warm_state.should_force_finish_tracing_for_key(key)
+                    || self.warm_state.should_force_finish_tracing(green_key)
+            }
+            None => self.warm_state.should_force_finish_tracing(green_key),
+        };
         let mut ctx = if let Some(values) = green_key_values {
             TraceCtx::with_green_key(recorder, green_key, values, self.staticdata.clone())
         } else {
@@ -6548,9 +6570,8 @@ impl<M: Clone> MetaInterp<M> {
         // `start_retrace_from_guard` and stay empty.
         ctx.seed_compile_and_run_once_merge_point();
 
-        // warmstate.py:439 `force_finish_trace=bool(cell.flags &
-        // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky upstream.
-        self.force_finish_trace = self.warm_state.should_force_finish_tracing(green_key);
+        // Computed above, before `green_key_values` moved.
+        self.force_finish_trace = force_finish;
         // pyjitpl.py:2411: propagate force_finish_trace to TraceCtx
         // so the proc-macro merge_fn closure can read it.
         ctx.set_force_finish(self.force_finish_trace);
@@ -17395,6 +17416,7 @@ impl<M: Clone> MetaInterp<M> {
         let _ = exception;
     }
 
+    #[allow(dead_code)]
     fn framestack_has_immediate_catch(&self) -> bool {
         let Some(frame) = self.framestack.frames.last() else {
             return false;
@@ -18706,10 +18728,10 @@ impl<M: Clone> MetaInterp<M> {
         let mut max_key = None;
         for (jd_no, key, pos) in positions.iter().cloned() {
             match key {
-                // pyjitpl.py:3547-3548 `if key is not None: start_stack.append`.
+                // pyjitpl.py `find_biggest_function`: `if key is not None`.
                 Some(key) => start_stack.push((jd_no, key, pos._pos)),
-                // pyjitpl.py `MetaInterp.find_biggest_function`: an unmatched
-                // close is an invalid frame stack, not an empty candidate.
+                // An unmatched close is an invalid frame stack, not an empty
+                // candidate.
                 None => {
                     let (start_jd_no, green_key, start_pos) = start_stack
                         .pop()
@@ -18722,8 +18744,9 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        // pyjitpl.py `MetaInterp.find_biggest_function` measures the outermost
-        // open frame against the live history unconditionally.
+        // pyjitpl.py `find_biggest_function` measures the outermost open
+        // frame against the live history. A frame opened by `newframe` and
+        // not yet stepped has size 0 and does not win (`size > max_size`).
         if let Some((jd_no, green_key, start_pos)) = start_stack.first().cloned() {
             let tracing = self
                 .tracing
@@ -23333,16 +23356,14 @@ mod metainterp_static_data_tests {
             .warm_state
             .cell_key_for(&typed)
             .expect("the typed force-start installed a cell for this key");
-        assert_ne!(
+        assert_eq!(
             marked, green_key,
-            "precondition: the raw hash was already claimed, so the new cell \
-             must have been minted a different key",
+            "one green key is one cell, named by get_uhash",
         );
         assert_eq!(
             meta.starting_green_key(),
             Some(marked),
-            "the trace must be keyed on the cell force_start_tracing marked, \
-             not on the bucket hash an earlier cell already claimed",
+            "the trace is keyed on the cell force_start_tracing marked"
         );
     }
 
@@ -30391,10 +30412,8 @@ mod tests {
         );
         assert_eq!(key.get_uhash(), bucket);
 
-        // A hash-only writer occupies the raw bucket first, forcing the typed
-        // cell to receive a minted identity. The tracing session must carry
-        // that identity; otherwise its finally-clear and compiled token attach
-        // are redirected to the comparator-less head.
+        // The hash-only writer and the typed key are one cell. The trace
+        // carries that cell's key.
         meta.warm_state.disable_noninlinable_function(bucket);
         assert!(matches!(
             meta.force_start_tracing(bucket, (code, pc), None, &[Value::Int(0)]),
@@ -30405,7 +30424,10 @@ mod tests {
             .warm_state
             .cell_key_for(&key)
             .expect("force-start installed the typed cell");
-        assert_ne!(typed_cell_key, bucket, "typed cell must be minted");
+        assert_eq!(
+            typed_cell_key, bucket,
+            "one green key is named by get_uhash"
+        );
         assert_eq!(
             meta.starting_green_key(),
             Some(typed_cell_key),
@@ -30834,8 +30856,8 @@ mod tests {
         let extra = 7200i64;
         let parked = majit_ir::GreenKey::new(vec![pc, extra]);
         let hash = parked.get_uhash();
-        // A comparekey-less cell already owns `hash`, so the typed install
-        // is minted a different cell key (`attach_procedure_to_interp`).
+        // The hash-only attach and the typed key are one cell, named by
+        // `get_uhash`. `compile_retrace` stores that resolved key.
         let squatter = std::sync::Arc::new(JitCellToken::new(meta.warm_state.alloc_token_number()));
         squatter.set_compiled(Box::new(()));
         meta.warm_state
@@ -30843,7 +30865,7 @@ mod tests {
         meta.warm_state
             .attach_procedure_to_interp_for_key(&parked, squatter);
         let minted = meta.warm_state.cell_key_for(&parked).expect("typed cell");
-        assert_ne!(minted, hash, "fixture: chained install mints a cell key");
+        assert_eq!(minted, hash, "one green key is named by get_uhash");
 
         for _ in 0..2 {
             meta.on_back_edge(1, &[0]);
@@ -30882,7 +30904,7 @@ mod tests {
             .unwrap()
             .green_key;
         assert_eq!(stored, minted);
-        assert_ne!(stored, hash);
+        assert_eq!(stored, hash);
     }
 
     #[test]

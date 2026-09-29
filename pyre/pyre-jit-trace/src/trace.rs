@@ -1910,18 +1910,25 @@ fn discard_bridge_carrier_walk<Sym: WalkSym>(
     entry_depth: usize,
     pre_pos: majit_metainterp::recorder::TracePosition,
     pre_virtualref_boxes: &[(majit_ir::OpRef, usize)],
+    close_scopes: bool,
 ) {
     // `pyframe.py execute_frame` closes exactly the frame entered by
     // that invocation in its `finally: executioncontext.leave(...)`.  Close
     // only scopes this carrier walk opened, while their recorder positions
     // are still live.  If the walk already closed a parent scope, preserve
     // only the snapshot prefix that still survives instead of reopening it.
+    // `close_scopes` is false once `SwitchToBlackhole` has already left
+    // `_interpret`: recording `virtual_ref_finish` after that raise is the
+    // band-aid the abort is not allowed to do. The caller concrete-unwinds
+    // when the blackhole adopt did not run.
     let restore_depth = ctx.virtualref_boxes_len().min(entry_depth);
-    while ctx.virtualref_boxes_len() > entry_depth {
-        let before = ctx.virtualref_boxes_len();
-        crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, false);
-        if ctx.virtualref_boxes_len() == before {
-            break;
+    if close_scopes {
+        while ctx.virtualref_boxes_len() > entry_depth {
+            let before = ctx.virtualref_boxes_len();
+            crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, false);
+            if ctx.virtualref_boxes_len() == before {
+                break;
+            }
         }
     }
     ctx.cut_trace(pre_pos);
@@ -2042,7 +2049,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     if !recursive_carrier
         && carrier_py_frame_depth(carrier) > crate::jitcode_dispatch::fbw_max_multiframe_depth()
     {
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
         crate::jitcode_dispatch::census_record("P2Drain::OverMultiframeDepth");
         return p2_drain_abort();
     }
@@ -2053,7 +2060,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // p2_local_result_bridge.py (loops_aborted 6 -> 505), so keep only
         // this measured P2 class permanently declined.
         fbw_bridge_decline(ctx);
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
         return p2_drain_abort();
     };
 
@@ -2070,12 +2077,12 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         root_ec_box,
         Vec::new(),
     ) else {
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
         crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
         return p2_drain_abort();
     };
     let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleePjc");
         return p2_drain_abort();
     };
@@ -2085,13 +2092,13 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         recipe.jitcode_pc,
     );
     let Some(entry) = entry else {
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
         return p2_drain_abort();
     };
     let raw_callee_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
     if raw_callee_code.is_null() {
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeCode");
         return p2_drain_abort();
     }
@@ -2132,7 +2139,14 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // admitting it would drive a frame this arm never read.
         let Some(seed) = seed else {
             fbw_bridge_decline(ctx);
-            discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+            discard_bridge_carrier_walk(
+                ctx,
+                sym,
+                entry_depth,
+                pre_pos,
+                &pre_virtualref_boxes,
+                true,
+            );
             crate::jitcode_dispatch::census_record("P2Drain::RecipeNotProjectable");
             return p2_drain_abort();
         };
@@ -2151,7 +2165,14 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             // class costs, and narrowing which carriers reach here does not
             // change what happens to the ones that do.
             fbw_bridge_decline(ctx);
-            discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+            discard_bridge_carrier_walk(
+                ctx,
+                sym,
+                entry_depth,
+                pre_pos,
+                &pre_virtualref_boxes,
+                true,
+            );
             crate::jitcode_dispatch::census_record("P2Drain::LoopBearingCallee");
             return p2_drain_abort();
         }
@@ -2211,7 +2232,18 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             _
         )))
     );
-    crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, deepest_got_exception);
+    // `SwitchToBlackhole` already left `_interpret`. Recording this leave
+    // would be another step after the raise.
+    let deepest_too_long = session.borrow().trace_too_long
+        || matches!(
+            walk,
+            Some(Err(
+                crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
+            ))
+        );
+    if !deepest_too_long {
+        crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, deepest_got_exception);
+    }
     // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
     // into the root's operand-stack result slot and walk the ROOT top-level to
     // compile the bridge (the recorded callee continuation + the root
@@ -2397,7 +2429,28 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             crate::jitcode_dispatch::fbw_executed_effect_count() - effects_at_entry,
         );
     }
-    discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+    // Re-read: a middle walked after the deepest return can be the frame
+    // that crossed `trace_limit`. Its raise must not record another leave,
+    // and a failed adopt replays from the guard, so the concrete chain this
+    // walk entered has to be back where `enter` found it.
+    let trace_too_long = session.borrow().trace_too_long
+        || matches!(
+            walk,
+            Some(Err(
+                crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
+            ))
+        );
+    if trace_too_long && !adopted {
+        crate::jitcode_dispatch::unwind_entered_scopes_above(ctx, sym, entry_depth);
+    }
+    discard_bridge_carrier_walk(
+        ctx,
+        sym,
+        entry_depth,
+        pre_pos,
+        &pre_virtualref_boxes,
+        !trace_too_long,
+    );
     if adopted {
         // `try_adopt_blackhole` mirrors `convert_and_run_from_pyjitpl` and can
         // finish the root frame with `DoneWithThisFrame*`; it records that
@@ -2777,7 +2830,14 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
             _
         )))
     );
-    crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, got_exception);
+    if !matches!(
+        middle_walk,
+        Some(Err(
+            crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
+        ))
+    ) {
+        crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, got_exception);
+    }
     match middle_walk {
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {
@@ -2992,7 +3052,14 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
             _
         )))
     );
-    crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, got_exception);
+    if !matches!(
+        middle_walk,
+        Some(Err(
+            crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
+        ))
+    ) {
+        crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, got_exception);
+    }
     match middle_walk {
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {

@@ -10185,11 +10185,23 @@ fn unpackiterable_portal_runner(
 /// Re-looping `eval_loop_jit(frame)` is the direct `portal_ptr(*args)` body
 /// call; it does not call `maybe_compile_and_run` again
 /// (`warmspot.py ll_portal_runner` owns that activation-entry step).
-#[inline(always)]
+///
+/// The stash check lives in [`promote_stashed_call_error`] so this graph's
+/// return is a tail forward of that call. An `Err` shell whose forward
+/// crosses `take_call_error` is declined by `lower_result_exc_returns`, and
+/// then `find_all_graphs` never sees the `eval_loop_jit` direct call.
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     let mut frame_root = FrameRoot::new(frame);
-    let result = eval_loop_jit(frame_root.frame());
-    // Helpers with a raw-pointer ABI publish their exception in this stash.
+    promote_stashed_call_error(eval_loop_jit(frame_root.frame()))
+}
+
+/// Publish a raw-pointer helper's stashed exception after `portal_ptr` returns.
+///
+/// `#[inline(never)]` keeps the `take_call_error` call out of
+/// [`handle_jitexception`]'s MIR. The codewriter still follows this function
+/// when its graph lowers; a declined graph stays a residual call.
+#[inline(never)]
+fn promote_stashed_call_error(result: PyResult) -> PyResult {
     if let Some(err) = pyre_interpreter::call::take_call_error() {
         return Err(err);
     }
@@ -11032,49 +11044,6 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     true
 }
 
-thread_local! {
-    /// Green keys whose cell `WarmEnterState::maybe_compile_decision` refuses
-    /// at the abort ceiling, against the `cell_generation` the refusal was
-    /// observed at.
-    ///
-    /// A loop that keeps declining can never trace, so its cell latches and
-    /// every later back edge re-derives the same refusal. Measured against the
-    /// profiled decline this cache was written for — since retired, a profiled
-    /// loop now records its own reporting and compiles — `abort_ceiling_refused`
-    /// tracked the iteration count one-for-one (194776 at 200k iterations,
-    /// 794776 at 800k), while a loop with no call in its body read exactly 0.
-    /// Any remaining latching decline re-derives the same way. The
-    /// re-derivation costs a green-key mint, three per-code gate lookups and a
-    /// bucket-chain walk per iteration.  Graded as the same tree built twice —
-    /// the only valid control, since `PYRE_JIT=0` is read by
-    /// `eval_with_jit_inner` and routes the frame to `execute_frame_plain`, a
-    /// different eval loop, rather than isolating this door — the profiled arm
-    /// runs 2.3% faster with the cache, faster in 5 of 5 rounds, and
-    /// `abort_ceiling_refused` falls from 194776 to 1.
-    ///
-    /// Caching it is behaviour-preserving: the refusal bumps a diagnostic slot
-    /// and returns `NotHot` above `decay_all_counters`, which
-    /// `maybe_compile_decision` documents as deliberate, so a latched cell
-    /// already contributes no decay. The generation is what keeps the cache
-    /// honest — `WarmEnterState` moves it whenever a cell is installed or a
-    /// procedure token attached, the two mutations that can make a refused key
-    /// runnable again.
-    static CEILING_LATCHED: std::cell::RefCell<std::collections::HashMap<u64, u64>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// Whether `green_key` was already refused at the abort ceiling, and nothing
-/// has happened since that could change the answer.
-fn ceiling_latch_is_current(green_key: u64, generation: u64) -> bool {
-    CEILING_LATCHED.with(|latched| latched.borrow().get(&green_key) == Some(&generation))
-}
-
-fn record_ceiling_latch(green_key: u64, generation: u64) {
-    CEILING_LATCHED.with(|latched| {
-        latched.borrow_mut().insert(green_key, generation);
-    });
-}
-
 /// RPython warmstate.py maybe_compile_and_run.
 ///
 /// Entry point to the JIT. Called at can_enter_jit (back-edge).
@@ -11102,14 +11071,6 @@ fn maybe_compile_and_run(
         return None;
     }
 
-    // The gates below and the decision at the end answer `None` for a green
-    // key whose cell has latched at the abort ceiling, and go on answering it
-    // for every back edge of a loop that can no longer trace. Take the cached
-    // answer instead; `CEILING_LATCHED` documents why that is the same answer.
-    let cell_generation = driver.meta_interp_mut().warm_state_mut().cell_generation();
-    if ceiling_latch_is_current(green_key, cell_generation) {
-        return None;
-    }
     // Not every back-edge reaching this helper passed `eval_with_jit_inner`'s
     // classification: `portal_runner_dispatch` enters `eval_loop_jit` for a
     // frame forced through the portal, and that route exists precisely for a
@@ -11212,16 +11173,7 @@ fn maybe_compile_and_run(
         (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
             execute_assembler(frame, compiled_key, loop_header_pc, driver, info, env)
         }
-        (majit_metainterp::warmstate::HotResult::NotHot, _) => {
-            if driver
-                .meta_interp_mut()
-                .warm_state_mut()
-                .is_ceiling_latched(green_key)
-            {
-                record_ceiling_latch(green_key, cell_generation);
-            }
-            None
-        }
+        (majit_metainterp::warmstate::HotResult::NotHot, _) => None,
         (majit_metainterp::warmstate::HotResult::AlreadyTracing, _) => None,
     }
 }

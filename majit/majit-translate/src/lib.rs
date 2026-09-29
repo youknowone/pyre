@@ -2746,6 +2746,21 @@ fn register_configured_jitdrivers(
             spec.portal.clone(),
         );
         call_control.set_jitdriver_portal_runner(index, spec.portal_runner.clone());
+        // `warmspot.py rewrite_jit_merge_point` runs on `_jit_merge_point_in`,
+        // the graph callers still name, after `split_graph_and_record_jitdriver`
+        // has copied the loop into `portal_graph`. The copy keeps the marker.
+        if spec.split_portal
+            && let Some(runner) = spec.portal_runner.clone()
+            && let Some(original) = call_control.function_graphs_mut().get_mut(&spec.portal)
+        {
+            crate::codewriter::support::rewrite_jit_merge_point(
+                original,
+                &runner,
+                spec.greens.len(),
+                spec.reds.len(),
+                driver_roots,
+            );
+        }
     }
 }
 
@@ -3337,6 +3352,38 @@ mod portal_driver_tests {
             &config.transform.jitdriver_receiver_roots,
         );
         let split_portal = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
+        let original_graph = call_control
+            .function_graphs()
+            .get(&portal)
+            .expect("original portal graph remains registered");
+        let calls_runner = original_graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.as_slice() == ["fixture", "portal_runner"],
+                _ => false,
+            })
+        });
+        assert!(
+            calls_runner,
+            "rewrite_jit_merge_point must leave a direct call to portal_runner"
+        );
+        assert!(
+            !original_graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target, .. }
+                            if crate::codewriter::jtransform::jit_marker_key_from_target(
+                                target,
+                                &config.transform.jitdriver_receiver_roots,
+                            ) == Some(crate::codewriter::jtransform::JitMarkerKey::JitMergePoint)
+                    )
+                })
+            }),
+            "original portal must not keep jit_merge_point after the rewrite"
+        );
         assert_eq!(call_control.jitdrivers_sd()[0].portal_graph, split_portal);
         assert_eq!(
             call_control.jitdrivers_sd()[0].portal_runner,

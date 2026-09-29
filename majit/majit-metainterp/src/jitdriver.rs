@@ -895,7 +895,7 @@ use crate::pyjitpl::{
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::virtualizable::VirtualizableInfo;
-use crate::warmstate::{FunctionEntryStep, HotResult, JcFlags, MAX_TRACE_ABORT_COUNT};
+use crate::warmstate::{FunctionEntryStep, HotResult, JcFlags};
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
@@ -6503,18 +6503,10 @@ impl<S: JitState> JitDriver<S> {
                 if cell.is_tracing() {
                     return Some(None);
                 }
-                // Dead-token cleanup (`maybe_compile_and_run`) lives on the
-                // occupied door, including a latched cell that is also dead.
+                // Dead-token and other tokenless cells take `cleanup_chain`
+                // on the occupied door (`maybe_compile_and_run`).
                 if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
                     return None;
-                }
-                // Same bump `maybe_compile_decision` makes at this refusal
-                // (`abort_ceiling_refused`). A latched cell never reaches
-                // `commit_start_tracing`, so slot 61 does not move; slot 81 is
-                // the one that counts the refusal itself.
-                if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
-                    crate::mc_diag_bump(81); // abort_ceiling_refused
-                    return Some(None);
                 }
                 if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
                     // `should_start_dont_trace_here_trace`: never traced
@@ -8031,10 +8023,6 @@ impl<S: JitState> JitDriver<S> {
                 }
                 if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
                     return BackEdgeWarmth::Full;
-                }
-                if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
-                    crate::mc_diag_bump(81); // abort_ceiling_refused
-                    return BackEdgeWarmth::Interpret;
                 }
                 if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
                     return BackEdgeWarmth::Full;
@@ -9849,10 +9837,6 @@ impl<S: JitState> JitDriver<S> {
                 if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
                     return None;
                 }
-                if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
-                    crate::mc_diag_bump(81); // abort_ceiling_refused
-                    return Some(None);
-                }
                 if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
                     // Immediate-Proceed (never traced) vs tick-normally
                     // (TRACING_OCCURRED) stay on the occupied door.
@@ -11608,7 +11592,7 @@ mod tests {
         for _ in 1..MAX_TRACE_ABORT_COUNT {
             driver.meta.warm_state_mut().abort_tracing(key, false);
         }
-        assert!(driver.meta.warm_state.is_ceiling_latched(key));
+        assert!(!driver.meta.warm_state.is_dont_trace_here(key));
 
         let mut state = CountingDoorState::default();
         assert!(
@@ -11642,22 +11626,25 @@ mod tests {
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             driver.meta.warm_state_mut().abort_tracing(green_key, false);
         }
-        // The typed route cannot match that comparator-less cell, so it owns
-        // a fresh sibling in the same bucket.
+        // The typed route is the same JitCell (`make_jitcell_subclass`):
+        // it stores the greens on the cell the hash door filed.
         driver.meta.warm_state_mut().ensure_cell_for_key(&key);
         assert_eq!(
             driver.meta.warm_state.get_stats().num_cells,
-            2,
-            "fixture must contain the hash-only cell and its typed sibling",
+            1,
+            "one green key, one cell",
         );
-        assert!(driver.meta.warm_state.is_ceiling_latched(green_key));
+        assert!(driver.meta.warm_state.is_dont_trace_here(green_key));
+        let typed = driver
+            .meta
+            .warm_state
+            .lookup_chain_with_key(&key)
+            .expect("the key's cell");
         assert!(
-            driver.meta.warm_state.lookup_chain_with_key(&key).is_some(),
-            "the typed decision must resolve its own cell in the chain",
-        );
-        assert!(
-            !driver.meta.warm_state.is_ceiling_latched_for_key(&key),
-            "the typed sibling must not inherit the raw cell's ceiling latch",
+            typed
+                .flags
+                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
+            "dont-trace lives on the one cell this green key owns",
         );
 
         let mut state = CountingDoorState {
@@ -11668,10 +11655,6 @@ mod tests {
             driver
                 .back_edge_or_run_compiled_keyed(green_key, target_pc, &mut state, &(), || {},)
                 .is_none()
-        );
-        assert!(
-            driver.is_tracing(),
-            "the early ceiling check and typed decision must select the same cell",
         );
     }
 
@@ -13582,9 +13565,8 @@ mod tests {
         let key = GreenKey::new(vec![1500, 1600]);
         let hash = key.get_uhash();
 
-        // A hash-only writer squats the bucket with a comparator-less cell and
-        // gives it a code-bearing token; then a typed writer for the SAME key
-        // chains its own, token-less cell behind it.
+        // A hash-only writer files the cell and gives it a code-bearing token.
+        // The typed writer for the SAME key stamps that cell (`JitCell.__init__`).
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
             driver.meta.warm_state_mut().alloc_token_number(),
         ));
@@ -13603,19 +13585,16 @@ mod tests {
         driver.meta.warm_state_mut().mark_dont_trace_for_key(&key);
 
         assert!(
-            driver.meta.green_key_bucket_is_chained(hash),
-            "fixture: two cells in one bucket is the only case in which the \
-             two forms can disagree",
+            !driver.meta.green_key_bucket_is_chained(hash),
+            "one green key is one cell",
         );
         assert!(
             driver.has_compiled_loop(hash),
-            "fixture: the head cell holds the code-bearing token, so a \
-             head-reading predicate says this key has compiled code",
+            "the cell holds the code-bearing token",
         );
         assert!(
-            !driver.has_compiled_loop_for_key(&key),
-            "but the cell this key owns holds no token at all, so the answer \
-             upstream would give is no",
+            driver.has_compiled_loop_for_key(&key),
+            "the typed predicate reads that same cell",
         );
     }
 
