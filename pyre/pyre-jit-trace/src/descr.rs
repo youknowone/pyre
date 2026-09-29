@@ -6756,18 +6756,12 @@ mod tests {
             W_ENUMERATE_USER_DESCR_GROUP.field_descrs[0].index(),
             0x6100_00B0
         );
-        assert_eq!(
-            W_MAP_USER_DESCR_GROUP.field_descrs[0].index(),
-            0x6100_00C0
-        );
+        assert_eq!(W_MAP_USER_DESCR_GROUP.field_descrs[0].index(), 0x6100_00C0);
         assert_eq!(
             W_FILTER_USER_DESCR_GROUP.field_descrs[0].index(),
             0x6100_00D0
         );
-        assert_eq!(
-            W_ZIP_USER_DESCR_GROUP.field_descrs[0].index(),
-            0x6100_00E0
-        );
+        assert_eq!(W_ZIP_USER_DESCR_GROUP.field_descrs[0].index(), 0x6100_00E0);
         assert_eq!(
             W_REVERSED_USER_DESCR_GROUP.field_descrs[0].index(),
             0x6100_00F0
