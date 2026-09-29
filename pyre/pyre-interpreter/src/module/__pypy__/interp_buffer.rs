@@ -220,7 +220,7 @@ fn dimensions(obj: PyObjectRef) -> Result<Vec<i64>, PyError> {
 pub mod bufferable_impl {
     use super::*;
 
-    #[crate::pyre_class("__pypy__.Bufferable")]
+    #[crate::pyre_class("__pypy__.Bufferable", user_layout)]
     #[derive(Default)]
     pub struct W_Bufferable {}
 
@@ -233,14 +233,17 @@ pub mod bufferable_impl {
             let _ = args;
             let base = type_object();
             crate::typedef::check_user_subclass(base, cls)?;
-            let obj = W_Bufferable::allocate_stable(W_Bufferable {
-                ob: pyre_object::PyObject {
-                    ob_type: std::ptr::null(),
-                    w_class: std::ptr::null_mut(),
+            // `objspace.py` `allocate_instance`: exact `Bufferable` stays the
+            // base layout; a subtype is `typedef.py` `_getusercls`.
+            Ok(W_Bufferable::allocate_instance(
+                W_Bufferable {
+                    ob: pyre_object::PyObject {
+                        ob_type: std::ptr::null(),
+                        w_class: std::ptr::null_mut(),
+                    },
                 },
-            });
-            crate::typedef::tag_subclass_instance(obj, cls);
-            Ok(obj)
+                cls,
+            ))
         }
 
         /// PyPy `W_Bufferable.descr_buffer`: subclasses provide the actual

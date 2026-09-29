@@ -4790,6 +4790,282 @@ static W_PROPERTY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
     )
 });
 
+static W_COUNT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_CountUser>(),
+        pyre_object::interp_itertools::W_COUNT_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::COUNT_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CountUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CountUser, storage),
+        "W_CountUser",
+        "interp_itertools::W_CountUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x120,
+    )
+});
+
+static W_REPEAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_RepeatUser>(),
+        pyre_object::interp_itertools::W_REPEAT_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::REPEAT_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_RepeatUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_RepeatUser, storage),
+        "W_RepeatUser",
+        "interp_itertools::W_RepeatUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x130,
+    )
+});
+
+static W_TAKEWHILE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_TakeWhileUser>(),
+        pyre_object::interp_itertools::W_TAKEWHILE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::TAKEWHILE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_TakeWhileUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_TakeWhileUser, storage),
+        "W_TakeWhileUser",
+        "interp_itertools::W_TakeWhileUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x140,
+    )
+});
+
+static W_DROPWHILE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_DropWhileUser>(),
+        pyre_object::interp_itertools::W_DROPWHILE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::DROPWHILE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_DropWhileUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_DropWhileUser, storage),
+        "W_DropWhileUser",
+        "interp_itertools::W_DropWhileUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x150,
+    )
+});
+
+static W_FILTERFALSE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_FilterFalseUser>(),
+        pyre_object::interp_itertools::W_FILTERFALSE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::FILTERFALSE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_FilterFalseUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_FilterFalseUser, storage),
+        "W_FilterFalseUser",
+        "interp_itertools::W_FilterFalseUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x160,
+    )
+});
+
+static W_ISLICE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_ISliceUser>(),
+        pyre_object::interp_itertools::W_ISLICE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::ISLICE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ISliceUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ISliceUser, storage),
+        "W_ISliceUser",
+        "interp_itertools::W_ISliceUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x170,
+    )
+});
+
+static W_BATCHED_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_BatchedUser>(),
+        pyre_object::interp_itertools::W_BATCHED_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::BATCHED_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_BatchedUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_BatchedUser, storage),
+        "W_BatchedUser",
+        "interp_itertools::W_BatchedUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x180,
+    )
+});
+
+static W_PRODUCT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_ProductUser>(),
+        pyre_object::interp_itertools::W_PRODUCT_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::PRODUCT_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ProductUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ProductUser, storage),
+        "W_ProductUser",
+        "interp_itertools::W_ProductUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x190,
+    )
+});
+
+static W_COMBINATIONS_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_CombinationsUser>(),
+        pyre_object::interp_itertools::W_COMBINATIONS_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::COMBINATIONS_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CombinationsUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CombinationsUser, storage),
+        "W_CombinationsUser",
+        "interp_itertools::W_CombinationsUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1A0,
+    )
+});
+
+static W_COMBINATIONS_WITH_REPLACEMENT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> =
+    LazyLock::new(|| {
+        build_native_user_mapdict_group(
+            std::mem::size_of::<pyre_object::interp_itertools::W_CombinationsWithReplacementUser>(),
+            pyre_object::interp_itertools::W_COMBINATIONS_WITH_REPLACEMENT_USER_GC_TYPE_ID_CELL
+                .get(),
+            &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_USER_TYPE as *const _
+                as usize,
+            std::mem::offset_of!(
+                pyre_object::interp_itertools::W_CombinationsWithReplacementUser,
+                map
+            ),
+            std::mem::offset_of!(
+                pyre_object::interp_itertools::W_CombinationsWithReplacementUser,
+                storage
+            ),
+            "W_CombinationsWithReplacementUser",
+            "interp_itertools::W_CombinationsWithReplacementUser",
+            NATIVE_MAPDICT_DESCR_TAG | 0x1B0,
+        )
+    });
+
+static W_PERMUTATIONS_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_PermutationsUser>(),
+        pyre_object::interp_itertools::W_PERMUTATIONS_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::PERMUTATIONS_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_PermutationsUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_PermutationsUser, storage),
+        "W_PermutationsUser",
+        "interp_itertools::W_PermutationsUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1C0,
+    )
+});
+
+static W_GROUPBY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_GroupByUser>(),
+        pyre_object::interp_itertools::W_GROUPBY_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::GROUPBY_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_GroupByUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_GroupByUser, storage),
+        "W_GroupByUser",
+        "interp_itertools::W_GroupByUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1D0,
+    )
+});
+
+static W_COMPRESS_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_CompressUser>(),
+        pyre_object::interp_itertools::W_COMPRESS_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::COMPRESS_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CompressUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CompressUser, storage),
+        "W_CompressUser",
+        "interp_itertools::W_CompressUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1E0,
+    )
+});
+
+static W_STARMAP_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_StarMapUser>(),
+        pyre_object::interp_itertools::W_STARMAP_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::STARMAP_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_StarMapUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_StarMapUser, storage),
+        "W_StarMapUser",
+        "interp_itertools::W_StarMapUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1F0,
+    )
+});
+
+static W_ACCUMULATE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_AccumulateUser>(),
+        pyre_object::interp_itertools::W_ACCUMULATE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::ACCUMULATE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_AccumulateUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_AccumulateUser, storage),
+        "W_AccumulateUser",
+        "interp_itertools::W_AccumulateUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x200,
+    )
+});
+
+static W_ZIP_LONGEST_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_ZipLongestUser>(),
+        pyre_object::interp_itertools::W_ZIP_LONGEST_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::ZIP_LONGEST_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ZipLongestUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ZipLongestUser, storage),
+        "W_ZipLongestUser",
+        "interp_itertools::W_ZipLongestUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x210,
+    )
+});
+
+static W_PAIRWISE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_PairwiseUser>(),
+        pyre_object::interp_itertools::W_PAIRWISE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::PAIRWISE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_PairwiseUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_PairwiseUser, storage),
+        "W_PairwiseUser",
+        "interp_itertools::W_PairwiseUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x220,
+    )
+});
+
+static W_CYCLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_CycleUser>(),
+        pyre_object::interp_itertools::W_CYCLE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::CYCLE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CycleUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CycleUser, storage),
+        "W_CycleUser",
+        "interp_itertools::W_CycleUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x230,
+    )
+});
+
+static W_CHAIN_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_ChainUser>(),
+        pyre_object::interp_itertools::W_CHAIN_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::CHAIN_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ChainUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ChainUser, storage),
+        "W_ChainUser",
+        "interp_itertools::W_ChainUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x240,
+    )
+});
+
+static W_BUFFERABLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser>(),
+        pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BUFFERABLE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::BUFFERABLE_USER_TYPE
+            as *const _ as usize,
+        std::mem::offset_of!(
+            pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser,
+            map
+        ),
+        std::mem::offset_of!(
+            pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser,
+            storage
+        ),
+        "W_BufferableUser",
+        "module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x250,
+    )
+});
+
 /// `W_ObjectObject.map` (`objectobject.rs`) — the instance shape word,
 /// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). Read as an
 /// `Int` word so the LOAD_ATTR fast path can `guard_value` it to a constant map
@@ -4858,6 +5134,51 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_SUPER_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::descriptor::is_property(obj) } {
         field_descr_from_group(&W_PROPERTY_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_count(obj) } {
+        field_descr_from_group(&W_COUNT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_repeat(obj) } {
+        field_descr_from_group(&W_REPEAT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_takewhile(obj) } {
+        field_descr_from_group(&W_TAKEWHILE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_dropwhile(obj) } {
+        field_descr_from_group(&W_DROPWHILE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_filterfalse(obj) } {
+        field_descr_from_group(&W_FILTERFALSE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_islice(obj) } {
+        field_descr_from_group(&W_ISLICE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_batched(obj) } {
+        field_descr_from_group(&W_BATCHED_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_product(obj) } {
+        field_descr_from_group(&W_PRODUCT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_combinations(obj) } {
+        field_descr_from_group(&W_COMBINATIONS_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_combinations_with_replacement(obj) } {
+        field_descr_from_group(&W_COMBINATIONS_WITH_REPLACEMENT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_permutations(obj) } {
+        field_descr_from_group(&W_PERMUTATIONS_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_groupby(obj) } {
+        field_descr_from_group(&W_GROUPBY_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_compress(obj) } {
+        field_descr_from_group(&W_COMPRESS_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_starmap(obj) } {
+        field_descr_from_group(&W_STARMAP_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_accumulate(obj) } {
+        field_descr_from_group(&W_ACCUMULATE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_zip_longest(obj) } {
+        field_descr_from_group(&W_ZIP_LONGEST_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_pairwise(obj) } {
+        field_descr_from_group(&W_PAIRWISE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_cycle(obj) } {
+        field_descr_from_group(&W_CYCLE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_chain(obj) } {
+        field_descr_from_group(&W_CHAIN_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::BUFFERABLE_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFERABLE_USER_DESCR_GROUP, 0)
     } else {
         object_map_descr()
     }
@@ -4907,6 +5228,51 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_SUPER_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::descriptor::is_property(obj) } {
         field_descr_from_group(&W_PROPERTY_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_count(obj) } {
+        field_descr_from_group(&W_COUNT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_repeat(obj) } {
+        field_descr_from_group(&W_REPEAT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_takewhile(obj) } {
+        field_descr_from_group(&W_TAKEWHILE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_dropwhile(obj) } {
+        field_descr_from_group(&W_DROPWHILE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_filterfalse(obj) } {
+        field_descr_from_group(&W_FILTERFALSE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_islice(obj) } {
+        field_descr_from_group(&W_ISLICE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_batched(obj) } {
+        field_descr_from_group(&W_BATCHED_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_product(obj) } {
+        field_descr_from_group(&W_PRODUCT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_combinations(obj) } {
+        field_descr_from_group(&W_COMBINATIONS_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_combinations_with_replacement(obj) } {
+        field_descr_from_group(&W_COMBINATIONS_WITH_REPLACEMENT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_permutations(obj) } {
+        field_descr_from_group(&W_PERMUTATIONS_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_groupby(obj) } {
+        field_descr_from_group(&W_GROUPBY_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_compress(obj) } {
+        field_descr_from_group(&W_COMPRESS_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_starmap(obj) } {
+        field_descr_from_group(&W_STARMAP_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_accumulate(obj) } {
+        field_descr_from_group(&W_ACCUMULATE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_zip_longest(obj) } {
+        field_descr_from_group(&W_ZIP_LONGEST_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_pairwise(obj) } {
+        field_descr_from_group(&W_PAIRWISE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_cycle(obj) } {
+        field_descr_from_group(&W_CYCLE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_chain(obj) } {
+        field_descr_from_group(&W_CHAIN_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::BUFFERABLE_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFERABLE_USER_DESCR_GROUP, 1)
     } else {
         object_storage_descr()
     }
@@ -6802,6 +7168,86 @@ mod tests {
         assert_eq!(
             W_PROPERTY_USER_DESCR_GROUP.field_descrs[0].index(),
             0x6100_0110
+        );
+        assert_eq!(
+            W_COUNT_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0120
+        );
+        assert_eq!(
+            W_REPEAT_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0130
+        );
+        assert_eq!(
+            W_TAKEWHILE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0140
+        );
+        assert_eq!(
+            W_DROPWHILE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0150
+        );
+        assert_eq!(
+            W_FILTERFALSE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0160
+        );
+        assert_eq!(
+            W_ISLICE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0170
+        );
+        assert_eq!(
+            W_BATCHED_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0180
+        );
+        assert_eq!(
+            W_PRODUCT_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0190
+        );
+        assert_eq!(
+            W_COMBINATIONS_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01A0
+        );
+        assert_eq!(
+            W_COMBINATIONS_WITH_REPLACEMENT_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01B0
+        );
+        assert_eq!(
+            W_PERMUTATIONS_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01C0
+        );
+        assert_eq!(
+            W_GROUPBY_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01D0
+        );
+        assert_eq!(
+            W_COMPRESS_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01E0
+        );
+        assert_eq!(
+            W_STARMAP_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01F0
+        );
+        assert_eq!(
+            W_ACCUMULATE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0200
+        );
+        assert_eq!(
+            W_ZIP_LONGEST_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0210
+        );
+        assert_eq!(
+            W_PAIRWISE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0220
+        );
+        assert_eq!(
+            W_CYCLE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0230
+        );
+        assert_eq!(
+            W_CHAIN_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0240
+        );
+        assert_eq!(
+            W_BUFFERABLE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0250
         );
         assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
@@ -8728,6 +9174,72 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("descriptor::W_PropertyUser", || {
         LazyLock::force(&W_PROPERTY_USER_DESCR_GROUP);
     }),
+    ("interp_itertools::W_CountUser", || {
+        LazyLock::force(&W_COUNT_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_RepeatUser", || {
+        LazyLock::force(&W_REPEAT_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_TakeWhileUser", || {
+        LazyLock::force(&W_TAKEWHILE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_DropWhileUser", || {
+        LazyLock::force(&W_DROPWHILE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_FilterFalseUser", || {
+        LazyLock::force(&W_FILTERFALSE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_ISliceUser", || {
+        LazyLock::force(&W_ISLICE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_BatchedUser", || {
+        LazyLock::force(&W_BATCHED_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_ProductUser", || {
+        LazyLock::force(&W_PRODUCT_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_CombinationsUser", || {
+        LazyLock::force(&W_COMBINATIONS_USER_DESCR_GROUP);
+    }),
+    (
+        "interp_itertools::W_CombinationsWithReplacementUser",
+        || {
+            LazyLock::force(&W_COMBINATIONS_WITH_REPLACEMENT_USER_DESCR_GROUP);
+        },
+    ),
+    ("interp_itertools::W_PermutationsUser", || {
+        LazyLock::force(&W_PERMUTATIONS_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_GroupByUser", || {
+        LazyLock::force(&W_GROUPBY_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_CompressUser", || {
+        LazyLock::force(&W_COMPRESS_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_StarMapUser", || {
+        LazyLock::force(&W_STARMAP_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_AccumulateUser", || {
+        LazyLock::force(&W_ACCUMULATE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_ZipLongestUser", || {
+        LazyLock::force(&W_ZIP_LONGEST_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_PairwiseUser", || {
+        LazyLock::force(&W_PAIRWISE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_CycleUser", || {
+        LazyLock::force(&W_CYCLE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_ChainUser", || {
+        LazyLock::force(&W_CHAIN_USER_DESCR_GROUP);
+    }),
+    (
+        "module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser",
+        || {
+            LazyLock::force(&W_BUFFERABLE_USER_DESCR_GROUP);
+        },
+    ),
     ("tupleobject::W_TupleObject", || {
         LazyLock::force(&W_TUPLE_DESCR_GROUP);
     }),

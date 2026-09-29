@@ -4260,8 +4260,108 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     gc.types
         .set_destructor(property_user_tid, property_destructor);
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_COUNT_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_REPEAT_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_TAKEWHILE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_DROPWHILE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_FILTERFALSE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_ISLICE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_BATCHED_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_PRODUCT_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_COMBINATIONS_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_COMBINATIONS_WITH_REPLACEMENT_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_PERMUTATIONS_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_GROUPBY_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_COMPRESS_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_STARMAP_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_ACCUMULATE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_ZIP_LONGEST_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_PAIRWISE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_CYCLE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_CHAIN_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BUFFERABLE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 176),
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 196),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,

@@ -32395,25 +32395,6 @@ fn itertools_constructor_scope_kwonly(
     Ok((pyre_object::gc_roots::shadow_stack_get(cls_slot), scope_w))
 }
 
-fn itertools_alloc_for_class(
-    cls: PyObjectRef,
-    exact_type: PyObjectRef,
-    obj: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
-    // typedef.py `allocate_instance` first checks that the requested
-    // subtype shares the builtin's layout, then installs that class on the
-    // freshly allocated interpreter object.
-    check_user_subclass(exact_type, cls)?;
-    if !std::ptr::eq(cls, exact_type) {
-        tag_subclass_instance(obj, cls);
-    }
-    // objspace.py:allocate_instance registers `hasuserdel` after the concrete
-    // subtype is installed.  Every PyPy constructor routed through this
-    // helper uses that allocation path.
-    pyre_object::gc_hook::maybe_register_finalizer(obj);
-    Ok(obj)
-}
-
 fn count_check_number(obj: PyObjectRef) -> Result<(), crate::PyError> {
     // interp_itertools.py `check_number`, with CPython 3.14's public error
     // wording (`a number is required`) in place of PyPy 3.11's older text.
@@ -32445,8 +32426,15 @@ fn count_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     count_check_number(w_step)?;
     let exact =
         gettypefor(&pyre_object::interp_itertools::COUNT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    let obj = pyre_object::interp_itertools::w_count_new(w_start, w_step);
-    itertools_alloc_for_class(cls, exact, obj)
+    check_user_subclass(exact, cls)?;
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_count_new(
+        w_start, w_step, w_subtype,
+    ))
 }
 
 fn count_single_argument(w_step: PyObjectRef) -> Result<bool, crate::PyError> {
@@ -32583,8 +32571,15 @@ fn repeat_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     };
     let exact =
         gettypefor(&pyre_object::interp_itertools::REPEAT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    let obj = pyre_object::interp_itertools::w_repeat_new(w_obj, times);
-    itertools_alloc_for_class(cls, exact, obj)
+    check_user_subclass(exact, cls)?;
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_repeat_new(
+        w_obj, times, w_subtype,
+    ))
 }
 
 fn repeat_descr_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -32743,8 +32738,15 @@ fn takewhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let (mut cls, mut predicate, iterable) = itertools_twoarg_new(args, exact, "takewhile")?;
     let iterator =
         pyre_object::with_roots!(cls, exact, predicate => crate::baseobjspace::iter(iterable))?;
-    let obj = pyre_object::interp_itertools::w_takewhile_new(predicate, iterator);
-    itertools_alloc_for_class(cls, exact, obj)
+    check_user_subclass(exact, cls)?;
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_takewhile_new(
+        predicate, iterator, w_subtype,
+    ))
 }
 
 fn dropwhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -32753,8 +32755,15 @@ fn dropwhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let (mut cls, mut predicate, iterable) = itertools_twoarg_new(args, exact, "dropwhile")?;
     let iterator =
         pyre_object::with_roots!(cls, exact, predicate => crate::baseobjspace::iter(iterable))?;
-    let obj = pyre_object::interp_itertools::w_dropwhile_new(predicate, iterator);
-    itertools_alloc_for_class(cls, exact, obj)
+    check_user_subclass(exact, cls)?;
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_dropwhile_new(
+        predicate, iterator, w_subtype,
+    ))
 }
 
 fn filterfalse_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -32768,8 +32777,15 @@ fn filterfalse_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     };
     let iterator =
         pyre_object::with_roots!(cls, exact, predicate => crate::baseobjspace::iter(iterable))?;
-    let obj = pyre_object::interp_itertools::w_filterfalse_new(predicate, iterator);
-    itertools_alloc_for_class(cls, exact, obj)
+    check_user_subclass(exact, cls)?;
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_filterfalse_new(
+        predicate, iterator, w_subtype,
+    ))
 }
 
 fn compress_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -32793,15 +32809,21 @@ fn compress_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let w_selectors = crate::baseobjspace::iter(unsafe {
         pyre_object::gc_roots::shadow_stack_get(selectors_arg_slot)
     })?;
-    let obj = pyre_object::interp_itertools::w_compress_new(
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_compress_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(data_slot) },
         w_selectors,
-    );
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+        w_subtype,
+    ))
 }
 
 fn compress_iter_self(args: &[PyObjectRef]) -> crate::PyResult {
@@ -32839,15 +32861,21 @@ fn starmap_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let iterator = crate::baseobjspace::iter(unsafe {
         pyre_object::gc_roots::shadow_stack_get(iterable_slot)
     })?;
-    let obj = pyre_object::interp_itertools::w_starmap_new(
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_starmap_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(fun_slot) },
         iterator,
-    );
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+        w_subtype,
+    ))
 }
 
 fn starmap_iter_self(args: &[PyObjectRef]) -> crate::PyResult {
@@ -32900,14 +32928,20 @@ fn accumulate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     } else {
         w_func
     };
-    let obj = pyre_object::interp_itertools::w_accumulate_new(w_iterable, w_func, unsafe {
-        pyre_object::gc_roots::shadow_stack_get(initial_slot)
-    });
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+    let w_initial = unsafe { pyre_object::gc_roots::shadow_stack_get(initial_slot) };
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_accumulate_new(
+        w_iterable, w_func, w_initial, w_subtype,
+    ))
 }
 
 fn zip_longest_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -32940,16 +32974,22 @@ fn zip_longest_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         .map(|index| unsafe { pyre_object::gc_roots::shadow_stack_get(iterators_base + index) })
         .collect();
     let w_iterators = pyre_object::w_list_new(iterators);
-    let obj = pyre_object::interp_itertools::w_zip_longest_new(
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_zip_longest_new(
         w_iterators,
         unsafe { pyre_object::gc_roots::shadow_stack_get(fill_slot) },
         n_sources as i64,
-    );
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+        w_subtype,
+    ))
 }
 
 fn init_takewhile_type(ns: PyObjectRef) {
@@ -33136,12 +33176,19 @@ fn islice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     };
 
     let iterable = crate::baseobjspace::iter(value(0))?;
-    let obj = pyre_object::interp_itertools::w_islice_new(iterable, start, stop, step);
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_islice_new(
+        iterable, start, stop, step, w_subtype,
+    ))
 }
 
 fn init_islice_type(ns: PyObjectRef) {
@@ -33266,12 +33313,19 @@ fn batched_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         return Err(crate::PyError::value_error("n must be at least one"));
     }
     let it = crate::baseobjspace::iter(value(0))?;
-    let obj = pyre_object::interp_itertools::w_batched_new(it, n, strict);
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_batched_new(
+        it, n, strict, w_subtype,
+    ))
 }
 
 fn init_batched_type(ns: PyObjectRef) {
@@ -33311,10 +33365,9 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // (`repeat` extraction, then the unexpected-keyword raise), the
     // `allocate_instance` subtype check and `W_Product.__init__` — which does
     // the `repeat` conversion and the pass over the input iterables — in that
-    // sequence, so the subtype check sits between the two.  Reaching it only
-    // through `itertools_alloc_for_class` would put it after the iterables,
-    // and an unbound `product.__new__(int, gen())` would consume `gen()`
-    // before reporting the foreign class.
+    // sequence, so the subtype check sits between the two.  Putting it after
+    // the iterables would let an unbound `product.__new__(int, gen())`
+    // consume `gen()` before reporting the foreign class.
     crate::builtins::kwarg_reject_unknown(kwargs, &["repeat"], "product")?;
     check_user_subclass(exact, cls)?;
 
@@ -33385,16 +33438,19 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let mut index_items = crate::builtins::try_vec_with_capacity(npools)?;
     index_items.extend((0..npools).map(|_| pyre_object::w_int_new(0)));
     let indices = pyre_object::w_list_new(index_items);
-    let obj = pyre_object::interp_itertools::w_product_new(
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_product_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(gears_slot) },
         indices,
         stopped,
-    );
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+        w_subtype,
+    ))
 }
 
 fn init_product_type(ns: PyObjectRef) {
@@ -33460,17 +33516,23 @@ fn combinations_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let mut index_items = crate::builtins::try_vec_with_capacity(r as usize)?;
     index_items.extend((0..r).map(|index| pyre_object::w_int_new(index as i64)));
     let indices = pyre_object::w_list_new(index_items);
-    let obj = pyre_object::interp_itertools::w_combinations_new(
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_combinations_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(pool_slot) },
         indices,
         r,
         stopped,
-    );
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+        w_subtype,
+    ))
 }
 
 fn init_combinations_type(ns: PyObjectRef) {
@@ -33543,16 +33605,24 @@ fn combinations_with_replacement_descr_new(
     let mut index_items = crate::builtins::try_vec_with_capacity(r as usize)?;
     index_items.extend((0..r).map(|_| pyre_object::w_int_new(0)));
     let indices = pyre_object::w_list_new(index_items);
-    let obj = pyre_object::interp_itertools::w_combinations_with_replacement_new(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(pool_slot) },
-        indices,
-        r,
-        stopped,
-    );
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(
+        pyre_object::interp_itertools::w_combinations_with_replacement_new(
+            unsafe { pyre_object::gc_roots::shadow_stack_get(pool_slot) },
+            indices,
+            r,
+            stopped,
+            w_subtype,
+        ),
     )
 }
 
@@ -33655,18 +33725,24 @@ fn permutations_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             cycles,
         )
     };
-    let obj = pyre_object::interp_itertools::w_permutations_new(
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_permutations_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(pool_slot) },
         r,
         stopped,
         indices,
         cycles,
-    );
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+        w_subtype,
+    ))
 }
 
 fn init_permutations_type(ns: PyObjectRef) {
@@ -33709,14 +33785,20 @@ fn groupby_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     pyre_object::gc_roots::normalize_roots(cls_slot, 1 + n_scope + 1);
     let w_iterator =
         crate::baseobjspace::iter(unsafe { pyre_object::gc_roots::shadow_stack_get(values_base) })?;
-    let obj = pyre_object::interp_itertools::w_groupby_new(w_iterator, unsafe {
-        pyre_object::gc_roots::shadow_stack_get(values_base + 1)
-    });
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+    let w_keyfunc = unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + 1) };
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_groupby_new(
+        w_iterator, w_keyfunc, w_subtype,
+    ))
 }
 
 fn groupby_iterator_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -33750,11 +33832,9 @@ fn groupby_iterator_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
         unsafe { pyre_object::gc_roots::shadow_stack_get(parent_slot) },
         unsafe { pyre_object::gc_roots::shadow_stack_get(key_slot) },
     );
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        exact,
-        obj,
-    )
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    Ok(obj)
 }
 
 fn init_groupby_type(ns: PyObjectRef) {
@@ -33877,11 +33957,9 @@ fn tee_dataobject_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         current_slot = next_slot;
     }
 
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        exact,
-        unsafe { pyre_object::gc_roots::shadow_stack_get(head_slot) },
-    )
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    Ok(unsafe { pyre_object::gc_roots::shadow_stack_get(head_slot) })
 }
 
 fn tee_iterable_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -33925,11 +34003,10 @@ fn tee_iterable_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         )
     };
     let obj = pyre_object::interp_itertools::w_tee_iterable_new(w_iterator, w_chained_list);
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    Ok(obj)
 }
 
 fn tee_copy_method(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -34173,7 +34250,7 @@ fn itertools_posonly_iter_new(
     args: &[PyObjectRef],
     name: &str,
     exact: PyObjectRef,
-    alloc: fn(PyObjectRef) -> PyObjectRef,
+    alloc: fn(PyObjectRef, PyObjectRef) -> PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let cls = positional.first().copied().unwrap_or(PY_NULL);
@@ -34203,12 +34280,17 @@ fn itertools_posonly_iter_new(
     let value_slot = cls_slot + 1;
     let iterator =
         crate::baseobjspace::iter(unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) })?;
-    let obj = alloc(iterator);
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(alloc(iterator, w_subtype))
 }
 
 fn pairwise_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -34310,12 +34392,20 @@ fn chain_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         .collect();
     let w_args = pyre_object::w_tuple_new(sources);
     let w_iterables = crate::baseobjspace::iter(w_args)?;
-    let obj = pyre_object::interp_itertools::w_chain_new(w_iterables);
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
-        obj,
-    )
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_chain_new(
+        w_iterables,
+        w_subtype,
+    ))
 }
 
 fn chain_from_iterable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -34341,14 +34431,22 @@ fn chain_from_iterable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let w_iterables = crate::baseobjspace::iter(unsafe {
         pyre_object::gc_roots::shadow_stack_get(iterable_slot)
     })?;
-    let obj = pyre_object::interp_itertools::w_chain_new(w_iterables);
+    let _ = pyre_object::gc_roots::pin_root(w_iterables);
+    let iterables_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let exact =
         gettypefor(&pyre_object::interp_itertools::CHAIN_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    itertools_alloc_for_class(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
-        exact,
-        obj,
-    )
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    check_user_subclass(exact, cls)?;
+    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+    let w_subtype = if std::ptr::eq(cls, exact) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::interp_itertools::w_chain_new(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(iterables_slot) },
+        w_subtype,
+    ))
 }
 
 fn init_chain_type(ns: PyObjectRef) {

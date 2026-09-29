@@ -7801,4 +7801,43 @@ mod tests {
             assert!(pyre_object::functional::is_enumerate(obj));
         }
     }
+
+    /// `typedef.py` `_getusercls`: a count subclass instance is
+    /// `W_CountUser` (`COUNT_USER_TYPE`) and carries mapdict storage.
+    #[test]
+    fn count_subclass_instance_carries_user_typeptr() {
+        let w_subtype =
+            pyre_object::w_type_new("CountSub", pyre_object::PY_NULL, std::ptr::null_mut());
+        let obj = pyre_object::interp_itertools::w_count_new(
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            w_subtype,
+        );
+        unsafe {
+            assert!(std::ptr::eq(
+                (*obj).ob_type,
+                &pyre_object::interp_itertools::COUNT_USER_TYPE
+            ));
+            assert!(has_mapdict_layout(obj));
+            assert!(pyre_object::interp_itertools::is_count(obj));
+        }
+    }
+
+    /// `typedef.py` `_getusercls`: a batched subclass instance is
+    /// `W_BatchedUser` (`BATCHED_USER_TYPE`) and carries mapdict storage.
+    #[test]
+    fn batched_subclass_instance_carries_user_typeptr() {
+        let w_subtype =
+            pyre_object::w_type_new("BatchedSub", pyre_object::PY_NULL, std::ptr::null_mut());
+        let obj =
+            pyre_object::interp_itertools::w_batched_new(pyre_object::PY_NULL, 0, false, w_subtype);
+        unsafe {
+            assert!(std::ptr::eq(
+                (*obj).ob_type,
+                &pyre_object::interp_itertools::BATCHED_USER_TYPE
+            ));
+            assert!(has_mapdict_layout(obj));
+            assert!(pyre_object::interp_itertools::is_batched(obj));
+        }
+    }
 }

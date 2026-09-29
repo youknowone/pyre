@@ -836,10 +836,11 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (156, Some(0)),
     (157, Some(0)),
-    // 158-175 are `typedef.py` `_getusercls` layouts
+    // 158-195 are `typedef.py` `_getusercls` layouts
     // (int/str/tuple/float/complex/bytes/bytearray/list/set/array/weakref user,
-    // plus enumerate/map/filter/zip/reversed/super/property).
-    // 169-175 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
+    // plus enumerate/map/filter/zip/reversed/super/property, the itertools
+    // user layouts, and `__pypy__.Bufferable`).
+    // 169-195 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
     (158, Some(1)),
     (159, Some(34)),
     (160, Some(8)),
@@ -858,20 +859,40 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (173, Some(89)),
     (174, Some(18)),
     (175, Some(19)),
+    (176, Some(24)),
+    (177, Some(25)),
+    (178, Some(114)),
+    (179, Some(115)),
+    (180, Some(116)),
+    (181, Some(134)),
+    (182, Some(135)),
+    (183, Some(136)),
+    (184, Some(137)),
+    (185, Some(138)),
+    (186, Some(139)),
+    (187, Some(140)),
+    (188, Some(103)),
+    (189, Some(104)),
+    (190, Some(105)),
+    (191, Some(106)),
+    (192, Some(117)),
+    (193, Some(93)),
+    (194, Some(95)),
+    (195, Some(149)),
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail so its id stays 176 on every target.
-    (176, Some(0)),
-    // Native-only type IDs 177 and 178 represent `posix.DirEntry` and
+    // posix / console tail, after the `_getusercls` layouts (158-195).
+    (196, Some(0)),
+    // Native-only type IDs 197 and 198 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (177, Some(0)),
+    (197, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (178, Some(0)),
+    (198, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (179, Some(0)),
+    (199, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1425,6 +1446,28 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(173, &crate::functional::REVERSED_USER_TYPE),
         subclass_range_alias(174, &crate::descriptor::SUPER_USER_TYPE),
         subclass_range_alias(175, &crate::descriptor::PROPERTY_USER_TYPE),
+        subclass_range_alias(176, &crate::interp_itertools::COUNT_USER_TYPE),
+        subclass_range_alias(177, &crate::interp_itertools::REPEAT_USER_TYPE),
+        subclass_range_alias(178, &crate::interp_itertools::TAKEWHILE_USER_TYPE),
+        subclass_range_alias(179, &crate::interp_itertools::DROPWHILE_USER_TYPE),
+        subclass_range_alias(180, &crate::interp_itertools::FILTERFALSE_USER_TYPE),
+        subclass_range_alias(181, &crate::interp_itertools::ISLICE_USER_TYPE),
+        subclass_range_alias(182, &crate::interp_itertools::BATCHED_USER_TYPE),
+        subclass_range_alias(183, &crate::interp_itertools::PRODUCT_USER_TYPE),
+        subclass_range_alias(184, &crate::interp_itertools::COMBINATIONS_USER_TYPE),
+        subclass_range_alias(
+            185,
+            &crate::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_USER_TYPE,
+        ),
+        subclass_range_alias(186, &crate::interp_itertools::PERMUTATIONS_USER_TYPE),
+        subclass_range_alias(187, &crate::interp_itertools::GROUPBY_USER_TYPE),
+        subclass_range_alias(188, &crate::interp_itertools::COMPRESS_USER_TYPE),
+        subclass_range_alias(189, &crate::interp_itertools::STARMAP_USER_TYPE),
+        subclass_range_alias(190, &crate::interp_itertools::ACCUMULATE_USER_TYPE),
+        subclass_range_alias(191, &crate::interp_itertools::ZIP_LONGEST_USER_TYPE),
+        subclass_range_alias(192, &crate::interp_itertools::PAIRWISE_USER_TYPE),
+        subclass_range_alias(193, &crate::interp_itertools::CYCLE_USER_TYPE),
+        subclass_range_alias(194, &crate::interp_itertools::CHAIN_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
