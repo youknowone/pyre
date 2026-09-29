@@ -2836,11 +2836,12 @@ impl<S: JitState> JitDriver<S> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gc_box"))]
 thread_local! {
-    /// Whether this execution thread has installed the interpreter's compiled
-    /// tier collector.
+    /// Whether this execution thread has finished `install_jitframe_gc`.
     ///
+    /// Set both when a per-thread box was installed and when
+    /// `gc_sync::is_initialized` was already true and no box was installed.
     /// This is deliberately execution-context state: the collector owns only
     /// temporary JITFRAMEs, deadframes are thread-confined, and no object
     /// identity or root is duplicated. The native backend's active-GC slot has
@@ -2858,16 +2859,22 @@ thread_local! {
 /// typed GC object. The interpreter's compiled tier constructs no heap object
 /// yet, so its collector needs exactly that one type. Installation is once per
 /// execution thread because the selected native backend owns its active
-/// allocator there.
-#[cfg(not(target_arch = "wasm32"))]
+/// allocator there. When `gc_sync::is_initialized` is already true, this
+/// installs nothing and lets the process collector serve.
+#[cfg(all(not(target_arch = "wasm32"), feature = "gc_box"))]
 pub fn install_jitframe_gc<S: JitState>(driver: &mut JitDriver<S>) {
     JITFRAME_GC_INSTALLED.with(|installed| {
         if installed.get() {
             return;
         }
-        let mut gc = majit_gc::collector::MiniMarkGC::new();
-        crate::register_active_backend_jitframe_gc_type(&mut gc);
-        driver.set_gc_allocator(Box::new(gc));
+        // Backend trampolines prefer a per-thread box over `gc_sync`'s
+        // process collector (`store_singleton`). Skip the box when that
+        // collector is already installed.
+        if !majit_gc::gc_sync::is_initialized() {
+            let mut gc = majit_gc::collector::MiniMarkGC::new();
+            crate::register_active_backend_jitframe_gc_type(&mut gc);
+            driver.set_gc_allocator(Box::new(gc));
+        }
         installed.set(true);
     });
 }

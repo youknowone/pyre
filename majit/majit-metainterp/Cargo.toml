@@ -10,6 +10,10 @@ description = "Meta-interpreter and optimizer for majit JIT compiler"
 # Backend selection is mandatory and intentionally has no default.
 dynasm = ["dep:majit-backend-dynasm"]
 cranelift = ["dep:majit-backend-cranelift"]
+# Per-thread allocator box. `install_jitframe_gc` calls `set_gc_allocator`,
+# which panics in `note_gc_box_installed` unless this is on. A process-global
+# runtime uses `install_active_backend_gc_standalone` and leaves this off.
+gc_box = ["majit-gc/gc_box"]
 jit-audits = ["majit-ir/jit-audits"]
 # A measurement arm, never a shipping one. It adds run-time selectable
 # amplification loops to three stages of the warm compiled entry in
@@ -73,8 +77,12 @@ majit-backend-wasm = { path = "../majit-backend-wasm", version = "0.0.2", defaul
 majit-translate = { workspace = true }
 bincode = { workspace = true }
 majit-macros = { workspace = true }
-# Integration tests call `install_jitframe_gc`. Dev-only so a downstream
+# `install_jitframe_gc` is behind `gc_box`. This edge turns that feature on
+# for this package's tests only; it is not a default, and a downstream
 # runtime build does not gain the per-thread box.
+majit-metainterp = { workspace = true, features = ["gc_box"] }
+# Integration tests name `majit_gc` directly (`store_singleton`,
+# `gc_box_installed`). Dev-only, same as the feature above.
 majit-gc = { workspace = true, features = ["gc_box"] }
 smallvec = { workspace = true }
 

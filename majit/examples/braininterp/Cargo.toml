@@ -10,8 +10,7 @@ dynasm = ["majit-metainterp/dynasm"]
 
 [dependencies]
 parking_lot = { workspace = true }
-# `set_gc_allocator` panics unless `gc_box` is on (`note_gc_box_installed`).
-majit-gc = { workspace = true, features = ["gc_box"] }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
-majit-metainterp = { workspace = true }
+# `install_jitframe_gc` is compiled only with `gc_box` (`note_gc_box_installed`).
+majit-metainterp = { workspace = true, features = ["gc_box"] }
