@@ -666,18 +666,15 @@ impl OptString {
     /// Handle STRSETITEM: if target is virtual Plain and index is constant, track.
     fn optimize_strsetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let str_ref = ctx.resolve_operand_operand(&op.arg(0));
-        let char_ref = op.arg(2).to_opref();
-        let char_resolved = ctx.get_replacement_opref(char_ref);
 
         if let Some(idx) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             let i = idx as usize;
-            // Materialize the char position before borrowing the plain info so a
-            // bound producer is stored, not a position-only box. `with_plain_info_mut`
-            // holds `ctx`, so the materialize must precede it.
-            let char_operand = ctx.materialize_operand_at(char_resolved);
+            // `self.get_box_replacement(op.getarg(2))`, resolved before
+            // `with_plain_info_mut` borrows `ctx`.
+            let char_operand = ctx.resolve_operand_operand(&op.arg(2));
             let did_write = self
                 .with_plain_info_mut(&str_ref, ctx, |info| {
                     if i < info._chars.len() {
@@ -889,33 +886,24 @@ impl OptString {
                 // vstring.py: vresult = self.strgetitem(None, ...) —
                 // const-folds a virtual/constant char or emits a STRGETITEM.
                 let ch_ref = self.strgetitem_emit(&src_ref_box, src_start + index, mode, ctx);
-                let char_ref = ctx.get_replacement_opref(ch_ref.to_opref());
+                let char_box = ctx.resolve_operand_operand(&ch_ref);
                 if dst_virtual {
-                    dst_chars.push(Some(char_ref));
+                    dst_chars.push(Some(char_box));
                 } else {
-                    // vstring.py:585-589: self.emit_extra(new_op)
+                    // copy_str_content: `new_op = ResOperation(
+                    // mode.STRSETITEM, [op, ConstInt(index + dst_start),
+                    // vresult])` then `string_optimizer.emit_extra(new_op)`.
                     let pass_idx = ctx.current_pass_idx;
-                    let arg_dst = ctx.materialize_operand_at(dst_ref.to_opref());
                     let arg_dst_index = Operand::const_(Const::Int(dst_start + index));
-                    let arg_char = ctx.materialize_operand_at(char_ref);
                     ctx.emit_extra(
                         pass_idx,
-                        Op::new(
-                            setitem_opcode,
-                            &[arg_dst.clone(), arg_dst_index.clone(), arg_char.clone()],
-                        ),
+                        Op::new(setitem_opcode, &[dst_ref.clone(), arg_dst_index, char_box]),
                     );
                 }
             }
             if dst_virtual {
-                // Materialize each char position to a bound producer before
-                // borrowing the plain info (the closure holds `ctx`).
-                let dst_operands: Vec<Option<Operand>> = dst_chars
-                    .into_iter()
-                    .map(|o| o.map(|r| ctx.materialize_operand_at(r)))
-                    .collect();
                 self.with_plain_info_mut(&dst_ref, ctx, |info| {
-                    for (index, ch_op) in dst_operands.into_iter().enumerate() {
+                    for (index, ch_op) in dst_chars.into_iter().enumerate() {
                         let dst_index = (dst_start as usize) + index;
                         if dst_index < info._chars.len() {
                             info._chars[dst_index] = ch_op;
@@ -1225,7 +1213,7 @@ impl OptString {
                 OopSpecIndex::StreqNonnull
             };
             if let Some(result) =
-                self.generate_modified_call(oopspec, &[arg1.to_opref(), arg2.to_opref()], op, ctx)
+                self.generate_modified_call(oopspec, &[arg1.clone(), arg2.clone()], op, ctx)
             {
                 return result;
             }
@@ -1294,10 +1282,10 @@ impl OptString {
                 }
                 // vstring.py:769-774: arg1 is a virtual slice, arg2 is length 1
                 if let Some(info) = self.get_slice_info(arg1, ctx) {
-                    let source = info.s.to_opref();
-                    let start = info.start.to_opref();
-                    let length = info.lgtop.to_opref();
-                    let vchar = self.strgetitem_emit(arg2, 0, mode, ctx).to_opref();
+                    let source = info.s.clone();
+                    let start = info.start.clone();
+                    let length = info.lgtop.clone();
+                    let vchar = self.strgetitem_emit(arg2, 0, mode, ctx);
                     return self.generate_modified_call(
                         OopSpecIndex::StreqSliceChar,
                         &[source, start, length, vchar],
@@ -1320,9 +1308,8 @@ impl OptString {
                 return Some(OptimizationResult::Remove);
             }
             // vstring.py:784: PTR_EQ against CONST_NULL (ref-null, not int-zero)
-            let arg_a = ctx.materialize_operand_at(arg1.to_opref());
             let arg_null = Operand::const_(Const::Ref(majit_ir::GcRef::NULL));
-            let mut eq_op = Op::new(OpCode::PtrEq, &[arg_a.clone(), arg_null.clone()]);
+            let mut eq_op = Op::new(OpCode::PtrEq, &[arg1.clone(), arg_null]);
             eq_op.pos().set(op.pos().get());
             // vstring.py:785-786: replace_op_with(PTR_EQ, ...) then self.emit(op)
             // (Optimization.emit) — the op flows on to the passes after OptString.
@@ -1352,21 +1339,21 @@ impl OptString {
             };
             if l2info.is_constant() && l2info.get_constant_int() == 1 {
                 // vstring.py: vchar = self.strgetitem(None, arg2, CONST_0, mode)
-                let vchar = self.strgetitem_emit(arg2, 0, mode, ctx).to_opref();
+                let vchar = self.strgetitem_emit(arg2, 0, mode, ctx);
                 // vstring.py:800-804
                 let oopspec = if self.is_known_nonnull(arg1, ctx) {
                     OopSpecIndex::StreqNonnullChar
                 } else {
                     OopSpecIndex::StreqChecknullChar
                 };
-                return self.generate_modified_call(oopspec, &[arg1.to_opref(), vchar], op, ctx);
+                return self.generate_modified_call(oopspec, &[arg1.clone(), vchar], op, ctx);
             }
         }
         // vstring.py:807-813: if arg1 is a virtual slice
         if let Some(info) = self.get_slice_info(arg1, ctx) {
-            let source = info.s.to_opref();
-            let start = info.start.to_opref();
-            let length = info.lgtop.to_opref();
+            let source = info.s.clone();
+            let start = info.start.clone();
+            let length = info.lgtop.clone();
             let oopspec = if self.is_known_nonnull(arg2, ctx) {
                 OopSpecIndex::StreqSliceNonnull
             } else {
@@ -1374,7 +1361,7 @@ impl OptString {
             };
             return self.generate_modified_call(
                 oopspec,
-                &[source, start, length, arg2.to_opref()],
+                &[source, start, length, arg2.clone()],
                 op,
                 ctx,
             );
@@ -1407,7 +1394,7 @@ impl OptString {
     fn generate_modified_call(
         &self,
         oopspec: OopSpecIndex,
-        args: &[OpRef],
+        args: &[Operand],
         result_op: &Op,
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
@@ -1421,9 +1408,7 @@ impl OptString {
         // `generate_modified_call`: `[ConstInt(func)] + args`
         let mut call_args_operand: Vec<Operand> = Vec::with_capacity(args.len() + 1);
         call_args_operand.push(Operand::const_(Const::Int(func_addr as i64)));
-        for a in args {
-            call_args_operand.push(ctx.materialize_operand_at(*a));
-        }
+        call_args_operand.extend(args.iter().cloned());
         // vstring.py:854: replace_op_with(result, rop.CALL_I, [...], descr=calldescr)
         let mut call_op = match calldescr {
             Some(d) => Op::with_descr(OpCode::CallI, &call_args_operand, d.clone()),
