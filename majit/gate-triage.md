@@ -470,25 +470,11 @@ cover the condition they diagnose.
 - What it does: Enables stack-position diagnostics on hot back-edge and guard-failure paths. The value is cached to avoid repeated environment reads.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
-### `MAJIT_STALL_WINDOW`
-
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
-- Accessor: `stall_window()`
-- What it does: **UNRECORDED** — no doc comment at the read site.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
-
 ### `MAJIT_STATS`
 
 - Read sites: 3 — `majit/majit-trace/src/logger.rs`, `pyre/pyre-wasm-runner/src/main.rs`, `pyre/pyrex/src/lib.rs`
 - Accessor: `stats_enabled()`; also read inline in `run()` and `maybe_print_jit_stats()`
 - What it does: Whether JIT statistics collection is enabled. Checks MAJIT_STATS=1 or MAJIT_LOG=1.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
-
-### `MAJIT_STEP_LIMIT`
-
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
-- Accessor: `step_limit()`
-- What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_STRICT`

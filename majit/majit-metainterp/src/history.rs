@@ -3396,9 +3396,11 @@ impl TraceCtx {
         self.recorder.num_ops() > self.trace_limit
     }
 
-    /// Current count of recorded (non-inputarg) ops.  The trace-recording
-    /// loop reads this to detect a non-productive spin — steps advancing
-    /// without the op list growing (which `is_too_long` cannot catch).
+    /// Non-inputarg recorded op count (`History.length`).
+    ///
+    /// Read by the `[interpret]` logs in `JitCodeMachine::run_to_end` and
+    /// `compile_and_run_once`, and copied onto `DispatchError::TraceTooLong`
+    /// by `walk` and `locals_expansion_cut_if_too_long`.
     pub fn num_recorded_ops(&self) -> usize {
         self.recorder.num_ops()
     }
