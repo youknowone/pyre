@@ -1,13 +1,21 @@
-# CPython-suite gap: no test stores __slots__ members on float/complex/str/bytearray/list/set/frozenset/array subclasses under a hot loop.
+# CPython-suite gap: no test stores __slots__ members on float/complex/str/bytearray/list/set/frozenset/array/weakref subclasses under a hot loop.
 # parity-tests reason: this targets the typedef.py _getusercls mapdict storage behind slot members.
 
-"""`__slots__` members of float/complex/str/bytearray/list/set/frozenset/array subclasses.
+"""`__slots__` members of float/complex/str/bytearray/list/set/frozenset/array/weakref subclasses.
 
 A slots-only subclass has no `__dict__`; a subclass that also asks for
 `__dict__` must still keep the slot value in the slot, not in the dict.
 """
 
 import array
+import weakref
+
+
+class _Referent:
+    pass
+
+
+_referent = _Referent()
 
 # int, tuple and bytes reject a nonempty __slots__.
 BASES = [
@@ -19,6 +27,7 @@ BASES = [
     (set, ()),
     (frozenset, ()),
     (array.array, ("i", [1, 2])),
+    (weakref.ref, (_referent,)),
 ]
 
 N = 2000

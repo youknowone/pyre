@@ -233,11 +233,12 @@ pub unsafe fn pytype_has_mapdict_mixin(obj: PyObjectRef) -> bool {
 /// layout — i.e. NOT a user subclass.
 ///
 /// A user subclass instance of `int`, `float`, `complex`, `str`, `tuple`,
-/// `list`, `set`, `frozenset` or `array.array` carries the builtin's
-/// `_getusercls` class as its typeptr, which alone decides exactness. A user
-/// subclass of any other builtin keeps the builtin `ob_type` (and therefore
-/// the builtin struct layout and the `is_list` / … layout predicates) while
-/// `w_class` is retagged to the subclass type object (`typedef::subclass_to_tag`).
+/// `list`, `set`, `frozenset`, `array.array` or `weakref.ref` carries the
+/// builtin's `_getusercls` class as its typeptr, which alone decides exactness.
+/// A user subclass of any other builtin keeps the builtin `ob_type` (and
+/// therefore the builtin struct layout and the `is_list` / … layout predicates)
+/// while `w_class` is retagged to the subclass type object
+/// (`typedef::subclass_to_tag`).
 /// The type-specific
 /// fast paths in
 /// `space.is_true` / `eq_w` / `len` / `getitem` / … assume the receiver's
@@ -778,8 +779,8 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (156, Some(0)),
     (157, Some(0)),
-    // 158-167 are `typedef.py` `_getusercls` layouts
-    // (int/str/tuple/float/complex/bytes/bytearray/list/set/array user), each an rclass
+    // 158-168 are `typedef.py` `_getusercls` layouts
+    // (int/str/tuple/float/complex/bytes/bytearray/list/set/array/weakref user), each an rclass
     // subclass of the builtin it was made from.
     (158, Some(1)),
     (159, Some(34)),
@@ -791,20 +792,21 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (165, Some(7)),
     (166, Some(30)),
     (167, Some(94)),
-    // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail so its id stays 168 on every target.
     (168, Some(0)),
-    // Native-only type IDs 169 and 170 represent `posix.DirEntry` and
+    // `_sre.SRE_Template` — registered immediately before the cfg-gated
+    // posix / console tail so its id stays 169 on every target.
+    (169, Some(0)),
+    // Native-only type IDs 170 and 171 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (169, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
     (170, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (171, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (171, Some(0)),
+    (172, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1352,6 +1354,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(166, &crate::setobject::SET_USER_TYPE),
         subclass_range_alias(166, &crate::setobject::FROZENSET_USER_TYPE),
         subclass_range_alias(167, &crate::interp_array::ARRAY_USER_TYPE),
+        subclass_range_alias(168, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),

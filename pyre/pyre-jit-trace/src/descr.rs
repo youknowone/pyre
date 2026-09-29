@@ -4676,6 +4676,20 @@ static W_ARRAY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     )
 });
 
+/// `W_WeakrefUser` (`typedef.py` `_getusercls`).
+static W_WEAKREF_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::weakref::W_WEAKREF_USER_OBJECT_SIZE,
+        pyre_object::weakref::W_WEAKREF_USER_GC_TYPE_ID,
+        &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::weakref::W_WeakrefUser, map),
+        std::mem::offset_of!(pyre_object::weakref::W_WeakrefUser, storage),
+        "W_WeakrefUser",
+        "weakref::W_WeakrefUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xA0,
+    )
+});
+
 /// `W_ObjectObject.map` (`objectobject.rs`) — the instance shape word,
 /// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). Read as an
 /// `Int` word so the LOAD_ATTR fast path can `guard_value` it to a constant map
@@ -4719,6 +4733,8 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_SET_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::interp_array::is_array(obj) } {
         field_descr_from_group(&W_ARRAY_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
+        field_descr_from_group(&W_WEAKREF_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_complex(obj) } {
         field_descr_from_group(&W_COMPLEX_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_str(obj) } {
@@ -4752,6 +4768,8 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_SET_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::interp_array::is_array(obj) } {
         field_descr_from_group(&W_ARRAY_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
+        field_descr_from_group(&W_WEAKREF_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_complex(obj) } {
         field_descr_from_group(&W_COMPLEX_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_str(obj) } {
@@ -6612,6 +6630,10 @@ mod tests {
             0x6100_0090
         );
         assert_eq!(
+            W_WEAKREF_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_00A0
+        );
+        assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
             Type::Ref
         );
@@ -8298,6 +8320,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("interp_array::W_ArrayUser", || {
         LazyLock::force(&W_ARRAY_USER_DESCR_GROUP);
+    }),
+    ("weakref::W_WeakrefUser", || {
+        LazyLock::force(&W_WEAKREF_USER_DESCR_GROUP);
     }),
     ("tupleobject::W_TupleObject", || {
         LazyLock::force(&W_TUPLE_DESCR_GROUP);

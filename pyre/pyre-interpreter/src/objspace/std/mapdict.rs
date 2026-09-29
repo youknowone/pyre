@@ -534,6 +534,7 @@ unsafe fn is_generated_user_layout_family(obj: PyObjectRef) -> bool {
             || pyre_object::is_list(obj)
             || pyre_object::is_set_or_frozenset(obj)
             || pyre_object::interp_array::is_array(obj)
+            || pyre_object::weakref::is_typed_weakref(obj)
             || (pyre_object::is_tuple(obj)
                 && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj))
     }
@@ -545,7 +546,7 @@ unsafe fn is_generated_user_layout_family(obj: PyObjectRef) -> bool {
 /// records that mixin; `mapdict.py` never names zlib / `_lsprof` /
 /// `_queue` / `_ssl`. Ordinary `W_ObjectObject` instances share
 /// `INSTANCE_TYPE`, which carries the same bit. The generated
-/// tuple/int/float/complex/str/list/set/array user layouts append the mixin after the builtin
+/// tuple/int/float/complex/str/list/set/array/weakref user layouts append the mixin after the builtin
 /// payload (`typedef.py` `_getusercls`) and are identified by those
 /// user type ids. `set` and `frozenset` share one user tid.
 ///
@@ -576,11 +577,12 @@ pub unsafe fn has_mapdict_layout(obj: PyObjectRef) -> bool {
         || type_id == pyre_object::listobject::W_LIST_USER_GC_TYPE_ID
         || type_id == pyre_object::setobject::W_SET_USER_GC_TYPE_ID
         || type_id == pyre_object::interp_array::W_ARRAY_USER_GC_TYPE_ID
+        || type_id == pyre_object::weakref::W_WEAKREF_USER_GC_TYPE_ID
 }
 
 /// Whether attribute access for `obj` routes through mapdict storage. This is
 /// the physical [`has_mapdict_layout`] test plus the owning class's `hasdict`
-/// flag for generated tuple/int/float/complex/str/list/set/array user layouts.
+/// flag for generated tuple/int/float/complex/str/list/set/array/weakref user layouts.
 ///
 /// # Safety
 /// `obj` must be null or a live object reference.
@@ -3522,6 +3524,15 @@ impl MapdictCarrier {
         }
         if unsafe { pyre_object::interp_array::is_array(obj) } {
             let user = obj as *mut pyre_object::interp_array::W_ArrayUser;
+            return unsafe {
+                (
+                    std::ptr::addr_of_mut!((*user).map),
+                    std::ptr::addr_of_mut!((*user).storage),
+                )
+            };
+        }
+        if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
+            let user = obj as *mut pyre_object::weakref::W_WeakrefUser;
             return unsafe {
                 (
                     std::ptr::addr_of_mut!((*user).map),
