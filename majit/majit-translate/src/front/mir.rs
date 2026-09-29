@@ -15879,7 +15879,13 @@ impl<'a> Lowering<'a> {
                 let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
-                let indirect = self.dyn_indirect_target(&dyn_operand);
+                // A monomorphized vtable stores every method slot as
+                // `*const ()`: the call casts the slot to the method's fn-ptr
+                // type into a temporary and calls the temporary.  The slot
+                // read is that cast's operand.
+                let vtable_slot = vtable_slot_under_fn_ptr_cast(self.llbc, self.body, &dyn_operand)
+                    .unwrap_or_else(|| dyn_operand.clone());
+                let indirect = self.dyn_indirect_target(&vtable_slot);
                 if let Some((trait_root, method_name)) = indirect {
                     // RPython `ClassRepr.getclsfield` emits the concrete
                     // vtable field read, then `FunctionReprBase.call` feeds
@@ -15887,7 +15893,7 @@ impl<'a> Lowering<'a> {
                     // already lowers this exact MIR Field projection, so keep
                     // it instead of replacing it with a blackhole-only
                     // name-based lookup that has no upstream counterpart.
-                    let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
+                    let funcptr = self.resolve_operand(mir_bb, vtable_slot)?;
                     OpKind::IndirectCall {
                         funcptr,
                         args,
@@ -27975,6 +27981,28 @@ fn defining_call(llbc: &Llbc, body: &Unstructured, local: usize) -> Option<CallP
         }
     }
     (producers == 1).then_some(found).flatten()
+}
+
+/// The vtable slot a monomorphized `dyn` call reads: `operand` is a
+/// temporary whose single producer is a raw-pointer cast of that slot
+/// (`_t = copy (*ptr_metadata(recv)).method_<name> as fn(..)`).
+fn vtable_slot_under_fn_ptr_cast(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+) -> Option<Operand> {
+    let PlaceKind::Local(local) = operand_place(operand)?.kind else {
+        return None;
+    };
+    let Rvalue::UnaryOp(op, slot) = defining_assign(llbc, body, local as usize)? else {
+        return None;
+    };
+    op.get("Cast")?.get("RawPtr")?;
+    let PlaceKind::Projection(_, ProjectionElem::Tagged(elem)) = &operand_place(slot)?.kind else {
+        return None;
+    };
+    elem.get("Field")?;
+    Some(slot.clone())
 }
 
 fn defining_assign<'a>(llbc: &Llbc, body: &'a Unstructured, local: usize) -> Option<&'a Rvalue> {
@@ -53047,6 +53075,62 @@ mod tests {
             ]),
             serde_json::json!([null, chars_offset_global(1, offset_leaf)]),
         )
+    }
+
+    /// A monomorphized vtable keeps its method slots as `*const ()`, so the
+    /// `dyn` call casts the slot into a temporary and calls that; the slot
+    /// read is recovered from the temporary's single producer.
+    #[test]
+    fn a_mono_vtable_call_reads_the_slot_under_its_fn_ptr_cast() {
+        let ty = ptr_ty();
+        let slot = serde_json::json!({"Copy": {"kind": {"Projection": [
+            {"kind": {"Projection": [{"kind": {"Local": 1}, "ty": ty}, "Deref"]}, "ty": ty},
+            {"Field": [null, 4]}
+        ]}, "ty": ty}});
+        let assign = |dst: u64, rvalue: serde_json::Value| {
+            serde_json::json!({"span": span_json(), "kind": {"Assign": [
+                {"kind": {"Local": dst}, "ty": ty},
+                rvalue
+            ]}})
+        };
+        let local = |index: u64| serde_json::json!({"index": index, "name": null, "span": span_json(), "ty": ty});
+        let fun = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "dyn_call"], "", true),
+            "signature": {"is_unsafe": true, "inputs": [ty], "output": ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [local(0), local(1), local(2), local(3)]},
+                "body": [{
+                    "statements": [
+                        assign(2, serde_json::json!({"UnaryOp": [
+                            {"Cast": {"RawPtr": [ty, ty]}},
+                            slot
+                        ]})),
+                        assign(3, serde_json::json!({"Use": [slot, "No"]}))
+                    ],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let llbc = const_artifact("fixture", serde_json::json!([fun]), serde_json::json!([]));
+        let fd = llbc.iter_local_fns().next().expect("fixture fn");
+        let body = fd.unstructured().expect("fixture body");
+        let operand = |index: u64| {
+            serde_json::from_value::<majit_charon_reader::ullbc::Operand>(serde_json::json!(
+                {"Copy": {"kind": {"Local": index}, "ty": ty}}
+            ))
+            .unwrap()
+        };
+        let peeled = super::vtable_slot_under_fn_ptr_cast(&llbc, &body, &operand(2))
+            .expect("the cast temporary names its vtable slot");
+        let expected =
+            serde_json::from_value::<majit_charon_reader::ullbc::Operand>(slot.clone()).unwrap();
+        assert_eq!(format!("{peeled:?}"), format!("{expected:?}"));
+        assert!(
+            super::vtable_slot_under_fn_ptr_cast(&llbc, &body, &operand(3)).is_none(),
+            "a plain copy of the slot is not a cast temporary"
+        );
     }
 
     fn graph_calls_leaf(graph: &crate::model::FunctionGraph, leaf: &str) -> bool {
