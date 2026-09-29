@@ -4598,11 +4598,11 @@ mod tests {
 
         // unroll.py inline_short_preamble seeds only
         // mapping[short_inputargs[i]] = jump_args[i].
-        ctx.materialize_operand_at(jump_arg);
+        let jump_arg_box = ctx.materialize_operand_at(jump_arg);
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let extra = crate::optimizeopt::unroll::OptUnroll::inline_short_preamble(
-            &[jump_arg],
-            &[jump_arg],
+            &[jump_arg_box.clone()],
+            &[jump_arg_box],
             &rebuilt,
             &mut optimizer,
             &mut ctx,
@@ -4611,7 +4611,10 @@ mod tests {
             ctx.take_invalid_loop().is_none(),
             "leg (1) maps the renamed short inputarg"
         );
-        assert_eq!(extra, vec![jump_arg]);
+        assert_eq!(
+            extra.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![jump_arg]
+        );
         let replayed = ctx
             .new_operations
             .iter()
@@ -4741,11 +4744,11 @@ mod tests {
 
         ctx.activate_short_preamble_producer(ext);
         let jump_arg = OpRef::int_op(3);
-        ctx.materialize_operand_at(jump_arg);
+        let jump_arg_box = ctx.materialize_operand_at(jump_arg);
         let mut optimizer = Optimizer::new();
         let extra = OptUnroll::inline_short_preamble(
-            &[jump_arg],
-            &[jump_arg],
+            &[jump_arg_box.clone()],
+            &[jump_arg_box],
             &stored,
             &mut optimizer,
             &mut ctx,
