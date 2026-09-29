@@ -101,6 +101,36 @@ pub fn _errno_after(save_err: i64) {
     }
 }
 
+// `rposix.c_ioctl_voidp`.
+//
+// `sys.platform == 'darwin'` sets `natural_arity=2`. This records only
+// `sys/ioctl.h`; the rest of `rposix.eci` is not ported here.
+#[cfg(unix)]
+crate::rffi::external_compilation_info! {
+    const IOCTL_ECI = {
+        includes: ["sys/ioctl.h"],
+    };
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_ioctl_voidp = "ioctl",
+    [crate::rffi::INT, crate::rffi::UINT, crate::rffi::VOIDP],
+    crate::rffi::INT,
+    compilation_info = IOCTL_ECI,
+    save_err = RFFI_SAVE_ERRNO,
+    natural_arity = 2
+);
+
+#[cfg(all(unix, not(target_os = "macos")))]
+crate::rffi::llexternal!(
+    pub c_ioctl_voidp = "ioctl",
+    [crate::rffi::INT, crate::rffi::UINT, crate::rffi::VOIDP],
+    crate::rffi::INT,
+    compilation_info = IOCTL_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
