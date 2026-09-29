@@ -4728,6 +4728,12 @@ mod tests {
             skip("fn f(xs: &[u8]) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
+        assert_eq!(skip("fn f(xs: &[PyObjectRef]) -> i64 { 0 }"), None);
+        assert_eq!(skip("fn f(xs: &mut [i64]) -> i64 { 0 }"), None);
+        assert_eq!(
+            skip("fn f(p: *const [PyObjectRef]) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::FatPointerArg)
+        );
         assert_eq!(
             skip("fn f(xs: &[PyObjectRef]) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)

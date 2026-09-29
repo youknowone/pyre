@@ -199,6 +199,9 @@ pub fn opcode_list_append<H: SharedOpcodeHandler + ?Sized>(
     handler.list_append(list, value)
 }
 
+/// pyopcode.py `UNPACK_SEQUENCE`: `space.fixedview_unroll` then
+/// `pushrevvalues`, which is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 pub fn opcode_unpack_sequence<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     count: usize,

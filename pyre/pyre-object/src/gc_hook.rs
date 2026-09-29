@@ -283,6 +283,12 @@ pub fn clear_gc_alloc_young_nonmoving_hook() {
 /// holds only the raw address — the old-generation twin would have
 /// survived to the next major instead.
 ///
+/// `external_malloc` tests `threshold_reached` before the birth and may run
+/// `minor_collection_with_major_progress`; this entry does the same. The
+/// caller must present a complete root set across the call. Frames themselves
+/// do not move, which is why a live `&mut PyFrame` across this allocation
+/// stays valid.
+///
 /// With no young hook installed this answers exactly as the stable twin.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> *mut u8 {

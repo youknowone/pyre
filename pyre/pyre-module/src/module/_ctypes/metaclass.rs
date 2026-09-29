@@ -756,8 +756,8 @@ fn promote_anonymous_fields(
     .ok_or_else(|| pyre_interpreter::PyError::attribute_error("anonymous field has no _fields_"))?;
     for entry in field_entries(fields)? {
         let name = entry.name;
-        let child_proto = entry.ty;
-        let child = unsafe {
+        let mut child_proto = entry.ty;
+        let mut child = unsafe {
             pyre_interpreter::baseobjspace::lookup_in_type(
                 proto,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new(name.as_str())),
@@ -1004,18 +1004,18 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
 
     let is_swapped = unsafe {
         pyre_interpreter::baseobjspace::lookup_in_type(
-            cls,
+            cls(),
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("_swappedbytes_")),
         )
     }
     .is_some();
-    let pack = usize_attr(cls, "_pack_", 0);
-    let forced = align_attr(cls)?;
+    let pack = usize_attr(cls(), "_pack_", 0);
+    let forced = align_attr(cls())?;
     if pack > 0
         && !cfg!(windows)
         && unsafe {
             pyre_interpreter::baseobjspace::lookup_in_type(
-                cls,
+                cls(),
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("_layout_")),
             )
         }
@@ -1883,7 +1883,7 @@ fn structure_new(args: &[PyObjectRef]) -> PyResult {
             "Structure.__new__ requires a type",
         ));
     }
-    let cls = args[0];
+    let mut cls = args[0];
     if unsafe {
         pyre_interpreter::baseobjspace::lookup_in_type(
             cls,

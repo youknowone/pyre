@@ -855,6 +855,7 @@ pub fn register_depth_bump(f: DepthBumpFn) {
 /// overflow) and on missing required positional / keyword-only args after
 /// defaults application, mirroring `argument.py` `ArgErrTooMany` and
 /// `argument.py` `ArgErrMissing`.
+#[majit_macros::unroll_safe]
 pub fn fill_user_function_args(
     callable: PyObjectRef,
     code_ref: &crate::CodeObject,
@@ -1464,6 +1465,7 @@ fn call_builtin_code_many_from_roots(root_base: usize, nargs: usize) -> PyResult
     builtin_code_call_positional(rooted[0], &rooted[1..])
 }
 
+#[majit_macros::unroll_safe]
 fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     // `gateway.py BuiltinCode.funcrun` is translated with both its code
     // object and `Arguments.arguments_w` live across gateway dispatch.  A
@@ -1525,7 +1527,7 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
 /// (method / type / staticmethod / classmethod / instance-`__call__`) is
 /// identical for both — only the leaf executor differs — so the two entry
 /// points share one body instead of a stripped-down copy.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, majit_macros::FieldlessEnumArg)]
 enum CallMode {
     Jit,
     Plain,
@@ -2482,7 +2484,7 @@ pub fn call_type_one_arg(
 }
 
 #[inline(never)]
-#[majit_macros::dont_look_inside]
+#[majit_macros::dont_look_inside(word_enums(CallMode))]
 fn call_non_function_callable_with_mode(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
@@ -4601,6 +4603,11 @@ pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) ->
 /// This is the canonical call path. `call_function_impl_raw` (legacy)
 /// wraps it for callers that expect a bare `PyObjectRef` and stash the
 /// error in `PENDING_CALL_ERROR` instead.
+///
+/// `*args_w` has a length fixed per call site, so the loops over `args`
+/// (root reload, receiver-prepended argument list) unroll like
+/// `list(args_w)` does.
+#[majit_macros::unroll_safe]
 pub fn call_function_impl_result(
     callable: PyObjectRef,
     args: &[PyObjectRef],

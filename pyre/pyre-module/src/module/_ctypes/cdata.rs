@@ -923,12 +923,19 @@ fn set_simple_value(obj: PyObjectRef, value: PyObjectRef) -> Result<(), pyre_int
     let tc =
         type_code_of(cls).ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
     // `value` is an arbitrary object, so under `"O"` it can be a `list` or a
-    // `dict`, both of which move, and `encode_value_into` can run Python: pin it
-    // and read the slot back where it is stored.
+    // `dict`, both of which move, and `encode_value_into` can run Python: pin
+    // the value and the instance and read the slots back where they are stored.
     let _roots = pyre_object::gc_roots::push_roots();
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    let value = pyre_object::gc_roots::pin_root(value);
-    let mut bytes = encode_value_into(&tc, value, obj, "0")?;
+    let _ = pyre_object::gc_roots::pin_root(value);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let mut bytes = encode_value_into(
+        &tc,
+        pyre_object::gc_roots::shadow_stack_get(value_slot),
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        "0",
+    )?;
     if unsafe {
         pyre_interpreter::baseobjspace::lookup_in_type(
             cls,
@@ -941,11 +948,13 @@ fn set_simple_value(obj: PyObjectRef, value: PyObjectRef) -> Result<(), pyre_int
     }
     // `BSTR_set` frees what the slot held only once the new string exists, so
     // a conversion that refuses its value leaves the previous one readable.
-    release_bstr_slot(&tc, cdata_addr(roots.get(base + 1)).unwrap_or(0));
-    cdata_write(roots.get(base + 1), 0, &bytes);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    release_bstr_slot(&tc, cdata_addr(obj).unwrap_or(0));
+    cdata_write(pyre_object::gc_roots::shadow_stack_get(obj_slot), 0, &bytes);
     if matches!(tc.as_str(), "z" | "Z" | "O") {
-        let d = pyre_interpreter::baseobjspace::getdict_native(roots.get(base + 1));
-        let value = roots.get(base);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+        let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
         unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, value) };
     }
     Ok(())

@@ -257,7 +257,7 @@ pub const QUASI_IMMUT_SLOT_COUNT: usize = (QuasiImmutSlot::WKwDefs as usize) + 1
 /// `quasiimmut.py` keys everything off the mutate-field *name*; pyre needs a
 /// value it can pass through the descr-index dispatch in
 /// `pyre-jit-trace state.rs` / `pyre-jit eval.rs`, so the name becomes a tag.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, majit_macros::FieldlessEnumArg)]
 pub enum QuasiImmutSlot {
     Code,
     WFuncGlobalsObj,
@@ -277,40 +277,6 @@ impl QuasiImmutSlot {
     pub fn index(self) -> usize {
         self as usize
     }
-}
-
-/// The `mutate_<name>` field for one `?` entry, or `None` when `obj` does not
-/// carry the `Function` layout the slot lives in.
-///
-/// Reaching a slot casts `obj` to `*const Function`, so the carrier test is the
-/// precondition for the cast, not a convenience. `is_function_carrier` is the
-/// right predicate rather than a bare `FUNCTION_TYPE` comparison: the four
-/// types `function_new_impl` stamps — `function`, `builtin_function_or_method`,
-/// `method_descriptor`, `wrapper_descriptor` — all allocate a real `Function`
-/// whose slots are initialised, and skipping any of them would leave a write
-/// unannounced. Under-invalidation is the unsound direction; over-invalidation
-/// is not (`quasiimmut.py`).
-///
-/// Answers `None` while [`Function::mutate_slots`] is still null, which is the
-/// null `mutate_<name>` of `quasiimmut.py`: nothing has folded the field, so
-/// there is nothing to revoke. Only [`function_current_qmut_instance`] creates
-/// the block.
-///
-/// # Safety
-/// `obj` must be null or point at a live `PyObject`.
-pub unsafe fn function_quasi_immut_field<'a>(
-    obj: PyObjectRef,
-    slot: QuasiImmutSlot,
-) -> Option<&'a QuasiImmutField> {
-    if obj.is_null() || !unsafe { is_function_carrier(obj) } {
-        return None;
-    }
-    let f = obj as *const Function;
-    let slots = unsafe { (*f).mutate_slots.load(Ordering::Acquire) };
-    if slots.is_null() {
-        return None;
-    }
-    Some(unsafe { &(*slots).0[slot.index()] })
 }
 
 /// `quasiimmut.py get_current_qmut_instance` — resolve the instance
@@ -352,15 +318,58 @@ pub unsafe fn function_current_qmut_instance(
     Some(unsafe { &(*slots).0[slot.index()] }.get_current_qmut_instance())
 }
 
-/// `quasiimmut.py make_invalidation_function._invalidate_now` — revoke
-/// every loop that folded this field. Runs BEFORE the store, the way
+/// `quasiimmut.py make_invalidation_function.invalidation` — revoke every
+/// loop that folded this field. Runs BEFORE the store, the way
 /// `typeobject.rs w_type_set_version_tag` calls its notify first.
+///
+/// Reaching a slot casts `obj` to `*const Function`, so the carrier test is the
+/// precondition for the cast, not a convenience. `is_function_carrier` is the
+/// right predicate rather than a bare `FUNCTION_TYPE` comparison: the four
+/// types `function_new_impl` stamps — `function`, `builtin_function_or_method`,
+/// `method_descriptor`, `wrapper_descriptor` — all allocate a real `Function`
+/// whose slots are initialised, and skipping any of them would leave a write
+/// unannounced. Under-invalidation is the unsound direction; over-invalidation
+/// is not (`quasiimmut.py`).
+///
+/// The `if getattr(p, mutatefieldname)` test is a `Relaxed` null check of
+/// [`Function::mutate_slots`]: nothing is read through the pointer here, and
+/// [`function_invalidate_now`] reloads it with `Acquire` before touching the
+/// block. A null block is the null `mutate_<name>` of `quasiimmut.py`: nothing
+/// has folded the field, so there is nothing to revoke. Only
+/// [`function_current_qmut_instance`] creates the block.
 ///
 /// # Safety
 /// `obj` must be null or point at a live `PyObject`.
 pub unsafe fn function_notify_quasi_immut(obj: PyObjectRef, slot: QuasiImmutSlot) {
-    if let Some(field) = unsafe { function_quasi_immut_field(obj, slot) } {
-        field.invalidate();
+    if obj.is_null() || !unsafe { is_function_carrier(obj) } {
+        return;
+    }
+    let slots = unsafe {
+        (*(obj as *const Function))
+            .mutate_slots
+            .load(Ordering::Relaxed)
+    };
+    if !slots.is_null() {
+        unsafe { function_invalidate_now(obj, slot.index()) };
+    }
+}
+
+/// `quasiimmut.py make_invalidation_function._invalidate_now`
+/// (`_dont_inline_`). Upstream specializes one per mutate field; the
+/// [`QuasiImmutSlot`] position stands in for that field.
+///
+/// # Safety
+/// `obj` must point at a live function carrier and `index` must be below
+/// [`QUASI_IMMUT_SLOT_COUNT`].
+#[majit_macros::dont_look_inside]
+unsafe fn function_invalidate_now(obj: PyObjectRef, index: usize) {
+    let slots = unsafe {
+        (*(obj as *const Function))
+            .mutate_slots
+            .load(Ordering::Acquire)
+    };
+    if !slots.is_null() {
+        unsafe { &(*slots).0[index] }.invalidate();
     }
 }
 
@@ -2818,19 +2827,18 @@ pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<()
         // generator, coroutine, and async generator remains permitted for
         // compatibility, but warns because the callable's result protocol
         // changes underneath existing references.
-        let old_code = &*(get_pycode(obj) as *const crate::CodeObject);
-        let kind_mask = crate::CodeFlags::GENERATOR
-            | crate::CodeFlags::COROUTINE
-            | crate::CodeFlags::ASYNC_GENERATOR;
+        let kind_mask = crate::astcompiler::consts::CO_GENERATOR
+            | crate::astcompiler::consts::CO_COROUTINE
+            | crate::astcompiler::consts::CO_ASYNC_GENERATOR;
+        let old_flags = (*(getcode(obj) as *const crate::pycode::PyCode)).co_flags;
+        let new_flags = (*(w_code as *const crate::pycode::PyCode)).co_flags;
         // `warn_deprecation` runs the app-level warnings machinery and
         // `function_get_doc` realizes the docstring; both allocate, so publish
         // the two operands and read them back from their root slots rather
         // than storing through a pre-move address.
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[obj, w_code]);
-        if old_code.flags.intersection(kind_mask).bits()
-            != (*raw_code).flags.intersection(kind_mask).bits()
-        {
+        if old_flags & kind_mask != new_flags & kind_mask {
             crate::warn::warn_deprecation(
                 "Assigning a code object of non-matching type is deprecated (e.g., from a generator to a plain function)",
             )?;
@@ -4114,6 +4122,7 @@ pub fn funccall(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
 /// paired `direct_fn` returns the same `(type, value, traceback)` tuple as the
 /// regular closure but skips the builtin-call setup.
 type ExcInfoDirectFn = fn(&mut crate::pyframe::PyFrame) -> PyObjectRef;
+#[majit_macros::prebuilt_static]
 static SYS_EXC_INFO_CODE: std::sync::atomic::AtomicPtr<PyObject> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static SYS_EXC_INFO_DIRECT_FN: std::sync::OnceLock<ExcInfoDirectFn> = std::sync::OnceLock::new();

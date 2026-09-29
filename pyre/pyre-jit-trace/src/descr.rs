@@ -951,12 +951,12 @@ fn build_object_descr_group_with_field_indices(
 }
 
 /// `build_object_descr_group_with_def_path` plus GC edges that the
-/// positional `fields` census does not name.  `extra_gc_edges` join the
-/// `PyObject.w_class` edge every group already carries: they land in
-/// `gc_fielddescrs` — which is what `rewrite.py clear_gc_fields`
-/// walks to zero a fresh object's GC-pointer slots — while staying out of
-/// the positional `all_fielddescrs` list that `field_descr_from_group`
-/// indexes.
+/// positional `fields` census does not name. Headered groups prepend the
+/// inherited `PyObject.w_class` leaf (`heaptracker.py:68-71` recursion,
+/// keyed `(PyObject, w_class)`) onto `all_fielddescrs`; `extra_gc_edges`
+/// join that same Arc in `gc_fielddescrs` so `rewrite.py clear_gc_fields`
+/// still zeroes the slot. `field_descr_from_group` indexes the payload
+/// vector, which does not include the nested leaf.
 fn build_object_descr_group_with_extra_gc_edges(
     obj_size: usize,
     type_id: u32,
@@ -984,47 +984,62 @@ fn build_object_descr_group_with_extra_gc_edges(
     } else {
         0
     };
-    let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = fields
+    // The inherited header leaf is prepended from `(PyObject, w_class)`,
+    // not minted under this STRUCT. Drop a spec that names those bytes so
+    // the outer list contains one descr object for the nested field.
+    let payload: Vec<_> = fields
+        .iter()
+        .copied()
+        .filter(|&(_, offset, ..)| headerless || offset != pyre_object::pyobject::W_CLASS_OFFSET)
+        .collect();
+    let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = payload
         .iter()
         .enumerate()
         .map(
             |(
                 index_in_parent,
                 &(field_key, offset, field_size, field_type, signed, immutable, quasi_immutable),
-            )| majit_ir::descr::SimpleFieldDescrSpec {
-                index: field_indices
-                    .get(index_in_parent)
-                    .copied()
-                    .unwrap_or_else(|| stable_field_index(offset, field_size, field_type, signed)),
-                field_key: field_key.to_string(),
-                // `descr.py get_field_descr` stores one FieldDescr per
-                // `(STRUCT, fieldname)`. `fieldname` is the cache key; the
-                // display name is `STRUCT._name + '.' + fieldname`. A key that
-                // already begins with that prefix is the fieldname, so
-                // prefixing it again mints a second descr (`PyFrame.flags`
-                // versus `PyFrame.PyFrame.flags`) for the same offset.
-                name: if simple_name.is_empty() || field_key.starts_with(&format!("{simple_name}."))
-                {
-                    field_key.to_string()
+            )| {
+                // `descr.py get_field_descr` caches by the bare fieldname;
+                // the display name is `STRUCT._name + '.' + fieldname`.
+                let field_key = if simple_name.is_empty() {
+                    field_key
                 } else {
-                    format!("{simple_name}.{field_key}")
-                },
-                offset,
-                field_size,
-                field_type,
-                is_immutable: immutable,
-                is_quasi_immutable: quasi_immutable,
-                flag: runtime_array_flag(field_type, signed),
-                virtualizable: false,
-                // pyre's layout invariant, not a name rule: the inherited
-                // `PyObject` header sits at `W_CLASS_OFFSET` in every object
-                // group. A name rule cannot express this — `Method` has a
-                // *payload* field called `w_class` (the class the bound
-                // function was found on) whose qualified name
-                // `"Method.w_class"` matches the header spelling exactly, and
-                // it sits ahead of the real header in the field list.
-                is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
-                index_in_parent,
+                    field_key
+                        .strip_prefix(simple_name)
+                        .and_then(|rest| rest.strip_prefix('.'))
+                        .unwrap_or(field_key)
+                };
+                majit_ir::descr::SimpleFieldDescrSpec {
+                    index: field_indices
+                        .get(index_in_parent)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            stable_field_index(offset, field_size, field_type, signed)
+                        }),
+                    field_key: field_key.to_string(),
+                    name: if simple_name.is_empty() {
+                        field_key.to_string()
+                    } else {
+                        format!("{simple_name}.{field_key}")
+                    },
+                    offset,
+                    field_size,
+                    field_type,
+                    is_immutable: immutable,
+                    is_quasi_immutable: quasi_immutable,
+                    flag: runtime_array_flag(field_type, signed),
+                    virtualizable: false,
+                    // pyre's layout invariant, not a name rule: the inherited
+                    // `PyObject` header sits at `W_CLASS_OFFSET` in every object
+                    // group. A name rule cannot express this — `Method` has a
+                    // *payload* field called `w_class` (the class the bound
+                    // function was found on) whose qualified name
+                    // `"Method.w_class"` matches the header spelling exactly, and
+                    // it sits ahead of the real header in the field list.
+                    is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
+                    index_in_parent,
+                }
             },
         )
         .collect();
@@ -1034,7 +1049,10 @@ fn build_object_descr_group_with_extra_gc_edges(
             .all(|s| s.field_type != Type::Ref || s.field_size == WORD),
         "a Ref field is one pointer; size it WORD, not a literal"
     );
-    let mut gc_edges: Vec<Arc<dyn FieldDescr>> = vec![W_CLASS_FIELD_DESCR.clone()];
+    let mut gc_edges: Vec<Arc<dyn FieldDescr>> = Vec::new();
+    if !headerless {
+        gc_edges.push(shared_pyobject_w_class_descr() as Arc<dyn FieldDescr>);
+    }
     gc_edges.extend(extra_gc_edges.iter().cloned());
     let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
         SIZE_DESCR_TAG | (obj_size as u32 & 0x0FFF_FFFF),
@@ -2215,7 +2233,7 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // last, outside the offset ordering, because the analyzer counts
             // only the struct's own fields.
             (
-                "PyObject.w_class",
+                "w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
                 WORD,
                 Type::Ref,
@@ -2356,6 +2374,9 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // escape a guard and be materialized, so the inherited Python
             // class needs to be a proper virtual field of this group — same
             // reasoning as the `PyObject.w_class` entry on W_ListObject.
+            // Keyed under a nested-struct spelling because this STRUCT
+            // already has a payload field named `w_class`
+            // (`descr.py cache[STRUCT][fieldname]`).
             (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
@@ -2525,7 +2546,7 @@ static W_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // to be a proper virtual field of this group -- the same reason
             // `W_Super` carries one.
             (
-                "PyObject.w_class",
+                "w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
                 WORD,
                 Type::Ref,
@@ -2562,7 +2583,7 @@ static W_SUPER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             field("super_type", core::mem::offset_of!(W_Super, super_type)),
             field("obj_type", core::mem::offset_of!(W_Super, obj_type)),
             field("obj", core::mem::offset_of!(W_Super, obj)),
-            field("PyObject.w_class", pyre_object::pyobject::W_CLASS_OFFSET),
+            field("w_class", pyre_object::pyobject::W_CLASS_OFFSET),
         ],
         "W_Super",
         "descriptor::W_Super",
@@ -2685,7 +2706,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // the same parent group as tuple objects so its SetfieldGc is a
             // proper virtual field and materialization reproduces w_list_new.
             (
-                "PyObject.w_class",
+                "w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
                 WORD,
                 Type::Ref,
@@ -2784,7 +2805,7 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyObject.w_class",
+                "w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
                 WORD,
                 Type::Ref,
@@ -2836,7 +2857,7 @@ static SPECIALISED_TUPLE_II_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 false,
             ),
             (
-                "PyObject.w_class",
+                "w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
                 WORD,
                 Type::Ref,
@@ -2885,7 +2906,7 @@ static SPECIALISED_TUPLE_FF_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 false,
             ),
             (
-                "PyObject.w_class",
+                "w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
                 WORD,
                 Type::Ref,
@@ -2934,7 +2955,7 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 false,
             ),
             (
-                "PyObject.w_class",
+                "w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
                 WORD,
                 Type::Ref,
@@ -3140,32 +3161,15 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
-/// `rvirtualizable.py` appends `('vable_token', llmemory.GCREF)` to the
-/// virtualizable's own fields, so upstream's `gc_fielddescrs` names it and
-/// `clear_gc_fields` zeroes the slot on every `new`.  pyre declares
-/// `PyFrame.vable_token` as a plain `usize` and the positional census below
-/// does not list it, so without this edge a JIT-inlined
-/// `NewWithVtable(pyframe_size_descr())` leaves the slot holding recycled
-/// nursery bytes — which `emit_force_virtualizable`'s `GETFIELD_GC_R` then
-/// reads as a live GC reference (`pyjitpl.py` `emit_force_virtualizable`).
-static PYFRAME_VABLE_TOKEN_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
-    Arc::new(PyreFieldDescr {
-        offset: crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
-        field_size: std::mem::size_of::<usize>(),
-        field_type: Type::Ref,
-        signed: false,
-        immutable: false,
-        quasi_immutable: false,
-        name: "vable_token",
-        is_class_word: false,
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
-});
-
+/// The inlined header's non-typeptr leaf (`w_class`) is a row of the
+/// same list: `heaptracker.py all_fielddescrs` recurses into an inlined
+/// `lltype.Struct` and skips only Void and `typeptr`. The virtualizable
+/// token is `llmemory.GCREF` (`VirtualizableInstanceRepr._setup_repr_llfields`),
+/// so it is a `Type::Ref` row of `gc_fielddescrs` and `clear_gc_fields`
+/// zeroes it. The factory prepends the nested leaf so payload accessors
+/// that index this group keep their slots.
 static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_extra_gc_edges(
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
         PYFRAME_GC_TYPE_ID,
         // `NewWithVtable` writes this typeptr at `cpu.vtable_offset`
@@ -3218,7 +3222,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.debugdata",
+                "debugdata",
                 crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
                 WORD,
                 Type::Ref,
@@ -3227,7 +3231,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.f_generator_wref",
+                "f_generator_wref",
                 crate::frame_layout::PYFRAME_F_GENERATOR_WREF_OFFSET,
                 WORD,
                 Type::Ref,
@@ -3236,7 +3240,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.w_yielding_from",
+                "w_yielding_from",
                 crate::frame_layout::PYFRAME_W_YIELDING_FROM_OFFSET,
                 WORD,
                 Type::Ref,
@@ -3245,7 +3249,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.f_backref",
+                "f_backref",
                 crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
                 WORD,
                 Type::Ref,
@@ -3254,7 +3258,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.w_builtin",
+                "w_builtin",
                 crate::frame_layout::PYFRAME_W_BUILTIN_OFFSET,
                 WORD,
                 Type::Ref,
@@ -3264,10 +3268,10 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             ),
             // `pyframe.py:80 escaped` and its neighbours live in one `u8`, so
             // the traced `mark_as_escaped` is a byte-wide read-or-write, not a
-            // word store.  Appended last: the accessors above address this
-            // group by index.
+            // word store.  Appended after the named accessors that address
+            // this group by index.
             (
-                "PyFrame.flags",
+                "flags",
                 crate::frame_layout::PYFRAME_FLAGS_OFFSET,
                 std::mem::size_of::<u8>(),
                 Type::Int,
@@ -3276,7 +3280,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.failed_attr_cleanup",
+                "failed_attr_cleanup",
                 crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
                 std::mem::size_of::<u8>(),
                 Type::Int,
@@ -3284,13 +3288,27 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            (
+                "vable_token",
+                crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "PyFrame",
         "pyframe::PyFrame",
-        std::slice::from_ref(&PYFRAME_VABLE_TOKEN_FIELD_DESCR),
-        &[],
-        "",
-        false,
     )
 });
 
@@ -3533,45 +3551,53 @@ use pyre_object::{
 // Re-import the rest without duplication
 use pyre_object::{COMPLEX_TYPE, FLOAT_TYPE, INT_TYPE};
 
-/// Field descriptor for `PyObject.w_class` (Ref, `w_class?`).
-///
-/// PyObject layout: [ob_type(8)] [w_class(8)]
-/// The w_class field holds the Python class for all object types.
-///
-/// RPython parity: jit.promote(w_obj.__class__) reads typeptr via
-/// getfield_gc_r then GUARD_VALUE. This is the pyre equivalent — a
-/// field read on the common PyObject header.
-///
-/// `__class__` assignment can change it (`objectobject.py
-/// descr_set___class__`), so the field is `?` not frozen: the optimizer
-/// folds the load, and `notify_w_class_mutated` revokes those loops.
-fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
-    // Declares itself the class word (`is_class_word`), which is what
-    // `FieldDescr::is_w_class()` reports; the name is for diagnostics only
-    // and no consumer reads it. OptVirtualize must resolve this field from
-    // the object's class identity rather than indexing it against a
-    // virtual's value fields (its `index_in_parent` of 0 would otherwise
-    // collide with the first value field, e.g. `W_IntObject.intval`).
-    Arc::new(PyreFieldDescr {
-        offset: pyre_object::pyobject::W_CLASS_OFFSET,
-        // One pointer, sized from the target: the build-time descr pool
-        // sizes this field by `layout::target_word_size()` (`call.rs
-        // get_type_flag`), and the two universes must agree for the
-        // canonical-descr bridge (`make_descr_from_bh`) and for
-        // `state.rs materialize_virtual_object`'s w_class branch, both of
-        // which compare widths. A fixed 8 would also overlap the first
-        // payload field on wasm32, where the header is 8 bytes.
-        field_size: WORD,
-        field_type: Type::Ref,
-        signed: false,
-        immutable: false,
-        quasi_immutable: true,
-        name: "w_class",
-        is_class_word: true,
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
+/// `descr.py get_field_descr(gccache, PyObject, "w_class")` — one Arc,
+/// cached by `(STRUCT, fieldname)`, and the leaf
+/// `heaptracker.py all_fielddescrs` appends when it recurses into the
+/// inlined header.
+fn shared_pyobject_w_class_descr() -> Arc<majit_ir::descr::SimpleFieldDescr> {
+    static DESCR: LazyLock<Arc<majit_ir::descr::SimpleFieldDescr>> = LazyLock::new(|| {
+        use majit_ir::descr::{ArrayFlag, LLType, gc_cache, path_hash};
+        let names = [
+            "PyObject",
+            "pyobject::PyObject",
+            "pyre_object::pyobject::PyObject",
+        ];
+        let mut gc = gc_cache().lock();
+        let size = std::mem::size_of::<pyre_object::pyobject::PyObject>();
+        let mut descr: Option<Arc<majit_ir::descr::SimpleFieldDescr>> = None;
+        for name in names {
+            let key = LLType::Struct(path_hash(name));
+            gc.get_size_descr(key.clone(), size, 0, false);
+            match descr.as_ref() {
+                None => {
+                    descr = Some(gc.get_field_descr_declaring(
+                        key,
+                        "w_class",
+                        Some("PyObject.w_class"),
+                        pyre_object::pyobject::W_CLASS_OFFSET,
+                        WORD,
+                        Type::Ref,
+                        false,
+                        true,
+                        ArrayFlag::Pointer,
+                        OBJECT_W_CLASS_INDEX,
+                        false,
+                        Some(0),
+                        Some(true),
+                    ));
+                }
+                Some(fd) => {
+                    gc._cache_field
+                        .entry(key)
+                        .or_default()
+                        .insert("w_class".to_string(), fd.clone());
+                }
+            }
+        }
+        descr.expect("PyObject.w_class field descr")
+    });
+    DESCR.clone()
 }
 
 /// The single `w_class` field descriptor for the shared `PyObject` header.
@@ -3583,10 +3609,11 @@ fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
 /// so do the short-preamble export and `force_from_effectinfo`. Minting a
 /// fresh `Arc` per call gave each `w_class` read in a trace its own identity,
 /// so two reads of the same header could never share a cache entry.
-static W_CLASS_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(new_w_class_field_descr);
+static W_CLASS_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> =
+    LazyLock::new(|| shared_pyobject_w_class_descr() as Arc<dyn FieldDescr>);
 
 pub fn w_class_descr() -> DescrRef {
-    W_CLASS_FIELD_DESCR.clone() as DescrRef
+    shared_pyobject_w_class_descr() as DescrRef
 }
 
 /// The canonical `w_class` (Python class object) for instances of the type
@@ -3951,7 +3978,7 @@ pub fn function_can_change_code_descr() -> DescrRef {
 /// standalone `w_class_descr`) so an inline emit's store is a virtual field of
 /// the same size descr and materialization reproduces the header.
 pub fn function_header_w_class_descr() -> DescrRef {
-    function_field_descr(pyre_object::pyobject::W_CLASS_OFFSET)
+    w_class_descr()
 }
 
 /// Size descriptor for `Function` allocation via `NewWithVtable`
@@ -4067,7 +4094,7 @@ pub fn cell_family_descr() -> DescrRef {
 /// Inherited `PyObject.w_class` on a `Cell` — kept in this group for the same
 /// reason [`super_header_w_class_descr`] is kept in the `W_Super` one.
 pub fn cell_header_w_class_descr() -> DescrRef {
-    field_descr_from_group(&W_CELL_DESCR_GROUP, 2)
+    w_class_descr()
 }
 
 /// Size descriptor for `nestedscope.py Cell` allocation via `NewWithVtable`
@@ -4099,7 +4126,7 @@ pub fn super_obj_descr() -> DescrRef {
 /// class stamped by `w_super_new`'s header, kept in this group for the same
 /// reason [`method_header_w_class_descr`] is kept in the `Method` one.
 pub fn super_header_w_class_descr() -> DescrRef {
-    field_descr_from_group(&W_SUPER_DESCR_GROUP, 3)
+    w_class_descr()
 }
 
 /// Size descriptor for `W_Super` allocation via `NewWithVtable`
@@ -4497,7 +4524,7 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
         &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
         &[
             (
-                "W_ObjectObject.map",
+                "map",
                 core::mem::offset_of!(pyre_object::W_ObjectObject, map),
                 // `map` is a `*const MapNode` erased to an opaque Int word, so
                 // its width is one machine word — 4 bytes on wasm32, 8 on
@@ -4512,7 +4539,7 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
                 false,
             ),
             (
-                "W_ObjectObject.storage",
+                "storage",
                 core::mem::offset_of!(pyre_object::W_ObjectObject, storage),
                 WORD,
                 Type::Ref,
@@ -4521,7 +4548,7 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
                 false,
             ),
             (
-                "PyObject.w_class",
+                "w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5979,7 +6006,7 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
 /// `w_class_descr`) so the instantiation emit's store is a virtual field of
 /// the same size descr; see [`W_OBJECT_OBJECT_DESCR_GROUP`].
 pub fn object_header_w_class_descr() -> DescrRef {
-    field_descr_from_group(&W_OBJECT_OBJECT_DESCR_GROUP, 2)
+    w_class_descr()
 }
 
 /// Size descriptor for an exact `object()` allocation via `NewWithVtable`
@@ -6056,7 +6083,7 @@ pub fn list_ascii_items_block_descr() -> DescrRef {
 }
 
 pub fn list_w_class_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 7)
+    w_class_descr()
 }
 
 /// `Ptr(GcArray(OBJECTPTR))` — `wrappeditems` body per
@@ -6070,11 +6097,11 @@ pub fn tuple_wrappeditems_descr() -> DescrRef {
 }
 
 pub fn tuple_w_class_descr() -> DescrRef {
-    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 1)
+    w_class_descr()
 }
 
 pub fn tuple_hash_descr() -> DescrRef {
-    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 2)
+    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 1)
 }
 
 /// `W_SpecialisedTupleObject_ii.value0` — inline `i64` per
@@ -6089,11 +6116,11 @@ pub fn specialised_tuple_ii_value1_descr() -> DescrRef {
 }
 
 pub fn specialised_tuple_ii_w_class_descr() -> DescrRef {
-    field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 2)
+    w_class_descr()
 }
 
 pub fn specialised_tuple_ii_hash_descr() -> DescrRef {
-    field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 3)
+    field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 2)
 }
 
 /// `W_SpecialisedTupleObject_ff.value0` — inline `f64`. Immutable.
@@ -6107,11 +6134,11 @@ pub fn specialised_tuple_ff_value1_descr() -> DescrRef {
 }
 
 pub fn specialised_tuple_ff_w_class_descr() -> DescrRef {
-    field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 2)
+    w_class_descr()
 }
 
 pub fn specialised_tuple_ff_hash_descr() -> DescrRef {
-    field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 3)
+    field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 2)
 }
 
 /// `W_SpecialisedTupleObject_oo.value0` — inline `PyObjectRef`. Immutable.
@@ -6125,11 +6152,11 @@ pub fn specialised_tuple_oo_value1_descr() -> DescrRef {
 }
 
 pub fn specialised_tuple_oo_w_class_descr() -> DescrRef {
-    field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 2)
+    w_class_descr()
 }
 
 pub fn specialised_tuple_oo_hash_descr() -> DescrRef {
-    field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 3)
+    field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 2)
 }
 
 /// `ItemsBlock.capacity` — the GcArray length header at offset 0 of
@@ -7222,12 +7249,18 @@ fn exception_user_mapdict_descr(extended: bool, offset: usize) -> DescrRef {
 }
 
 fn w_exception_field_at(group: &PyreObjectDescrGroup, offset: usize) -> DescrRef {
-    let field = group
-        .field_descrs
+    if let Some(field) = group.field_descrs.iter().position(|d| d.offset() == offset) {
+        return field_descr_from_group(group, field);
+    }
+    if let Some(fd) = group
+        .size_descr
+        .all_fielddescrs()
         .iter()
-        .position(|d| d.offset() == offset)
-        .unwrap_or_else(|| panic!("exception descr group has no field at offset {offset}"));
-    field_descr_from_group(group, field)
+        .find(|d| d.offset() == offset)
+    {
+        return fd.clone() as DescrRef;
+    }
+    panic!("exception descr group has no field at offset {offset}")
 }
 
 /// Locate a field of the per-kind exception group by offset.  See
@@ -7754,7 +7787,22 @@ static GIL_READY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = Lazy
         index_in_parent: 0,
         is_class_word: Some(false),
     };
-    majit_ir::descr::make_simple_descr_group_with_flags(u32::MAX, 8, 0, 0, false, false, &[spec])
+    // `descr.py get_field_descr` caches `(STRUCT, fieldname)`. The opcode
+    // EffectInfo member names this STRUCT by `path_hash("gil_ready::GilReadyState")`.
+    // A cache_key of 0 never occupies that slot, so `stamp_effect_info_descr`
+    // cannot find the quasi field `gil.py` `GILThreadLocals.gil_ready` already is.
+    let cache_key = majit_ir::descr::path_hash("gil_ready::GilReadyState");
+    majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+        u32::MAX,
+        8,
+        0,
+        cache_key,
+        0,
+        false,
+        true,
+        &[spec],
+        &[],
+    )
 });
 
 pub fn gil_ready_descr() -> DescrRef {
@@ -7860,6 +7908,18 @@ pub fn pyframe_failed_attr_cleanup_descr() -> DescrRef {
         .iter()
         .position(|d| d.offset() == crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET)
         .expect("PyFrame descr group has no failed_attr_cleanup field");
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, index)
+}
+
+/// `PyFrame.vable_token` — the virtualizable token, a GCREF row of this
+/// group (`VirtualizableInstanceRepr._setup_repr_llfields`). Located by
+/// offset like [`pyframe_flags_descr`].
+pub fn pyframe_vable_token_descr() -> DescrRef {
+    let index = PYFRAME_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET)
+        .expect("PyFrame descr group has no vable_token field");
     field_descr_from_group(&PYFRAME_DESCR_GROUP, index)
 }
 
@@ -8529,13 +8589,10 @@ mod tests {
                 Some(_) => {}
             }
 
-            // (b) the positional answer indexes that same field, and answers
-            // at all exactly when this group's own positional list holds the
-            // header row.  Ten of the groups below reach the header only as a
-            // gc-only edge, which `with_extra_gc_fielddescr` keeps out of
-            // `all_fielddescrs()` precisely so positional indexing is
-            // unaffected — for those `None` is the required answer, and a
-            // `Some` would mean some *payload* field claimed the class word.
+            // (b) the positional answer indexes that same field.
+            // `heaptracker.py:68-71` prepends the nested header leaf, so
+            // every headered group lists it and `class_word_index_in_parent`
+            // must answer.
             let header_is_positional = size
                 .all_fielddescrs()
                 .iter()
@@ -8757,12 +8814,78 @@ mod tests {
         let descr = pyframe_size_descr();
         let size = descr.as_size_descr().expect("PyFrame SizeDescr");
         assert!(
-            size.gc_fielddescrs()
+            size.all_fielddescrs()
                 .iter()
                 .any(|fd| fd.offset() == crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET),
-            "emit_force_virtualizable reads vable_token with GETFIELD_GC_R, so \
-             clear_gc_fields must zero it on a JIT-inlined frame allocation"
+            "heaptracker.py all_fielddescrs includes vable_token so the \
+             codewriter's store resolves through the same Arc"
         );
+        assert!(
+            size.gc_fielddescrs().iter().any(|fd| {
+                fd.offset() == crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET
+                    && fd.field_type() == Type::Ref
+            }),
+            "VirtualizableInstanceRepr._setup_repr_llfields types the token \
+             GCREF, so it is a gc_fielddescrs row clear_gc_fields zeroes"
+        );
+    }
+
+    /// `descr.py get_field_descr` caches one object per `(STRUCT, fieldname)`.
+    /// The descr that lookup returns for each PyFrame field is the row in
+    /// `size_descr.all_fielddescrs`, and that row's `index_in_parent` is its
+    /// position (`heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`).
+    #[test]
+    fn pyframe_get_field_descr_is_the_size_descrs_listed_row() {
+        LazyLock::force(&PYFRAME_DESCR_GROUP);
+        let size = pyframe_size_descr();
+        let sd = size.as_size_descr().expect("PyFrame SizeDescr");
+        let listed = sd.all_fielddescrs();
+        assert!(
+            !listed.is_empty(),
+            "PyFrame SizeDescr.all_fielddescrs must not be empty"
+        );
+        let key = majit_ir::descr::LLType::Struct(sd.cache_key());
+        let mut gc = majit_ir::descr::gc_cache().lock();
+        for (i, row) in listed.iter().enumerate() {
+            let fd = row.as_field_descr().expect("all_fielddescrs row");
+            assert_eq!(
+                fd.index_in_parent(),
+                i,
+                "all_fielddescrs()[{i}] index_in_parent"
+            );
+            // Nested leaves are cached by `(INNER, fieldname)`
+            // (`descr.py get_field_descr` / `heaptracker.py:71`).
+            let lookup_key = fd
+                .get_parent_descr()
+                .and_then(|parent| {
+                    parent
+                        .as_size_descr()
+                        .map(|size| majit_ir::descr::LLType::Struct(size.cache_key()))
+                })
+                .unwrap_or_else(|| key.clone());
+            let cached = gc.get_field_descr(
+                lookup_key,
+                fd.field_key(),
+                Some(fd.field_name()),
+                fd.offset(),
+                fd.field_size(),
+                fd.field_type(),
+                fd.is_immutable(),
+                fd.is_quasi_immutable(),
+                fd.field_flag(),
+                row.index(),
+                false,
+                Some(i),
+            );
+            assert!(
+                std::ptr::eq(
+                    std::sync::Arc::as_ptr(&cached) as *const (),
+                    std::sync::Arc::as_ptr(row) as *const (),
+                ),
+                "get_field_descr({:?}) must be all_fielddescrs()[{i}]",
+                fd.field_key(),
+            );
+        }
     }
 
     #[test]
@@ -8826,7 +8949,7 @@ mod tests {
         for i in 0..last_increasing {
             assert!(
                 fields[i].offset() < fields[i + 1].offset(),
-                "offsets 0..={last_increasing} must be strictly increasing: {}@{} then {}@{}",
+                "offsets 1..={last_increasing} must be strictly increasing: {}@{} then {}@{}",
                 fields[i].field_name(),
                 fields[i].offset(),
                 fields[i + 1].field_name(),
@@ -10596,6 +10719,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("interp_exceptions::W_ExceptionExtendedUser", || {
         let _ = w_exception_descrs_for(ExcKind::FileNotFoundError, true);
     }),
+    ("gil_ready::GilReadyState", || {
+        LazyLock::force(&GIL_READY_DESCR_GROUP);
+    }),
 ];
 
 /// The [`DECLARED_GROUPS`] rows by the `GcCache` key each one owns.
@@ -10627,6 +10753,21 @@ fn force_declared_group(cache_key: u64) {
         if majit_ir::descr::path_hash(entry.def_path) == cache_key {
             break;
         }
+    }
+}
+
+/// Publish every runtime object group into `gc_cache._cache_size` before
+/// synthetic struct tids are allocated.
+///
+/// `descr.py get_size_descr` keeps one SizeDescr per STRUCT, and
+/// `GcLLDescr_framework.init_size_descr` stamps that object's tid from
+/// `TypeLayoutBuilder.get_type_id`. Each group here already carries its
+/// collector id. Forcing it first makes that object the cache entry, so
+/// `register_unresolved_struct_tids` skips it instead of assigning a
+/// synthetic id to a second descr for the same key.
+pub fn force_declared_object_groups() {
+    for (_, force) in DECLARED_GROUPS {
+        force();
     }
 }
 

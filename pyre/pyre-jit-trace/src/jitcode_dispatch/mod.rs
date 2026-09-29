@@ -1709,13 +1709,6 @@ fn emit_traceback_node<Sym: WalkSym>(
             3,
         ),
         (ctx.trace_ctx.const_ref(site.w_code as i64), 4),
-        (
-            ctx.trace_ctx
-                .const_ref(pyre_object::pyobject::get_instantiate(
-                    &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
-                ) as i64),
-            5,
-        ),
     ];
     for (value, index) in fields {
         let descr = crate::descr::pytraceback_field_descr(index);
@@ -1724,6 +1717,19 @@ fn emit_traceback_node<Sym: WalkSym>(
         ctx.trace_ctx
             .heapcache_setfield_cached(traceback, descr.index(), value);
     }
+    let header_class = ctx
+        .trace_ctx
+        .const_ref(pyre_object::pyobject::get_instantiate(
+            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
+        ) as i64);
+    let header_descr = crate::descr::w_class_descr();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[traceback, header_class],
+        header_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(traceback, header_descr.index(), header_class);
 
     // `f_lineno` resolves through `offset2lineno(pycode, last_instr)` on every
     // read, so the frame itself has to carry the coordinate — the node's own
@@ -14484,14 +14490,9 @@ fn handle<Sym: WalkSym>(
             }
             let concrete = ctx.trace_ctx.execute_new_allocation(&descr, true);
             // Rooted by the `set_opref_concrete` stamp below, as in `new/d>r`.
-            if let Some(Value::Ref(majit_ir::GcRef(ptr))) = concrete
-                && let Some(w_class) = descr.as_size_descr().and_then(|size| size.w_class_obj())
-            {
-                unsafe {
-                    (*(ptr as *mut pyre_object::PyObject)).w_class =
-                        w_class as pyre_object::PyObjectRef;
-                }
-            }
+            // `bh_new_with_vtable` writes both header words when the backend
+            // has a class-word offset, so this arm does not store `w_class`
+            // again.
             // pyjitpl.py `execute_new_with_vtable`.
             ctx.trace_ctx
                 .profiler()

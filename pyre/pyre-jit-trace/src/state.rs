@@ -9863,23 +9863,10 @@ fn materialize_concrete_virtual_ptr(
             if ptr == 0 {
                 return majit_ir::GcRef::NULL;
             }
-            // Pyre adaptation: bh_new_with_vtable writes vtable at
-            // vtable_offset but PyObject.w_class needs separate init
-            // (`PyObject.w_class` in pyobject.rs). Matches
-            // materialize_virtual_object.
-            //
-            // `w_class_obj()` — not `get_instantiate(vtable)` — is the source:
-            // a vtable word is only a `PyType` pointer for a pyre object
-            // descr.  `JitVirtualRef` carries the `jit_virtual_ref_vtable`
-            // type-id constant there (`virtualref.py:21-23`) and its offset-8
-            // slot is `virtual_token`, not `w_class`, so it returns None and
-            // this seeding is skipped.
-            if let Some(w_class) = size_descr.w_class_obj() {
-                unsafe {
-                    let pyobj = ptr as *mut pyre_object::PyObject;
-                    (*pyobj).w_class = w_class as pyre_object::pyobject::PyObjectRef;
-                }
-            }
+            // `bh_new_with_vtable` writes the type word and, when the
+            // backend has a class-word offset, `resolve_w_class_obj`.
+            // `JitVirtualRef` resolves to None, so its `virtual_token`
+            // slot is left alone (`virtualref.py`).
             let gcref = majit_ir::GcRef(ptr as usize);
             // resume.py:620 cache BEFORE filling fields (circular ref safe)
             cache.set_concrete_ptr(vidx, gcref);

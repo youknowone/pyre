@@ -65,6 +65,7 @@ macro_rules! locals_w_mut {
 /// attached to this type by the `frame` typedef; until then it is a bare
 /// identity tag so a frame carries a valid `ob_type` like every other
 /// W_Root (mirrors `pytraceback::PYTRACEBACK_TYPE`).
+#[majit_macros::prebuilt_static]
 pub static FRAME_TYPE: PyType = new_pytype("frame");
 
 /// CPython 3.14 `FrameLocalsProxy` — the write-through mapping exposed by
@@ -1629,7 +1630,46 @@ pub unsafe fn alloc_fixed_array_with_header(
 
 /// Allocate a frame locals array in the lifetime regime selected by its owner.
 /// The old-gen form is the type-9 GcArray layout `[GcHeader | len | items]`.
+///
+/// `pyframe.py __init__` `[None] * size`: the allocation and its fill loop run
+/// behind one residual call per regime, selected here.
 unsafe fn alloc_frame_locals_array(
+    len: usize,
+    fill: pyre_object::PyObjectRef,
+    allocation: FrameLocalsArrayAllocation,
+) -> *mut FixedObjectArray {
+    match allocation {
+        FrameLocalsArrayAllocation::NurseryGc => alloc_frame_locals_array_nursery(len, fill),
+        FrameLocalsArrayAllocation::OldGenGc => alloc_frame_locals_array_old_gen(len, fill),
+        FrameLocalsArrayAllocation::StdAlloc => alloc_frame_locals_array_std(len, fill),
+    }
+}
+
+#[majit_macros::dont_look_inside]
+fn alloc_frame_locals_array_nursery(
+    len: usize,
+    fill: pyre_object::PyObjectRef,
+) -> *mut FixedObjectArray {
+    unsafe { alloc_frame_locals_array_in(len, fill, FrameLocalsArrayAllocation::NurseryGc) }
+}
+
+#[majit_macros::dont_look_inside]
+fn alloc_frame_locals_array_old_gen(
+    len: usize,
+    fill: pyre_object::PyObjectRef,
+) -> *mut FixedObjectArray {
+    unsafe { alloc_frame_locals_array_in(len, fill, FrameLocalsArrayAllocation::OldGenGc) }
+}
+
+#[majit_macros::dont_look_inside]
+fn alloc_frame_locals_array_std(
+    len: usize,
+    fill: pyre_object::PyObjectRef,
+) -> *mut FixedObjectArray {
+    unsafe { alloc_frame_locals_array_in(len, fill, FrameLocalsArrayAllocation::StdAlloc) }
+}
+
+unsafe fn alloc_frame_locals_array_in(
     len: usize,
     fill: pyre_object::PyObjectRef,
     allocation: FrameLocalsArrayAllocation,
@@ -1637,11 +1677,10 @@ unsafe fn alloc_frame_locals_array(
     let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
         + len * std::mem::size_of::<pyre_object::PyObjectRef>();
     let raw = match allocation {
-        FrameLocalsArrayAllocation::NurseryGc => pyre_object::gc_hook::GcAllocOutcome::from_hook(
-            pyre_object::gc_hook::try_gc_alloc(pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID, payload),
-        )
-        .allocated_or_abort(payload)
-        .unwrap_or(std::ptr::null_mut()),
+        FrameLocalsArrayAllocation::NurseryGc => pyre_object::gc_hook::try_gc_alloc_nursery_raw(
+            pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
+            payload,
+        ),
         FrameLocalsArrayAllocation::OldGenGc => pyre_object::gc_hook::try_gc_alloc_stable_raw(
             pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
             payload,
@@ -2063,7 +2102,7 @@ impl FrameBox {
         let register_final = unsafe {
             crate::pycode::w_code_yields_inside_try(self.pycode as pyre_object::PyObjectRef)
         };
-        let is_coroutine = self.code().flags.contains(crate::CodeFlags::COROUTINE);
+        let is_coroutine = self.co_flags() & crate::astcompiler::consts::CO_COROUTINE != 0;
         let _origin_roots = pyre_object::gc_roots::push_roots();
         let name_slot = name.map(|name| {
             let slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2108,12 +2147,10 @@ impl FrameBox {
         // frames have their own object type.  In particular, a Coroutine is
         // awaitable but is not itself an iterator; `__await__` supplies the
         // separate CoroutineWrapper iterator.
-        let generator = if unsafe {
-            (*frame_ptr)
-                .code()
-                .flags
-                .contains(crate::CodeFlags::ASYNC_GENERATOR)
-        } {
+        let generator = if unsafe { &(*frame_ptr) }.co_flags()
+            & crate::astcompiler::consts::CO_ASYNC_GENERATOR
+            != 0
+        {
             pyre_object::generator::w_async_generator_new(frame_ptr as *mut u8, pycode)
         } else if is_coroutine {
             pyre_object::generator::w_coroutine_new(frame_ptr as *mut u8, pycode)
@@ -2315,8 +2352,17 @@ pub fn unregister_frame_locals_slot(frame_ptr: *mut PyFrame) {
 /// projection, which `vable_projection_census` allows only on
 /// `FrameBox::new`. `inline(never)` keeps the deref in this function's
 /// LLBC so the census does not attribute it to the caller.
+///
+/// The frame is the one its constructor is still building, so the store
+/// re-establishes the constructor's `hint(access_directly=True,
+/// fresh_virtualizable=True)` pair on the pointer, the way `pycode.py
+/// funcrun` re-hints the frame it just built; `pyframe.py __init__` stores
+/// `locals_cells_stack_w` under that hint.
 #[inline(never)]
 unsafe fn store_locals_cells_stack_w(frame_ptr: *mut PyFrame, array: *mut FixedObjectArray) {
+    let frame_ptr = majit_metainterp::jit::hint_fresh_virtualizable(
+        majit_metainterp::jit::hint_access_directly(frame_ptr),
+    );
     unsafe {
         (*frame_ptr).locals_cells_stack_w = array;
     }
@@ -3314,7 +3360,10 @@ pub fn deref_name_and_kind(code: &CodeObject, idx: usize) -> (&str, bool) {
 /// `__class__` cell used by methods.  A class body is non-optimized and the
 /// affected slot is a cell variable, never a free variable (`nonlocal
 /// __class__` must continue to mutate its enclosing cell).
-#[inline]
+///
+/// The answer depends only on the code object, the green key of every frame
+/// that asks, so the call is elidable and a trace folds it to a constant.
+#[majit_macros::elidable_cannot_raise]
 pub fn class_scope_class_deref_is_name(code: &CodeObject, idx: usize) -> bool {
     if code.flags.contains(CodeFlags::OPTIMIZED) {
         return false;
@@ -4156,11 +4205,11 @@ impl PyFrame {
     /// The binding is the canonical `W_DictObject`, not the raw `DictStorage`
     /// proxy, so those opcodes route through the object.
     fn bind_unoptimized_locals_scope(&mut self) {
-        let flags = unsafe { (*pyframe_get_pycode(self)).flags };
-        if flags.contains(CodeFlags::OPTIMIZED) {
+        let flags = self.co_flags();
+        if flags & crate::astcompiler::consts::CO_OPTIMIZED != 0 {
             return;
         }
-        if flags.contains(CodeFlags::NEWLOCALS) {
+        if flags & crate::astcompiler::consts::CO_NEWLOCALS != 0 {
             // `build_class` replaces this with the `__prepare__` namespace via
             // `setdictscope`; an orphan NEWLOCALS frame still has a usable
             // mapping.  `newdict(module=True)` — the mapping a class body binds
@@ -4340,7 +4389,7 @@ impl PyFrame {
     /// not here — `jtransform.py rewrite_op_jit_force_virtualizable` deletes
     /// it from jitcode; the interpreter copy still runs.
     pub fn fget_getdictscope(&mut self) -> Result<PyObjectRef, crate::PyError> {
-        if self.code().flags.contains(crate::CodeFlags::OPTIMIZED)
+        if self.co_flags() & crate::astcompiler::consts::CO_OPTIMIZED != 0
             || self.has_active_hidden_locals()
         {
             return Ok(frame_locals_proxy::new(self as *mut PyFrame as PyObjectRef));
@@ -4363,7 +4412,7 @@ impl PyFrame {
     /// Module and class frames keep handing back their real namespace, which
     /// is what makes a module-level `locals() is globals()` still hold.
     pub fn frame_locals_snapshot(&mut self) -> Result<PyObjectRef, crate::PyError> {
-        if self.code().flags.contains(crate::CodeFlags::OPTIMIZED)
+        if self.co_flags() & crate::astcompiler::consts::CO_OPTIMIZED != 0
             || self.has_active_hidden_locals()
         {
             return self.frame_locals_proxy_snapshot();
@@ -4856,12 +4905,9 @@ impl PyFrame {
         Self::popvalues
     }
 
-    /// PyPy-compatible pop-values helper.
-    /// `pyframe.py popvalues` is `@jit.unroll_safe`. The return is a
-    /// `Vec` (two residual words); until that ABI exists, looking
-    /// inside residualizes a one-slot pointer and the length is
-    /// garbage. Keep the loop residual.
+    /// pyframe.py `popvalues` — `@jit.unroll_safe`.
     #[inline]
+    #[majit_macros::unroll_safe]
     pub fn popvalues(&mut self, n: usize) -> Vec<PyObjectRef> {
         let mut out = vec![PY_NULL; n];
         let mut idx = n;
@@ -4873,14 +4919,14 @@ impl PyFrame {
     }
 
     /// PyPy-compatible `popvalues_mutable`.
-    /// Same residual-ABI constraint as `popvalues`.
     #[inline]
     pub fn popvalues_mutable(&mut self, n: usize) -> Vec<PyObjectRef> {
         self.popvalues(n)
     }
 
-    /// pyframe.py peekvalues. Same residual-ABI constraint as `popvalues`.
+    /// pyframe.py `peekvalues` — `@jit.unroll_safe`.
     #[inline]
+    #[majit_macros::unroll_safe]
     pub fn peekvalues(&self, n: usize) -> Vec<PyObjectRef> {
         let base = self.valuestackdepth - n;
         // Reads cover `[base, valuestackdepth)`; the highest index is
@@ -6002,6 +6048,7 @@ impl PyFrame {
         let locals_slot = locals_roots.base();
         let _ = locals_roots.pin_root(w_locals);
         let code = unsafe { (*frame_anchor.live()).getcode() };
+        let co_flags = unsafe { (*frame_anchor.live()).co_flags() };
         let numlocals = code.varnames.len();
 
         for i in 0..numlocals {
@@ -6028,7 +6075,8 @@ impl PyFrame {
         // Same positional band as `fast2locals`: a filtered `Vec` would
         // residualize iterator adapters under `unroll_safe`.
         let npure = npure_cellvars(code);
-        let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED) && !skip_free_vars;
+        let include_freevars =
+            co_flags & crate::astcompiler::consts::CO_OPTIMIZED != 0 && !skip_free_vars;
         let freevarnames_len = if include_freevars {
             npure + code.freevars.len()
         } else {
@@ -6097,6 +6145,7 @@ impl PyFrame {
         let locals_slot = locals_roots.base();
         let _ = locals_roots.pin_root(w_locals);
         let code = unsafe { (*frame_anchor.live()).getcode() };
+        let co_flags = unsafe { (*frame_anchor.live()).co_flags() };
         let varnames = &code.varnames;
         let numlocals = varnames.len();
 
@@ -6104,7 +6153,7 @@ impl PyFrame {
             // Non-optimized frames expose a bound hidden slot through a
             // FrameLocalsProxy snapshot instead.  Copying it into the actual
             // module/class namespace would leak the comprehension variable.
-            if hidden_local(code, i) && !code.flags.contains(CodeFlags::OPTIMIZED) {
+            if hidden_local(code, i) && co_flags & crate::astcompiler::consts::CO_OPTIMIZED == 0 {
                 continue;
             }
             let name = &varnames[i];
@@ -6132,7 +6181,7 @@ impl PyFrame {
         // copying one in publishes a name the body never bound.  A class body
         // carries `__classdict__` as a cell whose value is the namespace
         // itself, and writing that back leaves the namespace holding itself.
-        if !code.flags.contains(CodeFlags::OPTIMIZED) {
+        if co_flags & crate::astcompiler::consts::CO_OPTIMIZED == 0 {
             return Ok(());
         }
         // `freevarnames = co_cellvars` and, under `CO_OPTIMIZED`,
@@ -6321,6 +6370,10 @@ impl PyFrame {
     /// `pick_builtin(w_globals)`, which raises a non-KeyError
     /// `OperationError` straight out of `__init__`.  Fallible frame builder
     /// mirroring that path.
+    ///
+    /// The argument loop is the positional copy of `function.py
+    /// _flat_pycall`, which is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     pub fn try_new_for_call_with_closure_and_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
@@ -6403,6 +6456,11 @@ impl PyFrame {
     /// Common tail of the frame builders: everything in `Frame.__init__`
     /// except the `pick_builtin` resolution, which is lifted to the callers
     /// so the fallible variant can propagate its error.
+    ///
+    /// Its loops are the positional copy of `function.py _flat_pycall` and
+    /// the cell/freevar setup of `pyframe.py initialize_frame_scopes`, both
+    /// `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn finish_for_call_with_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
@@ -6427,11 +6485,18 @@ impl PyFrame {
         let root_base = _roots.publish(&[code as PyObjectRef, w_globals, closure, w_builtin]);
         let args_base = _roots.publish(args);
         _roots.normalize(root_base, 4 + args.len());
-        let code_ref =
-            unsafe { &*(crate::w_code_get_ptr(_roots.get(root_base)) as *const CodeObject) };
-        let num_locals = code_ref.varnames.len();
-        let num_cells = ncells(code_ref);
-        let max_stack = code_ref.max_stackdepth as usize;
+        // pyframe.py `__init__`: the sizes are the PyCode's own
+        // `co_nlocals` / `co_cellvars` / `co_freevars` / `co_stacksize`.
+        let pycode = _roots.get(root_base) as *const crate::pycode::PyCode;
+        let (num_locals, npure, nfreevars, max_stack) = unsafe {
+            (
+                (*pycode).co_nlocals as usize,
+                (*pycode).npure_cellvars as usize,
+                (*pycode).co_nfreevars as usize,
+                (*pycode).co_stacksize as usize,
+            )
+        };
+        let num_cells = npure + nfreevars;
 
         let locals_cells_stack_w = unsafe {
             alloc_frame_locals_array(num_locals + num_cells + max_stack, PY_NULL, allocation)
@@ -6462,7 +6527,6 @@ impl PyFrame {
             // Allocating cells for the overlap would shift freevar
             // indices and break LOAD_DEREF on `def repeat(n): def
             // wrap(fn): def inner(): return (n, fn)` style closures.
-            let npure = npure_cellvars(code_ref);
             for i in 0..npure {
                 // pyframe.py `PyFrame.initialize_frame_scopes` `Cell(None, self.pycode.cell_families[i])`.
                 let family = unsafe {
@@ -6474,7 +6538,6 @@ impl PyFrame {
             }
             let closure = _roots.get(root_base + 2);
             if !closure.is_null() {
-                let nfreevars = code_ref.freevars.len();
                 for i in 0..nfreevars {
                     let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
                     let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
@@ -6550,9 +6613,20 @@ impl PyFrame {
         unsafe { &*pyframe_get_pycode(self) }
     }
 
+    /// `pycode.py self.co_flags`.
+    #[inline]
+    pub fn co_flags(&self) -> u32 {
+        unsafe { (*(self.pycode as *const crate::pycode::PyCode)).co_flags }
+    }
+
     #[inline]
     pub fn _is_generator_or_coroutine(&self) -> bool {
-        code_flags_make_generator(self.code().flags)
+        let flags = self.co_flags();
+        flags
+            & (crate::astcompiler::consts::CO_GENERATOR
+                | crate::astcompiler::consts::CO_COROUTINE
+                | crate::astcompiler::consts::CO_ASYNC_GENERATOR)
+            != 0
     }
 
     /// pyframe.py initialize_as_generator
