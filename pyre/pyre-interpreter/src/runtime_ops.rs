@@ -2100,8 +2100,8 @@ pub extern "C" fn jit_set_add_method(set: PyObjectRef, value: PyObjectRef) -> Py
 /// Recorded as a cannot-collect call when the traced `set.add` is that hit.
 /// It does not insert, so a user `__hash__` never runs here. `0` fails the
 /// guard and the interpreter performs the real add.
-pub extern "C" fn jit_int_set_add_already_present(set: i64, value: i64) -> i64 {
-    pyre_object::plain_int_already_in_int_set(set as PyObjectRef, value as PyObjectRef) as i64
+pub extern "C" fn jit_int_set_add_already_present(set: PyObjectRef, value: PyObjectRef) -> i64 {
+    pyre_object::plain_int_already_in_int_set(set, value) as i64
 }
 
 /// `pyopcode.py` FOR_ITER exception discrimination:
