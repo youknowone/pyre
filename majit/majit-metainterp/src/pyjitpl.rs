@@ -3354,6 +3354,17 @@ impl<M: Clone> MetaInterp<M> {
     /// `NUMBERING` payload addresses. A minor moves the array until it is
     /// promoted, so this walk is not gated on the const-pool scan bit.
     pub fn walk_rd_numb_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
+        // `resumecode.py` `NUMBERING` is a field of `compile.py`
+        // `AbstractResumeGuardDescr`. After `register_trace_ops_gc_type`
+        // pins the payload, that address lives in an owner-root slot for
+        // the `NumberingRef` lifetime. `incminimark.py`
+        // `collect_roots_in_nursery` traces roots, not a second walk of
+        // every guard. `walk_roots` already forwards the slot; enumerating
+        // layouts and fail descrs here repeated the same edge on every
+        // collection, including numberings that had been promoted.
+        if majit_ir::resumecode::numbering_owner_rooted() {
+            return;
+        }
         for entry in self.compiled_loops.values_mut() {
             for trace in entry.traces.values_mut() {
                 for layout in trace
@@ -3434,11 +3445,16 @@ impl<M: Clone> MetaInterp<M> {
             // SAFETY: pyre is single-threaded and the minor-collection
             // walker is the only writer; concurrent readers run outside
             // GC cycles.
-            // `Const::Ref` is an index into `const_ptr_table`. The table
-            // walker forwards `ConstPtr.value`. The pool stays reachable
-            // for the descr's life; it no longer stores the address.
-            let _consts = unsafe { pool.as_mut_vec_for_gc() };
-            let _ = visitor;
+            // `Const::Ref` is an index. This pool is the holder, so trace
+            // those slots. `history.py` `ResumeGuardDescr.rd_consts` is a
+            // GC list of `Const`; a constant that no descr still names is
+            // not a root.
+            let consts = unsafe { pool.as_mut_vec_for_gc() };
+            for constant in consts.iter() {
+                if let majit_ir::Const::Ref(index) = constant {
+                    majit_ir::const_ptr_table::trace_index(*index, visitor);
+                }
+            }
         }
 
         let generation = RD_CONSTS_WALK_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -3455,6 +3471,17 @@ impl<M: Clone> MetaInterp<M> {
         if scan_compiled_graph {
             for entry in self.compiled_loops.values_mut() {
                 for trace in entry.traces.values_mut() {
+                    // Blackhole replays `trace.ops`. Those `ConstPtr`
+                    // indexes stay live for the loop, same as the guard
+                    // pools below.
+                    for op in &trace.ops {
+                        op.walk_const_ptr_refs_mut(&mut visitor);
+                    }
+                    for constant in trace.constants.values() {
+                        if let majit_ir::Const::Ref(index) = constant {
+                            majit_ir::const_ptr_table::trace_index(*index, &mut visitor);
+                        }
+                    }
                     for layout in trace.exit_layouts.values_mut() {
                         visit_pool(
                             layout.storage.as_ref().map(|storage| &storage.rd_consts),
@@ -3596,9 +3623,9 @@ impl<M: Clone> MetaInterp<M> {
     /// Python object graph automatically; pyre's `Vec<Op>` lives in
     /// Rust storage so the embedder registers this walker.
     pub fn walk_partial_trace_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
-        // `ConstPtr.value` is the process table. Forward it before any
-        // mirror below reads `as_const_ptr`.
-        majit_ir::const_ptr_table::walk(&mut visitor);
+        // Live ops trace their own `ConstPtr` indexes. A process-wide
+        // table walk would keep constants from traces that have already
+        // been dropped (`history.py` `ConstPtr` dies with its box).
         if let Some(partial) = self.partial_trace.as_mut() {
             for op in partial.ops.iter_mut() {
                 walk_op_const_ptr_refs(op, &mut visitor);
@@ -3623,9 +3650,6 @@ impl<M: Clone> MetaInterp<M> {
     /// a no-op. Bridge / retrace paths reuse the same `TraceCtx`, so a
     /// single walker covers all in-progress trace states.
     pub fn walk_active_trace_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
-        // `ConstPtr.value` lives in `const_ptr_table`. Forward those slots
-        // before any mirror below reads them.
-        majit_ir::const_ptr_table::walk(&mut visitor);
         // pyjitpl.py `self.framestack` — `MIFrame.copy_constants()`
         // (pyjitpl/frame.rs) stores `jitcode.constants_r` entries as
         // `OpRef::ConstPtr(GcRef)` in `ref_regs`. history.py
@@ -3638,8 +3662,9 @@ impl<M: Clone> MetaInterp<M> {
                 // Forward the inline `ConstPtr` gcref in place; non-Const
                 // positions (ResOp / InputArg refs) carry no inline ref.
                 if let Some(majit_ir::OpRef::ConstPtr(index)) = *slot {
-                    // The index does not move. Refresh the concrete mirror
-                    // from the table the walker just forwarded.
+                    // The index does not move. This frame is the holder, so
+                    // trace the slot, then refresh the concrete mirror.
+                    majit_ir::const_ptr_table::trace_index(index, &mut visitor);
                     *concrete = Some(majit_ir::const_ptr_table::resolve(index).0 as i64);
                 }
             }
@@ -3673,9 +3698,14 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py — `initialize_virtualizable` /
         // `force_start_tracing` / `setup_tracing` snapshot inputarg
         // constants into `initial_inputarg_consts`. Each is an inline-const
-        // `OpRef`; a `ConstPtr` entry's inline gcref is forwarded in place —
-        // history.py `ConstPtr.value` is a gcref attribute of the Box.
-        let _ = &trace_ctx.initial_inputarg_consts;
+        // `OpRef`. `initial_inputarg_argbox` reads a `ConstPtr` through
+        // `resolve`, so this vec is the holder of that slot. The inputarg
+        // `Value::Ref` walked above is a different cell.
+        for r in &trace_ctx.initial_inputarg_consts {
+            if let OpRef::ConstPtr(index) = *r {
+                majit_ir::const_ptr_table::trace_index(index, &mut visitor);
+            }
+        }
         // The per-guard snapshot side table copies inline gcrefs out of the
         // `ref_regs` slots walked above into words of its own; see
         // `recorder::Snapshot::walk_const_ptr_refs` for why nothing else
@@ -3689,8 +3719,11 @@ impl<M: Clone> MetaInterp<M> {
         // `virtual_ref_finish` forwards the box and leaves that copy.
         // `virtualref_entry_ptr` re-reads a stamped box. The raw word is
         // still what a later intern stores when the stamp is absent.
+        // A `ConstPtr` box names its own table slot.
         for pair in trace_ctx.virtualref_boxes.iter_mut() {
-            let _ = &pair.0;
+            if let OpRef::ConstPtr(index) = pair.0 {
+                majit_ir::const_ptr_table::trace_index(index, &mut visitor);
+            }
             if pair.1 != 0 {
                 let mut gcref = GcRef(pair.1);
                 visitor(&mut gcref);
@@ -3746,8 +3779,8 @@ impl<M: Clone> MetaInterp<M> {
             let r = unsafe { &mut *(slot_addr as *mut majit_ir::OpRef) };
             // Forward the snapshot slot's inline const gcref in place (an
             // in-place `ConstPtr.value` update).
-            if let majit_ir::OpRef::ConstPtr(_index) = *r {
-                // Address lives in `const_ptr_table`, already walked.
+            if let majit_ir::OpRef::ConstPtr(index) = *r {
+                majit_ir::const_ptr_table::trace_index(index, &mut visitor);
             }
         }
     }
@@ -27874,19 +27907,21 @@ mod tests {
         // `const_ptr_table`, not the pool word.
         let stored = storage.rd_consts()[0];
         meta.remember_compiled_graph_write();
-        meta.walk_rd_consts_refs(|_| seen += 1);
-        assert_eq!(seen, 0, "an index pool has no address for the visitor");
-        assert_eq!(storage.rd_consts()[0], stored);
-        majit_ir::const_ptr_table::walk(&mut |slot| {
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        meta.walk_rd_consts_refs(|slot| {
+            seen += 1;
             if slot.0 == 0x91_0000_1000 {
                 *slot = GcRef(0x91_0000_2000);
             }
         });
+        assert_eq!(seen, 1, "a dirty pool traces its Const::Ref slot");
+        assert_eq!(storage.rd_consts()[0], stored);
         assert_eq!(stored.getref_base(), GcRef(0x91_0000_2000));
 
         set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
         meta.walk_rd_consts_refs(|_| seen += 1);
-        assert_eq!(seen, 0, "major marking does not re-visit an index pool");
+        assert_eq!(seen, 2, "major marking traces the pool again");
     }
 
     #[test]

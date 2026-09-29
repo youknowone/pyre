@@ -2,16 +2,17 @@ pub use collector::HEAP_DUMP_EIO;
 pub use gcreftracer::{GcTable, install_gc_table_walker};
 pub use header::GcType;
 
-/// Extra root for `majit_ir::const_ptr_table` (`history.py` `ConstPtr.value`).
+/// `history.py` `ConstPtr` is rooted by the holder that stores the box
+/// (`trace_index`), not by every slot `intern` has ever recorded.
+/// The registration stays so a collector still has a named walker; it
+/// does not keep dead trace constants alive. Compiled-code constants
+/// use `gcreftracer.GcTable`.
 /// Idempotent: `register_extra_root_walker` dedups by function address.
 pub fn install_const_ptr_table_walker() {
     shadow_stack::register_extra_root_walker(const_ptr_table_walker, "const_ptr_table");
 }
 
-fn const_ptr_table_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    majit_ir::const_ptr_table::walk(visitor);
-}
-
+fn const_ptr_table_walker(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
 /// GC traits and interfaces for the JIT.
 ///
 /// The GC subsystem provides:
@@ -2834,6 +2835,10 @@ pub fn minor_epoch() -> u64 {
 
 pub fn bump_minor_epoch() {
     MINOR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // `Reader` caches `NUMBERING` payload bytes until this generation
+    // changes. Same publication point as `MINOR_EPOCH`: after the
+    // nursery reset, before the mutator resumes.
+    majit_ir::resumecode::bump_numbering_payload_epoch();
 }
 
 /// What an allocation answered, with the two non-pointer states kept apart.

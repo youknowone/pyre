@@ -1118,10 +1118,9 @@ impl HeapCache {
     }
 
     /// `ConstPtr` in a value slot is a [`majit_ir::const_ptr_table`] index.
-    /// `history.py` `ConstPtr.value` is written once, by
-    /// `const_ptr_table::walk`. This walk does not apply `visitor`: the
-    /// index is not an address, and the active-trace walker already
-    /// forwarded the table before it reaches the cache.
+    /// `history.py` `ConstPtr.value` is written once per wave. This walk
+    /// traces value slots the cache still names. The index is not an
+    /// address.
     ///
     /// Value slots (`replaced_with_const`, `loopinvariant_result`,
     /// `CacheEntry` field values) are the ones a cache hit emits. Keys
@@ -1130,8 +1129,8 @@ impl HeapCache {
     /// order, and a stale key misses and repopulates.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            // The word is an index. Nothing here moves.
-            let _ = (slot, visitor);
+            // The word is an index. This cache is a live holder.
+            slot.trace_const_ptr(visitor);
         }
         fn forward_entry(entry: &mut CacheEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
             for value in entry.cache_anything.values_mut() {
@@ -2584,6 +2583,9 @@ mod tests {
         cache.replace_box(old, new);
         assert_eq!(cache.maybe_replace_with_const(old), new);
 
+        // The cache walk traces the same slot the table walk does. One
+        // wave writes `ConstPtr.value` once.
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
         majit_ir::const_ptr_table::walk(&mut |gcref: &mut GcRef| {
             if *gcref == addr {
                 *gcref = GcRef(0x96_0CAC_E002);

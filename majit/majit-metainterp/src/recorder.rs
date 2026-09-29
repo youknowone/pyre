@@ -116,9 +116,26 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// `Const` ref words and `OpRef::ConstPtr` are table indexes
-    /// (`history.py` `ConstPtr`). `const_ptr_table::walk` forwards the
-    /// referent; nothing in this snapshot moves.
-    pub fn walk_const_ptr_refs(&mut self, _visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
+    /// (`history.py` `ConstPtr`). This snapshot is the holder, so the
+    /// walk traces those slots. The index word itself does not move.
+    pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        let mut trace_tagged =
+            |tagged: &SnapshotTagged, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)| match tagged {
+                SnapshotTagged::Const(bits, majit_ir::Type::Ref) if *bits != 0 => {
+                    majit_ir::const_ptr_table::trace_index(*bits as u32, visitor);
+                }
+                SnapshotTagged::Box(op, _) => op.trace_const_ptr(visitor),
+                _ => {}
+            };
+        for frame in &self.frames {
+            for tagged in &frame.boxes {
+                trace_tagged(tagged, visitor);
+            }
+        }
+        for tagged in self.vable_boxes.iter().chain(self.vref_boxes.iter()) {
+            trace_tagged(tagged, visitor);
+        }
+    }
 }
 
 /// `jitcode_index` for a frame the recorder minted with no real coordinate.
@@ -2168,8 +2185,11 @@ mod tests {
     #[test]
     fn ref_pool_gc_visits_each_box_once_and_rekeys_overlapping_addresses() {
         let mut rec = Trace::new();
-        let boxes: Vec<_> = (1..=4)
-            .map(|i| rec.box_for_operand(OpRef::const_ptr(GcRef(i * 0x1000))))
+        // Private sentinels. `0x1000 * i` collides with another test's
+        // forwarded slot in this process-lifetime table.
+        let base = 0x96E1_0000usize;
+        let boxes: Vec<_> = (0..4)
+            .map(|i| rec.box_for_operand(OpRef::const_ptr(GcRef(base + i * 0x1000))))
             .collect();
         let constants: Vec<_> = boxes.iter().map(Operand::to_opref).collect();
         for &constant in &constants {
@@ -2182,13 +2202,13 @@ mod tests {
             &constants,
         );
         majit_ir::const_ptr_table::walk(&mut |reference| {
-            if (1..=4).any(|i| reference.0 == i * 0x1000) {
+            if (base..base + 4 * 0x1000).contains(&reference.0) {
                 reference.0 += 0x1000;
             }
         });
         assert_eq!(rec.const_ptrs.len(), 4);
         for (index, original) in boxes.iter().enumerate() {
-            let address = GcRef((index + 2) * 0x1000);
+            let address = GcRef(base + (index + 1) * 0x1000);
             assert_eq!(original.const_value(), Some(Value::Ref(address)));
         }
     }

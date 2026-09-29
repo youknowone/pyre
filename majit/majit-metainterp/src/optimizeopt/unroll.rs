@@ -2614,8 +2614,8 @@ impl ExportedState {
     /// short preamble state, virtual state, and `_forwarded` payloads all
     /// expose their actual mutable storage.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        fn visit_opref(opref: &mut OpRef, _visitor: &mut dyn FnMut(&mut GcRef)) {
-            let _ = opref;
+        fn visit_opref(opref: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+            opref.trace_const_ptr(visitor);
         }
 
         fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {

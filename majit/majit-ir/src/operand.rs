@@ -885,10 +885,17 @@ impl Operand {
 
     /// GC walk over any inline `ConstPtr` reachable from this operand
     /// (`resoperation.py` `walk_const_ptr_refs`). A wide `Ref` stores a
-    /// [`crate::const_ptr_table`] index; `const_ptr_table::walk` forwards
-    /// the referent. The legacy `OP_CONST` cell still carries a `Value::Ref`
-    /// address and is forwarded here.
+    /// [`crate::const_ptr_table`] index; tracing that index forwards
+    /// `ConstPtr.value` while this operand is live. The legacy `OP_CONST`
+    /// cell still carries a `Value::Ref` address and is forwarded here.
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        if self.packed != 0 && self.packed & OP_TAG == OP_SMALLWIDE {
+            let id = self.packed >> 3;
+            if let Some(index) = wide_ref_index(id) {
+                crate::const_ptr_table::trace_index(index, visitor);
+            }
+            return;
+        }
         if self.packed == 0 || self.packed & OP_TAG != OP_CONST {
             return;
         }

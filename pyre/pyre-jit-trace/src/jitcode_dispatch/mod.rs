@@ -9205,9 +9205,12 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         for value in latched.miframe.ref_values.iter_mut().flatten() {
             visitor(unsafe { &mut *(value as *mut i64).cast() });
         }
-        // `ConstPtr` is a `const_ptr_table` index. The table walker
-        // forwards the address; this slot does not hold one.
-        let _ = latched.miframe.ref_regs;
+        // `ConstPtr` in `ref_regs` is a table index. `ref_values` above
+        // is the concrete mirror, not that slot. This latch is the
+        // holder while `walk_active_trace_refs` cannot see the frame.
+        for slot in latched.miframe.ref_regs.iter().flatten() {
+            slot.trace_const_ptr(visitor);
+        }
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
         }
@@ -9230,7 +9233,9 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                 visitor(unsafe { &mut *(value as *mut i64).cast() });
             }
             // Both halves, for the reason the single-frame arm gives.
-            let _ = frame.ref_regs;
+            for slot in frame.ref_regs.iter().flatten() {
+                slot.trace_const_ptr(visitor);
+            }
         }
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });

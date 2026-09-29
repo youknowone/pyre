@@ -409,8 +409,9 @@ mod tests {
                 root.0 += 0x80;
             }
         };
-        // Frame mirrors live in the mutator area. `ConstPtr.value` lives in
-        // `const_ptr_table` and is forwarded by that walk, once.
+        // Live holders trace their indexes. The table walk still
+        // forwards a slot whose holder was dropped. One wave, one write.
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
         majit_gc::shadow_stack::walk_my_extra_areas(&mut step);
         majit_ir::const_ptr_table::walk(&mut step);
     }

@@ -3361,9 +3361,18 @@ impl OpRef {
     /// banks.  `ConstPtr` carries its `GcRef` by value, so a walker that has to
     /// forward a moved object must reach the slot in the bank; a copy would be
     /// visited and then thrown away.
-    pub fn walk_const_ptr_refs_mut(&mut self, _visitor: &mut dyn FnMut(&mut GcRef)) {
-        // `ConstPtr` stores a table index. `const_ptr_table::walk` is the
-        // root that forwards `ConstPtr.value`. Nothing in this word moves.
+    pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        // The word is the index. `history.py` `ConstPtr.value` is the
+        // table slot this holder keeps alive.
+        self.trace_const_ptr(visitor);
+    }
+
+    /// Forward `ConstPtr.value` when this word is a live holder.
+    /// The index itself does not move, so a shared borrow is enough.
+    pub fn trace_const_ptr(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        if let OpRef::ConstPtr(index) = *self {
+            crate::const_ptr_table::trace_index(index, visitor);
+        }
     }
 }
 

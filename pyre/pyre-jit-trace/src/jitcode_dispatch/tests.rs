@@ -51,7 +51,9 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
                 root.0 += 0x80;
             }
         };
-        // Raw frame words are mutator areas. `ConstPtr.value` is the table.
+        // Live holders trace their indexes. The table walk forwards a
+        // slot whose holder was dropped. One wave, one write.
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
         majit_gc::shadow_stack::walk_my_extra_areas(&mut visit);
         majit_ir::const_ptr_table::walk(&mut visit);
         seen.sort_unstable();
@@ -146,8 +148,9 @@ fn finish_payload_root_walker_writes_back_forwarded_const_ptr() {
             gcref.0 = 0x96B0_2000;
         }
     };
-    // The session area holds the index. `const_ptr_table::walk` writes
-    // `ConstPtr.value`.
+    // The session area traces the index. One wave so the table walk
+    // does not write the same slot again.
+    let _wave = majit_ir::const_ptr_table::Wave::enter();
     majit_gc::shadow_stack::walk_my_extra_areas(&mut visit);
     majit_ir::const_ptr_table::walk(&mut visit);
     assert_eq!(session.borrow().finish_payload, Some((op, Type::Ref)));

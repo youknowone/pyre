@@ -142,9 +142,12 @@ impl Forwarded {
                     cell.set(v);
                 }
             }
-            // Wide `ConstPtr` stores a table index. `const_ptr_table::walk`
-            // forwards the referent.
-            Forwarded::SmallWide(_) => {}
+            // Wide `ConstPtr` stores a table index. This holder traces it.
+            Forwarded::SmallWide(id) => {
+                if let Some(index) = crate::operand::wide_ref_index(*id) {
+                    crate::const_ptr_table::trace_index(index, visitor);
+                }
+            }
             _ => {}
         }
     }

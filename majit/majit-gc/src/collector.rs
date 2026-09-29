@@ -1901,6 +1901,10 @@ impl MiniMarkGC {
         needs_write_barrier: *mut bool,
     ) -> GcRef {
         unsafe {
+            // Same knob as `alloc_fast_with_type_rooted`. The plural-root
+            // Trace pools (`_refs`, `_bigints`, `_floats`) grow through
+            // this entry.
+            self.stress_trace_alloc_minor(roots, root_count);
             self.alloc_with_type_rooted_body::<true>(
                 type_id,
                 payload_size,
@@ -3581,6 +3585,9 @@ impl MiniMarkGC {
         } else {
             crate::shadow_stack::ExtraRootWalkKind::Minor
         };
+        // One wave for this root walk. Holders trace `ConstPtr` indexes;
+        // a second visit must not write `ConstPtr.value` again.
+        let _const_ptr_wave = majit_ir::const_ptr_table::Wave::enter();
         crate::shadow_stack::set_extra_root_walk_kind(extra_root_walk_kind);
         let mut visit_extra_area = |gcref: &mut GcRef| {
             self.drag_out_root(gcref);
@@ -6185,6 +6192,8 @@ impl MiniMarkGC {
     }
 
     fn seed_major_roots(&mut self) {
+        // One wave for this marking root walk. See the minor path.
+        let _const_ptr_wave = majit_ir::const_ptr_table::Wave::enter();
         // incminimark.py collect_roots: root_walker.walk_roots()
         // seeds stack roots for a major marking cycle. Mirror the same
         // root sets as minor collection, but mark old objects instead of

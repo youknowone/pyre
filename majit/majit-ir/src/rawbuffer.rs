@@ -104,10 +104,14 @@ impl RawBuffer {
         &self.values
     }
 
-    /// `ConstPtr` indexes [`crate::const_ptr_table`]. A wide operand
-    /// stores that index. `const_ptr_table::walk` forwards the referent;
-    /// the index stored here does not move.
-    pub fn walk_const_ptr_refs(&mut self, _visitor: &mut dyn FnMut(&mut GcRef)) {}
+    /// `values` holds boxes. A `ConstPtr` names a
+    /// [`crate::const_ptr_table`] slot. This buffer is the holder, so
+    /// trace the slot. The index stored here does not move.
+    pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        for value in &self.values {
+            value.walk_const_ptr_refs(visitor);
+        }
+    }
 
     pub fn iter_entries(&self) -> impl Iterator<Item = (i64, usize, &DescrRef, &Operand)> + '_ {
         self.offsets
@@ -499,14 +503,12 @@ mod tests {
         buf.write_value(0, 8, d.clone(), Operand::bound_from_opref(stored))
             .unwrap();
 
-        // The buffer holds a table index. The collector forwards the
-        // table; this walk has no address to rewrite.
-        crate::const_ptr_table::walk(&mut |gcref| {
+        // The buffer is the holder. Its walk traces the table slot.
+        buf.walk_const_ptr_refs(&mut |gcref| {
             if *gcref == GcRef(0x91_0000_0010) {
                 *gcref = GcRef(0x91_0000_0020);
             }
         });
-        buf.walk_const_ptr_refs(&mut |_| {});
 
         let got = buf.read_value(0, 8, &d).unwrap();
         assert_eq!(got.to_opref(), stored);

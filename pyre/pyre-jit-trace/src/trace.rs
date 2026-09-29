@@ -7328,9 +7328,9 @@ mod tests {
                     root.0 += 0x80;
                 }
             };
-            // Register banks hold indexes. `const_ptr_table::walk` forwards
-            // `ConstPtr.value`. An inner anchor must not hide the outer one:
-            // both indexes stay in the table.
+            // Banks trace their indexes. The table walk covers a bank
+            // that a later drop retired. One wave, one write per slot.
+            let _wave = majit_ir::const_ptr_table::Wave::enter();
             majit_gc::shadow_stack::walk_my_extra_areas(&mut visit);
             majit_ir::const_ptr_table::walk(&mut visit);
             seen.sort_unstable();

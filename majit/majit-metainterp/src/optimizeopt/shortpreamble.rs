@@ -125,9 +125,10 @@ impl ShortPreamble {
     }
 
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        fn visit_oprefs(refs: &mut [OpRef], _visitor: &mut dyn FnMut(&mut GcRef)) {
-            // `ConstPtr` indexes `const_ptr_table`.
-            let _ = refs;
+        fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
+            for op in refs.iter() {
+                op.trace_const_ptr(visitor);
+            }
         }
 
         for entry in &mut self.ops {
@@ -139,8 +140,11 @@ impl ShortPreamble {
         if let Some(exported_state) = self.exported_state.as_mut() {
             exported_state.walk_const_ptr_refs_mut(visitor);
         }
-        // `Const::Ref` indexes `const_ptr_table`; that walker owns the address.
-        let _ = &self.constants;
+        for constant in self.constants.values() {
+            if let majit_ir::Const::Ref(index) = constant {
+                majit_ir::const_ptr_table::trace_index(*index, visitor);
+            }
+        }
         for info in self.inputarg_infos.iter_mut().flatten() {
             info.walk_const_ptr_refs_mut(visitor);
         }
@@ -2447,13 +2451,18 @@ pub struct ExtendedShortPreambleBuilder {
 
 impl ExtendedShortPreambleBuilder {
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        fn visit_oprefs(refs: &mut [OpRef], _visitor: &mut dyn FnMut(&mut GcRef)) {
-            let _ = refs;
+        fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
+            for op in refs.iter() {
+                op.trace_const_ptr(visitor);
+            }
         }
 
-        fn visit_opref_set(set: &mut FxIndexSet<OpRef>, _visitor: &mut dyn FnMut(&mut GcRef)) {
+        fn visit_opref_set(set: &mut FxIndexSet<OpRef>, visitor: &mut dyn FnMut(&mut GcRef)) {
             // Index is stable across a move, so the set does not rekey.
-            let _ = set;
+            // The slot behind a `ConstPtr` key is still a live referent.
+            for op in set.iter() {
+                op.trace_const_ptr(visitor);
+            }
         }
 
         fn visit_produced(produced: &mut ProducedShortOp, visitor: &mut dyn FnMut(&mut GcRef)) {
