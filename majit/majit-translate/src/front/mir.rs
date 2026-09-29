@@ -90,9 +90,10 @@
 //!   - `Bool` → `ConstBool`. `Float` → `ConstFloat`.
 //!   - `Str` / `Char` / `ByteStr` → synthetic `Call(__str_const)`.
 //!   - `FnDef` → synthetic 0-arg `Call(FunctionPath)`.
-//!   - `Opaque(reason)` / `VTableRef` / `TraitConst` — synthetic
-//!     opaque-string Call. Deferred to a later widening pass when
-//!     Charon surfaces the underlying impl/method.
+//!   - `Opaque(reason)` / `VTableRef` — synthetic opaque-string Call.
+//!   - `TraitConst` on a selected impl folds to that impl's `NamedConst`
+//!     (`resolved_trait_const_op`). A `Clause` that names no impl stays
+//!     on the opaque-string path in `decode_constant`.
 //!
 //! Anything not in the above set returns [`LowerError::Unsupported`]
 //! with the precise shape that prompted the failure — the driver grows
@@ -10695,36 +10696,44 @@ impl<'a> Lowering<'a> {
         unit
     }
 
-    /// A trait associated const whose type is a primitive word.
+    /// Fold a `TraitConst` whose trait ref is one selected impl.
     ///
-    /// The value is not known until the impl is chosen (`T::SIZE` on a
-    /// generic `T: GcType`). The kind is: `getkind` of that primitive,
-    /// not the `Ref` a `__str_const` literal uses. A non-primitive
-    /// associated const stays on the string path in `decode_constant`.
-    fn trait_const_scalar_op(&self, value: &serde_json::Value) -> Option<OpKind> {
+    /// `FunctionDesc.cachedgraph` builds one graph per instantiation and
+    /// the copy substitutes the `Clause`, so the const names that impl.
+    /// The impl's `consts[index]` is the `NamedConst` global;
+    /// `const_eval_init_body` (and the `size_of` lane beside it) folds
+    /// the initializer to the literal `history.getkind` banks as `int`.
+    /// `CallControl.getcalldescr` then sees the same kind as the `usize`
+    /// parameter. A `Clause` that still names no impl returns `None`:
+    /// one shared template has no single value, and `decode_constant`
+    /// keeps the opaque-string path. A zero-arg `__trait_const` call is
+    /// not a registered graph, so `translate_op` would Skip the copy.
+    fn resolved_trait_const_op(&self, value: &serde_json::Value) -> Option<OpKind> {
         let kind = self.llbc.const_expr_kind(value)?;
-        if !kind.as_object()?.contains_key("TraitConst") {
-            return None;
-        }
-        let ty_node = self.llbc.const_expr_ty(value)?;
-        // The const's type is often `{"Deduplicated": id}` of a `usize`.
-        // `tyref_to_value_type` only unwraps `TyRef::Dedup`, so peel the
-        // hash-cons node first or the primitive looks like `Ref`.
-        let resolved = strip_ty_indirections(ty_node, self.llbc).unwrap_or(ty_node);
-        let vt = tyref_to_value_type(&TyRef::Other(resolved.clone()), self.llbc);
-        match vt {
-            ValueType::Int
-            | ValueType::Unsigned
-            | ValueType::Bool
-            | ValueType::Float
-            | ValueType::SingleFloat => Some(OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec!["__trait_const".to_string()],
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![]),
-                result_ty: vt,
-            }),
+        let pair = kind.as_object()?.get("TraitConst")?.as_array()?;
+        let trait_ref = pair.first()?;
+        let index = usize::try_from(pair.get(1)?.as_u64()?).ok()?;
+        let impl_id = traitref_impl_id(trait_ref, self.llbc, 0)?;
+        let global_id = self
+            .llbc
+            .trait_impl_by_id(impl_id)?
+            .get("consts")?
+            .as_array()?
+            .get(index)?
+            .get("id")?
+            .as_u64()?;
+        let op = self
+            .const_eval_global(global_id)
+            .or_else(|| self.fold_size_const_global(global_id))
+            .or_else(|| self.fold_transparent_int_const_global(global_id))?;
+        match op {
+            OpKind::ConstInt(_)
+            | OpKind::ConstUInt(_)
+            | OpKind::ConstInt128(_)
+            | OpKind::ConstUInt128(_)
+            | OpKind::ConstBool(_)
+            | OpKind::ConstFloat(_)
+            | OpKind::ConstSingleFloat(_) => Some(op),
             _ => None,
         }
     }
@@ -10738,12 +10747,11 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         value: &serde_json::Value,
     ) -> Result<Variable, LowerError> {
-        // `TraitConst` of a primitive (`GcType::SIZE: usize`) is that
-        // word. `history.py` `getkind(Unsigned)` is `int`, the same bank
-        // an inline `size_of::<T>()` folds to via `ConstInt`. Decoding it
-        // as a string constant banks the argument as `Ref` and the
-        // `usize` parameter does not.
-        if let Some(op) = self.trait_const_scalar_op(value) {
+        // A selected impl's associated const is that impl's literal.
+        // `history.getkind` of the folded word matches the parameter;
+        // a string sentinel would be `Ref` and `CallControl.getcalldescr`
+        // would reject the call.
+        if let Some(op) = self.resolved_trait_const_op(value) {
             let var = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
