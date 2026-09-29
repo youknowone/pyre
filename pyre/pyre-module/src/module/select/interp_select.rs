@@ -23,7 +23,7 @@ pub struct Poll {
 /// `interp_select.py defaultevents = POLLIN | POLLOUT | POLLPRI`.
 #[cfg(all(unix, feature = "host_env"))]
 fn default_poll_events() -> i16 {
-    libc::POLLIN | libc::POLLOUT | libc::POLLPRI
+    majit_rlib::rpoll::POLLIN | majit_rlib::rpoll::POLLOUT | majit_rlib::rpoll::POLLPRI
 }
 
 /// Resolve a Python fd argument (int or object with `fileno()`) to a
@@ -180,66 +180,59 @@ impl Poll {
             ));
         }
 
-        let mut pollfds: Vec<libc::pollfd> = self
-            .fddict
-            .iter()
-            .map(|(&fd, &events)| libc::pollfd {
-                fd,
-                events,
-                revents: 0,
-            })
-            .collect();
-
-        // EINTR retry with a recomputed timeout, mirroring
-        // `interp_select.py:89` (round the remaining time up to the next ms).
+        // EINTR retry with a recomputed timeout (`Poll.poll` rounds the
+        // remaining time up to the next millisecond). A negative timeout
+        // stays blocking: `end_time` is only consulted after EINTR when the
+        // caller asked for a finite wait.
         let deadline = (timeout >= 0)
             .then(|| std::time::Instant::now() + std::time::Duration::from_millis(timeout as u64));
         let mut cur_timeout = timeout;
         self.running = true;
-        let ret = loop {
-            let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| unsafe {
-                libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, cur_timeout)
-            });
-            if r >= 0 {
-                break r;
-            }
-            if errno == libc::EINTR {
-                // `interp_select.py:94-100` — deliver a pending signal, then
-                // retry with a recomputed timeout.  Reset `running` first so
-                // a raised handler does not leave the poll object wedged
-                // (PyPy's `finally: self.running = False`).
-                if let Err(err) =
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()
-                {
+        let ready = loop {
+            // Snapshot first. `rpoll.poll` releases the GIL inside
+            // `_rsocket_rffi.poll`, and this `&mut self` must not stay
+            // borrowed across that call.
+            let snapshot = self.fddict.clone();
+            match majit_rlib::rpoll::poll(&snapshot, cur_timeout) {
+                Ok(ready) => break ready,
+                Err(err) if err.errno == libc::EINTR => {
+                    // Deliver a pending signal, then retry. Reset `running`
+                    // first so a raised handler does not leave the poll object
+                    // wedged (`Poll.poll`'s `finally: self.running = False`).
+                    if let Err(err) =
+                        pyre_interpreter::module::signal::interp_signal::checksignals_now()
+                    {
+                        self.running = false;
+                        return Err(err);
+                    }
+                    if let Some(dl) = deadline {
+                        let now = std::time::Instant::now();
+                        cur_timeout = if now >= dl {
+                            0
+                        } else {
+                            ((dl - now).as_secs_f64() * 1000.0 + 0.999) as i32
+                        };
+                    }
+                    continue;
+                }
+                Err(err) => {
                     self.running = false;
-                    return Err(err);
+                    let e = std::io::Error::from_raw_os_error(err.errno);
+                    return Err(pyre_interpreter::PyError::os_error_with_errno(
+                        err.errno,
+                        format!("poll: {e}"),
+                    ));
                 }
-                if let Some(dl) = deadline {
-                    let now = std::time::Instant::now();
-                    cur_timeout = if now >= dl {
-                        0
-                    } else {
-                        ((dl - now).as_secs_f64() * 1000.0 + 0.999) as i32
-                    };
-                }
-                continue;
             }
-            self.running = false;
-            let e = std::io::Error::from_raw_os_error(errno);
-            return Err(pyre_interpreter::PyError::os_error_with_errno(
-                errno,
-                format!("poll: {e}"),
-            ));
         };
         self.running = false;
-        let _ = ret;
 
         let mut retval = pyre_object::gc_roots::RootedItems::new();
-        for pfd in pollfds.iter().filter(|pfd| pfd.revents != 0) {
+        for (fd, revents) in ready {
             let entry = {
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
-                fields.push(pyre_object::w_int_new(pfd.fd as i64));
-                fields.push(pyre_object::w_int_new(pfd.revents as i64));
+                fields.push(pyre_object::w_int_new(fd as i64));
+                fields.push(pyre_object::w_int_new(revents as i64));
                 pyre_object::w_tuple_new(fields.take())
             };
             retval.push(entry);
@@ -255,29 +248,27 @@ impl Poll {
 /// A POSIX fd_set is a bitmap indexed by the descriptor, so `FD_SET` on an fd
 /// at or above FD_SETSIZE writes outside it (`_PyIsSelectable_fd`).
 #[cfg(all(unix, feature = "host_env"))]
-fn selectable_fd(
-    fd: i32,
-    _index: usize,
-) -> Result<rustpython_host_env::select::RawFd, pyre_interpreter::PyError> {
-    if fd >= libc::FD_SETSIZE as i32 {
-        return Err(pyre_interpreter::PyError::value_error(
-            "file descriptor out of range in select()",
-        ));
+fn selectable_fd(fd: i32, _index: usize) -> Result<i32, pyre_interpreter::PyError> {
+    // `_build_fd_set`: `MAX_FD_SIZE is not None and fd >= MAX_FD_SIZE`.
+    if let Some(max) = majit_rlib::_rsocket_rffi::MAX_FD_SIZE {
+        if fd >= max {
+            return Err(pyre_interpreter::PyError::value_error(
+                "file descriptor out of range in select()",
+            ));
+        }
     }
     Ok(fd)
 }
 
 /// `selectable_fd` for WinSock, whose fd_set is a count plus an array of
 /// SOCKETs instead of a bitmap: the handle value itself is unconstrained, but
-/// only FD_SETSIZE of them fit and `FD_SET` past that silently drops the
-/// socket.  The array is sized by the `windows-sys` declaration, so the limit
-/// is the stock 64 rather than the 512 a C build can ask for.
+/// only `FD_SETSIZE` of them fit and `FD_SET` past that silently drops the
+/// socket. `_rsocket_rffi.FD_SETSIZE` is the SDK default 64.
+/// `_build_fd_set` does not apply this count (`MAX_FD_SIZE` is `None`); the
+/// rejection and its message are the ones already raised here.
 #[cfg(all(windows, feature = "host_env"))]
-fn selectable_fd(
-    fd: i32,
-    index: usize,
-) -> Result<rustpython_host_env::select::RawFd, pyre_interpreter::PyError> {
-    if index >= rustpython_host_env::select::platform::FD_SETSIZE as usize {
+fn selectable_fd(fd: i32, index: usize) -> Result<i32, pyre_interpreter::PyError> {
+    if index >= majit_rlib::_rsocket_rffi::FD_SETSIZE {
         return Err(pyre_interpreter::PyError::value_error(
             "too many file descriptors in select()",
         ));
@@ -285,7 +276,52 @@ fn selectable_fd(
     // `select()` takes SOCKET handles here, never CRT file descriptors; a
     // handle is 32-bit significant, which is what `fileno()` hands back.  A
     // descriptor that is not a socket fails the call itself with WSAENOTSOCK.
-    Ok(fd as rustpython_host_env::select::RawFd)
+    // `FD_SET` takes `rffi.INT`; the Winsock body widens it to `SOCKET`.
+    Ok(fd)
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+type OsFdSet = libc::fd_set;
+#[cfg(all(windows, feature = "host_env"))]
+type OsFdSet = majit_rlib::_rsocket_rffi::fd_set;
+
+#[cfg(all(unix, feature = "host_env"))]
+type OsTimeval = libc::timeval;
+#[cfg(all(windows, feature = "host_env"))]
+type OsTimeval = majit_rlib::_rsocket_rffi::timeval;
+
+/// `select` allocates an `fd_set` only for a non-empty list (`ll_inl` stays
+/// a null pointer when `iwtd_w` is empty).
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+fn prepare_fd_set(fds: &[(usize, i32)]) -> Option<Box<OsFdSet>> {
+    if fds.is_empty() {
+        return None;
+    }
+    let mut set = Box::new(unsafe { core::mem::zeroed::<OsFdSet>() });
+    unsafe {
+        majit_rlib::_rsocket_rffi::FD_ZERO(set.as_mut() as *mut OsFdSet);
+        for &(_, fd) in fds {
+            majit_rlib::_rsocket_rffi::FD_SET(fd, set.as_mut() as *mut OsFdSet);
+        }
+    }
+    Some(set)
+}
+
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+fn fd_set_ptr(set: &mut Option<Box<OsFdSet>>) -> *mut OsFdSet {
+    match set {
+        Some(set) => set.as_mut() as *mut OsFdSet,
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `_call_select` writes `int(timeout)` and `int((timeout - sec) * 1000000)`.
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+fn fill_timeval(timeout: f64, tv: &mut OsTimeval) {
+    let sec = timeout as i64;
+    let usec = ((timeout - sec as f64) * 1_000_000.0) as i64;
+    tv.tv_sec = sec as _;
+    tv.tv_usec = usec as _;
 }
 
 /// Dispose of a failed `select()`.  `Ok` means the call was interrupted and
@@ -320,10 +356,9 @@ fn select_failure(e: std::io::Error) -> Result<(), pyre_interpreter::PyError> {
 /// _select module — PyPy: pypy/module/select/.
 ///
 /// Implements `select.select(rlist, wlist, xlist, timeout=None)` via
-/// `rustpython_host_env::select::{FdSet, select, sec_to_timeval}` — on
-/// Windows over WinSock's `select`, which accepts sockets only — and the
-/// `select.poll()` polling object, which POSIX alone has.  epoll / kqueue
-/// object types are not implemented yet.
+/// `_rsocket_rffi.select` / `FD_*` — on Windows over WinSock's `select`,
+/// which accepts sockets only — and the `select.poll()` polling object,
+/// which POSIX alone has.  epoll is not implemented yet.
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     pyre_interpreter::module_ns_store(
         ns,
@@ -335,8 +370,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::make_module_builtin_function("select", |args| {
             #[cfg(all(any(unix, windows), feature = "host_env"))]
             {
-                use rustpython_host_env::select as host_select;
-
                 if args.len() < 3 {
                     return Err(pyre_interpreter::PyError::type_error(
                         "select() takes at least 3 arguments",
@@ -353,8 +386,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // the caller's root bracket and named by its slot.
                 fn collect_fds(
                     seq: pyre_object::PyObjectRef,
-                ) -> Result<Vec<(usize, host_select::RawFd)>, pyre_interpreter::PyError>
-                {
+                ) -> Result<Vec<(usize, i32)>, pyre_interpreter::PyError> {
                     let items = pyre_interpreter::baseobjspace::unpackiterable(seq, -1)?;
                     let base = pyre_object::gc_roots::pin_roots(&items);
                     let mut out = Vec::with_capacity(items.len());
@@ -424,79 +456,92 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     }
                 };
 
-                // `interp_select.py:166` — EINTR retry, recomputing the
-                // remaining timeout each pass and rebuilding the fd sets
-                // (select() clobbers them on every call).
-                // `Duration::from_secs_f64` panics on a NaN/inf/overflowing
-                // timeout; `float_w` lets such a value through, so convert it
-                // into a `ValueError` instead of aborting the host process.
-                let deadline = match timeout_secs {
-                    None => None,
-                    Some(s) => Some(
+                // `_call_select` builds each fd_set once, then retries on
+                // EINTR without rebuilding. POSIX leaves the sets unmodified
+                // when `select` fails. The first pass writes the caller's
+                // timeout. After EINTR only a positive timeout is replaced
+                // with the time left until the deadline taken here; a zero
+                // timeout stays zero. A non-finite timeout, or one `Duration`
+                // cannot represent, is a ValueError: `float_w` accepts it,
+                // and it is not a finite timeval.
+                let mut timeout_left = timeout_secs;
+                let end_time = if let Some(s) = timeout_secs.filter(|s| *s > 0.0) {
+                    Some(
                         std::time::Duration::try_from_secs_f64(s)
                             .ok()
                             .and_then(|d| std::time::Instant::now().checked_add(d))
                             .ok_or_else(|| {
                                 pyre_interpreter::PyError::value_error("timeout is too large")
                             })?,
-                    ),
+                    )
+                } else if timeout_secs.is_some_and(|s| !s.is_finite()) {
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "timeout is too large",
+                    ));
+                } else {
+                    None
                 };
-                let mut rset;
-                let mut wset;
-                let mut xset;
-                loop {
-                    rset = host_select::FdSet::new();
-                    wset = host_select::FdSet::new();
-                    xset = host_select::FdSet::new();
-                    for &(_, fd) in &rfds {
-                        rset.insert(fd);
-                    }
-                    for &(_, fd) in &wfds {
-                        wset.insert(fd);
-                    }
-                    for &(_, fd) in &xfds {
-                        xset.insert(fd);
-                    }
-                    let mut tv_storage;
-                    let timeout_ref: Option<&mut host_select::timeval> = match timeout_secs {
-                        None => None,
-                        Some(_) => {
-                            let remaining = deadline
-                                .map(|dl| {
-                                    let now = std::time::Instant::now();
-                                    if now >= dl {
-                                        0.0
-                                    } else {
-                                        (dl - now).as_secs_f64()
-                                    }
-                                })
-                                .unwrap_or(0.0);
-                            tv_storage = host_select::sec_to_timeval(remaining);
-                            Some(&mut tv_storage)
+                let mut rset = prepare_fd_set(&rfds);
+                let mut wset = prepare_fd_set(&wfds);
+                let mut xset = prepare_fd_set(&xfds);
+                let mut tv = OsTimeval {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                };
+                let res = loop {
+                    let tv_ptr = match timeout_left {
+                        None => std::ptr::null_mut(),
+                        Some(t) => {
+                            fill_timeval(t, &mut tv);
+                            &raw mut tv
                         }
                     };
-                    // `select` already carries its errno in the returned
-                    // `io::Error`, so the guard only has to span the call.
-                    let outcome = {
-                        let _blocked = pyre_interpreter::module::thread::before_external_block();
-                        host_select::select(nfds, &mut rset, &mut wset, &mut xset, timeout_ref)
+                    // `_rsocket_rffi.select` releases the GIL and stashes errno.
+                    let res = unsafe {
+                        majit_rlib::_rsocket_rffi::select(
+                            nfds,
+                            fd_set_ptr(&mut rset),
+                            fd_set_ptr(&mut wset),
+                            fd_set_ptr(&mut xset),
+                            tv_ptr,
+                        )
                     };
-                    match outcome {
-                        Ok(_) => break,
-                        // A retryable failure returns `Ok`, having delivered
-                        // any pending signal; the loop head then recomputes
-                        // the remaining timeout and rebuilds the fd sets.
-                        Err(e) => select_failure(e)?,
+                    if res >= 0 {
+                        break res;
                     }
-                }
+                    let errno = majit_rlib::_rsocket_rffi::geterrno();
+                    // A retryable failure returns `Ok`, having delivered any
+                    // pending signal. `_call_select` then updates `timeout`
+                    // only when it was positive.
+                    select_failure(std::io::Error::from_raw_os_error(errno))?;
+                    if let (Some(t), Some(dl)) = (timeout_left, end_time) {
+                        if t > 0.0 {
+                            let now = std::time::Instant::now();
+                            let remaining = if now >= dl {
+                                0.0
+                            } else {
+                                (dl - now).as_secs_f64()
+                            };
+                            timeout_left = Some(remaining);
+                        }
+                    }
+                };
 
                 fn build_ready(
-                    set: &mut host_select::FdSet,
-                    inputs: &[(usize, host_select::RawFd)],
+                    set: &mut Option<Box<OsFdSet>>,
+                    inputs: &[(usize, i32)],
                 ) -> pyre_object::PyObjectRef {
+                    // `_unbuild_fd_set` runs only when `res > 0`. A timeout
+                    // (`res == 0`) returns three empty lists.
+                    let Some(set) = set.as_mut() else {
+                        return pyre_object::w_list_new(Vec::new());
+                    };
                     let items: Vec<_> = inputs
                         .iter()
-                        .filter(|&&(_, fd)| set.contains(fd))
+                        .filter(|&&(_, fd)| unsafe {
+                            majit_rlib::_rsocket_rffi::FD_ISSET(fd, set.as_mut() as *mut OsFdSet)
+                                != 0
+                        })
                         .map(|&(slot, _)| pyre_object::gc_roots::shadow_stack_get(slot))
                         .collect();
                     pyre_object::w_list_new(items)
@@ -506,12 +551,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // allocation the next `build_ready` performs can relocate the
                 // previous one and leave its pre-move address in the local.
                 // Pin each at its mint and read all three back where the tuple
-                // is built.
+                // is built. `_unbuild_fd_set` runs only when `res > 0`.
                 let roots = pyre_object::gc_roots::push_roots();
                 let ready_base = roots.base();
-                let _ = roots.pin_root(build_ready(&mut rset, &rfds));
-                let _ = roots.pin_root(build_ready(&mut wset, &wfds));
-                let _ = roots.pin_root(build_ready(&mut xset, &xfds));
+                if res > 0 {
+                    let _ = roots.pin_root(build_ready(&mut rset, &rfds));
+                    let _ = roots.pin_root(build_ready(&mut wset, &wfds));
+                    let _ = roots.pin_root(build_ready(&mut xset, &xfds));
+                } else {
+                    let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
+                    let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
+                    let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
+                }
                 Ok(pyre_object::w_tuple_new(vec![
                     roots.get(ready_base),
                     roots.get(ready_base + 1),
@@ -557,16 +608,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
-        ev!("POLLIN", rustpython_host_env::select::POLLIN);
-        ev!("POLLPRI", rustpython_host_env::select::POLLPRI);
-        ev!("POLLOUT", rustpython_host_env::select::POLLOUT);
-        ev!("POLLERR", rustpython_host_env::select::POLLERR);
-        ev!("POLLHUP", rustpython_host_env::select::POLLHUP);
-        ev!("POLLNVAL", rustpython_host_env::select::POLLNVAL);
-        ev!("POLLRDNORM", rustpython_host_env::select::POLLRDNORM);
-        ev!("POLLRDBAND", rustpython_host_env::select::POLLRDBAND);
-        ev!("POLLWRNORM", rustpython_host_env::select::POLLWRNORM);
-        ev!("POLLWRBAND", rustpython_host_env::select::POLLWRBAND);
+        ev!("POLLIN", majit_rlib::rpoll::POLLIN);
+        ev!("POLLPRI", majit_rlib::rpoll::POLLPRI);
+        ev!("POLLOUT", majit_rlib::rpoll::POLLOUT);
+        ev!("POLLERR", majit_rlib::rpoll::POLLERR);
+        ev!("POLLHUP", majit_rlib::rpoll::POLLHUP);
+        ev!("POLLNVAL", majit_rlib::rpoll::POLLNVAL);
+        ev!("POLLRDNORM", majit_rlib::rpoll::POLLRDNORM);
+        ev!("POLLRDBAND", majit_rlib::rpoll::POLLRDBAND);
+        ev!("POLLWRNORM", majit_rlib::rpoll::POLLWRNORM);
+        ev!("POLLWRBAND", majit_rlib::rpoll::POLLWRBAND);
+        ev!("FD_SETSIZE", majit_rlib::rpoll::FD_SETSIZE);
     }
 
     // `interp_kqueue.py` — kqueue() / kevent objects plus the KQ_* event
@@ -594,49 +646,46 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             };
         }
         // `interp_kqueue.py symbol_map` — KQ_FILTER_* / KQ_EV_*.
-        use rustpython_host_env::select::kqueue as host_kqueue;
-        kq!("KQ_FILTER_READ", host_kqueue::EVFILT_READ);
-        kq!("KQ_FILTER_WRITE", host_kqueue::EVFILT_WRITE);
-        kq!("KQ_FILTER_AIO", host_kqueue::EVFILT_AIO);
-        kq!("KQ_FILTER_VNODE", host_kqueue::EVFILT_VNODE);
-        kq!("KQ_FILTER_PROC", host_kqueue::EVFILT_PROC);
-        kq!("KQ_FILTER_SIGNAL", host_kqueue::EVFILT_SIGNAL);
-        kq!("KQ_FILTER_TIMER", host_kqueue::EVFILT_TIMER);
-        kq!("KQ_EV_ADD", host_kqueue::EV_ADD);
-        kq!("KQ_EV_DELETE", host_kqueue::EV_DELETE);
-        kq!("KQ_EV_ENABLE", host_kqueue::EV_ENABLE);
-        kq!("KQ_EV_DISABLE", host_kqueue::EV_DISABLE);
-        kq!("KQ_EV_ONESHOT", host_kqueue::EV_ONESHOT);
-        kq!("KQ_EV_CLEAR", host_kqueue::EV_CLEAR);
-        kq!("KQ_EV_EOF", host_kqueue::EV_EOF);
-        kq!("KQ_EV_ERROR", host_kqueue::EV_ERROR);
-        // `symbol_map` stops here — it comments out the two internal
-        // `EV_` flags as "not defined on FreeBSD" and never names the
-        // `NOTE_*` family at all.  `selectmodule.c` publishes both under
-        // `#ifdef`, and darwin defines every one of them.
-        kq!("KQ_EV_SYSFLAGS", host_kqueue::EV_SYSFLAGS);
-        kq!("KQ_EV_FLAG1", host_kqueue::EV_FLAG1);
+        kq!("KQ_FILTER_READ", libc::EVFILT_READ);
+        kq!("KQ_FILTER_WRITE", libc::EVFILT_WRITE);
+        kq!("KQ_FILTER_AIO", libc::EVFILT_AIO);
+        kq!("KQ_FILTER_VNODE", libc::EVFILT_VNODE);
+        kq!("KQ_FILTER_PROC", libc::EVFILT_PROC);
+        kq!("KQ_FILTER_SIGNAL", libc::EVFILT_SIGNAL);
+        kq!("KQ_FILTER_TIMER", libc::EVFILT_TIMER);
+        kq!("KQ_EV_ADD", libc::EV_ADD);
+        kq!("KQ_EV_DELETE", libc::EV_DELETE);
+        kq!("KQ_EV_ENABLE", libc::EV_ENABLE);
+        kq!("KQ_EV_DISABLE", libc::EV_DISABLE);
+        kq!("KQ_EV_ONESHOT", libc::EV_ONESHOT);
+        kq!("KQ_EV_CLEAR", libc::EV_CLEAR);
+        kq!("KQ_EV_EOF", libc::EV_EOF);
+        kq!("KQ_EV_ERROR", libc::EV_ERROR);
+        // `symbol_map` stops here. It comments out `KQ_EV_SYSFLAGS` and
+        // `KQ_EV_FLAG1`, and it never names the `NOTE_*` family. Those
+        // extras stay: dropping them changes `dir(select)` on darwin.
+        kq!("KQ_EV_SYSFLAGS", libc::EV_SYSFLAGS);
+        kq!("KQ_EV_FLAG1", libc::EV_FLAG1);
         // READ / WRITE filter flag.
-        kq!("KQ_NOTE_LOWAT", host_kqueue::NOTE_LOWAT);
+        kq!("KQ_NOTE_LOWAT", libc::NOTE_LOWAT);
         // VNODE filter flags.
-        kq!("KQ_NOTE_DELETE", host_kqueue::NOTE_DELETE);
-        kq!("KQ_NOTE_WRITE", host_kqueue::NOTE_WRITE);
-        kq!("KQ_NOTE_EXTEND", host_kqueue::NOTE_EXTEND);
-        kq!("KQ_NOTE_ATTRIB", host_kqueue::NOTE_ATTRIB);
-        kq!("KQ_NOTE_LINK", host_kqueue::NOTE_LINK);
-        kq!("KQ_NOTE_RENAME", host_kqueue::NOTE_RENAME);
-        kq!("KQ_NOTE_REVOKE", host_kqueue::NOTE_REVOKE);
-        // PROC filter flags.  `NOTE_PCTRLMASK` is `~NOTE_PDATAMASK` over a
-        // signed `int` in `<sys/event.h>`, so it publishes negative; the rest
-        // are unsigned literals and publish as written.
-        kq!("KQ_NOTE_EXIT", host_kqueue::NOTE_EXIT);
-        kq!("KQ_NOTE_FORK", host_kqueue::NOTE_FORK);
-        kq!("KQ_NOTE_EXEC", host_kqueue::NOTE_EXEC);
-        kq!("KQ_NOTE_PCTRLMASK", host_kqueue::NOTE_PCTRLMASK as i32);
-        kq!("KQ_NOTE_PDATAMASK", host_kqueue::NOTE_PDATAMASK);
-        kq!("KQ_NOTE_TRACK", host_kqueue::NOTE_TRACK);
-        kq!("KQ_NOTE_CHILD", host_kqueue::NOTE_CHILD);
-        kq!("KQ_NOTE_TRACKERR", host_kqueue::NOTE_TRACKERR);
+        kq!("KQ_NOTE_DELETE", libc::NOTE_DELETE);
+        kq!("KQ_NOTE_WRITE", libc::NOTE_WRITE);
+        kq!("KQ_NOTE_EXTEND", libc::NOTE_EXTEND);
+        kq!("KQ_NOTE_ATTRIB", libc::NOTE_ATTRIB);
+        kq!("KQ_NOTE_LINK", libc::NOTE_LINK);
+        kq!("KQ_NOTE_RENAME", libc::NOTE_RENAME);
+        kq!("KQ_NOTE_REVOKE", libc::NOTE_REVOKE);
+        // PROC filter flags. `NOTE_PCTRLMASK` is `0xfff00000`; publishing
+        // it as a signed int makes it negative.
+        kq!("KQ_NOTE_EXIT", libc::NOTE_EXIT);
+        kq!("KQ_NOTE_FORK", libc::NOTE_FORK);
+        kq!("KQ_NOTE_EXEC", libc::NOTE_EXEC);
+        kq!("KQ_NOTE_PCTRLMASK", libc::NOTE_PCTRLMASK as i32);
+        kq!("KQ_NOTE_PDATAMASK", libc::NOTE_PDATAMASK);
+        kq!("KQ_NOTE_TRACK", libc::NOTE_TRACK);
+        kq!("KQ_NOTE_CHILD", libc::NOTE_CHILD);
+        kq!("KQ_NOTE_TRACKERR", libc::NOTE_TRACKERR);
     }
 
     // `interp_select.py:35 W_Error = OSError` — expose the real type so

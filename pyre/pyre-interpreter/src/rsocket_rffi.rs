@@ -151,12 +151,13 @@ pub fn init() {}
 
 // ── error reporting ──
 
-/// The code the last socket call failed with.  WinSock reports through
-/// `WSAGetLastError` and never touches the C runtime's `errno`, which is what
-/// `call_external_function` reads.
+/// The code the last socket call failed with.  POSIX `llexternal`s with
+/// `save_err` store it before the interpreter is taken back, so this reads
+/// that slot.  WinSock reports through `WSAGetLastError` and never touches
+/// the C runtime's `errno`.
 #[cfg(unix)]
 pub fn last_error_code() -> i32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    majit_rlib::rposix::get_saved_errno()
 }
 #[cfg(all(windows, feature = "host_env"))]
 pub fn last_error_code() -> i32 {
@@ -227,7 +228,7 @@ pub fn error_is_connect_in_progress(code: i32) -> bool {
 /// asks for it.
 #[cfg(unix)]
 pub fn gai_strerror(code: libc::c_int) -> String {
-    unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(code)) }
+    unsafe { std::ffi::CStr::from_ptr(majit_rlib::_rsocket_rffi::gai_strerror(code)) }
         .to_string_lossy()
         .into_owned()
 }
@@ -241,11 +242,31 @@ pub fn gai_strerror(code: libc::c_int) -> String {
 pub fn hostname() -> std::io::Result<std::ffi::OsString> {
     use std::os::unix::ffi::OsStringExt;
     let mut buf = [0u8; 256];
-    if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
-        return Err(std::io::Error::last_os_error());
+    if unsafe {
+        majit_rlib::_rsocket_rffi::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len())
+    } != 0
+    {
+        return Err(std::io::Error::from_raw_os_error(
+            majit_rlib::rposix::get_saved_errno(),
+        ));
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     Ok(std::ffi::OsString::from_vec(buf[..end].to_vec()))
+}
+
+/// `sethostname`. The name is the raw bytes the caller already encoded.
+#[cfg(unix)]
+pub fn sethostname(name: &[u8]) -> std::io::Result<()> {
+    let rc = unsafe {
+        majit_rlib::_rsocket_rffi::sethostname(name.as_ptr() as *const libc::c_char, name.len())
+    };
+    if rc != 0 {
+        Err(std::io::Error::from_raw_os_error(
+            majit_rlib::rposix::get_saved_errno(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 #[cfg(all(windows, feature = "host_env"))]
 pub fn hostname() -> std::io::Result<std::ffi::OsString> {
@@ -261,7 +282,7 @@ pub fn hostname() -> std::io::Result<std::ffi::OsString> {
 /// name stands for, or `None` when the database does not name it.
 #[cfg(unix)]
 pub fn protocol_by_name(name: &std::ffi::CStr) -> Option<libc::c_int> {
-    let entry = unsafe { libc::getprotobyname(name.as_ptr()) };
+    let entry = unsafe { majit_rlib::_rsocket_rffi::getprotobyname(name.as_ptr()) };
     (!entry.is_null()).then(|| unsafe { (*entry).p_proto })
 }
 #[cfg(windows)]
@@ -277,12 +298,9 @@ pub fn protocol_by_name(name: &std::ffi::CStr) -> Option<libc::c_int> {
 /// substitution `socketmodule.c socket_inet_aton` makes without one.
 #[cfg(unix)]
 pub fn inet_aton(text: &std::ffi::CStr) -> Option<[u8; 4]> {
-    unsafe extern "C" {
-        #[link_name = "inet_aton"]
-        fn c_inet_aton(cp: *const libc::c_char, inp: *mut libc::in_addr) -> libc::c_int;
-    }
     let mut addr: libc::in_addr = unsafe { core::mem::zeroed() };
-    (unsafe { c_inet_aton(text.as_ptr(), &mut addr) } != 0).then(|| addr.s_addr.to_ne_bytes())
+    (unsafe { majit_rlib::_rsocket_rffi::inet_aton(text.as_ptr(), &mut addr) } != 0)
+        .then(|| addr.s_addr.to_ne_bytes())
 }
 #[cfg(windows)]
 pub fn inet_aton(text: &std::ffi::CStr) -> Option<[u8; 4]> {
@@ -301,14 +319,10 @@ pub fn inet_aton(text: &std::ffi::CStr) -> Option<[u8; 4]> {
 /// order.
 #[cfg(unix)]
 pub fn inet_ntoa(packed: [u8; 4]) -> Option<String> {
-    unsafe extern "C" {
-        #[link_name = "inet_ntoa"]
-        fn c_inet_ntoa(addr: libc::in_addr) -> *mut libc::c_char;
-    }
     let addr = libc::in_addr {
         s_addr: u32::from_ne_bytes(packed),
     };
-    let text = unsafe { c_inet_ntoa(addr) };
+    let text = unsafe { majit_rlib::_rsocket_rffi::inet_ntoa(addr) };
     (!text.is_null()).then(|| {
         unsafe { std::ffi::CStr::from_ptr(text) }
             .to_string_lossy()
@@ -338,7 +352,7 @@ pub fn inet_ntoa(packed: [u8; 4]) -> Option<String> {
 /// inherit flag.  Best-effort, like the `fcntl` call it replaces.
 #[cfg(unix)]
 pub fn set_cloexec(s: Socket) {
-    unsafe { libc::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC) };
+    unsafe { majit_rlib::_rsocket_rffi::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC) };
 }
 #[cfg(all(windows, feature = "host_env"))]
 pub fn set_cloexec(s: Socket) {
@@ -351,9 +365,11 @@ pub fn set_cloexec(_s: Socket) {}
 /// socket.  POSIX inverts `FD_CLOEXEC`, Windows reads the handle's own flag.
 #[cfg(unix)]
 pub fn get_inheritable(s: Socket) -> std::io::Result<bool> {
-    let flags = unsafe { libc::fcntl(s, libc::F_GETFD) };
+    let flags = unsafe { majit_rlib::_rsocket_rffi::fcntl(s, libc::F_GETFD, 0) };
     if flags < 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(std::io::Error::from_raw_os_error(
+            majit_rlib::rposix::get_saved_errno(),
+        ));
     }
     Ok((flags & libc::FD_CLOEXEC) == 0)
 }
@@ -368,17 +384,22 @@ pub fn get_inheritable(_s: Socket) -> std::io::Result<bool> {
 
 #[cfg(unix)]
 pub fn set_inheritable(s: Socket, inheritable: bool) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(s, libc::F_GETFD) };
+    let flags = unsafe { majit_rlib::_rsocket_rffi::fcntl(s, libc::F_GETFD, 0) };
     if flags < 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(std::io::Error::from_raw_os_error(
+            majit_rlib::rposix::get_saved_errno(),
+        ));
     }
     let wanted = if inheritable {
         flags & !libc::FD_CLOEXEC
     } else {
         flags | libc::FD_CLOEXEC
     };
-    if wanted != flags && unsafe { libc::fcntl(s, libc::F_SETFD, wanted) } < 0 {
-        return Err(std::io::Error::last_os_error());
+    if wanted != flags && unsafe { majit_rlib::_rsocket_rffi::fcntl(s, libc::F_SETFD, wanted) } < 0
+    {
+        return Err(std::io::Error::from_raw_os_error(
+            majit_rlib::rposix::get_saved_errno(),
+        ));
     }
     Ok(())
 }
@@ -401,9 +422,11 @@ pub fn set_inheritable(_s: Socket, _inheritable: bool) -> std::io::Result<()> {
 /// not to `SO_RCVTIMEO`/`SO_SNDTIMEO`.
 #[cfg(unix)]
 pub fn apply_timeout(s: Socket, timeout: f64) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(s, libc::F_GETFL, 0) };
+    let flags = unsafe { majit_rlib::_rsocket_rffi::fcntl(s, libc::F_GETFL, 0) };
     if flags < 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(std::io::Error::from_raw_os_error(
+            majit_rlib::rposix::get_saved_errno(),
+        ));
     }
     // Bit-clear without unary `!` so the static analyzer accepts the helper
     // (the analyzer rejects bitwise-not on signed `c_int`).
@@ -414,8 +437,12 @@ pub fn apply_timeout(s: Socket, timeout: f64) -> std::io::Result<()> {
     } else {
         flags
     };
-    if new_flags != flags && unsafe { libc::fcntl(s, libc::F_SETFL, new_flags) } < 0 {
-        return Err(std::io::Error::last_os_error());
+    if new_flags != flags
+        && unsafe { majit_rlib::_rsocket_rffi::fcntl(s, libc::F_SETFL, new_flags) } < 0
+    {
+        return Err(std::io::Error::from_raw_os_error(
+            majit_rlib::rposix::get_saved_errno(),
+        ));
     }
     Ok(())
 }
@@ -439,9 +466,8 @@ pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
         events: libc::POLLIN,
         revents: 0,
     };
-    crate::module::thread::call_external_function(|| unsafe {
-        libc::poll(&mut pollfd, 1, timeout_ms)
-    })
+    let ready = unsafe { majit_rlib::_rsocket_rffi::poll(&mut pollfd, 1, timeout_ms) };
+    (ready, majit_rlib::rposix::get_saved_errno())
 }
 
 /// Writable half of `RSocket._select(True)`.  Keep this beside
@@ -455,9 +481,8 @@ pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
         events: libc::POLLOUT,
         revents: 0,
     };
-    crate::module::thread::call_external_function(|| unsafe {
-        libc::poll(&mut pollfd, 1, timeout_ms)
-    })
+    let ready = unsafe { majit_rlib::_rsocket_rffi::poll(&mut pollfd, 1, timeout_ms) };
+    (ready, majit_rlib::rposix::get_saved_errno())
 }
 #[cfg(windows)]
 pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
@@ -589,7 +614,7 @@ fn clamp_transfer_len(len: usize) -> i32 {
 
 #[cfg(unix)]
 pub unsafe fn socket(family: libc::c_int, ty: libc::c_int, proto: libc::c_int) -> Socket {
-    unsafe { libc::socket(family, ty, proto) }
+    unsafe { majit_rlib::_rsocket_rffi::socket(family, ty, proto) }
 }
 #[cfg(windows)]
 pub unsafe fn socket(family: libc::c_int, ty: libc::c_int, proto: libc::c_int) -> Socket {
@@ -599,7 +624,7 @@ pub unsafe fn socket(family: libc::c_int, ty: libc::c_int, proto: libc::c_int) -
 
 #[cfg(unix)]
 pub unsafe fn close(s: Socket) -> libc::c_int {
-    unsafe { libc::close(s) }
+    unsafe { majit_rlib::_rsocket_rffi::socketclose(s) }
 }
 #[cfg(windows)]
 pub unsafe fn close(s: Socket) -> libc::c_int {
@@ -608,7 +633,7 @@ pub unsafe fn close(s: Socket) -> libc::c_int {
 
 #[cfg(unix)]
 pub unsafe fn bind(s: Socket, addr: *const sockaddr, len: SockLen) -> libc::c_int {
-    unsafe { libc::bind(s, addr, len) }
+    unsafe { majit_rlib::_rsocket_rffi::socketbind(s, addr, len) }
 }
 #[cfg(windows)]
 pub unsafe fn bind(s: Socket, addr: *const sockaddr, len: SockLen) -> libc::c_int {
@@ -617,7 +642,7 @@ pub unsafe fn bind(s: Socket, addr: *const sockaddr, len: SockLen) -> libc::c_in
 
 #[cfg(unix)]
 pub unsafe fn connect(s: Socket, addr: *const sockaddr, len: SockLen) -> libc::c_int {
-    unsafe { libc::connect(s, addr, len) }
+    unsafe { majit_rlib::_rsocket_rffi::socketconnect(s, addr, len) }
 }
 #[cfg(windows)]
 pub unsafe fn connect(s: Socket, addr: *const sockaddr, len: SockLen) -> libc::c_int {
@@ -626,7 +651,7 @@ pub unsafe fn connect(s: Socket, addr: *const sockaddr, len: SockLen) -> libc::c
 
 #[cfg(unix)]
 pub unsafe fn listen(s: Socket, backlog: libc::c_int) -> libc::c_int {
-    unsafe { libc::listen(s, backlog) }
+    unsafe { majit_rlib::_rsocket_rffi::socketlisten(s, backlog) }
 }
 #[cfg(windows)]
 pub unsafe fn listen(s: Socket, backlog: libc::c_int) -> libc::c_int {
@@ -635,7 +660,7 @@ pub unsafe fn listen(s: Socket, backlog: libc::c_int) -> libc::c_int {
 
 #[cfg(unix)]
 pub unsafe fn accept(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> Socket {
-    unsafe { libc::accept(s, addr, len) }
+    unsafe { majit_rlib::_rsocket_rffi::socketaccept(s, addr, len) }
 }
 #[cfg(windows)]
 pub unsafe fn accept(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> Socket {
@@ -649,7 +674,7 @@ pub unsafe fn send(
     len: usize,
     flags: libc::c_int,
 ) -> isize {
-    unsafe { libc::send(s, buf, len, flags) }
+    unsafe { majit_rlib::_rsocket_rffi::send(s, buf, len, flags) }
 }
 #[cfg(windows)]
 pub unsafe fn send(
@@ -668,7 +693,7 @@ pub unsafe fn recv(
     len: usize,
     flags: libc::c_int,
 ) -> isize {
-    unsafe { libc::recv(s, buf, len, flags) }
+    unsafe { majit_rlib::_rsocket_rffi::socketrecv(s, buf, len, flags) }
 }
 #[cfg(windows)]
 pub unsafe fn recv(
@@ -689,7 +714,7 @@ pub unsafe fn sendto(
     addr: *const sockaddr,
     addrlen: SockLen,
 ) -> isize {
-    unsafe { libc::sendto(s, buf, len, flags, addr, addrlen) }
+    unsafe { majit_rlib::_rsocket_rffi::sendto(s, buf, len, flags, addr, addrlen) }
 }
 #[cfg(windows)]
 pub unsafe fn sendto(
@@ -712,7 +737,7 @@ pub unsafe fn recvfrom(
     addr: *mut sockaddr,
     addrlen: *mut SockLen,
 ) -> isize {
-    unsafe { libc::recvfrom(s, buf, len, flags, addr, addrlen) }
+    unsafe { majit_rlib::_rsocket_rffi::recvfrom(s, buf, len, flags, addr, addrlen) }
 }
 #[cfg(windows)]
 pub unsafe fn recvfrom(
@@ -728,7 +753,7 @@ pub unsafe fn recvfrom(
 
 #[cfg(unix)]
 pub unsafe fn getsockname(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> libc::c_int {
-    unsafe { libc::getsockname(s, addr, len) }
+    unsafe { majit_rlib::_rsocket_rffi::socketgetsockname(s, addr, len) }
 }
 #[cfg(windows)]
 pub unsafe fn getsockname(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> libc::c_int {
@@ -737,7 +762,7 @@ pub unsafe fn getsockname(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> 
 
 #[cfg(unix)]
 pub unsafe fn getpeername(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> libc::c_int {
-    unsafe { libc::getpeername(s, addr, len) }
+    unsafe { majit_rlib::_rsocket_rffi::socketgetpeername(s, addr, len) }
 }
 #[cfg(windows)]
 pub unsafe fn getpeername(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> libc::c_int {
@@ -752,7 +777,7 @@ pub unsafe fn getsockopt(
     value: *mut core::ffi::c_void,
     len: *mut SockLen,
 ) -> libc::c_int {
-    unsafe { libc::getsockopt(s, level, option, value, len) }
+    unsafe { majit_rlib::_rsocket_rffi::socketgetsockopt(s, level, option, value, len) }
 }
 #[cfg(windows)]
 pub unsafe fn getsockopt(
@@ -825,7 +850,7 @@ pub unsafe fn setsockopt(
     value: *const core::ffi::c_void,
     len: SockLen,
 ) -> libc::c_int {
-    unsafe { libc::setsockopt(s, level, option, value, len) }
+    unsafe { majit_rlib::_rsocket_rffi::socketsetsockopt(s, level, option, value, len) }
 }
 #[cfg(windows)]
 pub unsafe fn setsockopt(
@@ -840,7 +865,7 @@ pub unsafe fn setsockopt(
 
 #[cfg(unix)]
 pub unsafe fn shutdown(s: Socket, how: libc::c_int) -> libc::c_int {
-    unsafe { libc::shutdown(s, how) }
+    unsafe { majit_rlib::_rsocket_rffi::socketshutdown(s, how) }
 }
 #[cfg(windows)]
 pub unsafe fn shutdown(s: Socket, how: libc::c_int) -> libc::c_int {
@@ -854,7 +879,7 @@ pub unsafe fn getaddrinfo(
     hints: *const addrinfo,
     res: *mut *mut addrinfo,
 ) -> libc::c_int {
-    unsafe { libc::getaddrinfo(node, service, hints, res) }
+    unsafe { majit_rlib::_rsocket_rffi::getaddrinfo(node, service, hints, res) }
 }
 #[cfg(windows)]
 pub unsafe fn getaddrinfo(
@@ -864,12 +889,15 @@ pub unsafe fn getaddrinfo(
     res: *mut *mut addrinfo,
 ) -> libc::c_int {
     init();
+    // The unix body releases the interpreter inside its `llexternal`. This
+    // one does not, so the release stays here and the call sites stay shared.
+    let _blocked = crate::module::thread::before_external_block();
     unsafe { ws::getaddrinfo(node as *const u8, service as *const u8, hints, res) }
 }
 
 #[cfg(unix)]
 pub unsafe fn freeaddrinfo(res: *mut addrinfo) {
-    unsafe { libc::freeaddrinfo(res) }
+    unsafe { majit_rlib::_rsocket_rffi::freeaddrinfo(res) }
 }
 #[cfg(windows)]
 pub unsafe fn freeaddrinfo(res: *mut addrinfo) {
@@ -886,7 +914,11 @@ pub unsafe fn getnameinfo(
     servicelen: SockLen,
     flags: libc::c_int,
 ) -> libc::c_int {
-    unsafe { libc::getnameinfo(addr, addrlen, host, hostlen, service, servicelen, flags) }
+    unsafe {
+        majit_rlib::_rsocket_rffi::getnameinfo(
+            addr, addrlen, host, hostlen, service, servicelen, flags,
+        )
+    }
 }
 #[cfg(windows)]
 pub unsafe fn getnameinfo(
@@ -899,6 +931,7 @@ pub unsafe fn getnameinfo(
     flags: libc::c_int,
 ) -> libc::c_int {
     init();
+    let _blocked = crate::module::thread::before_external_block();
     unsafe {
         ws::getnameinfo(
             addr,
@@ -912,33 +945,13 @@ pub unsafe fn getnameinfo(
     }
 }
 
-// <arpa/inet.h>'s two address converters, which the libc crate does not
-// declare on any unix target we ship.  Aliased so the wrappers below can keep
-// the header's names.
-#[cfg(unix)]
-unsafe extern "C" {
-    #[link_name = "inet_pton"]
-    fn c_inet_pton(
-        af: libc::c_int,
-        src: *const libc::c_char,
-        dst: *mut libc::c_void,
-    ) -> libc::c_int;
-    #[link_name = "inet_ntop"]
-    fn c_inet_ntop(
-        af: libc::c_int,
-        src: *const libc::c_void,
-        dst: *mut libc::c_char,
-        size: libc::socklen_t,
-    ) -> *const libc::c_char;
-}
-
 #[cfg(unix)]
 pub unsafe fn inet_pton(
     family: libc::c_int,
     src: *const libc::c_char,
     dst: *mut core::ffi::c_void,
 ) -> libc::c_int {
-    unsafe { c_inet_pton(family, src, dst as *mut libc::c_void) }
+    unsafe { majit_rlib::_rsocket_rffi::inet_pton(family, src, dst) }
 }
 #[cfg(windows)]
 pub unsafe fn inet_pton(
@@ -957,7 +970,7 @@ pub unsafe fn inet_ntop(
     dst: *mut libc::c_char,
     size: SockLen,
 ) -> *const libc::c_char {
-    unsafe { c_inet_ntop(family, src as *const libc::c_void, dst, size) }
+    unsafe { majit_rlib::_rsocket_rffi::inet_ntop(family, src, dst, size) }
 }
 #[cfg(windows)]
 pub unsafe fn inet_ntop(
@@ -1056,22 +1069,6 @@ pub struct Servent {
 #[cfg(windows)]
 pub type Servent = ws::SERVENT;
 
-#[cfg(unix)]
-unsafe extern "C" {
-    #[link_name = "gethostbyname"]
-    fn c_gethostbyname(name: *const libc::c_char) -> *mut Hostent;
-    #[link_name = "gethostbyaddr"]
-    fn c_gethostbyaddr(
-        addr: *const libc::c_void,
-        len: libc::socklen_t,
-        family: libc::c_int,
-    ) -> *mut Hostent;
-    #[link_name = "getservbyname"]
-    fn c_getservbyname(name: *const libc::c_char, proto: *const libc::c_char) -> *mut Servent;
-    #[link_name = "getservbyport"]
-    fn c_getservbyport(port: libc::c_int, proto: *const libc::c_char) -> *mut Servent;
-}
-
 /// `rsocket._get_netdb_lock_thread`: the lookups below answer with a pointer
 /// into one process-global record, so a second lookup on another thread
 /// invalidates the first one's answer. Hold this across both the lookup and
@@ -1098,7 +1095,7 @@ pub unsafe fn pointer_at(array: *mut *mut libc::c_char, index: usize) -> *mut li
 pub unsafe fn host_by_name(name: *const libc::c_char) -> *mut Hostent {
     #[cfg(unix)]
     {
-        unsafe { c_gethostbyname(name) }
+        unsafe { majit_rlib::_rsocket_rffi::gethostbyname(name).cast() }
     }
     #[cfg(windows)]
     {
@@ -1117,7 +1114,7 @@ pub unsafe fn host_by_addr(
 ) -> *mut Hostent {
     #[cfg(unix)]
     {
-        unsafe { c_gethostbyaddr(addr, len, family) }
+        unsafe { majit_rlib::_rsocket_rffi::gethostbyaddr(addr, len, family).cast() }
     }
     #[cfg(windows)]
     {
@@ -1176,7 +1173,7 @@ pub fn host_error() -> (libc::c_int, String) {
 pub unsafe fn serv_by_name(name: *const libc::c_char, proto: *const libc::c_char) -> *mut Servent {
     #[cfg(unix)]
     {
-        unsafe { c_getservbyname(name, proto) }
+        unsafe { majit_rlib::_rsocket_rffi::getservbyname(name, proto).cast() }
     }
     #[cfg(windows)]
     {
@@ -1191,7 +1188,7 @@ pub unsafe fn serv_by_name(name: *const libc::c_char, proto: *const libc::c_char
 pub unsafe fn serv_by_port(port: libc::c_int, proto: *const libc::c_char) -> *mut Servent {
     #[cfg(unix)]
     {
-        unsafe { c_getservbyport(port, proto) }
+        unsafe { majit_rlib::_rsocket_rffi::getservbyport(port, proto).cast() }
     }
     #[cfg(windows)]
     {
