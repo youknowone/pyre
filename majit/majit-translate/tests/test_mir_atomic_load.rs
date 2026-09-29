@@ -121,3 +121,27 @@ fn atomic_load_real_acquire_readers_preserve_the_diagnostic() {
         "get_instantiate: the Relaxed reader must keep lowering: {result:?}"
     );
 }
+
+#[test]
+#[ignore = "loads build/llbc/pyre-interpreter.ullbc"]
+fn acquire_quasi_w_globals_lowers_across_the_block_copy() {
+    let llbc = Llbc::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-interpreter.ullbc"
+    ))
+    .expect("fresh pyre-interpreter corpus");
+    let graph = lower_function(&llbc, "w_code_get_w_globals")
+        .expect("Acquire load of quasi w_globals lowers");
+    let saw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                majit_translate::model::OpKind::FieldRead { field, .. } if field.name == "w_globals"
+            )
+        })
+    });
+    assert!(
+        saw,
+        "lowered w_code_get_w_globals has no w_globals field read"
+    );
+}

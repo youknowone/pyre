@@ -11320,6 +11320,13 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         // `(lo..=hi).contains` emits `int_between/iii>i`. The decoder is
         // `bhhandler_iii_i!` (`[a][b][c][dst]`), already wired below.
         ("int_between/iii>i", majit_jitcode::insns::BC_INT_BETWEEN),
+        // `jtransform.py rewrite_op_getfield` emits this ahead of a
+        // quasi-immutable getfield. The handler below is the no-op step;
+        // `wire_handler` binds it once this map contains the key.
+        (
+            "record_quasiimmut_field/rdd",
+            majit_jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD,
+        ),
     ] {
         insns.insert(key.to_string(), byte);
     }

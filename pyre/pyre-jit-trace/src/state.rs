@@ -5129,6 +5129,8 @@ pub(crate) fn module_dict_cell_value_direct(obj: PyObjectRef, slot: usize) -> Op
 /// The value is read after the watcher is installed and returned, so a
 /// caller baking a constant uses that read. Unlike `opimpl_getfield_gc_i`
 /// this records no load — that is exactly what quasi-immutability buys.
+/// The loaded constant is published with `heapcache_getfield_now_known`
+/// under `descr.index()`, so the following pure getfield cache-hits.
 pub(crate) fn record_quasiimmut_field(
     ctx: &mut TraceCtx,
     obj: OpRef,
@@ -5140,7 +5142,11 @@ pub(crate) fn record_quasiimmut_field(
             OpCode::QuasiimmutField,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
-        return current_quasiimmut_field_value(ctx, obj, &descr);
+        let value = current_quasiimmut_field_value(ctx, obj, &descr);
+        if let Some(value) = value {
+            ctx.heapcache_getfield_now_known(obj, field_index, value);
+        }
+        return value;
     }
     // quasiimmut.py `self.qmut = get_current_qmut_instance(cpu, struct,
     // mutatefielddescr)` — the half that makes the value captured below
@@ -5177,6 +5183,9 @@ pub(crate) fn record_quasiimmut_field(
     if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
         ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
     }
+    if let Some(value) = constantfieldbox {
+        ctx.heapcache_getfield_now_known(obj, field_index, value);
+    }
     constantfieldbox
 }
 
@@ -5208,6 +5217,23 @@ impl majit_ir::QuasiImmutHandle for RecordedQuasiImmut {
     }
 }
 
+/// `pycode.py` `"w_globals?"`. Analyzer `fielddescrof` stamps
+/// `PyCode.w_globals`; the reserved quasi descr uses the same offset and a
+/// `Struct.w_globals` name.
+fn is_pycode_w_globals_descr(descr: &DescrRef) -> bool {
+    if !descr.is_quasi_immutable() {
+        return false;
+    }
+    let Some(field) = descr.as_field_descr() else {
+        return false;
+    };
+    if field.offset() != pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET {
+        return false;
+    }
+    let name = field.field_name();
+    name == "w_globals" || name.ends_with(".w_globals")
+}
+
 /// `pyjitpl.py:1081 QuasiImmutDescr(cpu, structbox.getref_base(), fielddescr,
 /// mutatefielddescr)` — the descr a recorded `QUASIIMMUT_FIELD` carries.
 ///
@@ -5234,15 +5260,13 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     let index = descr.index();
     // The index decides which type `struct_ptr` is cast to, so an unrecognised
     // one must fail loudly rather than reinterpret a headerless map-node
-    // allocation as a `W_TypeObject`.  Dropping the old implicit `W_TypeObject`
-    // fallback is safe: the arms below are every quasi-immutable descr this
-    // binary can mint — the hand-minted singletons, including
-    // `GilReadyState.gil_ready` and `PyCode.w_globals`, plus the nine
-    // `Function` fields `function.py` declares, which
-    // `function_quasi_immut_slot` resolves as a group.  No analyzer-derived
-    // descr reaches here: a `#[jit_immutable_fields]` entry would need the
-    // `_immutable_fields_` `?` suffix and no declaration in the tree carries
-    // one, and `record_quasiimmut_field` is absent from the emitted-opname set.
+    // allocation as a `W_TypeObject`.  The arms below are every quasi-immutable
+    // descr this binary mints: the hand-minted singletons, including
+    // `GilReadyState.gil_ready`, the nine `Function` fields `function.py`
+    // declares (`function_quasi_immut_slot`), and `PyCode.w_globals`.
+    // Analyzer `fielddescrof` stamps that field from `pycode.py`
+    // `"w_globals?"`; the name plus `CODE_W_GLOBALS_OFFSET` is the same slot
+    // as the reserved `pycode_w_globals_quasi_descr` index.
     let qmut = unsafe {
         if index == crate::descr::module_dict_version_descr().index() {
             pyre_object::dictmultiobject::module_dict_strategy_current_version_qmut(
@@ -5293,7 +5317,9 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
             pyre_object::function::w_classmethod_current_w_function_qmut(
                 struct_ptr as pyre_object::PyObjectRef,
             )
-        } else if index == crate::descr::pycode_w_globals_quasi_descr().index() {
+        } else if index == crate::descr::pycode_w_globals_quasi_descr().index()
+            || is_pycode_w_globals_descr(descr)
+        {
             pyre_interpreter::pycode::w_code_current_w_globals_qmut(
                 struct_ptr as pyre_object::PyObjectRef,
             )

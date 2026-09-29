@@ -6636,6 +6636,10 @@ struct Lowering<'a> {
     /// [`Self::owner_root_reroot_call`]).
     owner_root_reroot: Option<CallPayload>,
     block_entry_local_var: Vec<PackedLocalRow>,
+    /// Fresh block-input id → the predecessor Variable `FrameState.copy`
+    /// minted it from. The target body is lowered before pass 2 writes
+    /// those pairs as link args, so a use in the target reads the map.
+    input_copied_from: std::collections::HashMap<u64, u64>,
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
     block_positional_seen: Vec<bit_set::BitSet>,
     block_positional_conflict: Vec<bit_set::BitSet>,
@@ -7255,6 +7259,7 @@ impl<'a> Lowering<'a> {
             block_id,
             block_live_in,
             block_entry_local_var,
+            input_copied_from: std::collections::HashMap::new(),
             block_entry_positional_aggregate_locals,
             block_positional_seen: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
             block_positional_conflict: vec![
@@ -7493,6 +7498,24 @@ impl<'a> Lowering<'a> {
         self.local_var = (0..n)
             .map(|i| fs.entries.get(i).cloned().flatten())
             .collect();
+    }
+
+    /// Record `FrameState.copy`'s fresh input → predecessor Variable.
+    ///
+    /// Pass 2 writes the same pairs as link args after the target body
+    /// is lowered. A use lowered in the target, such as the Acquire load
+    /// of a quasi-immutable field, reads the predecessor operation through
+    /// this map.
+    fn note_copied_block_inputs(&mut self, source: &FrameState, copied: &FrameState) {
+        let n = source.entries.len().min(copied.entries.len());
+        for slot in 0..n {
+            let (Some(src), Some(dst)) = (&source.entries[slot], &copied.entries[slot]) else {
+                continue;
+            };
+            if src.id() != dst.id() {
+                self.input_copied_from.insert(dst.id(), src.id());
+            }
+        }
     }
 
     /// Successor MIR blocks along the edges [`Self::lower_terminator`]
@@ -7896,7 +7919,11 @@ impl<'a> Lowering<'a> {
                     // inputargs; `remove_duplicate_inputargs`
                     // (`remove_identical_vars_SSA`) recombines the ones that
                     // really are one phi column.
-                    None => ex.copy(&mut self.graph),
+                    None => {
+                        let copied = ex.copy(&mut self.graph);
+                        self.note_copied_block_inputs(&ex, &copied);
+                        copied
+                    }
                     Some(prev) => prev.union(&ex, &mut self.graph).ok_or_else(|| {
                         LowerError::Unsupported(format!(
                             "framestate: union of predecessors failed at bb{tmir}"
@@ -14993,14 +15020,18 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // Only the existing Relaxed scalar fold is available here.
-                // An Acquire/SeqCst (or unknown) ordering cannot be erased.
-                // Nor can it fall through to an ordinary Atomic::load call:
-                // `&self` may already alias the loaded value, NOT its address.
+                // Only two loads alias the receiver. A Relaxed load is the
+                // existing scalar fold. An Acquire load aliases only when that
+                // receiver is already a `FieldRead` of a field this crate's
+                // `_immutable_fields_` marker ranks quasi-immutable: the
+                // codewriter then emits `record_quasiimmut_field` plus the
+                // pure getfield, and the pure read is the guarded value.
+                // SeqCst, Release, an unknown ordering, and an Acquire load of
+                // any other field stay unsupported. `&self` may already alias
+                // the loaded value, NOT its address, so those cannot fall
+                // through to an ordinary `Atomic::load` call.
                 // FlowContext.record_block in flowcontext.py propagates an
                 // unsupported operation rather than publishing a wrong graph.
-                // Keep that boundary until atomic borrows preserve addresses
-                // and ordered accesses have an executable effectful lowering.
                 // This rejects the body, not the whole translation: the
                 // whole-program builder's pre-existing residual fallback is
                 // separate #346 work, not an implementation of atomic loads.
@@ -15011,7 +15042,9 @@ impl<'a> Lowering<'a> {
                         .flatten()
                         .and_then(|local| self.atomic_ordering_locals.get(&local))
                         .map(String::as_str);
-                    if ordering != Some("Relaxed") {
+                    let quasi_acquire = ordering == Some("Acquire")
+                        && self.atomic_load_receiver_is_quasi_field(&args[0]);
+                    if ordering != Some("Relaxed") && !quasi_acquire {
                         return Err(LowerError::Unsupported(format!(
                             "atomic load ordering {} requires address-preserving ordered lowering",
                             ordering.unwrap_or("unknown")
@@ -20436,6 +20469,61 @@ impl<'a> Lowering<'a> {
 
     fn is_atomic_load(&self, reg: &RegularCall) -> bool {
         self.is_atomic_method(reg, "load")
+    }
+
+    /// The receiver variable is a `FieldRead`, or a fresh block input
+    /// copied from one, whose `(owner_root, field)` this crate's
+    /// `_immutable_fields_` marker ranks quasi-immutable.
+    ///
+    /// `w_code_get_w_globals` computes `&raw (*code).w_globals` in one
+    /// block and calls `AtomicPtr::load` in the successor. `FrameState.copy`
+    /// gives that successor a fresh Variable, so the load's receiver is not
+    /// the `FieldRead` result. [`Self::input_copied_from`] is that copy.
+    ///
+    /// The marker is read from `self.llbc` here because
+    /// `SemanticProgram::immutable_fields` is published only after lowering.
+    /// A missing owner, a missing marker, a merge phi, or a rank that is
+    /// not quasi fails closed and the load keeps the unsupported-ordering
+    /// error.
+    fn atomic_load_receiver_is_quasi_field(&self, recv: &Variable) -> bool {
+        let mut var_id = recv.id();
+        let mut seen = std::collections::HashSet::new();
+        let (owner, name) = loop {
+            if !seen.insert(var_id) || seen.len() > 64 {
+                return false;
+            }
+            let found = self.graph.blocks.iter().find_map(|block| {
+                block.operations.iter().find_map(|op| match &op.kind {
+                    OpKind::FieldRead { field, .. }
+                        if op
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result.id() == var_id) =>
+                    {
+                        Some((field.owner_root.clone(), field.name.clone()))
+                    }
+                    _ => None,
+                })
+            });
+            if let Some(found) = found {
+                break found;
+            }
+            match self.input_copied_from.get(&var_id).copied() {
+                Some(next) => var_id = next,
+                None => return false,
+            }
+        };
+        let Some(owner) = owner else {
+            return false;
+        };
+        let ranks = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
+            std::slice::from_ref(self.llbc),
+        );
+        ranks.get(&owner).is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|(field_name, rank)| field_name == &name && rank.is_quasi_immutable())
+        })
     }
 
     /// `<core::sync::atomic::Atomic*>::store(&self, value, ordering)` — the

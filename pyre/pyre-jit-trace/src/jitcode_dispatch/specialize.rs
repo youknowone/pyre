@@ -20602,19 +20602,106 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     emit_builtins_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, w_builtin, &name)
 }
 
-/// Trace the three frame reads at the head of `pyopcode.py IMPORT_NAME`.
+/// Walk `pyframe::PyFrame::get_w_globals` when `debugdata` is absent.
 ///
-/// PyPy does not leave calls for `get_builtin`, `getdebug`, or
-/// `get_w_globals` in the optimized loop. `get_builtin` and the debug-data
-/// reads are ordinary field reads from the live red frame. `get_w_globals`
-/// is `pyframe.py PyFrame.get_w_globals`: `debugdata.w_globals` when debug
-/// data is present, otherwise `jit.promote(self.pycode).w_globals`
-/// (`pycode.py` `"w_globals?"`) — a constant, one `QUASIIMMUT_FIELD`, and a
-/// `GUARD_NOT_INVALIDATED`. Pyre's bytecode frontend spells them as three
-/// residual helpers, so recognize those helpers here and emit that shape.
-/// Only the standard virtualizable is handled; an inlined callee has its own
-/// red frame and stays on the residual path until the generic
-/// nonstandard-virtualizable field descent can represent it directly.
+/// The body is `pyframe.py PyFrame.get_w_globals`: a null `debugdata`
+/// continues to `jit.promote(self.pycode).w_globals`. The frame argument is
+/// the portal's standard virtualizable, so the callee reads that red frame.
+/// A missing jitcode, an empty body, or
+/// [`DispatchError::OrthodoxSubWalkTraceUnsupported`] leaves the residual
+/// call. Any other walk error aborts the portal.
+pub(crate) fn try_walker_descend_frame_get_w_globals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    frame_op: OpRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if dst_bank != 'r' || ctx.trace_ctx.standard_virtualizable_box() != Some(frame_op) {
+        return Ok(None);
+    }
+    let Some(frame_ptr) = ctx.trace_ctx.standard_virtualizable_ptr() else {
+        return Ok(None);
+    };
+    let Some((_, majit_ir::Value::Ref(debugdata_ref))) = ctx
+        .trace_ctx
+        .virtualizable_entry_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
+    else {
+        return Ok(None);
+    };
+    if debugdata_ref == majit_ir::GcRef::NO_CONCRETE || debugdata_ref.as_usize() != 0 {
+        return Ok(None);
+    }
+
+    let Some(jc_arc) =
+        crate::jitcode_runtime::pathed_jitcode_cached("pyframe::PyFrame::get_w_globals")
+    else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    if sub_body.code.is_empty() {
+        return Ok(None);
+    }
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: set for the lifetime of the enclosing full-body walk.
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
+
+    let frame_obj = frame_ptr as pyre_object::PyObjectRef;
+    ctx.trace_ctx
+        .set_opref_concrete(frame_op, majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)));
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "get_w_globals_commit",
+        "get_w_globals_call_site",
+        &[],
+        &[],
+        &[frame_op],
+        &[ConcreteValue::Ref(frame_obj)],
+        &[],
+    );
+    let (walk_outcome, _walk_start) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] GET-W-GLOBALS-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
+/// Trace `pyopcode.py IMPORT_NAME`'s frame reads.
+///
+/// `get_builtin` and a non-null debugdata read are field reads from the
+/// live red frame. Null-debugdata `LoadImportGlobals` declines before the
+/// nullity guard so the caller descends `pyframe::PyFrame::get_w_globals`.
+/// An inlined callee keeps its own red frame and stays residual.
 pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -20693,6 +20780,21 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
         return Ok(false);
     }
 
+    // Null `debugdata` is `pyframe.py get_w_globals`'s promote arm. Decline
+    // before the nullity guard so that guard is not left behind when the
+    // caller walks the generated body. `LoadImportLocals` still guards.
+    if helper == majit_ir::RuntimeHelperKind::LoadImportGlobals {
+        let Some((_, majit_ir::Value::Ref(debugdata_ref))) = ctx
+            .trace_ctx
+            .virtualizable_entry_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
+        else {
+            return Ok(false);
+        };
+        if debugdata_ref == majit_ir::GcRef::NO_CONCRETE || debugdata_ref.as_usize() == 0 {
+            return Ok(false);
+        }
+    }
+
     // `debugdata` is a virtualizable field.  Read its shadow entry rather
     // than the heap field, which may be stale while compiled code owns the
     // frame.  The nullity guard is exactly PyPy's `d is None` branch.
@@ -20761,79 +20863,26 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
             }
         }
         majit_ir::RuntimeHelperKind::LoadImportGlobals => {
-            if debugdata_present {
-                let shadow =
-                    debugdata_ref.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
-                let w_globals = unsafe { (*shadow).w_globals };
-                if w_globals.is_null() {
-                    return Ok(false);
-                }
-                let live = crate::state::opimpl_getfield_gc_r(
-                    ctx.trace_ctx,
-                    debugdata_op,
-                    crate::descr::frame_debug_data_w_globals_descr(),
-                );
-                if live.is_constant() && ctx.trace_ctx.const_value(live) != Some(w_globals as i64) {
-                    return Ok(false);
-                }
-                ctx.trace_ctx.set_opref_concrete(
-                    live,
-                    majit_ir::Value::Ref(majit_ir::GcRef(w_globals as usize)),
-                );
-                live
-            } else {
-                // `pyframe.py PyFrame.get_w_globals`:
-                // `jit.promote(self.pycode).w_globals` (`pycode.py` `"w_globals?"`).
-                // A code object whose globals were never stamped keeps the residual.
-                let Some((pycode_op, majit_ir::Value::Ref(pycode_ref))) = ctx
-                    .trace_ctx
-                    .virtualizable_entry_at(crate::virtualizable_spec::PYCODE_VABLE_FIELD_INDEX)
-                else {
-                    return Ok(false);
-                };
-                if pycode_ref == majit_ir::GcRef::NO_CONCRETE || pycode_ref.as_usize() == 0 {
-                    return Ok(false);
-                }
-                let pycode = pycode_ref.as_usize() as pyre_object::PyObjectRef;
-                let pycode_const = ctx.trace_ctx.const_ref(pycode as i64);
-                if pycode_op.is_constant()
-                    && ctx.trace_ctx.const_value(pycode_op) != Some(pycode as i64)
-                {
-                    return Ok(false);
-                }
-                // Null stays residual: nothing has stamped this code object, and
-                // recording a watcher for that empty slot is not the fold.
-                // A non-null read here only decides that. The constant below is
-                // the read `record_quasiimmut_field` takes after it installs
-                // the watcher (`quasiimmut.py QuasiImmutDescr.__init__` before
-                // `get_current_constant_fieldvalue`). Baking the earlier read
-                // keeps a value a store can replace once the watcher exists.
-                let probed = unsafe { pyre_interpreter::w_code_get_w_globals(pycode) };
-                if probed.is_null() {
-                    return Ok(false);
-                }
-                if !pycode_op.is_constant() {
-                    walker_emit_fold_guard_with_snapshot(
-                        ctx,
-                        op_pc,
-                        OpCode::GuardValue,
-                        &[pycode_op, pycode_const],
-                    )?;
-                    ctx.trace_ctx
-                        .heap_cache_mut()
-                        .replace_box(pycode_op, pycode_const);
-                }
-                let captured = crate::state::record_quasiimmut_field(
-                    ctx.trace_ctx,
-                    pycode_const,
-                    crate::descr::pycode_w_globals_quasi_descr(),
-                );
-                walker_flush_guard_not_invalidated(ctx, op_pc)?;
-                captured.unwrap_or_else(|| {
-                    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(pycode) };
-                    ctx.trace_ctx.const_ref(w_globals as i64)
-                })
+            debug_assert!(debugdata_present);
+            let shadow =
+                debugdata_ref.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
+            let w_globals = unsafe { (*shadow).w_globals };
+            if w_globals.is_null() {
+                return Ok(false);
             }
+            let live = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                debugdata_op,
+                crate::descr::frame_debug_data_w_globals_descr(),
+            );
+            if live.is_constant() && ctx.trace_ctx.const_value(live) != Some(w_globals as i64) {
+                return Ok(false);
+            }
+            ctx.trace_ctx.set_opref_concrete(
+                live,
+                majit_ir::Value::Ref(majit_ir::GcRef(w_globals as usize)),
+            );
+            live
         }
         _ => unreachable!("helper was filtered above"),
     };

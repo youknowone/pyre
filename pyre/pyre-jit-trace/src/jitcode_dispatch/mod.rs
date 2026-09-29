@@ -13085,6 +13085,18 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx.gen_store_back_in_vable(vable);
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
+        // `jtransform.py rewrite_op_getfield` emits this ahead of a
+        // quasi-immutable getfield. Operand layout `rdd`: the struct, the
+        // field descr, and the mutate descr. The mutate descr is unused;
+        // `quasi_immut_descr` resolves the watcher from the field descr.
+        // The opcode has no result register.
+        "record_quasiimmut_field/rdd" => {
+            let obj = read_ref_reg(code, op, 0, ctx)?;
+            let descr = read_descr(code, op, 1, ctx)?;
+            let _ = crate::state::record_quasiimmut_field(ctx.trace_ctx, obj, descr);
+            walker_flush_guard_not_invalidated(ctx, op.pc)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // setfield_gc canonical shapes. `iid` / `ird` (int box)
         // shapes are pyre kind-flow kind-flow territory and stay
         // unsupported.

@@ -3987,6 +3987,11 @@ mod tests {
     /// only what the assembler emitted while analyzing this build's source
     /// set, so absence from it is not by itself proof that no jitcode carries
     /// the byte.
+    ///
+    /// `record_quasiimmut_field/rdd` is registered.
+    /// `jtransform.py rewrite_op_getfield` emits it ahead of a
+    /// quasi-immutable getfield, and `handler_record_quasiimmut_field` is
+    /// the no-op step.
     #[test]
     fn production_bh_builder_overlay_only_gap_snapshot() {
         let builder = build_pyre_production_bh_builder();
@@ -4015,7 +4020,6 @@ mod tests {
             "newlist_clear/idddd>r",
             "newlist_hint/idddd>r",
             "record_exact_class/ri",
-            "record_quasiimmut_field/rdd",
             "rvmprof_code/ii",
         ];
         assert_eq!(

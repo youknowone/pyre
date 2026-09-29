@@ -2051,13 +2051,11 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// assume.  A tuple's backing array has its own immutable descriptor and is
 /// read with `GetarrayitemGcPureR`.
 ///
-/// `#[majit_macros::jit_immutable_fields("code?", ...)]` on the struct is the
-/// declarative spelling of the same list, and it is deliberately NOT applied:
-/// it would make the codewriter emit `record_quasiimmut_field` into the
-/// analyzer's interpreter jitcodes, and that bytecode has no trace-time arm in
-/// `pyjitpl/dispatch.rs` (unknown bytecodes panic there) and no registration in
-/// the production blackhole builder.  Until both land, the declaration lives on
-/// this group, which is what every hand-written trace path resolves through.
+/// The declarative attribute stays off this struct. Emitting
+/// `record_quasiimmut_field` for these nine fields would put the opcode in
+/// every interpreter jitcode that reads them, and `pyjitpl/dispatch.rs` still
+/// has no arm for that byte. The descriptors in this group are what the
+/// hand-written trace paths resolve.
 ///
 /// The entries are in byte-offset order and each key is the struct's own field
 /// name, which is what makes the group's numbering agree with the analyzer's.

@@ -528,7 +528,11 @@ pub static CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("code");
 /// `Box::into_raw`'d; a nested body points into that permanently-live owner,
 /// matching PyPy's one recursively-owned `co_consts_w` code graph without
 /// cloning the child graph at each wrapping boundary.
+///
+/// `w_globals?` is `pycode.py` `_immutable_fields_`: the first store fills
+/// it, and a later read of the promoted code object is quasi-immutable.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("w_globals?")]
 pub struct PyCode {
     pub ob_header: PyObject,
     /// Opaque pointer to a permanently-live `CodeObject`. Top-level bodies are

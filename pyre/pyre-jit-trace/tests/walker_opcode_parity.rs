@@ -267,6 +267,11 @@ const PYRE_ONLY: &[&str] = &[
     "ref_push/r",
     // Raw float store.
     "raw_store_f/iifd",
+    // `jtransform.py rewrite_op_getfield` emits this ahead of a
+    // quasi-immutable getfield. Majit's tracer has no arm; the production
+    // walk records it here. The blackhole handler is the no-op
+    // `bhimpl_record_quasiimmut_field`.
+    "record_quasiimmut_field/rdd",
     // Constant-index string read (`pyjitpl.py opimpl_strgetitem`). Majit's
     // `BC_STRLEN` / `BC_STRGETITEM` arms decode the register-index shapes
     // only.
@@ -281,7 +286,7 @@ const PYRE_ONLY: &[&str] = &[
 /// Keys the encoding names that neither tracer walks.
 ///
 /// Measured once, so that a key ARRIVING here is the thing to look at rather
-/// than the list itself: fourteen of these are never assembled at all — the
+/// than the list itself: thirteen of these are never assembled at all — the
 /// registration-gap snapshot in `jitcode_runtime.rs` pins most of them
 /// against `build_emitted_insns()`, the opnames the build actually emitted.
 /// The two the build does emit are both accounted for. And
@@ -304,7 +309,6 @@ const NEITHER: &[&str] = &[
     "getlistitem_gc_r/ridd>r",
     "newlist/idddd>r",
     "newlist_hint/idddd>r",
-    "record_quasiimmut_field/rdd",
     // Encoded for the front's `InteriorFieldWrite` alongside the
     // `getinteriorfield_gc_*` keys above; no tracer walks either yet.
     "setinteriorfield_gc_f/rifd",
