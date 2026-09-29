@@ -20,7 +20,8 @@ fast-alloc = ["dep:mimalloc"]
 
 [dependencies]
 majit-backend = { workspace = true }
-majit-gc = { workspace = true }
+# `set_gc_allocator` panics unless `gc_box` is on (`note_gc_box_installed`).
+majit-gc = { workspace = true, features = ["gc_box"] }
 majit-ir = { workspace = true }
 majit-metainterp = { workspace = true }
 majit-macros = { workspace = true }

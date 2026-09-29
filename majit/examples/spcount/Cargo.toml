@@ -11,6 +11,8 @@ dynasm = ["majit-metainterp/dynasm"]
 [dependencies]
 linkme = { workspace = true }
 majit-ir = { workspace = true }
+# `set_gc_allocator` panics unless `gc_box` is on (`note_gc_box_installed`).
+majit-gc = { workspace = true, features = ["gc_box"] }
 majit-metainterp = { workspace = true }
 majit-macros = { workspace = true }
 

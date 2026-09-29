@@ -153,6 +153,7 @@ const PUSHARG: u8 = 22;
 pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlState> =
         majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     // Count compiled loops, and record the size of the last compiled body.
     driver.set_on_compile_loop(|_green_key, _ops_before, ops_after, opcodes| {
         COMPILES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);

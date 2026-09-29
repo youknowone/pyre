@@ -125,6 +125,7 @@ impl BytecodeExt for [u8] {
 fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<Tiny2State> =
         majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     driver.set_on_compile_loop(|_green_key, _ops_before, ops_after, opcodes| {
         COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         LAST_OPS_AFTER.store(ops_after, std::sync::atomic::Ordering::Relaxed);

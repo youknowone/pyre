@@ -331,6 +331,7 @@ dependencies = [
 name = "braininterp"
 version = "0.0.2"
 dependencies = [
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -421,6 +422,7 @@ dependencies = [
 name = "cel"
 version = "0.0.2"
 dependencies = [
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -999,6 +1001,7 @@ checksum = "9bda8e21c04aca2ae33ffc2fd8c23134f3cac46db123ba97bd9d3f3b8a4a85e1"
 name = "dualtape"
 version = "0.0.2"
 dependencies = [
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -1414,6 +1417,7 @@ dependencies = [
 name = "i64env"
 version = "0.0.2"
 dependencies = [
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -3942,6 +3946,7 @@ version = "0.0.2"
 dependencies = [
  "ctor",
  "linkme",
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -4170,6 +4175,7 @@ dependencies = [
 name = "tiny2"
 version = "0.0.2"
 dependencies = [
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -4180,6 +4186,7 @@ dependencies = [
 name = "tiny3"
 version = "0.0.2"
 dependencies = [
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -4190,6 +4197,7 @@ dependencies = [
 name = "tinyframe"
 version = "0.0.2"
 dependencies = [
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -4227,6 +4235,7 @@ version = "0.0.2"
 dependencies = [
  "ctor",
  "linkme",
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -4237,6 +4246,7 @@ dependencies = [
 name = "tla"
 version = "0.0.2"
 dependencies = [
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -4246,6 +4256,7 @@ dependencies = [
 name = "tlc"
 version = "0.0.2"
 dependencies = [
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -4256,6 +4267,7 @@ dependencies = [
 name = "tlr"
 version = "0.0.2"
 dependencies = [
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",

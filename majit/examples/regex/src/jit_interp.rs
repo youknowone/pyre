@@ -204,6 +204,7 @@ impl Matcher {
     pub fn new(root: *mut NodeRec, threshold: u32) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
         let mut driver = JitDriver::new(threshold);
+        majit_metainterp::install_jitframe_gc(&mut driver);
         driver.set_on_compile_loop(|_gk, _before, ops_after, opcodes| {
             COMPILES.fetch_add(1, Relaxed);
             LAST_OPS_AFTER.store(ops_after, Relaxed);

@@ -79,6 +79,7 @@ struct BfState {
 fn mainloop(program: &Bytecode, threshold: u32) -> String {
     let mut driver: majit_metainterp::JitDriver<BfState> =
         majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     driver.set_on_compile_loop(|_green_key, ops_before, ops_after, opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
         LAST_OPS_BEFORE.store(ops_before, Ordering::Relaxed);

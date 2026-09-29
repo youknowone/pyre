@@ -74,6 +74,7 @@ struct VmState {
 fn mainloop(program: &Code, base_a: i64, base_b: i64, n: i64, threshold: u32) -> f64 {
     let mut driver: majit_metainterp::JitDriver<VmState> =
         majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after, _opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
     });
@@ -251,6 +252,7 @@ mod count {
     fn mainloop_count(program: &Code, base_a: i64, base_b: i64, n: i64, threshold: u32) -> i64 {
         let mut driver: majit_metainterp::JitDriver<CountState> =
             majit_metainterp::JitDriver::new(threshold);
+        majit_metainterp::install_jitframe_gc(&mut driver);
         driver.set_on_compile_loop(|_green_key, _ob, _oa, _opcodes| {
             COMPILES.fetch_add(1, Ordering::Relaxed);
         });
@@ -453,6 +455,7 @@ mod twobank {
     fn mainloop_twobank(program: &Code, threshold: u32) -> i64 {
         let mut driver: majit_metainterp::JitDriver<TwoBankState> =
             majit_metainterp::JitDriver::new(threshold);
+        majit_metainterp::install_jitframe_gc(&mut driver);
         driver.set_on_compile_loop(|_g, _a, _b, _opcodes| {
             COMPILES.fetch_add(1, Ordering::Relaxed);
         });
