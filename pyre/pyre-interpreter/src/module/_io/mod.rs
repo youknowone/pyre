@@ -874,8 +874,12 @@ pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
             Err(error) if error.matches_stop_iteration() => break,
             Err(error) => return Err(error),
         };
-        length = length.saturating_add(crate::baseobjspace::len_w(line)?);
+        // `len_w` can run `__len__`; the line is pinned before it.
+        let line_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(line);
+        length = length.saturating_add(crate::baseobjspace::len_w(
+            pyre_object::gc_roots::shadow_stack_get(line_slot),
+        )?);
         count += 1;
         if hint > 0 && length > hint {
             break;

@@ -2437,16 +2437,15 @@ const SRE_FLAG_NAMES: [&str; 9] = [
 /// decoded into their `re.*` names (the implicit `re.UNICODE` on a known
 /// unicode pattern is suppressed, :160-165).
 pub(crate) fn sre_pattern_repr_str(
-    pat: PyObjectRef,
+    mut pat: PyObjectRef,
 ) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
-    let pp = pat as *const W_SRE_Pattern;
-    let mut w_pattern = unsafe { (*pp).w_pattern };
-    let mut flags = unsafe { (*pp).flags };
+    let mut w_pattern = unsafe { (*(pat as *const W_SRE_Pattern)).w_pattern };
     let u = truncate_code_points(
-        pyre_object::with_roots!(w_pattern => unsafe { crate::display::py_repr_wtf8(w_pattern) })?,
+        pyre_object::with_roots!(pat, w_pattern => unsafe { crate::display::py_repr_wtf8(w_pattern) })?,
         200,
     );
 
+    let mut flags = unsafe { (*(pat as *const W_SRE_Pattern)).flags };
     let is_known_unicode = unsafe { is_str(w_pattern) };
     if is_known_unicode
         && (flags & (SRE_FLAG_LOCALE | SRE_FLAG_UNICODE | SRE_FLAG_ASCII)) == SRE_FLAG_UNICODE

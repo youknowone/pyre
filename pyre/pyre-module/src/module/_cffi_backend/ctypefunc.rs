@@ -168,26 +168,17 @@ fn call_varargs(
             args_w.len()
         )));
     }
-    let fvarargs = complete_argtypes(&fargs, args_w)?;
-    // `args_w` and `fvarargs` are native copies that building the cif can
-    // move; publish both and hand each consumer a copy read from the slots.
+    // `args_w` is a native copy: completing the argument types can allocate
+    // a promoted primitive type, and the completed tuple below is a fresh
+    // allocation.  The completed types themselves are stable ctypes.
     let roots = pyre_object::gc_roots::push_roots();
-    let args_base = roots.publish(args_w);
-    let fvarargs_base = roots.publish(&fvarargs);
-    roots.normalize(args_base, args_w.len() + fvarargs.len());
-    let mut live_fvarargs = Vec::with_capacity(fvarargs.len());
-    for i in 0..fvarargs.len() {
-        live_fvarargs.push(roots.get(fvarargs_base + i));
-    }
-    let cif = build_cif_descr(&live_fvarargs, ct.ctitem, ct.abi, Some(fargs.len()))?;
+    let args_base = roots.pin_roots(args_w);
+    let fvarargs = complete_argtypes(&fargs, &roots, args_base, args_w.len())?;
+    let cif = build_cif_descr(&fvarargs, ct.ctitem, ct.abi, Some(fargs.len()))?;
     // `new_ctypefunc_completing_argtypes` builds a fresh function type and
     // calls `_call` on it. The completed tuple is young and is not a field
     // of `ct`, so this opaque arm pins it for the conversions below.
-    let mut live_fvarargs = Vec::with_capacity(fvarargs.len());
-    for i in 0..fvarargs.len() {
-        live_fvarargs.push(roots.get(fvarargs_base + i));
-    }
-    let fargs_slot = roots.pin_roots(&[pyre_object::tupleobject::w_tuple_new(live_fvarargs)]);
+    let fargs_slot = roots.pin_roots(&[pyre_object::tupleobject::w_tuple_new(fvarargs)]);
     let mut live_args = Vec::with_capacity(args_w.len());
     for i in 0..args_w.len() {
         live_args.push(roots.get(args_base + i));
@@ -199,13 +190,19 @@ fn call_varargs(
 
 /// `W_CTypeFunc.new_ctypefunc_completing_argtypes` — the declared argument
 /// types followed by the promoted type of each variadic argument.
+///
+/// The arguments are read from the caller's slots `args_base..+nargs`: a
+/// promoted primitive type is allocated on first use.
 fn complete_argtypes(
     fargs: &[PyObjectRef],
-    args_w: &[PyObjectRef],
+    roots: &pyre_object::gc_roots::RootScope,
+    args_base: usize,
+    nargs: usize,
 ) -> Result<Vec<PyObjectRef>, PyError> {
-    let mut fvarargs = Vec::with_capacity(args_w.len());
+    let mut fvarargs = Vec::with_capacity(nargs);
     fvarargs.extend_from_slice(fargs);
-    for (i, &w_obj) in args_w.iter().enumerate().skip(fargs.len()) {
+    for i in fargs.len()..nargs {
+        let w_obj = roots.get(args_base + i);
         let Some(cdata) = W_CData::from_obj(w_obj) else {
             return Err(PyError::type_error(format!(
                 "argument {} passed in the variadic part needs to be a cdata object (got {})",
@@ -384,20 +381,19 @@ pub(crate) mod cif {
     /// `CifDescrBuilder` — the two-pass bump allocator that measures the block
     /// and then fills it.
     ///
-    /// `build_cif_descr` roots the argument and result types; `fargs_base`
-    /// and `fresult_slot` name their shadow-stack slots, since building can
-    /// collect and move them.
-    struct Builder {
-        fargs_base: usize,
-        nargs: usize,
-        fresult_slot: usize,
+    /// The argument and result types are ctypes, born through
+    /// `allocate_stable`: a collection never moves them, and the caller's
+    /// function type or rooted arguments keep them alive.
+    struct Builder<'a> {
+        fargs: &'a [PyObjectRef],
+        w_fresult: PyObjectRef,
         nb_bytes: usize,
         bufferp: *mut u8,
         atypes: *mut *mut ffi_type,
         rtype: *mut ffi_type,
     }
 
-    impl Builder {
+    impl Builder<'_> {
         /// `CifDescrBuilder.fb_alloc`.  Every request is a multiple of eight
         /// and the block itself comes from `malloc`, so each record inside it
         /// lands on its own alignment.
@@ -414,20 +410,15 @@ pub(crate) mod cif {
 
         /// `CifDescrBuilder.fb_build`.
         fn build(&mut self) -> Result<(), PyError> {
-            let nargs = self.nargs;
+            let nargs = self.fargs.len();
             self.alloc(
                 std::mem::size_of::<CifDescription>() + nargs * std::mem::size_of::<usize>(),
             );
             let atypes = self.alloc(nargs * std::mem::size_of::<*mut ffi_type>());
             self.atypes = atypes.cast::<*mut ffi_type>();
-            self.rtype = self.fill_type(
-                ctypeobj::ctype_arg(pyre_object::gc_roots::shadow_stack_get(self.fresult_slot))?,
-                true,
-            )?;
+            self.rtype = self.fill_type(ctypeobj::ctype_arg(self.w_fresult)?, true)?;
             for i in 0..nargs {
-                let farg = ctypeobj::ctype_arg(pyre_object::gc_roots::shadow_stack_get(
-                    self.fargs_base + i,
-                ))?;
+                let farg = ctypeobj::ctype_arg(self.fargs[i])?;
                 let atype = self.fill_type(farg, false)?;
                 if !self.atypes.is_null() {
                     unsafe { self.atypes.add(i).write(atype) };
@@ -679,14 +670,9 @@ pub(crate) mod cif {
         abi: i64,
         nfixedargs: Option<usize>,
     ) -> Result<usize, PyError> {
-        let roots = pyre_object::gc_roots::push_roots();
-        let fargs_base = roots.publish(fargs);
-        let fresult_slot = roots.publish(&[w_fresult]);
-        roots.normalize(fargs_base, fargs.len() + 1);
         let mut builder = Builder {
-            fargs_base,
-            nargs: fargs.len(),
-            fresult_slot,
+            fargs,
+            w_fresult,
             nb_bytes: 0,
             bufferp: std::ptr::null_mut(),
             atypes: std::ptr::null_mut(),
@@ -710,7 +696,7 @@ pub(crate) mod cif {
         for i in 0..nargs {
             // Room for the must-free flag the pointer conversion writes just
             // before the slot.
-            if ctypeobj::ctype_arg(roots.get(fargs_base + i))?.kind == ctypeobj::KIND_POINTER {
+            if ctypeobj::ctype_arg(fargs[i])?.kind == ctypeobj::KIND_POINTER {
                 offset += 1;
             }
             let atype = unsafe { builder.atypes.add(i).read() };

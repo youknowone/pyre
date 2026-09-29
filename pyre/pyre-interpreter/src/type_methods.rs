@@ -4591,10 +4591,13 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         0,
     )?;
     crate::builtins::kwarg_reject_unknown(kwargs, &["encoding", "errors"], "encode")?;
+    // Only the counts are read off the native slices once they are pinned.
+    let nargs = args.len();
+    let npos = pos.len();
     let _roots = pyre_object::gc_roots::push_roots();
     let arg_base = pyre_object::gc_roots::pin_roots(args);
     let reload = |i: usize| pyre_object::gc_roots::shadow_stack_get(arg_base + i);
-    let kwargs = kwargs.map(|_| reload(args.len() - 1));
+    let kwargs = kwargs.map(|_| reload(nargs - 1));
     let dual =
         |name: &str, p: Option<PyObjectRef>| -> Result<Option<PyObjectRef>, crate::PyError> {
             let kw = crate::builtins::kwarg_get(kwargs, name);
@@ -4605,8 +4608,8 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             }
             Ok(p.or(kw))
         };
-    let w_encoding = if pos.len() > 1 { Some(reload(1)) } else { None };
-    let w_errors = if pos.len() > 2 { Some(reload(2)) } else { None };
+    let w_encoding = if npos > 1 { Some(reload(1)) } else { None };
+    let w_errors = if npos > 2 { Some(reload(2)) } else { None };
     let encoding = str_arg(dual("encoding", w_encoding)?, "utf-8")?;
     let errors = str_arg(dual("errors", w_errors)?, "strict")?;
     Ok(pyre_object::w_bytes_from_bytes(&encode_object(

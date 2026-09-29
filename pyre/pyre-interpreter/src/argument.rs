@@ -102,11 +102,17 @@ pub fn raise_type_error(
 /// from CPython-style interned-string identity.  The typed fallback routes
 /// through `W_UnicodeObject.eq_w`; using generic `space.eq_w` here would invoke
 /// Python-level `__eq__` on hand-built Arguments and silently drift.
-pub fn contains_w_names(mut w_key: PyObjectRef, keys_w: &[PyObjectRef]) -> bool {
-    for &(mut w_other) in keys_w {
-        if pyre_object::with_roots!(w_key, w_other => crate::baseobjspace::is_w(w_other, w_key)) {
+pub fn contains_w_names(w_key: PyObjectRef, keys_w: &[PyObjectRef]) -> bool {
+    // `is_w` can build a bigint, so the key and the names are read from their
+    // slots on every turn.
+    let roots = pyre_object::gc_roots::push_roots();
+    let key_slot = roots.pin_roots(&[w_key]);
+    let keys_base = roots.pin_roots(keys_w);
+    for i in 0..keys_w.len() {
+        if crate::baseobjspace::is_w(roots.get(keys_base + i), roots.get(key_slot)) {
             return true;
         }
+        let (w_other, w_key) = (roots.get(keys_base + i), roots.get(key_slot));
         unsafe {
             if pyre_object::is_str(w_other)
                 && pyre_object::is_str(w_key)
@@ -139,29 +145,47 @@ pub fn check_not_duplicate_kwargs(
     existingkeywords_w: &[PyObjectRef],
     keyword_names_w: &[PyObjectRef],
     _keywords_w: &[PyObjectRef],
-    mut w_function: PyObjectRef,
+    w_function: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    for &(mut w_key) in keyword_names_w {
-        if pyre_object::with_roots!(w_function, w_key => contains_w_names(w_key, existingkeywords_w))
-        {
-            let key_repr = unsafe {
-                if pyre_object::is_str(w_key) {
-                    pyre_object::w_str_get_wtf8(w_key).to_owned()
-                } else {
-                    pyre_object::with_roots!(w_function => crate::display::py_str_wtf8(w_key))?
-                }
-            };
-            return Err(raise_type_error(
-                w_function,
-                crate::display::wtf8_format!(
-                    "got multiple values for keyword argument '",
-                    key_repr,
-                    "'"
-                ),
-            ));
+    let Some((w_key, mut w_function)) =
+        find_duplicate_kwarg(existingkeywords_w, keyword_names_w, w_function)
+    else {
+        return Ok(());
+    };
+    let key_repr = unsafe {
+        if pyre_object::is_str(w_key) {
+            pyre_object::w_str_get_wtf8(w_key).to_owned()
+        } else {
+            pyre_object::with_roots!(w_function => crate::display::py_str_wtf8(w_key))?
+        }
+    };
+    Err(raise_type_error(
+        w_function,
+        crate::display::wtf8_format!("got multiple values for keyword argument '", key_repr, "'"),
+    ))
+}
+
+/// The loop of `_check_not_duplicate_kwargs`: the first of `keyword_names_w`
+/// that `existingkeywords_w` already holds, returned with `w_function`.
+/// `contains_w_names` can collect, so both lists and the callable are read
+/// from their slots.
+fn find_duplicate_kwarg(
+    existingkeywords_w: &[PyObjectRef],
+    keyword_names_w: &[PyObjectRef],
+    w_function: PyObjectRef,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let function_slot = roots.pin_roots(&[w_function]);
+    let existing_base = roots.pin_roots(existingkeywords_w);
+    let names_base = roots.pin_roots(keyword_names_w);
+    let mut existing_now = existingkeywords_w.to_vec();
+    for i in 0..keyword_names_w.len() {
+        pyre_object::gc_roots::shadow_stack_copy_range(existing_base, &mut existing_now);
+        if contains_w_names(roots.get(names_base + i), &existing_now) {
+            return Some((roots.get(names_base + i), roots.get(function_slot)));
         }
     }
-    Ok(())
+    None
 }
 
 /// pypy/interpreter/argument.py `_do_combine_starstarargs_wrapped`.
@@ -282,6 +306,8 @@ pub fn do_combine_starstarargs_wrapped(
                 format!("got multiple values for keyword argument '{key}'"),
             ));
         }
+        // `contains_w_names` can collect; the key is read back from its slot.
+        let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
         // argument.py — `keyword_names_w[i] = w_key`.
         pyre_object::gc_roots::shadow_stack_set(pairs_base + 2 * i, w_key);
         // argument.py:449-457 — value lookup.
@@ -472,10 +498,18 @@ pub fn combine_starstarargs_wrapped(
     if let Some(names) = fast_names {
         let values = fast_values
             .expect("baseobjspace.py:1159 view_as_kwargs returns matching Some/Some or None/None");
+        let mut names = names;
+        let mut values = values;
         refresh_out(keyword_names_out, keywords_out);
         // argument.py:111-119 — merge with optional duplicate check.
         if !keyword_names_out.is_empty() {
+            // The duplicate check compares through `is_w`, which can collect.
+            let fast_names_base = pyre_object::gc_roots::pin_roots(&names);
+            let fast_values_base = pyre_object::gc_roots::pin_roots(&values);
             check_not_duplicate_kwargs(keyword_names_out, &names, &values, w_function())?;
+            refresh_out(keyword_names_out, keywords_out);
+            pyre_object::gc_roots::shadow_stack_copy_range(fast_names_base, &mut names[..]);
+            pyre_object::gc_roots::shadow_stack_copy_range(fast_values_base, &mut values[..]);
         }
         keyword_names_out.extend(names);
         keywords_out.extend(values);
@@ -528,15 +562,19 @@ pub fn combine_starstarargs_wrapped(
             } else {
                 crate::baseobjspace::findattr(w_obj_type, "__iter__")?
             };
+            // `findattr` runs `__getattribute__`: the dict type is fetched
+            // again and `lhs` is compared by identity after it.
+            let mut lhs = lhs.unwrap_or(pyre_object::PY_NULL);
+            let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
             let rhs = if w_dict_type.is_null() {
                 None
             } else {
-                crate::baseobjspace::findattr(w_dict_type, "__iter__")?
+                pyre_object::with_roots!(lhs => crate::baseobjspace::findattr(w_dict_type, "__iter__"))?
             };
             // `space.is_w` is pointer identity.
-            match (lhs, rhs) {
-                (Some(a), Some(b)) => crate::baseobjspace::is_w(a, b),
-                (None, None) => true,
+            match (!lhs.is_null(), rhs) {
+                (true, Some(b)) => crate::baseobjspace::is_w(lhs, b),
+                (false, None) => true,
                 _ => false,
             }
         }

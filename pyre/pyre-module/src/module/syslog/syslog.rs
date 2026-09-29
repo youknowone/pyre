@@ -24,18 +24,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // `str_utf8_w` does not forward it.
                 let _roots = pyre_object::gc_roots::push_roots();
                 let args_base = _roots.pin_roots(args);
-                let ident = match args.first() {
-                    Some(_) if unsafe { pyre_object::is_str(_roots.get(args_base)) } => {
-                        // openlog(3) keeps a C string, so the ident ends at
-                        // the first NUL.
-                        let ident =
-                            pyre_interpreter::baseobjspace::str_utf8_w(_roots.get(args_base))?;
-                        let ident = ident.split_once('\0').map_or(ident, |(s, _)| s);
-                        std::ffi::CString::new(ident)
-                            .ok()
-                            .map(|c| c.into_boxed_c_str())
-                    }
-                    _ => None,
+                let ident = if !args.is_empty()
+                    && unsafe { pyre_object::is_str(_roots.get(args_base)) }
+                {
+                    // openlog(3) keeps a C string, so the ident ends at
+                    // the first NUL.
+                    let ident =
+                        pyre_interpreter::baseobjspace::str_utf8_w(_roots.get(args_base))?;
+                    let ident = ident.split_once('\0').map_or(ident, |(s, _)| s);
+                    std::ffi::CString::new(ident)
+                        .ok()
+                        .map(|c| c.into_boxed_c_str())
+                } else {
+                    None
                 };
                 for index in 1..args.len() {
                     if !unsafe { pyre_object::is_int(_roots.get(args_base + index)) } {

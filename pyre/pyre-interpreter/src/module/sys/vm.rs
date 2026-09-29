@@ -829,6 +829,9 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let self_obj = pyre_object::gc_roots::pin_root(self_obj);
+    // Only the presence of keyword changes is tested below; the dict itself
+    // is read from its slot.
+    let has_kwargs = kwargs.is_some();
     if let Some(kwargs) = kwargs {
         let _ = pyre_object::gc_roots::pin_root(kwargs);
     }
@@ -852,14 +855,14 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
     }
     let _ = pyre_object::gc_roots::pin_root(self_type);
     let result = crate::call::call_function_impl_result(
-        pyre_object::gc_roots::shadow_stack_get(sp + 1 + usize::from(kwargs.is_some())),
+        pyre_object::gc_roots::shadow_stack_get(sp + 1 + usize::from(has_kwargs)),
         &[],
     )?;
     let _ = pyre_object::gc_roots::pin_root(result);
     // Reread from this slot at every use below: the `__dict__` lookup and each
     // `namespace_update_dict` can run Python and collect, so a local captured
     // here would name the pre-relocation address.
-    let result_slot = sp + 2 + usize::from(kwargs.is_some());
+    let result_slot = sp + 2 + usize::from(has_kwargs);
     let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
     let result_type = crate::typedef::r#type(result)
         .map(|tp| tp.as_ptr())
@@ -867,7 +870,7 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
     if !unsafe { crate::baseobjspace::issubtype_w(result_type, simple_namespace_type()) } {
         let constructed = unsafe {
             crate::baseobjspace::type_fully_qualified_name(pyre_object::gc_roots::shadow_stack_get(
-                sp + 1 + usize::from(kwargs.is_some()),
+                sp + 1 + usize::from(has_kwargs),
             ))
         };
         let returned = if result_type.is_null() {
@@ -886,10 +889,10 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
     let _ = pyre_object::gc_roots::pin_root(source_dict);
     namespace_update_dict(
         pyre_object::gc_roots::shadow_stack_get(result_slot),
-        pyre_object::gc_roots::shadow_stack_get(sp + 3 + usize::from(kwargs.is_some())),
+        pyre_object::gc_roots::shadow_stack_get(sp + 3 + usize::from(has_kwargs)),
         false,
     )?;
-    if kwargs.is_some() {
+    if has_kwargs {
         namespace_update_dict(
             pyre_object::gc_roots::shadow_stack_get(result_slot),
             pyre_object::gc_roots::shadow_stack_get(sp + 1),

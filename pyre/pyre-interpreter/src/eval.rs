@@ -2470,7 +2470,9 @@ fn prepare_frame_resume(
             // The delegate's StopIteration value is already on the outer
             // frame stack and its SEND completion target is installed.
             Ok(None) => return Ok(FrameResume::Dispatch(None)),
-            Err(err) => pending_operr = Some(err),
+            // The delegate's error is thrown into this frame's own dispatch;
+            // the sent value was the delegate's and is not resumed here.
+            Err(err) => return Ok(FrameResume::Dispatch(Some(err))),
         }
     }
     if pending_operr.is_none()
@@ -2576,18 +2578,18 @@ pub(crate) fn eval_frame_plain_with_resume(
     let mut outer_result = (|| -> PyResult {
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
         // The sent `OperationError` is a GC object there (`error.py`). Pin
-        // the native carrier across the hook and write the slot back before
-        // the resume reads `exc_object`.
-        let operr_pin = resume.operr.as_ref().and_then(|err| {
+        // the native carrier across the hook and write the slots back before
+        // the resume reads them.
+        let operr_pin = resume.operr.as_ref().map(|err| {
             let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin_exc_object(&roots)?;
-            Some((roots, slot))
+            let slot = err.pin_gc_refs(&roots);
+            (roots, slot)
         });
         execution_context.call_trace(frame_anchor.live())?;
         if let Some((roots, slot)) = &operr_pin
             && let Some(err) = resume.operr.as_mut()
         {
-            err.reload_exc_object(roots, Some(*slot));
+            err.reload_gc_refs(roots, *slot);
         }
         drop(operr_pin);
         let mut inner_result = (|| -> PyResult {
@@ -2608,13 +2610,13 @@ pub(crate) fn eval_frame_plain_with_resume(
             let exit_slot = roots.base();
             let exit = roots.pin_root(w_exitvalue);
             let err_slot = match &inner_result {
-                Err(err) => err.pin_exc_object(&roots),
+                Err(err) => Some(err.pin_gc_refs(&roots)),
                 Ok(_) => None,
             };
             let result = execution_context.return_trace(frame_anchor.live(), exit);
             w_exitvalue = roots.get(exit_slot);
-            if let Err(err) = &mut inner_result {
-                err.reload_exc_object(&roots, err_slot);
+            if let (Err(err), Some(base)) = (&mut inner_result, err_slot) {
+                err.reload_gc_refs(&roots, base);
             }
             result
         };
@@ -2639,12 +2641,12 @@ pub(crate) fn eval_frame_plain_with_resume(
     let leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
         let err_slot = match &outer_result {
-            Err(err) => err.pin_exc_object(&roots),
+            Err(err) => Some(err.pin_gc_refs(&roots)),
             Ok(_) => None,
         };
         let result = execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
-        if let Err(err) = &mut outer_result {
-            err.reload_exc_object(&roots, err_slot);
+        if let (Err(err), Some(base)) = (&mut outer_result, err_slot) {
+            err.reload_gc_refs(&roots, base);
         }
         result
     };

@@ -2426,6 +2426,7 @@ fn string_index_type_error(index: PyObjectRef) -> PyError {
 #[inline(never)]
 unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
+    let mut index = index;
     if is_slice(index) {
         let (rs, rp, st) = {
             // Every slice component goes through `__index__`, so this runs
@@ -2475,10 +2476,12 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             // before dispatching here, so nothing else roots it across the
             // call. A list is nursery-allocated, so read the address back —
             // a minor collection during the call moves it.
+            // The index is read back for the overflow message's type name.
             let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, index]);
             let indexed = space_index(index)?;
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            index = pyre_object::gc_roots::shadow_stack_get(obj_slot + 1);
             indexed
         };
         if is_int(indexed) {
@@ -2513,6 +2516,7 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 #[inline(never)]
 unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
+    let mut index = index;
     if is_slice(index) {
         // tupleobject.py descr_getslice → slice.indices.
         let len = w_tuple_len(obj) as i64;
@@ -2563,10 +2567,12 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             // before dispatching here, so nothing else roots it across the
             // call. A tuple is nursery-allocated, so read the address back —
             // a minor collection during the call moves it.
+            // The index is read back for the overflow message's type name.
             let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, index]);
             let indexed = space_index(index)?;
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            index = pyre_object::gc_roots::shadow_stack_get(obj_slot + 1);
             indexed
         };
         if is_int(indexed) {
@@ -2608,6 +2614,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // position through the string's cached `rutf8` index table, so a read is
     // O(1) either way and nothing here has to materialise the code points.
     let mut obj = obj;
+    let mut index = index;
     let len = w_str_len(obj);
     if is_slice(index) {
         // `pypy/objspace/std/unicodeobject.py W_UnicodeObject._getitem_slice`
@@ -2664,10 +2671,12 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             // before dispatching here, so nothing else roots it across the
             // call. `space.str` answers a nursery header, so read the address
             // back — a minor collection during the call moves it.
+            // The index is read back for the overflow message's type name.
             let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, index]);
             let indexed = space_index(index)?;
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            index = pyre_object::gc_roots::shadow_stack_get(obj_slot + 1);
             indexed
         };
         if is_int(indexed) {
@@ -6741,6 +6750,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // The receiver, its type and the descriptor are read back from
             // their slots after each call below: a descriptor `__get__` and
             // the dict lookup can both run Python.
+            let has_descr = w_descr.is_some();
             let descr_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_descr.unwrap_or(PY_NULL));
             // module.py descr_getattribute runs the normal lookup, then catches
@@ -6750,9 +6760,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // AttributeError; the bare `object.__getattribute__` slot
             // (`!call_getattr`) still propagates so `module_getattribute`'s own
             // `try`/`except` performs the routing.
-            if w_descr.is_some()
-                && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot))
-            {
+            if has_descr && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
                 match get(
                     pyre_object::gc_roots::shadow_stack_get(descr_slot),
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -6779,7 +6787,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             {
                 return Ok(value);
             }
-            if w_descr.is_some() {
+            if has_descr {
                 match get(
                     pyre_object::gc_roots::shadow_stack_get(descr_slot),
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -6928,14 +6936,23 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
 
             // Step 1: look up in type MRO
             let w_descr = lookup_in_type_where(w_type, name);
+            // A descriptor `__get__` and the dict read below can run Python;
+            // the descriptor is read back from its slot after each.
+            let has_descr = w_descr.is_some();
+            let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+            if let Some(descr) = w_descr {
+                let _ = pyre_object::gc_roots::pin_root(descr);
+            }
 
             // Step 2: data descriptor takes priority over instance dict.
             // objspace.py — a descriptor `__get__` raising
             // AttributeError falls back to `__getattr__`, not propagated.
-            if let Some(descr) = w_descr
-                && is_data_descr(descr)
-            {
-                match get(descr, obj, w_type) {
+            if has_descr && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
+                match get(
+                    pyre_object::gc_roots::shadow_stack_get(descr_slot),
+                    obj,
+                    w_type,
+                ) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
                     Err(e) if e.kind == PyErrorKind::AttributeError => {
@@ -6972,9 +6989,8 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // PyPy: descroperation.py — invoke __get__ to bind methods.
             // objspace.py — a non-data descriptor `__get__` raising
             // AttributeError falls back to `__getattr__` too.
-            if let Some(descr) = w_descr {
-                let descr_slot = pyre_object::gc_roots::shadow_stack_len();
-                let descr = pyre_object::gc_roots::pin_root(descr);
+            if has_descr {
+                let descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
                 match get(descr, obj, w_type) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
@@ -8224,22 +8240,9 @@ unsafe fn instance_getattr_hook_or_err(
     mut e: crate::PyError,
 ) -> PyResult {
     unsafe {
-        let _roots = pyre_object::gc_roots::push_roots();
+        let roots = pyre_object::gc_roots::push_roots();
         let live = pyre_object::gc_roots::pin_roots(&[w_type, obj]);
-        let name_ctx_slot = if !e.w_name_context.is_null() {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(e.w_name_context);
-            Some(slot)
-        } else {
-            None
-        };
-        let obj_ctx_slot = if !e.w_obj_context.is_null() {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(e.w_obj_context);
-            Some(slot)
-        } else {
-            None
-        };
+        let err_base = e.pin_gc_refs(&roots);
         if let Some(getattr_fn) =
             lookup_in_type_where(pyre_object::gc_roots::shadow_stack_get(live), "__getattr__")
         {
@@ -8260,12 +8263,7 @@ unsafe fn instance_getattr_hook_or_err(
                 &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
             );
         }
-        if let Some(slot) = name_ctx_slot {
-            e.w_name_context = pyre_object::gc_roots::shadow_stack_get(slot);
-        }
-        if let Some(slot) = obj_ctx_slot {
-            e.w_obj_context = pyre_object::gc_roots::shadow_stack_get(slot);
-        }
+        e.reload_gc_refs(&roots, err_base);
     }
     Err(e)
 }
@@ -8283,25 +8281,12 @@ unsafe fn type_getattr_hook_or_err(
     mut e: crate::PyError,
     call_getattr: bool,
 ) -> PyResult {
-    let _roots = pyre_object::gc_roots::push_roots();
+    let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     let mc_vals: Vec<PyObjectRef> = w_metaclasses.iter().copied().flatten().collect();
     let mc_base = pyre_object::gc_roots::pin_roots(&mc_vals);
-    let name_ctx_slot = if !e.w_name_context.is_null() {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(e.w_name_context);
-        Some(slot)
-    } else {
-        None
-    };
-    let obj_ctx_slot = if !e.w_obj_context.is_null() {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(e.w_obj_context);
-        Some(slot)
-    } else {
-        None
-    };
+    let err_base = e.pin_gc_refs(&roots);
     if call_getattr && e.kind == PyErrorKind::AttributeError {
         for i in 0..mc_vals.len() {
             let w_metaclass = pyre_object::gc_roots::shadow_stack_get(mc_base + i);
@@ -8326,12 +8311,7 @@ unsafe fn type_getattr_hook_or_err(
             }
         }
     }
-    if let Some(slot) = name_ctx_slot {
-        e.w_name_context = pyre_object::gc_roots::shadow_stack_get(slot);
-    }
-    if let Some(slot) = obj_ctx_slot {
-        e.w_obj_context = pyre_object::gc_roots::shadow_stack_get(slot);
-    }
+    e.reload_gc_refs(&roots, err_base);
     Err(e)
 }
 
@@ -9380,10 +9360,19 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             && let Some(w_type) = crate::typedef::r#type(obj)
         {
             let w_descr = lookup_in_type_where(w_type.as_ptr(), name);
-            if let Some(descr) = w_descr
-                && is_data_descr(descr)
-            {
-                match get(descr, obj, w_type.as_ptr()) {
+            // `get` and `getdictvalue` can run Python; the descriptor is read
+            // back from its slot after each.
+            let has_descr = w_descr.is_some();
+            let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+            if let Some(descr) = w_descr {
+                let _ = pyre_object::gc_roots::pin_root(descr);
+            }
+            if has_descr && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
+                match get(
+                    pyre_object::gc_roots::shadow_stack_get(descr_slot),
+                    obj,
+                    w_type.as_ptr(),
+                ) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
                     Err(e) if e.kind == PyErrorKind::AttributeError => {
@@ -9395,7 +9384,8 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             if let Some(value) = getdictvalue(obj, name)? {
                 return Ok(value);
             }
-            if let Some(descr) = w_descr {
+            if has_descr {
+                let descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
                 // A plain Python function is the one callable `get` leaves
                 // unhandled; bind it here.  A builtin-code carrier is not:
                 // a `method_descriptor` binds to a
@@ -9409,8 +9399,6 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                 {
                     return Ok(pyre_object::w_method_new(descr, obj, w_type.as_ptr()));
                 }
-                let descr_slot = pyre_object::gc_roots::shadow_stack_len();
-                let descr = pyre_object::gc_roots::pin_root(descr);
                 match get(descr, obj, w_type.as_ptr()) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
@@ -9439,9 +9427,17 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
         // dict (`hasdict` false) and take the direct class-attr fast path.
         if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
             let w_descr = unsafe { lookup_in_type_where(w_type.as_ptr(), name) };
-            if let Some(descr) = w_descr
-                && unsafe { is_data_descr(descr) }
+            // `get` and `getdictvalue` can run Python; the descriptor is read
+            // back from its slot after each.
+            let has_descr = w_descr.is_some();
+            let method_slot = pyre_object::gc_roots::shadow_stack_len();
+            if let Some(descr) = w_descr {
+                let _ = pyre_object::gc_roots::pin_root(descr);
+            }
+            if has_descr
+                && unsafe { is_data_descr(pyre_object::gc_roots::shadow_stack_get(method_slot)) }
             {
+                let descr = pyre_object::gc_roots::shadow_stack_get(method_slot);
                 match unsafe { get(descr, obj, w_type.as_ptr()) } {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
@@ -9457,9 +9453,8 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                 return Ok(value);
             }
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            if let Some(method) = w_descr {
-                let method_slot = pyre_object::gc_roots::shadow_stack_len();
-                let method = pyre_object::gc_roots::pin_root(method);
+            if has_descr {
+                let method = pyre_object::gc_roots::shadow_stack_get(method_slot);
                 match unsafe { get(method, obj, w_type.as_ptr()) } {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
@@ -15735,7 +15730,7 @@ pub fn call_args_and_c_profile_args(
     // slice and the `Arguments` vectors are native storage no root walker
     // updates.  Root them all, dispatch from the roots, and refresh the
     // `Arguments` vectors before the return hook reads them again.
-    let _roots = pyre_object::gc_roots::push_roots();
+    let roots = pyre_object::gc_roots::push_roots();
     let callable_slot = pyre_object::gc_roots::publish_roots(&[callable]);
     let flat_base = pyre_object::gc_roots::publish_roots(flat_args);
     let positional_base = pyre_object::gc_roots::publish_roots(&arguments.arguments_w);
@@ -15794,15 +15789,7 @@ pub fn call_args_and_c_profile_args(
             // the call and written back with `set_call_error`. A tracer error
             // replaces it, matching `except` replacing the in-flight error.
             let mut parked = crate::call::take_call_error();
-            let parked_base = parked.as_ref().map(|err| {
-                let base = pyre_object::gc_roots::publish_roots(&[
-                    err.exc_object,
-                    err.w_name_context,
-                    err.w_obj_context,
-                ]);
-                pyre_object::gc_roots::normalize_roots(base, 3);
-                base
-            });
+            let parked_base = parked.as_ref().map(|err| err.pin_gc_refs(&roots));
             let exc_children = parked
                 .as_ref()
                 .and_then(|err| pin_unmanaged_exception_children(err.exc_object));
@@ -15811,9 +15798,7 @@ pub fn call_args_and_c_profile_args(
             };
             if let Some(mut err) = parked.take() {
                 if let Some(base) = parked_base {
-                    err.exc_object = pyre_object::gc_roots::shadow_stack_get(base);
-                    err.w_name_context = pyre_object::gc_roots::shadow_stack_get(base + 1);
-                    err.w_obj_context = pyre_object::gc_roots::shadow_stack_get(base + 2);
+                    err.reload_gc_refs(&roots, base);
                 }
                 if let Some((child_base, offsets)) = exc_children {
                     write_unmanaged_exception_children(err.exc_object, child_base, offsets);
@@ -21435,21 +21420,23 @@ pub(crate) fn resume_yield_from(
     let roots = pyre_object::gc_roots::push_roots();
     let yf_slot = roots.publish(&[w_yf, w_arg]);
     let arg_slot = yf_slot + 1;
-    let exc_slot = operr
-        .as_ref()
-        .and_then(|err| err.publish_exc_object(&roots));
+    let exc_slot = operr.as_ref().map(|err| err.publish_gc_refs(&roots));
     let throw_slot = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
     roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
 
     let result = match operr {
         Some(mut err) if err.kind == PyErrorKind::GeneratorExit => {
             close_yield_from(roots.get(yf_slot))?;
-            err.reload_exc_object(&roots, exc_slot);
+            if let Some(base) = exc_slot {
+                err.reload_gc_refs(&roots, base);
+            }
             unsafe { (*anchor.live()).w_yielding_from = pyre_object::PY_NULL };
             return Err(err);
         }
         Some(mut err) => {
-            err.reload_exc_object(&roots, exc_slot);
+            if let Some(base) = exc_slot {
+                err.reload_gc_refs(&roots, base);
+            }
             let throw_args = throw_slot.map(|(base, argc)| {
                 (
                     [roots.get(base), roots.get(base + 1), roots.get(base + 2)],
@@ -21518,18 +21505,18 @@ fn throw_yield_from(
     // the range once, before `getattr`.
     let roots = pyre_object::gc_roots::push_roots();
     let yf_slot = roots.publish(&[w_yf]);
-    let mut exc_slot = err.publish_exc_object(&roots);
+    let mut exc_slot = err.publish_gc_refs(&roots);
     let pinned_args = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
     roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
     let throw = match getattr_str(roots.get(yf_slot), "throw") {
         Ok(method) => method,
         Err(attr_err) if attr_err.kind == PyErrorKind::AttributeError => {
-            err.reload_exc_object(&roots, exc_slot);
+            err.reload_gc_refs(&roots, exc_slot);
             return Err(err);
         }
         Err(attr_err) => return Err(attr_err),
     };
-    err.reload_exc_object(&roots, exc_slot);
+    err.reload_gc_refs(&roots, exc_slot);
     let throw_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(throw);
     if let Some((args_base, argc)) = pinned_args {
@@ -21548,17 +21535,17 @@ fn throw_yield_from(
             _ => crate::call::call_function_impl_result(throw, &[arg0, arg1, arg2]),
         };
     }
-    if exc_slot.is_none() {
+    if err.exc_object.is_null() {
         let w_exc = err.to_exc_object();
         err.exc_object = w_exc;
-        exc_slot = err.pin_exc_object(&roots);
+        exc_slot = err.pin_gc_refs(&roots);
     }
-    err.reload_exc_object(&roots, exc_slot);
+    err.reload_gc_refs(&roots, exc_slot);
     let w_type =
         crate::typedef::r#type(err.exc_object).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_type);
-    err.reload_exc_object(&roots, exc_slot);
+    err.reload_gc_refs(&roots, exc_slot);
     crate::call::call_function_impl_result(
         roots.get(throw_slot),
         &[roots.get(type_slot), err.exc_object],

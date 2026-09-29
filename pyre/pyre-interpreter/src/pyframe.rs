@@ -1890,6 +1890,7 @@ impl FrameBox {
         // locals slot (the latter also covers the std::alloc fallback frame)
         // across that allocation.
         let _frame_roots = pyre_object::gc_roots::push_roots();
+        let frame_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(frame_ptr as pyre_object::PyObjectRef);
         let _root = FrameLocalsRoot::new(frame_ptr);
         // generator.py `self.pycode = frame.pycode`: preserve the exact
@@ -1942,12 +1943,13 @@ impl FrameBox {
             };
         }
         // pyframe.py `initialize_as_generator`: `self.f_generator_wref =
-        // rweakref.ref(gen)`.  The frame is non-moving and pinned in
-        // `_frame_roots`; the WEAKREF allocation can move the generator, so
-        // read it back from its pin.  An old frame storing a nursery WEAKREF
-        // runs the write barrier.
+        // rweakref.ref(gen)`.  The WEAKREF allocation can move the generator
+        // and collects, so the frame is read back from its pin in
+        // `_frame_roots` after it, and the generator from its own pin below.
+        // An old frame storing a nursery WEAKREF runs the write barrier.
         unsafe {
             let wref = pyre_object::weakref::w_weakref_new(generator);
+            let frame_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame;
             (*frame_ptr).f_generator_wref = wref as PyObjectRef;
             if pyre_object::gc_hook::try_gc_owns_object(frame_ptr as *mut u8) {
                 pyre_object::gc_hook::try_gc_write_barrier(frame_ptr as *mut u8);
@@ -5137,18 +5139,18 @@ impl PyFrame {
         // `stack_check`'s overflow arm allocates `RecursionError` while a
         // thrown `OperationError` is still the argument. `OperationError`
         // (`error.py`) is a GC object. Pin the native carrier only when this
-        // entry holds one, and write the slot back before the resume reads it.
-        let operr_pin = operr.as_ref().and_then(|err| {
+        // entry holds one, and write the slots back before the resume reads it.
+        let operr_pin = operr.as_ref().map(|err| {
             let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin_exc_object(&roots)?;
-            Some((roots, slot))
+            let slot = err.pin_gc_refs(&roots);
+            (roots, slot)
         });
         crate::stack_check::stack_check()?;
         let mut operr = operr;
         if let Some((roots, slot)) = &operr_pin
             && let Some(err) = operr.as_mut()
         {
-            err.reload_exc_object(roots, Some(*slot));
+            err.reload_gc_refs(roots, *slot);
         }
         drop(operr_pin);
         crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, None)
@@ -5210,16 +5212,16 @@ impl PyFrame {
         crate::stack_check::drain_jit_pending_exception()?;
         // Same carrier pin as `execute_frame`: the overflow arm allocates
         // before `eval_frame_plain_with_resume` takes `operr`.
-        let operr_pin = resume.operr.as_ref().and_then(|err| {
+        let operr_pin = resume.operr.as_ref().map(|err| {
             let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin_exc_object(&roots)?;
-            Some((roots, slot))
+            let slot = err.pin_gc_refs(&roots);
+            (roots, slot)
         });
         crate::stack_check::stack_check()?;
         if let Some((roots, slot)) = &operr_pin
             && let Some(err) = resume.operr.as_mut()
         {
-            err.reload_exc_object(roots, Some(*slot));
+            err.reload_gc_refs(roots, *slot);
         }
         drop(operr_pin);
         crate::eval::eval_frame_plain_with_resume(
@@ -6867,6 +6869,7 @@ pub fn createframe_obj(
     let root_base = _roots.base();
     let _ = _roots.pin_root(code as PyObjectRef);
     let _ = _roots.pin_root(w_globals);
+    let _ = _roots.pin_root(outer_func.unwrap_or(PY_NULL));
     let frame_stores_global = unsafe {
         crate::w_code_frame_stores_global(_roots.get(root_base), _roots.get(root_base + 1))
     };
@@ -6890,7 +6893,7 @@ pub fn createframe_obj(
         f_generator_wref: PY_NULL,
         w_yielding_from: PY_NULL,
         f_backref: std::ptr::null_mut(),
-        w_builtin: _roots.get(root_base + 2),
+        w_builtin: _roots.get(root_base + 3),
     };
     // pyframe.py `__init__` — `self = hint(self, access_directly=True,
     // fresh_virtualizable=True)`.  Upstream spells the two kwargs on one
@@ -6912,7 +6915,7 @@ pub fn createframe_obj(
     // flags for the seed CodeInfo (`crates/codegen/src/compile.rs Compiler::new`)
     // so initialize_frame_scopes selects the `!OPTIMIZED && !NEWLOCALS`
     // arm and binds `w_locals = w_globals` per pyframe.py.
-    let outer_ref = outer_func.unwrap_or(PY_NULL);
+    let outer_ref = _roots.get(root_base + 2);
     // initialize_frame_scopes allocates (the locals dict and `w_cell_new`
     // cells) and stores the cells into `locals_cells_stack_w`; root the slot so
     // a collection mid-init can't drop the cells already written there.
@@ -6924,7 +6927,7 @@ pub fn createframe_obj(
         let _frame_roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(frame.as_mut_ptr() as pyre_object::PyObjectRef);
         let _root = FrameLocalsRoot::new(frame.as_mut_ptr());
-        frame.initialize_frame_scopes(outer_ref, code)?;
+        frame.initialize_frame_scopes(outer_ref, _roots.get(root_base) as *const ())?;
     }
     remember_frame_locals_array(frame.locals_cells_stack_w);
 
