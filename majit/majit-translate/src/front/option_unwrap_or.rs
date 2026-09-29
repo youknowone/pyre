@@ -81,6 +81,8 @@ pub(crate) struct UnwrapOrSite {
     /// `tyref_is_niche_option_ptr`).  Always an `Option` (never a `Result`)
     /// when set, so `payload_on_disc_true` is `true`.
     pub niche: bool,
+    /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
+    pub niche_null_cast: Option<(String, ValueType)>,
     /// `None`'s scalar tag for `Option<E>` when `E` is a densely numbered
     /// fieldless enum.  Like the pointer niche, this representation has no
     /// aggregate fields: `Some(e)` is `e` itself and `None` is this tag.
@@ -292,7 +294,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
         // is a `null_mut()` call (repr-adaptive) rather than a `ConstRefNull`
         // (fixed GCREF), so `ptr_ne` sees two operands of the receiver's own
         // `InstanceRepr`.
-        let nullc = graph.push_null_mut_ptr(a_id);
+        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
@@ -387,6 +389,7 @@ mod tests {
             payload_ty: ValueType::Int,
             payload_on_disc_true: true,
             niche: false,
+            niche_null_cast: None,
             fieldless_none_tag: None,
         }
     }
@@ -410,6 +413,7 @@ mod tests {
             // `Result::Ok = 0`, so the payload arm is the `bool(disc)`-false arm.
             payload_on_disc_true: false,
             niche: false,
+            niche_null_cast: None,
             fieldless_none_tag: None,
         }
     }
@@ -717,6 +721,71 @@ mod tests {
         }
         // A still branches two ways (Some / None).
         assert_eq!(g.blocks[a.0].exits.len(), 2, "A branches to Some/None arms");
+    }
+
+    #[test]
+    fn niche_str_cast_is_ne_rhs() {
+        let mut g = FunctionGraph::new("test_unwrap_or_niche_str_cast");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let default = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: unwrap_or_target(),
+                    args: crate::model::call_args(vec![opt.clone(), default]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+
+        let mut site = option_site(result);
+        site.niche = true;
+        site.niche_null_cast = Some(("&str".into(), ValueType::Str));
+        assert_eq!(rewire_unwrap_or_call_sites(&mut g, &[site]), 1);
+
+        let raw_null = g.blocks[a.0]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. }
+                    if args.is_empty() && target.to_string() == "core::ptr::null_mut" =>
+                {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("null_mut");
+        let cast_result = g.blocks[a.0]
+            .operations
+            .iter()
+            .find(|op| {
+                crate::model::cast_instance_of(&op.kind, &raw_null) == Some("&str")
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call { result_ty, .. } if result_ty == &ValueType::Str
+                    )
+            })
+            .and_then(|op| op.result.clone())
+            .expect("str cast of the niche null");
+        let ne = g.blocks[a.0]
+            .operations
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne"))
+            .expect("ne discriminant");
+        match &ne.kind {
+            OpKind::BinOp { lhs, rhs, .. } => {
+                assert_eq!(lhs, &opt);
+                assert_eq!(rhs, &cast_result);
+                assert_ne!(rhs, &raw_null);
+            }
+            other => panic!("expected ne, got {other:?}"),
+        }
     }
 
     #[test]

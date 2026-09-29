@@ -101,6 +101,8 @@ pub(crate) struct MapOrSite {
     /// discriminant is then `opt != null` and the payload is the base pointer
     /// itself (identity), not a `__pos_0` field read.
     pub niche: bool,
+    /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
+    pub niche_null_cast: Option<(String, ValueType)>,
 }
 
 /// Rewrite every recorded `Option::map_or` call site into the discriminant
@@ -358,7 +360,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
         // `ptr_ne` with an `Int` result matching the aggregate read.  The null
         // is a repr-adaptive `null_mut()` call, not a fixed-GCREF
         // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
-        let nullc = graph.push_null_mut_ptr(a_id);
+        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
@@ -427,6 +429,7 @@ mod tests {
             result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
             niche: false,
+            niche_null_cast: None,
         }
     }
 

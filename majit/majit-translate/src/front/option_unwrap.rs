@@ -70,6 +70,8 @@ pub(crate) struct UnwrapSite {
     /// discriminant is then `opt != null` and the payload is the base pointer
     /// itself (identity), not a `__pos_0` field read.
     pub niche: bool,
+    /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
+    pub niche_null_cast: Option<(String, ValueType)>,
 }
 
 /// Rewrite every recorded `Option::unwrap` / `Result::unwrap` call site into
@@ -260,7 +262,7 @@ fn rewire_one_unwrap_site(
         // `ptr_ne` with an `Int` result matching the aggregate read.  The null
         // is a repr-adaptive `null_mut()` call, not a fixed-GCREF
         // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
-        let nullc = graph.push_null_mut_ptr(a_id);
+        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
@@ -353,6 +355,7 @@ mod tests {
                 payload_ty: ValueType::Int,
                 payload_on_disc_true: true,
                 niche: false,
+                niche_null_cast: None,
             }],
         );
         assert_eq!(rewritten, 1, "the unwrap site must be rewritten");
@@ -433,6 +436,7 @@ mod tests {
                 payload_ty: ValueType::Ref(None),
                 payload_on_disc_true: true,
                 niche: false,
+                niche_null_cast: None,
             }],
         );
         assert_eq!(rewritten, 1);
@@ -516,6 +520,7 @@ mod tests {
                 payload_ty: ValueType::Unsigned,
                 payload_on_disc_true: false,
                 niche: false,
+                niche_null_cast: None,
             }],
         );
         assert_eq!(rewritten, 1, "the Result unwrap site must be rewritten");
@@ -578,6 +583,7 @@ mod tests {
                 payload_ty: ValueType::Int,
                 payload_on_disc_true: true,
                 niche: false,
+                niche_null_cast: None,
             }],
         );
         assert_eq!(rewritten, 0, "a non-unary producer declines");
