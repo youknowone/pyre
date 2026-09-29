@@ -105,6 +105,8 @@ pub fn _errno_after(save_err: i64) {
 //
 // `sys.platform == 'darwin'` sets `natural_arity=2`. This records only
 // `sys/ioctl.h`; the rest of `rposix.eci` is not ported here.
+// `gnu_time_bits64` on `ioctl` names the 32-bit redirect `__ioctl_time64`.
+// Native targets are 64-bit, so that `link_name` is not copied.
 #[cfg(unix)]
 crate::rffi::external_compilation_info! {
     const IOCTL_ECI = {

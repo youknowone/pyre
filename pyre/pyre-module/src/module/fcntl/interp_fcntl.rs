@@ -14,6 +14,8 @@ mod ll {
         };
     }
 
+    // Leading `#[link_name]` / `#[cfg_attr(..., link_name = ...)]` ride along
+    // in `$($t:tt)*`. A separate `meta` matcher is ambiguous next to `tt`.
     macro_rules! external {
         ($($t:tt)*) => {
             majit_rlib::rffi::llexternal!($($t)*, compilation_info = ECI);
@@ -23,27 +25,42 @@ mod ll {
     // `sys.platform == 'darwin'` picks `natural_arity = 2`; every other
     // platform passes `-1`. The third argument is the variadic one.
     macro_rules! external_natural_arity {
-        ($vis:vis $name:ident = $($rest:tt)*) => {
+        ($(#[$attr:meta])* $vis:vis $name:ident = $($rest:tt)*) => {
             #[cfg(target_os = "macos")]
-            external!($vis $name = $($rest)*, natural_arity = 2);
+            external!($(#[$attr])* $vis $name = $($rest)*, natural_arity = 2);
             #[cfg(not(target_os = "macos"))]
-            external!($vis $name = $($rest)*, natural_arity = -1);
+            external!($(#[$attr])* $vis $name = $($rest)*, natural_arity = -1);
         };
     }
 
+    // `gnu_time_bits64` and `gnu_file_offset_bits64` on `fcntl` and `ioctl`
+    // name 32-bit redirects (`__fcntl_time64`, `__ioctl_time64`). Native
+    // targets are 64-bit, so those `link_name`s are not copied.
     external_natural_arity!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "fcntl$UNIX2003"
+        )]
         pub(super) fcntl_int = "fcntl",
         [INT, INT, INT],
         INT,
         save_err = RFFI_SAVE_ERRNO
     );
     external_natural_arity!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "fcntl$UNIX2003"
+        )]
         pub(super) fcntl_str = "fcntl",
         [INT, INT, CCHARP],
         INT,
         save_err = RFFI_SAVE_ERRNO
     );
     external_natural_arity!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "fcntl$UNIX2003"
+        )]
         pub(super) fcntl_flock = "fcntl",
         [INT, INT, *mut libc::flock],
         INT,

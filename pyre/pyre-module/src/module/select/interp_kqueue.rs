@@ -24,13 +24,15 @@ mod ll {
         };
     }
 
+    // `gnu_time_bits64` and `gnu_file_offset_bits64` on `fcntl` name the 32-bit
+    // redirect `__fcntl_time64`. Native targets are 64-bit, so that `link_name`
+    // is not copied. This module is macOS-only; NetBSD `__kevent50` is not.
     majit_rlib::rffi::llexternal!(
         pub(super) syscall_kqueue = "kqueue",
         [],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::kqueue
+        save_err = RFFI_SAVE_ERRNO
     );
     majit_rlib::rffi::llexternal!(
         pub(super) syscall_kevent = "kevent",
@@ -44,18 +46,20 @@ mod ll {
         ],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::kevent
+        save_err = RFFI_SAVE_ERRNO
     );
     // macOS `fcntl` is variadic. `_rsocket_rffi.fcntl` uses `natural_arity = 2`.
     majit_rlib::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "fcntl$UNIX2003"
+        )]
         pub(super) c_fcntl = "fcntl",
         [INT, INT, INT],
         INT,
         compilation_info = ECI,
         natural_arity = 2,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::fcntl
+        save_err = RFFI_SAVE_ERRNO
     );
 
     /// `rposix.set_inheritable(fd, False)` via the fcntl fallback.

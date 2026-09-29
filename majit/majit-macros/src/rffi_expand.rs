@@ -11,8 +11,8 @@ use quote::{format_ident, quote};
 use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::{
-    Expr, Ident, LitBool, LitInt, LitStr, Token, Type, Visibility, bracketed, parse::Parse,
-    parse::ParseStream,
+    Attribute, Expr, Ident, LitBool, LitInt, LitStr, Meta, Token, Type, Visibility, bracketed,
+    parse::Parse, parse::ParseStream,
 };
 
 pub fn expand_llexternal(input: TokenStream) -> syn::Result<TokenStream> {
@@ -26,6 +26,7 @@ pub fn expand_external_compilation_info(input: TokenStream) -> syn::Result<Token
 }
 
 struct LlexternalInput {
+    link_attrs: Vec<LinkAttr>,
     vis: Visibility,
     name: Ident,
     c_name: String,
@@ -49,8 +50,18 @@ enum Tri {
     Bool(bool),
 }
 
+struct LinkAttr {
+    attr: Attribute,
+    /// `None` is an unconditional `#[link_name]`. `Some` is the `cfg_attr` predicate.
+    cfg_pred: Option<TokenStream>,
+}
+
 impl Parse for LlexternalInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut link_attrs = Vec::new();
+        for attr in input.call(Attribute::parse_outer)? {
+            link_attrs.push(parse_link_attr(attr)?);
+        }
         let vis: Visibility = input.parse()?;
         let name: Ident = input.parse()?;
         input.parse::<Token![=]>()?;
@@ -121,7 +132,14 @@ impl Parse for LlexternalInput {
                 "calling_conv must be \"c\", \"unknown\", or \"win\"",
             ));
         }
+        if macro_path.is_some() && !link_attrs.is_empty() {
+            return Err(syn::Error::new_spanned(
+                &link_attrs[0].attr,
+                "link_name attributes apply to the generated extern funcptr; remove them when `macro` replaces that funcptr",
+            ));
+        }
         Ok(LlexternalInput {
+            link_attrs,
             vis,
             name,
             c_name: c_name.value(),
@@ -139,6 +157,82 @@ impl Parse for LlexternalInput {
             natural_arity,
             compilation_info,
         })
+    }
+}
+
+fn parse_link_attr(attr: Attribute) -> syn::Result<LinkAttr> {
+    if attr.path().is_ident("link_name") {
+        match &attr.meta {
+            Meta::NameValue(name_value) => {
+                require_link_name_str(&name_value.value)?;
+                return Ok(LinkAttr {
+                    attr,
+                    cfg_pred: None,
+                });
+            }
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    &attr,
+                    "llexternal accepts `#[link_name = \"...\"]`, not another `link_name` form",
+                ));
+            }
+        }
+    }
+    if attr.path().is_ident("cfg_attr") {
+        let Meta::List(list) = &attr.meta else {
+            return Err(syn::Error::new_spanned(
+                &attr,
+                "llexternal accepts `#[cfg_attr(<pred>, link_name = \"...\")]`",
+            ));
+        };
+        let nested: Punctuated<Meta, Token![,]> =
+            list.parse_args_with(Punctuated::parse_terminated)?;
+        let mut metas = nested.into_iter();
+        let Some(pred) = metas.next() else {
+            return Err(syn::Error::new_spanned(
+                &attr,
+                "llexternal `#[cfg_attr]` needs a predicate and `link_name = \"...\"`",
+            ));
+        };
+        let mut saw_link_name = false;
+        for meta in metas {
+            match &meta {
+                Meta::NameValue(name_value) if name_value.path.is_ident("link_name") => {
+                    require_link_name_str(&name_value.value)?;
+                    saw_link_name = true;
+                }
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        meta,
+                        "llexternal `#[cfg_attr]` may only set `link_name = \"...\"`",
+                    ));
+                }
+            }
+        }
+        if !saw_link_name {
+            return Err(syn::Error::new_spanned(
+                &attr,
+                "llexternal `#[cfg_attr]` needs `link_name = \"...\"`",
+            ));
+        }
+        return Ok(LinkAttr {
+            attr,
+            cfg_pred: Some(quote! { #pred }),
+        });
+    }
+    Err(syn::Error::new_spanned(
+        attr,
+        "llexternal accepts only `#[link_name = \"...\"]` and `#[cfg_attr(<pred>, link_name = \"...\")]`",
+    ))
+}
+
+fn require_link_name_str(expr: &Expr) -> syn::Result<()> {
+    match expr {
+        Expr::Lit(lit) if matches!(lit.lit, syn::Lit::Str(_)) => Ok(()),
+        _ => Err(syn::Error::new_spanned(
+            expr,
+            "link_name value must be a string literal",
+        )),
     }
 }
 
@@ -550,7 +644,6 @@ impl LlexternalInput {
                 quote! {}
             };
         }
-        let c_name = &self.c_name;
         let result = &self.result;
         let rust_name = if nowrapper {
             self.name.clone()
@@ -571,10 +664,35 @@ impl LlexternalInput {
         } else {
             quote! { #vis fn #rust_name(#(#fixed),*) -> #result; }
         };
+        let link_attrs = self.extern_link_attrs();
         quote! {
             unsafe extern "C" {
-                #[link_name = #c_name]
+                #link_attrs
                 #decl
+            }
+        }
+    }
+
+    /// An unconditional `#[link_name]` replaces `c_name`. Each `cfg_attr`
+    /// link name is copied through, and `c_name` applies only where none of
+    /// those predicates hold, so two `link_name` attributes are never both active.
+    fn extern_link_attrs(&self) -> TokenStream {
+        let c_name = &self.c_name;
+        if self.link_attrs.is_empty() {
+            return quote! { #[link_name = #c_name] };
+        }
+        let user = self.link_attrs.iter().map(|attr| &attr.attr);
+        let unconditional = self.link_attrs.iter().any(|attr| attr.cfg_pred.is_none());
+        if unconditional {
+            quote! { #(#user)* }
+        } else {
+            let preds = self
+                .link_attrs
+                .iter()
+                .filter_map(|attr| attr.cfg_pred.as_ref());
+            quote! {
+                #(#user)*
+                #[cfg_attr(not(any(#(#preds),*)), link_name = #c_name)]
             }
         }
     }

@@ -21,8 +21,10 @@ majit-jitcode = { workspace = true }
 
 [dev-dependencies]
 linkme = { workspace = true }
+majit-gc = { workspace = true }
 majit-ir = { workspace = true }
 majit-metainterp = { workspace = true }
+majit-rlib = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 ctor = { workspace = true }
