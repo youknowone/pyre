@@ -15604,9 +15604,18 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
     let w_globals = recover_inline_callee_globals(recipe.code_ptr);
     restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
+    // The resume section's own frame, when it is a block the walk can keep.
+    // Building a second frame would split the traceback `f_back` chain.
+    let resumed = if w_code.is_null() {
+        None
+    } else {
+        resume_reconstructed_callee_frame(ctx, recipe, w_code, stack_base)
+    };
     // The box recorded before `prepare_resume_from_failure`. A missing box
     // after that guard must not be allocated here: the snapshot would name it.
-    let frame_vable = if let Some(frame) = recipe.rebuilt_frame {
+    let frame_vable = if let Some((frame, _)) = resumed {
+        frame
+    } else if let Some(frame) = recipe.rebuilt_frame {
         frame
     } else if ctx.bridge_exception_resume_prepared() {
         return None;
@@ -15636,7 +15645,9 @@ pub(crate) fn setup_reconstructed_callee_frame(
     if w_code.is_null() {
         return None;
     }
-    let concrete_frame_ptr = {
+    let concrete_frame_ptr = if let Some((_, ptr)) = resumed {
+        ptr
+    } else {
         // `perform_call` (`pyjitpl.py`) is three lines — `newframe` +
         // `setup_call` + `raise ChangeFrame` — and `newframe` builds an
         // `MIFrame` and nothing else: upstream has no recording-time app-level

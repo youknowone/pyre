@@ -7859,6 +7859,16 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// the COND_CALL and leaves the guard holding the recorder's placeholder
     /// resume position.
     pub guard_stamp: GuardStampTarget,
+
+    /// Resume an inlined callee's plain guard at its own opcode: liveness is
+    /// read at the `-live-` directly before the op (`get_list_of_active_boxes`,
+    /// `pc = self.pc - SIZE_LIVE_OP`) instead of at the Python opcode's
+    /// resume marker.  `_nonstandard_virtualizable`'s promote guard needs it:
+    /// the `setarrayitem_vable` that pushes a call's result sits after the
+    /// call in the same Python opcode, so the opcode's marker would resume by
+    /// running the finished call again, from registers the call consumed.
+    /// Falls back to the opcode marker when no `-live-` precedes the op.
+    pub orgpc_live_resume: bool,
 }
 
 /// Which already-recorded guard op a capture stamps its resume position on.

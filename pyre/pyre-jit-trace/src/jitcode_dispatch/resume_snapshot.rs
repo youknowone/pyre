@@ -44,6 +44,15 @@ fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<us
     (marker.opname == "live").then_some(marker.pc)
 }
 
+/// The `-live-` directly before `op_pc`: the liveness a plain guard reads
+/// (`get_list_of_active_boxes`, `pc = self.pc - SIZE_LIVE_OP`).
+fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) -> Option<usize> {
+    const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
+    let pc = op_pc.checked_sub(SIZE_LIVE_OP)?;
+    let marker = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc)?;
+    (marker.opname == "live" && marker.next_pc == op_pc).then_some(pc)
+}
+
 /// Select the resume marker for an after-residual-call guard.  The bytecode's
 /// immediate trailing `-live-` is the RPython authority; metadata twins are
 /// compatibility fallbacks for incomplete/fixture bodies.
@@ -300,7 +309,10 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
                 op_pc,
                 false,
                 parent_frames.clone(),
-                GuardCaptureScope::default(),
+                GuardCaptureScope {
+                    orgpc_live_resume: true,
+                    ..GuardCaptureScope::default()
+                },
                 GuardStampTarget::GuardFromEnd(from_end),
             )?;
         }
@@ -3521,9 +3533,15 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         // while reading the values out of the sub-walk registers at another.
         // The single-frame path can substitute the anchor because it re-reads
         // the owning frame's vable shadow at the carried coordinate; the callee
-        // sub-walk owns no shadow to re-read.
-        false => callee_pjc
-            .resume_marker_for_jitcode_pc(callee_op_pc)
+        // sub-walk owns no shadow to re-read.  `orgpc_live_resume` names a
+        // different coordinate: the `-live-` directly before `callee_op_pc`,
+        // which is this op's own liveness window, so nothing has run between it
+        // and the registers read below.
+        false => scope
+            .orgpc_live_resume
+            .then(|| preceding_live_marker(&callee_pjc, callee_op_pc))
+            .flatten()
+            .or_else(|| callee_pjc.resume_marker_for_jitcode_pc(callee_op_pc))
             .map(|m| m as i32)
             .unwrap_or(callee_op_pc as i32),
     };
