@@ -3467,84 +3467,58 @@ impl GcRewriterImpl {
     }
 }
 
-impl GcRewriter for GcRewriterImpl {
-    fn rewrite_for_gc(&self, ops: &[OpRc]) -> Vec<OpRc> {
-        let (rewritten, gcrefs) = self.rewrite_for_gc_with_constants(ops, &ConstMap::default());
-        // This wrapper drops the gc_table output list. A non-null ConstPtr
-        // operand is rewritten to LoadFromGcTable, which needs that list to
-        // build the table; callers carrying one must use the
-        // constants-returning form. Fail fast rather than emit IR whose
-        // table is silently discarded.
-        assert!(
-            gcrefs.is_empty(),
-            "rewrite_for_gc discards gc_table refs; use rewrite_for_gc_with_constants"
-        );
-        rewritten
-    }
-
-    fn rewrite_for_gc_with_constants(
-        &self,
-        ops: &[OpRc],
-        constants: &ConstMap<Const>,
-    ) -> (Vec<OpRc>, Vec<GcRef>) {
-        // rewrite.py remove_bridge_exception: strip a
-        // SaveExcClass+SaveException+RestoreException prefix that is
-        // a no-op (common in bridges).
-        let ops = Self::remove_bridge_exception(ops);
-
-        // Result positions are consumed only by result-producing ops; a
-        // Void-result op never occupies a position slot. Skip sentinels and
-        // constants below for the same reason `emit` assigns no position id
-        // when `rt == Type::Void`.
-        //
-        // rewrite.py:106-116 replaces a ConstPtr argument with a fresh
-        // LOAD_FROM_GC_TABLE box. RPython boxes retain distinct identity when
-        // their producer was optimized away, so pyre's numeric namespace must
-        // reserve argument and guard-fail positions too. Forced virtuals can
-        // carry producerless constant boxes as allocation lengths; reusing
-        // such a raw position would alias an Int box with the new Ref box in
-        // backend SSA.
-        // The `VoidOp(u32::MAX)` sentinel is the one raw payload that must not
-        // enter the high-water mark: it would pin `next_pos` at `u32::MAX`,
-        // which the first `+= 1` in `emit` overflows — a panic where overflow
-        // checks are on, and a silent wrap to 0 in release, handing every
-        // rewritten op a position that aliases a live operand. Every other
-        // non-constant payload still counts, `TempVar` included: its sentinel
-        // range sits above the body positions, and lowering the mark past it
-        // lets a new box collide with a position that reaches the backend
-        // through resume data rather than through `pos`/args/failargs.
-        let counts_toward_high_water =
-            |pos: OpRef| !pos.is_none() && !pos.is_constant() && pos.ty() != Some(Type::Void);
-        let max_result_pos = ops
-            .iter()
-            .filter_map(|op| {
-                let pos = op.pos().get();
-                counts_toward_high_water(pos).then(|| pos.raw())
-            })
-            .max();
-        // A trace whose ops all carry void results — `Label` /
-        // `SETARRAYITEM_GC` / `FINISH` is one — leaves `max_result_pos` at
-        // `None`, so the argument scan has to run on its own rather than under
-        // a result-derived floor: the mark it produces is the only thing
-        // separating a minted position from a live input arg.
-        let mut max_raw_pos = max_result_pos;
-        let mut reserve_later_box = |pos: OpRef| {
-            if counts_toward_high_water(pos) {
-                max_raw_pos = Some(max_raw_pos.map_or(pos.raw(), |old: u32| old.max(pos.raw())));
-            }
-        };
-        for op in ops.iter() {
+/// First free value position over every segment.
+///
+/// Result positions are consumed only by result-producing ops; a Void-result
+/// op never occupies a position slot. Skip sentinels and constants for the
+/// same reason `emit` assigns no position id when `rt == Type::Void`.
+///
+/// `rewrite.py remove_constptr` replaces a ConstPtr argument with a fresh
+/// LOAD_FROM_GC_TABLE box. RPython boxes retain distinct identity when their
+/// producer was optimized away, so pyre's numeric namespace must reserve
+/// argument and guard-fail positions too. Forced virtuals can carry
+/// producerless constant boxes as allocation lengths; reusing such a raw
+/// position would alias an Int box with the new Ref box in backend SSA.
+///
+/// The `VoidOp(u32::MAX)` sentinel is the one raw payload that must not enter
+/// the high-water mark: it would pin `next_pos` at `u32::MAX`, which the first
+/// `+= 1` in `emit` overflows — a panic where overflow checks are on, and a
+/// silent wrap to 0 in release, handing every rewritten op a position that
+/// aliases a live operand. Every other non-constant payload still counts,
+/// `TempVar` included: its sentinel range sits above the body positions, and
+/// lowering the mark past it lets a new box collide with a position that
+/// reaches the backend through resume data rather than through
+/// `pos`/args/failargs. A trace whose ops all carry void results (`Label` /
+/// `SETARRAYITEM_GC` / `FINISH`) still gets its mark from the argument scan.
+fn result_pos_high_water(segments: &[&[OpRc]]) -> u32 {
+    let counts = |pos: OpRef| !pos.is_none() && !pos.is_constant() && pos.ty() != Some(Type::Void);
+    let mut max_raw_pos: Option<u32> = None;
+    let mut reserve = |pos: OpRef| {
+        if counts(pos) {
+            max_raw_pos = Some(max_raw_pos.map_or(pos.raw(), |old| old.max(pos.raw())));
+        }
+    };
+    for ops in segments {
+        for op in *ops {
+            reserve(op.pos().get());
             for arg in op.getarglist() {
-                reserve_later_box(arg.to_opref());
+                reserve(arg.to_opref());
             }
             if let Some(fail_args) = op.guard_fail_args() {
                 for arg in fail_args.iter() {
-                    reserve_later_box(arg.to_opref());
+                    reserve(arg.to_opref());
                 }
             }
         }
-        let next_pos = max_raw_pos.map_or(0, |max_pos| max_pos.saturating_add(1));
-        let mut st = RewriteState::with_constants(ops.len(), next_pos, constants);
+    }
+    max_raw_pos.map_or(0, |max_pos| max_pos.saturating_add(1))
+}
+
+impl GcRewriterImpl {
+    /// One pass of `GcRewriterAssembler.rewrite` over a single segment.
+    /// The caller supplies a fresh `RewriteState`; only `next_pos` and
+    /// `gcrefs_output_list` are carried across segments.
+    fn rewrite_ops_with_state(&self, ops: &[OpRc], mut st: &mut RewriteState<'_>) {
         for (i, orig_op) in ops.iter().enumerate() {
             // rewrite.py `if op is self._changed_op: op = self._changed_op_to`.
             let op_rc: OpRc = match (&st._changed_op, &st._changed_op_to) {
@@ -3560,7 +3534,7 @@ impl GcRewriter for GcRewriterImpl {
             // must be called regardless of whether the flush path is
             // taken — the flush only fires when one of the two branches
             // returns true.
-            let merges = self.could_merge_with_next_guard(op, i, ops.as_ref(), &mut st);
+            let merges = self.could_merge_with_next_guard(op, i, ops, &mut st);
             if op.opcode.is_guard() || merges {
                 st.emit_pending_zeros();
             }
@@ -3763,8 +3737,6 @@ impl GcRewriter for GcRewriterImpl {
         // rewrite.py `self.newops` is the list emit just appended;
         // hand those `OpRc` identities to the backend instead of
         // cloning each `Op` out of the Rc.
-        let out = st.out;
-
         // rewrite.py post-condition: `remove_constptr` replaced
         // every non-null reference-constant *operand* with a
         // `LoadFromGcTable` result, so no raw non-null `GcRef` is left for
@@ -3775,7 +3747,7 @@ impl GcRewriter for GcRewriterImpl {
         // the "ConstPtr transient-only" invariant: any survivor is a
         // missed emit point.
         #[cfg(debug_assertions)]
-        for op in &out {
+        for op in &st.out {
             if op.opcode == OpCode::JitDebug {
                 continue;
             }
@@ -3788,8 +3760,63 @@ impl GcRewriter for GcRewriterImpl {
                 );
             }
         }
+    }
+}
 
-        (out, st.gcrefs_output_list)
+impl GcRewriter for GcRewriterImpl {
+    fn rewrite_for_gc(&self, ops: &[OpRc]) -> Vec<OpRc> {
+        let (rewritten, gcrefs) = self.rewrite_for_gc_with_constants(ops, &ConstMap::default());
+        // This wrapper drops the gc_table output list. A non-null ConstPtr
+        // operand is rewritten to LoadFromGcTable, which needs that list to
+        // build the table; callers carrying one must use the
+        // constants-returning form. Fail fast rather than emit IR whose
+        // table is silently discarded.
+        assert!(
+            gcrefs.is_empty(),
+            "rewrite_for_gc discards gc_table refs; use rewrite_for_gc_with_constants"
+        );
+        rewritten
+    }
+
+    fn rewrite_for_gc_with_constants(
+        &self,
+        ops: &[OpRc],
+        constants: &ConstMap<Const>,
+    ) -> (Vec<OpRc>, Vec<GcRef>) {
+        let (mut parts, gcrefs) = self
+            .rewrite_for_gc_segments(std::slice::from_ref(&ops), constants)
+            .expect("GcRewriterImpl segmented rewrite");
+        (parts.pop().unwrap_or_default(), gcrefs)
+    }
+
+    fn rewrite_for_gc_segments(
+        &self,
+        segments: &[&[OpRc]],
+        constants: &ConstMap<Const>,
+    ) -> Option<(Vec<Vec<OpRc>>, Vec<GcRef>)> {
+        // `GcRewriterAssembler.rewrite` runs once per assemble_bridge, so
+        // each segment starts from a fresh RewriteState. The result-position
+        // high-water mark is taken over every segment first, and minted
+        // positions keep climbing, so no position is issued twice. One
+        // gcrefs list is shared so LoadFromGcTable indices stay unique.
+        let stripped: Vec<std::borrow::Cow<'_, [OpRc]>> = segments
+            .iter()
+            .copied()
+            .map(Self::remove_bridge_exception)
+            .collect();
+        let views: Vec<&[OpRc]> = stripped.iter().map(|ops| ops.as_ref()).collect();
+        let mut next_pos = result_pos_high_water(&views);
+        let mut gcrefs = Vec::new();
+        let mut outs = Vec::with_capacity(views.len());
+        for ops in views {
+            let mut st = RewriteState::with_constants(ops.len(), next_pos, constants);
+            st.gcrefs_output_list = std::mem::take(&mut gcrefs);
+            self.rewrite_ops_with_state(ops, &mut st);
+            next_pos = st.next_pos;
+            gcrefs = std::mem::take(&mut st.gcrefs_output_list);
+            outs.push(st.out);
+        }
+        Some((outs, gcrefs))
     }
 }
 
@@ -5339,6 +5366,59 @@ mod tests {
             .filter(|o| o.opcode == OpCode::CondCallGcWb)
             .count();
         assert_eq!(wb_count, 0);
+    }
+
+    #[test]
+    fn segmented_rewrite_does_not_carry_write_barrier_state() {
+        // Segment 1 allocates. Segment 2 stores through that result the way
+        // a spliced fail arg names it. `GcRewriterAssembler.rewrite` runs
+        // once per bridge, so the store still gets a barrier. One trace
+        // would see the allocation's `wb_applied` and elide it.
+        let rw = make_rewriter();
+        let new_op = Op::with_descr(OpCode::New, &[], size_descr(32, 1));
+        new_op.pos().set(OpRef::ref_op(5));
+        let store = Op::with_descr(
+            OpCode::SetfieldGc,
+            &[
+                ro(OpRef::ref_op(5)),
+                Operand::const_from_value(Value::Ref(GcRef(0xABC))),
+            ],
+            ref_field_descr(),
+        );
+        let seg1: Vec<OpRc> = vec![OpRc::new(new_op.clone())];
+        let seg2: Vec<OpRc> = vec![OpRc::new(store.clone())];
+        let (parts, _gcrefs) = rw
+            .rewrite_for_gc_segments(&[&seg1, &seg2], &ConstMap::default())
+            .expect("segmented rewrite");
+        assert!(
+            parts[1].iter().any(|op| op.opcode == OpCode::CondCallGcWb),
+            "segment 2 must barrier a store into an object allocated in segment 1"
+        );
+        let combined = vec![OpRc::new(new_op), OpRc::new(store)];
+        let (flat, _) = rw.rewrite_for_gc_with_constants(&combined, &ConstMap::default());
+        assert!(
+            !flat.iter().any(|op| op.opcode == OpCode::CondCallGcWb),
+            "one trace elides the barrier because wb_applied survives the allocation"
+        );
+        let minted = |ops: &[OpRc]| -> Vec<u32> {
+            ops.iter()
+                .filter_map(|op| {
+                    let pos = op.pos().get();
+                    (!pos.is_none() && !pos.is_constant() && pos.ty() != Some(Type::Void))
+                        .then(|| pos.raw())
+                })
+                .collect()
+        };
+        let a = minted(&parts[0]);
+        let b = minted(&parts[1]);
+        assert!(
+            b.iter().any(|pos| !a.contains(pos)),
+            "segment 2 must mint a position of its own, got {a:?} and {b:?}"
+        );
+        assert!(
+            a.iter().all(|pos| !b.contains(pos)),
+            "minted positions must be disjoint, got {a:?} and {b:?}"
+        );
     }
 
     // ── Test 10: NEW_WITH_VTABLE also writes vtable ──

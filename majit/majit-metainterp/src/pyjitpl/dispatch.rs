@@ -1764,6 +1764,10 @@ where
         (frame.jitcode.code.get(pc) == Some(&op_live)).then_some(pc)
     }
 
+    /// `pyjitpl.py vable_after_residual_call` followed by
+    /// `generate_guard(rop.GUARD_NOT_FORCED)`. The caller returns any result
+    /// other than `Continue`: `SwitchToBlackhole` is the `ABORT_ESCAPE` raise,
+    /// and continuing past it would compile the call with no GUARD_NOT_FORCED.
     fn finalize_standard_virtualizable_may_force(
         &mut self,
         ctx: &mut TraceCtx,
@@ -3939,11 +3943,9 @@ where
             );
         }
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-        if matches!(
-            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-            TraceAction::Abort
-        ) {
-            return TraceAction::Abort;
+        let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+        if !matches!(action, TraceAction::Continue) {
+            return action;
         }
         // pyjitpl.py:2080-2081 KEEPALIVE on the vable box.
         if let Some(vbox) = vable_opref {
@@ -8406,13 +8408,12 @@ where
                     //    `handle_possible_exception` runs below — the
                     //    upstream order is GUARD_NOT_FORCED first, then
                     //    GUARD_NO_EXCEPTION.
-                    if is_forces
-                        && matches!(
-                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                            TraceAction::Abort
-                        )
-                    {
-                        return TraceAction::Abort;
+                    if is_forces {
+                        let action =
+                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                        if !matches!(action, TraceAction::Continue) {
+                            return action;
+                        }
                     }
                     match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
                         TraceAction::Continue => {}
@@ -8794,11 +8795,10 @@ where
                                 frame.jitcode.code.get(frame.code_cursor),
                             );
                         }
-                        if matches!(
-                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                            TraceAction::Abort
-                        ) {
-                            return TraceAction::Abort;
+                        let action =
+                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                        if !matches!(action, TraceAction::Continue) {
+                            return action;
                         }
                     }
                     // pyjitpl.py `exc = exc and not isinstance(op, Const)`:
@@ -9113,13 +9113,12 @@ where
                         majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
                     );
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
-                    if is_forces
-                        && matches!(
-                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                            TraceAction::Abort
-                        )
-                    {
-                        return TraceAction::Abort;
+                    if is_forces {
+                        let action =
+                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                        if !matches!(action, TraceAction::Continue) {
+                            return action;
+                        }
                     }
                     if !(pure && traced.is_constant()) {
                         match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
@@ -9406,13 +9405,12 @@ where
                     // results this way (`jitcode_dispatch/residual_call.rs`).
                     ctx.set_opref_concrete(traced, majit_ir::Value::Float(concrete));
                     self.set_float_reg(dst, Some(traced), Some(concrete.to_bits() as i64));
-                    if is_forces
-                        && matches!(
-                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                            TraceAction::Abort
-                        )
-                    {
-                        return TraceAction::Abort;
+                    if is_forces {
+                        let action =
+                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                        if !matches!(action, TraceAction::Continue) {
+                            return action;
+                        }
                     }
                     if !(pure && traced.is_constant()) {
                         match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
@@ -9546,11 +9544,9 @@ where
                 // 6. vable_after_residual_call + GUARD_NOT_FORCED
                 //    (pyjitpl.py)
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-                if matches!(
-                    self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                    TraceAction::Abort
-                ) {
-                    return TraceAction::Abort;
+                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                if !matches!(action, TraceAction::Continue) {
+                    return action;
                 }
                 // 7. `pyjitpl.py:2080-2081`:
                 //        if vablebox is not None:
@@ -10538,11 +10534,9 @@ where
                 let traced = ctx.call_assembler_int_arc_typed(arc, &args, &arg_types);
                 self.set_int_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-                if matches!(
-                    self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                    TraceAction::Abort
-                ) {
-                    return TraceAction::Abort;
+                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                if !matches!(action, TraceAction::Continue) {
+                    return action;
                 }
                 // `pyjitpl.py:2080-2081` KEEPALIVE on the vable box.
                 if let Some(vbox) = vable_opref {
@@ -10667,11 +10661,9 @@ where
                 let traced = ctx.call_assembler_ref_arc_typed(arc, &args, &arg_types);
                 self.set_ref_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-                if matches!(
-                    self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                    TraceAction::Abort
-                ) {
-                    return TraceAction::Abort;
+                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                if !matches!(action, TraceAction::Continue) {
+                    return action;
                 }
                 // `pyjitpl.py:2080-2081` KEEPALIVE on the vable box.
                 if let Some(vbox) = vable_opref {
@@ -10796,11 +10788,9 @@ where
                 let traced = ctx.call_assembler_float_arc_typed(arc, &args, &arg_types);
                 self.set_float_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-                if matches!(
-                    self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                    TraceAction::Abort
-                ) {
-                    return TraceAction::Abort;
+                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
+                if !matches!(action, TraceAction::Continue) {
+                    return action;
                 }
                 // `pyjitpl.py:2080-2081` KEEPALIVE on the vable box.
                 if let Some(vbox) = vable_opref {
@@ -12334,7 +12324,9 @@ where
 /// `jit_merge_point` they reach.  Hand the whole framestack to the abort
 /// consumer so it can do that; i0 stays as the fallback for a consumer that
 /// declines the conversion.  CloseLoop and Finish already capture their own
-/// positions; only Abort needs this recovery handoff.
+/// positions; Abort and SwitchToBlackhole need this recovery handoff
+/// (`pyjitpl.py _interpret` answers a `SwitchToBlackhole` with
+/// `run_blackhole_interp_to_cancel_tracing` on the live framestack).
 ///
 /// Shared by every walk entry: where the walk started does not change what a
 /// consumer needs in order to resume from where it stopped.
@@ -12343,7 +12335,11 @@ pub fn publish_walk_abort_handoff(
     action: &TraceAction,
     standalone: &mut StandaloneFrameStack,
 ) {
-    if matches!(action, TraceAction::Abort) && !standalone.frames.is_empty() {
+    if matches!(
+        action,
+        TraceAction::Abort | TraceAction::SwitchToBlackhole(_)
+    ) && !standalone.frames.is_empty()
+    {
         // `None` is itself a resume choice: the generated dispatch loop falls
         // through and re-runs the source arm. The trace-start reachable-set
         // gate makes that sound for every statically named target because no
@@ -15791,6 +15787,18 @@ mod tests {
         );
     }
 
+    /// pyjitpl.py `vable_after_residual_call`: `raise SwitchToBlackhole(
+    /// Counters.ABORT_ESCAPE, raising_exception=True)`. A plain `Abort` would
+    /// let the caller keep walking and compile the call with no
+    /// GUARD_NOT_FORCED.
+    fn assert_escape_switch_to_blackhole(action: &TraceAction) {
+        let TraceAction::SwitchToBlackhole(stb) = action else {
+            panic!("an escaped virtualizable must switch to the blackhole, got {action:?}");
+        };
+        assert_eq!(stb.reason, crate::counters::ABORT_ESCAPE);
+        assert!(stb.raising_exception);
+    }
+
     #[test]
     fn jitcode_call_may_force_aborts_when_standard_virtualizable_escapes() {
         let mut obj = ResidualVable { token: 0 };
@@ -15823,7 +15831,7 @@ mod tests {
             |_pc| 0,
             &[(JitArgKind::Ref, vable_ref, obj_ptr)],
         );
-        assert!(matches!(action, TraceAction::Abort));
+        assert_escape_switch_to_blackhole(&action);
         assert_eq!(obj.token, 0, "forced residual call must clear the token");
 
         let recorder = ctx.into_recorder();
@@ -15897,7 +15905,7 @@ mod tests {
             |_pc| 0,
             &[(JitArgKind::Ref, vable_ref, obj_ptr)],
         );
-        assert!(matches!(action, TraceAction::Abort));
+        assert_escape_switch_to_blackhole(&action);
         assert_eq!(obj.pc, 99, "the forced residual call wrote the heap field");
 
         let (_, reloaded) = ctx
