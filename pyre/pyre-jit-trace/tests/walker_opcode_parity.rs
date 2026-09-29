@@ -249,8 +249,6 @@ const MAJIT_ONLY: &[&str] = &[
 
 /// Keys pyre's walker answers and majit's tracer does not.
 const PYRE_ONLY: &[&str] = &[
-    // The walker's own abort marker.
-    "abort/>r",
     // The float array reads. `getarrayitem_gc_r_pure/rid>r` left this list
     // when majit's tracer gained the pure array-read arms.
     "getarrayitem_gc_f/rid>f",

@@ -11301,7 +11301,10 @@ impl<M: Clone> MetaInterp<M> {
         // (`run_blackhole_interp_to_cancel_tracing`). CloseLoop aborts
         // return before `interpret` stamps it.
         if let Some(top) = self.framestack.frames.last_mut() {
-            top.pc = top.code_cursor;
+            // Same boundary as `publish_walk_abort_handoff`:
+            // `BlackholeInterpreter.setposition` dispatches `MIFrame.pc`,
+            // and `_get_opimpl_method` only stores an instruction start.
+            top.pc = dispatch::snap_pc_to_instruction_start(top);
         }
         let framestack = std::mem::replace(&mut self.framestack, MIFrameStack::empty());
         self.pending_abort_blackhole = Some(crate::PendingAbortBlackhole {
@@ -25586,6 +25589,44 @@ mod metainterp_static_data_tests {
         ));
         assert_eq!(meta.framestack.len(), 1);
         assert_eq!(meta.framestack.current_mut().pc, target);
+    }
+
+    #[test]
+    fn interpret_abort_snaps_mid_instruction_cursor_to_the_opcode() {
+        let mut builder = JitCodeBuilder::new();
+        builder.set_name("interpret_abort_pc");
+        builder.load_const_i_value(1, 0);
+        builder.load_const_i_value(2, 1);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let start = jitcode
+            .startpoints
+            .as_ref()
+            .expect("assembled jitcode records startpoints")
+            .iter()
+            .copied()
+            .min()
+            .expect("at least one instruction");
+        let mid = (start + 1..jitcode.code.len())
+            .find(|pc| !jitcode.is_valid_startpoint(*pc))
+            .expect("an operand byte");
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.interpret_framestack_for_abort = true;
+        let mut frame = crate::pyjitpl::MIFrame::new(jitcode, 0);
+        frame.last_opcode_position = start;
+        frame.code_cursor = mid;
+        frame.pc = 0;
+        meta.framestack.push(frame);
+
+        meta.stage_interpret_abort_blackhole();
+
+        let pending = meta
+            .pending_abort_blackhole
+            .expect("interpret abort publishes a blackhole framestack");
+        let top = pending.framestack.frames.last().expect("top frame");
+        assert_eq!(top.pc, start);
+        assert!(top.jitcode.is_valid_startpoint(top.pc));
+        assert_eq!(top.code_cursor, mid);
     }
 
     #[test]

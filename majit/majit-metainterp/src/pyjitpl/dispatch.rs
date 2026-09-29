@@ -1672,6 +1672,13 @@ impl Drop for ActiveStandardVirtualizable {
     }
 }
 
+/// `abort/` and `abort/>r` both bail the trace out. The ref-result form
+/// is what the assembler emits when the unsupported op still owns an SSA
+/// result (`insns.rs` `BC_ABORT_RESULT_R`).
+fn trace_abort_bytecode(bytecode: u8) -> bool {
+    bytecode == jitcode::insns::BC_ABORT || bytecode == jitcode::insns::BC_ABORT_RESULT_R
+}
+
 impl<'mi, S, R> JitCodeMachine<'mi, S, R>
 where
     S: JitCodeSym,
@@ -11034,8 +11041,16 @@ where
                 self.pop_exception_frame(ctx);
                 return self.unwind_to_exception_handler(ctx);
             }
-            jitcode::insns::BC_ABORT => {
-                self.log_bytecode_abort("BC_ABORT");
+            jitcode::insns::BC_ABORT | jitcode::insns::BC_ABORT_RESULT_R => {
+                debug_assert!(trace_abort_bytecode(bytecode));
+                // `abort/>r` is the same bailout as `abort/` (`handler_abort_result_marker_r`).
+                // The destination byte is not consumed: the frame is left
+                // immediately, matching the blackhole handler.
+                self.log_bytecode_abort(if bytecode == jitcode::insns::BC_ABORT {
+                    "BC_ABORT"
+                } else {
+                    "BC_ABORT_RESULT_R"
+                });
                 // A helper's `BC_ABORT` is a compile-time "this path cannot
                 // be traced". The reconstructed registers that reached it
                 // will reach it again; retrying rebuilds the same abort.
@@ -11468,7 +11483,6 @@ where
         TraceAction::Continue
     }
 
-    /// `pyjitpl.py` `MIFrame.setup_call` writes the callee's arguments when
     /// `MetaInterp.newframe` creates the frame. A per-arm sub-JitCode also
     /// reads the portal identity slots, which are not inline-call arguments,
     /// so those slots are seeded from `__JitSym` before the frame is pushed
@@ -12307,6 +12321,24 @@ where
     action
 }
 
+/// `MIFrame.pc` for `BlackholeInterpreter.setposition`.
+///
+/// `_get_opimpl_method` assigns `pc` at an instruction boundary. A cursor
+/// that sits on an operand byte is not that boundary;
+/// `last_opcode_position` is the opcode `run_one_step` saved before the
+/// decode. A cursor that is already a startpoint stays.
+pub(crate) fn snap_pc_to_instruction_start(frame: &MIFrame) -> usize {
+    let cursor = frame.code_cursor;
+    let opcode_at = frame.last_opcode_position;
+    if frame.jitcode.is_valid_startpoint(cursor) {
+        cursor
+    } else if frame.jitcode.is_valid_startpoint(opcode_at) {
+        opcode_at
+    } else {
+        cursor
+    }
+}
+
 /// Publish an aborted walk's resume handoff onto the trace ctx.
 ///
 /// The walk executes the portal JitCode forward against the real
@@ -12415,11 +12447,12 @@ pub fn publish_walk_abort_handoff(
         // before pushing the callee.  The top frame's is still the last guard's
         // `orgpc` swap, so publish the position the walk actually stopped at —
         // `copy_data_from_miframe` (`blackhole.py`) reads `frame.pc` as
-        // each level's `setposition`.  `code_cursor` is that position: the walk
-        // decodes an instruction's operands before running its arm, so a
-        // completed step leaves the cursor just past them — where RPython's
-        // `self.pc = position` (`pyjitpl.py`, in the `_get_opimpl_method`
-        // handler) leaves `MIFrame.pc`.
+        // each level's `setposition`.  A finished step leaves `code_cursor`
+        // on the next instruction, and that offset is a startpoint.  An abort
+        // inside operand decode leaves the cursor on an operand byte of the
+        // same jitcode.  `setposition` then dispatches that byte.
+        // `last_opcode_position` is the boundary `run_one_step` saved before
+        // consuming the opcode, so that is the pc the blackhole frame runs.
         //
         // A stub abort corrected above declines the conversion for the same
         // reason `abort_after_panic` does — the frames name no work the
@@ -12431,7 +12464,7 @@ pub fn publish_walk_abort_handoff(
         let abort_after_panic = std::mem::replace(&mut ctx.abort_after_panic, false);
         if !abort_after_panic && stub_resume_pc.is_none() {
             if let Some(top) = standalone.frames.frames.last_mut() {
-                top.pc = top.code_cursor;
+                top.pc = snap_pc_to_instruction_start(top);
             }
             ctx.aborted_framestack = Some(std::mem::take(&mut standalone.frames));
         }
@@ -13688,6 +13721,54 @@ mod tests {
 
     extern "C" fn scale_f64(x: f64, k: i64) -> f64 {
         x * k as f64
+    }
+
+    #[test]
+    fn ref_result_abort_bails_the_trace_like_abort() {
+        assert!(super::trace_abort_bytecode(
+            majit_jitcode::insns::BC_ABORT_RESULT_R
+        ));
+        assert!(super::trace_abort_bytecode(majit_jitcode::insns::BC_ABORT));
+        assert!(!super::trace_abort_bytecode(
+            majit_jitcode::insns::BC_INT_ADD
+        ));
+    }
+
+    #[test]
+    fn abort_handoff_does_not_resume_mid_instruction() {
+        let mut builder = JitCodeBuilder::new();
+        builder.set_name("abort_pc");
+        builder.load_const_i_value(1, 0);
+        builder.load_const_i_value(2, 1);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let start = jitcode
+            .startpoints
+            .as_ref()
+            .expect("assembled jitcode records startpoints")
+            .iter()
+            .copied()
+            .min()
+            .expect("at least one instruction");
+        let mid = (start + 1..jitcode.code.len())
+            .find(|pc| !jitcode.is_valid_startpoint(*pc))
+            .expect("an operand byte");
+
+        let sd = std::sync::Arc::new(crate::MetaInterpStaticData::new());
+        let mut ctx = TraceCtx::new(crate::recorder::Trace::new(), 0, sd);
+        let mut standalone = StandaloneFrameStack::new();
+        let mut frame = standalone.frames.take_frame(jitcode, start, None, None);
+        frame.last_opcode_position = start;
+        frame.code_cursor = mid;
+        frame.pc = 0;
+        standalone.frames.push(frame);
+
+        publish_walk_abort_handoff(&mut ctx, &TraceAction::Abort, &mut standalone);
+        let resumed = ctx
+            .aborted_framestack
+            .expect("abort publishes the framestack");
+        let top = resumed.frames.last().expect("top frame");
+        assert_eq!(top.pc, start);
+        assert!(top.jitcode.is_valid_startpoint(top.pc));
     }
 
     #[test]

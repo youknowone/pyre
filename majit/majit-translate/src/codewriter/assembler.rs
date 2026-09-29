@@ -5801,6 +5801,46 @@ mod tests {
     }
 
     #[test]
+    fn integer_add_with_a_signed_result_is_int_add_ii() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{ConcreteType, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("int_add_signed");
+        let lhs = push_input_var(&mut graph, "lhs", ValueType::Int);
+        let rhs = push_input_var(&mut graph, "rhs", ValueType::Int);
+        let sum = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(sum.clone()));
+        FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&sum, ConcreteType::Signed);
+
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            !asm.insns.contains_key("int_add/ii>r"),
+            "an int add must not take a ref result bank: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        let byte = *asm.insns.get("int_add/ii>i").expect("int_add/ii>i");
+        assert_eq!(byte, crate::insns::BC_INT_ADD);
+        assert!(body.code.contains(&byte));
+    }
+
+    #[test]
     fn canonical_int_binop_is_not_double_prefixed() {
         let lhs = crate::flowspace::model::Variable::new();
         let rhs = crate::flowspace::model::Variable::new();

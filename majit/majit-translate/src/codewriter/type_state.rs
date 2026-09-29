@@ -242,12 +242,17 @@ pub(crate) fn promote_gc_field_bases(
                 }
                 OpKind::VableFieldRead { base, .. }
                 | OpKind::VableFieldWrite { base, .. }
-                | OpKind::ArrayRead { base, .. }
-                | OpKind::ArrayWrite { base, .. }
-                | OpKind::ArrayLen { base, .. }
                 | OpKind::VableArrayRead { base, .. }
                 | OpKind::VableArrayWrite { base, .. }
                 | OpKind::VableArrayLen { base, .. } => (base, true),
+                // `nolength` is a raw items region (`ARRAY._gckind == 'raw'`).
+                // Its base is the address integer (`getkind` → int). Promoting
+                // that address to `GcRef` puts an `int_add` result in the ref
+                // bank (`int_add/ii>r`), which no blackhole handler has.
+                // A length-prefixed array is the GC family and stays `GcRef`.
+                OpKind::ArrayRead { base, nolength, .. }
+                | OpKind::ArrayWrite { base, nolength, .. }
+                | OpKind::ArrayLen { base, nolength, .. } => (base, !nolength),
                 _ => continue,
             };
             if !force_gc {
@@ -365,6 +370,45 @@ mod tests {
             FunctionGraph::concretetype_of(&base),
             ConcreteType::GcRef,
             "a GC ArrayRead base that arrived as Signed must be published as GcRef"
+        );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_leaves_a_headerless_array_address_signed() {
+        let (array_type_id, nolength) =
+            crate::front::mir::fixed_array_index_identity(false, "&[u32]");
+        assert!(nolength, "a [u32] item run has no length header");
+        assert!(crate::front::typestr::nolength_from_array_type_id(
+            array_type_id.as_deref()
+        ));
+
+        let mut graph = FunctionGraph::new("raw_slice_address");
+        let addr = push_input(&mut graph, "addr", ValueType::Int);
+        let index = push_input(&mut graph, "i", ValueType::Int);
+        let value = push_input(&mut graph, "v", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&addr, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&index, ConcreteType::Signed);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: None,
+                kind: OpKind::ArrayWrite {
+                    base: addr.clone(),
+                    index,
+                    value: crate::model::LinkArg::Value(value),
+                    item_ty: ValueType::Int,
+                    array_type_id,
+                    nolength,
+                },
+            });
+
+        promote_gc_field_bases(&graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&addr),
+            ConcreteType::Signed,
+            "nolength raw slice base stays an int"
         );
     }
 

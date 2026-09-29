@@ -8390,9 +8390,6 @@ impl<'a> Lowering<'a> {
                 let lhs_v = self.resolve_operand(mir_bb, lhs)?;
                 let rhs_v = self.resolve_operand(mir_bb, rhs)?;
                 let mut op_label = binop_label(&op_json)?;
-                let res = self
-                    .graph
-                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 // Preserve the source scalar width through flow-graph
                 // construction.  PyPy's rbigint `_x_divrem` performs its
                 // intermediates in `LONG_TYPE` / `ULONG_TYPE`
@@ -8435,6 +8432,19 @@ impl<'a> Lowering<'a> {
                 if result_ty == ValueType::Float && op_label == "floordiv" {
                     op_label = "truediv".to_string();
                 }
+                // `getkind` reads the result variable, not `result_ty`.
+                // `Unknown` is kind `'r'`, so an `i64` add was emitted as
+                // `int_add/ii>r`, a key no blackhole handler has. A scalar
+                // result is Signed / Float (`history.py getkind`). A
+                // non-scalar destination keeps `Unknown`.
+                let result_concrete = match &scalar_ty {
+                    ValueType::Float => crate::model::ConcreteType::Float,
+                    ValueType::Int | ValueType::Unsigned | ValueType::Bool => {
+                        crate::model::ConcreteType::Signed
+                    }
+                    _ => crate::model::ConcreteType::Unknown,
+                };
+                let res = self.graph.alloc_value_var_with_type(result_concrete);
                 // Integer ops that have no pointer form (`rptr.py` is
                 // only eq/ne) must see Signed addresses:
                 // `cast_ptr_to_int(p) < cast_ptr_to_int(q)`, and the
@@ -13150,9 +13160,16 @@ impl<'a> Lowering<'a> {
                 let slice_object_element = self
                     .is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
                     && element_node.is_some_and(|elem| json_ty_is_objectptr(elem, self.llbc));
+                // `Option<Box<T>>` (and the other null niches) is one pointer
+                // word: `None` is null, `Some` is the payload. Indexing it
+                // as a residual `Vec::index_mut` hands a virtualizable array
+                // to a call, which `jtransform.py` rejects.
+                let element_is_niche_option =
+                    element_node.is_some_and(|elem| json_ty_is_niche_option_word(elem, self.llbc));
                 let element_is_addressable = element_spelling.is_some()
                     || element_node
-                        .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc));
+                        .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc))
+                    || element_is_niche_option;
                 let vable_array_var = (args.len() == 2)
                     .then(|| declared_vable_array_var(&self.graph, &args[0]))
                     .flatten();
@@ -13359,10 +13376,10 @@ impl<'a> Lowering<'a> {
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     let element_is_pointer_word = self.var_tracks_pointer_word_array(&args[0]);
-                    if element_is_pointer_word {
+                    if element_is_pointer_word || element_is_niche_option {
                         self.pointer_word_vars.insert(res.clone());
                     }
-                    let item_ty = if element_is_pointer_word {
+                    let item_ty = if element_is_pointer_word || element_is_niche_option {
                         ValueType::Ref(None)
                     } else {
                         item_ty
@@ -17022,6 +17039,15 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .and_then(|ty| self.adt_struct_fields(ty))
         };
+        // Only a thin `Box<T>` is one pointer word. `Box<[T]>`, `Box<str>` and
+        // `Box<dyn Trait>` carry a metadata word that a `same_as` would drop.
+        let receiver_is_thin_box = first_arg_ty.as_ref().is_some_and(|ty| {
+            let peeled = self
+                .tyref_peel_ref_to_pointee(ty)
+                .unwrap_or_else(|| ty.clone());
+            tyref_node(&peeled, self.llbc)
+                .is_some_and(|node| type_node_is_thin_box(node, self.llbc))
+        });
         let op_kind = crate::front::std_identity::lower_std_primitive_op(
             op_kind,
             identity_recv.as_deref(),
@@ -17031,6 +17057,35 @@ impl<'a> Lowering<'a> {
             dest_is_bool,
             identity_banks_agree,
             identity_layout.as_deref(),
+            receiver_is_thin_box,
+        );
+        // `Option::as_deref` / `as_deref_mut` on a null-niche
+        // `Option<Box<T>>` is the pointer word (`Box::as_mut` is the
+        // same identity on the box itself). `None` stays null.
+        let niche_option_ptr = first_arg_ty.as_ref().is_some_and(|ty| {
+            let peeled = self
+                .tyref_peel_ref_to_pointee(ty)
+                .unwrap_or_else(|| ty.clone());
+            self.tyref_is_niche_option_ptr(&peeled)
+        });
+        // `CallTarget::Method` keeps the leaf. The inherent impl's owner
+        // ADT is on the FunDecl (`impl_method_owner_for_fundecl`):
+        // `option::Option::as_deref` / `as_deref_mut`.
+        let decl_is_option_deref = match &op_kind {
+            OpKind::Call { target, .. } => target
+                .fun_decl_id()
+                .and_then(|id| self.llbc.fn_by_id(id))
+                .and_then(|fd| impl_method_owner_for_fundecl(self.llbc, fd))
+                .is_some_and(|(owner, leaf)| {
+                    (owner == "option::Option" || owner == "core::option::Option")
+                        && matches!(leaf.as_str(), "as_deref" | "as_deref_mut")
+                }),
+            _ => false,
+        };
+        let op_kind = crate::front::std_identity::lower_niche_option_deref(
+            op_kind,
+            niche_option_ptr,
+            decl_is_option_deref,
         );
         // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
         // typed) for the checked-arith rewiring pass
@@ -17102,11 +17157,13 @@ impl<'a> Lowering<'a> {
             && name == "ok_or_else"
             && receiver_root.as_deref() == Some("Option")
             && args.len() == 2
+            && let Some(closure_arg) = args.get(1).and_then(|arg| arg.as_variable()).cloned()
             && let Some(site) = self.recognize_checked_arith_ok_or_else_site(
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
                 &call.dest.ty,
                 &result_var,
+                closure_arg,
             )
         {
             self.checked_arith_ok_or_else_sites.push(site);
@@ -22648,6 +22705,7 @@ impl<'a> Lowering<'a> {
         env_ty: Option<&TyRef>,
         dest_ty: &TyRef,
         result_var: &Variable,
+        closure_arg: Variable,
     ) -> Option<crate::front::checked_arith::CheckedArithOkOrElseSite> {
         if !crate::front::result_exc::tyref_is_option(recv_ty?, self.llbc)
             || !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc)
@@ -22663,6 +22721,7 @@ impl<'a> Lowering<'a> {
         let err_ty = self.tyref_adt_type_arg(dest_ty, 1)?;
         Some(crate::front::checked_arith::CheckedArithOkOrElseSite {
             result_var: result_var.clone(),
+            closure_arg,
             call_once_owner,
             result_suffix,
             ok_payload_ty: tyref_enum_payload_value_type(&ok_ty, self.llbc, self.tombstoned_leaves),
@@ -35949,6 +36008,34 @@ fn json_ty_scalar_element_spelling(node: &serde_json::Value, llbc: &Llbc) -> Opt
 ///
 /// A pointer is one word only while it is thin: a pointer to an unsized
 /// pointee carries a length or a vtable beside the address.
+/// `Option<Box<T>>` / `Option<&T>` / `Option<*mut T>` laid out as one
+/// nullable pointer word. `rmodel.py` represents that pointer with
+/// `can_be_none`; `None` is the null word and there is no tag field.
+fn json_ty_is_niche_option_word(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(node) = strip_ty_wrappers(node, llbc) else {
+        return false;
+    };
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    if llbc
+        .type_by_id(id)
+        .is_none_or(|td| td.item_meta.name_path() != "core::option::Option")
+    {
+        return false;
+    }
+    let Some(payload) = node
+        .get("Adt")
+        .and_then(|a| a.get("generics"))
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.first())
+    else {
+        return false;
+    };
+    type_node_is_thin_box(payload, llbc) || json_ty_is_thin_pointer_element(payload, llbc)
+}
+
 fn json_ty_is_thin_pointer_element(node: &serde_json::Value, llbc: &Llbc) -> bool {
     // `Box<T>` of a sized `T` is one pointer word, the same width as `&T`.
     if type_node_is_thin_box(node, llbc) {
