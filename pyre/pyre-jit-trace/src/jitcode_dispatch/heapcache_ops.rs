@@ -947,10 +947,13 @@ pub(crate) fn opimpl_newstr<Sym: WalkSym>(
 /// `return self.execute(rop.STRSETITEM, strbox, indexbox, newcharbox)`.
 ///
 /// Operand layout `rii` and its `c` forms: 1B r-reg(string) + index +
-/// newchar.  The store runs when every operand is live.  Only a buffer
-/// still being filled is ever stored into (`rstr.py` strings are immutable
-/// once built), and the store is idempotent, so the interpreter repeating
-/// it after the walk writes the same byte.
+/// newchar.  Only a buffer still being filled is ever stored into
+/// (`rstr.py` strings are immutable once built), and the store is
+/// idempotent, so the interpreter repeating it after the walk writes the
+/// same byte.  `execute` runs the store before the op is recorded; a store
+/// the walk cannot run (an operand without a concrete value, or a range
+/// outside the buffer) declines instead of recording a mutation the walk's
+/// own later reads would not see.
 pub(crate) fn opimpl_strsetitem<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -959,14 +962,26 @@ pub(crate) fn opimpl_strsetitem<Sym: WalkSym>(
     let string = read_ref_reg(code, op, 0, ctx)?;
     let (index, index_value) = int_operand(code, op, 1, ctx)?;
     let (newchar, newchar_value) = int_operand(code, op, 2, ctx)?;
-    if let Some(ptr) = concrete_ref_operand_ptr(code, op, 0, string, ctx)
-        && let (Some(index_value), Some(newchar_value)) = (index_value, newchar_value)
-        && str_range_in_bounds(ptr, index_value, 1)
-        && (0..=0xff).contains(&newchar_value)
-    {
-        ctx.trace_ctx
-            .execute_strsetitem(ptr, index_value, newchar_value);
+    let Some(ptr) = concrete_ref_operand_ptr(code, op, 0, string, ctx) else {
+        return Err(DispatchError::UnsupportedOpname {
+            pc: op.pc,
+            key: "strsetitem (string not concrete)",
+        });
+    };
+    let (Some(index_value), Some(newchar_value)) = (index_value, newchar_value) else {
+        return Err(DispatchError::UnsupportedOpname {
+            pc: op.pc,
+            key: "strsetitem (index or char not concrete)",
+        });
+    };
+    if !str_range_in_bounds(ptr, index_value, 1) || !(0..=0xff).contains(&newchar_value) {
+        return Err(DispatchError::UnsupportedOpname {
+            pc: op.pc,
+            key: "strsetitem (out of range)",
+        });
     }
+    ctx.trace_ctx
+        .execute_strsetitem(ptr, index_value, newchar_value);
     let args = [string, index, newchar];
     ctx.trace_ctx
         .heapcache_invalidate_caches(OpCode::Strsetitem, &args);
@@ -980,8 +995,8 @@ pub(crate) fn opimpl_strsetitem<Sym: WalkSym>(
 /// rop.COPYSTRCONTENT, srcbox, dstbox, srcstartbox, dststartbox,
 /// lengthbox)`.
 ///
-/// Operand layout `rriii` and its `c` forms.  The copy runs under the same
-/// rule as [`opimpl_strsetitem`].
+/// Operand layout `rriii` and its `c` forms.  The copy runs, or the walk
+/// declines, under the same rule as [`opimpl_strsetitem`].
 pub(crate) fn opimpl_copystrcontent<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -992,21 +1007,38 @@ pub(crate) fn opimpl_copystrcontent<Sym: WalkSym>(
     let (srcstart, srcstart_value) = int_operand(code, op, 2, ctx)?;
     let (dststart, dststart_value) = int_operand(code, op, 3, ctx)?;
     let (length, length_value) = int_operand(code, op, 4, ctx)?;
-    if let Some(src_ptr) = concrete_ref_operand_ptr(code, op, 0, src, ctx)
-        && let Some(dst_ptr) = concrete_ref_operand_ptr(code, op, 1, dst, ctx)
-        && let (Some(srcstart_value), Some(dststart_value), Some(length_value)) =
-            (srcstart_value, dststart_value, length_value)
-        && str_range_in_bounds(src_ptr, srcstart_value, length_value)
-        && str_range_in_bounds(dst_ptr, dststart_value, length_value)
+    let (Some(src_ptr), Some(dst_ptr)) = (
+        concrete_ref_operand_ptr(code, op, 0, src, ctx),
+        concrete_ref_operand_ptr(code, op, 1, dst, ctx),
+    ) else {
+        return Err(DispatchError::UnsupportedOpname {
+            pc: op.pc,
+            key: "copystrcontent (string not concrete)",
+        });
+    };
+    let (Some(srcstart_value), Some(dststart_value), Some(length_value)) =
+        (srcstart_value, dststart_value, length_value)
+    else {
+        return Err(DispatchError::UnsupportedOpname {
+            pc: op.pc,
+            key: "copystrcontent (bound not concrete)",
+        });
+    };
+    if !str_range_in_bounds(src_ptr, srcstart_value, length_value)
+        || !str_range_in_bounds(dst_ptr, dststart_value, length_value)
     {
-        ctx.trace_ctx.execute_copystrcontent(
-            src_ptr,
-            dst_ptr,
-            srcstart_value,
-            dststart_value,
-            length_value,
-        );
+        return Err(DispatchError::UnsupportedOpname {
+            pc: op.pc,
+            key: "copystrcontent (out of range)",
+        });
     }
+    ctx.trace_ctx.execute_copystrcontent(
+        src_ptr,
+        dst_ptr,
+        srcstart_value,
+        dststart_value,
+        length_value,
+    );
     let args = [src, dst, srcstart, dststart, length];
     ctx.trace_ctx
         .heapcache_invalidate_caches(OpCode::Copystrcontent, &args);

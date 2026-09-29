@@ -9974,17 +9974,32 @@ fn run_keyed_step(
 fn newstr_strsetitem_copystrcontent_record_their_operands() {
     // `pyjitpl.py opimpl_newstr` / `opimpl_strsetitem` /
     // `opimpl_copystrcontent`: each form records its op over the decoded
-    // operands, `c` bytes as ConstInt.
+    // operands, `c` bytes as ConstInt.  `execute` runs the store first, so
+    // the string registers hold live STR buffers long enough for every
+    // index below and the int registers hold concrete values.
+    use pyre_object::lowlevel_string::{
+        LOWLEVEL_STR_BASE_SIZE, bh_alloc_lowlevel_string, bh_free_lowlevel_string,
+    };
     let mut tc = fresh_trace_ctx();
+    let bufs = [
+        bh_alloc_lowlevel_string(16, LOWLEVEL_STR_BASE_SIZE, 1),
+        bh_alloc_lowlevel_string(16, LOWLEVEL_STR_BASE_SIZE, 1),
+    ];
     let r = [
         tc.record_op(majit_ir::OpCode::IntAdd, &[]),
         tc.record_op(majit_ir::OpCode::IntAdd, &[]),
     ];
+    for (reg, buf) in r.iter().zip(bufs) {
+        tc.set_opref_concrete(*reg, majit_ir::Value::Ref(majit_ir::GcRef(buf as usize)));
+    }
     let i = [
         tc.record_op(majit_ir::OpCode::IntAdd, &[]),
         tc.record_op(majit_ir::OpCode::IntAdd, &[]),
         tc.record_op(majit_ir::OpCode::IntAdd, &[]),
     ];
+    for (n, reg) in i.iter().enumerate() {
+        tc.set_opref_concrete(*reg, majit_ir::Value::Int(n as i64));
+    }
     let c = OpRef::ConstInt;
     use majit_ir::OpCode::{Copystrcontent, Newstr, Strsetitem};
     let cases: Vec<(&'static str, Vec<u8>, majit_ir::OpCode, Vec<OpRef>)> = vec![
@@ -10078,6 +10093,63 @@ fn newstr_strsetitem_copystrcontent_record_their_operands() {
             assert_ne!(regs_r[0], r[0], "{key} writes its dst register");
         }
     }
+    for buf in bufs {
+        bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
+    }
+}
+
+#[test]
+fn strsetitem_and_copystrcontent_decline_a_store_they_cannot_run() {
+    // `execute` runs the store before the op is recorded.  A string with no
+    // concrete value, or a range outside the buffer, declines without
+    // recording anything.
+    use pyre_object::lowlevel_string::{
+        LOWLEVEL_STR_BASE_SIZE, bh_alloc_lowlevel_string, bh_free_lowlevel_string,
+    };
+    let mut tc = fresh_trace_ctx();
+    let buf = bh_alloc_lowlevel_string(4, LOWLEVEL_STR_BASE_SIZE, 1);
+    let r = [
+        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
+        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
+    ];
+    tc.set_opref_concrete(r[0], majit_ir::Value::Ref(majit_ir::GcRef(buf as usize)));
+    let i = [tc.record_op(majit_ir::OpCode::IntAdd, &[])];
+    // The copy length: srcstart 2 + 3 overruns the 4-char buffer.
+    tc.set_opref_concrete(i[0], majit_ir::Value::Int(3));
+    let cases: [(&'static str, Vec<u8>, &'static str); 4] = [
+        (
+            "strsetitem/rci",
+            vec![1, 0, 0],
+            "strsetitem (string not concrete)",
+        ),
+        (
+            "strsetitem/rcc",
+            vec![0, 4, 97],
+            "strsetitem (out of range)",
+        ),
+        (
+            "copystrcontent/rrcci",
+            vec![0, 1, 0, 0, 0],
+            "copystrcontent (string not concrete)",
+        ),
+        (
+            "copystrcontent/rrcci",
+            vec![0, 0, 2, 0, 0],
+            "copystrcontent (out of range)",
+        ),
+    ];
+    for (key, operands, expected) in cases {
+        let before = tc.ops().len();
+        let mut regs_r = r;
+        let mut regs_i = i;
+        let err = run_keyed_step(key, &operands, &mut tc, &mut regs_r, &mut regs_i).expect_err(key);
+        match err {
+            DispatchError::UnsupportedOpname { key: got, .. } => assert_eq!(got, expected, "{key}"),
+            other => panic!("{key}: expected UnsupportedOpname, got {other:?}"),
+        }
+        assert_eq!(tc.ops().len(), before, "{key} records nothing");
+    }
+    bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
 }
 
 #[test]
