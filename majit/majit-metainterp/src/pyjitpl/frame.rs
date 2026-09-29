@@ -695,6 +695,41 @@ impl MIFrame {
         self.pc = pc;
     }
 
+    /// pyjitpl.py `MIFrame.handle_rvmprof_enter_on_resume`.
+    ///
+    /// Skip a leading `-live-`. When the resumed opcode is `rvmprof_code/ii`
+    /// and arg1 == 1, execution will call `jit_rvmprof_code(1, unique_id)`,
+    /// so emit the matching enter `jit_rvmprof_code(0, arg2)` first.
+    /// `op_live` / `op_rvmprof_code` are `staticdata` lookups
+    /// (`insns.get(..., -1)`). `-1` matches no opcode byte.
+    pub fn handle_rvmprof_enter_on_resume(&mut self, op_live: i32, op_rvmprof_code: i32) {
+        let code = &self.jitcode.code;
+        let mut position = self.pc;
+        let mut opcode = code[position];
+        if op_live >= 0 && opcode == op_live as u8 {
+            position += majit_jitcode::liveness::OFFSET_SIZE + 1;
+            opcode = code[position];
+        }
+        if op_rvmprof_code >= 0 && opcode == op_rvmprof_code as u8 {
+            let arg1 = self.int_values[code[position + 1] as usize].unwrap_or_else(|| {
+                panic!(
+                    "handle_rvmprof_enter_on_resume: registers_i[{}] has no int",
+                    code[position + 1]
+                )
+            });
+            let arg2 = self.int_values[code[position + 2] as usize].unwrap_or_else(|| {
+                panic!(
+                    "handle_rvmprof_enter_on_resume: registers_i[{}] has no int",
+                    code[position + 2]
+                )
+            });
+            if arg1 == 1 {
+                // pyjitpl.py `cintf.jit_rvmprof_code(0, arg2)`.
+                majit_rlib::rvmprof::cintf::jit_rvmprof_code(0, arg2);
+            }
+        }
+    }
+
     /// pyjitpl.py `MIFrame.make_result_of_lastop(resultbox)`.
     ///
     /// Stores the result of the last opimpl into the typed register at

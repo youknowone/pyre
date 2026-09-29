@@ -18835,23 +18835,44 @@ impl<M: Clone> MetaInterp<M> {
             let _ = self.newframe(mainjitcode, None);
         } else {
             for (section_i, section) in frames.iter().enumerate() {
-                // `staticdata.jitcodes[jitcode_pos]`. A missing entry still
-                // builds the frame rather than dropping the section.
-                // `frame_value_count_at` counts boxes on the materialized
-                // body; a skeleton at the same index decodes no `-live-`.
-                let jitcode = usize::try_from(section.jitcode_index)
-                    .ok()
-                    .and_then(|pos| jitcodes.jitcodes.get(pos).cloned())
-                    .unwrap_or_else(|| mainjitcode.clone());
-                let jitcode = materialized
-                    .get(section_i)
-                    .and_then(|slot| slot.clone())
-                    .unwrap_or(jitcode);
-                let frame_index = self.newframe(jitcode, None);
-                let Ok(pc) = usize::try_from(section.pc) else {
-                    continue;
+                // resume.py `rebuild_from_resumedata`:
+                // `jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`.
+                // The caller's materialized body for this section is that
+                // jitcode (`frame_value_count_at` counts boxes on it; a
+                // skeleton at the same index decodes no `-live-`). Without
+                // one, a missing index is an indexing error; do not
+                // substitute `mainjitcode`.
+                let jitcode = match materialized.get(section_i).and_then(|slot| slot.clone()) {
+                    Some(jitcode) => jitcode,
+                    None => {
+                        let pos = usize::try_from(section.jitcode_index).unwrap_or_else(|_| {
+                            panic!(
+                                "rebuild_from_resumedata: jitcodes[{}] index error",
+                                section.jitcode_index
+                            )
+                        });
+                        jitcodes.jitcodes.get(pos).cloned().unwrap_or_else(|| {
+                            panic!(
+                                "rebuild_from_resumedata: jitcodes[{pos}] index error (len {})",
+                                jitcodes.jitcodes.len()
+                            )
+                        })
+                    }
                 };
+                // resume.py `read_jitcode_pos_pc` stores `frame.pc`.
+                // `capture_resumedata` leaves that pc alone when `resumepc < 0`,
+                // so the stored word is never negative. Pyre can still put
+                // `NO_JITCODE_PC` (-1) or an `encode_branch_orgpc` word (<= -2)
+                // here. That is not a jitcode position: `resolve_jitcode`
+                // declines `pc < 0`, and this rebuild reports the same failure
+                // (`false` → caller aborts to blackhole) instead of seating a
+                // pc-0 frame and returning success.
+                let Ok(pc) = usize::try_from(section.pc) else {
+                    return false;
+                };
+                let frame_index = self.newframe(jitcode, None);
                 if let Some(frame) = self.framestack.frames.get_mut(frame_index) {
+                    // resume.py `MIFrame.setup_resume_at_op`.
                     frame.setup_resume_at_op(pc);
                 }
             }
@@ -18868,11 +18889,12 @@ impl<M: Clone> MetaInterp<M> {
     /// `resume.py` `ResumeDataBoxReader.consume_boxes`: pair each section's
     /// rebuilt values with that jitcode's live registers and store the box.
     ///
-    /// `resume.py ResumeDataBoxReader.consume_boxes` always consumes the
-    /// section. A liveness/section length mismatch is a producer bug: the
-    /// bridge is not built and the caller falls back through the blackhole
-    /// path the other resume errors take. A virtual stays unset; the
-    /// guard-resume walk allocates it through `materialize_bridge_virtual`.
+    /// `resume.py` `ResumeDataBoxReader.consume_boxes` always consumes the
+    /// section; it has no length check. A liveness/section length mismatch
+    /// is a pyre guard: the bridge is not built and the caller aborts to
+    /// the blackhole path the other resume errors take. A virtual stays
+    /// unset; the guard-resume walk allocates it through
+    /// `materialize_bridge_virtual`.
     fn consume_portal_resume_boxes(
         &mut self,
         frames: &[majit_ir::resumedata::RebuiltFrame],
@@ -18902,11 +18924,12 @@ impl<M: Clone> MetaInterp<M> {
         let n = self.framestack.frames.len().min(frames.len());
         for i in 0..n {
             let section = &frames[i];
-            // A negative pc is not a jitcode position (`setup_resume_at_op`
-            // leaves the frame at 0). Pairing values against pc 0 would
-            // write them into the wrong registers.
+            // Same unrepresentable coordinate as `rebuild_from_resumedata`
+            // above (`NO_JITCODE_PC` / `encode_branch_orgpc`). Upstream
+            // `read_jitcode_pos_pc` has no negative pc. Decline with the
+            // same `false` this function already returns for a length mismatch.
             let Ok(pc) = usize::try_from(section.pc) else {
-                continue;
+                return false;
             };
             let jitcode = materialized
                 .get(i)
@@ -18916,9 +18939,9 @@ impl<M: Clone> MetaInterp<M> {
             let indices =
                 crate::resume::read_frame_liveness_reg_indices(&jitcode, pc, op_live, &liveness);
             if indices.total_len() != section.values.len() {
-                // `resume.py consume_boxes` always consumes the section.
-                // A mismatch resumes with an empty register file, so the
-                // bridge is not built.
+                // pyre guard. `resume.py` `ResumeDataBoxReader.consume_boxes`
+                // always consumes and has no length check. A mismatch must
+                // not build the bridge; the caller aborts to blackhole.
                 debug_assert!(
                     false,
                     "consume_boxes: liveness {} != section values {} at pc {}",
@@ -18938,29 +18961,42 @@ impl<M: Clone> MetaInterp<M> {
             for index in indices.float {
                 order.push((majit_ir::Type::Float, index as usize));
             }
-            let frame = &mut self.framestack.frames[i];
-            for (slot, value) in order.into_iter().zip(section.values.iter()) {
-                let Some((opref, bits)) = crate::resume::resume_register_box(value, fail_values)
-                else {
-                    continue;
-                };
-                let (bank, index) = slot;
-                match bank {
-                    majit_ir::Type::Int if index < frame.int_regs.len() => {
-                        frame.int_regs[index] = Some(opref);
-                        frame.int_values[index] = Some(bits);
+            {
+                let frame = &mut self.framestack.frames[i];
+                for (slot, value) in order.into_iter().zip(section.values.iter()) {
+                    let Some((opref, bits)) =
+                        crate::resume::resume_register_box(value, fail_values)
+                    else {
+                        continue;
+                    };
+                    let (bank, index) = slot;
+                    match bank {
+                        majit_ir::Type::Int if index < frame.int_regs.len() => {
+                            frame.int_regs[index] = Some(opref);
+                            frame.int_values[index] = Some(bits);
+                        }
+                        majit_ir::Type::Ref if index < frame.ref_regs.len() => {
+                            frame.ref_regs[index] = Some(opref);
+                            frame.ref_values[index] = Some(bits);
+                        }
+                        majit_ir::Type::Float if index < frame.float_regs.len() => {
+                            frame.float_regs[index] = Some(opref);
+                            frame.float_values[index] = Some(bits);
+                        }
+                        _ => {}
                     }
-                    majit_ir::Type::Ref if index < frame.ref_regs.len() => {
-                        frame.ref_regs[index] = Some(opref);
-                        frame.ref_values[index] = Some(bits);
-                    }
-                    majit_ir::Type::Float if index < frame.float_regs.len() => {
-                        frame.float_regs[index] = Some(opref);
-                        frame.float_values[index] = Some(bits);
-                    }
-                    _ => {}
                 }
             }
+        }
+        // resume.py `rebuild_from_resumedata` calls
+        // `f.handle_rvmprof_enter_on_resume()` after each `consume_boxes`.
+        // Upstream never abandons a rebuild halfway; this one can return
+        // `false` above and then resumes through `blackhole_from_resumedata`,
+        // which emits its own enter. The hooks therefore run only once every
+        // section has been consumed.
+        for i in 0..n {
+            self.framestack.frames[i]
+                .handle_rvmprof_enter_on_resume(staticdata.op_live, staticdata.op_rvmprof_code);
         }
         true
     }
@@ -22874,6 +22910,125 @@ impl MetaInterpStaticData {
             fnaddress,
             |jitcode| jitcode.fnaddr as usize,
         )
+    }
+}
+
+#[cfg(test)]
+mod portal_resume_rebuild_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use majit_ir::resumedata::{RebuiltFrame, RebuiltValue};
+    use majit_jitcode::codewriter::liveness::encode_liveness;
+    use majit_jitcode::insns::{BC_LIVE, BC_RVMPROF_CODE};
+    use majit_jitcode::jitcode::JitCodeBody;
+
+    static RVMPROF_LEAVING: AtomicI64 = AtomicI64::new(-1);
+    static RVMPROF_UID: AtomicI64 = AtomicI64::new(-1);
+
+    fn hook(leaving: i64, unique_id: i64) {
+        RVMPROF_LEAVING.store(leaving, Ordering::SeqCst);
+        RVMPROF_UID.store(unique_id, Ordering::SeqCst);
+    }
+
+    fn rvmprof_jitcode() -> std::sync::Arc<crate::jitcode::JitCode> {
+        let bits = encode_liveness(&[0, 1]);
+        let mut startpoints = indexmap::IndexSet::new();
+        startpoints.insert(0);
+        startpoints.insert(3);
+        let jc = crate::jitcode::JitCode::new("rvmprof-resume");
+        jc.set_body(JitCodeBody {
+            code: vec![BC_LIVE, 0, 0, BC_RVMPROF_CODE, 0, 1],
+            c_num_regs_i: 2,
+            startpoints: Some(startpoints),
+            ..JitCodeBody::default()
+        });
+        std::sync::Arc::new(jc)
+    }
+
+    fn liveness_two_ints() -> Vec<u8> {
+        let mut buf = vec![2, 0, 0];
+        buf.extend(encode_liveness(&[0, 1]));
+        buf
+    }
+
+    fn install(meta: &mut MetaInterp<()>, jitcode: std::sync::Arc<crate::jitcode::JitCode>) {
+        let sd = std::sync::Arc::get_mut(&mut meta.staticdata).expect("staticdata uniquely owned");
+        sd.op_live = i32::from(BC_LIVE);
+        sd.op_rvmprof_code = i32::from(BC_RVMPROF_CODE);
+        sd.jitcodes.push(jitcode);
+    }
+
+    fn section(pc: i32, values: Vec<RebuiltValue>) -> RebuiltFrame {
+        RebuiltFrame {
+            jitcode_index: 0,
+            pc,
+            values,
+        }
+    }
+
+    #[test]
+    fn negative_section_pc_aborts_without_a_pc0_frame() {
+        let mut meta = MetaInterp::<()>::new(0);
+        let jitcode = rvmprof_jitcode();
+        install(&mut meta, jitcode.clone());
+        let frames = [section(majit_ir::resumedata::NO_JITCODE_PC, vec![])];
+        let ok = meta.rebuild_portal_framestack_from_resumedata(jitcode, &frames, &[], &[], &[], 0);
+        assert!(!ok);
+        assert!(meta.framestack.frames.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "jitcodes[5] index error")]
+    fn missing_jitcode_index_panics() {
+        let mut meta = MetaInterp::<()>::new(0);
+        let jitcode = rvmprof_jitcode();
+        let frames = [RebuiltFrame {
+            jitcode_index: 5,
+            pc: 0,
+            values: vec![],
+        }];
+        let _ = meta.rebuild_portal_framestack_from_resumedata(jitcode, &frames, &[], &[], &[], 0);
+    }
+
+    #[test]
+    fn resume_on_rvmprof_enter_emits_jit_rvmprof_code_zero() {
+        struct HookReset;
+        impl Drop for HookReset {
+            fn drop(&mut self) {
+                majit_rlib::rvmprof::cintf::set_hook(None);
+            }
+        }
+        RVMPROF_LEAVING.store(-1, Ordering::SeqCst);
+        RVMPROF_UID.store(-1, Ordering::SeqCst);
+        let _reset = HookReset;
+        majit_rlib::rvmprof::cintf::set_hook(Some(hook));
+
+        let mut meta = MetaInterp::<()>::new(0);
+        let jitcode = rvmprof_jitcode();
+        install(&mut meta, jitcode.clone());
+        let frames = [section(
+            0,
+            vec![
+                RebuiltValue::Const(majit_ir::Const::Int(1)),
+                RebuiltValue::Const(majit_ir::Const::Int(42)),
+            ],
+        )];
+        let ok = meta.rebuild_portal_framestack_from_resumedata(
+            jitcode,
+            &frames,
+            &[],
+            &[],
+            &liveness_two_ints(),
+            BC_LIVE,
+        );
+        assert!(ok);
+        assert_eq!(meta.framestack.frames.len(), 1);
+        assert_eq!(meta.framestack.frames[0].pc, 0);
+        assert_eq!(meta.framestack.frames[0].int_values[0], Some(1));
+        assert_eq!(meta.framestack.frames[0].int_values[1], Some(42));
+        assert_eq!(RVMPROF_LEAVING.load(Ordering::SeqCst), 0);
+        assert_eq!(RVMPROF_UID.load(Ordering::SeqCst), 42);
     }
 }
 
