@@ -214,10 +214,11 @@ impl DictStrategy for KwargsDictStrategy {
         crate::dictmultiobject::StrategyKind::Kwargs
     }
 
-    /// `kwargsdict.py get_empty_storage` — erased `([], [])`.
-    /// GC-managed box (`setfield_gc` on reassign).
+    /// `kwargsdict.py get_empty_storage` — erased `([], [])`, born young
+    /// like the nursery tuple upstream erases.  GC-managed box (`setfield_gc`
+    /// on reassign).
     fn get_empty_storage(&self) -> *mut u8 {
-        crate::gc_storage::gc_alloc_storage_box(
+        crate::gc_storage::gc_alloc_young_storage_box(
             KwargsDictStorage::default(),
             kwargs_dict_storage_gc_type_id(),
         ) as *mut u8
@@ -386,8 +387,9 @@ impl DictStrategy for KwargsDictStrategy {
     }
 
     /// `kwargsdict.py clear` — `w_dict.dstorage =
-    /// self.get_empty_storage()`.  The field overwrite is a `setfield_gc`;
-    /// the unreachable old parallel-array box is reclaimed by the sweep.
+    /// self.get_empty_storage()`.  The field overwrite is a `setfield_gc`,
+    /// barrier included: the new box is young; the unreachable old
+    /// parallel-array box is reclaimed by the collector.
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
         let storage = &*(dict.dstorage as *const (Vec<PyObjectRef>, Vec<PyObjectRef>));
@@ -395,6 +397,7 @@ impl DictStrategy for KwargsDictStrategy {
             dict.keys_version = dict.keys_version.wrapping_add(1);
         }
         dict.dstorage = self.get_empty_storage();
+        crate::dictmultiobject::dict_write_barrier(w_dict);
     }
 
     /// `kwargsdict.py view_as_kwargs` — copy parallel arrays
