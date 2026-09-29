@@ -1256,9 +1256,9 @@ two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_pop
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_object_descr_new
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_set_descr_add
 two-phase-never-a-subject	pyre_interpreter::typedef::buffer_as_bytes_like
-two-phase-never-a-subject	pyre_interpreter::typedef::bytes_method_decode
 two-phase-never-a-subject	pyre_interpreter::typedef::decode_bytes_to_wtf8
 two-phase-never-a-subject	pyre_interpreter::typedef::decode_utf8_with_errors
+two-phase-never-a-subject	pyre_interpreter::typedef::descr_decode
 two-phase-never-a-subject	pyre_interpreter::typedef::descr_member_name
 two-phase-never-a-subject	pyre_interpreter::typedef::direct_member_get
 two-phase-never-a-subject	pyre_interpreter::typedef::direct_member_set
