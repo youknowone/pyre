@@ -1,0 +1,279 @@
+//! Front-end register kinds that `CallControl::getcalldescr` and
+//! `func_result_kind` compare.
+//!
+//! `history.py` `getkind`: a primitive and a raw pointer are `int`; a GC
+//! pointer is `ref`. These graphs used to lie about that — a `*const i64`
+//! deref aliased the pointer (`ref`) out of an `i64` function, `GcType::SIZE`
+//! arrived as `Ref`, and `&i64` / `*mut i64` parameters were `Ref(None)`
+//! while their callers passed the scalar.
+
+use majit_charon_reader::Llbc;
+use majit_translate::{
+    HostStaticAddrs,
+    front::mir::{
+        build_semantic_program_from_llbcs_with_static_addrs_and_module_paths, lower_function,
+    },
+    model::{CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType},
+};
+
+const OBJECT_LLBC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../build/llbc/pyre-object.ullbc"
+);
+
+fn load_object() -> Llbc {
+    Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted")
+}
+
+fn int_family(ty: &ValueType) -> bool {
+    matches!(ty, ValueType::Int | ValueType::Unsigned | ValueType::Bool)
+}
+
+fn input_types(graph: &FunctionGraph) -> Vec<ValueType> {
+    let start = graph.block(graph.startblock);
+    start
+        .inputargs
+        .iter()
+        .map(|arg| {
+            start
+                .operations
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::Input { ty, .. } if op.result.as_ref() == Some(arg) => Some(ty.clone()),
+                    _ => None,
+                })
+                .unwrap_or(ValueType::Unknown)
+        })
+        .collect()
+}
+
+fn defining_op<'a>(
+    graph: &'a FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+) -> Option<&'a OpKind> {
+    graph.blocks.iter().find_map(|block| {
+        block
+            .operations
+            .iter()
+            .find_map(|op| (op.result.as_ref() == Some(var)).then_some(&op.kind))
+    })
+}
+
+/// Follow block-argument links back to the operation that produced `var`.
+fn root_op<'a>(
+    graph: &'a FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+) -> Option<&'a OpKind> {
+    let mut current = var.clone();
+    for _ in 0..32 {
+        if let Some(op) = defining_op(graph, &current) {
+            return Some(op);
+        }
+        let mut next = None;
+        for block in &graph.blocks {
+            let Some(slot) = block.inputargs.iter().position(|arg| arg == &current) else {
+                continue;
+            };
+            for pred in &graph.blocks {
+                for exit in &pred.exits {
+                    if exit.target == block.id
+                        && let Some(src) = exit.args.get(slot).and_then(|arg| arg.as_variable())
+                        && src != &current
+                    {
+                        next = Some(src.clone());
+                    }
+                }
+            }
+        }
+        match next {
+            Some(src) => current = src,
+            None => return None,
+        }
+    }
+    None
+}
+
+fn call_leaf(target: &CallTarget) -> Option<&str> {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str),
+        CallTarget::Method { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+fn ops(graph: &FunctionGraph) -> impl Iterator<Item = &SpaceOperation> {
+    graph.blocks.iter().flat_map(|block| &block.operations)
+}
+
+#[test]
+fn sizehint_deref_loads_an_int_word() {
+    let llbc = load_object();
+    let graph = lower_function(&llbc, "listobject::sizehint_state_value")
+        .expect("lower sizehint_state_value");
+    let ret = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.exits)
+        .find(|link| link.target == graph.returnblock)
+        .and_then(|link| link.args.first())
+        .and_then(majit_translate::model::LinkArg::as_variable)
+        .cloned()
+        .expect("sizehint_state_value returns the loaded word");
+    match defining_op(&graph, &ret) {
+        Some(OpKind::RawLoad {
+            item_ty: ValueType::Int,
+            itemsize: 8,
+            is_item_signed: true,
+            ..
+        }) => {}
+        other => {
+            let kinds: Vec<String> = ops(&graph)
+                .map(|op| {
+                    let rendered = format!("{:?}", op.kind);
+                    rendered.chars().take(90).collect()
+                })
+                .collect();
+            panic!("*const i64 deref must raw_load an i64, got {other:?}; ops {kinds:?}")
+        }
+    }
+
+    let store = lower_function(&llbc, "listobject::set_sizehint_state_value")
+        .expect("lower set_sizehint_state_value");
+    assert!(
+        ops(&store).any(|op| matches!(
+            &op.kind,
+            OpKind::RawStore {
+                item_ty: ValueType::Int,
+                itemsize: 8,
+                is_item_signed: true,
+                ..
+            }
+        )),
+        "set_sizehint_state_value must raw_store the i64"
+    );
+}
+
+#[test]
+fn gc_type_size_argument_is_an_int() {
+    let llbc = load_object();
+    let graph =
+        lower_function(&llbc, "lltype::malloc_typed_stable").expect("lower malloc_typed_stable");
+    let call = ops(&graph)
+        .find_map(|op| match &op.kind {
+            OpKind::Call { target, args, .. }
+                if call_leaf(target) == Some("try_gc_alloc_stable_raw") =>
+            {
+                Some(args.clone())
+            }
+            _ => None,
+        })
+        .expect("malloc_typed_stable calls try_gc_alloc_stable_raw");
+    assert_eq!(call.len(), 2, "try_gc_alloc_stable_raw(type_id, T::SIZE)");
+    let size = call[1].as_variable().expect("T::SIZE is a value").clone();
+    match defining_op(&graph, &size) {
+        Some(OpKind::ConstInt(_) | OpKind::ConstUInt(_)) => {}
+        Some(OpKind::Call { result_ty, .. }) if int_family(result_ty) => {}
+        other => panic!("T::SIZE must be int-kind, got {other:?}"),
+    }
+}
+
+#[test]
+fn scalar_pointer_params_match_int_callers() {
+    let llbc = load_object();
+    let callback = lower_function(
+        &llbc,
+        "dictmultiobject::w_dict_object_setitem_callback_free",
+    )
+    .expect("lower setitem callback");
+    let tys = input_types(&callback);
+    assert_eq!(tys.len(), 6, "callback params: {tys:?}");
+    assert!(
+        matches!(tys[0], ValueType::Ref(_)),
+        "obj: *mut PyObject stays ref, got {:?}",
+        tys[0]
+    );
+    assert!(
+        matches!(tys[1], ValueType::Ref(_)) && matches!(tys[4], ValueType::Ref(_)),
+        "key and value stay ref, got {tys:?}"
+    );
+    assert!(
+        int_family(&tys[2]) && int_family(&tys[3]),
+        "hash words stay int, got {tys:?}"
+    );
+    assert!(
+        int_family(&tys[5]),
+        "hash_out: *mut i64 is int, got {:?}",
+        tys[5]
+    );
+
+    let caller = lower_function(
+        &llbc,
+        "dictmultiobject::w_dict_store_object_strategy_checked_inner",
+    )
+    .expect("lower callback caller");
+    let args = ops(&caller)
+        .find_map(|op| match &op.kind {
+            OpKind::Call { target, args, .. }
+                if call_leaf(target) == Some("w_dict_object_setitem_callback_free") =>
+            {
+                Some(args.clone())
+            }
+            _ => None,
+        })
+        .expect("caller invokes the callback");
+    let hash_out = args[5].as_variable().expect("hash_out value").clone();
+    let produced = root_op(&caller, &hash_out);
+    let passed_int = match produced {
+        Some(OpKind::Input { ty, .. }) => int_family(ty),
+        Some(OpKind::ConstInt(_) | OpKind::ConstUInt(_)) => true,
+        Some(
+            OpKind::Call { result_ty, .. }
+            | OpKind::UnaryOp { result_ty, .. }
+            | OpKind::BinOp { result_ty, .. },
+        ) => int_family(result_ty),
+        Some(OpKind::RawLoad { item_ty, .. }) => int_family(item_ty),
+        other => panic!("caller must pass hash_out as int, producer {other:?}"),
+    };
+    assert!(passed_int, "caller passes hash_out as int");
+
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+        std::slice::from_ref(&llbc),
+        HostStaticAddrs::default(),
+        &["dictmultiobject", "rordereddict"],
+    )
+    .expect("lower dict modules");
+    let hash_of: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|function| function.name.starts_with("hash_of"))
+        .collect();
+    assert!(
+        hash_of.iter().any(|function| {
+            let tys = input_types(&function.graph);
+            tys.len() >= 2 && int_family(&tys[1]) && function.name.contains("i64")
+        }),
+        "RDict<i64, IntKeyHasher>::hash_of key must be int, got {}",
+        hash_of
+            .iter()
+            .map(|function| format!("{} {:?}", function.name, input_types(&function.graph)))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let lookup: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|function| function.name.starts_with("lookup_for_store"))
+        .collect();
+    assert!(
+        lookup.iter().any(|function| {
+            let tys = input_types(&function.graph);
+            tys.len() >= 3 && int_family(&tys[2]) && function.name.contains("i64")
+        }),
+        "RDict<i64>::lookup_for_store key must be int, got {}",
+        lookup
+            .iter()
+            .map(|function| format!("{} {:?}", function.name, input_types(&function.graph)))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+}

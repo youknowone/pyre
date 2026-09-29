@@ -7091,8 +7091,21 @@ fn pygraph_initial_block(
         // param is never touched, and a fieldless enum — already
         // resolved to `Int` above regardless of its own zero-sized
         // layout — never reaches this arm.
+        //
+        // A reference or raw pointer to a primitive is the same case
+        // in the other bank. `lltype.Ptr.__new__` refuses a
+        // non-container pointee, so `&i64` / `*mut i64` are not GC
+        // refs: `Rvalue::Ref` and `Rvalue::RawPtr` alias the scalar,
+        // and `history.py` `getkind` banks a raw pointer as `int`.
+        // Recording `Ref(None)` makes `FUNC.ARGS` disagree with that
+        // caller. A GC `*mut PyObject` is not a primitive pointee and
+        // stays `Ref`.
         let mut ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc) {
             ValueType::Void
+        } else if matches!(ty, ValueType::Ref(None))
+            && let Some(scalar) = tyref_scalar_pointee_value_type(&local.ty, llbc)
+        {
+            scalar
         } else {
             ty
         };
@@ -10682,6 +10695,40 @@ impl<'a> Lowering<'a> {
         unit
     }
 
+    /// A trait associated const whose type is a primitive word.
+    ///
+    /// The value is not known until the impl is chosen (`T::SIZE` on a
+    /// generic `T: GcType`). The kind is: `getkind` of that primitive,
+    /// not the `Ref` a `__str_const` literal uses. A non-primitive
+    /// associated const stays on the string path in `decode_constant`.
+    fn trait_const_scalar_op(&self, value: &serde_json::Value) -> Option<OpKind> {
+        let kind = self.llbc.const_expr_kind(value)?;
+        if !kind.as_object()?.contains_key("TraitConst") {
+            return None;
+        }
+        let ty_node = self.llbc.const_expr_ty(value)?;
+        // The const's type is often `{"Deduplicated": id}` of a `usize`.
+        // `tyref_to_value_type` only unwraps `TyRef::Dedup`, so peel the
+        // hash-cons node first or the primitive looks like `Ref`.
+        let resolved = strip_ty_indirections(ty_node, self.llbc).unwrap_or(ty_node);
+        let vt = tyref_to_value_type(&TyRef::Other(resolved.clone()), self.llbc);
+        match vt {
+            ValueType::Int
+            | ValueType::Unsigned
+            | ValueType::Bool
+            | ValueType::Float
+            | ValueType::SingleFloat => Some(OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__trait_const".to_string()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![]),
+                result_ty: vt,
+            }),
+            _ => None,
+        }
+    }
+
     /// Decode a Charon `Operand::Const` value and emit the matching
     /// `OpKind::Const*` (or synthetic `Call` for non-primitive
     /// constants) operation on the current block, returning the fresh
@@ -10691,6 +10738,22 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         value: &serde_json::Value,
     ) -> Result<Variable, LowerError> {
+        // `TraitConst` of a primitive (`GcType::SIZE: usize`) is that
+        // word. `history.py` `getkind(Unsigned)` is `int`, the same bank
+        // an inline `size_of::<T>()` folds to via `ConstInt`. Decoding it
+        // as a string constant banks the argument as `Ref` and the
+        // `usize` parameter does not.
+        if let Some(op) = self.trait_const_scalar_op(value) {
+            let var = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let bb_id = self.block_id[mir_bb];
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(var.clone()),
+                kind: op,
+            });
+            return Ok(var);
+        }
         let op = match decode_constant(self.llbc, value)? {
             DecodedConst::Int(n) => OpKind::ConstInt(n),
             DecodedConst::UInt(n) => OpKind::ConstUInt(n),
@@ -11190,10 +11253,12 @@ impl<'a> Lowering<'a> {
                 // `.1` read fails loud — the overflow bit is unmodeled).
                 //
                 // Atom projections (`Deref` and others) still
-                // collapse: `Deref` is a no-op for typed refs at the
-                // JIT IR level, and any other Atom variant has no
-                // typed analogue today. A cell parameter is the
-                // exception: `*p` reads the cell's `value` field.
+                // collapse. `Deref` of a reference is a no-op: the
+                // referent is already the value, and any other Atom
+                // variant has no typed analogue today. A cell
+                // parameter is the exception: `*p` reads the cell's
+                // `value` field. `Deref` of a raw pointer to a
+                // primitive is `raw_load` (below), not that alias.
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
                     && let Some((owner_root, field_name, field_ty, owner_id)) =
@@ -11666,6 +11731,51 @@ impl<'a> Lowering<'a> {
                             return Ok(self.emit_gc_mut_ref_field_read(mir_bb, base, &root));
                         }
                     }
+                }
+                // `*(p as *const i64)` reads one primitive at that
+                // address. `jtransform.py` `rewrite_op_raw_load` emits
+                // `raw_load_<kind>` and `history.py` `getkind` banks the
+                // loaded word as `int` (signed), `int` (unsigned / bool)
+                // or `float`. Aliasing `p` returns the pointer, which
+                // this front end banks as `Ref`, so a function declared
+                // to return the word disagrees with its CFG. A reference
+                // deref stays the collapse below: `Rvalue::Ref` already
+                // aliased the scalar, and loading through it would treat
+                // that word as an address. A raw pointer bound by
+                // `&raw const place` is that same alias, so a local on
+                // `atomic_ref_place` is excluded too.
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "Deref"
+                    && tyref_is_raw_pointer(&inner.ty, self.llbc)
+                    && !matches!(inner.kind, PlaceKind::Local(local)
+                        if self.atomic_ref_place.contains_key(&(local as usize)))
+                    && tyref_is_primitive_scalar(&place_ty, self.llbc)
+                    && let Some((item_ty, itemsize, is_item_signed)) =
+                        self.raw_word_descr(&place_ty)
+                {
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let offset = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(offset.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    let loaded = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(loaded.clone()),
+                        kind: OpKind::RawLoad {
+                            base,
+                            offset,
+                            item_ty,
+                            itemsize,
+                            is_item_signed,
+                        },
+                    });
+                    return Ok(loaded);
                 }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {
@@ -34268,6 +34378,60 @@ fn tyref_is_raw_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|node| strip_ty_indirections(node, llbc))
         .and_then(serde_json::Value::as_object)
         .is_some_and(|obj| obj.contains_key("RawPtr"))
+}
+
+/// `ty` is one `&` / `&mut` / `*const` / `*mut` whose pointee is a
+/// primitive (`i64`, `usize`, `bool`, `f64`, …).
+///
+/// `history.py` `getkind` banks a reference's scalar as `int` or
+/// `float` and a raw pointer as `int`. `lltype.Ptr` cannot point at a
+/// primitive, so neither is a GC ref. Returns `None` for
+/// a pointer to an ADT (`*mut PyObject`), a pointer to a pointer, and
+/// every non-pointer type. 128-bit primitives stay `None`: `getkind`
+/// rejects them.
+fn tyref_scalar_pointee_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let obj = node.as_object()?;
+    let (pointee, is_raw) = match obj.get("Ref").and_then(serde_json::Value::as_array) {
+        Some(arr) => (arr.get(1)?, false),
+        None => (
+            obj.get("RawPtr")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| arr.first())?,
+            true,
+        ),
+    };
+    let prim = tyref_primitive_node(pointee, llbc)?;
+    let scalar = prim.as_object()?.get("Scalar")?;
+    let pointee_vt = scalar_value_type(scalar)?;
+    // A raw pointer is the address itself: `getkind` of a raw `Ptr` is
+    // `int` whatever the pointee, so `*mut f64` is not a float.
+    if is_raw {
+        return matches!(
+            pointee_vt,
+            ValueType::Int
+                | ValueType::Unsigned
+                | ValueType::Bool
+                | ValueType::Float
+                | ValueType::SingleFloat
+        )
+        .then_some(ValueType::Int);
+    }
+    match pointee_vt {
+        vt @ (ValueType::Int
+        | ValueType::Unsigned
+        | ValueType::Bool
+        | ValueType::Float
+        | ValueType::SingleFloat) => Some(vt),
+        _ => None,
+    }
+}
+
+/// `ty` itself is a Charon primitive scalar, not a pointer to one.
+fn tyref_is_primitive_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .is_some_and(|node| json_ty_is_copy_scalar(node, llbc))
 }
 
 fn collect_fn_stubs_from_llbc_if(
