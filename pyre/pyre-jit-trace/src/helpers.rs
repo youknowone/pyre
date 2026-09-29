@@ -224,15 +224,6 @@ pub extern "C" fn jit_force_vref(
     pyre_interpreter::executioncontext::force_vref(frame)
 }
 
-/// Rebuild a definition's keyword-only defaults into the namespace mapping —
-/// `function.py init_kwdefaults_dict`, reached as a residual because it
-/// allocates.  The SET_FUNCTION_ATTRIBUTE fold stores the result rather than
-/// the operand, so a compiled replay installs the same flavour the recording
-/// did.
-pub extern "C" fn jit_init_kwdefaults_dict(dict: PyObjectRef) -> PyObjectRef {
-    unsafe { pyre_interpreter::function::init_kwdefaults_dict(dict) }
-}
-
 /// `objspace.py space.getexecutioncontext()` as a residual callee: the
 /// running thread's ExecutionContext, read out of its thread-local slot.
 ///

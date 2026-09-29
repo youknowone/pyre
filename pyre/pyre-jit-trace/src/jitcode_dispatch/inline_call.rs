@@ -6348,8 +6348,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // reads the slot off its raw address: the allocator hands the next
         // incarnation the same address, so the peeled body's load disagrees
         // with what the heap cache holds for that address and trips
-        // `_opimpl_getfield_gc_any_pureornot`'s sanity check.  Same test the
-        // `set_function_attribute` fold uses to tell the two apart.
+        // `_opimpl_getfield_gc_any_pureornot`'s sanity check.
         if ctx.trace_ctx.heap_cache().is_unescaped(callable_guard_op) {
             return resolved_inline_decline(op.pc, line!());
         }
