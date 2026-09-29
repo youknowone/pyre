@@ -13911,14 +13911,20 @@ fn walker_guard_fold_callable<Sym: WalkSym>(
     Ok(())
 }
 
-/// `float(x)` on an exact int/float argument: inline the conversion
-/// (`W_IntObject.descr_float` → `space.newfloat`, or the identity
-/// `float(f) is f` for an exact float) instead of the opaque
-/// `bh_call_fn(float_type, NULL, x)` residual, so the result virtualizes.  The
-/// callable must be the exact `float` type object; a rebound name or a float
-/// subclass (which reboxes rather than returning the argument) declines.  Any
-/// non-matching shape falls through to the generic residual (SAFE).
-pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
+const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::floatobject::newfloat",
+    commit_label: "newfloat_commit",
+    call_site_label: "newfloat_call_site",
+    decline_tag: "NEWFLOAT-SUBWALK",
+};
+
+/// `float(x)` on an exact int/float argument.
+///
+/// An exact int walks `floatobject.py newfloat` after `CastIntToFloat`
+/// (`intobject.py descr_float`: `space.newfloat(float(self.intval))`).
+/// An exact float is `float(f) is f`. A rebound name or a float subclass
+/// (which reboxes) falls through to the generic residual.
+pub(crate) fn try_walker_orthodox_float_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
@@ -13979,17 +13985,29 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
     }
     let arg_op = r_args[2];
     if is_int {
-        // int/bool → CastIntToFloat + inline wrapfloat (no residual call).
+        // Exact int: `CastIntToFloat`, then `floatobject.py newfloat`.
         // The coercion pins `w_class`: `builtin_float` reads an int payload only
         // for an exact builtin, so an `int` subclass overriding `__float__` must
         // side-exit.  The float arm below pins its own for the same reason.
+        // A decline cuts the cast so the generic residual is the only writer.
+        let pre_cast = ctx.trace_ctx.get_trace_position();
         let raw = walker_coerce_operand_to_float(ctx, op.pc, arg_op, arg_obj, true, val, false)?;
-        let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
-        ctx.trace_ctx.set_opref_concrete(
-            boxed,
-            majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
-        );
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+        if try_walker_orthodox_descent(
+            ctx,
+            op.pc,
+            &[],
+            &[],
+            &[(raw, val)],
+            dst,
+            'r',
+            &NEWFLOAT_DESCENT,
+        )?
+        .is_none()
+        {
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_cast);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
     } else {
         // exact float → `float(f) is f`: forward the argument unchanged.  Only
         // sound when the constructor actually returned the same object; a
