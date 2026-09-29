@@ -36,19 +36,20 @@ mod reexports {
         red_schema, resolve_greens, resolve_reds,
     };
     pub(super) use super::helpers::{
-        binding_kind_for_inline_policy, binop_f_emit_tokens, binop_i_emit_tokens,
-        binop_is_symmetric, block_has_loop_control, call_is_null_ptr, expr_has_loop_control,
-        expr_is_literal_call, expr_is_null_ptr, expr_is_ptr_is_null_method, expr_is_unsigned_int,
-        extract_block_tail_int, extract_bool_branch_values, extract_branch_int,
-        extract_pat_switch_case_tokens, extract_pat_value_tokens, extract_stmts,
-        inline_call_tokens, inline_call_tokens_void, inline_float_arg_tokens,
-        inline_int_arg_tokens, inline_prebuild_path, inline_ref_arg_tokens, inline_shared_path,
-        int_arg_regs, int_literal_value, is_lowercase_binding_pat, is_supported_float_type,
-        is_supported_int_cast, is_supported_ref_type, is_word_width_int, jit_arg_kind_tokens,
-        mirrored_compare_binop, opcode_for_assign_binop, opcode_for_assign_binop_f,
-        opcode_for_binop, opcode_for_binop_f, opcode_for_compare_f, stmt_has_loop_control,
-        type_is_raw_pointer, type_is_unsigned_int, typed_call_arg_tokens,
-        word_result_addr_for_kind, word_result_addr_tokens, word_void_addr_tokens,
+        binding_kind_for_inline_policy, binop_f_emit_tokens, binop_i_accepts_constant,
+        binop_i_const_emit_tokens, binop_i_emit_tokens, binop_is_symmetric, block_has_loop_control,
+        call_is_null_ptr, expr_has_loop_control, expr_is_literal_call, expr_is_null_ptr,
+        expr_is_ptr_is_null_method, expr_is_unsigned_int, extract_block_tail_int,
+        extract_bool_branch_values, extract_branch_int, extract_pat_switch_case_tokens,
+        extract_pat_value_tokens, extract_stmts, inline_call_tokens, inline_call_tokens_void,
+        inline_float_arg_tokens, inline_int_arg_tokens, inline_prebuild_path,
+        inline_ref_arg_tokens, inline_shared_path, int_arg_regs, int_literal_value,
+        is_lowercase_binding_pat, is_supported_float_type, is_supported_int_cast,
+        is_supported_ref_type, is_word_width_int, jit_arg_kind_tokens, mirrored_compare_binop,
+        opcode_for_assign_binop, opcode_for_assign_binop_f, opcode_for_binop, opcode_for_binop_f,
+        opcode_for_compare_f, stmt_has_loop_control, type_is_raw_pointer, type_is_unsigned_int,
+        typed_call_arg_tokens, word_result_addr_for_kind, word_result_addr_tokens,
+        word_void_addr_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
@@ -1756,6 +1757,14 @@ pub(super) enum LoweredCondition {
         rhs: Binding,
         branch: Ident,
     },
+    /// `goto_if_not_int_<cmp>` whose second operand is a `Constant` that
+    /// `assembler.py` `emit_const` encodes in the branch. `opcode` names the
+    /// comparison (`IntLt`, …).
+    CompareConst {
+        lhs: Binding,
+        value: TokenStream,
+        opcode: Ident,
+    },
 }
 
 impl LoweredCondition {
@@ -1763,6 +1772,7 @@ impl LoweredCondition {
         match self {
             Self::Value { binding, .. } => binding.depends_on_stack,
             Self::Compare { lhs, rhs, .. } => lhs.depends_on_stack || rhs.depends_on_stack,
+            Self::CompareConst { lhs, .. } => lhs.depends_on_stack,
         }
     }
 }
@@ -1866,6 +1876,11 @@ pub(super) enum OpKind {
     MoveI,
     MoveR,
     MoveF,
+    /// `as usize` / `as isize`: a rename on a 64-bit word, a narrowing on a
+    /// 32-bit one (`JitCodeBuilder::cast_int_to_word`). Register allocation
+    /// coalesces it like a `MoveI`; unlike a move it is kept when source and
+    /// target share a color, because the 32-bit narrowing still applies.
+    CastIntToWord,
     BinopI,
     BinopF,
     UnaryI,

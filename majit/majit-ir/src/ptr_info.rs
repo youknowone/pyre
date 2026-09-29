@@ -885,10 +885,11 @@ impl PtrInfo {
         }
     }
 
-    /// vstring.py:112: return self.lgtop — cached length OpRef if available.
-    pub fn get_cached_lgtop(&self) -> Option<OpRef> {
+    /// vstring.py `StrPtrInfo.getstrlen`: return self.lgtop — cached length
+    /// box if available.
+    pub fn get_cached_lgtop(&self) -> Option<Operand> {
         match self {
-            PtrInfo::Str(info) => info.lgtop.as_ref().map(|b| b.to_opref()),
+            PtrInfo::Str(info) => info.lgtop.clone(),
             _ => None,
         }
     }

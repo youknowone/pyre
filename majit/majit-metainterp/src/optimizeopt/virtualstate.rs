@@ -1170,7 +1170,7 @@ impl VirtualState {
                             ctx,
                         );
                         ctx.current_pass_idx = saved_pass_idx;
-                        forced
+                        forced.to_opref()
                     }
                     _ => resolved,
                 };

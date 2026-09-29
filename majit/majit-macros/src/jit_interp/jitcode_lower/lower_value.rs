@@ -87,6 +87,49 @@ fn struct_pointee_of_pointer(ty: &syn::Type) -> Option<syn::Path> {
 }
 
 impl<'c> Lowerer<'c> {
+    /// The value of an int operand that is a flow-graph `Constant`: an
+    /// integer, byte or bool literal, or a SCREAMING_CASE constant path —
+    /// the forms [`Self::lower_value_expr`] would otherwise load into a fresh
+    /// register with `load_const_i_value`. `flatten.py` leaves a `Constant`
+    /// in the operation and `assembler.py` `emit_const` encodes it there, so
+    /// a consumer that takes this value emits no `int_copy` first.
+    pub(super) fn int_constant_operand(&self, expr: &Expr) -> Option<TokenStream> {
+        match expr {
+            Expr::Paren(ExprParen { expr, .. }) => self.int_constant_operand(expr),
+            Expr::Group(group) => self.int_constant_operand(&group.expr),
+            Expr::Lit(ExprLit {
+                lit: Lit::Byte(byte_lit),
+                ..
+            }) => {
+                let value = i64::from(byte_lit.value());
+                Some(quote! { #value })
+            }
+            Expr::Path(ExprPath {
+                path, qself: None, ..
+            }) => {
+                if let Some(ident) = path.get_ident()
+                    && self.bindings.contains_key(&ident.to_string())
+                {
+                    return None;
+                }
+                let last = path.segments.last()?;
+                if !last.arguments.is_none()
+                    || !last
+                        .ident
+                        .to_string()
+                        .starts_with(|c: char| c.is_uppercase())
+                {
+                    return None;
+                }
+                Some(quote! { (#path as i64) })
+            }
+            _ => {
+                let value = int_literal_value(expr)?;
+                Some(quote! { #value })
+            }
+        }
+    }
+
     pub(super) fn lower_value_expr(&mut self, expr: &Expr) -> Option<Binding> {
         // State field read (register/tape machines).
         if let Some(binding) = self.lower_state_field_read(expr) {
@@ -1194,6 +1237,17 @@ impl<'c> Lowerer<'c> {
             BindingKind::Float => (OpKind::BinopF, opcode_for_assign_binop_f(&binary.op)?),
             BindingKind::Ref => return None,
         };
+        if matches!(lhs.kind, BindingKind::Int)
+            && let Some(value) = self.int_constant_operand(&binary.right)
+            && let Some(tokens) = binop_i_const_emit_tokens(lhs.reg, &opcode, lhs.reg, &value)
+        {
+            let register = Register::int(lhs.reg);
+            self.emit_op(
+                OpMeta::linear(op_kind, vec![register], vec![register]),
+                tokens,
+            );
+            return Some(());
+        }
         let rhs = self.lower_value_expr(&binary.right)?;
         if lhs.kind != rhs.kind {
             return None;
@@ -2751,21 +2805,17 @@ impl<'c> Lowerer<'c> {
         }
 
         let x_reg = inner.reg;
-        let one_reg = self.alloc_reg();
-        self.emit_op(
-            OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(one_reg)]),
-            quote! { __builder.load_const_i_value(#one_reg, 1i64); },
-        );
-
+        let one = quote! { 1i64 };
         let shl_reg = self.alloc_reg();
         let lshift = syn::Ident::new("IntLshift", proc_macro2::Span::call_site());
         self.emit_op(
             OpMeta::linear(
                 OpKind::BinopI,
-                Register::ints(&[x_reg, one_reg]),
+                Register::ints(&[x_reg]),
                 vec![Register::int(shl_reg)],
             ),
-            binop_i_emit_tokens(shl_reg, &lshift, x_reg, one_reg),
+            binop_i_const_emit_tokens(shl_reg, &lshift, x_reg, &one)
+                .expect("int_lshift accepts a constant operand"),
         );
 
         let res_reg = self.alloc_reg();
@@ -2773,10 +2823,11 @@ impl<'c> Lowerer<'c> {
         self.emit_op(
             OpMeta::linear(
                 OpKind::BinopI,
-                Register::ints(&[shl_reg, one_reg]),
+                Register::ints(&[shl_reg]),
                 vec![Register::int(res_reg)],
             ),
-            binop_i_emit_tokens(res_reg, &or, shl_reg, one_reg),
+            binop_i_const_emit_tokens(res_reg, &or, shl_reg, &one)
+                .expect("int_or accepts a constant operand"),
         );
         Some(Binding {
             reg: res_reg,
@@ -2791,6 +2842,9 @@ impl<'c> Lowerer<'c> {
             if let Some(binding) = self.lower_ptr_equality_against_null(expr) {
                 return Some(binding);
             }
+        }
+        if let Some(binding) = self.transactional(|s| s.lower_binary_int_constant(expr)) {
+            return Some(binding);
         }
         let lhs = self.lower_value_expr(&expr.left)?;
         let rhs = self.lower_value_expr(&expr.right)?;
@@ -2959,6 +3013,68 @@ impl<'c> Lowerer<'c> {
         })
     }
 
+    /// An int operation with one `Constant` operand keeps the constant in the
+    /// operation (`assembler.py` `emit_const`) instead of loading it into a
+    /// register. `jtransform.py` `_rewrite_symmetric` first moves a constant
+    /// left operand to the right, mirroring an ordered comparison, and
+    /// `_rewrite_equality` turns a compare against zero into the unary
+    /// `int_is_zero` / `int_is_true`. `None` leaves the operation to the
+    /// register-operand lowering.
+    fn lower_binary_int_constant(&mut self, expr: &ExprBinary) -> Option<Binding> {
+        let (op, var_expr, const_expr, value) = match (
+            self.int_constant_operand(&expr.left),
+            self.int_constant_operand(&expr.right),
+        ) {
+            (None, Some(value)) => (expr.op, &*expr.left, &*expr.right, value),
+            (Some(value), None) if binop_is_symmetric(&expr.op) => (
+                mirrored_compare_binop(&expr.op),
+                &*expr.right,
+                &*expr.left,
+                value,
+            ),
+            _ => return None,
+        };
+        let var = self.lower_value_expr(var_expr)?;
+        if !matches!(var.kind, BindingKind::Int) {
+            return None;
+        }
+        let reg = self.alloc_reg();
+        if matches!(op, BinOp::Eq(_) | BinOp::Ne(_)) && int_literal_value(const_expr) == Some(0) {
+            let name = if matches!(op, BinOp::Eq(_)) {
+                "IntIsZero"
+            } else {
+                "IntIsTrue"
+            };
+            let opcode = Ident::new(name, proc_macro2::Span::call_site());
+            let var_reg = var.reg;
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::UnaryI,
+                    Register::ints(&[var_reg]),
+                    vec![Register::int(reg)],
+                ),
+                quote! { __builder.record_unary_i(#reg, majit_ir::OpCode::#opcode, #var_reg); },
+            );
+        } else {
+            let opcode = opcode_for_binop(&op)?;
+            let tokens = binop_i_const_emit_tokens(reg, &opcode, var.reg, &value)?;
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopI,
+                    Register::ints(&[var.reg]),
+                    vec![Register::int(reg)],
+                ),
+                tokens,
+            );
+        }
+        Some(Binding {
+            reg,
+            kind: BindingKind::Int,
+            depends_on_stack: var.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
     /// Lower an `<int> as f64` cast to RPython's `cast_int_to_float`
     /// (`bhimpl_cast_int_to_float`). The operand is read from the int bank and
     /// widened to the float bank; the result is a float binding. `UnaryI` is the
@@ -3104,55 +3220,28 @@ impl<'c> Lowerer<'c> {
             "usize" => return Some(self.emit_pointer_width_int_cast(binding, false)),
             _ => return None,
         };
+        // `jtransform.py` `_int_to_int_cast`: a narrowing to a signed type is
+        // `int_signext(v, size2)`, to an unsigned one `int_and(v, mask)`,
+        // both with a Constant second operand.
         let depends_on_stack = binding.depends_on_stack;
         let x_reg = binding.reg;
-        let result_reg = if signed {
-            let shift_reg = self.alloc_reg();
-            let shift = (64 - bits) as i64;
-            self.emit_op(
-                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(shift_reg)]),
-                quote! { __builder.load_const_i_value(#shift_reg, #shift); },
-            );
-            let shl_reg = self.alloc_reg();
-            let lshift = syn::Ident::new("IntLshift", proc_macro2::Span::call_site());
-            self.emit_op(
-                OpMeta::linear(
-                    OpKind::BinopI,
-                    Register::ints(&[x_reg, shift_reg]),
-                    vec![Register::int(shl_reg)],
-                ),
-                binop_i_emit_tokens(shl_reg, &lshift, x_reg, shift_reg),
-            );
-            let res_reg = self.alloc_reg();
-            let rshift = syn::Ident::new("IntRshift", proc_macro2::Span::call_site());
-            self.emit_op(
-                OpMeta::linear(
-                    OpKind::BinopI,
-                    Register::ints(&[shl_reg, shift_reg]),
-                    vec![Register::int(res_reg)],
-                ),
-                binop_i_emit_tokens(res_reg, &rshift, shl_reg, shift_reg),
-            );
-            res_reg
+        let result_reg = self.alloc_reg();
+        let (opcode, operand) = if signed {
+            ("IntSignext", i64::from(bits / 8))
         } else {
-            let mask_reg = self.alloc_reg();
-            let mask = ((1u64 << bits) - 1) as i64;
-            self.emit_op(
-                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(mask_reg)]),
-                quote! { __builder.load_const_i_value(#mask_reg, #mask); },
-            );
-            let res_reg = self.alloc_reg();
-            let and = syn::Ident::new("IntAnd", proc_macro2::Span::call_site());
-            self.emit_op(
-                OpMeta::linear(
-                    OpKind::BinopI,
-                    Register::ints(&[x_reg, mask_reg]),
-                    vec![Register::int(res_reg)],
-                ),
-                binop_i_emit_tokens(res_reg, &and, x_reg, mask_reg),
-            );
-            res_reg
+            ("IntAnd", ((1u64 << bits) - 1) as i64)
         };
+        let opcode = syn::Ident::new(opcode, proc_macro2::Span::call_site());
+        let operand = quote! { #operand };
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::BinopI,
+                Register::ints(&[x_reg]),
+                vec![Register::int(result_reg)],
+            ),
+            binop_i_const_emit_tokens(result_reg, &opcode, x_reg, &operand)
+                .expect("int_signext and int_and take a Constant operand"),
+        );
         Some(Binding {
             reg: result_reg,
             kind: BindingKind::Int,
@@ -3165,68 +3254,26 @@ impl<'c> Lowerer<'c> {
     ///
     /// RPython `jtransform.py rewrite_op_cast_int_to_uint` /
     /// `rewrite_op_cast_uint_to_int` are explicit no-ops: both kinds share
-    /// the `'int'` box, so the cast is a rename. A 64-bit target is the
-    /// same rename (`int_copy` / `move_i`, no resop). A 32-bit target still
-    /// has to mask or sign-extend; that decision is the jitcode-build
-    /// `size_of::<usize>()` so one lowering covers native and wasm32.
+    /// the `'int'` box, so the cast is a rename. The target width is known
+    /// only when the jitcode is built, so the op is one
+    /// [`OpKind::CastIntToWord`] that register allocation coalesces like a
+    /// renaming; `JitCodeBuilder::cast_int_to_word` then emits nothing on a
+    /// 64-bit word and the 32-bit narrowing on wasm32.
     fn emit_pointer_width_int_cast(&mut self, binding: Binding, signed: bool) -> Binding {
         let x_reg = binding.reg;
         let result_reg = self.alloc_reg();
-        let depends_on_stack = binding.depends_on_stack;
-        if signed {
-            let shift_reg = self.alloc_reg();
-            let shl_reg = self.alloc_reg();
-            self.emit_op(
-                OpMeta::linear(OpKind::LoadConstI, vec![], Register::ints(&[shift_reg])),
-                quote! {
-                    if ::core::mem::size_of::<usize>() < 8 {
-                        __builder.load_const_i_value(#shift_reg as u16, 32i64);
-                    }
-                },
-            );
-            self.emit_op(
-                OpMeta::linear(OpKind::BinopI, Register::ints(&[x_reg, shift_reg]), Register::ints(&[shl_reg])),
-                quote! {
-                    if ::core::mem::size_of::<usize>() < 8 {
-                        __builder.record_binop_i(#shl_reg as u16, majit_ir::OpCode::IntLshift, #x_reg as u16, #shift_reg as u16);
-                    }
-                },
-            );
-            self.emit_op(
-                OpMeta::linear(OpKind::Aux, Register::ints(&[x_reg, shl_reg, shift_reg]), Register::ints(&[result_reg])),
-                quote! {
-                    if ::core::mem::size_of::<usize>() >= 8 {
-                        __builder.move_i(#result_reg as u16, #x_reg as u16);
-                    } else {
-                        __builder.record_binop_i(#result_reg as u16, majit_ir::OpCode::IntRshift, #shl_reg as u16, #shift_reg as u16);
-                    }
-                },
-            );
-        } else {
-            let mask_reg = self.alloc_reg();
-            self.emit_op(
-                OpMeta::linear(OpKind::LoadConstI, vec![], Register::ints(&[mask_reg])),
-                quote! {
-                    if ::core::mem::size_of::<usize>() < 8 {
-                        __builder.load_const_i_value(#mask_reg as u16, 0xFFFF_FFFFi64);
-                    }
-                },
-            );
-            self.emit_op(
-                OpMeta::linear(OpKind::Aux, Register::ints(&[x_reg, mask_reg]), Register::ints(&[result_reg])),
-                quote! {
-                    if ::core::mem::size_of::<usize>() >= 8 {
-                        __builder.move_i(#result_reg as u16, #x_reg as u16);
-                    } else {
-                        __builder.record_binop_i(#result_reg as u16, majit_ir::OpCode::IntAnd, #x_reg as u16, #mask_reg as u16);
-                    }
-                },
-            );
-        }
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::CastIntToWord,
+                Register::ints(&[x_reg]),
+                Register::ints(&[result_reg]),
+            ),
+            quote! { __builder.cast_int_to_word(#result_reg as u16, #x_reg as u16, #signed); },
+        );
         Binding {
             reg: result_reg,
             kind: BindingKind::Int,
-            depends_on_stack,
+            depends_on_stack: binding.depends_on_stack,
             struct_type: None,
         }
     }
@@ -3449,9 +3496,10 @@ mod tests {
     }
 
     #[test]
-    fn pointer_width_usize_cast_is_int_copy_on_64_bit_and_mask_on_32_bit() {
+    fn pointer_width_usize_cast_is_one_coalescable_cast() {
         // jtransform.py rewrite_op_cast_int_to_uint / rewrite_op_cast_uint_to_int
-        // are identity. The emitted builder still has to mask on wasm32.
+        // are identity. The builder decides the width, so the lowering emits
+        // one op register allocation can coalesce.
         let mut lowerer = Lowerer::new(None);
         lowerer
             .bindings
@@ -3462,29 +3510,41 @@ mod tests {
             .lower_value_expr(&expr)
             .expect("usize cast should lower");
         assert_eq!(result.kind, BindingKind::Int);
-        assert_ne!(result.reg, 4);
 
-        let emitted = lowerer
-            .statements
-            .iter()
-            .map(ToString::to_string)
-            .collect::<String>();
+        assert_eq!(lowerer.op_metadata.len(), 1);
+        let meta = &lowerer.op_metadata[0];
+        assert_eq!(meta.kind, OpKind::CastIntToWord);
+        assert_eq!(meta.reads, vec![Register::int(4)]);
+        assert_eq!(meta.writes, vec![Register::int(result.reg)]);
+        let emitted = lowerer.statements[0].to_string();
         assert!(
-            emitted.contains("move_i"),
-            "64-bit path must be int_copy, got {emitted}"
+            emitted.contains("cast_int_to_word") && emitted.contains("false"),
+            "got {emitted}"
         );
-        assert!(
-            emitted.contains("size_of"),
-            "pointer width must be decided at jitcode-build time, got {emitted}"
-        );
-        assert!(
-            emitted.contains("0xFFFF_FFFFi64") || emitted.contains("4294967295"),
-            "32-bit path must still mask, got {emitted}"
-        );
-        assert!(
-            !emitted.contains("- 1i64") && !emitted.contains("-1i64"),
-            "64-bit must not record IntAnd(x, -1), got {emitted}"
-        );
+    }
+
+    #[test]
+    fn narrowing_int_casts_are_signext_and_mask_with_a_constant() {
+        // jtransform.py `_int_to_int_cast`: int_signext(v, size2) for a
+        // signed target, int_and(v, mask) for an unsigned one.
+        for (ty, opcode, operand) in [("i8", "IntSignext", "1i64"), ("u16", "IntAnd", "65535i64")] {
+            let mut lowerer = Lowerer::new(None);
+            lowerer
+                .bindings
+                .insert("x".to_string(), binding(4, BindingKind::Int));
+            let expr: Expr = syn::parse_str(&format!("x as {ty}")).expect("parse cast");
+            lowerer.lower_value_expr(&expr).expect("cast should lower");
+
+            assert_eq!(lowerer.op_metadata.len(), 1, "{ty}");
+            assert_eq!(lowerer.op_metadata[0].reads, vec![Register::int(4)]);
+            let emitted = lowerer.statements[0].to_string();
+            assert!(
+                emitted.contains("record_binop_i_const")
+                    && emitted.contains(opcode)
+                    && emitted.contains(operand),
+                "{ty}: got {emitted}"
+            );
+        }
     }
 
     #[test]
@@ -3497,10 +3557,10 @@ mod tests {
 
         assert_eq!(lowerer.lower_local_update(&expr), Some(()));
 
-        assert_eq!(lowerer.op_metadata[0].kind, OpKind::LoadConstI);
-        let op = &lowerer.op_metadata[1];
+        assert_eq!(lowerer.op_metadata.len(), 1);
+        let op = &lowerer.op_metadata[0];
         assert_eq!(op.kind, OpKind::BinopI);
-        assert_eq!(op.reads[0], Register::int(3));
+        assert_eq!(op.reads, vec![Register::int(3)]);
         assert_eq!(op.writes, vec![Register::int(3)]);
         assert_eq!(lowerer.bindings["need"].reg, 3);
         let emitted = lowerer
@@ -3508,7 +3568,59 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect::<String>();
+        assert!(emitted.contains("record_binop_i_const"));
         assert!(emitted.contains("IntSub"));
+    }
+
+    /// A literal operand stays in the operation: no `load_const_i_value`, and
+    /// the op reads only the variable's register.
+    #[test]
+    fn a_literal_operand_is_not_loaded_into_a_register() {
+        for (src, opcode) in [
+            ("n - 1", "IntSub"),
+            ("1 + n", "IntAdd"),
+            ("3 < n", "IntGt"),
+            ("n == KIND", "IntEq"),
+        ] {
+            let mut lowerer = Lowerer::new(None);
+            lowerer
+                .bindings
+                .insert("n".to_string(), binding(3, BindingKind::Int));
+            let expr: Expr = syn::parse_str(src).expect("parse binary");
+            let result = lowerer.lower_value_expr(&expr).expect("binary lowers");
+            assert_eq!(result.kind, BindingKind::Int);
+            assert_eq!(lowerer.op_metadata.len(), 1, "{src}");
+            let op = &lowerer.op_metadata[0];
+            assert_eq!(op.kind, OpKind::BinopI, "{src}");
+            assert_eq!(op.reads, vec![Register::int(3)], "{src}");
+            let emitted = lowerer
+                .statements
+                .iter()
+                .map(ToString::to_string)
+                .collect::<String>();
+            assert!(emitted.contains("record_binop_i_const"), "{src}: {emitted}");
+            assert!(emitted.contains(opcode), "{src}: {emitted}");
+        }
+    }
+
+    /// `_rewrite_equality`: `n == 0` is the unary `int_is_zero`, and the zero
+    /// is never loaded.
+    #[test]
+    fn an_int_compare_against_zero_loads_no_constant() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("n".to_string(), binding(3, BindingKind::Int));
+        let expr: Expr = syn::parse_str("n == 0").expect("parse compare");
+        lowerer.lower_value_expr(&expr).expect("compare lowers");
+        assert_eq!(lowerer.op_metadata.len(), 1);
+        assert_eq!(lowerer.op_metadata[0].kind, OpKind::UnaryI);
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("IntIsZero"), "{emitted}");
     }
 
     #[test]

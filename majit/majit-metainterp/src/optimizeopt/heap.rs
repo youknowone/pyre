@@ -709,7 +709,6 @@ impl ArrayCachedItem {
                 continue;
             }
             // compile.py ResOperation(... [arrayop, ConstInt(index)] ...)
-            let idx_ref = ctx.make_constant_int(self.index);
             let opcode = descr
                 .as_array_descr()
                 .map(|array_descr| OpCode::getarrayitem_for_type(array_descr.item_type()))
@@ -717,7 +716,7 @@ impl ArrayCachedItem {
             let arraybox_b = arraybox_box
                 .clone()
                 .unwrap_or_else(|| ctx.materialize_operand_at(arraybox));
-            let idx_b = ctx.materialize_operand_at(idx_ref);
+            let idx_b = Operand::const_(majit_ir::Const::Int(self.index));
             let mut op = Op::with_descr(opcode, &[arraybox_b, idx_b], descr.clone());
             op.pos().set(cached_val);
             sb.add_heap_op(ctx, cached_box, op);
@@ -2279,7 +2278,7 @@ impl OptHeap {
                 .is_some()
             && let Some(value) = ctx.constant_fold(op)
         {
-            let b = ctx.materialize_operand_at(op.pos().get());
+            let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, value);
             return OptimizationResult::Remove;
         }
@@ -2524,10 +2523,9 @@ impl OptHeap {
         let is_vable_ref = is_vable_field && matches!(op.opcode, OpCode::GetfieldGcR);
         if is_vable_ref {
             ctx.emit(op.clone());
-            let zero_ref = ctx.make_constant_int(0);
             let cmp_pos = ctx.alloc_op_position_typed(OpCode::IntNe.result_type());
-            let cmp_arg0 = ctx.materialize_operand_at(op.pos().get());
-            let cmp_arg1 = ctx.materialize_operand_at(zero_ref);
+            let cmp_arg0 = Operand::from_bound_op(op_rc);
+            let cmp_arg1 = Operand::const_(majit_ir::Const::Int(0));
             let mut cmp_op = Op::new(OpCode::IntNe, &[cmp_arg0, cmp_arg1]);
             cmp_op.pos().set(cmp_pos);
             ctx.emit(cmp_op);

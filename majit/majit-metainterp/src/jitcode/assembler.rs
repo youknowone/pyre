@@ -2793,7 +2793,45 @@ impl JitCodeBuilder {
     /// `pyre-jit-trace/src/jitcode_dispatch/specialize.rs::walker_emit_int_py_div_or_mod`
     /// covers the runtime trace path.
     pub fn record_binop_i(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
-        let key = match opcode {
+        let key = Self::binop_i_key(opcode);
+        self.touch_reg(dst);
+        self.touch_reg(lhs);
+        self.touch_reg(rhs);
+        self.write_insn(key);
+        // `assembler.py write_insn` argcode `ii>i` byte order:
+        // `[lhs][rhs][dst]`, matching the canonical `bhhandler_ii_i!`
+        // decoder.
+        self.push_u8(lhs as u8);
+        self.push_u8(rhs as u8);
+        self.push_u8(dst as u8);
+    }
+
+    /// [`Self::record_binop_i`] whose right operand is a `Constant`.
+    /// `assembler.py` `emit_const` encodes it as the register-space index
+    /// `num_regs_i + const_idx` of the constants suffix, so the operation
+    /// keeps its `ii>i` key and no `int_copy` loads the value first.
+    pub fn record_binop_i_const(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: i64) {
+        let key = Self::binop_i_key(opcode);
+        self.touch_reg(dst);
+        self.touch_reg(lhs);
+        self.write_insn(key);
+        self.push_u8(lhs as u8);
+        self.push_const_i_operand(rhs);
+        self.push_u8(dst as u8);
+    }
+
+    /// `assembler.py` `emit_const` for an int `Constant` operand: a
+    /// placeholder byte that `finish()` patches to `num_regs_i + const_idx`.
+    fn push_const_i_operand(&mut self, value: i64) {
+        let const_idx = self.add_const_i(value);
+        let offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((offset, ConstKind::Int, const_idx));
+    }
+
+    fn binop_i_key(opcode: OpCode) -> &'static str {
+        match opcode {
             OpCode::IntAdd => "int_add/ii>i",
             OpCode::IntSub => "int_sub/ii>i",
             OpCode::IntMul => "int_mul/ii>i",
@@ -2817,17 +2855,7 @@ impl JitCodeBuilder {
             OpCode::UintGt => "uint_gt/ii>i",
             OpCode::UintGe => "uint_ge/ii>i",
             other => panic!("record_binop_i: unsupported opcode {other:?}"),
-        };
-        self.touch_reg(dst);
-        self.touch_reg(lhs);
-        self.touch_reg(rhs);
-        self.write_insn(key);
-        // RPython `assembler.py:165-174` argcode `ii>i` byte order:
-        // `[lhs][rhs][dst]`, matching the canonical `bhhandler_ii_i!`
-        // decoder.
-        self.push_u8(lhs as u8);
-        self.push_u8(rhs as u8);
-        self.push_u8(dst as u8);
+        }
     }
 
     /// Emit a dynamically-numbered `USE_C_FORM` integer operation. PyPy's
@@ -3196,6 +3224,26 @@ impl JitCodeBuilder {
         self.write_insn("goto_if_not_int_le/iiL");
         self.push_u8(a as u8);
         self.push_u8(b as u8);
+        self.push_label_ref(label);
+    }
+
+    /// `goto_if_not_int_<cmp>/iiL` whose second operand is a `Constant`,
+    /// encoded by `assembler.py` `emit_const` as a constants-suffix
+    /// register index (see [`Self::record_binop_i_const`]).
+    pub fn goto_if_not_int_const(&mut self, opcode: OpCode, a: u16, b: i64, label: u16) {
+        let key = match opcode {
+            OpCode::IntLt => "goto_if_not_int_lt/iiL",
+            OpCode::IntLe => "goto_if_not_int_le/iiL",
+            OpCode::IntEq => "goto_if_not_int_eq/iiL",
+            OpCode::IntNe => "goto_if_not_int_ne/iiL",
+            OpCode::IntGt => "goto_if_not_int_gt/iiL",
+            OpCode::IntGe => "goto_if_not_int_ge/iiL",
+            other => panic!("goto_if_not_int_const: unsupported opcode {other:?}"),
+        };
+        self.touch_reg(a);
+        self.write_insn(key);
+        self.push_u8(a as u8);
+        self.push_const_i_operand(b);
         self.push_label_ref(label);
     }
 
@@ -5594,6 +5642,24 @@ impl JitCodeBuilder {
         self.write_insn("int_copy/i>i");
         self.push_u8(src as u8);
         self.push_u8(dst as u8);
+    }
+
+    /// `x as usize` / `x as isize` on the word-sized int bank.
+    /// `jtransform.py` `rewrite_op_cast_int_to_uint` /
+    /// `rewrite_op_cast_uint_to_int` rename on a 64-bit word, so only a
+    /// distinct target costs a copy. A 32-bit word narrows as
+    /// `_int_to_int_cast` does: `int_signext` to 4 bytes, or `int_and` with
+    /// the 32-bit mask.
+    pub fn cast_int_to_word(&mut self, dst: u16, src: u16, signed: bool) {
+        if std::mem::size_of::<usize>() >= 8 {
+            if dst != src {
+                self.move_i(dst, src);
+            }
+        } else if signed {
+            self.record_binop_i_const(dst, OpCode::IntSignext, src, 4);
+        } else {
+            self.record_binop_i_const(dst, OpCode::IntAnd, src, 0xFFFF_FFFF);
+        }
     }
 
     /// `flatten.py` `self.emitline('int_push', v)` / `blackhole.py bhimpl_int_push`
@@ -8542,6 +8608,60 @@ mod tests {
         assert_eq!(
             jitcode.code[0],
             majit_jitcode::codewriter::insns::insn_byte("int_copy/i>i")
+        );
+    }
+
+    /// A `Constant` operand is the register-space index of its constants
+    /// slot, `num_regs_i + const_idx`, and a repeated value reuses the slot.
+    #[test]
+    fn a_word_cast_onto_its_own_register_emits_nothing_on_a_64_bit_word() {
+        let mut builder = JitCodeBuilder::new();
+        builder.ensure_i_regs(2);
+        builder.cast_int_to_word(1, 1, false);
+        builder.cast_int_to_word(1, 1, true);
+        let empty = builder.code.is_empty();
+        builder.cast_int_to_word(0, 1, false);
+        let jitcode = builder.finish();
+        if std::mem::size_of::<usize>() >= 8 {
+            assert!(empty);
+            let int_copy = crate::jitcode::wellknown_bh_insns()
+                .into_iter()
+                .find(|(name, _)| *name == "int_copy/i>i")
+                .expect("int_copy/i>i is a wellknown insn")
+                .1;
+            assert_eq!(jitcode.code, vec![int_copy, 1, 0]);
+            assert!(jitcode.constants_i.is_empty());
+        } else {
+            assert_eq!(jitcode.constants_i, vec![4, 0xFFFF_FFFF]);
+        }
+    }
+
+    #[test]
+    fn a_constant_operand_is_patched_to_its_constants_slot() {
+        let mut builder = JitCodeBuilder::new();
+        builder.ensure_i_regs(3);
+        builder.record_binop_i_const(2, OpCode::IntSub, 1, 7);
+        let label = builder.new_label();
+        builder.goto_if_not_int_const(OpCode::IntEq, 2, 7, label);
+        builder.mark_label(label);
+        let jitcode = builder.try_finish().expect("must assemble");
+        assert_eq!(jitcode.constants_i, vec![7]);
+        assert_eq!(
+            &jitcode.code[..4],
+            &[
+                majit_jitcode::codewriter::insns::insn_byte("int_sub/ii>i"),
+                1,
+                3,
+                2
+            ]
+        );
+        assert_eq!(
+            &jitcode.code[4..7],
+            &[
+                majit_jitcode::codewriter::insns::insn_byte("goto_if_not_int_eq/iiL"),
+                2,
+                3
+            ]
         );
     }
 

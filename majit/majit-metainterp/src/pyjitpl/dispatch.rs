@@ -1243,6 +1243,20 @@ fn report_symbolic_residual_call_target_once(func: i64, arg_classes: Option<&str
     }
 }
 
+/// Refuse a `BC_RECURSIVE_CALL_*` before its call has run.
+///
+/// `pyjitpl.py do_residual_call` writes the call's result
+/// (`make_result_of_lastop`) before anything can raise `SwitchToBlackhole`,
+/// so a blackhole resumed after the opcode always finds its result register
+/// filled. A walk that refuses the call has run nothing and written nothing:
+/// converting the post-decode framestack would resume past the call and read
+/// whatever the result register held before. Refuse it the way an unbound
+/// residual target is refused, so the portal replays the source arm.
+fn refuse_unexecuted_recursive_call(ctx: &mut TraceCtx) -> TraceAction {
+    ctx.symbolic_residual_abort = true;
+    TraceAction::Abort
+}
+
 /// Report a residual call whose target is still a `symbolic_fnaddr_for_path`
 /// placeholder, once per distinct target.
 ///
@@ -1562,6 +1576,11 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// because the previous arm's `BC_LOOP_HEADER` handler stamped it.
     /// Pyre's typed `i32` mirrors RPython's `int` (sentinel `-1`).
     seen_loop_header_for_jdindex: i32,
+    /// Runaway-trace backstop counters (`run_to_end` explains the bounds).
+    /// `run_one_step` advances them once per executed instruction.
+    walk_steps: u64,
+    walk_steps_since_growth: u64,
+    walk_last_num_ops: usize,
     marker: PhantomData<(S, R)>,
 }
 
@@ -2846,6 +2865,9 @@ where
             outer_program_pc: None,
             // pyjitpl.py:2882 / :2916 — sentinel "no loop_header seen yet".
             seen_loop_header_for_jdindex: -1,
+            walk_steps: 0,
+            walk_steps_since_growth: 0,
+            walk_last_num_ops: 0,
             marker: PhantomData,
         }
     }
@@ -3331,50 +3353,12 @@ where
         //     a non-productive spin never does).  Catches the cycle early.
         //   * `step_limit` — absolute cap for any other runaway.
         // `MAJIT_STALL_WINDOW` / `MAJIT_STEP_LIMIT` override for diagnosis.
-        let stall_window: u64 = crate::stall_window();
-        let step_limit: u64 = crate::step_limit();
-        let mut step_count: u64 = 0;
-        let mut last_num_ops = ctx.num_recorded_ops();
-        let mut steps_since_growth: u64 = 0;
+        // `run_one_step` executes many instructions per call, so it counts
+        // them itself (`count_walk_step`).
+        self.walk_steps = 0;
+        self.walk_steps_since_growth = 0;
+        self.walk_last_num_ops = ctx.num_recorded_ops();
         while !self.frames.is_empty() {
-            step_count += 1;
-            let n = ctx.num_recorded_ops();
-            if n > last_num_ops {
-                last_num_ops = n;
-                steps_since_growth = 0;
-            } else {
-                steps_since_growth += 1;
-            }
-            if steps_since_growth > stall_window || step_count > step_limit {
-                if crate::majit_log_enabled() {
-                    let why = if step_count > step_limit {
-                        "step limit"
-                    } else {
-                        "op-growth stall"
-                    };
-                    eprintln!(
-                        "[jit] trace_jitcode aborting ({why}): portal pc={portal_pc} jit pc={} steps={step_count} ops={n} (runaway trace)",
-                        self.frames.current_mut().pc
-                    );
-                }
-                sym.abort_portal_op();
-                return TraceAction::Abort;
-            }
-            if crate::optrace_enabled() {
-                let fr = self.frames.current_mut();
-                let cur = fr.code_cursor;
-                let anchor_pc = fr.pc;
-                let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
-                let name = fr.jitcode.name.clone();
-                eprintln!(
-                    "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
-                    self.frames.len(),
-                    cur,
-                    anchor_pc,
-                    opcode,
-                    name
-                );
-            }
             // Catch panics from BigInt overflow in runtime stack operations.
             // RPython doesn't have this issue (no BigInt); we abort the trace.
             let action = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3408,11 +3392,13 @@ where
                 {
                     // Every `Finish` return drains the framestack first.
                     eprintln!(
-                        "[interpret] run_to_end action={:?} steps={step_count} ops={} framestack drained",
+                        "[interpret] run_to_end action={:?} steps={} ops={} framestack drained",
                         action,
+                        self.walk_steps,
                         ctx.num_recorded_ops(),
                     );
                 } else if crate::majit_log_enabled() || crate::tldbg_enabled() {
+                    let steps = self.walk_steps;
                     let fr = self.frames.current_mut();
                     let last_op = fr
                         .jitcode
@@ -3427,7 +3413,7 @@ where
                         _ => "",
                     };
                     eprintln!(
-                        "[interpret] run_to_end action={:?} steps={step_count} ops={} cursor={} last_op=0x{last_op:02x} reason={why} jitcode={}",
+                        "[interpret] run_to_end action={:?} steps={steps} ops={} cursor={} last_op=0x{last_op:02x} reason={why} jitcode={}",
                         action,
                         ctx.num_recorded_ops(),
                         fr.code_cursor,
@@ -3720,7 +3706,7 @@ where
         // (`warmspot.py` `jd.portal_runner_adr = adr_of(ll_portal_runner)`;
         // `eval.rs` wires one for jd0, which is why production has no such
         // hole), not a decision-routing change here.
-        TraceAction::Abort
+        refuse_unexecuted_recursive_call(ctx)
     }
 
     /// pyjitpl.py `do_recursive_call(assembler_call=True)` for a
@@ -3762,7 +3748,7 @@ where
             | (Some(JitArgKind::Ref), Some(_))
             | (Some(JitArgKind::Float), Some(_))
             | (None, None) => {}
-            _ => return TraceAction::Abort,
+            _ => return refuse_unexecuted_recursive_call(ctx),
         }
 
         // The greens carry the portal green key (pyjitpl.py:3593-3599
@@ -3777,7 +3763,7 @@ where
         let (token_arc, _green_key) =
             match runtime.recursive_call_assembler_target(jd_index, green_values) {
                 Some(target) => target,
-                None => return TraceAction::Abort,
+                None => return refuse_unexecuted_recursive_call(ctx),
             };
 
         // Build the callee's red args.  A recursive portal call runs the
@@ -3793,15 +3779,15 @@ where
         // run.
         let (fresh_values, fresh_owner) = match sym.recursive_fresh_entry_reds() {
             Some(pair) => pair,
-            None => return TraceAction::Abort,
+            None => return refuse_unexecuted_recursive_call(ctx),
         };
         let fresh_capacities = match sym.recursive_fresh_entry_vable_capacities() {
             Some(capacities) => capacities,
-            None => return TraceAction::Abort,
+            None => return refuse_unexecuted_recursive_call(ctx),
         };
         let (alloc_fp, free_fp) = match sym.recursive_fresh_alloc_free_targets() {
             Some(targets) => targets,
-            None => return TraceAction::Abort,
+            None => return refuse_unexecuted_recursive_call(ctx),
         };
         // The trace-time fresh state stands in for the residual allocator's
         // result (byte-identical by construction — both build a fresh state,
@@ -3844,7 +3830,7 @@ where
                     // an extra portal red (pyjitpl.py `do_recursive_call`).
                     let cap = match capacities.next() {
                         Some(cap) => cap,
-                        None => return TraceAction::Abort,
+                        None => return refuse_unexecuted_recursive_call(ctx),
                     };
                     let cap_arg = OpRef::const_int(cap);
                     let alloc_result = ctx.call_ref_typed_with_effect(
@@ -3859,11 +3845,11 @@ where
                     arg_types.push(majit_ir::Type::Ref);
                     idx += 1;
                 }
-                _ => return TraceAction::Abort,
+                _ => return refuse_unexecuted_recursive_call(ctx),
             }
         }
         if capacities.next().is_some() {
-            return TraceAction::Abort;
+            return refuse_unexecuted_recursive_call(ctx);
         }
 
         // 8-step `do_residual_call(assembler_call=True)` protocol, mirroring
@@ -4011,11 +3997,114 @@ where
         );
     }
 
-    pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, _runtime: &R) -> TraceAction {
+    /// `pyjitpl.py` `MIFrame.run_one_step`: execute the frame forward,
+    /// leaving the loop only when the current frame changes (`ChangeFrame`,
+    /// a call or a return) or an instruction ends the trace. `live` and
+    /// `goto` advance the position in the loop itself.
+    ///
+    /// Two exits sit inside the loop because the checks they answer run once
+    /// per instruction: the runaway backstop (`count_walk_step`) and the
+    /// trace-length overflow `run_to_end` answers, which is left to that
+    /// caller. A `goto` counts toward the backstop too, so a cycle of `live`
+    /// and `goto` alone still reaches it.
+    pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
         self.install_replace_frames(ctx);
         // SAFETY: the guard is a local of this call and `ctx` is borrowed for
         // longer, so it is dropped while the `TraceCtx` it names is alive.
         let _clear = unsafe { ClearReplaceFrames::new(ctx) };
+        let depth = self.frames.len();
+        loop {
+            let Some(frame) = self.frames.frames.last_mut() else {
+                return TraceAction::Continue;
+            };
+            let pc = frame.code_cursor;
+            match frame.bytecode().get(pc).copied() {
+                Some(jitcode::insns::BC_LIVE) => {
+                    frame.code_cursor = pc + 3;
+                    continue;
+                }
+                Some(jitcode::insns::BC_JUMP) => {
+                    frame.code_cursor = frame
+                        .peek_u16_at(pc + 1)
+                        .expect("BC_JUMP target operand is truncated")
+                        as usize;
+                    if let Some(action) = self.count_walk_step(ctx) {
+                        return action;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(action) = self.count_walk_step(ctx) {
+                return action;
+            }
+            let action = self.execute_one_instruction(ctx, sym, runtime);
+            if !matches!(action, TraceAction::Continue)
+                || self.frames.len() != depth
+                || ctx.is_too_long()
+            {
+                return action;
+            }
+        }
+    }
+
+    /// Runaway backstop for a trace-recording walk; `run_to_end` documents
+    /// the two bounds. Returns the abort once either is exceeded.
+    fn count_walk_step(&mut self, ctx: &TraceCtx) -> Option<TraceAction> {
+        self.walk_steps += 1;
+        let n = ctx.num_recorded_ops();
+        if n > self.walk_last_num_ops {
+            self.walk_last_num_ops = n;
+            self.walk_steps_since_growth = 0;
+        } else {
+            self.walk_steps_since_growth += 1;
+        }
+        let step_limit = crate::step_limit();
+        if self.walk_steps_since_growth > crate::stall_window() || self.walk_steps > step_limit {
+            if crate::majit_log_enabled() {
+                let why = if self.walk_steps > step_limit {
+                    "step limit"
+                } else {
+                    "op-growth stall"
+                };
+                let portal_pc = self
+                    .outer_program_pc
+                    .unwrap_or_else(|| self.frames.current_mut().pc);
+                eprintln!(
+                    "[jit] trace_jitcode aborting ({why}): portal pc={portal_pc} jit pc={} steps={} ops={n} (runaway trace)",
+                    self.frames.current_mut().pc,
+                    self.walk_steps,
+                );
+            }
+            return Some(TraceAction::Abort);
+        }
+        if crate::optrace_enabled() {
+            let fr = self.frames.current_mut();
+            let cur = fr.code_cursor;
+            let anchor_pc = fr.pc;
+            let opcode = fr.jitcode.code.get(cur).copied().unwrap_or(0xff);
+            let name = fr.jitcode.name.clone();
+            eprintln!(
+                "[optrace] depth={} cursor={} pc={} opcode={} jitcode={}",
+                self.frames.len(),
+                cur,
+                anchor_pc,
+                opcode,
+                name
+            );
+        }
+        None
+    }
+
+    /// One instruction of [`Self::run_one_step`]'s loop: pop a finished frame,
+    /// or decode and execute the instruction at the cursor.
+    #[inline(always)]
+    fn execute_one_instruction(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+    ) -> TraceAction {
         if crate::take_walk_abort() || majit_backend::take_null_mem_access() {
             ctx.symbolic_residual_abort = true;
             if crate::is_bridge_walking() || ctx.is_bridge_trace {
@@ -13995,6 +14084,61 @@ mod tests {
         assert_eq!(
             leave_count, enter_count,
             "normal-return path must balance ENTER_PORTAL_FRAME with LEAVE_PORTAL_FRAME",
+        );
+    }
+
+    /// [`RecursivePortalRuntime`] without a portal jitcode: the inline
+    /// decision has no frame to push.
+    struct RecursivePortalWithoutJitcodeRuntime;
+
+    impl JitCodeRuntime for RecursivePortalWithoutJitcodeRuntime {
+        fn label_at(&self, _pc: usize) -> usize {
+            0
+        }
+
+        fn recursive_inline_decision(
+            &self,
+            _jd_index: usize,
+            _green_values: &[i64],
+            _inline_depth: usize,
+            _recursive_depth: usize,
+        ) -> crate::pyjitpl::InlineDecision {
+            crate::pyjitpl::InlineDecision::Inline
+        }
+    }
+
+    /// A refused `BC_RECURSIVE_CALL_INT` has not run, so its result register
+    /// holds whatever it held before. Handing the post-decode framestack to
+    /// the blackhole would resume past the call and read that stale value;
+    /// the refusal must instead leave the portal to replay the source arm.
+    #[test]
+    fn refused_recursive_call_hands_the_blackhole_no_framestack() {
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.load_const_i_value(5, 42);
+        caller_builder.recursive_call_int(0, 0, &[], &[(JitArgKind::Int, 5)]);
+        caller_builder.int_return(0);
+        let caller = caller_builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args_and_runtime(
+            &mut ctx,
+            &mut sym,
+            &caller,
+            0,
+            &RecursivePortalWithoutJitcodeRuntime,
+            &[],
+        );
+
+        assert!(matches!(action, TraceAction::Abort), "got {action:?}");
+        assert!(
+            ctx.aborted_framestack.is_none(),
+            "a refused recursive call must not resume after itself",
+        );
+        assert_eq!(ctx.walk_final_pc, None);
+        assert!(
+            !ctx.symbolic_residual_abort,
+            "the one-shot refusal flag must be consumed by the publisher",
         );
     }
 

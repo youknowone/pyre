@@ -93,6 +93,51 @@ impl<'c> Lowerer<'c> {
                         });
                     }
                 }
+                // A `Constant` operand stays in the branch (`assembler.py`
+                // `emit_const`), after `_rewrite_symmetric` moved it right and
+                // `_rewrite_equality` turned a compare against zero unary.
+                let constant = match (
+                    s.int_constant_operand(&binary.left),
+                    s.int_constant_operand(&binary.right),
+                ) {
+                    (None, Some(value)) => Some((binary.op, &*binary.left, &*binary.right, value)),
+                    (Some(value), None) => Some((
+                        mirrored_compare_binop(&binary.op),
+                        &*binary.right,
+                        &*binary.left,
+                        value,
+                    )),
+                    _ => None,
+                };
+                if let Some((op, var_expr, const_expr, value)) = constant {
+                    let var = s.lower_value_expr(var_expr)?;
+                    if !matches!(var.kind, BindingKind::Int) {
+                        return None;
+                    }
+                    if matches!(op, BinOp::Eq(_) | BinOp::Ne(_))
+                        && int_literal_value(const_expr) == Some(0)
+                    {
+                        return Some(LoweredCondition::Value {
+                            binding: var,
+                            negated: matches!(op, BinOp::Eq(_)),
+                            int_is_true: true,
+                        });
+                    }
+                    let opcode = match op {
+                        BinOp::Lt(_) => "IntLt",
+                        BinOp::Le(_) => "IntLe",
+                        BinOp::Eq(_) => "IntEq",
+                        BinOp::Ne(_) => "IntNe",
+                        BinOp::Gt(_) => "IntGt",
+                        BinOp::Ge(_) => "IntGe",
+                        _ => return None,
+                    };
+                    return Some(LoweredCondition::CompareConst {
+                        lhs: var,
+                        value,
+                        opcode: format_ident!("{opcode}"),
+                    });
+                }
                 let lhs = s.lower_value_expr(&binary.left)?;
                 let rhs = s.lower_value_expr(&binary.right)?;
                 if lhs.kind != rhs.kind {
@@ -299,40 +344,26 @@ impl<'c> Lowerer<'c> {
                 self.emit_fused_int_eq_miss(disc_reg, &value_tokens[0], &next_label);
             } else {
                 let first_tok = &value_tokens[0];
-                let first_const_reg = self.alloc_reg();
                 let mut or_reg = self.alloc_reg();
                 self.emit_op(
                     OpMeta::linear(
-                        OpKind::LoadConstI,
-                        vec![],
-                        vec![Register::int(first_const_reg)],
-                    ),
-                    quote! { __builder.load_const_i_value(#first_const_reg, #first_tok); },
-                );
-                self.emit_op(
-                    OpMeta::linear(
                         OpKind::BinopI,
-                        Register::ints(&[disc_reg, first_const_reg]),
+                        Register::ints(&[disc_reg]),
                         vec![Register::int(or_reg)],
                     ),
-                    quote! { __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg); },
+                    quote! { __builder.record_binop_i_const(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_tok); },
                 );
                 for tok in &value_tokens[1..] {
-                    let const_reg = self.alloc_reg();
                     let eq_reg = self.alloc_reg();
                     let new_or_reg = self.alloc_reg();
                     self.emit_op(
-                        OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-                        quote! { __builder.load_const_i_value(#const_reg, #tok); },
+                        OpMeta::linear(
+                            OpKind::BinopI,
+                            Register::ints(&[disc_reg]),
+                            vec![Register::int(eq_reg)],
+                        ),
+                        quote! { __builder.record_binop_i_const(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #tok); },
                     );
-                    self.emit_op(
-                    OpMeta::linear(
-                        OpKind::BinopI,
-                        Register::ints(&[disc_reg, const_reg]),
-                        vec![Register::int(eq_reg)],
-                    ),
-                    quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
-                );
                     self.emit_op(
                         OpMeta::linear(
                             OpKind::BinopI,
@@ -762,40 +793,26 @@ impl<'c> Lowerer<'c> {
                 self.emit_fused_int_eq_miss(disc_reg, &values[0], &next_label);
             } else {
                 let first_val = &values[0];
-                let first_const_reg = self.alloc_reg();
                 let mut or_reg = self.alloc_reg();
                 self.emit_op(
                     OpMeta::linear(
-                        OpKind::LoadConstI,
-                        vec![],
-                        vec![Register::int(first_const_reg)],
-                    ),
-                    quote! { __builder.load_const_i_value(#first_const_reg, #first_val); },
-                );
-                self.emit_op(
-                    OpMeta::linear(
                         OpKind::BinopI,
-                        Register::ints(&[disc_reg, first_const_reg]),
+                        Register::ints(&[disc_reg]),
                         vec![Register::int(or_reg)],
                     ),
-                    quote! { __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg); },
+                    quote! { __builder.record_binop_i_const(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_val); },
                 );
                 for lit_val in &values[1..] {
-                    let const_reg = self.alloc_reg();
                     let eq_reg = self.alloc_reg();
                     let new_or_reg = self.alloc_reg();
                     self.emit_op(
-                        OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-                        quote! { __builder.load_const_i_value(#const_reg, #lit_val); },
+                        OpMeta::linear(
+                            OpKind::BinopI,
+                            Register::ints(&[disc_reg]),
+                            vec![Register::int(eq_reg)],
+                        ),
+                        quote! { __builder.record_binop_i_const(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #lit_val); },
                     );
-                    self.emit_op(
-                    OpMeta::linear(
-                        OpKind::BinopI,
-                        Register::ints(&[disc_reg, const_reg]),
-                        vec![Register::int(eq_reg)],
-                    ),
-                    quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
-                );
                     self.emit_op(
                         OpMeta::linear(
                             OpKind::BinopI,
@@ -1584,12 +1601,16 @@ mod unroll_binding_tests {
         assert!(lowerer.lower_if_stmt(&expr_if).is_some());
         let emitted = emitted_if(&lowerer);
         assert!(
-            emitted.contains("goto_if_not_int_gt"),
+            emitted.contains("goto_if_not_int_const") && emitted.contains("IntGt"),
             "`if 0 < n` must swap to int_gt, got:\n{emitted}"
         );
         assert!(
-            !emitted.contains("goto_if_not_int_lt"),
+            !emitted.contains("IntLt"),
             "must not keep the constant-left form:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("load_const_i_value"),
+            "the constant must stay in the branch:\n{emitted}"
         );
     }
 
@@ -1614,12 +1635,16 @@ mod unroll_binding_tests {
         assert!(lowerer.lower_match_stmt(&expr_match).is_some());
         let emitted = emitted_if(&lowerer);
         assert!(
-            emitted.contains("goto_if_not_int_eq"),
+            emitted.contains("goto_if_not_int_const") && emitted.contains("IntEq"),
             "`match n {{ 1 => }}` must fuse to int_eq, got:\n{emitted}"
         );
         assert!(
-            !emitted.contains("IntEq"),
+            !emitted.contains("record_binop_i"),
             "must not materialise the compare:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("load_const_i_value"),
+            "the constant must stay in the branch:\n{emitted}"
         );
     }
 

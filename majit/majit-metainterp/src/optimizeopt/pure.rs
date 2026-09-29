@@ -920,7 +920,7 @@ impl OptPure {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(&resolved_box, ctx);
-            return ctx.get_replacement_opref(forced);
+            return ctx.resolve_operand_operand(&forced).to_opref();
         }
         resolved
     }
@@ -1176,7 +1176,7 @@ impl Optimization for OptPure {
 
             // pure.py: _can_optimize_call_pure(op, start_index=1).
             if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = Operand::from_bound_op(op_rc);
                 ctx.make_constant_box(&b, value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;

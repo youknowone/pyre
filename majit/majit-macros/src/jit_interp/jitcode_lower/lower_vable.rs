@@ -884,20 +884,36 @@ impl<'c> Lowerer<'c> {
         if let Some(&field_index) = config.state_scalars.get(&member_name) {
             let opcode = opcode_for_assign_binop(&binary.op)?;
             let lhs = self.lower_state_field_read(&binary.left)?;
-            let rhs = self.lower_value_expr(&binary.right)?;
-            if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
+            if !matches!(lhs.kind, BindingKind::Int) {
                 return None;
             }
-            let dst = self.alloc_reg();
             let lhs_reg = lhs.reg;
-            let rhs_reg = rhs.reg;
-            self.emit_op(
-                OpMeta::linear(
-                    OpKind::BinopI,
-                    Register::ints(&[lhs_reg, rhs_reg]),
-                    vec![Register::int(dst)],
+            // A `Constant` right operand stays in the operation
+            // (`assembler.py` `emit_const`).
+            let rhs = match self.int_constant_operand(&binary.right) {
+                Some(value) if binop_i_accepts_constant(&opcode) => Ok(value),
+                _ => {
+                    let rhs = self.lower_value_expr(&binary.right)?;
+                    if !matches!(rhs.kind, BindingKind::Int) {
+                        return None;
+                    }
+                    Err(rhs.reg)
+                }
+            };
+            let dst = self.alloc_reg();
+            let (reads, tokens) = match rhs {
+                Ok(value) => (
+                    Register::ints(&[lhs_reg]),
+                    binop_i_const_emit_tokens(dst, &opcode, lhs_reg, &value)?,
                 ),
-                binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
+                Err(rhs_reg) => (
+                    Register::ints(&[lhs_reg, rhs_reg]),
+                    binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
+                ),
+            };
+            self.emit_op(
+                OpMeta::linear(OpKind::BinopI, reads, vec![Register::int(dst)]),
+                tokens,
             );
             let fi = field_index as u16;
             if config.vable_var.as_deref() == Some("state")

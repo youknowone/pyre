@@ -2771,6 +2771,15 @@ mod tests {
         assert!(!layout.is_traced_ref_slot(3));
     }
 
+    /// Frame value count for the `build_guard_metadata` fixtures below, each
+    /// of which numbers one box per frame. Passed as the driver-scoped count
+    /// so the decode does not fall back to the process-global
+    /// `set_frame_value_count_fn`, which a test running in parallel may have
+    /// installed for its own jitcodes.
+    fn one_box_per_frame(_jitcode_index: i32, _pc: i32) -> usize {
+        1
+    }
+
     // history.py ConstInt.value inline — SimpleBoxEnv.get_const
     // reads inline-Const directly without the legacy raw-u32 side table.
     #[test]
@@ -2822,7 +2831,8 @@ mod tests {
         ]);
         guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
-        let (_resume_data, exit_layouts) = build_guard_metadata(&inputargs, &[guard], 8, None);
+        let (_resume_data, exit_layouts) =
+            build_guard_metadata(&inputargs, &[guard], 8, Some(one_box_per_frame));
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
@@ -2934,7 +2944,8 @@ mod tests {
         guard.setfailargs(smallvec::smallvec![rooted_inputarg_operand(Type::Int, 0)]);
         guard.set_fail_arg_types(vec![Type::Int]);
 
-        let (_resume_data, exit_layouts) = build_guard_metadata(&inputargs, &[guard], 4, None);
+        let (_resume_data, exit_layouts) =
+            build_guard_metadata(&inputargs, &[guard], 4, Some(one_box_per_frame));
         let exit = exit_layouts.get(&0).expect("guard exit layout");
         let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
         assert!(
@@ -2990,7 +3001,8 @@ mod tests {
         guard.setfailargs(smallvec::smallvec![rooted_inputarg_operand(Type::Int, 0)]);
         guard.set_fail_arg_types(vec![Type::Int]);
 
-        let (_resume_data, mut exit_layouts) = build_guard_metadata(&inputargs, &[guard], 4, None);
+        let (_resume_data, mut exit_layouts) =
+            build_guard_metadata(&inputargs, &[guard], 4, Some(one_box_per_frame));
         {
             let exit = exit_layouts.get_mut(&0).expect("guard exit layout");
             let resume =

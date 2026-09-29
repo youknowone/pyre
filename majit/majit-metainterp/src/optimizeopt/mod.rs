@@ -2635,7 +2635,12 @@ impl OptContext {
             && !OpRc::ptr_eq(&superseded, op)
         {
             let carried = superseded.forwarded().borrow().clone();
-            *op.forwarded().borrow_mut() = carried;
+            // An Op redirect is not info to carry: when it names `op` (a
+            // stand-in already forwarded to the op now taking its position),
+            // copying it closes a one-node cycle.
+            if !matches!(carried, majit_ir::forwarding::Forwarded::Op(_)) {
+                *op.forwarded().borrow_mut() = carried;
+            }
             // replace_op_with parity (optimizer.py): forward the
             // superseded stand-in to `op`. A consumer dispatched before
             // this supersession bound its operand to `superseded` (the
@@ -3135,6 +3140,15 @@ impl OptContext {
         }
     }
 
+    /// `emit_for_force` when the caller keeps the op as its box.
+    pub fn emit_for_force_rc(&mut self, op: majit_ir::OpRc) -> OpRef {
+        if self.in_final_emission {
+            self.emit_rc(op)
+        } else {
+            self.emit_extra_rc(self.current_pass_idx, op)
+        }
+    }
+
     /// optimizer.py new_const_item(arraydescr) — default value for
     /// the given item type.
     pub fn new_const_item(&mut self, item_type: Type) -> OpRef {
@@ -3158,12 +3172,12 @@ impl OptContext {
     }
 
     /// vstring.py getstrlen / 171-175 / 251-253 / 281-295
-    /// Per-subclass getstrlen() dispatch — returns a cached lgtop OpRef if
+    /// Per-subclass getstrlen() dispatch — returns a cached lgtop box if
     /// available, or computes/emits the length and caches in StrPtrInfo.lgtop.
-    /// Always returns a box (OpRef), never an i64 summary.
+    /// Always returns a box, never an i64 summary.
     ///
     /// Delegates to `getstrlen_for(opref, opref, mode)`.
-    pub fn getstrlen_opref(&mut self, opref: OpRef, mode: u8) -> OpRef {
+    pub fn getstrlen_opref(&mut self, opref: OpRef, mode: u8) -> Operand {
         self.getstrlen_for(opref, opref, mode)
     }
 
@@ -3175,7 +3189,7 @@ impl OptContext {
     /// PtrInfo.
     ///
     /// When both are the same, use `getstrlen_opref(opref, mode)` instead.
-    pub fn getstrlen_for(&mut self, info_opref: OpRef, op_opref: OpRef, mode: u8) -> OpRef {
+    pub fn getstrlen_for(&mut self, info_opref: OpRef, op_opref: OpRef, mode: u8) -> Operand {
         let resolved_box = self.get_box_replacement_operand_opt(info_opref);
         // vstring.py:112/283: if self.lgtop is not None: return self.lgtop
         if let Some(info) = resolved_box.as_ref().and_then(|b| self.getptrinfo(b))
@@ -3189,13 +3203,11 @@ impl OptContext {
             .and_then(|b| self.getptrinfo(b))
             .and_then(|info| info.get_known_str_length(self, mode));
         if let Some(len) = known_len {
-            let len_opref = self.make_constant_int(len);
-            // operand shim — write path through `materialize_operand_at` per the
-            // "Box always exists" invariant for set_forwarded mirrors.
+            let len_box = Operand::const_(majit_ir::Const::Int(len));
             if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
-                self.set_str_lgtop(&b, len_opref);
+                self.set_str_lgtop(&b, len_box.clone());
             }
-            return len_opref;
+            return len_box;
         }
         // vstring.py: VStringConcatInfo.getstrlen — recursive
         // dispatch: getstrlen on each child, then _int_add.
@@ -3216,13 +3228,10 @@ impl OptContext {
             // vstring.py:286-293
             let left_len = self.getstrlen_for(vleft, vleft, mode);
             let right_len = self.getstrlen_for(vright, vright, mode);
-            let left_len = self.materialize_operand_at(left_len);
-            let right_len = self.materialize_operand_at(right_len);
-            let result =
-                crate::optimizeopt::vstring::_int_add(&left_len, &right_len, self).to_opref();
+            let result = crate::optimizeopt::vstring::_int_add(&left_len, &right_len, self);
             // vstring.py: self.lgtop = _int_add(optstring, len1box, len2box)
             if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
-                self.set_str_lgtop(&b, result);
+                self.set_str_lgtop(&b, result.clone());
             }
             return result;
         }
@@ -3236,28 +3245,22 @@ impl OptContext {
             majit_ir::OpCode::Strlen
         };
         let arg1 = self.materialize_operand_at(op_resolved);
-        let strlen_op = majit_ir::Op::new(strlen_opcode, &[arg1]);
-        let result = self.emit_extra(self.current_pass_idx, strlen_op);
-        // vstring.py: lengthop.set_forwarded(self.getlenbound(mode))
-        // `set_forwarded` writes the bound unconditionally; route through
-        // `materialize_operand_at` so the new STRLEN/UNICODELEN box materializes for
-        // the IntBound install ("Box always exists" per resoperation.py).
-        // operand shim for `get_str_lenbound(&Operand)`; lazy-install of
-        // lenbound on the StrPtrInfo is a PtrInfo-internal mutation that
-        // RPython performs on the StrPtrInfo instance directly. Route
-        // through `materialize_operand_at` so the operand exists for the chain walk.
+        let lengthop = majit_ir::OpRc::new(majit_ir::Op::new(strlen_opcode, &[arg1]));
+        self.emit_extra_rc(self.current_pass_idx, lengthop.clone());
+        let result = Operand::from_bound_op(&lengthop);
+        // vstring.py: lengthop.set_forwarded(self.getlenbound(mode)). The
+        // lenbound is lazily installed on the StrPtrInfo, a PtrInfo-internal
+        // mutation.
         let lenbound = self
             .get_box_replacement_operand_opt(info_opref)
             .as_ref()
             .and_then(|b| self.get_str_lenbound(b));
-        if let Some(bound) = lenbound
-            && let Some(result_box) = self.get_box_replacement_operand_opt(result)
-        {
-            self.setintbound(&result_box, &bound);
+        if let Some(bound) = lenbound {
+            self.setintbound(&result, &bound);
         }
         // vstring.py:117: self.lgtop = lengthop
         if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
-            self.set_str_lgtop(&b, result);
+            self.set_str_lgtop(&b, result.clone());
         }
         result
     }
@@ -3266,20 +3269,17 @@ impl OptContext {
     /// box in `StrPtrInfo.lgtop`. Direct PtrInfo field write,
     /// unconditional per `info.py`.
     ///
-    /// `op: &Operand` is the StrPtrInfo-bearing box; `lgtop: OpRef` is the
-    /// length op's position, materialized to its bound producer before the
-    /// cache write so the field carries an `Operand` (never a position-only
-    /// box).
-    pub(crate) fn set_str_lgtop(&mut self, op: &Operand, lgtop: OpRef) {
+    /// `op: &Operand` is the StrPtrInfo-bearing box; `lgtop` is the length
+    /// box.
+    pub(crate) fn set_str_lgtop(&mut self, op: &Operand, lgtop: Operand) {
         // optimizer.py `get_box_replacement` chain walk before mutation.
         let resolved = op.get_box_replacement(false);
         if resolved.is_constant() {
             return;
         }
-        let lgtop_op = self.materialize_operand_at(lgtop);
         self.with_ptr_info_mut(&resolved, |info| {
             if let PtrInfo::Str(si) = info {
-                si.lgtop = Some(lgtop_op.clone());
+                si.lgtop = Some(lgtop.clone());
             }
         });
     }
@@ -3865,6 +3865,17 @@ impl OptContext {
             self.emit(op)
         } else {
             self.emit_extra_at(0, OpRc::new(op))
+        }
+    }
+
+    /// `send_extra_operation` when the caller already holds the ResOperation
+    /// object (`rewrite.py` sending each operation `intdiv` built). Queue
+    /// that `OpRc` so a box built on an earlier one stays bound to it.
+    pub fn send_extra_operation_rc(&mut self, op: majit_ir::OpRc) -> OpRef {
+        if self.in_final_emission {
+            self.emit_rc(op)
+        } else {
+            self.emit_extra_at(0, op)
         }
     }
 
@@ -7049,66 +7060,56 @@ impl OptContext {
     /// then force virtuals to concrete. Body refs route through the preamble
     /// source directly, so the prior reverse-lookup 3rd key is no longer
     /// needed.
-    pub(crate) fn force_box_inline(&mut self, op: &Operand) -> OpRef {
-        let opref = op.to_opref();
-        if opref.is_constant() {
-            return opref;
+    pub(crate) fn force_box_inline(&mut self, op: &Operand) -> Operand {
+        // optimizer.py: op = get_box_replacement(op)
+        if op.is_constant() {
+            return op.clone();
         }
-        let resolved_op = self.get_box_replacement_operand_opt(opref);
-        let resolved = resolved_op.as_ref().map_or(opref, |op| op.to_opref());
+        let resolved_box = self.resolve_operand_operand(op);
         // optimizer.py:351-359: a result that folded to an inline Const can
         // never be a `potential_extra_ops` key (the pool is keyed by the pure
         // op's result Box; the Const inlines at use sites instead of being
         // produced by a short box), so skip the short-preamble recording for
         // const-resolved results — otherwise the Const reaches `used_boxes`
         // and the carried label slot trips `OpRef::raw()` in unroll.rs.
-        if !resolved.is_constant() {
-            let tracked = match resolved_op.clone() {
-                Some(resolved_box) => self.take_potential_extra_op(&resolved_box),
-                None => None,
-            }
+        if resolved_box.is_constant() {
+            return resolved_box;
+        }
+        let tracked = self
+            .take_potential_extra_op(&resolved_box)
             .or_else(|| self.take_potential_extra_op(op));
-            if let Some(preamble_op) = tracked {
-                // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
-                // — the resolved Box itself is handed to the builder.
-                // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
-                // — walk the box's own `_forwarded` chain (total; identity on a
-                // miss), object-native rather than positional.
-                let resolved_for_pop = preamble_op.op.get_box_replacement(false);
-                if let Some(builder) = self.active_short_preamble_producer_mut() {
-                    builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
-                } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
-                    builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
-                }
+        if let Some(preamble_op) = tracked {
+            // shortpreamble.py `op = preamble_op.op.get_box_replacement()` —
+            // walk the box's own `_forwarded` chain, the resolved Box itself
+            // is handed to the builder.
+            let resolved_for_pop = preamble_op.op.get_box_replacement(false);
+            if let Some(builder) = self.active_short_preamble_producer_mut() {
+                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
+            } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
+                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             }
         }
         // optimizer.py:361-362: if op.type == 'i' and info.is_constant():
         //     return ConstInt(info.get_constant_int())
         // Mirrors Optimizer::force_box — a forced operand with an already-constant
         // IntBound materializes as ConstInt; peek the bound without installing.
-        if let Some(rb) = resolved_op.as_ref()
-            && rb.const_value().is_none()
-            && rb.type_() == Type::Int
-            && let Some(bound) = self.peek_intbound_box(rb)
+        if resolved_box.type_() == Type::Int
+            && let Some(bound) = self.peek_intbound_box(&resolved_box)
             && bound.is_constant()
         {
-            return self.make_constant_int(bound.get_constant_int());
+            return Operand::const_(majit_ir::Const::Int(bound.get_constant_int()));
         }
         // optimizer.py force_box reads the live info. Only the recursive
         // materialization path needs an owned snapshot across &mut self.
-        let virtual_info = resolved_op
-            .as_ref()
-            .and_then(Operand::ptr_info)
+        let virtual_info = resolved_box
+            .ptr_info()
             .filter(|info| info.is_virtual())
             .map(|info| info.clone());
         if let Some(mut info) = virtual_info {
-            let resolved_op = resolved_op
-                .clone()
-                .expect("is_virtual implies resolved_op is Some");
-            let forced = info.force_box(&resolved_op, self);
-            return self.get_replacement_opref(forced);
+            let forced = info.force_box(&resolved_box, self);
+            return self.resolve_operand_operand(&forced);
         }
-        resolved
+        resolved_box
     }
 
     /// RPython optimizer.py store_final_boxes_in_guard inline.
