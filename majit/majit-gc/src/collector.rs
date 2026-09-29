@@ -5479,7 +5479,9 @@ impl MiniMarkGC {
         self.validate_type_id(type_id, obj_addr, site);
         let custom_trace = self.types.get(type_id).custom_trace;
 
-        // custom_trace_hook parity: use custom trace function if registered.
+        // `GCBase.trace` / `_trace_slow_path`: a custom trace adds slots.
+        // It does not replace the fixed `offsets_to_gc_pointers` walk or
+        // the variable-part items below.
         if let Some(trace_fn) = custom_trace {
             // A custom trace names its own slots — for a JITFRAME, `jf_gcmap`
             // decides them, not the type table. When one of those slots does
@@ -5535,7 +5537,6 @@ impl MiniMarkGC {
                     slot_addr,
                 );
             }
-            return;
         }
 
         let type_info = self.types.get(type_id);
@@ -6077,7 +6078,6 @@ impl MiniMarkGC {
         let type_info = self.types.get(type_id);
         if let Some(trace_fn) = type_info.custom_trace {
             unsafe { trace_fn(obj_addr, visitor) };
-            return;
         }
         for &offset in &type_info.gc_ptr_offsets {
             visitor((obj_addr + offset) as *mut GcRef);
@@ -6160,7 +6160,6 @@ impl MiniMarkGC {
                     }
                 });
             }
-            return;
         }
         for &offset in &type_info.gc_ptr_offsets {
             if ignored_offset == Some(offset) {
@@ -7905,7 +7904,9 @@ impl MiniMarkGC {
         // and nothing below registers or rewrites a type.
         let (offsets, var_offsets) = unsafe { (&*offsets, &*var_offsets) };
 
-        // custom_trace_hook parity for major GC marking.
+        // `GCBase.trace` / `_trace_slow_path`: `custom_trace_dispatcher`
+        // when `has_custom_trace`, then the fixed `offsets_to_gc_pointers`
+        // walk. Variable-part items are the other half of the slow path.
         if let Some(trace_fn) = custom_trace {
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
@@ -7920,36 +7921,35 @@ impl MiniMarkGC {
                     }
                 });
             }
-        } else {
-            // Fixed-part fields (count bounded by the struct's GC field count).
-            for &offset in offsets {
-                let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
-                if !field_ref.is_null() {
-                    self.grey_child(
-                        field_ref.0,
-                        obj_addr,
-                        obj_addr + offset,
-                        "major_fixed_field",
-                    );
-                }
+        }
+        // Fixed-part fields (count bounded by the struct's GC field count).
+        for &offset in offsets {
+            let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
+            if !field_ref.is_null() {
+                self.grey_child(
+                    field_ref.0,
+                    obj_addr,
+                    obj_addr + offset,
+                    "major_fixed_field",
+                );
             }
-            // Variable-part items: streamed one at a time, never buffered, so a
-            // large GC-managed pointer array does not double the marking-side
-            // peak memory or retain that capacity for the collector's lifetime.
-            if items_have_gc_ptrs && item_size > 0 {
-                // The nursery arm above asserts `!is_forwarded`. An old
-                // object is never forwarded (`is_forwarded` requires the
-                // nursery), so this length is the object's own.
-                let length = unsafe { *((obj_addr + length_offset) as *const usize) };
-                let items_start = obj_addr + fixed_size;
-                for i in 0..length {
-                    let item = items_start + i * item_size;
-                    for &offset in var_offsets {
-                        let slot = item + offset;
-                        let field_ref = unsafe { *(slot as *const GcRef) };
-                        if !field_ref.is_null() {
-                            self.grey_child(field_ref.0, obj_addr, slot, "major_varsize_item");
-                        }
+        }
+        // Variable-part items: streamed one at a time, never buffered, so a
+        // large GC-managed pointer array does not double the marking-side
+        // peak memory or retain that capacity for the collector's lifetime.
+        if items_have_gc_ptrs && item_size > 0 {
+            // The nursery arm above asserts `!is_forwarded`. An old
+            // object is never forwarded (`is_forwarded` requires the
+            // nursery), so this length is the object's own.
+            let length = unsafe { *((obj_addr + length_offset) as *const usize) };
+            let items_start = obj_addr + fixed_size;
+            for i in 0..length {
+                let item = items_start + i * item_size;
+                for &offset in var_offsets {
+                    let slot = item + offset;
+                    let field_ref = unsafe { *(slot as *const GcRef) };
+                    if !field_ref.is_null() {
+                        self.grey_child(field_ref.0, obj_addr, slot, "major_varsize_item");
                     }
                 }
             }
@@ -8484,7 +8484,6 @@ impl MiniMarkGC {
                     }
                 });
             }
-            return children;
         }
         for &offset in &info.gc_ptr_offsets {
             let child = unsafe { *((obj_addr + offset) as *const GcRef) };
@@ -11673,6 +11672,74 @@ mod tests {
         for object in [holder, class, item] {
             assert!(!unsafe { (*header_of(object.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
         }
+        gc.roots.clear();
+    }
+
+    /// `GCBase.trace` visits a custom trace and `offsets_to_gc_pointers`.
+    /// A young object reachable only through a fixed offset of such a type
+    /// survives a minor collection. `object_subclass_with_custom_trace`
+    /// does not inherit parent offsets: those hooks already walk the base.
+    #[test]
+    fn custom_trace_and_fixed_offsets_are_both_traced() {
+        unsafe fn trace_middle_word(obj_addr: usize, visit: &mut dyn FnMut(*mut GcRef)) {
+            let word = std::mem::size_of::<GcRef>();
+            visit((obj_addr + word) as *mut GcRef);
+        }
+
+        let word = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let parent_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(2 * word, vec![0]));
+        let holder_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs_and_custom_trace(
+            3 * word,
+            parent_tid,
+            vec![2 * word],
+            trace_middle_word,
+        ));
+        let plain_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+            2 * word,
+            parent_tid,
+            trace_middle_word,
+        ));
+        let leaf_tid = gc.register_type(TypeInfo::simple(word));
+
+        {
+            let holder_info = gc.types.get(holder_tid);
+            assert!(holder_info.inherits_parent_offsets);
+            assert_eq!(holder_info.gc_ptr_offsets, vec![0, 2 * word]);
+            let mut storage = vec![0u8; 3 * word];
+            let obj_addr = storage.as_mut_ptr() as usize;
+            let mut slots = Vec::new();
+            unsafe {
+                holder_info.for_each_gc_ptr(obj_addr, |slot| slots.push(slot as usize));
+            }
+            assert_eq!(slots.len(), 3);
+            assert!(slots.contains(&obj_addr));
+            assert!(slots.contains(&(obj_addr + word)));
+            assert!(slots.contains(&(obj_addr + 2 * word)));
+        }
+        assert!(gc.types.get(plain_tid).gc_ptr_offsets.is_empty());
+        assert!(!gc.types.get(plain_tid).inherits_parent_offsets);
+
+        let leaf = gc.alloc_with_type(leaf_tid, word);
+        unsafe {
+            *(leaf.0 as *mut usize) = 0xC0FFEE;
+        }
+        let mut holder = gc.alloc_with_type(holder_tid, 3 * word);
+        unsafe {
+            *(holder.0 as *mut GcRef) = GcRef::NULL;
+            *((holder.0 + word) as *mut GcRef) = GcRef::NULL;
+            *((holder.0 + 2 * word) as *mut GcRef) = leaf;
+            gc.roots.add(&mut holder);
+        }
+        let leaf_addr = leaf.0;
+        gc.do_collect_nursery();
+        let kept = unsafe { *((holder.0 + 2 * word) as *const GcRef) };
+        assert_ne!(kept.0, leaf_addr);
+        assert!(!gc.is_in_nursery(kept.0));
+        assert!(gc.oldgen.contains(kept.0));
+        assert_eq!(unsafe { *(kept.0 as *const usize) }, 0xC0FFEE);
+        assert!(unsafe { *(holder.0 as *const GcRef) }.is_null());
+        assert!(unsafe { *((holder.0 + word) as *const GcRef) }.is_null());
         gc.roots.clear();
     }
 

@@ -377,9 +377,10 @@ pub struct TypeRegistry {
 /// Custom trace function type.
 ///
 /// RPython parity: `rgc.register_custom_trace_hook(TYPE, trace_fn)`.
-/// When set, the GC calls this instead of the generic offset-based
-/// tracing. Used for types with dynamic GC reference layouts
-/// (e.g. JitFrame with gcmap bitmap).
+/// `GCBase.trace` calls this from `_trace_slow_path` when
+/// `has_custom_trace`, then still walks `offsets_to_gc_pointers`.
+/// Used for types with dynamic GC reference layouts (e.g. JitFrame
+/// with a gcmap bitmap).
 ///
 /// `obj_addr` is the object payload start. The callback `f` must be
 /// called for each GC reference slot address.
@@ -423,8 +424,17 @@ pub struct TypeInfo {
     /// array of structs may contain several entries at non-zero offsets.
     pub var_gc_ptr_offsets: Vec<usize>,
     /// RPython `rgc.register_custom_trace_hook` parity.
-    /// When set, overrides offset-based tracing entirely.
+    /// `GCBase._trace_slow_path` runs this when `has_custom_trace`;
+    /// `GCBase.trace` still walks `offsets_to_gc_pointers` afterwards.
     pub custom_trace: Option<CustomTraceFn>,
+    /// `TypeRegistry::register` merges the parent's fixed
+    /// `gc_ptr_offsets` into this object subclass even when
+    /// `custom_trace` is set. Only
+    /// `object_subclass_with_gc_ptrs_and_custom_trace` sets this, and
+    /// only for a non-empty offset list. `object_subclass_with_custom_trace`
+    /// leaves it clear: those hooks already walk the base fields, and
+    /// merging them would trace the same slots twice.
+    pub inherits_parent_offsets: bool,
     /// gc.py:642 `T_IS_RPYTHON_INSTANCE` parity. True when this type has
     /// `rclass.OBJECT` layout — the first word of the payload is the
     /// `typeptr` (ob_type) and `cls_of_box(gcref)` is valid. False for
@@ -523,6 +533,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
+            inherits_parent_offsets: false,
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
@@ -552,6 +563,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
+            inherits_parent_offsets: false,
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
@@ -668,6 +680,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
+            inherits_parent_offsets: false,
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
@@ -703,6 +716,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
+            inherits_parent_offsets: false,
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
@@ -737,6 +751,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
+            inherits_parent_offsets: false,
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
@@ -769,6 +784,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
+            inherits_parent_offsets: false,
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
@@ -810,6 +826,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
+            inherits_parent_offsets: false,
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
@@ -841,6 +858,48 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             var_gc_ptr_offsets: Vec::new(),
             custom_trace: Some(trace_fn),
+            inherits_parent_offsets: false,
+            is_object: true,
+            has_subclass_range: true,
+            hide_from_app_level_inspector: false,
+            has_no_typedef: false,
+            app_level_inspector_hidden_edge_offset: None,
+            parent: Some(parent_typeid),
+            subclassrange_min: 0,
+            subclassrange_max: 0,
+            is_weakref: false,
+            destructor: None,
+            old_style_finalizer: None,
+            memory_pressure_offset: None,
+        }
+    }
+
+    /// `object_subclass` variant with both fixed GC offsets and a custom
+    /// trace. `GCBase.trace` walks `offsets_to_gc_pointers` after
+    /// `_trace_slow_path` runs `custom_trace_dispatcher`.
+    ///
+    /// `offsets` are this subclass's own fixed slots. When that list is
+    /// non-empty, `inherits_parent_offsets` makes `TypeRegistry::register`
+    /// merge the parent's fixed offsets the same way an offset-traced
+    /// subclass does. `object_subclass_with_custom_trace` does not set
+    /// the flag: those hooks already walk the base fields.
+    pub fn object_subclass_with_gc_ptrs_and_custom_trace(
+        size: usize,
+        parent_typeid: u32,
+        offsets: Vec<usize>,
+        trace_fn: CustomTraceFn,
+    ) -> Self {
+        let inherits_parent_offsets = !offsets.is_empty();
+        TypeInfo {
+            size,
+            has_gc_ptrs: true,
+            gc_ptr_offsets: offsets,
+            item_size: 0,
+            length_offset: 0,
+            items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
+            custom_trace: Some(trace_fn),
+            inherits_parent_offsets,
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
@@ -869,6 +928,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
+            inherits_parent_offsets: false,
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
@@ -936,6 +996,7 @@ impl TypeInfo {
             items_have_gc_ptrs,
             var_gc_ptr_offsets,
             custom_trace: None,
+            inherits_parent_offsets: false,
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
@@ -964,6 +1025,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             var_gc_ptr_offsets: Vec::new(),
             custom_trace: Some(trace_fn),
+            inherits_parent_offsets: false,
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
@@ -1005,9 +1067,12 @@ impl TypeInfo {
             gc_ptr_offsets: Vec::new(),
             item_size,
             length_offset,
-            items_have_gc_ptrs: false, // custom_trace handles ref tracing
+            // This constructor lists no variable-part offsets. `GCBase.trace`
+            // still walks `offsets_to_gc_pointers` after `_trace_slow_path`.
+            items_have_gc_ptrs: false,
             var_gc_ptr_offsets: Vec::new(),
             custom_trace: Some(trace_fn),
+            inherits_parent_offsets: false,
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
@@ -1042,11 +1107,11 @@ impl TypeInfo {
     /// `obj_addr` must point to valid memory of at least `self.size` bytes (plus
     /// variable part if applicable).
     pub unsafe fn for_each_gc_ptr(&self, obj_addr: usize, mut f: impl FnMut(*mut GcRef)) {
-        // RPython custom_trace_hook parity: if a custom trace function
-        // is registered, use it instead of generic offset-based tracing.
+        // `GCBase.trace` always walks `offsets_to_gc_pointers` after
+        // `_trace_slow_path`. The hook (`has_custom_trace`) and the
+        // variable-part items add slots; neither replaces the fixed offsets.
         if let Some(trace_fn) = self.custom_trace {
             unsafe { trace_fn(obj_addr, &mut f) };
-            return;
         }
 
         // Fixed-part GC pointer fields.
@@ -1124,7 +1189,15 @@ impl TypeRegistry {
             id <= u16::MAX as usize,
             "TypeRegistry exhausted the 16-bit T_MEMBER_INDEX field: id {id}"
         );
-        if info.custom_trace.is_none()
+        // `GCBase.trace` walks `offsets_to_gc_pointers` after
+        // `_trace_slow_path`. An offset-traced subclass always inherits
+        // its parent's fixed offsets. A custom-traced subclass inherits
+        // them only when `inherits_parent_offsets` is set
+        // (`object_subclass_with_gc_ptrs_and_custom_trace` with a
+        // non-empty offset list). `object_subclass_with_custom_trace`
+        // leaves the flag clear so a hook that already walks the base
+        // fields is not traced twice.
+        if (info.custom_trace.is_none() || info.inherits_parent_offsets)
             && let Some(parent_id) = info.parent
         {
             let parent = self
