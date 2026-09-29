@@ -67,7 +67,7 @@ pub static ARRAY_USER_TYPE: PyType = new_user_pytype(
 );
 
 /// User-subclass array layout (`typedef.py` `_getusercls`). Unconditional,
-/// so its tid sits with the other closed ids (176) ahead of the
+/// so its tid sits with the other closed ids (167) ahead of the
 /// target-gated tail.
 pub const W_ARRAY_USER_GC_TYPE_ID: u32 = 167;
 pub const W_ARRAY_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_ArrayUser>();

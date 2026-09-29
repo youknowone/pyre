@@ -2045,7 +2045,7 @@ pub fn ascii_set_storage_gc_type_id() -> u32 {
 /// Fixed payload size (`framework.py:811`).
 pub const W_SET_OBJECT_SIZE: usize = std::mem::size_of::<W_SetObject>();
 /// User-subclass set layout (`typedef.py` `_getusercls`). Unconditional,
-/// so its tid sits with the other closed ids (175) ahead of the
+/// so its tid sits with the other closed ids (166) ahead of the
 /// target-gated tail. `set` and `frozenset` share it.
 pub const W_SET_USER_GC_TYPE_ID: u32 = 166;
 pub const W_SET_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_SetObjectUser>();

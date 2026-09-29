@@ -136,7 +136,7 @@ pub static WEAKREF_LAYOUT_USER_TYPE: PyType = new_user_pytype(
 );
 
 /// User-subclass weakref layout (`typedef.py` `_getusercls`). Unconditional,
-/// so its tid sits with the other closed ids (177) ahead of the
+/// so its tid sits with the other closed ids (168) ahead of the
 /// target-gated tail.
 pub const W_WEAKREF_USER_GC_TYPE_ID: u32 = 168;
 pub const W_WEAKREF_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_WeakrefUser>();
