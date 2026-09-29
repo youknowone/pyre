@@ -26017,28 +26017,9 @@ fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
     let Some(result) = pyre_object::with_roots!(a =>
     crate::baseobjspace::simple_buffer_bytes(a).map(|buffer| {
         buffer.map(|buffer| {
-            // `release` can collect. The parse `Result` drops at the end
-            // of its scope, which ends before the release; a live handle
-            // is pinned across the release.
-            let (ok_bytes, mut err) = {
-                let parsed = parse_hex_bytes(buffer.as_bytes());
-                match parsed {
-                    Ok(bytes) => (Some(bytes), None),
-                    Err(e) => (None, Some(e)),
-                }
-            };
-            if let Some(ref mut e) = err {
-                let roots = pyre_object::gc_roots::push_roots();
-                let slot = e.pin(&roots);
-                buffer.release();
-                e.reload(&roots, slot);
-            } else {
-                buffer.release();
-            }
-            match err {
-                Some(e) => Err(e),
-                None => Ok(ok_bytes.unwrap()),
-            }
+            let result = parse_hex_bytes(buffer.as_bytes());
+            buffer.release();
+            result
         })
     }))?
     else {

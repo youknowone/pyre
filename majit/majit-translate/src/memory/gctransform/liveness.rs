@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 
 use majit_charon_reader::ullbc::{
     BasicBlock, CallFunc, CallKind, FunId, Operand, Place, PlaceKind, ProjectionElem, Rvalue,
-    StmtKind, SwitchTargets, TermKind, TyRef,
+    StmtKind, SwitchTargets, TermKind, TyRef, TypeDeclKind,
 };
 
 /// One call that can collect, with GC pointers live across it and no bracket.
@@ -1381,6 +1381,10 @@ pub fn scan(
         })
         .map(|(id, _)| *id)
         .collect();
+    // Drop glue is a property of the type, not of the local that holds it.
+    // One answer per hash-cons id is reused across every body in the artefact.
+    let drop_owners = explicit_drop_owners(llbc);
+    let mut drop_memo: HashMap<u64, bool> = HashMap::new();
     for fd in llbc.iter_local_fns() {
         let id = fd.def_id;
         if !reach.contains(&id) {
@@ -1966,7 +1970,14 @@ pub fn scan(
                         live.extend(sl.iter().copied());
                     }
                 }
-                transfer_term(t, &mut live, &metadata_fns);
+                transfer_term(
+                    t,
+                    &mut live,
+                    &metadata_fns,
+                    llbc,
+                    &drop_owners,
+                    &mut drop_memo,
+                );
                 for st in body.body[b].statements.iter().rev() {
                     if let Ok(k) = st.stmt_kind() {
                         transfer_stmt(&k, &mut live, &gc_locals);
@@ -2302,7 +2313,14 @@ fn term_span<'a>(
         .expect("span id is not in the artefact span table")
 }
 
-fn transfer_term(t: &TermKind, live: &mut HashSet<u64>, metadata_fns: &HashSet<u64>) {
+fn transfer_term(
+    t: &TermKind,
+    live: &mut HashSet<u64>,
+    metadata_fns: &HashSet<u64>,
+    llbc: &majit_charon_reader::Llbc,
+    drop_owners: &HashSet<u64>,
+    drop_memo: &mut HashMap<u64, bool>,
+) {
     match t {
         TermKind::Call { call, .. } => {
             if let Some(d) = bare_local(&call.dest) {
@@ -2324,12 +2342,297 @@ fn transfer_term(t: &TermKind, live: &mut HashSet<u64>, metadata_fns: &HashSet<u
         }
         TermKind::Switch { discr, .. } => use_operand(discr, live),
         TermKind::Assert { assert, .. } => use_operand(&assert.cond, live),
+        // A `Drop` reads the local only when its drop glue runs a user
+        // `Drop` impl. Upstream livevars stop at the last real use; glue
+        // that does not run user code is not one.
         TermKind::Drop { place, .. } => {
-            if let Some(l) = place_local(place) {
+            if let Some(l) = place_local(place)
+                && ty_may_run_user_drop(&place.ty, llbc, drop_owners, drop_memo, &[], &[], 0)
+            {
                 live.insert(l);
             }
         }
         _ => {}
+    }
+}
+
+/// Self types of `core::ops::drop::Drop` impls in this artefact.
+///
+/// An impl whose trait decl is missing counts too: that is the same
+/// "cannot prove dropless" answer as `type_decl_has_explicit_drop`.
+fn explicit_drop_owners(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
+    let mut owners = HashSet::new();
+    for row in llbc.trait_impls_raw() {
+        let Some(impl_trait) = row.get("impl_trait") else {
+            continue;
+        };
+        let Some(def_id) = impl_trait
+            .get("generics")
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+            .and_then(|owner| impl_self_def_id(llbc, owner))
+        else {
+            continue;
+        };
+        let drop_or_unknown = impl_trait
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|trait_id| llbc.trait_by_id(trait_id))
+            .is_none_or(|decl| decl.item_meta.name_path() == "core::ops::drop::Drop");
+        if drop_or_unknown {
+            owners.insert(def_id);
+        }
+    }
+    owners
+}
+
+/// Nominal ADT def id of an impl's first type argument.
+///
+/// `Value: [id, body]` and `Deduplicated: id` are the two spellings
+/// `resolve_tyexpr_to_adt_def_id_free` accepts. Tuple and `str` have no
+/// nominal owner; `Box` does.
+fn impl_self_def_id(llbc: &majit_charon_reader::Llbc, ty: &serde_json::Value) -> Option<u64> {
+    if let Some(pair) = ty.get("Value").and_then(serde_json::Value::as_array)
+        && let Some(body) = pair.get(1)
+    {
+        return body.get("Adt").and_then(adt_nominal_def_id);
+    }
+    if let Some(id) = ty.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return llbc.dedup_to_adt_def_id(id);
+    }
+    ty.get("Adt").and_then(adt_nominal_def_id)
+}
+
+fn adt_nominal_def_id(adt: &serde_json::Value) -> Option<u64> {
+    match adt.get("builtin").and_then(serde_json::Value::as_str) {
+        None | Some("Box") => adt.get("id").and_then(serde_json::Value::as_u64),
+        Some(_) => None,
+    }
+}
+
+fn ty_body<'a>(
+    ty: &'a TyRef,
+    llbc: &'a majit_charon_reader::Llbc,
+) -> Option<&'a serde_json::Value> {
+    match ty {
+        TyRef::Inline { value: (_, body) } => Some(body),
+        TyRef::Other(body) => Some(body),
+        TyRef::Dedup { id } => llbc.dedup_body(*id),
+    }
+}
+
+/// Whether dropping `ty` can run a user `Drop` impl.
+///
+/// `subst` binds type variables of `ty`; `outer` binds type variables that
+/// occur inside those arguments. A generic parameter with no binding, a
+/// trait object, a missing decl, or a walk deeper than 16 types counts.
+/// The memo is the hash-cons id of a closed type, so two instantiations of
+/// one ADT do not share an answer. It is not keyed by a local.
+fn ty_may_run_user_drop(
+    ty: &TyRef,
+    llbc: &majit_charon_reader::Llbc,
+    owners: &HashSet<u64>,
+    memo: &mut HashMap<u64, bool>,
+    subst: &[serde_json::Value],
+    outer: &[serde_json::Value],
+    depth: usize,
+) -> bool {
+    let closed = subst.is_empty() && outer.is_empty();
+    let key = if closed { ty_id(ty) } else { None };
+    if let Some(id) = key
+        && let Some(answer) = memo.get(&id)
+    {
+        return *answer;
+    }
+    if let Some(id) = key {
+        // A cycle of closed types has no user destructor of its own.
+        memo.insert(id, false);
+    }
+    let answer = match ty_body(ty, llbc) {
+        Some(body) => value_may_run_user_drop(body, llbc, owners, memo, subst, outer, depth),
+        None => true,
+    };
+    if let Some(id) = key {
+        memo.insert(id, answer);
+    }
+    answer
+}
+
+fn value_may_run_user_drop(
+    node: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+    owners: &HashSet<u64>,
+    memo: &mut HashMap<u64, bool>,
+    subst: &[serde_json::Value],
+    outer: &[serde_json::Value],
+    depth: usize,
+) -> bool {
+    if depth > 16 {
+        return true;
+    }
+    let closed = subst.is_empty() && outer.is_empty();
+    let mut node = node;
+    let mut memo_id = None;
+    let mut peeled = false;
+    for _ in 0..24 {
+        if let Some(id) = node.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            if closed {
+                if let Some(answer) = memo.get(&id).copied() {
+                    if let Some(outer_id) = memo_id {
+                        memo.insert(outer_id, answer);
+                    }
+                    return answer;
+                }
+                memo.insert(id, false);
+                memo_id = Some(id);
+            }
+            match llbc.dedup_body(id) {
+                Some(body) => node = body,
+                None => {
+                    if let Some(id) = memo_id {
+                        memo.insert(id, true);
+                    }
+                    return true;
+                }
+            }
+            continue;
+        }
+        if let Some(pair) = node.get("Value").and_then(serde_json::Value::as_array)
+            && pair.len() == 2
+        {
+            if closed
+                && memo_id.is_none()
+                && let Some(id) = pair[0].as_u64()
+            {
+                if let Some(answer) = memo.get(&id).copied() {
+                    return answer;
+                }
+                memo.insert(id, false);
+                memo_id = Some(id);
+            }
+            node = &pair[1];
+            continue;
+        }
+        peeled = true;
+        break;
+    }
+    let answer = if peeled {
+        type_node_may_run_user_drop(node, llbc, owners, memo, subst, outer, depth)
+    } else {
+        true
+    };
+    if let Some(id) = memo_id {
+        memo.insert(id, answer);
+    }
+    answer
+}
+
+fn type_node_may_run_user_drop(
+    node: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+    owners: &HashSet<u64>,
+    memo: &mut HashMap<u64, bool>,
+    subst: &[serde_json::Value],
+    outer: &[serde_json::Value],
+    depth: usize,
+) -> bool {
+    if node.as_str() == Some("Never")
+        || node.get("Scalar").is_some()
+        || node.get("Ref").is_some()
+        || node.get("RawPtr").is_some()
+        || node.get("FnDef").is_some()
+        || node.get("FnPtr").is_some()
+    {
+        return false;
+    }
+    if let Some(type_var) = node.get("TypeVar") {
+        let Some(index) = typevar_index(type_var) else {
+            return true;
+        };
+        let Some(arg) = subst.get(index) else {
+            return true;
+        };
+        return value_may_run_user_drop(arg, llbc, owners, memo, outer, &[], depth + 1);
+    }
+    if node.get("DynTrait").is_some() || node.get("Dynamic").is_some() {
+        return true;
+    }
+    if let Some(adt) = node.get("Adt") {
+        return adt_may_run_user_drop(adt, llbc, owners, memo, subst, depth);
+    }
+    if let Some(element) = node
+        .get("Array")
+        .or_else(|| node.get("Slice"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parts| parts.first())
+    {
+        return value_may_run_user_drop(element, llbc, owners, memo, subst, outer, depth + 1);
+    }
+    true
+}
+
+/// Index of a `TypeVar` bound at the innermost binder, or `None` when the
+/// binder is not that one (the argument list in hand does not cover it).
+fn typevar_index(type_var: &serde_json::Value) -> Option<usize> {
+    let pair = type_var
+        .get("Bound")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| type_var.as_array())?;
+    let debruijn = pair.first()?.as_u64()?;
+    let index = pair.get(1)?.as_u64()?;
+    (debruijn == 0).then_some(index as usize)
+}
+
+fn adt_may_run_user_drop(
+    adt: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+    owners: &HashSet<u64>,
+    memo: &mut HashMap<u64, bool>,
+    enclosing: &[serde_json::Value],
+    depth: usize,
+) -> bool {
+    let args: &[serde_json::Value] = adt
+        .get("generics")
+        .and_then(|generics| generics.get("types"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    // A tuple's elements are its type arguments. Other non-nominal builtins
+    // (`str`, and anything this reader does not model) stay uses.
+    if adt.get("builtin").and_then(serde_json::Value::as_str) == Some("Tuple") {
+        return args.iter().any(|arg| {
+            value_may_run_user_drop(arg, llbc, owners, memo, enclosing, &[], depth + 1)
+        });
+    }
+    let Some(def_id) = adt_nominal_def_id(adt) else {
+        return true;
+    };
+    if owners.contains(&def_id) {
+        return true;
+    }
+    let Some(decl) = llbc.type_by_id(def_id) else {
+        return true;
+    };
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields.iter().any(|field| {
+            ty_may_run_user_drop(&field.ty, llbc, owners, memo, args, enclosing, depth + 1)
+        }),
+        TypeDeclKind::Enum(variants) => variants.iter().any(|variant| {
+            variant.fields.iter().any(|field| {
+                ty_may_run_user_drop(&field.ty, llbc, owners, memo, args, enclosing, depth + 1)
+            })
+        }),
+        // No field list. A destructor of this shape can still run the
+        // instantiation's type arguments; an argument that is itself
+        // dropless contributes nothing.
+        TypeDeclKind::Opaque => args
+            .iter()
+            .any(|arg| value_may_run_user_drop(arg, llbc, owners, memo, enclosing, &[], depth + 1)),
+        TypeDeclKind::Alias(body) => {
+            value_may_run_user_drop(body, llbc, owners, memo, args, enclosing, depth + 1)
+        }
+        TypeDeclKind::Unknown => true,
     }
 }
 
@@ -2702,5 +3005,349 @@ mod tests {
         assert!(!ids.contains(&4));
         assert!(!ids.contains(&5));
         assert!(!ids.contains(&9));
+    }
+
+
+    fn item_meta(path: &[&str]) -> serde_json::Value {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    }
+
+    fn generics(types: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "regions": [], "types": types, "const_generics": [], "trait_refs": []
+        })
+    }
+
+    fn adt(id: u64, types: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {"id": id, "generics": generics(types), "builtin": null}
+        })
+    }
+
+    fn inline(id: u64, body: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"Value": [id, body]})
+    }
+
+    fn raw_ptr() -> serde_json::Value {
+        serde_json::json!({"RawPtr": [null, "Mut"]})
+    }
+
+    fn field(ty: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"name": "_0", "is_positional": true, "ty": ty})
+    }
+
+    fn struct_decl(id: u64, name: &str, fields: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": item_meta(&[name]),
+            "kind": {"Struct": fields}
+        })
+    }
+
+    fn trait_decl(id: u64, path: &[&str]) -> serde_json::Value {
+        serde_json::json!({"def_id": id, "item_meta": item_meta(path)})
+    }
+
+    fn trait_impl(trait_id: u64, adt_id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "impl_trait": {
+                "id": trait_id,
+                "generics": {"types": [inline(1, adt(adt_id, serde_json::json!([])))]}
+            }
+        })
+    }
+
+    /// Locals live across the collecting call that sits between the payload's
+    /// last real use and the `Drop` of that payload.
+    fn live_across_drop(
+        type_decls: serde_json::Value,
+        trait_decls: serde_json::Value,
+        trait_impls: serde_json::Value,
+        payload_ty: serde_json::Value,
+    ) -> Vec<String> {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = inline(1, serde_json::json!({"Scalar": "Bool"}));
+        let gens = generics(serde_json::json!([]));
+        let place =
+            |id: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+        let call = |fun: u64,
+                    args: serde_json::Value,
+                    dest: u64,
+                    dest_ty: &serde_json::Value,
+                    target: u64| {
+            serde_json::json!({
+                "statements": [],
+                "terminator": {"span": span.clone(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
+                        "args": args,
+                        "dest": place(dest, dest_ty)
+                    },
+                    "target": target,
+                    "on_unwind": 3
+                }}}
+            })
+        };
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "holder"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span.clone(), "ty": scalar.clone()},
+                    {"index": 1, "name": "tmp", "span": span.clone(), "ty": scalar.clone()},
+                    {"index": 2, "name": "payload", "span": span.clone(), "ty": payload_ty.clone()}
+                ]},
+                "body": [
+                    call(2, serde_json::json!([{"Copy": place(2, &payload_ty)}]), 1, &scalar, 1),
+                    call(1, serde_json::json!([]), 0, &scalar, 2),
+                    {"statements": [], "terminator": {"span": span.clone(), "kind": {"Drop": {
+                        "place": place(2, &payload_ty),
+                        "fn_ptr": {"kind": {"Fun": 1}, "generics": gens.clone()},
+                        "target": 3,
+                        "on_unwind": 3
+                    }}}},
+                    {"statements": [], "terminator": {"span": span.clone(), "kind": "Return"}}
+                ]
+            }}
+        });
+        let opaque = |id: u64, name: &str| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(&["fixture", name]),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": "Opaque"
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": type_decls,
+                "fun_decls": [holder, opaque(1, "collect"), opaque(2, "touch")],
+                "global_decls": [],
+                "trait_decls": trait_decls,
+                "trait_impls": trait_impls
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("drop fixture parses");
+        let cg = super::super::framework::build(&llbc);
+        let mut reach = HashSet::new();
+        reach.insert(0);
+        reach.insert(1);
+        let mut gc_tys = HashSet::new();
+        gc_tys.insert(100);
+        let (findings, stats) = scan(
+            &llbc,
+            &cg,
+            &reach,
+            &HashSet::new(),
+            &gc_tys,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            stats.unparsed_terminator_bodies, 0,
+            "the fixture's terminators must parse"
+        );
+        assert_eq!(
+            stats.bodies_scanned, 1,
+            "the payload must be a tracked local"
+        );
+        findings
+            .into_iter()
+            .flat_map(|finding| finding.live_non_arg)
+            .collect()
+    }
+
+    /// The `Drop` after the payload's last real use is not itself a use, so
+    /// the collecting call between them sees a dead local.
+    #[test]
+    fn a_drop_of_a_dropless_local_after_its_last_use_leaves_it_dead() {
+        let payload = struct_decl(
+            0,
+            "Handle",
+            serde_json::json!([field(inline(7, raw_ptr()))]),
+        );
+        let ty = inline(100, adt(0, serde_json::json!([])));
+        let live = live_across_drop(
+            serde_json::json!([payload]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            ty,
+        );
+        assert!(live.is_empty(), "dropless drop kept {live:?} live");
+    }
+
+    /// A type with a `Drop` impl is read by its destructor, so the local is
+    /// live at the collecting call that precedes that `Drop`.
+    #[test]
+    fn a_drop_of_a_type_with_a_drop_impl_keeps_it_live() {
+        let payload = struct_decl(0, "Guard", serde_json::json!([]));
+        let ty = inline(100, adt(0, serde_json::json!([])));
+        let live = live_across_drop(
+            serde_json::json!([payload]),
+            serde_json::json!([trait_decl(0, &["core", "ops", "drop", "Drop"])]),
+            serde_json::json!([trait_impl(0, 0)]),
+            ty,
+        );
+        assert_eq!(live, vec!["payload".to_string()]);
+    }
+
+    /// The destructor runs for a field too, not only for the outer type's
+    /// own impl.
+    #[test]
+    fn a_drop_of_a_struct_whose_field_has_a_drop_impl_keeps_it_live() {
+        let outer = struct_decl(
+            0,
+            "Outer",
+            serde_json::json!([field(inline(8, adt(1, serde_json::json!([]))))]),
+        );
+        let inner = struct_decl(1, "Inner", serde_json::json!([]));
+        let ty = inline(100, adt(0, serde_json::json!([])));
+        let live = live_across_drop(
+            serde_json::json!([outer, inner]),
+            serde_json::json!([trait_decl(0, &["core", "ops", "drop", "Drop"])]),
+            serde_json::json!([trait_impl(0, 1)]),
+            ty,
+        );
+        assert_eq!(live, vec!["payload".to_string()]);
+    }
+
+    /// `Result<RawPtr, RawPtr>`: the enum's fields are type variables, and
+    /// neither instantiation argument runs a user destructor.
+    #[test]
+    fn a_drop_of_an_instantiated_enum_of_raw_pointers_leaves_it_dead() {
+        let result = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["Result"]),
+            "kind": {"Enum": [
+                {"name": "Ok", "fields": [field(inline(5, serde_json::json!({"TypeVar": {"Bound": [0, 0]}})))]},
+                {"name": "Err", "fields": [field(inline(6, serde_json::json!({"TypeVar": {"Bound": [0, 1]}})))]}
+            ]}
+        });
+        let ty = inline(
+            100,
+            adt(
+                0,
+                serde_json::json!([inline(101, raw_ptr()), inline(102, raw_ptr())]),
+            ),
+        );
+        let live = live_across_drop(
+            serde_json::json!([result]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            ty,
+        );
+        assert!(live.is_empty(), "enum of raw pointers kept {live:?} live");
+    }
+
+    /// An unbound type variable can be anything, so the `Drop` counts.
+    #[test]
+    fn a_drop_of_a_generic_parameter_keeps_it_live() {
+        let ty = inline(100, serde_json::json!({"TypeVar": {"Bound": [0, 0]}}));
+        let live = live_across_drop(
+            serde_json::json!([]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            ty,
+        );
+        assert_eq!(live, vec!["payload".to_string()]);
+    }
+
+    /// No declaration means the destructor contract is unknown.
+    #[test]
+    fn a_drop_of_a_missing_decl_keeps_it_live() {
+        let ty = inline(100, adt(0, serde_json::json!([])));
+        let live = live_across_drop(
+            serde_json::json!([]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            ty,
+        );
+        assert_eq!(live, vec!["payload".to_string()]);
+    }
+
+    /// An opaque body has no fields. Its type arguments are what a
+    /// destructor can still run, and a raw pointer does not.
+    #[test]
+    fn a_drop_of_an_opaque_type_of_raw_pointers_leaves_it_dead() {
+        let wrapper = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["Vec"]),
+            "kind": "Opaque"
+        });
+        let ty = inline(100, adt(0, serde_json::json!([inline(101, raw_ptr())])));
+        let live = live_across_drop(
+            serde_json::json!([wrapper]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            ty,
+        );
+        assert!(
+            live.is_empty(),
+            "opaque raw-pointer wrapper kept {live:?} live"
+        );
+    }
+
+    /// The same opaque shape keeps the local live when an argument has a
+    /// `Drop` impl.
+    #[test]
+    fn a_drop_of_an_opaque_type_carrying_a_drop_type_keeps_it_live() {
+        let wrapper = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["Vec"]),
+            "kind": "Opaque"
+        });
+        let inner = struct_decl(1, "Guard", serde_json::json!([]));
+        let ty = inline(
+            100,
+            adt(
+                0,
+                serde_json::json!([inline(101, adt(1, serde_json::json!([])))]),
+            ),
+        );
+        let live = live_across_drop(
+            serde_json::json!([wrapper, inner]),
+            serde_json::json!([trait_decl(0, &["core", "ops", "drop", "Drop"])]),
+            serde_json::json!([trait_impl(0, 1)]),
+            ty,
+        );
+        assert_eq!(live, vec!["payload".to_string()]);
+    }
+
+    /// `Copy` is not `Drop`. A missing trait decl is not `Copy` either: the
+    /// impl cannot be shown to be something other than a destructor.
+    #[test]
+    fn a_copy_impl_does_not_keep_the_local_live_but_an_unresolved_impl_does() {
+        let payload = struct_decl(0, "Bits", serde_json::json!([]));
+        let ty = inline(100, adt(0, serde_json::json!([])));
+        let copy = live_across_drop(
+            serde_json::json!([payload.clone()]),
+            serde_json::json!([trait_decl(0, &["core", "marker", "Copy"])]),
+            serde_json::json!([trait_impl(0, 0)]),
+            ty.clone(),
+        );
+        assert!(copy.is_empty(), "Copy kept {copy:?} live");
+        let unresolved = live_across_drop(
+            serde_json::json!([payload]),
+            serde_json::json!([]),
+            serde_json::json!([trait_impl(9, 0)]),
+            ty,
+        );
+        assert_eq!(unresolved, vec!["payload".to_string()]);
     }
 }

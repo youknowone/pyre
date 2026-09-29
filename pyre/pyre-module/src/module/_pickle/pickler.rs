@@ -3115,30 +3115,20 @@ fn save_global_surrogate_module(
 ) -> Result<(), PyError> {
     if ctx.proto < 4 {
         let encoding = if ctx.proto < 3 { "ascii" } else { "utf-8" };
-        // The encode `Result` drops at the end of its scope, so that scope
-        // ends before either error constructor, both of which can collect.
-        let encode_err = {
-            let encoded = pyre_interpreter::type_methods::encode_object(
-                pyre_object::gc_roots::shadow_stack_get(module_slot),
-                encoding,
-                "strict",
-            );
-            match encoded {
-                Ok(_) => None,
-                Err(error) => Some(error),
-            }
-        };
-        return if let Some(error) = encode_err {
-            Err(identifier_encoding_error(
+        return match pyre_interpreter::type_methods::encode_object(
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+            encoding,
+            "strict",
+        ) {
+            Ok(_) => Err(pickling_error(
+                "surrogate module identifier unexpectedly encoded",
+            )),
+            Err(error) => Err(identifier_encoding_error(
                 error,
                 pyre_object::gc_roots::shadow_stack_get(module_slot),
                 "module",
                 ctx.proto,
-            ))
-        } else {
-            Err(pickling_error(
-                "surrogate module identifier unexpectedly encoded",
-            ))
+            )),
         };
     }
     save(
@@ -3209,21 +3199,11 @@ fn save_global_surrogate_name(
 
     if ctx.proto < 4 {
         let encoding = if ctx.proto < 3 { "ascii" } else { "utf-8" };
-        // Each encode `Result` drops at the end of its scope. The module
-        // result is gone before the name is encoded, and both are gone
-        // before either error constructor.
-        let module_encode_err = {
-            let module_encoded = pyre_interpreter::type_methods::encode_object(
-                pyre_object::gc_roots::shadow_stack_get(module_slot),
-                encoding,
-                "strict",
-            );
-            match module_encoded {
-                Ok(_) => None,
-                Err(error) => Some(error),
-            }
-        };
-        if let Some(error) = module_encode_err {
+        if let Err(error) = pyre_interpreter::type_methods::encode_object(
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+            encoding,
+            "strict",
+        ) {
             return Err(identifier_encoding_error(
                 error,
                 pyre_object::gc_roots::shadow_stack_get(module_slot),
@@ -3231,28 +3211,20 @@ fn save_global_surrogate_name(
                 ctx.proto,
             ));
         }
-        let name_encode_err = {
-            let name_encoded = pyre_interpreter::type_methods::encode_object(
-                pyre_object::gc_roots::shadow_stack_get(name_slot),
-                encoding,
-                "strict",
-            );
-            match name_encoded {
-                Ok(_) => None,
-                Err(error) => Some(error),
-            }
-        };
-        return if let Some(error) = name_encode_err {
-            Err(identifier_encoding_error(
+        return match pyre_interpreter::type_methods::encode_object(
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+            encoding,
+            "strict",
+        ) {
+            Ok(_) => Err(pickling_error(
+                "surrogate global identifier unexpectedly encoded",
+            )),
+            Err(error) => Err(identifier_encoding_error(
                 error,
                 pyre_object::gc_roots::shadow_stack_get(name_slot),
                 "global",
                 ctx.proto,
-            ))
-        } else {
-            Err(pickling_error(
-                "surrogate global identifier unexpectedly encoded",
-            ))
+            )),
         };
     }
 
