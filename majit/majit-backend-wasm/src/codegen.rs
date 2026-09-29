@@ -4335,7 +4335,8 @@ fn aligned_varsize_frame_bump(size: i64) -> Option<u32> {
 }
 
 /// `gen_initialize_tid` immediately after `CallMallocNursery`: a constant
-/// HALFWORD store of the type id into the header word at `obj - HDR_SIZE`.
+/// Signed `HDR.tid` store of the type id into the header word at
+/// `obj - HDR_SIZE`.
 struct NurseryTidStore {
     tid: i64,
     offset: i64,
@@ -4358,7 +4359,7 @@ fn nursery_header_tid_store(
         return None;
     }
     let width = const_operand_value(constants, next.arg(3).to_opref())?;
-    if width != (std::mem::size_of::<usize>() / 2) as i64 {
+    if width != std::mem::size_of::<usize>() as i64 {
         return None;
     }
     let tid = const_operand_value(constants, next.arg(2).to_opref())?;
@@ -8474,11 +8475,10 @@ fn build_function(
             // rewrite.py `CALL_MALLOC_NURSERY(ConstInt(size))`: size is the
             // already-rounded header+payload total. Fast path is malloc_cond
             // (bump, write the physical header word, return free+HDR). Slow
-            // path is `wasm_jit_alloc(0, payload)` — a following HALFWORD tid
-            // store keeps old-gen TRACK_YOUNG_PTRS. When that store is the
-            // next op, the fast path writes the tid in the same header store
-            // (flags and padding stay zero) and the HALFWORD store runs only
-            // on this slow arm.
+            // path is `wasm_jit_alloc(0, payload)`. When the following
+            // `gen_initialize_tid` store is the next op, the fast path writes
+            // the tid in the same physical header store (flags and padding
+            // stay zero) and the tid store runs only on this slow arm.
             OpCode::CallMallocNursery => {
                 let vi = op.pos().get().raw();
                 let size_const = const_operand_value(constants, op.arg(0).to_opref());
@@ -8564,7 +8564,7 @@ fn build_function(
                         memory_index: 0,
                     });
                     // Physical header word. Tid is the low half when the
-                    // following HALFWORD store was folded in; otherwise zero.
+                    // following tid store was folded in; otherwise zero.
                     // Payload stays dirty (`malloc_zero_filled = False`).
                     sink.local_get(alloc_scratch_local);
                     sink.i64_const(header_word);

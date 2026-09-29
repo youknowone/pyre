@@ -10565,7 +10565,8 @@ fn tid_gc_store(obj: u32, tid: i64) -> Op {
             OpRef::ref_op(obj),
             OpRef::const_int(-(std::mem::size_of::<usize>() as i64)),
             OpRef::const_int(tid),
-            OpRef::const_int((std::mem::size_of::<usize>() / 2) as i64),
+            // `gen_initialize_tid`: the whole Signed `HDR.tid`.
+            OpRef::const_int(std::mem::size_of::<usize>() as i64),
         ],
         OpRef::NONE,
     )
@@ -11273,24 +11274,13 @@ fn call_malloc_nursery_tid_store_is_one_fast_path_header_store() {
         fast.i64, 1,
         "fast path header store is full-width: {fast:?}"
     );
+    assert_eq!(fast.i64_32 + fast.i64_16, 0, "{fast:?}");
+    // Slow path: the rewriter's tid store runs as-is, one native-word store.
     assert_eq!(
-        fast.i64_32, 0,
-        "fast path must not HALFWORD-store tid: {fast:?}"
+        slow.i64_off0, 1,
+        "slow path keeps the one tid store: {slow:?}"
     );
-    assert_eq!(
-        fast.i64_16, 0,
-        "fast path must not HALFWORD-store tid: {fast:?}"
-    );
-    // Slow path: HALFWORD tid so old-gen flags survive; no full-width header.
-    let halfword = slow.i64_32 + slow.i64_16;
-    assert_eq!(
-        halfword, 1,
-        "slow path keeps the HALFWORD tid store: {slow:?}"
-    );
-    assert_eq!(
-        slow.i64_off0, 0,
-        "slow path must not write a full-width header: {slow:?}"
-    );
+    assert_eq!(slow.i64_32 + slow.i64_16, 0, "{slow:?}");
 }
 
 #[test]

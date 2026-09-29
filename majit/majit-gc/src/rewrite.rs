@@ -3098,30 +3098,6 @@ impl GcRewriterImpl {
                     &[st.last_malloced_ref.clone(), prev_size_ref],
                 );
                 let r = st.emit_result(incr_op, result_pos);
-                // rewrite.py gen_initialize_tid writes the whole Signed
-                // HDR.tid, which zeros flags. pyre's descr is the type-id
-                // half only (`make_tid_field_descr`), so leftover nursery
-                // flags survive unless this store clears that half.
-                // header.rs: flags start at FLAG_SHIFT bits into the
-                // physical header (obj - SIZE + FLAG_SHIFT/8). On wasm32
-                // that is obj-6, not obj-4: obj-4 is ABI padding, and a
-                // recycled HAS_SHADOW bit there is what
-                // `copy_nursery_object` / `find_shadow` then panic on.
-                // Nursery-only: the first CallMallocNursery result can
-                // be an old-gen slow path whose TRACK_YOUNG_PTRS
-                // gen_initialize_tid must keep. Headerless objects have
-                // no flags word in front of the payload.
-                if !self.headerless_fixedsize {
-                    let flags_byteofs = (crate::header::FLAG_SHIFT / 8) as i64;
-                    let flags_ofs =
-                        st.const_int(-(crate::header::GcHeader::SIZE as i64) + flags_byteofs);
-                    let zero = st.const_int(0);
-                    let flags_size = st.const_int((crate::header::TYPE_ID_BITS / 8) as i64);
-                    st.emit(mk_op(
-                        OpCode::GcStore,
-                        &[r.clone(), flags_ofs, zero, flags_size],
-                    ));
-                }
                 st.previous_size = size;
                 st.last_malloced_ref = r.clone();
                 st.remember_wb(&r);
@@ -3170,18 +3146,13 @@ impl GcRewriterImpl {
     /// the actual store address is `obj_ptr + (-HDR_SIZE +
     /// descr.offset())`.  None disables the store (Boehm parity).
     ///
-    /// `fielddescr_tid.field_size` is `WORD / 2` (descr.rs
-    /// `make_tid_field_descr`): pyre's logical HDR word packs the type id
-    /// into its lower half and gc flags (TRACK_YOUNG_PTRS / VISITED / …)
-    /// into its upper half, and the slow `dynasm_nursery_slowpath` /
-    /// cranelift-side malloc helpers may promote large or
-    /// post-collection allocations to the old gen, where
-    /// `collector.rs`'s `alloc_in_oldgen` pre-stamps `TRACK_YOUNG_PTRS`
-    /// in those upper bits.  A full-word store from this helper would
-    /// wipe that bit and leave a fresh oldgen object invisible to the
-    /// remembered-set machinery, dropping any subsequent young pointer
-    /// written into it.  Restricting the GC_STORE width to
-    /// `field_size = WORD / 2` keeps the flags half intact.
+    /// `fielddescr_tid.field_size` is `WORD` (descr.rs
+    /// `make_tid_field_descr`), the whole Signed `HDR.tid`: the store
+    /// writes the type id and clears the flags half, so neither the
+    /// backend's bump nor a NURSERY_PTR_INCREMENT interior object needs a
+    /// separate header clear. That is sound for the same reason it is
+    /// upstream: `gc.py malloc_nursery_slowpath` answers a size that
+    /// passed `can_use_nursery` with a young object whose flags are clear.
     fn gen_initialize_tid(&self, obj: Operand, tid: u32, st: &mut RewriteState<'_>) {
         let Some(tid_fd_ref) = self.fielddescr_tid.as_ref() else {
             return;
@@ -4325,22 +4296,14 @@ mod tests {
             .inline_const_bits()
             .expect("inline ConstInt");
         assert_eq!(tid_val, 7); // type_id = 7
-        // GcHeader packs the type id and gc flags into the lower and upper
-        // halves of the logical native word. gen_initialize_tid must emit a
-        // HALFWORD store so that the runtime-set flags
-        // (collector.rs's alloc_in_oldgen ORs in TRACK_YOUNG_PTRS for
-        // oldgen-promoted allocs) survive the type id stamp.
+        // gen_initialize_tid stores the whole Signed `HDR.tid`, clearing the
+        // flags half along with stamping the type id.
         let store_size = result[1]
             .arg(3)
             .to_opref()
             .inline_const_bits()
             .expect("inline ConstInt");
-        assert_eq!(
-            store_size,
-            (std::mem::size_of::<usize>() / 2) as i64,
-            "gen_initialize_tid must emit a HALFWORD store so oldgen \
-             TRACK_YOUNG_PTRS in the flags half is preserved"
-        );
+        assert_eq!(store_size, std::mem::size_of::<usize>() as i64);
 
         for (_key, c) in &constants {
             assert_eq!(
@@ -5100,88 +5063,27 @@ mod tests {
             round_up(24 + header) as i64
         );
 
-        // Both have tid initialisation; the interior allocation also clears
-        // the flags half of its header because NurseryPtrIncrement bypasses
-        // the backend's CallMallocNursery header clear.
-        let flags_ofs =
-            -(crate::header::GcHeader::SIZE as i64) + (crate::header::FLAG_SHIFT / 8) as i64;
+        // Both have tid initialisation, one Signed `HDR.tid` store each: the
+        // store clears the flags half too, so the interior allocation needs
+        // no separate header clear.
         let tid_stores: Vec<_> = result
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
             .collect();
-        assert_eq!(tid_stores.len(), 3);
-        assert_eq!(
-            tid_stores[0]
-                .arg(2)
-                .to_opref()
-                .inline_const_bits()
-                .expect("inline ConstInt"),
-            1
-        ); // first type_id
-        assert_eq!(
-            tid_stores[2]
-                .arg(2)
-                .to_opref()
-                .inline_const_bits()
-                .expect("inline ConstInt"),
-            2
-        ); // second type_id
-        let half = std::mem::size_of::<usize>() / 2;
-        assert_eq!(
-            tid_stores[1]
-                .arg(1)
-                .to_opref()
-                .inline_const_bits()
-                .expect("inline ConstInt"),
-            flags_ofs
-        );
-        assert_eq!(
-            tid_stores[1]
-                .arg(2)
-                .to_opref()
-                .inline_const_bits()
-                .expect("inline ConstInt"),
-            0
-        );
-        assert_eq!(
-            tid_stores[1]
-                .arg(3)
-                .to_opref()
-                .inline_const_bits()
-                .expect("inline ConstInt"),
-            half as i64
-        );
-    }
-
-    #[test]
-    fn test_npi_flags_store_matches_flag_shift() {
-        let rw = make_rewriter();
-        let ops = vec![
-            Op::with_descr(OpCode::New, &[], size_descr(24, 1)),
-            Op::with_descr(OpCode::New, &[], size_descr(32, 2)),
-        ];
-        let (result, _, _) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
-        let incr_idx = result
-            .iter()
-            .position(|o| o.opcode == OpCode::NurseryPtrIncrement)
-            .expect("batched New emits NurseryPtrIncrement");
-        let flags = &result[incr_idx + 1];
-        assert_eq!(flags.opcode, OpCode::GcStore);
-        let offset = flags
-            .arg(1)
-            .to_opref()
-            .inline_const_bits()
-            .expect("flags offset is ConstInt");
-        let width = flags
-            .arg(3)
-            .to_opref()
-            .inline_const_bits()
-            .expect("flags width is ConstInt");
-        assert_eq!(
-            offset + crate::header::GcHeader::SIZE as i64,
-            i64::from(crate::header::FLAG_SHIFT / 8)
-        );
-        assert_eq!(width * 8, i64::from(crate::header::FLAG_SHIFT));
+        assert_eq!(tid_stores.len(), 2);
+        let tid_ofs = -(crate::header::GcHeader::SIZE as i64);
+        for (store, type_id) in tid_stores.iter().zip([1, 2]) {
+            let arg = |i: usize| {
+                store
+                    .arg(i)
+                    .to_opref()
+                    .inline_const_bits()
+                    .expect("inline ConstInt")
+            };
+            assert_eq!(arg(1), tid_ofs);
+            assert_eq!(arg(2), type_id);
+            assert_eq!(arg(3), std::mem::size_of::<usize>() as i64);
+        }
     }
 
     // ── Test 7: A collecting operation between two NEWs prevents batching ──

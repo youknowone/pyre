@@ -15656,11 +15656,8 @@ impl CraneliftBackend {
                         // (malloc_cond: MOV [nursery_free], edx; continue)
                         builder.switch_to_block(fast_block);
                         builder.seal_block(fast_block);
+                        // `gen_initialize_tid` writes the whole header word.
                         builder.ins().store(flags, new_free, nf_ptr, 0);
-                        let zero_hdr = builder.ins().iconst(cl_types::I64, 0);
-                        builder
-                            .ins()
-                            .store(MemFlagsData::trusted(), zero_hdr, free, 0);
                         let hdr_sz = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                         let obj = builder.ins().iadd(free, hdr_sz);
                         // Pass original values through block params
@@ -15968,14 +15965,11 @@ impl CraneliftBackend {
 
                     builder.ins().brif(fits, fast_block, &[], slow_block, &[]);
 
-                    // fast: bump free pointer, zero GcHeader, return payload
+                    // fast: bump free pointer, return payload.
+                    // `gen_initialize_tid` writes the whole header word.
                     builder.switch_to_block(fast_block);
                     builder.seal_block(fast_block);
                     builder.ins().store(flags, new_free, nf_ptr, 0);
-                    let zero_hdr = builder.ins().iconst(cl_types::I64, 0);
-                    builder
-                        .ins()
-                        .store(MemFlagsData::trusted(), zero_hdr, free, 0);
                     let header_size = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                     let obj_ptr = builder.ins().iadd(free, header_size);
                     let mut fast_args: Vec<BlockArg> =

@@ -12,15 +12,7 @@ pub const PYFRAME_VABLE_OWNER_ROOT: &str = "PyFrame";
 /// in declaration order. RPython's `InstanceRepr._parse_field_list` skips
 /// names with no concrete field; after `PyCode.frame_stores_global` removed
 /// `PyFrame.w_globals` in upstream commit `bcd8653e5ec`, that stale list entry
-/// therefore produces no virtualizable scalar. `PyFrame.lastblock` is deliberately absent:
-/// the frame model tracked by this tree has no block stack. Unwind uses
-/// the `co_exceptiontable` lookup at
-/// `pypy/interpreter/pyopcode.py lookup_exceptiontable`, and pyre's
-/// 3.14 bytecode emits no `SETUP_*` / `POP_BLOCK`, so nothing mutates
-/// the field inside a trace. It remains an ordinary heap field with a
-/// plain `FieldDescr` and a GC root slot. If block opcodes are ever
-/// reintroduced, re-add it here and emit `_opimpl_setfield_vable` from
-/// their handlers; a layout slot with no setfield is not tracking.
+/// therefore produces no virtualizable scalar.
 pub const PYFRAME_VABLE_FIELDS: &[(&str, usize)] = &[
     ("last_instr", 0),      // interp_jit.py:25 last_instr
     ("pycode", 1),          // interp_jit.py:25 pycode

@@ -6917,11 +6917,10 @@ impl<'a> AssemblerARM64<'a> {
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; b.hi =>slow_path);
 
-        // Fast path: x16 still holds &nursery_free; bump it, zero the header,
-        // and return the payload pointer.
+        // Fast path: x16 still holds &nursery_free; bump it and return the
+        // payload pointer. `gen_initialize_tid` writes the whole header word.
         dynasm!(self.mc ; .arch aarch64
             ; str x1, [x16]      // *nursery_free = new_free
-            ; str xzr, [x0]      // zero GcHeader
         );
         let hs = gc_hdr as u32;
         dynasm!(self.mc ; .arch aarch64

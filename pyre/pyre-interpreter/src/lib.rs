@@ -1150,72 +1150,72 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // `collections.deque` W_Deque — auto-id registered at the tail of the
         // GC type chain (`build_gc`), after the coroutine / dict-view-iterator
         // slots, so its vtable alias lands at the current max tid.
-        subclass_range_alias(116, typed::<crate::module::_collections::W_Deque>()),
+        subclass_range_alias(115, typed::<crate::module::_collections::W_Deque>()),
         // Formerly-immortal iterators converted to `allocate_stable` (managed),
         // registered at the tail of the JIT `register_pyre_class` chain after
-        // the pyre-object iterators (W_Struct = 125 .. W_DequeRevIter = 128).
-        subclass_range_alias(125, typed::<crate::module::r#struct::W_Struct>()),
+        // the pyre-object iterators (W_Struct = 124 .. W_DequeRevIter = 127).
+        subclass_range_alias(124, typed::<crate::module::r#struct::W_Struct>()),
         subclass_range_alias(
-            126,
+            125,
             typed::<crate::module::r#struct::unpack_iter::W_UnpackIter>(),
         ),
-        subclass_range_alias(127, typed::<crate::module::_collections::W_DequeIter>()),
-        subclass_range_alias(128, typed::<crate::module::_collections::W_DequeRevIter>()),
+        subclass_range_alias(126, typed::<crate::module::_collections::W_DequeIter>()),
+        subclass_range_alias(127, typed::<crate::module::_collections::W_DequeRevIter>()),
         subclass_range_alias(
-            129,
+            128,
             typed::<crate::pyframe::frame_locals_proxy::FrameLocalsProxy>(),
         ),
-        subclass_range_alias(134, typed::<crate::module::_io::W_BufferedReader>()),
-        subclass_range_alias(135, typed::<crate::module::_io::W_BufferedWriter>()),
-        subclass_range_alias(136, typed::<crate::module::_io::W_BufferedRWPair>()),
-        subclass_range_alias(137, typed::<crate::module::_io::W_BufferedRandom>()),
-        subclass_range_alias(138, typed::<crate::module::_io::W_TextIOWrapper>()),
-        subclass_range_alias(139, typed::<crate::module::thread::W_Local>()),
+        subclass_range_alias(133, typed::<crate::module::_io::W_BufferedReader>()),
+        subclass_range_alias(134, typed::<crate::module::_io::W_BufferedWriter>()),
+        subclass_range_alias(135, typed::<crate::module::_io::W_BufferedRWPair>()),
+        subclass_range_alias(136, typed::<crate::module::_io::W_BufferedRandom>()),
+        subclass_range_alias(137, typed::<crate::module::_io::W_TextIOWrapper>()),
+        subclass_range_alias(138, typed::<crate::module::thread::W_Local>()),
         // `all_w_class_only_descriptors` order, registered in `build_gc`
         // after `W_DequeBlock` and `W_BufferWrapper`.
-        subclass_range_alias(152, typed::<crate::module::thread::W_Lock>()),
-        subclass_range_alias(153, typed::<crate::module::thread::W_RLock>()),
-        subclass_range_alias(154, typed::<crate::module::thread::W_ThreadHandle>()),
+        subclass_range_alias(151, typed::<crate::module::thread::W_Lock>()),
+        subclass_range_alias(152, typed::<crate::module::thread::W_RLock>()),
+        subclass_range_alias(153, typed::<crate::module::thread::W_ThreadHandle>()),
         // `__pypy__.Bufferable` follows them in the order `build_gc`
         // registers them.
         subclass_range_alias(
-            155,
+            154,
             typed::<crate::module::__pypy__::interp_buffer::bufferable_impl::W_Bufferable>(),
         ),
         // `_io.BytesIO` registers after the `rbigint` result pair, which takes
-        // 156 as a bare `with_gc_ptrs` id and carries no vtable of its own.
-        subclass_range_alias(157, typed::<crate::module::_io::W_BytesIO>()),
-        subclass_range_alias(158, typed::<crate::module::_io::W_StringIO>()),
+        // 155 as a bare `with_gc_ptrs` id and carries no vtable of its own.
+        subclass_range_alias(156, typed::<crate::module::_io::W_BytesIO>()),
+        subclass_range_alias(157, typed::<crate::module::_io::W_StringIO>()),
         // `gc.GcRef` keeps its raw referent as a traced wrapper field.
         // referent field is traced on the wrapper itself, as in
         // `pypy/module/gc/referents.py`.
-        subclass_range_alias(159, typed::<crate::module::gc::referents::gcref::W_GcRef>()),
+        subclass_range_alias(158, typed::<crate::module::gc::referents::gcref::W_GcRef>()),
         // `gc.hooks` owns its three callback references directly, matching
         // W_AppLevelHooks in pypy/module/gc/hook.py.
-        subclass_range_alias(160, typed::<crate::module::gc::hook::W_AppLevelHooks>()),
+        subclass_range_alias(159, typed::<crate::module::gc::hook::W_AppLevelHooks>()),
         // `gc._get_stats()` returns referents.py's native W_GcStats owner.
         subclass_range_alias(
-            161,
+            160,
             typed::<crate::module::gc::referents::stats::W_GcStats>(),
         ),
         // `_PyLineIterator` / `_PyPositionsIterator` / `_PyBranchesIterator` —
         // each retains the code object its suspended walk reads.  All three
         // are unconditional, so they precede the target-gated native aliases.
-        subclass_range_alias(162, typed::<crate::pycode::W_LineIterObject>()),
-        subclass_range_alias(163, typed::<crate::pycode::W_PositionsIterObject>()),
-        subclass_range_alias(164, typed::<crate::pycode::W_BranchesIterObject>()),
-        // Native-only posix aliases 172 and 173 preserve `build_gc`'s rclass
-        // registration order after the `_getusercls` layouts (167-171).
+        subclass_range_alias(161, typed::<crate::pycode::W_LineIterObject>()),
+        subclass_range_alias(162, typed::<crate::pycode::W_PositionsIterObject>()),
+        subclass_range_alias(163, typed::<crate::pycode::W_BranchesIterObject>()),
+        // Native-only posix aliases 171 and 172 preserve `build_gc`'s rclass
+        // registration order after the `_getusercls` layouts (166-170).
         // `scandir` has no seam on wasm32, so neither type exists there.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(172, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(171, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(173, typed::<crate::module::posix::W_ScandirIterator>()),
+        subclass_range_alias(172, typed::<crate::module::posix::W_ScandirIterator>()),
         // PEP 528's raw console stream closes the interpreter's classes on
         // Windows.  It is subclassable and therefore participates in the same
         // rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(174, typed::<crate::module::_io::W_WinConsoleIO>()),
+        subclass_range_alias(173, typed::<crate::module::_io::W_WinConsoleIO>()),
     ];
     aliases.extend(module_subclass_range_aliases());
     aliases
@@ -1231,11 +1231,11 @@ const WINDOWS_CONSOLE_IO: bool = cfg!(all(windows, feature = "host_env", not(fea
 /// not depend on which modules are linked; the module classes follow in the
 /// order [`module_gc_types`] lists them.
 pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
-    172
+    171
 } else if WINDOWS_CONSOLE_IO {
-    175
-} else {
     174
+} else {
+    173
 };
 
 /// The GC classes of builtin modules, in `build_gc` order: those of this

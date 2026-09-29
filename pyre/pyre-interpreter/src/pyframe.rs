@@ -1304,9 +1304,6 @@ pub struct PyFrame {
     /// pyframe.py:82 debugdata — lazily allocated tracing/debug payload.
     /// Virtualizable static field (interp_jit.py:28).
     pub debugdata: *mut FrameDebugData,
-    /// pyframe.py:86 lastblock — head of the FrameBlock linked list.
-    /// Virtualizable static field (interp_jit.py:29).
-    pub lastblock: *mut FrameBlock,
     /// Virtualizable token — set by JIT when this frame is virtualized.
     /// 0 = not virtualized, nonzero = pointer to JIT state.
     pub vable_token: usize,
@@ -1349,12 +1346,10 @@ pub struct PyFrame {
 /// drift panics on startup.
 pub const PYFRAME_GC_TYPE_ID: u32 = 37;
 
-/// GC type ids appended after the existing runtime registration census.
-/// `FrameDebugData` is stationary old-gen for a GC-owned frame; block-stack
-/// nodes are ordinary nursery objects.  Keep these at the tail of
-/// `pyre-jit::eval::build_gc` so older type ids never shift.
+/// GC type id appended after the existing runtime registration census.
+/// `FrameDebugData` is stationary old-gen for a GC-owned frame.  Keep this
+/// at the tail of `pyre-jit::eval::build_gc` so older type ids never shift.
 pub const FRAME_DEBUG_DATA_GC_TYPE_ID: u32 = 103;
-pub const FRAME_BLOCK_GC_TYPE_ID: u32 = 104;
 
 /// GC header size in bytes — single source of truth is
 /// [`majit_gc::header::GcHeader::SIZE`]. Every `FixedObjectArray` and
@@ -1558,8 +1553,8 @@ pub struct FrameBox {
 const _: fn(PyFrame) -> FrameBox = FrameBox::new;
 
 /// First published-root index [`FrameBox::new`] gives to the interior of a
-/// `std::alloc` `FrameDebugData`, after the frame's own nine GCREF fields.
-const FRAME_BOX_DEBUG_INPUT: usize = 9;
+/// `std::alloc` `FrameDebugData`, after the frame's own eight GCREF fields.
+const FRAME_BOX_DEBUG_INPUT: usize = 8;
 
 impl FrameBox {
     /// Move `frame` onto the heap behind a GC header.
@@ -1569,7 +1564,7 @@ impl FrameBox {
     /// installed this allocates a non-moving YOUNG `PYFRAME_GC_TYPE_ID`
     /// block (`external_malloc(..., alloc_young=True)`, through
     /// `try_gc_alloc_young_nonmoving_raw`); the collector reclaims the frame
-    /// and its GC-managed locals, debug data, and block stack once no root
+    /// and its GC-managed locals and debug data once no root
     /// (the handle's own owner root while it lives, then `walk_pyframe_roots`
     /// over the `CURRENT_FRAME` / `f_backref` chain or a traced edge such as
     /// a traceback's `tb_frame`) reaches it, so `Drop` performs no manual
@@ -1653,7 +1648,6 @@ impl FrameBox {
             frame.pycode as pyre_object::PyObjectRef,
             frame.locals_cells_stack_w as pyre_object::PyObjectRef,
             frame.debugdata as pyre_object::PyObjectRef,
-            frame.lastblock as pyre_object::PyObjectRef,
             frame.f_generator_wref,
             frame.w_yielding_from,
             frame.f_backref as pyre_object::PyObjectRef,
@@ -1700,11 +1694,10 @@ impl FrameBox {
             frame.locals_cells_stack_w =
                 frame_root.get(inputs + 2) as *mut pyre_object::FixedObjectArray;
             frame.debugdata = frame_root.get(inputs + 3) as *mut FrameDebugData;
-            frame.lastblock = frame_root.get(inputs + 4) as *mut FrameBlock;
-            frame.f_generator_wref = frame_root.get(inputs + 5);
-            frame.w_yielding_from = frame_root.get(inputs + 6);
-            frame.f_backref = frame_root.get(inputs + 7) as *mut PyFrame;
-            frame.w_builtin = frame_root.get(inputs + 8);
+            frame.f_generator_wref = frame_root.get(inputs + 4);
+            frame.w_yielding_from = frame_root.get(inputs + 5);
+            frame.f_backref = frame_root.get(inputs + 6) as *mut PyFrame;
+            frame.w_builtin = frame_root.get(inputs + 7);
             if unscanned_debugdata {
                 let debug = unsafe { &mut *frame.debugdata };
                 debug.w_globals = frame_root.get(inputs + FRAME_BOX_DEBUG_INPUT);
@@ -2160,109 +2153,6 @@ unsafe fn clear_debugdata_ptr(ptr: &mut *mut FrameDebugData) {
     }
 }
 
-struct FrameBlockRoot {
-    slot: *mut *mut u8,
-    registered: bool,
-}
-
-impl FrameBlockRoot {
-    unsafe fn new(block: &mut *mut FrameBlock) -> Self {
-        let slot = block as *mut *mut FrameBlock as *mut *mut u8;
-        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
-        Self { slot, registered }
-    }
-}
-
-impl Drop for FrameBlockRoot {
-    fn drop(&mut self) {
-        if self.registered {
-            pyre_object::gc_hook::try_gc_remove_root(self.slot);
-        }
-    }
-}
-
-unsafe fn alloc_frame_block(
-    block: FrameBlock,
-    allocation: FrameLocalsArrayAllocation,
-) -> *mut FrameBlock {
-    if allocation == FrameLocalsArrayAllocation::OldGenGc {
-        // `FRAME_BLOCK_GC_TYPE_ID` registers `previous` as a traced edge, so
-        // the walker forwards the rest of the chain unconditionally once it
-        // reaches a managed block. A `malloc_raw` block spliced in after a
-        // failed managed allocation would be forwarded without a header.
-        let payload_size = std::mem::size_of::<FrameBlock>();
-        if let Some(raw) = pyre_object::gc_hook::GcAllocOutcome::from_hook(
-            pyre_object::gc_hook::try_gc_alloc(FRAME_BLOCK_GC_TYPE_ID, payload_size),
-        )
-        .allocated_or_abort(payload_size)
-        {
-            unsafe { std::ptr::write(raw as *mut FrameBlock, block) };
-            return raw as *mut FrameBlock;
-        }
-    }
-    pyre_object::lltype::malloc_raw(block)
-}
-
-#[inline]
-fn remember_frame_block_node(node: *mut FrameBlock) {
-    if pyre_object::gc_hook::try_gc_owns_object(node as *mut u8) {
-        pyre_object::gc_hook::try_gc_write_barrier(node as *mut u8);
-    }
-}
-
-unsafe fn clone_block_chain(
-    ptr: *mut FrameBlock,
-    allocation: FrameLocalsArrayAllocation,
-) -> *mut FrameBlock {
-    // `previous` is assigned only while a node is constructed and points to
-    // a strictly older node. Rebuild oldest-to-newest, but barrier each store:
-    // a nursery-full allocation fallback can make a node old while its
-    // predecessor is still young.
-    let mut source = Vec::new();
-    let mut current = ptr;
-    while !current.is_null() {
-        unsafe {
-            source.push(FrameBlock {
-                handlerposition: (*current).handlerposition,
-                valuestackdepth: (*current).valuestackdepth,
-                previous: std::ptr::null_mut(),
-            });
-            current = (*current).previous;
-        }
-    }
-
-    let mut cloned = std::ptr::null_mut();
-    for mut block in source.into_iter().rev() {
-        let _root = unsafe { FrameBlockRoot::new(&mut cloned) };
-        block.previous = std::ptr::null_mut();
-        let node = unsafe { alloc_frame_block(block, allocation) };
-        unsafe { (*node).previous = cloned };
-        remember_frame_block_node(node);
-        cloned = node;
-    }
-    cloned
-}
-
-unsafe fn clear_block_chain(ptr: &mut *mut FrameBlock) {
-    unsafe {
-        if !(*ptr).is_null() && pyre_object::gc_hook::try_gc_owns_object(*ptr as *mut u8) {
-            // A GC chain is uniformly managed by its owning GC frame.  The
-            // collector traces `previous` and reclaims the nodes itself.
-            *ptr = std::ptr::null_mut();
-            return;
-        }
-        let mut current = *ptr;
-        while !current.is_null() {
-            debug_assert!(!pyre_object::gc_hook::try_gc_owns_object(
-                current as *mut u8
-            ));
-            let block = Box::from_raw(current);
-            current = block.previous;
-        }
-        *ptr = std::ptr::null_mut();
-    }
-}
-
 impl Drop for PyFrame {
     fn drop(&mut self) {
         // Reached only for a `std::alloc`-backed frame (the `FrameBox`
@@ -2284,8 +2174,8 @@ impl PyFrame {
     }
 
     /// Free the `std::alloc` resources owned by a snapshot, fallback, or bare
-    /// stack frame: its `locals_cells_stack_w` array, `FrameDebugData` box,
-    /// and `FrameBlock` chain.  This is reached only through `Drop for
+    /// stack frame: its `locals_cells_stack_w` array and `FrameDebugData` box.
+    /// This is reached only through `Drop for
     /// PyFrame`; GC-managed frames and all of their corresponding resources
     /// are reclaimed by the collector.
     ///
@@ -2305,7 +2195,6 @@ impl PyFrame {
         }
         unsafe {
             clear_debugdata_ptr(&mut self.debugdata);
-            clear_block_chain(&mut self.lastblock);
         }
     }
 
@@ -2541,66 +2430,6 @@ pub const FRAME_DEBUG_DATA_W_GLOBALS_OFFSET: usize =
 /// Allocated size of a `FrameDebugData`.
 pub const FRAME_DEBUG_DATA_SIZE: usize = std::mem::size_of::<FrameDebugData>();
 
-/// pyopcode.py:1875-1897 FrameBlock — linked list node for the block stack.
-/// `previous` forms a singly-linked list; `lastblock` in PyFrame is the head.
-/// It is assigned only during construction and targets a strictly older node,
-/// so an old-gen node never needs a write barrier for it.
-#[derive(Debug, Clone, Copy)]
-pub struct FrameBlock {
-    /// pyopcode.py:1883
-    pub valuestackdepth: usize,
-    /// pyopcode.py delegate_to_nongen
-    pub handlerposition: usize,
-    /// pyopcode.py:1884 — pointer to the previous FrameBlock (null = None).
-    pub previous: *mut FrameBlock,
-}
-
-impl FrameBlock {
-    /// pyopcode.py:1886-1887
-    #[inline]
-    pub fn cleanupstack(&self, frame: &mut PyFrame) {
-        frame.dropvaluesuntil(self.valuestackdepth);
-    }
-}
-
-#[inline]
-pub fn get_block_class(opname: &str) -> &'static str {
-    match opname {
-        "SETUP_LOOP" | "SETUP_EXCEPT" | "SETUP_FINALLY" | "SETUP_WITH" => "FrameBlock",
-        _ => "FrameBlock",
-    }
-}
-
-#[inline]
-pub fn unpickle_block(_space: PyObjectRef, w_tup: PyObjectRef) -> FrameBlock {
-    let _ = _space;
-    let handlerposition = unsafe {
-        w_tuple_getitem(w_tup, 0).and_then(|v| {
-            if is_int(v) {
-                Some(w_int_get_value(v) as usize)
-            } else {
-                None
-            }
-        })
-    }
-    .unwrap_or(0);
-    let valuestackdepth = unsafe {
-        w_tuple_getitem(w_tup, 2).and_then(|v| {
-            if is_int(v) {
-                Some(w_int_get_value(v) as usize)
-            } else {
-                None
-            }
-        })
-    }
-    .unwrap_or(0);
-    FrameBlock {
-        handlerposition,
-        valuestackdepth,
-        previous: std::ptr::null_mut(),
-    }
-}
-
 // ── Virtualizable field offsets ───────────────────────────────────────
 //
 // These constants tell the JIT where each virtualizable field lives
@@ -2625,9 +2454,6 @@ pub const PYFRAME_LOCALS_CELLS_STACK_OFFSET: usize =
 
 /// Byte offset of `debugdata` in `PyFrame`.
 pub const PYFRAME_DEBUGDATA_OFFSET: usize = std::mem::offset_of!(PyFrame, debugdata);
-
-/// Byte offset of `lastblock` in `PyFrame`.
-pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrame, lastblock);
 
 /// Byte offset of `f_generator_wref` in `PyFrame`.
 /// `PyObjectRef` slot — points into the GC heap (possibly nursery).
@@ -4050,7 +3876,6 @@ impl PyFrame {
         self.f_backref = std::ptr::null_mut();
         unsafe {
             clear_debugdata_ptr(&mut self.debugdata);
-            clear_block_chain(&mut self.lastblock);
         }
         // This storage-only hook carries no globals object.
         let mut w_globals = PY_NULL;
@@ -4580,7 +4405,6 @@ impl PyFrame {
             flags: self.flags,
             failed_attr_cleanup: self.failed_attr_cleanup,
             debugdata: unsafe { clone_debugdata_ptr(self.debugdata, allocation) },
-            lastblock: unsafe { clone_block_chain(self.lastblock, allocation) },
             vable_token: self.vable_token,
             f_generator_wref: self.f_generator_wref,
             w_yielding_from: self.w_yielding_from,
@@ -4595,11 +4419,9 @@ impl PyFrame {
     /// long as the generator object reaches it (`generator.py` holds the
     /// frame), and the generator's custom trace greys the frame block.
     pub fn snapshot_for_generator(&self) -> FrameBox {
-        // `build_snapshot_frame` finishes by cloning `lastblock`; no later
-        // field construction allocates. `FrameBox::new` then uses the
-        // non-collecting `alloc_in_oldgen` path and write-barriers the frame
-        // before this returns, so any nursery block chain is reached from the
-        // remembered set on the next minor collection.
+        // `build_snapshot_frame` finishes its allocations before returning.
+        // `FrameBox::new` then uses the non-collecting `alloc_in_oldgen` path
+        // and write-barriers the frame before this returns.
         let mut frame =
             FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc));
         frame.fix_array_ptrs();
@@ -4939,54 +4761,6 @@ impl PyFrame {
         }
     }
 
-    /// pyframe.py:186 append_block
-    #[inline]
-    pub fn append_block(&mut self, mut block: FrameBlock) {
-        let allocation = self.aux_allocation();
-        let mut previous = self.lastblock;
-        let _root = unsafe { FrameBlockRoot::new(&mut previous) };
-        block.previous = std::ptr::null_mut();
-        let node = unsafe { alloc_frame_block(block, allocation) };
-        // Both links need barriers: a nursery-full allocation fallback can
-        // make `node` old while `previous` is young, and this old frame usually
-        // receives a young `node`.
-        unsafe { (*node).previous = previous };
-        remember_frame_block_node(node);
-        self.lastblock = node;
-        if pyre_object::gc_hook::try_gc_owns_object(self as *mut PyFrame as *mut u8) {
-            pyre_object::gc_hook::try_gc_write_barrier(self as *mut PyFrame as *mut u8);
-        }
-    }
-
-    /// pyframe.py:190 pop_block
-    #[inline]
-    pub fn pop_block(&mut self) -> Option<FrameBlock> {
-        if self.lastblock.is_null() {
-            return None;
-        }
-        unsafe {
-            let current = self.lastblock;
-            if pyre_object::gc_hook::try_gc_owns_object(current as *mut u8) {
-                let mut result = *current;
-                self.lastblock = result.previous;
-                result.previous = std::ptr::null_mut();
-                Some(result)
-            } else {
-                let block = Box::from_raw(current);
-                self.lastblock = block.previous;
-                let mut result = *block;
-                result.previous = std::ptr::null_mut();
-                Some(result)
-            }
-        }
-    }
-
-    /// pyframe.py:195 blockstack_non_empty
-    #[inline]
-    pub fn blockstack_non_empty(&self) -> bool {
-        !self.lastblock.is_null()
-    }
-
     /// PyPy-compatible exception-info unwind helper.
     #[inline]
     pub fn _exc_info_unroll(&self, _for_hidden: bool) -> PyObjectRef {
@@ -5033,34 +4807,6 @@ impl PyFrame {
     #[inline]
     pub fn descr__setstate__(&mut self, _state: PyObjectRef) {
         let _ = _state;
-    }
-
-    /// pyframe.py:198 get_blocklist — walk linked list, return in reverse order.
-    #[inline]
-    pub fn get_blocklist(&self) -> Vec<FrameBlock> {
-        let mut lst = Vec::new();
-        let mut block = self.lastblock;
-        while !block.is_null() {
-            unsafe {
-                let mut entry = *block;
-                entry.previous = std::ptr::null_mut();
-                lst.push(entry);
-                block = (*block).previous;
-            }
-        }
-        lst
-    }
-
-    /// pyframe.py:207 set_blocklist — rebuild linked list from slice.
-    #[inline]
-    pub fn set_blocklist(&mut self, lst: &[FrameBlock]) {
-        unsafe { clear_block_chain(&mut self.lastblock) };
-        let mut i = lst.len();
-        while i > 0 {
-            i -= 1;
-            // `ll_getitem_fast` on the rebuilt block list.
-            self.append_block(unsafe { *lst.as_ptr().add(i) });
-        }
     }
 
     /// PyPy-compatible execution entrypoint.
@@ -6525,7 +6271,6 @@ impl PyFrame {
             flags: 0,
             failed_attr_cleanup: 0,
             debugdata: std::ptr::null_mut(),
-            lastblock: std::ptr::null_mut(),
             vable_token: 0,
             f_generator_wref: PY_NULL,
             w_yielding_from: PY_NULL,
@@ -6888,7 +6633,6 @@ pub fn createframe_obj(
         flags: 0,
         failed_attr_cleanup: 0,
         debugdata: std::ptr::null_mut(),
-        lastblock: std::ptr::null_mut(),
         vable_token: 0,
         f_generator_wref: PY_NULL,
         w_yielding_from: PY_NULL,
@@ -7266,7 +7010,7 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn pyframe_common_layout_has_no_eager_globals_word() {
-        assert_eq!(std::mem::size_of::<super::PyFrame>(), 112);
+        assert_eq!(std::mem::size_of::<super::PyFrame>(), 104);
     }
 
     #[test]

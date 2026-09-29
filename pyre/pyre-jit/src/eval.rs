@@ -1369,7 +1369,7 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 ///     WEAKREF box `initialize_as_generator` stores; the collector
 ///     invalidates that box's `weakptr`, so the frame does not keep its
 ///     generator alive.
-///   - `debugdata` / `lastblock` — managed field slots are forwarded.
+///   - `debugdata` — the managed field slot is forwarded.
 ///   - `debugdata->{w_globals, w_locals, w_extra_locals, w_f_trace,
 ///     hidden_operationerr}` — a GC-managed payload's own
 ///     `FRAME_DEBUG_DATA_GC_TYPE_ID` offset walker owns these; a raw
@@ -1493,17 +1493,6 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
             f(&mut d.hidden_operationerr as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
         }
     }
-
-    if !frame.lastblock.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(frame.lastblock as *mut u8)
-    {
-        // FRAME_BLOCK_GC_TYPE_ID's `previous` walker forwards the rest of
-        // the chain. Blocks themselves contain no PyObjectRefs.
-        f(
-            &mut frame.lastblock as *mut *mut pyre_interpreter::pyframe::FrameBlock
-                as *mut majit_ir::GcRef,
-        );
-    }
 }
 
 /// RPython jitexc.py ContinueRunningNormally parity.
@@ -1567,18 +1556,17 @@ enum JitAction {
 }
 
 use crate::jit::descr::{
-    BUILTIN_CODE_GC_TYPE_ID, FRAME_BLOCK_GC_TYPE_ID, FRAME_DEBUG_DATA_GC_TYPE_ID,
-    FUNCTION_GC_TYPE_ID, JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
-    PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID, SPECIALISED_TUPLE_FF_GC_TYPE_ID,
-    SPECIALISED_TUPLE_II_GC_TYPE_ID, SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID,
-    W_BASE_EXCEPTION_GC_TYPE_ID, W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID,
-    W_CELL_GC_TYPE_ID, W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID,
-    W_DICT_PROXY_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID,
-    W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID,
-    W_MODULE_DICT_GC_TYPE_ID, W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID,
-    W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
-    W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID, W_UNICODE_GC_TYPE_ID,
-    W_UNION_GC_TYPE_ID,
+    BUILTIN_CODE_GC_TYPE_ID, FRAME_DEBUG_DATA_GC_TYPE_ID, FUNCTION_GC_TYPE_ID, JITFRAME_GC_TYPE_ID,
+    OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID, PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID,
+    SPECIALISED_TUPLE_FF_GC_TYPE_ID, SPECIALISED_TUPLE_II_GC_TYPE_ID,
+    SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID, W_BASE_EXCEPTION_GC_TYPE_ID,
+    W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID,
+    W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID, W_DICT_PROXY_GC_TYPE_ID,
+    W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID, W_LIST_GC_TYPE_ID,
+    W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID, W_MODULE_DICT_GC_TYPE_ID,
+    W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID, W_SEQ_ITER_GC_TYPE_ID,
+    W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID, W_SUPER_GC_TYPE_ID,
+    W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID, W_UNICODE_GC_TYPE_ID, W_UNION_GC_TYPE_ID,
 };
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
@@ -3440,20 +3428,10 @@ fn build_gc() -> Box<MiniMarkGC> {
         ],
     ));
     debug_assert_eq!(frame_debug_data_tid, FRAME_DEBUG_DATA_GC_TYPE_ID);
-    // Block-stack nodes are young GC objects. `previous` is their only GC
-    // edge, so the normal walker forwards and major-marks an entire chain.
-    let frame_block_tid = gc.register_type(TypeInfo::with_gc_ptrs(
-        std::mem::size_of::<pyre_interpreter::pyframe::FrameBlock>(),
-        vec![std::mem::offset_of!(
-            pyre_interpreter::pyframe::FrameBlock,
-            previous
-        )],
-    ));
-    debug_assert_eq!(frame_block_tid, FRAME_BLOCK_GC_TYPE_ID);
     // setobject.py W_SetIterObject — AUTO-ID typed payload. Its live `w_set`
     // edge is traced, preserving a source owned solely by an iterator. Keep
     // this at the absolute tail of the type-id chain: inserting it before the
-    // fixed FrameDebugData/FrameBlock slots changes their generated ids and
+    // fixed FrameDebugData slots changes their generated ids and
     // corrupts JIT frame payloads during guard/resume.
     register_pyre_class(
         &mut gc,
@@ -3481,7 +3459,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     // W_Compress (`itertools.compress`) — AUTO-ID; the live data and
     // selectors iterators are both traced edges.  Keep this at the absolute
-    // tail, after the fixed FrameDebugData/FrameBlock slots and every prior
+    // tail, after the fixed FrameDebugData slots and every prior
     // AUTO-ID type, so adding it cannot renumber an existing GC type.
     register_pyre_class(
         &mut gc,
@@ -3937,7 +3915,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     }
 
     // The two `step == 1` iterator shapes.  Their ids are explicit
-    // (`type_id = 165` / `166`) because their descr groups bake them at
+    // (`type_id = 164` / `165`) because their descr groups bake them at
     // compile time to guard and virtualize a FOR_ITER, and an explicit id only
     // holds where registration order does: they are unconditional, so they
     // close the ungated block here, ahead of the target-gated tail whose ids
@@ -4954,7 +4932,6 @@ fn install_pyre_object_hooks() {
                 "failed_attr_cleanup",
             ),
             (T, fl::PYFRAME_DEBUGDATA_OFFSET, "debugdata"),
-            (T, fl::PYFRAME_LASTBLOCK_OFFSET, "lastblock"),
             (T, fl::PYFRAME_VABLE_TOKEN_OFFSET, "vable_token"),
             (T, fl::PYFRAME_F_GENERATOR_WREF_OFFSET, "f_generator_wref"),
             (T, fl::PYFRAME_W_YIELDING_FROM_OFFSET, "w_yielding_from"),
@@ -15878,7 +15855,7 @@ mod tests {
         use majit_ir::{OpRef, Type};
         use majit_metainterp::TraceCtx;
         use pyre_interpreter::compile_exec;
-        use pyre_interpreter::pyframe::{FrameBlock, PyFrame};
+        use pyre_interpreter::pyframe::PyFrame;
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
         use pyre_object::{w_int_new, w_list_new};
 
@@ -15894,11 +15871,6 @@ mod tests {
         locals_w_mut!(frame)[3] = w_int_new(5);
         frame.valuestackdepth = 4;
         let _ = frame.getorcreatedebug(123);
-        frame.append_block(FrameBlock {
-            valuestackdepth: 0,
-            handlerposition: 55,
-            previous: std::ptr::null_mut(),
-        });
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
