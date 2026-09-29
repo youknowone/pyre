@@ -18271,10 +18271,25 @@ unsafe fn list_iter_descr_next(obj: PyObjectRef) -> PyResult {
     // with the acquire/release calls. The lock body stays
     // `dont_look_inside`; only the untaken call is absent from the trace.
     let ready = pyre_object::gil_ready::gil_ready_word();
-    let lock = if ready == 0 {
-        0
+    // A contended stripe parks in `before_external_block`. Pin both objects
+    // and read them back before the inner get, the same bracket as
+    // `w_list_getitem` / `contains_int_list_locked`. The zero arm stays free
+    // of that bracket so a trace of an unpublished `gil_ready` does not
+    // residualize it.
+    let (lock, seq, obj) = if ready == 0 {
+        (0, seq, obj)
     } else {
-        pyre_object::w_list_lock_acquire(seq)
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::publish_roots(&[obj, seq]);
+        pyre_object::gc_roots::normalize_roots(root_base, 2);
+        let seq = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let lock = pyre_object::w_list_lock_acquire(seq);
+        (
+            lock,
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            pyre_object::gc_roots::shadow_stack_get(root_base),
+        )
     };
     let item = pyre_object::w_list_getitem_inner(seq, pyre_object::seq_index_to_i64(index));
     if lock != 0 {
