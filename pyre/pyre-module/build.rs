@@ -455,8 +455,12 @@ fn accept(candidate: &Candidate) -> bool {
     for lib in &candidate.libraries {
         println!("cargo:rustc-link-lib={lib}");
     }
-    for extra in &candidate.link_extra {
+    // `_link_args_from_eci` appends `link_extra` to the final link line.
+    // `rustc-link-arg` reaches this package's tests. Numbered metadata is
+    // what a dependent binary passes to its own link.
+    for (index, extra) in candidate.link_extra.iter().enumerate() {
         println!("cargo:rustc-link-arg={extra}");
+        println!("cargo:metadata=LINK_ARG_{index}={extra}");
     }
     println!("cargo:rustc-cfg=pyre_minimal_curses");
     let _ = fs::remove_file(out_dir().join("curses_probe_last_stderr.txt"));

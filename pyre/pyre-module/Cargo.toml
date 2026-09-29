@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Optional builtin modules for pyre interpreter"
+# `ExternalCompilationInfo.link_extra`. Dependents read
+# `DEP_PYRE_MINIMAL_CURSES_LINK_ARG_<n>`.
+links = "pyre_minimal_curses"
 
 [features]
 default = ["host_env"]
