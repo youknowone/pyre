@@ -362,6 +362,9 @@ fn layout_measure(llbc: &crate::Llbc, raw: &str, target: &str, field: &str) -> O
     layout_u64_resolved(llbc, entry.get("value")?.get(field)?, 0)
 }
 
+/// A layout expression (`size` / `align`). Its `Deduplicated` ids index the
+/// layout-expression table; the payload of a `Constant` is a constant
+/// expression, whose ids index the const table instead.
 fn layout_u64_resolved(llbc: &crate::Llbc, v: &Value, depth: u8) -> Option<u64> {
     if depth > 24 {
         return None;
@@ -370,13 +373,8 @@ fn layout_u64_resolved(llbc: &crate::Llbc, v: &Value, depth: u8) -> Option<u64> 
         return Some(n);
     }
     if let Some(id) = v.get("Deduplicated").and_then(Value::as_u64) {
-        if let Some(body) = llbc.layout_scalar_body(id)
-            && let Some(n) = layout_u64_resolved(llbc, body, depth + 1)
-        {
-            return Some(n);
-        }
         return llbc
-            .dedup_const_body(id)
+            .layout_scalar_body(id)
             .and_then(|body| layout_u64_resolved(llbc, body, depth + 1));
     }
     if let Some(chosen) = v.get("chosen") {
@@ -390,11 +388,35 @@ fn layout_u64_resolved(llbc: &crate::Llbc, v: &Value, depth: u8) -> Option<u64> 
         return layout_u64_resolved(llbc, body, depth + 1);
     }
     if let Some(constant) = v.get("Constant") {
-        return layout_u64_resolved(llbc, constant, depth + 1);
+        return layout_const_u64(llbc, constant, depth + 1);
+    }
+    None
+}
+
+/// A constant expression `[kind, ty]`, inline, as `{"Value": [id, [kind,
+/// ty]]}`, or as `{"Deduplicated": id}` in the const table.
+fn layout_const_u64(llbc: &crate::Llbc, v: &Value, depth: u8) -> Option<u64> {
+    if depth > 24 {
+        return None;
+    }
+    if let Some(n) = layout_u64_literal(v) {
+        return Some(n);
+    }
+    if let Some(id) = v.get("Deduplicated").and_then(Value::as_u64) {
+        return llbc
+            .dedup_const_body(id)
+            .and_then(|body| layout_const_u64(llbc, body, depth + 1));
+    }
+    if let Some(body) = v
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|a| a.get(1))
+    {
+        return layout_const_u64(llbc, body, depth + 1);
     }
     v.as_array()
         .and_then(|a| a.first())
-        .and_then(|b| layout_u64_resolved(llbc, b, depth + 1))
+        .and_then(|kind| layout_const_u64(llbc, kind, depth + 1))
 }
 
 impl TypeLayout {
@@ -635,10 +657,17 @@ impl ItemMeta {
     /// `"<Variant>"` — a label, not an identity: the rendering is not
     /// injective, and [`Self::trait_impl_id`] is what recovers what it
     /// dropped.
+    ///
+    /// This is the template path: an `Instantiated` segment (a
+    /// monomorphized copy's generic arguments) is left out, so every
+    /// instance of one generic item spells the same path, the way every
+    /// specialization of one `FunctionDesc` answers to `desc.name`
+    /// (`rpython/annotator/description.py`).  [`Self::instantiation`]
+    /// returns the arguments that tell the instances apart.
     pub fn name_path(&self) -> String {
         let mut out = String::new();
-        for (i, seg) in self.name.iter().enumerate() {
-            if i > 0 {
+        for seg in self.template_name() {
+            if !out.is_empty() {
                 out.push_str("::");
             }
             match seg {
@@ -674,6 +703,36 @@ impl ItemMeta {
         }
         out
     }
+
+    /// The name segments of the template path: [`Self::name`] without the
+    /// `Instantiated` segment.  A leaf read takes `.last()` of this, not of
+    /// `name`, whose last segment is the instantiation on a monomorphized
+    /// item.
+    pub fn template_name(&self) -> impl DoubleEndedIterator<Item = &NameSeg> {
+        self.name
+            .iter()
+            .filter(|seg| !matches!(seg, NameSeg::Other(v) if instantiated_args(v).is_some()))
+    }
+
+    /// The generic arguments of a monomorphized item: the `skip_binder` of
+    /// its `Instantiated` name segment, spelled like any `GenericArgs`
+    /// (`regions`, `types`, `const_generics`, `trait_refs`).  `None` for an
+    /// item Charon did not instantiate.
+    ///
+    /// This is the specialization key `FunctionDesc.cachedgraph(key)`
+    /// indexes by; [`Self::name_path`] is the desc's name.
+    pub fn instantiation(&self) -> Option<&Value> {
+        self.name.iter().rev().find_map(|seg| match seg {
+            NameSeg::Other(v) => instantiated_args(v),
+            NameSeg::Ident { .. } => None,
+        })
+    }
+}
+
+/// The `skip_binder` generic arguments of a `PathElem::Instantiated`
+/// segment, spelled `{"Instantiated": {"params": .., "skip_binder": ..}}`.
+fn instantiated_args(seg: &Value) -> Option<&Value> {
+    seg.as_object()?.get("Instantiated")?.get("skip_binder")
 }
 
 /// Whether a struct-root leaf names a closure env — the bare `closure`
@@ -1124,7 +1183,20 @@ fn decode_term_kind(kind: &Value, llbc: &crate::Llbc) -> Result<TermKind, String
     {
         return decode_switch(sw, llbc).map_err(|e| format!("{e}; raw kind: {kind}"));
     }
-    TermKind::deserialize(kind).map_err(|e| format!("{e}; raw kind: {kind}"))
+    let mut term = TermKind::deserialize(kind).map_err(|e| format!("{e}; raw kind: {kind}"))?;
+    match &mut term {
+        TermKind::Call {
+            call:
+                CallPayload {
+                    func: CallFunc::Regular(reg),
+                    ..
+                },
+            ..
+        } => reg.take_instance_arguments(llbc),
+        TermKind::Drop { fn_ptr, .. } => fn_ptr.take_instance_arguments(llbc),
+        _ => {}
+    }
+    Ok(term)
 }
 
 /// `Switch { data: {scrutinee, branches, fallback}, branches }` decodes
@@ -1226,6 +1298,45 @@ pub struct RegularCall {
     pub generics: Value,
 }
 
+impl RegularCall {
+    /// Spell a call to a monomorphized copy the way a call to its generic
+    /// item is spelled: the callee's instance arguments become the call's
+    /// `generics`.  Charon's `--monomorphize` moves the call site's type,
+    /// const and trait arguments into the callee's `Instantiated` name
+    /// segment and leaves the call with its regions only, so a reader of
+    /// `generics` would see an unparameterized call.  The call keeps its own
+    /// regions; a call that already carries arguments is left alone.
+    fn take_instance_arguments(&mut self, llbc: &crate::Llbc) {
+        let CallKind::Fun(FunId::Regular { id }) = &self.kind else {
+            return;
+        };
+        let Some(args) = llbc
+            .fn_by_id(*id)
+            .and_then(|fd| fd.item_meta.instantiation())
+        else {
+            return;
+        };
+        let Some(generics) = self.generics.as_object_mut() else {
+            return;
+        };
+        const KEYS: [&str; 3] = ["types", "const_generics", "trait_refs"];
+        let unparameterized = KEYS.iter().all(|key| {
+            generics
+                .get(*key)
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+        });
+        if !unparameterized {
+            return;
+        }
+        for key in KEYS {
+            if let Some(v) = args.get(key) {
+                generics.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub enum CallKind {
     /// Statically resolved function call: `Fun { Regular(fn_id) }` or
@@ -1294,6 +1405,103 @@ pub enum CallClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item_meta(name: Value) -> ItemMeta {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "span": {"Deduplicated": 0},
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        }))
+        .unwrap()
+    }
+
+    /// A monomorphized copy keeps its generic item's path; its arguments
+    /// come from `instantiation`.
+    #[test]
+    fn instantiated_segment_is_left_out_of_the_template_path() {
+        let args = serde_json::json!({
+            "regions": [], "types": [{"Deduplicated": 3}],
+            "const_generics": [], "trait_refs": []
+        });
+        let mono = item_meta(serde_json::json!([
+            {"Ident": ["core", 0]},
+            {"Ident": ["ptr", 0]},
+            {"Ident": ["null", 0]},
+            {"Instantiated": {"params": {}, "skip_binder": args.clone(), "kind": "Other"}}
+        ]));
+        assert_eq!(mono.name_path(), "core::ptr::null");
+        assert_eq!(mono.instantiation(), Some(&args));
+        assert!(matches!(
+            mono.template_name().last(),
+            Some(NameSeg::Ident { ident: (leaf, _) }) if leaf == "null"
+        ));
+
+        let generic = item_meta(serde_json::json!([
+            {"Ident": ["core", 0]},
+            {"Ident": ["ptr", 0]},
+            {"Ident": ["null", 0]}
+        ]));
+        assert_eq!(generic.name_path(), "core::ptr::null");
+        assert_eq!(generic.instantiation(), None);
+    }
+
+    /// A call to a monomorphized copy reads the copy's instance arguments
+    /// as its `generics`; a call that carries its own keeps them.
+    #[test]
+    fn a_call_to_an_instance_carries_the_instance_arguments() {
+        let doc = r#"{"charon_version":"t","has_errors":false,
+            "translated":{"crate_name":"c","fun_decls":[{
+                "def_id":0,
+                "item_meta":{"name":[{"Ident":["core",0]},{"Ident":["into",0]},
+                    {"Instantiated":{"params":{},"kind":"Other","skip_binder":{
+                        "regions":[],"types":[{"Deduplicated":3},{"Deduplicated":4}],
+                        "const_generics":[],"trait_refs":[]}}}],
+                    "span":{"Deduplicated":0},"source_text":null,
+                    "attr_info":{"attributes":[],"inline":null,"rename":null,"public":true},
+                    "is_local":false},
+                "signature":{"is_unsafe":false,"inputs":[],"output":{"Deduplicated":3}},
+                "body":null}]}}"#;
+        let llbc = crate::Llbc::from_slice(doc.as_bytes()).expect("fixture parses");
+        let call = |generics: Value| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": 0}, "generics": generics}},
+                    "args": [],
+                    "dest": {"kind": {"Local": 0}, "ty": {"Deduplicated": 3}}
+                },
+                "target": 1,
+                "on_unwind": 2
+            }})
+        };
+        let generics_of = |kind: &Value| match decode_term_kind(kind, &llbc) {
+            Ok(TermKind::Call {
+                call:
+                    CallPayload {
+                        func: CallFunc::Regular(reg),
+                        ..
+                    },
+                ..
+            }) => reg.generics,
+            other => panic!("not a regular call: {other:?}"),
+        };
+        let mono = generics_of(&call(serde_json::json!({
+            "regions": [{"Body": 9}], "types": [], "const_generics": [], "trait_refs": []
+        })));
+        assert_eq!(
+            mono,
+            serde_json::json!({
+                "regions": [{"Body": 9}],
+                "types": [{"Deduplicated": 3}, {"Deduplicated": 4}],
+                "const_generics": [], "trait_refs": []
+            })
+        );
+        let own = serde_json::json!({
+            "regions": [], "types": [{"Deduplicated": 5}], "const_generics": [], "trait_refs": []
+        });
+        assert_eq!(generics_of(&call(own.clone())), own);
+    }
 
     /// A positional field loses its `_N` spelling; a named `_0` keeps it.
     #[test]

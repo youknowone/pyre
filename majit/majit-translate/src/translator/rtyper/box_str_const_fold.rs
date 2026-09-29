@@ -27,11 +27,14 @@ fn is_box_str_constant_call(kind: &OpKind) -> Option<&Variable> {
     let [arg] = args.as_slice() else {
         return None;
     };
-    (segments
+    if !segments
         .iter()
         .map(String::as_str)
-        .eq(BOX_STR_CONSTANT_PATH))
-    .then_some(arg)
+        .eq(BOX_STR_CONSTANT_PATH)
+    {
+        return None;
+    }
+    arg.as_variable()
 }
 
 /// The bytes of a string literal, in either spelling it can have.
@@ -214,6 +217,26 @@ mod tests {
         let folded = &graph.block(entry).operations[1];
         assert_eq!(folded.result.as_ref(), Some(&boxed));
         assert_eq!(folded.kind, OpKind::ConstStr(b"__instancecheck__".to_vec()));
+    }
+
+    /// A constant argument is not a literal `Variable` to trace back.
+    #[test]
+    fn leaves_constant_argument_call_unchanged() {
+        let mut graph = FunctionGraph::new("box_constant");
+        let entry = graph.startblock;
+        let original = OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
+                fun_decl_id: None,
+            },
+            args: vec![LinkArg::from(crate::flowspace::model::ConstValue::None)],
+            result_ty: ValueType::Ref(None),
+        };
+        graph.push_op_var(entry, original.clone(), true);
+
+        fold_box_str_constants(&mut graph);
+
+        assert_eq!(graph.block(entry).operations[0].kind, original);
     }
 
     #[test]

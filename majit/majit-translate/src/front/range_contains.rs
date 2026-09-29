@@ -447,7 +447,14 @@ fn segments_end_with(segments: &[String], tail: &[&str]) -> bool {
         && segments[segments.len() - tail.len()..]
             .iter()
             .zip(tail)
-            .all(|(s, t)| s.as_str() == *t)
+            .enumerate()
+            .all(|(i, (s, t))| {
+                if i + 1 == tail.len() {
+                    crate::front::clause_spec::unspecialized_leaf(s) == *t
+                } else {
+                    s.as_str() == *t
+                }
+            })
 }
 
 /// Remove the (single) op in the graph whose result is `result_var`.

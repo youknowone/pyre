@@ -850,8 +850,7 @@ fn spec_trait_ref_name(v: &Value, llbc: &Llbc) -> String {
 fn spec_fn_name(meta: &majit_charon_reader::ullbc::ItemMeta, llbc: &Llbc) -> String {
     use majit_charon_reader::ullbc::NameSeg;
     let segs = meta
-        .name
-        .iter()
+        .template_name()
         .map(|seg| match seg {
             NameSeg::Ident {
                 ident: (name, disambiguator),
@@ -952,14 +951,10 @@ fn spec_raw_ptr(rp: &Value, llbc: &Llbc, depth: usize) -> String {
 }
 
 fn spec_adt(adt: &serde_json::Map<String, Value>, llbc: &Llbc, depth: usize) -> String {
-    let types = generic_items(adt, "types")
-        .into_iter()
-        .map(|ty| spec_type_name(ty, llbc, depth + 1))
-        .collect::<Vec<_>>();
-    let consts = generic_items(adt, "const_generics")
-        .into_iter()
-        .map(|cg| spec_const_name(cg, llbc, depth + 1))
-        .collect::<Vec<_>>();
+    let (types, consts) = crate::front::mir::type_decl_ref_generics(adt, llbc)
+        .and_then(Value::as_object)
+        .map(|args| spec_generic_args(args, llbc, depth))
+        .unwrap_or_default();
     let tref = Value::Object(adt.clone());
     if crate::front::mir::type_decl_ref_builtin(&tref) == Some("Tuple") {
         return match types.as_slice() {
@@ -972,13 +967,48 @@ fn spec_adt(adt: &serde_json::Map<String, Value>, llbc: &Llbc, depth: usize) -> 
         return spec_builtin(builtin, &types, &consts);
     }
     if let Some(def_id) = crate::front::mir::type_decl_ref_adt_id(adt) {
-        let name = llbc
-            .type_by_id(def_id)
+        let td = llbc.type_by_id(def_id);
+        let name = td
             .map(|td| td.item_meta.name_path())
             .unwrap_or_else(|| "?adt".to_string());
+        // A monomorphized ADT is referenced with no arguments; its own
+        // `Instantiated` segment carries them, so an instance spells the
+        // same with or without Charon's monomorphization.
+        let (types, consts) = match td
+            .and_then(|td| td.item_meta.instantiation())
+            .and_then(Value::as_object)
+        {
+            Some(args) if types.is_empty() && consts.is_empty() => {
+                spec_generic_args(args, llbc, depth)
+            }
+            _ => (types, consts),
+        };
         return format!("{name}{}", angle_args(&types, &consts));
     }
     canonical_type_json(&Value::Object(adt.clone()), llbc, depth)
+}
+
+/// The spelled `types` and `const_generics` of a `GenericArgs`.
+fn spec_generic_args(
+    args: &serde_json::Map<String, Value>,
+    llbc: &Llbc,
+    depth: usize,
+) -> (Vec<String>, Vec<String>) {
+    let items = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    };
+    let types = items("types")
+        .iter()
+        .map(|ty| spec_type_name(ty, llbc, depth + 1))
+        .collect();
+    let consts = items("const_generics")
+        .iter()
+        .map(|cg| spec_const_name(cg, llbc, depth + 1))
+        .collect();
+    (types, consts)
 }
 
 /// `builtin` is the `TypeDeclRef` tag: `"Box"` or `"Str"` (tuples are
@@ -1026,15 +1056,6 @@ fn spec_fn_ptr(fnptr: &Value, llbc: &Llbc, depth: usize) -> String {
     } else {
         format!("fn({inputs}) -> {output}")
     }
-}
-
-fn generic_items<'a>(adt: &'a serde_json::Map<String, Value>, key: &str) -> Vec<&'a Value> {
-    adt.get("generics")
-        .and_then(Value::as_object)
-        .and_then(|generics| generics.get(key))
-        .and_then(Value::as_array)
-        .map(|items| items.iter().collect())
-        .unwrap_or_default()
 }
 
 fn angle_args(types: &[String], consts: &[String]) -> String {
@@ -1340,6 +1361,72 @@ mod tests {
             spec_leaf("f", 1, &inline_g, &llbc),
             spec_leaf("f", 1, &dedup_g, &llbc)
         );
+    }
+
+    /// A Charon-monomorphized copy is named the way a clause-specialized
+    /// copy of the same instance is.
+    #[test]
+    fn monomorphized_copy_takes_the_spec_leaf_of_its_template() {
+        let ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let args = json!({"regions": [], "types": [ty], "trait_refs": [], "const_generics": []});
+        let decl = |def_id: u64, name: Value, body: Value| {
+            json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": name,
+                    "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}},
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                },
+                "signature": {"is_unsafe": false, "inputs": [], "output": ty},
+                "body": body
+            })
+        };
+        let unstructured = json!({"Unstructured": null});
+        let template = json!([{"Ident": ["fixture", 0]}, {"Ident": ["m", 0]}, {"Ident": ["f", 0]}]);
+        let mut instance = template.as_array().unwrap().clone();
+        instance.push(
+            json!({"Instantiated": {"params": {}, "skip_binder": args.clone(), "kind": "Other"}}),
+        );
+        let mut sibling = instance.clone();
+        sibling[0] = json!({"Ident": ["sibling", 0]});
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "fun_decls": [
+                    decl(0, template, unstructured.clone()),
+                    decl(1, Value::Array(instance.clone()), unstructured),
+                    decl(2, Value::Array(instance), json!("Opaque")),
+                    decl(3, Value::Array(sibling), json!("Opaque")),
+                ],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let graph_name = |id| crate::front::mir::graph_name_of(&llbc, llbc.fn_by_id(id).unwrap());
+        assert_eq!(graph_name(0), "fixture::m::f");
+        assert_eq!(
+            graph_name(1),
+            format!("m::{}", spec_leaf("f", 0, &args, &llbc))
+        );
+        assert_eq!(
+            spec_leaf("f", 0, &args, &llbc),
+            spec_leaf("f", 1, &args, &llbc)
+        );
+        // An instance with no body is the external declaration itself.
+        assert_eq!(graph_name(2), "fixture::m::f");
+        assert_eq!(graph_name(3), "sibling::m::f");
+        // unless its crate is one of the local crates: that crate's own LLBC
+        // carries the body, registered under the same spec leaf.
+        crate::local_crates::with_local_crate_root("sibling", || {
+            assert_eq!(
+                graph_name(3),
+                format!("m::{}", spec_leaf("f", 3, &args, &llbc))
+            );
+        });
     }
 
     /// `&T` stays distinct from `T`.

@@ -127,7 +127,8 @@ pub(crate) fn tyref_is_result_of_carrier(
     }
     let Some(err_slot) = body
         .get("Adt")
-        .and_then(|a| a.get("generics"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| crate::front::mir::type_decl_ref_generics(a, llbc))
         .and_then(|g| g.get("types"))
         .and_then(|t| t.get(1))
     else {
@@ -149,7 +150,8 @@ pub(crate) fn tyref_is_result_of_carrier(
         }
         let Some(inner) = err_body
             .get("Adt")
-            .and_then(|a| a.get("generics"))
+            .and_then(|a| a.as_object())
+            .and_then(|a| crate::front::mir::type_decl_ref_generics(a, llbc))
             .and_then(|g| g.get("types"))
             .and_then(|t| t.get(0))
             .and_then(|slot| ty_json_body(slot, llbc))
@@ -287,7 +289,8 @@ fn result_ok_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::V
         return None;
     }
     body.get("Adt")
-        .and_then(|a| a.get("generics"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| crate::front::mir::type_decl_ref_generics(a, llbc))
         .and_then(|g| g.get("types"))
         .and_then(|t| t.get(0))
 }
@@ -303,7 +306,8 @@ fn result_err_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::
         return None;
     }
     body.get("Adt")
-        .and_then(|a| a.get("generics"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| crate::front::mir::type_decl_ref_generics(a, llbc))
         .and_then(|g| g.get("types"))
         .and_then(|t| t.get(1))
 }
@@ -336,7 +340,8 @@ fn option_payload_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_js
         return None;
     }
     body.get("Adt")
-        .and_then(|a| a.get("generics"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| crate::front::mir::type_decl_ref_generics(a, llbc))
         .and_then(|g| g.get("types"))
         .and_then(|t| t.get(0))
 }
@@ -507,9 +512,9 @@ fn lower_result_exc_returns_inner(
         let Some((ctor_idx, ctor_var, is_err)) = ctor else {
             continue;
         };
-        // Payload FieldWrite (__pos_0).  Required: every scoped callee
-        // returns a payload-carrying Result (unit payloads would lower
-        // with no FieldWrite and need a Void widening).
+        // Payload FieldWrite (__pos_0).  An `Ok` of a zero-sized payload
+        // has none: the field gets no slot and so no write, and its value
+        // is the Void unit (`widen_unit_return_to_void` then drops it).
         let mut fieldwrite_idx: Option<(usize, Variable)> = None;
         let mut discriminant_write_idx: Option<usize> = None;
         for (i, op) in graph.blocks[bi]
@@ -569,11 +574,18 @@ fn lower_result_exc_returns_inner(
                 fieldwrite_idx = Some((i, payload_var.clone()));
             }
         }
-        let Some((fw_idx, payload)) = fieldwrite_idx else {
-            return Err(format!(
-                "{}: block {bi} Result ctor without a __pos_0 payload write",
-                graph.name
-            ));
+        let (fw_idx, payload) = match fieldwrite_idx {
+            Some((i, payload)) => (Some(i), payload),
+            None if !is_err => (
+                None,
+                graph.alloc_value_var_with_type(crate::model::ConcreteType::Void),
+            ),
+            None => {
+                return Err(format!(
+                    "{}: block {bi} Result Err ctor without a __pos_0 payload write",
+                    graph.name
+                ));
+            }
         };
         // The shell's only op use is the `__pos_0` payload FieldWrite
         // base.  Its link uses are forwarding exit args: the monotonic
@@ -586,7 +598,8 @@ fn lower_result_exc_returns_inner(
         // the `Err` rewrite discards the exit wholesale (`set_raise_values`
         // → `set_goto`), so multiple forwarding slots lower soundly.
         let consumers = count_var_uses(graph, &ctor_var);
-        let expected_op_uses = 1 + usize::from(discriminant_write_idx.is_some());
+        let expected_op_uses =
+            usize::from(fw_idx.is_some()) + usize::from(discriminant_write_idx.is_some());
         let well_formed_return = consumers.op_uses == expected_op_uses && consumers.link_uses >= 1;
         // The shell must flow out through this block's single
         // unconditional exit.  A conditional exit is acceptable only when
@@ -736,11 +749,23 @@ fn lower_result_exc_returns_inner(
 
         // Drop the ctor + payload and optional static discriminant writes
         // (higher index first).  A dead `ConstInt` producer for the tag is
-        // removed by the ordinary dead-op sweep.
+        // removed by the ordinary dead-op sweep.  A payload-less `Ok` ctor
+        // becomes the unit constant it forwards instead.
         {
             let ops = &mut graph.blocks[bi].operations;
-            debug_assert!(fw_idx > ctor_idx);
-            let mut remove = vec![ctor_idx, fw_idx];
+            let mut remove = Vec::new();
+            match fw_idx {
+                Some(fw_idx) => {
+                    debug_assert!(fw_idx > ctor_idx);
+                    remove.extend([ctor_idx, fw_idx]);
+                }
+                None => {
+                    ops[ctor_idx] = SpaceOperation {
+                        result: Some(payload.clone()),
+                        kind: OpKind::ConstNone,
+                    };
+                }
+            }
             if let Some(disc_idx) = discriminant_write_idx {
                 remove.push(disc_idx);
             }
@@ -4750,6 +4775,46 @@ mod static_result_shell_tests {
         let err = lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
             .expect_err("mismatched variant tag must fail closed");
         assert!(err.contains("non-matching __discriminant write"));
+    }
+
+    /// `Ok(())` of a `Result<(), E>` whose payload type is `()` itself writes
+    /// no `__pos_0`: the return forwards the Void unit instead of the shell.
+    #[test]
+    fn payloadless_ok_shell_returns_the_unit() {
+        let mut graph = FunctionGraph::new("unit_result_shell");
+        let entry = graph.startblock;
+        let shell = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<(),E>".into()],
+                        "Ok",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::result::Result<(),E>::Ok".into())),
+                },
+                true,
+            )
+            .expect("shell");
+        let returnblock = graph.returnblock;
+        graph.set_goto(entry, returnblock, vec![shell.clone()]);
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+                .expect("payload-less Ok lowers"),
+            1
+        );
+        let ops = &graph.blocks[entry.0].operations;
+        let [unit_op] = ops.as_slice() else {
+            panic!("expected the ctor to become one unit constant: {ops:?}");
+        };
+        let (Some(unit), OpKind::ConstNone) = (&unit_op.result, &unit_op.kind) else {
+            panic!("expected ConstNone, got {unit_op:?}");
+        };
+        assert_eq!(
+            graph.blocks[entry.0].exits[0].args,
+            vec![LinkArg::Value(unit.clone())]
+        );
     }
 }
 

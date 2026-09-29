@@ -1159,6 +1159,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         } else {
             format!("{module_path}::{name}")
         };
+        // A monomorphized copy registers under its instance leaf, as a
+        // clause-specialized copy does below; `fn_path` stays the template's
+        // for the policy and hint lookups every instance shares.
+        let name = instance_leaf(llbc, fd).unwrap_or(name);
         if not_rpython.contains(&fn_path) {
             continue;
         }
@@ -3174,6 +3178,49 @@ fn graph_has_builder_accumulator(llbc: &Llbc, u: &Unstructured, builder_mode: &[
 /// body — the whole-program loop, which needs the projection to decide
 /// whether the decl has one at all — passes it in here rather than paying
 /// the parse a second time.
+/// The name of `fd`'s graph: its template path, or for a monomorphized copy
+/// the name a clause-specialized copy of the same instance gets.
+///
+/// `FunctionDesc.cachedgraph` (`rpython/annotator/description.py`) names a
+/// specialized graph `"%s__%s" % (self.name, valid_identifier(nameof(key)))`.
+/// [`crate::front::clause_spec::spec_leaf`] is that spelling for a Charon
+/// instance key, and a Charon-monomorphized copy is the same instance, so it
+/// takes the same name and the passes that see through `__spec_` see
+/// through it too.  The copy's identity is its `FunDeclId`.
+pub(crate) fn graph_name_of(llbc: &Llbc, fd: &FunDecl) -> String {
+    match instance_leaf(llbc, fd) {
+        Some(leaf) => spec_segments(llbc, fd, &leaf).join("::"),
+        None => fd.item_meta.name_path(),
+    }
+}
+
+/// The leaf a Charon-monomorphized copy registers and is called under:
+/// [`crate::front::clause_spec::spec_leaf`] of its template leaf and its
+/// instance arguments.  `None` for an item Charon did not instantiate, and
+/// for a bodyless instance of a foreign or std declaration: that is one
+/// external whatever it is instantiated at, so it keeps the template path, as
+/// an opaque callee does in `enqueue_spec`.  A bodyless instance of a local
+/// crate's item is the copy that crate's own LLBC carries a body for, so it
+/// takes the same leaf and a call across the crate boundary resolves to that
+/// copy.
+fn instance_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+    let args = fd.item_meta.instantiation()?;
+    if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+        let sibling = fd.item_meta.name.first().is_some_and(|seg| {
+            matches!(seg, NameSeg::Ident { ident: (root, _) }
+                if crate::local_crates::is_local_crate_root(root))
+        });
+        if !sibling {
+            return None;
+        }
+    }
+    let name = fd.item_meta.name_path();
+    let leaf = name.rsplit("::").next().unwrap_or(&name);
+    Some(crate::front::clause_spec::spec_leaf(
+        leaf, fd.def_id, args, llbc,
+    ))
+}
+
 fn lower_unstructured_with_static_addrs_and_attrs(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -3195,7 +3242,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     spec: Option<&std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
     spec_body: bool,
 ) -> Result<FunctionGraph, LowerError> {
-    let name = fd.item_meta.name_path();
+    let name = graph_name_of(llbc, fd);
     // The Result-of-PyError exception-link lowering's callee rule
     // applies when this body is a scoped callee (see
     // `front::result_exc`); the caller rule applies to the diamond
@@ -10908,7 +10955,8 @@ impl<'a> Lowering<'a> {
             return false;
         }
         let Some(lit) = head
-            .get("generics")
+            .as_object()
+            .and_then(|head| type_decl_ref_generics(head, self.llbc))
             .and_then(|g| g.as_object())
             .and_then(|g| g.get("types"))
             .and_then(|t| t.as_array())
@@ -15647,6 +15695,7 @@ impl<'a> Lowering<'a> {
                     Some(payload)
                 } else {
                     self.reflexive_into_alias(
+                        &reg,
                         &segments,
                         &args,
                         first_arg_ty.as_ref(),
@@ -15660,7 +15709,7 @@ impl<'a> Lowering<'a> {
                             &call.dest.ty,
                         )
                     })
-                    .or_else(|| self.trait_into_string_alias(&segments, &args, &call.dest.ty))
+                    .or_else(|| self.trait_into_string_alias(&reg, &segments, &args, &call.dest.ty))
                     .or_else(|| self.wtf8_string_identity_alias(&segments, &args))
                     .or_else(|| {
                         self.oparg_arg_get_alias(&reg.kind, &segments, &args, &call.dest.ty)
@@ -16810,7 +16859,10 @@ impl<'a> Lowering<'a> {
                             TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
                             TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
                         };
-                        let inner = body.get("Adt")?.get("generics")?.get("types")?.get(0)?;
+                        let inner =
+                            type_decl_ref_generics(body.get("Adt")?.as_object()?, self.llbc)?
+                                .get("types")?
+                                .get(0)?;
                         let inner_ty = serde_json::from_value::<TyRef>(inner.clone()).ok()?;
                         self.tyref_ref_adt_path(&inner_ty)
                     })
@@ -16830,7 +16882,9 @@ impl<'a> Lowering<'a> {
                     // `Option<(usize, I::Item)>` — the inner next yields
                     // `I::Item`, packed into the tuple on the Some arm.
                     let body = if enumerate_next {
-                        body.get("Adt")?.get("generics")?.get("types")?.get(1)?
+                        type_decl_ref_generics(body.get("Adt")?.as_object()?, self.llbc)?
+                            .get("types")?
+                            .get(1)?
                     } else {
                         body
                     };
@@ -17832,6 +17886,11 @@ impl<'a> Lowering<'a> {
                 .llbc
                 .fn_by_id(*id)
                 .map(|fd| {
+                    // A Charon-monomorphized callee is its own instance; its
+                    // generics were substituted before the call was emitted.
+                    if let Some(leaf) = instance_leaf(self.llbc, fd) {
+                        return (spec_segments(self.llbc, fd, &leaf), None);
+                    }
                     if let Some(segments) = self.specialized_fun_segments(fd, reg) {
                         return (segments, None);
                     }
@@ -18042,9 +18101,9 @@ impl<'a> Lowering<'a> {
                 // arguments (`PyError::type_error(msg)`) would
                 // otherwise thread its first argument as the getattr
                 // receiver and the annotator resolves the method name
-                // against that argument's type.  Compared by ADT
-                // def_id, not name leaf, so generic owners
-                // (`Result::branch` — `?`'s Try::branch) still match.
+                // against that argument's type.  Compared by nominal ADT,
+                // not name leaf, so generic owners (`Result::branch` —
+                // `?`'s Try::branch) still match.
                 let first_is_self = fd
                     .signature
                     .inputs
@@ -18052,7 +18111,7 @@ impl<'a> Lowering<'a> {
                     .and_then(|t| tyref_node(t, self.llbc))
                     .and_then(|n| strip_ty_wrappers(n, self.llbc))
                     .and_then(adt_node_def_id)
-                    .is_some_and(|id| id == adt_def_id);
+                    .is_some_and(|id| same_nominal_adt(self.llbc, id, adt_def_id));
                 if !first_is_self {
                     return None;
                 }
@@ -21428,14 +21487,7 @@ impl<'a> Lowering<'a> {
     /// obligation is unresolved (`kind` is a clause/builtin rather
     /// than `TraitImpl`) or any table lookup misses.
     fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return None;
-        };
-        let is_blanket_into = self
-            .llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::convert::<Impl>::into");
-        if !is_blanket_into {
+        if !self.callee_is_blanket_into(reg) {
             return None;
         }
         let trait_refs = reg.generics.get("trait_refs")?.as_array()?;
@@ -21566,7 +21618,8 @@ impl<'a> Lowering<'a> {
                     None => return false,
                 }
             }
-            return inline_adt_def_id(v) == Some(adt_def_id);
+            return inline_adt_def_id(v)
+                .is_some_and(|id| same_nominal_adt(self.llbc, id, adt_def_id));
         }
     }
 
@@ -21831,11 +21884,11 @@ impl<'a> Lowering<'a> {
     /// node back through [`TyRef`] so deduplicated and inline literal forms use
     /// the same width-atom helpers as top-level signature inputs/outputs.
     fn tyref_adt_type_arg(&self, ty: &TyRef, index: usize) -> Option<TyRef> {
-        let node = tyref_node(ty, self.llbc)?
+        let adt = tyref_node(ty, self.llbc)?
             .as_object()?
             .get("Adt")?
-            .as_object()?
-            .get("generics")?
+            .as_object()?;
+        let node = type_decl_ref_generics(adt, self.llbc)?
             .as_object()?
             .get("types")?
             .as_array()?
@@ -21932,7 +21985,9 @@ impl<'a> Lowering<'a> {
             TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
             TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
         };
-        let inner = body.get("Adt")?.get("generics")?.get("types")?.get(0)?;
+        let inner = type_decl_ref_generics(body.get("Adt")?.as_object()?, self.llbc)?
+            .get("types")?
+            .get(0)?;
         Some(tyref_enum_payload_value_type(
             &TyRef::Other(inner.clone()),
             self.llbc,
@@ -21949,12 +22004,15 @@ impl<'a> Lowering<'a> {
     /// consumes (`rpython/rtyper/rclass.py`).
     fn option_payload_instance_class_root(&self, option_ty: &TyRef) -> Option<String> {
         let payload = strip_ty_indirections(
-            tyref_node(option_ty, self.llbc)?
-                .as_object()?
-                .get("Adt")?
-                .get("generics")?
-                .get("types")?
-                .get(0)?,
+            type_decl_ref_generics(
+                tyref_node(option_ty, self.llbc)?
+                    .as_object()?
+                    .get("Adt")?
+                    .as_object()?,
+                self.llbc,
+            )?
+            .get("types")?
+            .get(0)?,
             self.llbc,
         )?;
         if let Some(root) =
@@ -22014,10 +22072,11 @@ impl<'a> Lowering<'a> {
         // receiver must key the same suffixed root instead of a bare GCREF.
         // Foreign value payloads (`BigInt` / `Wtf8Buf`, no registered root;
         // a non-split enum arg) still bail, keeping them classdef-less.
-        let payload = tyref_node(dest_ty, self.llbc)?
+        let adt = tyref_node(dest_ty, self.llbc)?
             .as_object()?
             .get("Adt")?
-            .get("generics")?
+            .as_object()?;
+        let payload = type_decl_ref_generics(adt, self.llbc)?
             .get("types")?
             .get(0)?;
         let payload_node = strip_ty_wrappers(payload, self.llbc)?;
@@ -22068,10 +22127,11 @@ impl<'a> Lowering<'a> {
         if !self.tyref_is_niche_option_ptr(option_ty) {
             return None;
         }
-        let payload = tyref_node(option_ty, self.llbc)?
+        let adt = tyref_node(option_ty, self.llbc)?
             .as_object()?
             .get("Adt")?
-            .get("generics")?
+            .as_object()?;
+        let payload = type_decl_ref_generics(adt, self.llbc)?
             .get("types")?
             .get(0)?;
         let stripped = strip_ty_wrappers(payload, self.llbc)?;
@@ -22740,6 +22800,8 @@ impl<'a> Lowering<'a> {
     /// `Result::branch` whose operand and `ControlFlow` result share a
     /// Charon type-decl layout is already that value: emit `same_as`.
     /// A missing layout stays a call for the later discriminant match.
+    /// A `Result<T, PyError>` keeps its `branch`: `front::result_exc`
+    /// rewires that `?` diamond onto the exception edge.
     fn rewrite_equal_layout_result_branch(
         &self,
         op_kind: OpKind,
@@ -22749,7 +22811,13 @@ impl<'a> Lowering<'a> {
         let Some(recv_ty) = recv_ty else {
             return op_kind;
         };
-        if !crate::front::result_exc::tyref_is_result(recv_ty, self.llbc) {
+        if !crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
+            || crate::front::result_exc::tyref_is_result_of_carrier(
+                recv_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
+        {
             return op_kind;
         }
         let Some(result_layout) = self.layout_of_tyref(recv_ty) else {
@@ -23594,7 +23662,8 @@ impl<'a> Lowering<'a> {
         let Some(payload) = tyref_node(option_ty, self.llbc)
             .and_then(|node| node.as_object())
             .and_then(|m| m.get("Adt"))
-            .and_then(|a| a.get("generics"))
+            .and_then(|a| a.as_object())
+            .and_then(|a| type_decl_ref_generics(a, self.llbc))
             .and_then(|g| g.get("types"))
             .and_then(|t| t.as_array())
             .and_then(|t| t.first())
@@ -23687,7 +23756,8 @@ impl<'a> Lowering<'a> {
         let Some(payload) = node
             .as_object()
             .and_then(|m| m.get("Adt"))
-            .and_then(|a| a.get("generics"))
+            .and_then(|a| a.as_object())
+            .and_then(|a| type_decl_ref_generics(a, self.llbc))
             .and_then(|g| g.get("types"))
             .and_then(|t| t.as_array())
             .and_then(|t| t.first())
@@ -25404,22 +25474,34 @@ impl<'a> Lowering<'a> {
     /// the generic `Call` form.
     fn reflexive_into_alias(
         &self,
+        reg: &RegularCall,
         segments: &[String],
         args: &[Variable],
         first_arg_ty: Option<&TyRef>,
         dest_ty: &TyRef,
     ) -> Option<Variable> {
-        let [first, .., module, impl_seg, leaf] = segments else {
-            return None;
-        };
-        if first.as_str() != "core"
-            || module.as_str() != "convert"
-            || impl_seg.as_str() != "<Impl>"
-            || leaf.as_str() != "into"
-        {
+        let spelled_blanket = matches!(
+            segments,
+            [first, .., module, impl_seg, leaf]
+                if first == "core" && module == "convert" && impl_seg == "<Impl>" && leaf == "into"
+        );
+        if !spelled_blanket && !self.callee_is_blanket_into(reg) {
             return None;
         }
         self.identity_self_call_alias(args, first_arg_ty, dest_ty)
+    }
+
+    /// The callee is the blanket `impl<T, U: From<T>> Into<U> for T`
+    /// method.  Read off the declaration, not the rendered call path: a
+    /// monomorphized instance's `Self` is a concrete type, so its path
+    /// renders under that type's name.
+    fn callee_is_blanket_into(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::convert::<Impl>::into")
     }
 
     /// Resolve the reflexive blanket `IntoIterator::into_iter`
@@ -25484,16 +25566,20 @@ impl<'a> Lowering<'a> {
     /// single string type (`rstr.py`), so the conversion is an identity
     /// at the annotation level.  Other destination types keep the
     /// generic `Call` form.
+    ///
+    /// A monomorphized caller names the selected impl instead: the
+    /// blanket `core::convert::<Impl>::into` instance, which is the same
+    /// conversion.
     fn trait_into_string_alias(
         &self,
+        reg: &RegularCall,
         segments: &[String],
         args: &[Variable],
         dest_ty: &TyRef,
     ) -> Option<Variable> {
-        let [trait_seg, leaf] = segments else {
-            return None;
-        };
-        if trait_seg.as_str() != "Into" || leaf.as_str() != "into" {
+        let spelled_trait =
+            matches!(segments, [trait_seg, leaf] if trait_seg == "Into" && leaf == "into");
+        if !spelled_trait && !self.callee_is_blanket_into(reg) {
             return None;
         }
         let [arg] = args else {
@@ -28040,6 +28126,9 @@ fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
 /// method (`register_trait_method` / inherent registration). A trait-impl
 /// id is local to one LLBC and is not part of this key.
 fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::CallPath {
+    if let Some(leaf) = instance_leaf(llbc, fd) {
+        return crate::parse::CallPath::from_segments(spec_segments(llbc, fd, &leaf));
+    }
     if let Some((owner, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
         crate::parse::CallPath::for_impl_method(&owner, &leaf)
     } else {
@@ -30160,7 +30249,7 @@ fn type_node_is_owner_root(node: &serde_json::Value, llbc: &Llbc) -> bool {
 fn type_id_is_owner_root(id: u64, llbc: &Llbc) -> bool {
     llbc.type_by_id(id).is_some_and(|td| {
         // The leaf compare keeps the full path off every other ADT local.
-        matches!(td.item_meta.name.last(), Some(NameSeg::Ident { ident: (leaf, _) }) if leaf == "RBigIntGcRoot")
+        matches!(td.item_meta.template_name().last(), Some(NameSeg::Ident { ident: (leaf, _) }) if leaf == "RBigIntGcRoot")
             && owner_root_type_path(&td.item_meta.name_path())
     })
 }
@@ -30951,7 +31040,7 @@ fn mark_local_def(local_idx: usize, defs: &mut bit_set::BitSet, n_locals: usize)
 /// `JitPolicy.look_inside_function` subclasses test the path by prefix, and
 /// a trailing segment does not move a prefix test.
 fn fundecl_module(fd: &FunDecl) -> Option<String> {
-    let name = &fd.item_meta.name;
+    let name: Vec<&NameSeg> = fd.item_meta.template_name().collect();
     let mut segs: Vec<&str> = name
         .iter()
         .map_while(|seg| match seg {
@@ -31030,7 +31119,7 @@ fn trait_default_call_segments(
     if owner.is_empty() {
         return None;
     }
-    let leaf = match fd.item_meta.name.last()? {
+    let leaf = match fd.item_meta.template_name().last()? {
         NameSeg::Ident { ident: (s, _) } => s.clone(),
         _ => return None,
     };
@@ -31542,7 +31631,7 @@ fn first_input_is_adt_free(llbc: &Llbc, fd: &FunDecl, adt_def_id: u64) -> bool {
         .and_then(|t| tyref_node(t, llbc))
         .and_then(|n| strip_ty_wrappers(n, llbc))
         .and_then(adt_node_def_id)
-        .is_some_and(|id| id == adt_def_id)
+        .is_some_and(|id| same_nominal_adt(llbc, id, adt_def_id))
 }
 
 /// Faithful result `ValueType` for a residualized foreign-opaque method,
@@ -31972,13 +32061,12 @@ fn field_ty_is_inline_vec(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(td) = llbc.type_by_id(id) else {
         return false;
     };
-    if td.item_meta.name.len() != 3 {
+    if td.item_meta.template_name().count() != 3 {
         return false;
     }
     let idents: Vec<&str> = td
         .item_meta
-        .name
-        .iter()
+        .template_name()
         .filter_map(|seg| match seg {
             NameSeg::Ident { ident: (s, _) } => Some(s.as_str()),
             NameSeg::Other(_) => None,
@@ -31989,7 +32077,8 @@ fn field_ty_is_inline_vec(ty: &TyRef, llbc: &Llbc) -> bool {
     }
     let arity = obj
         .get("Adt")
-        .and_then(|adt| adt.get("generics"))
+        .and_then(|adt| adt.as_object())
+        .and_then(|adt| type_decl_ref_generics(adt, llbc))
         .and_then(|generics| generics.get("types"))
         .and_then(|types| types.as_array())
         .map(|types| types.len());
@@ -33193,9 +33282,7 @@ fn tyref_option_fieldless_niche(ty: &TyRef, llbc: &Llbc) -> Option<FieldlessOpti
         return None;
     }
     let option = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
-    let payload = option
-        .get("Adt")?
-        .get("generics")?
+    let payload = type_decl_ref_generics(option.get("Adt")?.as_object()?, llbc)?
         .get("types")?
         .as_array()?
         .first()?;
@@ -33472,8 +33559,7 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
     if !is_range {
         return false;
     }
-    let elem = adt
-        .get("generics")
+    let elem = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
@@ -33832,27 +33918,25 @@ fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
 fn tyref_atomic_arg<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let id = adt_node_def_id(node)?;
-    let name = &llbc.type_by_id(id)?.item_meta.name;
+    let meta = &llbc.type_by_id(id)?.item_meta;
     // Cheap leaf check first — no path-string allocation (unlike
     // `name_path` / `adt_path_of_tyref`).  This runs on the hot
     // `tyref_to_value_type` fallback path, so it must stay
     // allocation-free: bail before the module scan unless the type's
     // last segment is `Atomic`.
-    match name.last()? {
+    match meta.template_name().next_back()? {
         NameSeg::Ident { ident: (s, _) } if s == "Atomic" => {}
         _ => return None,
     }
     // Confirm std's `core::sync::atomic` module so a user type
     // coincidentally named `Atomic` does not match.
-    let in_atomic_mod = name
-        .iter()
+    let in_atomic_mod = meta
+        .template_name()
         .any(|s| matches!(s, NameSeg::Ident { ident: (id, _) } if id == "atomic"));
     if !in_atomic_mod {
         return None;
     }
-    let arg = node
-        .get("Adt")?
-        .get("generics")?
+    let arg = type_decl_ref_generics(node.get("Adt")?.as_object()?, llbc)?
         .get("types")?
         .as_array()?
         .first()?;
@@ -33942,8 +34026,7 @@ fn field_is_zst(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     let is_tuple = adt.get("builtin").and_then(|id| id.as_str()) == Some("Tuple");
-    let empty = adt
-        .get("generics")
+    let empty = type_decl_ref_generics(adt, llbc)
         .and_then(|generics| generics.get("types"))
         .and_then(|types| types.as_array())
         .is_some_and(|types| types.is_empty());
@@ -34342,6 +34425,48 @@ pub(crate) fn type_decl_ref_adt_id(
     }
 }
 
+/// Whether two ADT decl ids name one nominal type.  Charon's
+/// `--monomorphize` makes each instance of a generic ADT a decl of its own;
+/// the instances share the template path they were instantiated from.
+pub(crate) fn same_nominal_adt(llbc: &Llbc, a: u64, b: u64) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(x), Some(y)) = (llbc.type_by_id(a), llbc.type_by_id(b)) else {
+        return false;
+    };
+    x.item_meta.instantiation().is_some()
+        && y.item_meta.instantiation().is_some()
+        && x.item_meta.name_path() == y.item_meta.name_path()
+}
+
+/// The generic arguments of the type a `TypeDeclRef` names.  A
+/// Charon-monomorphized type, tuples included, is a decl of its own whose
+/// references carry no arguments; they are the arguments its name was
+/// instantiated at.
+pub(crate) fn type_decl_ref_generics<'a>(
+    tref: &'a serde_json::Map<String, serde_json::Value>,
+    llbc: &'a Llbc,
+) -> Option<&'a serde_json::Value> {
+    let own = tref.get("generics");
+    let own_has_args = own.is_some_and(|generics| {
+        ["types", "const_generics"].iter().any(|key| {
+            generics
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|args| !args.is_empty())
+        })
+    });
+    if own_has_args {
+        return own;
+    }
+    tref.get("id")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|id| llbc.type_by_id(id))
+        .and_then(|decl| decl.item_meta.instantiation())
+        .or(own)
+}
+
 /// The `builtin` tag of a `TypeDeclRef`: `"Tuple"`, `"Str"` or `"Box"`.
 pub(crate) fn type_decl_ref_builtin(tref: &serde_json::Value) -> Option<&str> {
     tref.get("builtin")?.as_str()
@@ -34356,8 +34481,7 @@ fn adt_node_class_root_with(
 ) -> Option<String> {
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let def_id = adt_node_def_id(node)?;
-    let has_type_args = adt
-        .get("generics")
+    let has_type_args = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
@@ -34765,7 +34889,10 @@ fn type_node_box_pointee<'l>(
         if !is_box {
             return None;
         }
-        return adt.get("generics")?.get("types")?.as_array()?.first();
+        return type_decl_ref_generics(adt, llbc)?
+            .get("types")?
+            .as_array()?
+            .first();
     }
     None
 }
@@ -35402,8 +35529,7 @@ fn tyref_is_tuple(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     let is_tuple = adt.get("builtin").and_then(|i| i.as_str()) == Some("Tuple");
-    let non_empty = adt
-        .get("generics")
+    let non_empty = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
@@ -35420,7 +35546,10 @@ fn tyref_checked_binop_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> 
     if adt.get("builtin").and_then(serde_json::Value::as_str) != Some("Tuple") {
         return None;
     }
-    let types = adt.get("generics")?.as_object()?.get("types")?.as_array()?;
+    let types = type_decl_ref_generics(adt, llbc)?
+        .as_object()?
+        .get("types")?
+        .as_array()?;
     if types.len() != 2 {
         return None;
     }
@@ -35469,8 +35598,7 @@ fn is_unit_type(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     let is_tuple = adt.get("builtin").and_then(|i| i.as_str()) == Some("Tuple");
-    let empty_types = adt
-        .get("generics")
+    let empty_types = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
@@ -36425,7 +36553,7 @@ fn render_adt_type_args(
     llbc: &Llbc,
     depth: usize,
 ) -> Vec<String> {
-    adt.get("generics")
+    type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
@@ -36711,7 +36839,8 @@ fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: &Llbc) -> String {
     };
     let Some(node) = body
         .get("Adt")
-        .and_then(|a| a.get("generics"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| type_decl_ref_generics(a, llbc))
         .and_then(|g| g.get("types"))
         .and_then(|t| t.get(0))
     else {
@@ -37112,7 +37241,7 @@ fn scalar_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<Str
         return None;
     }
     let mut path = crate::model::split_qualified_path(&owner);
-    path.push(method);
+    path.push(instance_leaf(llbc, declaration).unwrap_or(method));
     Some(path)
 }
 
@@ -39541,13 +39670,21 @@ struct FmtChain {
 /// Match a `FunctionPath`'s trailing segments against `tail`, so a
 /// crate-qualified spelling (`core::fmt::Arguments::new`) and the
 /// crate-stripped front-end spelling (`fmt::Arguments::new`) both
-/// resolve.
+/// resolve.  The leaf is compared through its `__spec_` marker: a
+/// specialized copy is the same function.
 fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
     segments.len() >= tail.len()
         && segments[segments.len() - tail.len()..]
             .iter()
             .zip(tail)
-            .all(|(s, t)| s.as_str() == *t)
+            .enumerate()
+            .all(|(i, (s, t))| {
+                if i + 1 == tail.len() {
+                    crate::front::clause_spec::unspecialized_leaf(s) == *t
+                } else {
+                    s.as_str() == *t
+                }
+            })
 }
 
 /// `core::result::<Impl>::map_err` / `std::result::Result::map_err`.
@@ -40689,9 +40826,7 @@ fn substitute_typevar_field(
 ) -> Option<TyRef> {
     let node = tyref_node(field_ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
     if let Some(index) = typevar_bound_index(node) {
-        let arg = owner_adt
-            .get("Adt")?
-            .get("generics")?
+        let arg = type_decl_ref_generics(owner_adt.get("Adt")?.as_object()?, llbc)?
             .get("types")?
             .as_array()?
             .get(index as usize)?;
@@ -43559,6 +43694,18 @@ mod tests {
             serde_json::json!({"Ref": ["Erased", {"Scalar": {"Integer": {"Signed": "I64"}}}, "Shared"]}),
         )
         .unwrap()
+    }
+
+    /// A specialized copy's leaf matches its template's tail.
+    #[test]
+    fn a_spec_leaf_matches_its_template_tail() {
+        use crate::front::mir::fmt_path_ends_with;
+        let segs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let spec = segs(&["lltype", "malloc_typed__spec_W_X_0123456789abcdef"]);
+        assert!(fmt_path_ends_with(&spec, &["lltype", "malloc_typed"]));
+        assert!(!fmt_path_ends_with(&spec, &["lltype", "malloc"]));
+        let inner = segs(&["malloc_typed__spec_X_0123456789abcdef", "new"]);
+        assert!(!fmt_path_ends_with(&inner, &["malloc_typed", "new"]));
     }
 
     /// `&i64` and `i64` are different banks. `slice::Iter<i64>`'s type
@@ -58370,7 +58517,11 @@ mod tests {
                 .expect("load pyre-interpreter LLBC"),
             Llbc::load(format!("{root}pyre-jit.ullbc")).expect("load pyre-jit LLBC"),
         ];
-        let names = ["w_cell_new", "w_long_from_raw", "w_str_from_wtf8_managed"];
+        let names = [
+            "w_cell_new",
+            "alloc_instance_object",
+            "w_str_from_wtf8_managed",
+        ];
         let program =
             super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
                 &llbcs,
@@ -58382,9 +58533,9 @@ mod tests {
         for (name, owner, expected_fields) in [
             ("w_cell_new", "Cell", &["ob", "contents", "family"][..]),
             (
-                "w_long_from_raw",
-                "W_LongObject",
-                &["ob_header", "value"][..],
+                "alloc_instance_object",
+                "W_ObjectObject",
+                &["ob_header", "map", "storage"][..],
             ),
             (
                 "w_str_from_wtf8_managed",
@@ -58413,33 +58564,46 @@ mod tests {
                 }),
                 "{name}: generic core::ptr::write must not survive as a shared callee"
             );
-            let destination = graph
+            // A graph can cast more than one raw pointer to the owner (the
+            // other arm's fallback allocation); the one the write targeted
+            // carries the stores.
+            let destinations: Vec<_> = graph
                 .blocks
                 .iter()
                 .flat_map(|b| &b.operations)
-                .find_map(|op| match (&op.result, &op.kind) {
-                    (
-                        Some(result),
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            ..
-                        },
-                    ) if crate::model::cast_instance_root(&op.kind) == Some(owner) => Some(result),
-                    _ => None,
-                })
-                .expect("typed raw allocation destination");
-            let fields: Vec<_> = graph
-                .blocks
-                .iter()
-                .flat_map(|b| &b.operations)
-                .filter_map(|op| match &op.kind {
-                    OpKind::FieldWrite { base, field, .. } if base == destination => {
-                        Some(field.name.as_str())
+                .filter_map(|op| match (&op.result, &op.kind) {
+                    (Some(result), OpKind::Call { .. })
+                        if crate::model::cast_instance_root(&op.kind) == Some(owner) =>
+                    {
+                        Some(result)
                     }
                     _ => None,
                 })
                 .collect();
-            assert_eq!(fields, expected_fields, "{name}: source field order");
+            assert!(
+                !destinations.is_empty(),
+                "{name}: typed raw allocation destination"
+            );
+            let fields: Vec<Vec<_>> = destinations
+                .iter()
+                .map(|destination| {
+                    graph
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.operations)
+                        .filter_map(|op| match &op.kind {
+                            OpKind::FieldWrite { base, field, .. } if base == *destination => {
+                                Some(field.name.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .collect();
+            assert!(
+                fields.iter().any(|fields| fields == expected_fields),
+                "{name}: source field order, got {fields:?}"
+            );
         }
     }
 
@@ -58601,6 +58765,33 @@ mod tests {
                 .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
             "{name}: successful get arm must read the guarded item"
         );
+    }
+
+    /// A monomorphized copy's module is its generic item's: the
+    /// `Instantiated` segment after the leaf is not a path segment.
+    #[test]
+    fn fundecl_module_of_an_instance_ends_at_its_leaf() {
+        let fd: majit_charon_reader::ullbc::FunDecl = serde_json::from_value(serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["c", 0]},
+                    {"Ident": ["m", 0]},
+                    {"Ident": ["f", 0]},
+                    {"Instantiated": {"params": {}, "kind": "Other", "skip_binder": {
+                        "regions": [], "types": [{"Deduplicated": 0}],
+                        "const_generics": [], "trait_refs": []}}}
+                ],
+                "span": {"Deduplicated": 0},
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": {"Deduplicated": 0}},
+            "body": null
+        }))
+        .unwrap();
+        assert_eq!(super::fundecl_module(&fd).as_deref(), Some("c::m"));
     }
 
     /// `func.__module__`: a free function's module ends at its leaf, a
