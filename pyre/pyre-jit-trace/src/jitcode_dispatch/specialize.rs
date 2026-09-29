@@ -14013,26 +14013,20 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// `str(i)` on an exact `int`: emit the guarded unbox plus `ll_int2dec`
-/// + `newutf8` instead of the opaque `bh_call_fn(str_type, NULL, i)`
-/// residual.  `descr_repr` (intobject.py) is `space.newutf8(str(self.intval),
-/// len(res))`; `rint.py rtype_str` / `ll_str.py ll_int2dec` lower the
-/// unboxed render to `call_r(..., EF=3)` + `guard_no_exception`.
+/// `str(i)` / `repr(i)` on an exact `int`: walk `intobject.py descr_str`.
 ///
-/// The residual it replaces is a `CallMayForce`, so it also clears the heap
-/// cache and forces virtualizables across itself — the reason a `str(i)` loop
-/// costs far more than the one allocation it performs.
+/// The generated body is `ll_int2dec` then `newutf8`. The residual it
+/// replaces is a `CallMayForce`, so it clears the heap cache and forces
+/// virtualizables across itself.
 ///
-/// The callable must be the canonical `str` type object or the `repr` builtin
-/// itself: a rebound name or a `str` subclass reboxes through `__new__`
-/// instead. `repr(i)` shares the arm because it renders the same decimal text
-/// for an exact `int` — the cross-check below is what holds that, so the two
-/// callables need no separate reasoning. The argument must be an exact `int`,
-/// because `bool` renders `True`/`False`, an `int` subclass may override
-/// `__str__` / `__repr__`, and a `W_LongObject`'s payload is a pointer where
-/// `intval` would be. Any other shape falls through to the generic residual
-/// (SAFE).
-pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
+/// The callable must be the canonical `str` type object or the `repr`
+/// builtin: a rebound name or a `str` subclass reboxes through `__new__`.
+/// `repr(i)` shares the body because it renders the same decimal text for
+/// an exact `int`. The argument must be an exact `int`: `bool` renders
+/// `True`/`False`, an `int` subclass may override `__str__` / `__repr__`,
+/// and a `W_LongObject`'s payload is a pointer where `intval` would be.
+/// Any other shape falls through to the generic residual.
+pub(crate) fn try_walker_orthodox_str_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
@@ -14068,48 +14062,20 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
         return Ok(None);
     }
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-    let int_value = unsafe {
+    unsafe {
         if !std::ptr::eq((*arg_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
             || !std::ptr::eq((*arg_obj).w_class, int_typeobj)
         {
             return Ok(None);
         }
-        pyre_object::w_int_get_value(arg_obj)
-    };
-    // Authentic boxed result, produced on the plain eval loop exactly as the
-    // skipped residual would, then cross-checked against what `jit_int_str`
-    // renders.  A disagreement declines rather than compiling itself in.
-    //
-    // The check reads `int_str_text` rather than calling the helper, because
-    // the helper allocates: a nursery collection under it could move
-    // `arg_obj` and `boxed_result`, which this frame still holds as raw
-    // pointers, and there is no root scope around them.
-    let boxed_result = {
-        let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[arg_obj])
-    };
-    let Ok(boxed_result) = boxed_result else {
-        return Ok(None);
-    };
-    let renders_the_same = unsafe {
-        pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE)
-            && pyre_object::w_str_get_value_opt(boxed_result)
-                == Some(pyre_object::unicodeobject::int_str_text(int_value).as_str())
-    };
-    if !renders_the_same {
-        return Ok(None);
     }
 
     walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
-    if try_walker_orthodox_int_descr_str(ctx, op.pc, r_args[2], arg_obj, dst)?.is_some() {
-        return Ok(Some(()));
-    }
-    walker_emit_jit_int_str(ctx, op.pc, r_args[2], boxed_result, dst)
+    try_walker_orthodox_int_descr_str(ctx, op.pc, r_args[2], arg_obj, dst)
 }
 
-/// Descend `intobject.py descr_str` / `descr_repr` instead of emitting
-/// the `ll_int2dec` + wrap split by hand.  The generated body is that
-/// split; a missing jitcode declines so the caller can keep the fold.
+/// Walk `intobject.py descr_str` / `descr_repr`. The generated body is
+/// `ll_int2dec` then `newutf8`. A missing jitcode declines.
 fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -14178,7 +14144,7 @@ fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
 }
 
 /// Guard exact `int`, unbox, and emit `ll_int2dec` + `newutf8`.
-/// Shared by [`try_walker_specialize_str_call`] and the FORMAT_SIMPLE int arm.
+/// FORMAT_SIMPLE int arm: `ll_int2dec` plus the pad `descr_str` does not apply.
 ///
 /// `descr_repr` (intobject.py) is `space.newutf8(str(self.intval),
 /// len(res))`: `str(self.intval)` is `@jit.elidable` `ll_int2dec`
@@ -14207,16 +14173,6 @@ enum IntStrPad {
         width: i64,
         left: bool,
     },
-}
-
-fn walker_emit_jit_int_str<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    boxed_result: pyre_object::PyObjectRef,
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    walker_emit_jit_int_str_padded(ctx, op_pc, operand, boxed_result, None, dst)
 }
 
 fn walker_emit_jit_int_str_padded<Sym: WalkSym>(

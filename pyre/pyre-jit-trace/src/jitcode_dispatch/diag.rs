@@ -395,7 +395,6 @@ spec_folds! {
     MathFrexp            => ("math_frexp",               "residual_call", "-"),
     IntCall              => ("int_call",                 "residual_call", "-"),
     FloatCall            => ("float_call",               "residual_call", "-"),
-    StrCall              => ("str_call",                 "residual_call", "-"),
     BuiltinDivmod        => ("builtin_divmod",           "residual_call", "-"),
     ExceptionReduce      => ("exception_reduce",         "residual_call", "-"),
     SetAddMethod         => ("set_add_method",           "residual_call", "-"),

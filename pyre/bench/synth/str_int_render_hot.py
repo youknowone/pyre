@@ -1,19 +1,15 @@
-# pyre-check: spec-folds=str_call
-# Hot-loop `str(int)`. The Python-level call has to reach the same
-# `descr_repr` split the rtyper gives an unboxed `str(int)` -- elidable
-# `ll_int2dec` plus a `newutf8` wrap -- instead of the opaque
-# `bh_call_fn(str_type, NULL, i)` residual. That residual is a `CallMayForce`,
-# so it clears the heap cache and forces virtualizables across itself; a loop
-# built around it pays far more than the one string it allocates.
+# Hot-loop `str(int)`. The Python-level call walks `intobject.py descr_str`:
+# `ll_int2dec` plus a `newutf8` wrap. The residual it replaces is a
+# `CallMayForce`, so it clears the heap cache and forces virtualizables
+# across itself; a loop built around it pays far more than the one string
+# it allocates.
 #
-# `hot_render` is the speed leg, and it is written to carry the fold's own
-# subject and nothing else: the checksum reads the rendered length, so the
-# string has to materialize, but the loop performs no subscript.  That keeps
-# unrelated string-indexing cost out of the fold census. `hot_render_signed`
-# keeps a first-digit read at a size that checks the sign digit without
-# dominating the sum.
+# `hot_render` is the speed leg: the checksum reads the rendered length, so
+# the string has to materialize, but the loop performs no subscript.
+# `hot_render_signed` keeps a first-digit read at a size that checks the
+# sign digit without dominating the sum.
 #
-# The other legs are correctness legs for the shapes the fold must REFUSE,
+# The other legs are correctness legs for the shapes the walk must refuse,
 # each written so a wrongly-admitted shape is a wrong number and not a silent
 # pass:
 #
@@ -26,15 +22,10 @@
 #   * a `str` SUBCLASS reboxes through its own `__new__`; admitting it hands
 #     back a plain `str`, which the reported type name catches.
 #
-# `fresh_identity` is the leg for what the fold must not do to the renders it
-# DOES admit. A render of more than one code point has storage identity under
-# `is_w`, so two calls on the same operand are two objects; recording the call
-# as elidable let the pure pass share one, and the loop below counts that
-# sharing directly rather than inferring it from a timing.
-#
-# `spec-folds` gates the subject exactly: a residual produces the same strings,
-# so output parity cannot tell a fold that stopped firing from a fixture nobody
-# wrote a leg for.
+# `fresh_identity` checks that two renders of the same operand are two
+# objects. A render of more than one code point has storage identity under
+# `is_w`, so recording the call as elidable let the pure pass share one.
+# The loop counts that sharing directly.
 #
 # Deterministic; output asserted cpython==pypy.
 
