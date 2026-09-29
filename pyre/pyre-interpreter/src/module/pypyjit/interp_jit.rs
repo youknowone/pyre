@@ -11,10 +11,11 @@
 ///     `set_param("default")` — the positional string form.
 ///   * `set_param(name=value, ...)` — keyword arguments.
 ///
-/// Both forms funnel through the JIT's authoritative `set_user_param` parser
-/// (`call::set_jit_param_string`); the keyword form additionally validates each
-/// name against `unroll_parameters`, reading the JIT's own table rather than
-/// duplicating it.
+/// The positional string goes through `set_user_param`
+/// (`call::set_jit_param_string`). A keyword `enable_opts` goes to
+/// `set_param_enable_opts` with the whole string. Every other keyword is an
+/// integer (`space.int_w`) whose name is in `unroll_parameters`, then one
+/// `name=value` list through the same string parser.
 pub(super) fn set_param(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
@@ -45,14 +46,13 @@ pub(super) fn set_param(
         }
     }
 
-    // interp_jit.py:159-170 — keyword arguments. Re-serialize each `name=value`
-    // pair into one parameter string so the JIT-side parser stays the single
-    // source of truth. `enable_opts` carries a string value; every other
-    // parameter is an integer (`space.int_w` rejects a non-int value here) whose
-    // name is looked up in `unroll_parameters` (rlib/jit.py) before it is
-    // accepted.
+    // interp_jit.py:159-170 — keyword arguments.
+    // `enable_opts` is `jit.set_param(None, 'enable_opts', text)` and is not
+    // split on commas. Other names are `space.int_w` plus `unroll_parameters`,
+    // then one `name=value` string for `set_user_param`.
     if let Some(kw_dict) = kwds {
         let mut parts: Vec<String> = Vec::new();
+        let mut enable_opts: Option<&str> = None;
         for (k, v) in unsafe { pyre_object::dictmultiobject::w_dict_items(kw_dict) } {
             if !unsafe { pyre_object::is_str(k) } {
                 continue;
@@ -62,8 +62,7 @@ pub(super) fn set_param(
                 continue;
             }
             if key == "enable_opts" {
-                let value = pyre_interpreter::baseobjspace::text_w(v)?;
-                parts.push(format!("{key}={value}"));
+                enable_opts = Some(pyre_interpreter::baseobjspace::text_w(v)?);
             } else {
                 let value = pyre_interpreter::baseobjspace::int_w(v)?;
                 let known = majit_metainterp::jit::UNROLL_PARAMETERS
@@ -84,6 +83,9 @@ pub(super) fn set_param(
                 pyre_interpreter::PyErrorKind::ValueError,
                 "error in JIT parameters string".to_string(),
             ));
+        }
+        if let Some(value) = enable_opts {
+            pyre_interpreter::call::set_jit_param_enable_opts(value);
         }
     }
 

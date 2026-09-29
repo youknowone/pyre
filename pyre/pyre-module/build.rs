@@ -441,7 +441,7 @@ fn accept(candidate: &Candidate) -> bool {
         record_failure(candidate, stdout.as_bytes());
         return false;
     };
-    let path = out_dir().join("curses_constants.rs");
+    let path = out_dir().join("curses_ints.c");
     if fs::write(&path, body).is_err() {
         return false;
     }
@@ -521,6 +521,12 @@ fn probe_source() -> String {
              if (kept == 0) return 1;\n",
     );
     for name in CURSES_NAMES {
+        // `_curses._setup` skips `keyname(KEY_MIN..KEY_MAX)` and `A_INVIS`
+        // when `_m_NetBSD` (`__NetBSD__` in `_curses_build.py`). `KEY_MIN`
+        // and `KEY_MAX` are in the unconditional copy list.
+        if suppressed_on_netbsd(name) {
+            src.push_str("#ifndef __NetBSD__\n");
+        }
         // `curses.h` spells function keys as `#define KEY_F(n) (KEY_F0+(n))`.
         // `KEY_F1`..`KEY_F63` are not object-like macros, so `#ifdef KEY_F1`
         // is false wherever the header only provides `KEY_F`.
@@ -539,9 +545,20 @@ fn probe_source() -> String {
             push_const_printf(&mut src, name, name);
             src.push_str("#endif\n");
         }
+        if suppressed_on_netbsd(name) {
+            src.push_str("#endif\n");
+        }
     }
     src.push_str("    return 0;\n}\n");
     src
+}
+
+/// `KEY_*` from `keyname()`, plus `A_INVIS`. `KEY_MIN` and `KEY_MAX` stay.
+fn suppressed_on_netbsd(name: &str) -> bool {
+    if name == "A_INVIS" {
+        return true;
+    }
+    name.starts_with("KEY_") && name != "KEY_MIN" && name != "KEY_MAX"
 }
 
 /// `KEY_F1`..`KEY_F63`. `KEY_F0` stays an object-like macro.
@@ -580,13 +597,24 @@ fn constants_body(stdout: &str) -> Option<String> {
         if !CURSES_NAMES.contains(&name.as_str()) || !seen.insert(name.clone()) {
             return None;
         }
-        elements.push_str(&format!("(\"{name}\", {value}),\n"));
+        elements.push_str(&format!("    {{\"{name}\", {value}}},\n"));
     }
     if elements.is_empty() {
         None
     } else {
-        // A complete expression: `include!` denies a fragment of elements.
-        Some(format!("&[\n{elements}]\n"))
+        Some(format!(
+            "struct rpy_curses_int_entry {{\n    const char *name;\n    long long value;\n}};\n\
+             static const struct rpy_curses_int_entry RPY_CURSES_INTS[] = {{\n{elements}}};\n\
+             int rpy_curses_int_count(void) {{\n\
+                 return (int)(sizeof RPY_CURSES_INTS / sizeof RPY_CURSES_INTS[0]);\n\
+             }}\n\
+             const char *rpy_curses_int_name(int index) {{\n\
+                 return RPY_CURSES_INTS[index].name;\n\
+             }}\n\
+             long long rpy_curses_int_value(int index) {{\n\
+                 return RPY_CURSES_INTS[index].value;\n\
+             }}\n"
+        ))
     }
 }
 
@@ -613,6 +641,7 @@ fn parse_const_line(line: &str) -> Option<(String, String)> {
 fn compile_wrapper(candidate: &Candidate) -> bool {
     let mut build = cc::Build::new();
     build.file("src/module/_minimal_curses/fficurses.c");
+    build.file(out_dir().join("curses_ints.c"));
     if candidate.ncurses_prefix {
         build.define("PYRE_CURSES_INCLUDE_NCURSES_PREFIX", None);
     }

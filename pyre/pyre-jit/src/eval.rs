@@ -6696,6 +6696,16 @@ fn set_jit_param_string_via_warmstate(text: &str) -> Result<(), ()> {
     apply_jit_param_string(ws, text)
 }
 
+/// `interp_jit.py` keyword `enable_opts`. `set_param_enable_opts` receives
+/// the keyword string unchanged.
+fn set_jit_param_enable_opts_via_warmstate(value: &str) {
+    let (driver, _) = driver_pair();
+    driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .set_param_enable_opts(value);
+}
+
 /// Gate for jd1 (`unpackiterable_driver`): the merge-point hook drives a
 /// `JitCodeMachine` trace of `unpackiterable_portal` on hot unpack
 /// sites, closing and compiling the drain loop. This remains opt-in with
@@ -8267,6 +8277,9 @@ pub fn init_jit_hooks() {
     );
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
     pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
+    pyre_interpreter::call::register_set_jit_param_enable_opts_hook(
+        set_jit_param_enable_opts_via_warmstate,
+    );
     pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
     pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
     pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);
@@ -8880,6 +8893,9 @@ fn eval_with_jit_inner(
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
     pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
+    pyre_interpreter::call::register_set_jit_param_enable_opts_hook(
+        set_jit_param_enable_opts_via_warmstate,
+    );
     pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
     pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
     pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);

@@ -16,7 +16,11 @@ pyre_interpreter::py_module! {
     },
     extra_init: |ns| {
         let mut ns = ns;
-        for &(name, value) in fficurses::CURSES_INTS {
+        let count = unsafe { fficurses::rpy_curses_int_count() };
+        for index in 0..count {
+            let name_cstr = unsafe { std::ffi::CStr::from_ptr(fficurses::rpy_curses_int_name(index)) };
+            let name = name_cstr.to_str().expect("curses constant name");
+            let value = unsafe { fficurses::rpy_curses_int_value(index) } as i64;
             let stored = pyre_object::with_roots!(ns => pyre_object::w_int_new(value));
             pyre_interpreter::module_ns_store(ns, name, stored);
         }
