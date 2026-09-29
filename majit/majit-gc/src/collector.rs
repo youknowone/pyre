@@ -5073,6 +5073,43 @@ impl MiniMarkGC {
     /// will be copied to at the next minor collection).  For old-gen
     /// objects, returns the object's own address (old-gen objects don't
     /// move in mark-sweep).
+    /// `id_or_identityhash` without allocating a shadow.
+    ///
+    /// `Trace::refresh_from_gc` rekeys `_refs_dict` from a root walk, which
+    /// is already inside `gc_op`. A second `gc_op` aliases the collector.
+    /// A nursery object that has no shadow yet keeps its address: the walk
+    /// cannot call `allocate_shadow`.
+    pub fn id_or_identityhash_reentrant(&self, obj_addr: usize) -> usize {
+        if !self.is_valid_gc_object(obj_addr) || !self.is_in_nursery(obj_addr) {
+            return obj_addr;
+        }
+        let hdr = unsafe { *header_of(obj_addr) };
+        if hdr.is_forwarded() {
+            let forwarded = unsafe { GcHeader::forwarding_address(header_of(obj_addr)) };
+            if self.is_in_nursery(forwarded) {
+                return self
+                    .nursery_objects_shadows
+                    .get(&forwarded)
+                    .copied()
+                    .unwrap_or(forwarded);
+            }
+            return forwarded;
+        }
+        let free = self.nursery.free_ptr() as usize;
+        let top = self.nursery.top_ptr() as usize;
+        if obj_addr >= free && obj_addr < top {
+            return obj_addr;
+        }
+        if hdr.has_flag(GcFlags::GCFLAG_HAS_SHADOW) {
+            return self
+                .nursery_objects_shadows
+                .get(&obj_addr)
+                .copied()
+                .expect("GCFLAG_HAS_SHADOW but no shadow found");
+        }
+        obj_addr
+    }
+
     pub fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
         if !self.is_valid_gc_object(obj_addr) || !self.is_in_nursery(obj_addr) {
             return obj_addr;

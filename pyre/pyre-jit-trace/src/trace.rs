@@ -7303,53 +7303,65 @@ mod tests {
 
         let _runtime = crate::trace_ctx_for_test(0);
         let ptr = |word| OpRef::const_ptr(GcRef(word));
+        // Private sentinels. The table is process-lifetime.
+        let o_reg = ptr(0x96C1_0000);
+        let i_reg = ptr(0x96C2_0000);
+        let o_bank_op = ptr(0x96C3_0000);
+        let i_bank_op = ptr(0x96C4_0000);
         let outer = Box::new(PyreSym::new_uninit(OpRef::NONE));
         let inner = Box::new(PyreSym::new_uninit(OpRef::NONE));
-        outer.registers_r.replace(vec![ptr(0x1000)]);
-        inner.registers_r.replace(vec![ptr(0x2000)]);
-        let outer_bank = RegisterBank::new([ptr(0x3000), OpRef::input_arg_ref(0)]);
-        let inner_bank = RegisterBank::new([ptr(0x4000)]);
+        outer.registers_r.replace(vec![o_reg]);
+        inner.registers_r.replace(vec![i_reg]);
+        let outer_bank = RegisterBank::new([o_bank_op, OpRef::input_arg_ref(0)]);
+        let inner_bank = RegisterBank::new([i_bank_op]);
         // Do not expose sentinel addresses to another test's real collector.
         let _stw = majit_gc::gc_sync::quiesce_mutators();
         let outer_anchor = super::TraceRoots::enter(&outer);
         let outer_registration = super::InlineRegisterBankGuard::enter(&outer_bank);
         let inner_anchor = super::TraceRoots::enter(&inner);
         let inner_registration = super::InlineRegisterBankGuard::enter(&inner_bank);
-        let mut seen = Vec::new();
-        // Sentinel words are never dereferenced. This is a forwarding visitor,
-        // not a real collection. Use the actual registry, including the
-        // independently registered frame banks, not just the current anchor.
-        {
-            majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-                if (0x1000..0x5000).contains(&root.0) {
+        let collect = || {
+            let mut seen = Vec::new();
+            let mut visit = |root: &mut GcRef| {
+                if (0x96C0_0000..0x96D0_0000).contains(&root.0) {
                     seen.push(root.0);
                     root.0 += 0x80;
                 }
-            });
-        }
+            };
+            // Register banks hold indexes. `const_ptr_table::walk` forwards
+            // `ConstPtr.value`. An inner anchor must not hide the outer one:
+            // both indexes stay in the table.
+            majit_gc::shadow_stack::walk_my_extra_areas(&mut visit);
+            majit_ir::const_ptr_table::walk(&mut visit);
+            seen.sort_unstable();
+            seen
+        };
+        assert_eq!(
+            collect(),
+            [0x96C1_0000, 0x96C2_0000, 0x96C3_0000, 0x96C4_0000]
+        );
+        assert_eq!(outer.registers_r.to_vec(), [o_reg]);
+        assert_eq!(o_reg.as_const_ptr(), Some(GcRef(0x96C1_0080)));
+        assert_eq!(outer_bank.get(0), Some(o_bank_op));
+        assert_eq!(o_bank_op.as_const_ptr(), Some(GcRef(0x96C3_0080)));
+        assert_eq!(outer_bank.get(1), Some(OpRef::input_arg_ref(0)));
+        assert_eq!(i_reg.as_const_ptr(), Some(GcRef(0x96C2_0080)));
+        assert_eq!(i_bank_op.as_const_ptr(), Some(GcRef(0x96C4_0080)));
+
         drop(inner_registration);
         drop(inner_anchor);
-        assert_eq!(seen, [0x1000, 0x3000, 0x2000, 0x4000]);
-        assert_eq!(outer.registers_r.to_vec(), [ptr(0x1080)]);
-        assert_eq!(outer_bank.get(0), Some(ptr(0x3080)));
-        assert_eq!(outer_bank.get(1), Some(OpRef::input_arg_ref(0)));
-        assert_eq!(inner.registers_r.to_vec(), [ptr(0x2080)]);
-        assert_eq!(inner_bank.get(0), Some(ptr(0x4080)));
-
-        seen.clear();
-        {
-            majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-                if (0x1000..0x5000).contains(&root.0) {
-                    seen.push(root.0);
-                    root.0 += 0x80;
-                }
-            });
-        }
+        // Dropping the inner bank retires that area. The indexes remain
+        // table roots, so the next minor still forwards every value.
+        assert_eq!(
+            collect(),
+            [0x96C1_0080, 0x96C2_0080, 0x96C3_0080, 0x96C4_0080]
+        );
+        assert_eq!(o_reg.as_const_ptr(), Some(GcRef(0x96C1_0100)));
+        assert_eq!(o_bank_op.as_const_ptr(), Some(GcRef(0x96C3_0100)));
+        assert_eq!(i_reg.as_const_ptr(), Some(GcRef(0x96C2_0100)));
+        assert_eq!(i_bank_op.as_const_ptr(), Some(GcRef(0x96C4_0100)));
         drop(outer_registration);
         drop(outer_anchor);
-        assert_eq!(seen, [0x1080, 0x3080]);
-        assert_eq!(outer.registers_r.to_vec(), [ptr(0x1100)]);
-        assert_eq!(outer_bank.get(0), Some(ptr(0x3100)));
     }
 
     #[test]

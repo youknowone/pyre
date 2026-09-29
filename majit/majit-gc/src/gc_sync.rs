@@ -629,7 +629,7 @@ impl Drop for ReentryGuard {
 /// which is `gc_op`). `ReentryGuard` owns the flag and compiles it out of
 /// release builds, so this is false when the guard is absent.
 #[inline]
-pub(crate) fn in_gc_op() -> bool {
+pub fn in_gc_op() -> bool {
     #[cfg(debug_assertions)]
     {
         IN_GC_OP.load(Ordering::Relaxed)

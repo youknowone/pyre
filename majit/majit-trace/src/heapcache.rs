@@ -1117,22 +1117,20 @@ impl HeapCache {
             .filter(|&c| c != 0)
     }
 
-    /// Walk every cached *value* slot so a `ConstPtr` ref survives a moving
-    /// minor collection. history.py `ConstPtr.value` is a gcref field
-    /// the Python GC traces through the box object graph; pyre stores cached
-    /// values as flat [`OpRef`] slots and forwards inline `ConstPtr` values in
-    /// place. Every other `OpRef` kind is a no-op.
+    /// `ConstPtr` in a value slot is a [`majit_ir::const_ptr_table`] index.
+    /// `history.py` `ConstPtr.value` is written once, by
+    /// `const_ptr_table::walk`. This walk does not apply `visitor`: the
+    /// index is not an address, and the active-trace walker already
+    /// forwarded the table before it reaches the cache.
     ///
-    /// Only value slots are walked — these are returned on cache hits and
-    /// emitted into the op-graph (`replaced_with_const` /
-    /// `loopinvariant_result` / `CacheEntry` field values), so a stale one
-    /// is a use-after-move. The `cache_anything` / `cache_seen_allocation`
-    /// / `quasiimmut_seen_refs` *keys* are deliberately left stale: a forwarded
-    /// lookup key simply misses the stale-keyed entry and the cache
-    /// repopulates (same contract as the `call_pure_results` cache), and an
-    /// in-place key rewrite would break the sorted-`VecMap` ordering.
+    /// Value slots (`replaced_with_const`, `loopinvariant_result`,
+    /// `CacheEntry` field values) are the ones a cache hit emits. Keys
+    /// (`cache_anything`, `cache_seen_allocation`, `quasiimmut_seen_refs`)
+    /// stay as they are: rewriting a key would break sorted `VecMap`
+    /// order, and a stale key misses and repopulates.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+            // The word is an index. Nothing here moves.
             let _ = (slot, visitor);
         }
         fn forward_entry(entry: &mut CacheEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
@@ -2576,32 +2574,36 @@ mod tests {
 
     #[test]
     fn test_walk_const_ptr_refs_forwards_replaced_with_const() {
-        // history.py parity: a ConstPtr cached as a replacement
-        // value must survive a moving minor collection. Forward it and read
-        // back through maybe_replace_with_const.
+        // history.py `ConstPtr`: one box, `value` written once. The cache
+        // keeps the index. `const_ptr_table::walk` forwards the address;
+        // the heapcache walk must not move it a second time.
         let mut cache = HeapCache::new();
         let old = OpRef::ref_op(3);
-        let new = OpRef::const_ptr(GcRef(0x1000));
+        let addr = GcRef(0x96_0CAC_E001);
+        let new = OpRef::const_ptr(addr);
         cache.replace_box(old, new);
         assert_eq!(cache.maybe_replace_with_const(old), new);
 
+        majit_ir::const_ptr_table::walk(&mut |gcref: &mut GcRef| {
+            if *gcref == addr {
+                *gcref = GcRef(0x96_0CAC_E002);
+            }
+        });
         cache.walk_const_ptr_refs(&mut |gcref: &mut GcRef| {
             gcref.0 = gcref.0.wrapping_add(0x1_0000);
         });
 
-        assert_eq!(
-            cache.maybe_replace_with_const(old),
-            OpRef::const_ptr(GcRef(0x1_1000))
-        );
+        let got = cache.maybe_replace_with_const(old);
+        assert_eq!(got, new);
+        assert_eq!(got.as_const_ptr(), Some(GcRef(0x96_0CAC_E002)));
     }
 
     #[test]
     fn test_walk_const_ptr_refs_leaves_cache_keys_stale() {
-        // Cache *keys* are intentionally not forwarded: an in-place key
-        // rewrite would break the sorted-VecMap ordering, and a stale key
-        // simply misses + repopulates (the live lookup arrives already
-        // forwarded). A `ConstPtr` object used as a `cache_anything`
-        // key must therefore stay at its pre-collection address.
+        // Cache *keys* are indexes, not addresses. Rewriting one would
+        // break sorted-VecMap order. A stale key misses and the cache
+        // repopulates. The heapcache walk must leave the index in place,
+        // so a later intern of a different address is a different key.
         let mut cache = HeapCache::new();
         let const_obj = OpRef::const_ptr(GcRef(0x2000));
         let field = 7;

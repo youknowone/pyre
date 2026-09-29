@@ -1262,6 +1262,12 @@ fn dynasm_id_or_identityhash(addr: usize) -> usize {
     if !majit_gc::collector_installed() {
         return !addr;
     }
+    // `Trace::refresh_from_gc` calls this from a root walk. `gc_op` already
+    // holds the collector; a second one panics in debug
+    // (`reentrant &mut gc_op`).
+    if majit_gc::gc_sync::in_gc_op() {
+        return majit_gc::gc_sync::gc_query_reentrant(|g| g.id_or_identityhash_reentrant(addr));
+    }
     // A box whose borrow is already held by an in-progress alloc answers with
     // the raw `addr`, not with the singleton's id: this is a top-level op, so
     // the busy borrow means the box is mid-allocation, not that it is absent.
