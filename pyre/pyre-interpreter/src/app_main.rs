@@ -108,10 +108,14 @@ pub fn seed_main_loader(
 ) {
     use crate::baseobjspace::getattr_str;
 
+    // The imports below run module bodies; the globals are read from their
+    // slot at each use.
+    let roots = pyre_object::gc_roots::push_roots();
+    let globals_slot = roots.pin_roots(&[w_main_globals]);
     let load = |module: &str, attr: &str| -> Option<pyre_object::PyObjectRef> {
         importing::importhook(
             rustpython_wtf8::Wtf8::new(module),
-            w_main_globals,
+            roots.get(globals_slot),
             pyre_object::PY_NULL,
             0,
             ec_ptr,
@@ -153,7 +157,11 @@ pub fn seed_main_loader(
         return;
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str(w_main_globals, "__loader__", loader);
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            roots.get(globals_slot),
+            "__loader__",
+            loader,
+        );
     }
 }
 
@@ -194,17 +202,20 @@ fn init_warnoptions(
             )?;
             return Ok(());
         };
-        let Some(w_sys) = importing::get_interpreter_sys_module() else {
+        let Some(mut w_sys) = importing::get_interpreter_sys_module() else {
             return Ok(());
         };
         // `from warnings import _processoptions` raises `ImportError` when the
         // name is absent, which the `except` covers; the attribute read that
         // spells it here raises `AttributeError`, which it would not, so that
         // lookup keeps its own swallowing arm.
-        let Ok(process) = crate::baseobjspace::getattr_str(w_warnings, "_processoptions") else {
+        let Ok(mut process) = pyre_object::with_roots!(w_sys =>
+            crate::baseobjspace::getattr_str(w_warnings, "_processoptions"))
+        else {
             return Ok(());
         };
-        let options = crate::baseobjspace::getattr_str(w_sys, "warnoptions")?;
+        let options = pyre_object::with_roots!(process =>
+            crate::baseobjspace::getattr_str(w_sys, "warnoptions"))?;
         crate::call::call_function_impl_result(process, &[options])?;
         Ok(())
     })();
@@ -327,7 +338,11 @@ pub fn import_site(
 ) -> bool {
     // `run_command_line` installs it ahead of its own `import site`, so a
     // crash inside `site` itself is already covered.
-    if !init_faulthandler(w_main_globals, ec_ptr) {
+    // `init_faulthandler` and `import site` run module bodies; the globals
+    // are read from their slot at each use.
+    let roots = pyre_object::gc_roots::push_roots();
+    let globals_slot = roots.pin_roots(&[w_main_globals]);
+    if !init_faulthandler(roots.get(globals_slot), ec_ptr) {
         return false;
     }
     // Through the `builtins.__import__` binding, the way the `import site`
@@ -341,7 +356,7 @@ pub fn import_site(
     if !no_site
         && importing::call_dunder_import(
             "site",
-            w_main_globals,
+            roots.get(globals_slot),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
             0,
@@ -354,7 +369,7 @@ pub fn import_site(
     importing::add_sys_path_0();
     // The warnings bootstrap sits outside the `no_site` guard in `app_main.py`,
     // so `-S -Wxxx` still reports a bad filter.
-    init_warnoptions(w_main_globals, ec_ptr);
+    init_warnoptions(roots.get(globals_slot), ec_ptr);
     true
 }
 
