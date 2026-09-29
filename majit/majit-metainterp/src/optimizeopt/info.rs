@@ -1149,14 +1149,8 @@ fn force_box_impl(
             // optimizer.py `Optimizer.emit_extra` → `emit` →
             // `_emit_operation`: `arg = self.force_box(op.getarg(i))`.
             for i in 0..op.num_args() {
-                let original = op.arg(i);
-                let forced = ctx.force_box_inline(&original);
-                if forced != original.get_box_replacement(false).to_opref() {
-                    let forced_box = ctx
-                        .get_box_replacement_operand_opt(forced)
-                        .unwrap_or_else(|| ctx.materialize_operand_at(forced));
-                    op.setarg(i, forced_box);
-                }
+                let arg = ctx.force_box_inline(&op.arg(i));
+                op.setarg(i, arg);
             }
             ctx.emit_rc(op.clone());
         } else {

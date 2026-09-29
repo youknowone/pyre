@@ -7060,66 +7060,56 @@ impl OptContext {
     /// then force virtuals to concrete. Body refs route through the preamble
     /// source directly, so the prior reverse-lookup 3rd key is no longer
     /// needed.
-    pub(crate) fn force_box_inline(&mut self, op: &Operand) -> OpRef {
-        let opref = op.to_opref();
-        if opref.is_constant() {
-            return opref;
+    pub(crate) fn force_box_inline(&mut self, op: &Operand) -> Operand {
+        // optimizer.py: op = get_box_replacement(op)
+        if op.is_constant() {
+            return op.clone();
         }
-        let resolved_op = self.get_box_replacement_operand_opt(opref);
-        let resolved = resolved_op.as_ref().map_or(opref, |op| op.to_opref());
+        let resolved_box = self.resolve_operand_operand(op);
         // optimizer.py:351-359: a result that folded to an inline Const can
         // never be a `potential_extra_ops` key (the pool is keyed by the pure
         // op's result Box; the Const inlines at use sites instead of being
         // produced by a short box), so skip the short-preamble recording for
         // const-resolved results — otherwise the Const reaches `used_boxes`
         // and the carried label slot trips `OpRef::raw()` in unroll.rs.
-        if !resolved.is_constant() {
-            let tracked = match resolved_op.clone() {
-                Some(resolved_box) => self.take_potential_extra_op(&resolved_box),
-                None => None,
-            }
+        if resolved_box.is_constant() {
+            return resolved_box;
+        }
+        let tracked = self
+            .take_potential_extra_op(&resolved_box)
             .or_else(|| self.take_potential_extra_op(op));
-            if let Some(preamble_op) = tracked {
-                // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
-                // — the resolved Box itself is handed to the builder.
-                // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
-                // — walk the box's own `_forwarded` chain (total; identity on a
-                // miss), object-native rather than positional.
-                let resolved_for_pop = preamble_op.op.get_box_replacement(false);
-                if let Some(builder) = self.active_short_preamble_producer_mut() {
-                    builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
-                } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
-                    builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
-                }
+        if let Some(preamble_op) = tracked {
+            // shortpreamble.py `op = preamble_op.op.get_box_replacement()` —
+            // walk the box's own `_forwarded` chain, the resolved Box itself
+            // is handed to the builder.
+            let resolved_for_pop = preamble_op.op.get_box_replacement(false);
+            if let Some(builder) = self.active_short_preamble_producer_mut() {
+                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
+            } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
+                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             }
         }
         // optimizer.py:361-362: if op.type == 'i' and info.is_constant():
         //     return ConstInt(info.get_constant_int())
         // Mirrors Optimizer::force_box — a forced operand with an already-constant
         // IntBound materializes as ConstInt; peek the bound without installing.
-        if let Some(rb) = resolved_op.as_ref()
-            && rb.const_value().is_none()
-            && rb.type_() == Type::Int
-            && let Some(bound) = self.peek_intbound_box(rb)
+        if resolved_box.type_() == Type::Int
+            && let Some(bound) = self.peek_intbound_box(&resolved_box)
             && bound.is_constant()
         {
-            return self.make_constant_int(bound.get_constant_int());
+            return Operand::const_(majit_ir::Const::Int(bound.get_constant_int()));
         }
         // optimizer.py force_box reads the live info. Only the recursive
         // materialization path needs an owned snapshot across &mut self.
-        let virtual_info = resolved_op
-            .as_ref()
-            .and_then(Operand::ptr_info)
+        let virtual_info = resolved_box
+            .ptr_info()
             .filter(|info| info.is_virtual())
             .map(|info| info.clone());
         if let Some(mut info) = virtual_info {
-            let resolved_op = resolved_op
-                .clone()
-                .expect("is_virtual implies resolved_op is Some");
-            let forced = info.force_box(&resolved_op, self);
-            return self.resolve_operand_operand(&forced).to_opref();
+            let forced = info.force_box(&resolved_box, self);
+            return self.resolve_operand_operand(&forced);
         }
-        resolved
+        resolved_box
     }
 
     /// RPython optimizer.py store_final_boxes_in_guard inline.
