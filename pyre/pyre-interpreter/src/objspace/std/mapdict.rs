@@ -2232,8 +2232,8 @@ unsafe fn property_descr_fast_path_wtf8(
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where_wtf8(w_type, name) }?;
     // Exact type: the fold calls `fget`/`fset` directly, which stands in for
     // `type(w_descr).__get__` only where that cannot have been overridden
-    // (`descroperation.py get_and_call_function`).  A `property` subclass keeps the base
-    // layout and retags only `w_class`, so the layout test admits it.
+    // (`descroperation.py get_and_call_function`). A property subclass is
+    // `PROPERTY_USER_TYPE` (`typedef.py` `_getusercls`) and fails this test.
     if !unsafe { pyre_object::descriptor::is_exact_property(w_descr) } {
         return None;
     }
@@ -2332,6 +2332,12 @@ pub unsafe fn data_descriptor_get_fast_path(
     }
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
     if !unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
+        return None;
+    }
+    // Exact `property` has its own fold. A `_getusercls` property
+    // subclass is still that builtin descriptor; this path is for a
+    // user type's `__get__`, not `W_Property`.
+    if unsafe { pyre_object::descriptor::is_property(w_descr) } {
         return None;
     }
     let descr_type = crate::typedef::r#type(w_descr)?.as_ptr();

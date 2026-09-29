@@ -1,3 +1,6 @@
+# CPython-suite gap: no test stores attributes, slots, weakrefs or __del__ on enumerate/map/filter/zip/reversed/super/property subclasses.
+# parity-tests reason: this targets the typedef.py _getusercls mapdict storage on those iterator and descriptor layouts.
+
 """Subclass instances of enumerate/map/filter/zip/reversed/super/property.
 
 `typedef.py` `_getusercls` allocates them with mapdict storage: attributes,
