@@ -6869,6 +6869,7 @@ pub fn createframe_obj(
     let root_base = _roots.base();
     let _ = _roots.pin_root(code as PyObjectRef);
     let _ = _roots.pin_root(w_globals);
+    let _ = _roots.pin_root(outer_func.unwrap_or(PY_NULL));
     let frame_stores_global = unsafe {
         crate::w_code_frame_stores_global(_roots.get(root_base), _roots.get(root_base + 1))
     };
@@ -6892,7 +6893,7 @@ pub fn createframe_obj(
         f_generator_wref: PY_NULL,
         w_yielding_from: PY_NULL,
         f_backref: std::ptr::null_mut(),
-        w_builtin: _roots.get(root_base + 2),
+        w_builtin: _roots.get(root_base + 3),
     };
     // pyframe.py `__init__` — `self = hint(self, access_directly=True,
     // fresh_virtualizable=True)`.  Upstream spells the two kwargs on one
@@ -6914,7 +6915,7 @@ pub fn createframe_obj(
     // flags for the seed CodeInfo (`crates/codegen/src/compile.rs Compiler::new`)
     // so initialize_frame_scopes selects the `!OPTIMIZED && !NEWLOCALS`
     // arm and binds `w_locals = w_globals` per pyframe.py.
-    let outer_ref = outer_func.unwrap_or(PY_NULL);
+    let outer_ref = _roots.get(root_base + 2);
     // initialize_frame_scopes allocates (the locals dict and `w_cell_new`
     // cells) and stores the cells into `locals_cells_stack_w`; root the slot so
     // a collection mid-init can't drop the cells already written there.
@@ -6926,7 +6927,7 @@ pub fn createframe_obj(
         let _frame_roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(frame.as_mut_ptr() as pyre_object::PyObjectRef);
         let _root = FrameLocalsRoot::new(frame.as_mut_ptr());
-        frame.initialize_frame_scopes(outer_ref, code)?;
+        frame.initialize_frame_scopes(outer_ref, _roots.get(root_base) as *const ())?;
     }
     remember_frame_locals_array(frame.locals_cells_stack_w);
 

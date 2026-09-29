@@ -893,23 +893,32 @@ fn deque_compare(
     // snapshots, so check each deque's lock before consuming its element
     // and stop as soon as the result is determined.
     use crate::baseobjspace::CompareOp;
-    let lock_a = getlock(self_obj);
-    let lock_b = getlock(other);
-    let snap_a = snapshot(self_obj);
-    let snap_b = snapshot(other);
+    // `getlock` allocates the lock token, `snapshot` takes the stripe and
+    // `eq_w` runs Python: both deques, their locks and the first snapshot are
+    // read back from their slots.
     let _roots = pyre_object::gc_roots::push_roots();
-    // Publish both snapshots before any normalize query: each `pin_roots`
-    // is a safepoint, and the second slice would still be unrooted.
-    let a_base = pyre_object::gc_roots::publish_roots(&snap_a);
-    let b_base = pyre_object::gc_roots::publish_roots(&snap_b);
-    pyre_object::gc_roots::normalize_roots(a_base, snap_a.len() + snap_b.len());
+    let own_base = pyre_object::gc_roots::pin_roots(&[self_obj, other, PY_NULL, PY_NULL]);
+    let lock_a = getlock(pyre_object::gc_roots::shadow_stack_get(own_base));
+    pyre_object::gc_roots::shadow_stack_set(own_base + 2, lock_a);
+    let lock_b = getlock(pyre_object::gc_roots::shadow_stack_get(own_base + 1));
+    pyre_object::gc_roots::shadow_stack_set(own_base + 3, lock_b);
+    let snap_a = snapshot(pyre_object::gc_roots::shadow_stack_get(own_base));
+    let a_base = pyre_object::gc_roots::pin_roots(&snap_a);
+    let snap_b = snapshot(pyre_object::gc_roots::shadow_stack_get(own_base + 1));
+    let b_base = pyre_object::gc_roots::pin_roots(&snap_b);
     let mut i = 0usize;
     loop {
         // next(w_it1): lock-check precedes the element.
-        checklock(self_obj, lock_a)?;
+        checklock(
+            pyre_object::gc_roots::shadow_stack_get(own_base),
+            pyre_object::gc_roots::shadow_stack_get(own_base + 2),
+        )?;
         let x1 = (i < snap_a.len()).then(|| pyre_object::gc_roots::shadow_stack_get(a_base + i));
         // next(w_it2): lock-check precedes the element.
-        checklock(other, lock_b)?;
+        checklock(
+            pyre_object::gc_roots::shadow_stack_get(own_base + 1),
+            pyre_object::gc_roots::shadow_stack_get(own_base + 3),
+        )?;
         let x2 = (i < snap_b.len()).then(|| pyre_object::gc_roots::shadow_stack_get(b_base + i));
         match (x1, x2) {
             (Some(_), Some(_)) => {
@@ -996,7 +1005,6 @@ pub(crate) fn deque_repeat(
             }
         }
     }
-    let ty = unsafe { w_instance_get_type(self_obj) };
     let items_base = pyre_object::gc_roots::publish_roots(&items);
     pyre_object::gc_roots::normalize_roots(items_base, items.len());
     let list = w_list_new(
@@ -1007,6 +1015,9 @@ pub(crate) fn deque_repeat(
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(list);
     let m = maxlen_obj(pyre_object::gc_roots::shadow_stack_get(roots));
+    // `w_list_new` and `maxlen_obj` allocate; the type is read off the
+    // rooted receiver after them.
+    let ty = unsafe { w_instance_get_type(pyre_object::gc_roots::shadow_stack_get(roots)) };
     if unsafe { is_none(m) } {
         crate::call::call_function_impl_result(
             ty,

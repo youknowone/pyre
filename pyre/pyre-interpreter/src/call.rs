@@ -2355,14 +2355,15 @@ fn call_non_function_callable_with_mode(
     // general `__get__` arms execute Python.  Root the arguments first and
     // dispatch each bound call from the forwarded roots — this native slice is
     // not one the collector updates.
+    let nargs = args.len();
     let _override_roots = pyre_object::gc_roots::push_roots();
     let override_base = pyre_object::gc_roots::publish_roots(args);
     let callable_slot = pyre_object::gc_roots::publish_roots(&[callable]);
-    pyre_object::gc_roots::normalize_roots(override_base, args.len() + 1);
+    pyre_object::gc_roots::normalize_roots(override_base, nargs + 1);
     let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     let reloaded_args = || {
-        let mut reloaded = Vec::with_capacity(args.len());
-        for index in 0..args.len() {
+        let mut reloaded = Vec::with_capacity(nargs);
+        for index in 0..nargs {
             reloaded.push(pyre_object::gc_roots::shadow_stack_get(
                 override_base + index,
             ));
@@ -4497,8 +4498,8 @@ pub fn call_function_impl_result(
             // have been updated to forwarded addresses; reconstruct the
             // argument view before recursively dispatching the bound call.
             let current_callable = pyre_object::gc_roots::shadow_stack_get(root_base);
-            let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
-            for i in 0..args.len() {
+            let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(arg_count);
+            for i in 0..arg_count {
                 current_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
             }
             if prepend_receiver {

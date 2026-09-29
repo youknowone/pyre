@@ -1049,7 +1049,11 @@ crate::py_module! {
         "_release_lock" / 0 = lock_noop,
     },
     extra_init: |ns| {
+        // `create_filter` and the allocations below can collect; the
+        // namespace is read back from its slot.
         let _filter_roots = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::pin_roots(&[ns]);
+        let ns = || pyre_object::gc_roots::shadow_stack_get(ns_slot);
         let mut filter_slots = Vec::new();
         let mut put_filter = |filter: PyObjectRef| {
             filter_slots.push(pyre_object::gc_roots::shadow_stack_len());
@@ -1087,10 +1091,13 @@ crate::py_module! {
         // State fields into the module dict.  Capture the namespace only once
         // every field is in place, so `state_is_readable` never reports a
         // half-filled State to a warning raised in between.
-        crate::module_ns_store(ns, "filters", filters);
-        crate::module_ns_store(ns, "_onceregistry", w_dict_new());
-        crate::module_ns_store(ns, "_defaultaction", w_str_new("default"));
-        crate::module_ns_store(ns, VERSION_ATTR, new_version());
-        STATE_NS.store(ns as usize, std::sync::atomic::Ordering::Release);
+        crate::module_ns_store(ns(), "filters", filters);
+        let onceregistry = w_dict_new();
+        crate::module_ns_store(ns(), "_onceregistry", onceregistry);
+        let defaultaction = w_str_new("default");
+        crate::module_ns_store(ns(), "_defaultaction", defaultaction);
+        let version = new_version();
+        crate::module_ns_store(ns(), VERSION_ATTR, version);
+        STATE_NS.store(ns() as usize, std::sync::atomic::Ordering::Release);
     },
 }

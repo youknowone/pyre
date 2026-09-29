@@ -7517,13 +7517,14 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<Wtf8Buf>, crate
     // Python 3.14 importlib._bootstrap._calc___package__: an explicit
     // non-None __package__ wins; otherwise __spec__.parent is authoritative.
     let package = crate::baseobjspace::finditem_str(shadow_stack_get(globals_slot), "__package__")?;
+    let has_package = package.is_some();
     let package_slot = shadow_stack_len();
     let _ = pin_root(package.unwrap_or(pyre_object::w_none()));
     let spec = crate::baseobjspace::finditem_str(shadow_stack_get(globals_slot), "__spec__")?;
     let spec_slot = shadow_stack_len();
     let _ = pin_root(spec.unwrap_or(pyre_object::w_none()));
 
-    if package.is_some() {
+    if has_package {
         let pkg = shadow_stack_get(package_slot);
         if !unsafe { pyre_object::is_none(pkg) } {
             if !unsafe { pyre_object::is_str(pkg) } {

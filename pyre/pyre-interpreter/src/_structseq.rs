@@ -103,24 +103,24 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         ));
     }
     // The class reads below can allocate; the instance is reloaded from its
-    // root afterwards.
+    // root afterwards, and the class is re-read through it.
     let roots = pyre_object::gc_roots::push_roots();
     let inst_slot = roots.pin_roots(&[inst]);
-    let cls = unsafe { (*inst).w_class };
-    if !is_structseq_type(cls) {
+    let cls = || unsafe { (*roots.get(inst_slot)).w_class };
+    if !is_structseq_type(cls()) {
         return Err(PyError::type_error(
             "__replace__() requires a structseq instance",
         ));
     }
-    let name = class_name(cls).unwrap_or_default();
-    if read_class_int(cls, "n_unnamed_fields").unwrap_or(0) > 0 {
+    let name = class_name(cls()).unwrap_or_default();
+    if read_class_int(cls(), "n_unnamed_fields").unwrap_or(0) > 0 {
         return Err(PyError::type_error(format!(
             "__replace__() is not supported for {name} because it has unnamed field(s)"
         )));
     }
     // With no unnamed field, `__match_args__` names every positional field.
-    let fields = match_args_names(cls)?;
-    let extra_fields = extra_field_names(cls)?;
+    let fields = match_args_names(cls())?;
+    let extra_fields = extra_field_names(cls())?;
     let inst = roots.get(inst_slot);
 
     // Key stays the str object. A lone surrogate is not a field name and
@@ -195,7 +195,7 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             (field.as_str(), value)
         })
         .collect();
-    Ok(new_instance_with_extra(cls, body, extras))
+    Ok(new_instance_with_extra(cls(), body, extras))
 }
 
 /// A keyword matches a structseq field when its WTF-8 view is that UTF-8 name.

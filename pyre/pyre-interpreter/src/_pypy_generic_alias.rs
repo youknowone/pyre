@@ -439,8 +439,10 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // indices rather than values — the same shape `push_newarg` uses above —
     // and `items` is read back before each element fetch.
     let _roots = pyre_object::gc_roots::push_roots();
-    let items_slot = pyre_object::gc_roots::pin_roots(&[items, pyre_object::PY_NULL]);
+    let items_slot =
+        pyre_object::gc_roots::pin_roots(&[items, pyre_object::PY_NULL, pyre_object::PY_NULL]);
     let subargs_slot = items_slot + 1;
+    let arg_slot = items_slot + 2;
     let items = || pyre_object::gc_roots::shadow_stack_get(items_slot);
     let n = unsafe { w_tuple_len(items()) };
     let mut newarg_slots: Vec<usize> = Vec::new();
@@ -452,6 +454,9 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         let Some(arg) = (unsafe { w_tuple_getitem(items(), i as i64) }) else {
             continue;
         };
+        // getattr_str / is_true / getitem run Python; `arg` is read back
+        // from its slot for `push_newarg`.
+        pyre_object::gc_roots::shadow_stack_set(arg_slot, arg);
         let subargs = match crate::baseobjspace::getattr_str(arg, "__typing_unpacked_tuple_args__")
         {
             Ok(s) => s,
@@ -491,7 +496,10 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
                 newarg_slots.push(member_base + index);
             }
         } else {
-            push_newarg(arg, &mut newarg_slots);
+            push_newarg(
+                pyre_object::gc_roots::shadow_stack_get(arg_slot),
+                &mut newarg_slots,
+            );
         }
     }
     let mut newargs = Vec::with_capacity(newarg_slots.len());

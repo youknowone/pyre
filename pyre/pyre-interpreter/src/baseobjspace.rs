@@ -2426,6 +2426,7 @@ fn string_index_type_error(index: PyObjectRef) -> PyError {
 #[inline(never)]
 unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
+    let mut index = index;
     if is_slice(index) {
         let (rs, rp, st) = {
             // Every slice component goes through `__index__`, so this runs
@@ -2475,10 +2476,12 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             // before dispatching here, so nothing else roots it across the
             // call. A list is nursery-allocated, so read the address back —
             // a minor collection during the call moves it.
+            // The index is read back for the overflow message's type name.
             let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, index]);
             let indexed = space_index(index)?;
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            index = pyre_object::gc_roots::shadow_stack_get(obj_slot + 1);
             indexed
         };
         if is_int(indexed) {
@@ -2513,6 +2516,7 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 #[inline(never)]
 unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
+    let mut index = index;
     if is_slice(index) {
         // tupleobject.py descr_getslice → slice.indices.
         let len = w_tuple_len(obj) as i64;
@@ -2563,10 +2567,12 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             // before dispatching here, so nothing else roots it across the
             // call. A tuple is nursery-allocated, so read the address back —
             // a minor collection during the call moves it.
+            // The index is read back for the overflow message's type name.
             let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, index]);
             let indexed = space_index(index)?;
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            index = pyre_object::gc_roots::shadow_stack_get(obj_slot + 1);
             indexed
         };
         if is_int(indexed) {
@@ -2608,6 +2614,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // position through the string's cached `rutf8` index table, so a read is
     // O(1) either way and nothing here has to materialise the code points.
     let mut obj = obj;
+    let mut index = index;
     let len = w_str_len(obj);
     if is_slice(index) {
         // `pypy/objspace/std/unicodeobject.py W_UnicodeObject._getitem_slice`
@@ -2664,10 +2671,12 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             // before dispatching here, so nothing else roots it across the
             // call. `space.str` answers a nursery header, so read the address
             // back — a minor collection during the call moves it.
+            // The index is read back for the overflow message's type name.
             let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, index]);
             let indexed = space_index(index)?;
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            index = pyre_object::gc_roots::shadow_stack_get(obj_slot + 1);
             indexed
         };
         if is_int(indexed) {
@@ -6741,6 +6750,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // The receiver, its type and the descriptor are read back from
             // their slots after each call below: a descriptor `__get__` and
             // the dict lookup can both run Python.
+            let has_descr = w_descr.is_some();
             let descr_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_descr.unwrap_or(PY_NULL));
             // module.py descr_getattribute runs the normal lookup, then catches
@@ -6750,9 +6760,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // AttributeError; the bare `object.__getattribute__` slot
             // (`!call_getattr`) still propagates so `module_getattribute`'s own
             // `try`/`except` performs the routing.
-            if w_descr.is_some()
-                && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot))
-            {
+            if has_descr && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
                 match get(
                     pyre_object::gc_roots::shadow_stack_get(descr_slot),
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -6779,7 +6787,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             {
                 return Ok(value);
             }
-            if w_descr.is_some() {
+            if has_descr {
                 match get(
                     pyre_object::gc_roots::shadow_stack_get(descr_slot),
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -6928,14 +6936,23 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
 
             // Step 1: look up in type MRO
             let w_descr = lookup_in_type_where(w_type, name);
+            // A descriptor `__get__` and the dict read below can run Python;
+            // the descriptor is read back from its slot after each.
+            let has_descr = w_descr.is_some();
+            let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+            if let Some(descr) = w_descr {
+                let _ = pyre_object::gc_roots::pin_root(descr);
+            }
 
             // Step 2: data descriptor takes priority over instance dict.
             // objspace.py — a descriptor `__get__` raising
             // AttributeError falls back to `__getattr__`, not propagated.
-            if let Some(descr) = w_descr
-                && is_data_descr(descr)
-            {
-                match get(descr, obj, w_type) {
+            if has_descr && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
+                match get(
+                    pyre_object::gc_roots::shadow_stack_get(descr_slot),
+                    obj,
+                    w_type,
+                ) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
                     Err(e) if e.kind == PyErrorKind::AttributeError => {
@@ -6972,9 +6989,8 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // PyPy: descroperation.py — invoke __get__ to bind methods.
             // objspace.py — a non-data descriptor `__get__` raising
             // AttributeError falls back to `__getattr__` too.
-            if let Some(descr) = w_descr {
-                let descr_slot = pyre_object::gc_roots::shadow_stack_len();
-                let descr = pyre_object::gc_roots::pin_root(descr);
+            if has_descr {
+                let descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
                 match get(descr, obj, w_type) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
@@ -9344,10 +9360,19 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             && let Some(w_type) = crate::typedef::r#type(obj)
         {
             let w_descr = lookup_in_type_where(w_type.as_ptr(), name);
-            if let Some(descr) = w_descr
-                && is_data_descr(descr)
-            {
-                match get(descr, obj, w_type.as_ptr()) {
+            // `get` and `getdictvalue` can run Python; the descriptor is read
+            // back from its slot after each.
+            let has_descr = w_descr.is_some();
+            let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+            if let Some(descr) = w_descr {
+                let _ = pyre_object::gc_roots::pin_root(descr);
+            }
+            if has_descr && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
+                match get(
+                    pyre_object::gc_roots::shadow_stack_get(descr_slot),
+                    obj,
+                    w_type.as_ptr(),
+                ) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
                     Err(e) if e.kind == PyErrorKind::AttributeError => {
@@ -9359,7 +9384,8 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             if let Some(value) = getdictvalue(obj, name)? {
                 return Ok(value);
             }
-            if let Some(descr) = w_descr {
+            if has_descr {
+                let descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
                 // A plain Python function is the one callable `get` leaves
                 // unhandled; bind it here.  A builtin-code carrier is not:
                 // a `method_descriptor` binds to a
@@ -9373,8 +9399,6 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                 {
                     return Ok(pyre_object::w_method_new(descr, obj, w_type.as_ptr()));
                 }
-                let descr_slot = pyre_object::gc_roots::shadow_stack_len();
-                let descr = pyre_object::gc_roots::pin_root(descr);
                 match get(descr, obj, w_type.as_ptr()) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
@@ -9403,9 +9427,17 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
         // dict (`hasdict` false) and take the direct class-attr fast path.
         if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
             let w_descr = unsafe { lookup_in_type_where(w_type.as_ptr(), name) };
-            if let Some(descr) = w_descr
-                && unsafe { is_data_descr(descr) }
+            // `get` and `getdictvalue` can run Python; the descriptor is read
+            // back from its slot after each.
+            let has_descr = w_descr.is_some();
+            let method_slot = pyre_object::gc_roots::shadow_stack_len();
+            if let Some(descr) = w_descr {
+                let _ = pyre_object::gc_roots::pin_root(descr);
+            }
+            if has_descr
+                && unsafe { is_data_descr(pyre_object::gc_roots::shadow_stack_get(method_slot)) }
             {
+                let descr = pyre_object::gc_roots::shadow_stack_get(method_slot);
                 match unsafe { get(descr, obj, w_type.as_ptr()) } {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
@@ -9421,9 +9453,8 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                 return Ok(value);
             }
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            if let Some(method) = w_descr {
-                let method_slot = pyre_object::gc_roots::shadow_stack_len();
-                let method = pyre_object::gc_roots::pin_root(method);
+            if has_descr {
+                let method = pyre_object::gc_roots::shadow_stack_get(method_slot);
                 match unsafe { get(method, obj, w_type.as_ptr()) } {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}

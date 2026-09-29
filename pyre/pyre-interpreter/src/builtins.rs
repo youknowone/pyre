@@ -8091,20 +8091,21 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
     // runs `getindex_w_written`, both a user `__index__`, so the arguments are
     // read off the root stack rather than out of the caller's slice once
     // either has run.
+    let nargs = args.len();
     let _roots = pyre_object::gc_roots::push_roots();
     let args_base = pyre_object::gc_roots::pin_roots(args);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(exc);
     let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
-    let arg_opt = |index: usize| (index < args.len()).then(|| arg(index));
+    let arg_opt = |index: usize| (index < nargs).then(|| arg(index));
     // `_parse_init_args`: only a 2..=5 argument call carries errno/strerror
     // (and optionally filename/filename2); outside that range every argument
     // stays in `args_w` and no slot is filled.
     // Pinned as well: on Windows the parse can mint a fresh int, and
     // `getindex_w_written` below can move either one.
-    let mut live_args = Vec::with_capacity(args.len());
-    for index in 0..args.len() {
+    let mut live_args = Vec::with_capacity(nargs);
+    for index in 0..nargs {
         live_args.push(pyre_object::gc_roots::shadow_stack_get(args_base + index));
     }
     let errno_slot = os_error_parsed_errno(&live_args).map(|w_errno| {
@@ -8158,9 +8159,9 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
     let args_w: Vec<PyObjectRef> = match (errno(), trimmed) {
         (Some(w_errno), true) => vec![w_errno, arg(1)],
         (Some(w_errno), false) => std::iter::once(w_errno)
-            .chain((1..args.len()).map(&arg))
+            .chain((1..nargs).map(&arg))
             .collect(),
-        (None, _) => (0..args.len()).map(&arg).collect(),
+        (None, _) => (0..nargs).map(&arg).collect(),
     };
     let args_list = interp_exceptions::w_exception_args_new(args_w);
     unsafe { interp_exceptions::w_exception_set_args(exc(), args_list) };
@@ -23204,6 +23205,10 @@ fn builtin_open_impl(
     let argument_roots = pyre_object::gc_roots::push_roots();
     let file = pyre_object::gc_roots::pin_root(file);
     let mut file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // `str_utf8_w` can collect; the arguments still to bind are read back
+    // from their slots after it.
+    let positional_base = pyre_object::gc_roots::pin_roots(positional);
+    let kwargs_slot = pyre_object::gc_roots::pin_roots(&[kwargs.unwrap_or(PY_NULL)]);
     let w_mode =
         bind_pos_or_kw(positional, kwargs, 1, "mode", "open", 2)?.unwrap_or_else(|| w_str_new("r"));
     if unsafe { !pyre_object::is_str(w_mode) } {
@@ -23213,6 +23218,11 @@ fn builtin_open_impl(
         )));
     }
     let mode = crate::baseobjspace::str_utf8_w(w_mode)?.to_string();
+    let positional: Vec<PyObjectRef> = (0..positional.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
+        .collect();
+    let positional = positional.as_slice();
+    let kwargs = kwargs.map(|_| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
     let w_buffering = bind_pos_or_kw(positional, kwargs, 2, "buffering", "open", 3)?
         .unwrap_or_else(|| w_int_new(-1));
     let w_encoding =
