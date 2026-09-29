@@ -5144,6 +5144,8 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // computes the hidden mutate field's address, pyre unlinks the instance
     // and flips every loop flag it recorded.
     majit_metainterp::set_force_quasi_immutable_hook(Some(crate::call_jit::force_quasi_immutable));
+    // `warmspot.py` `WarmRunnerDesc.make_virtualizable_infos` builds this
+    // before the entry function and `finish_setup`.
     let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);
     d.set_virtualizable_info(info.clone());
@@ -5272,9 +5274,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // (`install_build_time_liveness_before_trace`). Doing it here decodes
     // `liveness.bin` on the cold portal tick `python -c ''` pays.
     // `jtransform.py` `_handle_stroruni_call` / `_handle_oopspec_call`
-    // adds `OS_STR_CONCAT` to `callinfocollection`.  The walker records
-    // `jit_ll_strconcat` itself, so seed the same row for
-    // `resume.py concat_strings`.
+    // adds `OS_STR_CONCAT` to `callinfocollection`, and `finish_setup`
+    // publishes that collection. Seed the row here so
+    // `resume.py concat_strings` can run without a prior trace.
     {
         let descr = majit_metainterp::make_call_descr_with_effect(
             &[majit_ir::Type::Ref, majit_ir::Type::Ref],
@@ -8286,11 +8288,13 @@ pub fn init_jit_hooks() {
     // at the first `force_start_tracing` is too late: Windows
     // `frame_chain` then allocates about 2.2 TiB and exits 3221226505.
     // Publish the whole kind-0 table here, before user code. `PYRE_JIT=0`
-    // / `PYRE_NO_JIT` never trace, so they skip the bincode. The decode
-    // runs on a fresh stack; a trace that wins the race still hits the
-    // same `Once` from `publish_kind0_descrs_before_trace`.
+    // / `PYRE_NO_JIT` never trace, so they skip the bincode. This stack
+    // is still the process stack: a helper thread would only add spawn
+    // and join latency. A trace that wins the race still hits the same
+    // `Once` from `publish_kind0_descrs_before_trace`, which decodes off
+    // the recursive `CALL_ASSEMBLER` stack.
     if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
-        publish_kind0_descrs_before_trace();
+        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs_on_caller_stack();
     }
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
@@ -12005,7 +12009,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let entry_pc = frame_root.frame().next_instr();
     let is_being_profiled = frame_root.frame().get_is_being_profiled();
     let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
-    let (driver, info) = driver_pair();
+    let pair = driver_pair();
 
     // `maybe_compile_and_run` matches the greens with `JitCell.comparekey`
     // before anything is read off a cell, so resolve the bucket hash to the key
@@ -12020,7 +12024,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `code_ptr` is the PyCode object `frame.pycode` holds, which is the green
     // `interp_jit.PyPyJitDriver` carries, so the typed key built here names the
     // cell `green_key_hash` hashes.
-    let green_key = driver.resolve_cell_key(green_key_hash, || {
+    let green_key = pair.0.resolve_cell_key(green_key_hash, || {
         pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
     });
 
@@ -12029,7 +12033,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // Asking the door first read the token and its compiled meta for a cell
     // this then declines anyway, and ticked the counter for a call upstream
     // never counts.
-    if driver.meta_interp().is_tracing_key((
+    if pair.0.meta_interp().is_tracing_key((
         frame_root.frame().pycode as usize,
         frame_root.frame().next_instr(),
     )) {
@@ -12045,10 +12049,14 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `has_runnable_compiled_loop`, the counter gate, then
     // `has_runnable_compiled_loop` again to decide the run -- walked it three
     // times to learn one thing, on every call that refused.
-    let step = driver.function_entry_step(green_key, green_key_hash, (code_ptr as usize, entry_pc));
+    let step = pair
+        .0
+        .function_entry_step(green_key, green_key_hash, (code_ptr as usize, entry_pc));
     if matches!(step, FunctionEntryStep::NotHot) {
         return None;
     }
+    let info = pair.1.as_ref();
+    let driver = &mut pair.0;
 
     // `warmstate.py maybe_compile_and_run` carries the token the cell read
     // produced out through `EnterJitAssembler(procedure_token, *execute_args)`;

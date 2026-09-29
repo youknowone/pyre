@@ -3773,7 +3773,7 @@ pub fn trace_and_compile_from_bridge(
 
     let info = {
         let (_, info) = crate::eval::driver_pair();
-        info
+        info.clone()
     };
 
     // pyjitpl.py handle_guard_failure parity:
@@ -3785,7 +3785,7 @@ pub fn trace_and_compile_from_bridge(
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp().get_compiled_meta(green_key).cloned()
     };
-    let mut jit_state_local = build_jit_state(frame, info);
+    let mut jit_state_local = build_jit_state(frame, &info);
     // `num_resume_frames > 1` marks a multi-frame (inlined-callee) guard:
     // the guard fired inside a callee inlined into the trace, so the resume
     // pc is the INNERMOST frame's bytecode pc, which does not address the
@@ -3831,7 +3831,7 @@ pub fn trace_and_compile_from_bridge(
     }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
-    let mut jit_state = build_jit_state(frame, info);
+    let mut jit_state = build_jit_state(frame, &info);
 
     // A resume_pc on LOAD_CONST + RETURN_VALUE (or `n<=0` RETURN) is still
     // a live `handle_guard_failure` walk. RPython's `interpret()` records

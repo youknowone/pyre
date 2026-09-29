@@ -1345,7 +1345,8 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
 /// `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
 /// for those ids during translation, against Size objects already in
 /// `GcCache`. pyre cannot embed the collector ids in the executable.
-/// `init_jit_hooks` publishes every kind-0 slot before user code. Publishing
+/// `init_jit_hooks` publishes every kind-0 slot before user code, on the
+/// process stack. Publishing
 /// at the first `force_start_tracing` is too late: Windows `frame_chain`
 /// then allocates about 2.2 TiB (exit 3221226505). `PYRE_JIT=0` /
 /// `PYRE_NO_JIT` skip the boot call. A trace that starts without that boot
@@ -1356,12 +1357,32 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
 /// so the registry is still open when the tids are registered. CallDescr
 /// restoration stays on the first slot lookup.
 pub fn materialize_gccache_owned_descrs() {
+    // The close hook and a trace that starts without `init_jit_hooks` can
+    // already be inside recursive `CALL_ASSEMBLER`. That stack must not
+    // run the bincode.
+    materialize_gccache_owned_descrs_with(false);
+}
+
+/// Same publication as [`materialize_gccache_owned_descrs`], decoded on
+/// this thread.
+///
+/// `init_jit_hooks` runs before user code, so the process stack is empty
+/// and a helper thread is only spawn and join latency. The `Once` is
+/// shared: whichever caller runs first chooses the stack, and the other
+/// call only registers tids.
+pub fn materialize_gccache_owned_descrs_on_caller_stack() {
+    materialize_gccache_owned_descrs_with(true);
+}
+
+fn materialize_gccache_owned_descrs_with(on_caller_stack: bool) {
     static ONCE: Once = Once::new();
-    // Always a fresh stack. The boot caller is `init_jit_hooks`, but the
-    // close hook can still run this from inside recursive `CALL_ASSEMBLER`
-    // when a trace wins the race. `init_size_descr` itself is
-    // translation-time and does not run on that stack.
-    ONCE.call_once(decode_kind0_descrs_off_caller_stack);
+    ONCE.call_once(|| {
+        if on_caller_stack {
+            decode_kind0_descrs();
+        } else {
+            decode_kind0_descrs_off_caller_stack();
+        }
+    });
     // The decode `Once` may have run before a collector existed. Register
     // once the live collector is installed; a second call is a no-op.
     register_synthetic_struct_tids();
