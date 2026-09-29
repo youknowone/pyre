@@ -1014,28 +1014,42 @@ pub fn cdata_buffer_view(
     let ba = cdata_buffer(obj)?;
     let obj = pyre_object::gc_roots::shadow_stack_get(slot);
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    // The ctype walks below and `cdata_len` collect: keep ba, cls and leaf in slots.
+    let ba_slot = pyre_object::gc_roots::pin_roots(&[ba, cls]);
+    let cls_slot = ba_slot + 1;
     let info = super::stginfo::stginfo_of(cls);
     let kind = info
         .map(super::stginfo::stginfo_paramfunc)
         .unwrap_or(ParamFunc::Other);
-    let shape = ctype_shape(cls);
-    let leaf = ctype_leaf(cls);
+    let shape = ctype_shape(pyre_object::gc_roots::shadow_stack_get(cls_slot));
+    let leaf = ctype_leaf(pyre_object::gc_roots::shadow_stack_get(cls_slot));
+    let leaf_slot = pyre_object::gc_roots::pin_roots(&[leaf]);
     let funcptr_cls = super::funcptr::cfuncptr_type();
     let obj = pyre_object::gc_roots::shadow_stack_get(slot);
     let is_funcptr = unsafe { pyre_interpreter::baseobjspace::isinstance_w(obj, funcptr_cls) };
     let itemsize = if is_funcptr {
         host_ctypes::pointer_size()
     } else {
-        super::stginfo::field_size_of(leaf).unwrap_or(0)
+        super::stginfo::field_size_of(pyre_object::gc_roots::shadow_stack_get(leaf_slot))
+            .unwrap_or(0)
     };
     let format = if is_funcptr {
         "X{}".to_string()
     } else if kind == ParamFunc::Union {
         "B".to_string()
     } else {
-        ctype_pep3118_format(cls, None)
+        ctype_pep3118_format(pyre_object::gc_roots::shadow_stack_get(cls_slot), None)
     };
-    Some((ba, boff(obj), cdata_len(obj)?, format, itemsize, shape))
+    let offset = boff(pyre_object::gc_roots::shadow_stack_get(slot));
+    let length = cdata_len(pyre_object::gc_roots::shadow_stack_get(slot))?;
+    Some((
+        pyre_object::gc_roots::shadow_stack_get(ba_slot),
+        offset,
+        length,
+        format,
+        itemsize,
+        shape,
+    ))
 }
 
 fn ctype_shape(mut cls: PyObjectRef) -> Vec<usize> {

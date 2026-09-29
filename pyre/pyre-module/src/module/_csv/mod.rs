@@ -722,13 +722,14 @@ fn reader_next_inner(mut self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> 
     };
 
     let _roots = gc_roots::push_roots();
-    let iter_slot = gc_roots::shadow_stack_len();
-    let _ = gc_roots::pin_root(pyre_interpreter::baseobjspace::getattr_str(
-        self_obj,
-        "_iterator",
-    )?);
+    // `getattr_str` collects: pin self before looking up the iterator.
     let self_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(self_obj);
+    let iter_slot = gc_roots::shadow_stack_len();
+    let _ = gc_roots::pin_root(pyre_interpreter::baseobjspace::getattr_str(
+        gc_roots::shadow_stack_get(self_slot),
+        "_iterator",
+    )?);
 
     let mut fields: Vec<(String, bool, usize)> = Vec::new();
     let mut field = String::new();

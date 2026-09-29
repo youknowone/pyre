@@ -2323,12 +2323,15 @@ pyre_interpreter::py_module! {
         // one of those stores allocates.  Each takes one liveness pin at its
         // mint; an instance does not move, so the locals stay current.
         let ns_roots = pyre_object::gc_roots::push_roots();
+        // The module dict is read after every one of those allocations too.
+        let ns_slot = ns_roots.base();
+        let _ = ns_roots.pin_root(ns);
         let model = make_namespace("pyexpat.model");
         let model = ns_roots.pin_root(model);
         for (name, value) in MODEL_CONSTANTS {
             pyre_interpreter::baseobjspace::setdictvalue_native(model, name, w_int_new(*value));
         }
-        pyre_interpreter::module_ns_store(ns, "model", model);
+        pyre_interpreter::module_ns_store(ns_roots.get(ns_slot), "model", model);
 
         // errors — XML_ERROR_* message strings plus the `codes`
         // (message -> code) and `messages` (code -> message) maps.
@@ -2370,7 +2373,7 @@ pyre_interpreter::py_module! {
         pyre_interpreter::baseobjspace::setdictvalue_native(errors, "codes", codes);
         let messages = error_map_roots.get(messages_slot);
         pyre_interpreter::baseobjspace::setdictvalue_native(errors, "messages", messages);
-        pyre_interpreter::module_ns_store(ns, "errors", errors);
+        pyre_interpreter::module_ns_store(ns_roots.get(ns_slot), "errors", errors);
 
         // features — list of (name, value) capability tuples.
         // Each name, value and tuple allocates while the pieces already built
@@ -2395,6 +2398,6 @@ pyre_interpreter::py_module! {
             feature_items.push(entry);
         }
         let features = w_list_new(feature_items.take());
-        pyre_interpreter::module_ns_store(ns, "features", features);
+        pyre_interpreter::module_ns_store(ns_roots.get(ns_slot), "features", features);
     },
 }

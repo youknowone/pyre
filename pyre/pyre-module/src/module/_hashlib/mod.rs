@@ -1255,6 +1255,9 @@ pyre_interpreter::py_module! {
         let hmac = pyre_interpreter::module_ns_get(ns, "HMAC").expect("_hashlib.HMAC installed");
         unsafe { pyre_object::w_type_suppress_cpython_basetype(hmac) };
         let _roots = gc_roots::push_roots();
+        // `w_dict_new`, `setitem` and `w_dict_proxy_new` collect: keep ns in a slot.
+        let ns_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(ns);
         let mapping_slot = gc_roots::shadow_stack_len();
         let _ = gc_roots::pin_root(w_dict_new());
         for (constructor, name) in [
@@ -1271,7 +1274,8 @@ pyre_interpreter::py_module! {
             ("openssl_shake_128", "shake_128"),
             ("openssl_shake_256", "shake_256"),
         ] {
-            let function = pyre_interpreter::module_ns_get(ns, constructor)
+            let function =
+                pyre_interpreter::module_ns_get(gc_roots::shadow_stack_get(ns_slot), constructor)
                 .expect("_hashlib constructor installed before extra_init");
             let function_slot = gc_roots::shadow_stack_len();
             let _ = gc_roots::pin_root(function);
@@ -1284,10 +1288,11 @@ pyre_interpreter::py_module! {
             )
             .expect("populate _hashlib._constructors");
         }
+        let w_proxy = pyre_object::w_dict_proxy_new(gc_roots::shadow_stack_get(mapping_slot));
         pyre_interpreter::module_ns_store(
-            ns,
+            gc_roots::shadow_stack_get(ns_slot),
             "_constructors",
-            pyre_object::w_dict_proxy_new(gc_roots::shadow_stack_get(mapping_slot)),
+            w_proxy,
         );
     },
 }
