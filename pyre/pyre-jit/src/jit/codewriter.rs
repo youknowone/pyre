@@ -3401,7 +3401,6 @@ fn emit_frontend_super_attr_unwrap(
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn frontend_load_small_int_flow_value(val: i64) -> super::flow::FlowValue {
     pyobject_const_ref_value(pyre_object::w_small_int_const(val))
 }
@@ -9274,33 +9273,11 @@ impl CodeWriter {
                         }
 
                         Instruction::LoadSmallInt { i } => {
+                            // `LOAD_CONST` of a small int: the interned
+                            // `w_small_int_const` box, pushed as a Constant.
                             let val = i.get(op_arg) as u32 as i64;
-                            // Interpreter `LOAD_SMALL_INT` still returns the
-                            // interned box (`w_small_int_const`). The
-                            // recorded graph cannot: a process-global
-                            // ConstPtr of that box, stored through
-                            // `setarrayitem_vable_r`, is reused onto a live
-                            // local (`it`) at a `trace_limit` abort and
-                            // `for _ in it` sees an int. `wrapint` /
-                            // `box_int_fn` keeps a fresh identity per
-                            // site, matching `intobject.py wrapint`
-                            // (`withprebuiltint=False`). `getconstant_w`
-                            // intern stays on `LOAD_CONST` (`co_consts_w`).
-                            let boxed = residual_call!(
-                                box_int_fn_idx,
-                                CallFlavor::Plain,
-                                majit_ir::RuntimeHelperKind::BoxInt,
-                                vec![super::flow::Constant::signed(val).into()],
-                                vec![],
-                                vec![],
-                                vec![Kind::Int],
-                                ResKind::Ref,
-                                py_pc as i64,
-                            );
-                            let stack_value = boxed
-                                .map(super::flow::FlowValue::from)
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            push_and_bump!(stack_value, py_pc);
+                            let value = frontend_load_small_int_flow_value(val);
+                            push_and_bump!(value, py_pc);
                         }
 
                         Instruction::LoadConst { consti } => {
