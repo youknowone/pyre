@@ -997,8 +997,14 @@ impl MIFrame {
                     OpBox::ConstPtr(0)
                 } else if idx < num_regs_r {
                     // pyjitpl.py `add_box_to_storage(self.registers_r[index])`
-                    let opref = self.ref_regs[idx]
-                        .expect("get_list_of_active_boxes: ref register uninitialized");
+                    let opref = self.ref_regs[idx].unwrap_or_else(|| {
+                        panic!(
+                            "get_list_of_active_boxes: ref register uninitialized \
+                             (jitcode {:?} pc {} live-op pc {pc} reg r{idx})",
+                            self.jitcode.name(),
+                            self.pc,
+                        )
+                    });
                     register_to_box(opref)
                 } else {
                     // pyjitpl.py `copy_constants(..., constants_r, ...,

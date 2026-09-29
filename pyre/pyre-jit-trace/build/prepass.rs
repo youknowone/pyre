@@ -34,7 +34,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v20";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v21";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × release/dev) inside 300 MB.
@@ -1186,6 +1186,20 @@ fn real_main() {
                     "pyre_object",
                     "listobject",
                     "w_list_getitem_inner",
+                ]),
+                // `space.newbool` (`baseobjspace.py:896-900`): `if b:
+                // return w_True; else: return w_False`. The residual
+                // wrapper is `dont_look_inside`; these bodies are the
+                // look-inside graphs portal interpret descends.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "opcode_ops",
+                    "bool_value_from_truth",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "boolobject",
+                    "w_bool_from",
                 ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`

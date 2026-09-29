@@ -1,3 +1,4 @@
+# pyre-check: trace-shape=hot_lib_call:max=CallMayForceR:2
 # pyre-check: skip-cpython
 # pyre-check: skip-backends=wasm
 # pyre-check: requires-modules=_cffi_backend
