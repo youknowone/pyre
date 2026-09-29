@@ -426,7 +426,7 @@ impl RawBufferPtrInfo {
         offset: i64,
         length: usize,
         descr: &DescrRef,
-    ) -> Result<OpRef, InvalidRawOperation> {
+    ) -> Result<Operand, InvalidRawOperation> {
         self.buffer.read_value(offset, length, descr)
     }
 
@@ -436,7 +436,7 @@ impl RawBufferPtrInfo {
         offset: i64,
         length: usize,
         descr: DescrRef,
-        value: OpRef,
+        value: Operand,
     ) -> Result<(), InvalidRawOperation> {
         self.buffer.write_value(offset, length, descr, value)
     }
@@ -935,7 +935,9 @@ impl PtrInfo {
                 .iter()
                 .flat_map(|fields| fields.iter().map(|(_, r)| r.to_opref()))
                 .collect(),
-            PtrInfo::VirtualRawBuffer(v) => v.buffer.values(),
+            PtrInfo::VirtualRawBuffer(v) => {
+                v.buffer.values().iter().map(|b| b.to_opref()).collect()
+            }
             PtrInfo::VirtualRawSlice(v) => vec![v.parent.to_opref()],
             PtrInfo::Virtualizable(v) => {
                 let mut refs: Vec<OpRef> = v.fields.iter().map(|(_, r)| r.to_opref()).collect();

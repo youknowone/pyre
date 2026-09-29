@@ -1298,9 +1298,7 @@ impl OptVirtualize {
                 // rawbuffer.py: read_value(offset, length, descr)
                 if let Ok(val_ref) = vinfo.read_value(lookup_offset, ad.item_size(), &descr) {
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_val = ctx
-                        .get_box_replacement_operand_opt(val_ref)
-                        .unwrap_or_else(|| ctx.materialize_operand_at(val_ref));
+                    let b_val = ctx.resolve_operand_operand(&val_ref);
                     ctx.make_equal_to(&b_old, &b_val);
                     return OptimizationResult::Remove;
                 }
@@ -1312,7 +1310,7 @@ impl OptVirtualize {
     fn optimize_raw_store(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let buf_ref = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
         let offset_ref = op.arg(1).to_opref();
-        let value_ref = ctx.resolve_operand_operand(&op.arg(2)).to_opref();
+        let value_ref = ctx.resolve_operand_operand(&op.arg(2));
 
         if let Some(offset) = ctx
             .get_box_replacement_operand_opt(offset_ref)
@@ -1492,7 +1490,7 @@ impl OptVirtualize {
                     // make_nonnull + emit.
                     if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, &descr) {
                         let b_old = Operand::from_bound_op(op_rc);
-                        let b_val = ctx.get_box_replacement_operand(val_ref);
+                        let b_val = ctx.resolve_operand_operand(&val_ref);
                         ctx.make_equal_to(&b_old, &b_val);
                         return OptimizationResult::Remove;
                     }
@@ -1529,7 +1527,7 @@ impl OptVirtualize {
     /// ```
     fn optimize_setarrayitem_raw(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
-        let value_ref = ctx.resolve_operand_operand(&op.arg(2)).to_opref();
+        let value_ref = ctx.resolve_operand_operand(&op.arg(2));
 
         if let Some(index) = ctx
             .resolve_operand_operand_opt(&op.arg(1))

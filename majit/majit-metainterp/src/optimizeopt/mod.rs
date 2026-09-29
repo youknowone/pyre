@@ -1742,7 +1742,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .buffer
                     .values()
                     .iter()
-                    .map(|vref| self.ctx.get_replacement_opref(*vref))
+                    .map(|vref| self.ctx.get_replacement_opref(vref.to_opref()))
                     .collect(),
             }),
             // `info.py` `RawSlicePtrInfo._visitor_walk_recursive`:

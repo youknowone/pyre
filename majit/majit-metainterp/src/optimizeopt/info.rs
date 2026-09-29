@@ -1551,11 +1551,10 @@ fn force_box_impl(
             // force_child would force-box it and synthesize a ConstInt for a
             // constant-bound int, neither of which upstream does here.
             for (offset, _length, descr, value) in entries {
-                let value_box = ctx.materialize_operand_at(value);
                 let offset_ref = Operand::const_(majit_ir::Const::Int(offset));
                 let arg_alloc = Operand::from_bound_op(&alloc_rc);
                 let arg_offset = offset_ref.clone();
-                let arg_value = ctx.resolve_operand_operand(&value_box);
+                let arg_value = ctx.resolve_operand_operand(&value);
                 let mut store_op = Op::new(
                     OpCode::RawStore,
                     &[arg_alloc.clone(), arg_offset.clone(), arg_value.clone()],
