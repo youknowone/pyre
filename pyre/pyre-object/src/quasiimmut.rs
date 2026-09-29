@@ -273,11 +273,43 @@ impl QuasiImmutField {
     /// against the old value in between.
     pub fn invalidate_then_store<F: FnOnce()>(&self, store: F) {
         let _guard = self.lock();
+        self.invalidate_locked();
+        store();
+    }
+
+    /// Publish `value` at `slot` only when it still holds `expected`.
+    ///
+    /// The check, the sweep and the store share this field's lock, so a
+    /// recorder cannot install a watcher for the old pointer in between
+    /// (`rclass.py hook_setfield` ahead of the store; the GIL made that
+    /// pair indivisible). A lost race leaves the installed watcher alone:
+    /// the winner's publication is what has to invalidate it.
+    ///
+    /// # Safety
+    /// `slot` is live and is the pointer this field watches. The call
+    /// allocates nothing GC-managed and crosses no safepoint.
+    pub unsafe fn compare_exchange_ptr(
+        &self,
+        slot: *mut crate::pyobject::PyObjectRef,
+        expected: crate::pyobject::PyObjectRef,
+        value: crate::pyobject::PyObjectRef,
+    ) -> Result<(), crate::pyobject::PyObjectRef> {
+        let _guard = self.lock();
+        let atomic = unsafe { std::sync::atomic::AtomicPtr::from_ptr(slot) };
+        let current = atomic.load(Ordering::Acquire);
+        if current != expected {
+            return Err(current);
+        }
+        self.invalidate_locked();
+        atomic.store(value, Ordering::Release);
+        Ok(())
+    }
+
+    fn invalidate_locked(&self) {
         let qmut_ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
         if !qmut_ptr.is_null() {
             unsafe { Arc::from_raw(qmut_ptr) }.invalidate();
         }
-        store();
     }
 
     /// Unlink the instance and hand the field's reference to the caller, who
@@ -352,6 +384,41 @@ impl Drop for QuasiImmutField {
 #[majit_macros::dont_look_inside]
 pub unsafe fn sweep_quasi_immut_field(field: *const QuasiImmutField) {
     unsafe { (*field).invalidate() };
+}
+
+/// `rclass.py hook_setfield` and the store, under the field lock.
+///
+/// An `is_installed` test followed by a separate store leaves a window
+/// where [`QuasiImmutField::get_current_qmut_instance`] publishes a watcher
+/// for the old value after the sweep decided there was nothing to sweep.
+///
+/// # Safety
+/// `field` is live. `slot` is the pointer it watches and is live for the call.
+#[majit_macros::dont_look_inside]
+pub unsafe fn publish_quasi_immut_ptr(
+    field: *const QuasiImmutField,
+    slot: *mut crate::pyobject::PyObjectRef,
+    value: crate::pyobject::PyObjectRef,
+) {
+    unsafe {
+        (*field).invalidate_then_store(|| {
+            std::sync::atomic::AtomicPtr::from_ptr(slot).store(value, Ordering::Release);
+        });
+    }
+}
+
+/// [`QuasiImmutField::compare_exchange_ptr`] as a trace-opaque call.
+///
+/// # Safety
+/// `field` is live. `slot` is the pointer it watches and is live for the call.
+#[majit_macros::dont_look_inside]
+pub unsafe fn publish_quasi_immut_cas(
+    field: *const QuasiImmutField,
+    slot: *mut crate::pyobject::PyObjectRef,
+    expected: crate::pyobject::PyObjectRef,
+    value: crate::pyobject::PyObjectRef,
+) -> Result<(), crate::pyobject::PyObjectRef> {
+    unsafe { (*field).compare_exchange_ptr(slot, expected, value) }
 }
 
 #[cfg(test)]
@@ -487,6 +554,34 @@ mod tests {
             published.store(true, Ordering::Release);
         });
         assert!(published.load(Ordering::Acquire));
+        assert!(!field.is_installed());
+    }
+
+    /// A lost compare-exchange must not sweep a watcher the winner's value
+    /// already published. The winning exchange sweeps, then stores, before
+    /// the lock is released.
+    #[test]
+    fn compare_exchange_ptr_sweeps_only_the_publication_that_wins() {
+        let field = QuasiImmutField::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        let token = test_loop_token(&flag);
+        field
+            .get_current_qmut_instance()
+            .register_loop_token(&token);
+
+        let current = 8usize as crate::pyobject::PyObjectRef;
+        let next = 16usize as crate::pyobject::PyObjectRef;
+        let mut slot = current;
+        let lost = unsafe { field.compare_exchange_ptr(&mut slot, std::ptr::null_mut(), next) };
+        assert!(lost.is_err());
+        assert_eq!(slot, current);
+        assert!(field.is_installed(), "a lost race leaves the watcher");
+        assert!(!flag.load(Ordering::Acquire));
+
+        let won = unsafe { field.compare_exchange_ptr(&mut slot, current, next) };
+        assert!(won.is_ok());
+        assert_eq!(slot, next);
+        assert!(flag.load(Ordering::Acquire));
         assert!(!field.is_installed());
     }
 

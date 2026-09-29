@@ -5126,17 +5126,21 @@ pub(crate) fn module_dict_cell_value_direct(obj: PyObjectRef, slot: usize) -> Op
 /// The heapcache keys on `descr.index()` and the receiver, the same way
 /// [`opimpl_getfield_gc_i`] does.
 ///
-/// The caller has already resolved the field's value and is baking it as a
-/// constant, so unlike `opimpl_getfield_gc_i` this records no load — that is
-/// exactly what quasi-immutability buys.
-pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) {
+/// The value is read after the watcher is installed and returned, so a
+/// caller baking a constant uses that read. Unlike `opimpl_getfield_gc_i`
+/// this records no load — that is exactly what quasi-immutability buys.
+pub(crate) fn record_quasiimmut_field(
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    descr: DescrRef,
+) -> Option<OpRef> {
     let field_index = descr.index();
     if ctx.heap_cache().is_quasi_immut_known(field_index, obj) {
         ctx.profiler().count_ops(
             OpCode::QuasiimmutField,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
-        return;
+        return current_quasiimmut_field_value(ctx, obj, &descr);
     }
     // quasiimmut.py `self.qmut = get_current_qmut_instance(cpu, struct,
     // mutatefielddescr)` — the half that makes the value captured below
@@ -5173,6 +5177,7 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
         ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
     }
+    constantfieldbox
 }
 
 /// `quasiimmut.py QuasiImmut` published to the optimizer and the
