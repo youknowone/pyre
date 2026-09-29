@@ -66,7 +66,7 @@ pub(super) fn raw_readinto_size(
                     pyre_object::gc_roots::shadow_stack_get(cause_slot),
                 )
             };
-            outer.exc_object = outer_obj;
+            outer.set_exc_object(outer_obj);
             return Err(outer);
         }
     };
@@ -921,7 +921,7 @@ impl W_BufferedReader {
                         pyre_object::gc_roots::shadow_stack_get(flush_slot),
                     )
                 };
-                close_error.exc_object = close_obj;
+                close_error.set_exc_object(close_obj);
             }
             return Err(close_error);
         }

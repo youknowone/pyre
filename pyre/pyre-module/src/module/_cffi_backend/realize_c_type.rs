@@ -145,7 +145,7 @@ fn ffi_error(message: impl Into<String>) -> PyError {
     args.push(newtype::ffi_error());
     args.push(pyre_object::w_str_new_managed(&message));
     if let Ok(w_exc) = pyre_interpreter::builtins::exc_exception_new(&args.take()) {
-        error.exc_object = w_exc;
+        error.set_exc_object(w_exc);
     }
     error
 }

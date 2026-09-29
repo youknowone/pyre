@@ -169,7 +169,7 @@ fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
         ]) {
             let exc_slot = pyre_object::gc_roots::pin_roots(&[exc]);
             set_library_reason(pyre_object::gc_roots::shadow_stack_get(exc_slot), &message);
-            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+            err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         }
     }
     err
@@ -273,7 +273,7 @@ fn tls_error(code: i32, message: String) -> pyre_interpreter::PyError {
                     pyre_object::gc_roots::shadow_stack_get(reason_slot),
                 );
             }
-            error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+            error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         }
     }
     error

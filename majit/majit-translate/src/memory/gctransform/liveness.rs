@@ -308,6 +308,12 @@ pub fn gc_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
             }
         }
     }
+    // `PyError::pin`'s receiver names the handle, the way `pin_root` names
+    // `PyObjectRef`. `Result<_, PyError>` is a different hash-cons id per
+    // instantiation; collect those whose error slot is that handle.
+    let pyerror = pyerror_type_ids(llbc);
+    out.extend(pyerror.iter().copied());
+    out.extend(result_pyerror_type_ids(llbc, &pyerror).iter().copied());
     out
 }
 
@@ -388,6 +394,131 @@ pub fn gc_option_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64
         }
     }
     out
+}
+
+fn pyerror_def_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
+    llbc.iter_type_decls()
+        .filter(|td| td.item_meta.name_path().ends_with("::error::PyError"))
+        .map(|td| td.def_id)
+        .collect()
+}
+
+fn json_ty_id(v: &serde_json::Value) -> Option<u64> {
+    if let Some(id) = v.get("Deduplicated").and_then(|x| x.as_u64()) {
+        return Some(id);
+    }
+    v.get("Value")
+        .and_then(|x| x.as_array())
+        .and_then(|a| a.first())
+        .and_then(|x| x.as_u64())
+}
+
+fn adt_is_pyerror(llbc: &majit_charon_reader::Llbc, id: u64, defs: &HashSet<u64>) -> bool {
+    llbc.dedup_to_adt_def_id(id)
+        .is_some_and(|d| defs.contains(&d))
+}
+
+/// Ids of the `PyError` handle. Prefer `PyError::pin`'s receiver; if that
+/// spelling is a reference, also accept any signature that names the ADT.
+fn pyerror_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
+    let defs = pyerror_def_ids(llbc);
+    let mut out = HashSet::new();
+    if defs.is_empty() {
+        return out;
+    }
+    fn consider(
+        llbc: &majit_charon_reader::Llbc,
+        defs: &HashSet<u64>,
+        out: &mut HashSet<u64>,
+        ty: &TyRef,
+    ) {
+        let Some(id) = ty_id(ty) else {
+            return;
+        };
+        if adt_is_pyerror(llbc, id, defs) {
+            out.insert(id);
+        }
+    }
+    for fd in llbc.iter_fun_decls() {
+        let name = fd.item_meta.name_path();
+        if name.contains("::error::") && name.ends_with("::pin") {
+            for inp in &fd.signature.inputs {
+                consider(llbc, &defs, &mut out, inp);
+            }
+        }
+    }
+    if out.is_empty() {
+        for fd in llbc.iter_fun_decls() {
+            consider(llbc, &defs, &mut out, &fd.signature.output);
+            for inp in &fd.signature.inputs {
+                consider(llbc, &defs, &mut out, inp);
+            }
+        }
+    }
+    out
+}
+
+fn result_pyerror_type_ids(
+    llbc: &majit_charon_reader::Llbc,
+    pyerror_ids: &HashSet<u64>,
+) -> HashSet<u64> {
+    let py_defs = pyerror_def_ids(llbc);
+    let result_defs: HashSet<u64> = llbc
+        .iter_type_decls()
+        .filter(|td| td.item_meta.name_path() == "core::result::Result")
+        .map(|td| td.def_id)
+        .collect();
+    let mut seen = HashSet::new();
+    let mut ids = HashSet::new();
+    if result_defs.is_empty() || pyerror_ids.is_empty() {
+        return ids;
+    }
+    let mut classify = |ty: &TyRef| {
+        let Some(id) = ty_id(ty) else {
+            return;
+        };
+        if !seen.insert(id) {
+            return;
+        }
+        if !llbc
+            .dedup_to_adt_def_id(id)
+            .is_some_and(|d| result_defs.contains(&d))
+        {
+            return;
+        }
+        let Some(body) = llbc.dedup_body(id) else {
+            return;
+        };
+        let Some(slot) = body
+            .get("Adt")
+            .and_then(|a| a.get("generics"))
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.get(1))
+        else {
+            return;
+        };
+        let is_py = if let Some(err_id) = json_ty_id(slot) {
+            pyerror_ids.contains(&err_id) || adt_is_pyerror(llbc, err_id, &py_defs)
+        } else if let Some(def) = slot
+            .get("Adt")
+            .and_then(|a| a.get("id"))
+            .and_then(|i| i.as_u64())
+        {
+            py_defs.contains(&def)
+        } else {
+            false
+        };
+        if is_py {
+            ids.insert(id);
+        }
+    };
+    for fd in llbc.iter_fun_decls() {
+        classify(&fd.signature.output);
+        for ty in &fd.signature.inputs {
+            classify(ty);
+        }
+    }
+    ids
 }
 
 /// The type ids a `PyFrame` pointer is spelled with in *this* artefact.

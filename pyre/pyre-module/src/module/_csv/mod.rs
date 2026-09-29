@@ -64,7 +64,7 @@ fn csv_error(msg: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
     if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_csv.Error") {
         let args = [cls, pyre_object::w_str_from_wtf8_managed(msg)];
         if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            err.exc_object = exc;
+            err.set_exc_object(exc);
         }
     }
     err

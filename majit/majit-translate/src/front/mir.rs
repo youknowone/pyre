@@ -11323,6 +11323,78 @@ impl<'a> Lowering<'a> {
         self.resolve_operand(mir_bb, op)
     }
 
+    /// Whether `ty` is the configured exception carrier (`PyError`).
+    fn ty_is_error_carrier(&self, ty: &TyRef) -> bool {
+        let spec = self.static_addrs.error_carrier.carrier_path;
+        if spec.is_empty() {
+            return false;
+        }
+        let Some(path) = adt_path_of_tyref(ty, self.llbc) else {
+            return false;
+        };
+        path == spec || strip_crate_prefix(&path) == strip_crate_prefix(spec)
+    }
+
+    fn error_carrier_class_root(&self, ty: &TyRef) -> Option<String> {
+        if !self.ty_is_error_carrier(ty) {
+            return None;
+        }
+        tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
+    }
+
+    /// Class root of the carrier's single pointer field (`PyObjectRef`).
+    fn error_carrier_inner_class_root(&self, ty: &TyRef) -> Option<String> {
+        if !self.ty_is_error_carrier(ty) {
+            return None;
+        }
+        let node = strip_ty_wrappers(tyref_node(ty, self.llbc)?, self.llbc)?;
+        let decl = self.llbc.type_by_id(adt_node_def_id(node)?)?;
+        let (index, _) = transparent_nonzst_field(decl, self.llbc)?;
+        let TypeDeclKind::Struct(fields) = &decl.kind else {
+            return None;
+        };
+        let field = fields.get(index)?;
+        tyref_class_root_with(&field.ty, self.llbc, self.tombstoned_leaves)
+    }
+
+    /// `PyError(ptr)` is one pointer word, but the handle's class is not
+    /// `PyObject`. Leaving the aggregate as the inner value merges
+    /// `pyobject::PyObject` with `error::PyError` at every call.
+    fn retag_error_carrier(
+        &mut self,
+        wrapper_ty: &TyRef,
+        value: Variable,
+    ) -> (Option<OpKind>, Variable) {
+        let Some(root) = self.error_carrier_class_root(wrapper_ty) else {
+            return (None, value);
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        (Some(crate::model::cast_instance_call(root, value)), res)
+    }
+
+    /// `self.0` on the carrier: the same word, typed as the inner object.
+    fn cast_off_error_carrier(
+        &mut self,
+        mir_bb: usize,
+        wrapper_ty: &TyRef,
+        base: Variable,
+    ) -> Variable {
+        let Some(root) = self.error_carrier_inner_class_root(wrapper_ty) else {
+            return base;
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let bb_id = self.block_id[mir_bb];
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: crate::model::cast_instance_call(root, base),
+        });
+        res
+    }
+
     /// Build the IR for an Rvalue. Returns `(op, result_var)` — `op` is
     /// the `OpKind` to push onto the current block, `result_var` is the
     /// Variable the destination local should be bound to. `op` is
@@ -12067,7 +12139,7 @@ impl<'a> Lowering<'a> {
                                 res,
                             ));
                         }
-                        Ok((None, value))
+                        return Ok(self.retag_error_carrier(dest_ty, value));
                     }
                     AggregateShape::Ctor(ctor) => {
                         // Resolve operand Variables up front; they flow into the
@@ -13127,7 +13199,12 @@ impl<'a> Lowering<'a> {
                     // try to dereference that word as an aggregate base.
                     if let Some((_, name)) = tyref_transparent_nonzst_field(&inner.ty, self.llbc) {
                         if field_name == name {
-                            return self.resolve_place(mir_bb, *inner);
+                            let wrapper_ty = clone_tyref(&inner.ty);
+                            let base = self.resolve_place(mir_bb, *inner)?;
+                            // The carrier word stays one pointer. Projecting
+                            // its inner `PyObjectRef` has to name that class,
+                            // or the handle and the object merge.
+                            return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
                         }
                         return Ok(self.emit_unit(self.block_id[mir_bb]));
                     }
@@ -13142,7 +13219,9 @@ impl<'a> Lowering<'a> {
                         )
                         .is_some()
                     {
-                        return self.resolve_place(mir_bb, *inner);
+                        let wrapper_ty = clone_tyref(&inner.ty);
+                        let base = self.resolve_place(mir_bb, *inner)?;
+                        return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
                     }
                     // A one-word niche `Option` is represented by its payload
                     // pointer, so the

@@ -2187,7 +2187,7 @@ pub(crate) fn add_internal_exception_note(error: &mut PyError, text: &str) -> Re
                 pyre_object::gc_roots::shadow_stack_get(note_exc_slot),
                 pyre_object::gc_roots::shadow_stack_get(exc_slot),
             );
-            note_error.exc_object = pyre_object::gc_roots::shadow_stack_get(note_exc_slot);
+            note_error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(note_exc_slot));
             return Err(note_error);
         }
         None => {
@@ -2212,7 +2212,7 @@ pub(crate) fn add_internal_exception_note(error: &mut PyError, text: &str) -> Re
             pyre_object::gc_roots::shadow_stack_get(note_slot),
         );
     }
-    error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     Ok(())
 }
 
@@ -21939,8 +21939,10 @@ fn throw_yield_from(
         };
     }
     if err.exc_object.is_null() {
+        let slot = err.pin(&roots);
         let w_exc = err.to_exc_object();
-        err.exc_object = w_exc;
+        err.reload(&roots, slot);
+        err.set_exc_object(w_exc);
         exc_slot = err.pin_gc_refs(&roots);
     }
     err.reload_gc_refs(&roots, exc_slot);
@@ -23215,7 +23217,7 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
             repr
         );
         if let Some(slot) = exc_slot {
-            err.exc_object = pyre_object::gc_roots::shadow_stack_get(slot);
+            err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(slot));
         }
         err.write_unraisable(w_none(), &where_desc, w_none());
     }

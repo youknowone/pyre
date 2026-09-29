@@ -102,7 +102,7 @@ fn binascii_error(msg: impl Into<String>) -> pyre_interpreter::PyError {
     if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("binascii.Error") {
         let args = [cls, w_str_new_managed(&msg)];
         if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            err.exc_object = exc;
+            err.set_exc_object(exc);
         }
     }
     err

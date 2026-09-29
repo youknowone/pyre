@@ -4748,6 +4748,30 @@ fn build_gc() -> Box<MiniMarkGC> {
         "interpreter classes must end where the module classes begin"
     );
     register_module_gc_types(&mut gc, &mut pytype_to_tid);
+    // `OperationError` (`error.py`). Standalone range, appended after the
+    // module classes so no earlier id moves. P2 parents it under Exception.
+    {
+        let pyerror_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            pyre_interpreter::error::PYERROR_OBJECT_SIZE,
+            object_tid,
+            vec![
+                std::mem::offset_of!(pyre_interpreter::error::PyErrorObject, ob_header.w_class),
+                pyre_interpreter::error::PYERROR_MESSAGE_OFFSET,
+                pyre_interpreter::error::PYERROR_EXC_OBJECT_OFFSET,
+                pyre_interpreter::error::PYERROR_W_NAME_CONTEXT_OFFSET,
+                pyre_interpreter::error::PYERROR_W_OBJ_CONTEXT_OFFSET,
+            ],
+        ));
+        debug_assert_eq!(
+            pyerror_tid,
+            pyre_interpreter::MODULE_FIRST_TYPE_ID
+                + pyre_interpreter::module_gc_types().len() as u32
+        );
+        pyre_interpreter::error::PYERROR_GC_TYPE_ID_CELL.set(pyerror_tid);
+        let pytype = &pyre_interpreter::error::PYERROR_TYPE as *const _ as usize;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, pytype, pyerror_tid);
+        pytype_to_tid.insert(pytype, pyerror_tid);
+    }
     // setobject.py stores the copied r_dict behind `sstorage`;
     // rordereddict.py makes that table a GcStruct("dicttable") the collector
     // traces itself. `set_object_custom_trace` only greys the `sstorage` slot.
@@ -10362,7 +10386,7 @@ fn screen_frame_already_recorded(frame: *const PyFrame, err: &mut pyre_interpret
         && unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) }
             == frame as *mut PyFrame;
     if owns_head {
-        err.attach_tb = false;
+        err.set_attach_tb(false);
     }
 }
 
@@ -12479,7 +12503,7 @@ fn compile_and_run_once(
                 // The flag belongs here and not in `finish_concrete_raise_error`:
                 // its other caller is the bridge-walk raise, whose frame has no
                 // node yet.
-                err.attach_tb = false;
+                err.set_attach_tb(false);
                 return Some(LoopResult::ExitFrameWithException(err));
             }
             None => {}

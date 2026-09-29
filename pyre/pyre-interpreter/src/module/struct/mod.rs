@@ -36,7 +36,7 @@ fn struct_error(msg: impl Into<String>) -> crate::PyError {
     let exc = crate::builtins::exc_exception_new(&args.take())
         .expect("exc_exception_new is infallible for str args");
     let mut err = crate::PyError::new(crate::PyErrorKind::ValueError, msg);
-    err.exc_object = exc;
+    err.set_exc_object(exc);
     err
 }
 

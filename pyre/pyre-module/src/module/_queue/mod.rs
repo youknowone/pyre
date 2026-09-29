@@ -132,7 +132,7 @@ fn empty_error() -> pyre_interpreter::PyError {
     if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_queue.Empty")
         && let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&[cls])
     {
-        err.exc_object = exc;
+        err.set_exc_object(exc);
     }
     err
 }

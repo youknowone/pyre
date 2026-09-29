@@ -1542,7 +1542,7 @@ fn make_builtin_error(name: &str, msg: &str) -> pyre_interpreter::PyError {
     if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class(name) {
         let args = [cls, w_str_new_managed(msg)];
         if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            err.exc_object = exc;
+            err.set_exc_object(exc);
         }
     }
     err
@@ -1750,7 +1750,7 @@ fn pyexpat_error(msg: String, code: i64, lineno: i64, offset: i64) -> pyre_inter
             pyre_interpreter::baseobjspace::setdictvalue_native(exc, "code", w_int_new(code));
             pyre_interpreter::baseobjspace::setdictvalue_native(exc, "lineno", w_int_new(lineno));
             pyre_interpreter::baseobjspace::setdictvalue_native(exc, "offset", w_int_new(offset));
-            err.exc_object = exc;
+            err.set_exc_object(exc);
         }
     }
     err

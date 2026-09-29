@@ -820,6 +820,10 @@ fn lower_result_exc_returns_inner(
                     }
                 }
             }
+            // The target phi is still the Result shell. Retarget it onto a
+            // fresh variable so the payload's kind is not copied into the
+            // shell's ref (`exceptiontransform`'s normal edge).
+            separate_payload_from_shell(graph, bi, &payload);
         }
         rewritten += 1;
     }
@@ -2835,6 +2839,10 @@ fn describe_var_residence(graph: &FunctionGraph, r: &Variable) -> VarResidence {
     }
 }
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn rewire_one_call_site(
     graph: &mut FunctionGraph,
     r: &Variable,
@@ -2893,6 +2901,7 @@ fn rewire_one_call_site(
         // keep the normal-edge value off the shell).
         let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
         replace_exit_value(graph, a, r, &payload);
+        separate_payload_from_shell(graph, a, &payload);
         return Ok(SiteOutcome::TailForward);
     }
     let (b, r_b) =
@@ -3138,12 +3147,18 @@ fn rewire_one_call_site(
     );
     exc_link.last_exception = Some(LinkArg::Value(va));
     exc_link.last_exc_value = Some(LinkArg::Value(vb));
-    let block_a = &mut graph.blocks[a];
-    block_a.exitswitch = Some(ExitSwitch::LastException);
-    block_a.exits = vec![
-        Link::new_mixed(normal_args, continue_target, None),
-        exc_link,
-    ];
+    {
+        let block_a = &mut graph.blocks[a];
+        block_a.exitswitch = Some(ExitSwitch::LastException);
+        block_a.exits = vec![
+            Link::new_mixed(normal_args, continue_target, None),
+            exc_link,
+        ];
+    }
+    // `collapse_pos0_read` folded the payload read onto the shell phi.
+    // The link now carries `T`; the phi has to be a fresh variable of
+    // that kind, not the ControlFlow shell.
+    separate_payload_from_shell(graph, a, &payload);
     // Blocks B, C and the break arm are now unreachable; the dead-op
     // sweep leaves them to the reachability-walking consumers.
     Ok(SiteOutcome::Diamond)
@@ -3370,6 +3385,10 @@ fn catch_and_rewrap(
 ///
 /// Fail-safe: any other use of the shell returns `Err` with the graph
 /// unchanged. Every check runs before the first edit.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn collapse_rebuilt_shell_match(
     graph: &mut FunctionGraph,
     normal: usize,
@@ -3480,6 +3499,10 @@ fn collapse_rebuilt_shell_match(
     for plan in collapses {
         apply_pos0_collapse(graph, &plan);
     }
+    // Each arm's phi was the shell. The link now carries that arm's
+    // payload, which is not the shell's kind when `T` is a scalar.
+    separate_payload_from_shell(graph, normal, ok_payload);
+    separate_payload_from_shell(graph, handler, err_payload);
     Ok(())
 }
 
@@ -3918,25 +3941,67 @@ fn verify_drain_reraise_returns_err_payload(
             "{name}: reraise arm block {reraise_target} does not write the already-bound Err payload"
         ));
     };
-    // Only these two ops may carry an effect; any other side-effecting op
+    // `Result<T, PyError>` still stores an explicit `__discriminant` when
+    // the handle has no niche the payload can occupy. That write is the
+    // shell's tag, the same plumbing as the ctor and the payload store.
+    let disc_idx = ops.iter().position(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { base, field, .. }
+                if *base == outer && field.name == "__discriminant"
+        )
+    });
+    let mut recognized = vec![ctor_idx, write_idx];
+    if let Some(disc_idx) = disc_idx {
+        recognized.push(disc_idx);
+    }
+    // The bracket close may sit in this block, beside the shell, rather than
+    // in a later empty forward. It is re-emitted at the substituted raise.
+    let mut closes = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if crate::front::mir::is_root_scope_drop_glue_call(&op.kind) {
+            recognized.push(i);
+            closes.push(op.kind.clone());
+        }
+    }
+    // Only these ops may carry an effect; any other side-effecting op
     // would be dropped when block `R` replaces this tail.
-    assert_block_pure_besides(
-        graph,
-        reraise_target,
-        &[ctor_idx, write_idx],
-        "reraise",
-        name,
-    )?;
+    assert_block_pure_besides(graph, reraise_target, &recognized, "reraise", name)?;
     // A root-bracket close is the one operation such a block may carry: the
     // rewind has to run before the function leaves either way, so it is handed
     // back for the caller to re-emit at the substituted raise rather than left
     // in a tail nothing reaches.  Anything else still fails here.
-    root_scope_closes_to_returnblock(graph, reraise_target, &outer).map_err(|e| {
-        format!(
-            "{name}: reraise arm block {reraise_target} does not forward the Err shell \
-             unconditionally to returnblock: {e}"
-        )
-    })
+    closes.extend(
+        root_scope_closes_to_returnblock(graph, reraise_target, &outer).map_err(|e| {
+            format!(
+                "{name}: reraise arm block {reraise_target} does not forward the Err shell \
+                 unconditionally to returnblock: {e}"
+            )
+        })?,
+    );
+    Ok(closes)
+}
+
+/// `e.matches_stop_iteration()` on the `PyError` handle.
+///
+/// An inherent method on the newtype lowers as `FunctionPath`
+/// `error::PyError::matches_stop_iteration`. The same call spelled as a
+/// `Method` with receiver root `PyError` is the other front shape.
+fn stop_iteration_predicate(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => name == "matches_stop_iteration" && receiver_root.as_deref() == Some("PyError"),
+        CallTarget::FunctionPath { segments, .. } => {
+            let mut segs = segments.iter().rev();
+            segs.next()
+                .is_some_and(|name| name == "matches_stop_iteration")
+                && segs.next().is_some_and(|owner| owner == "PyError")
+        }
+        _ => false,
+    }
 }
 
 /// Drain-loop `match next()` fusion — the hand-written `match` at
@@ -4091,18 +4156,9 @@ fn try_fuse_drain_match(
         .iter()
         .enumerate()
         .find_map(|(i, op)| match &op.kind {
-            OpKind::Call {
-                target:
-                    CallTarget::Method {
-                        name: method,
-                        receiver_root,
-                        ..
-                    },
-                args,
-                ..
-            } if method == "matches_stop_iteration"
-                && receiver_root.as_deref() == Some("PyError")
-                && args.as_slice() == std::slice::from_ref(&err_payload) =>
+            OpKind::Call { target, args, .. }
+                if stop_iteration_predicate(target)
+                    && args.as_slice() == std::slice::from_ref(&err_payload) =>
             {
                 op.result.clone().map(|matched| (i, matched))
             }
@@ -5266,6 +5322,164 @@ fn remint_call_as_payload(
     payload
 }
 
+/// The `Ok` payload and the `Err` handle are not one register.
+///
+/// `exceptiontransform` carries `T` on the normal edge and the
+/// `OperationError` instance in `last_exc_value`. Substituting the
+/// payload into a link while the target phi is still the `Result`
+/// shell asks `insert_renamings` to copy the payload's kind into the
+/// shell's ref. Each forwarding slot gets a fresh variable; that
+/// variable's only incoming value is the payload.
+fn separate_payload_from_shell(graph: &mut FunctionGraph, origin: usize, payload: &Variable) {
+    // Pass-through edges (the inputarg already is this value, or already a
+    // payload phi) are followed once per block. Fresh phis are each queued
+    // once from the edge that created them. Block ids, not a variable set.
+    let mut passed = vec![false; graph.blocks.len()];
+    let mut work = vec![(origin, payload.clone())];
+    while let Some((block, carried)) = work.pop() {
+        let forwarded: Vec<(crate::model::BlockId, Vec<usize>)> = graph.blocks[block]
+            .exits
+            .iter()
+            .filter(|link| link.target != graph.exceptblock)
+            .map(|link| {
+                let positions: Vec<usize> = link
+                    .args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, arg)| {
+                        matches!(arg, LinkArg::Value(var) if *var == carried).then_some(index)
+                    })
+                    .collect();
+                (link.target, positions)
+            })
+            .filter(|(_, positions)| !positions.is_empty())
+            .collect();
+        for (target, positions) in forwarded {
+            let created = install_payload_phis(graph, target, &positions, &carried);
+            if target == graph.returnblock {
+                continue;
+            }
+            if created.is_empty() {
+                if !passed[target.0] {
+                    passed[target.0] = true;
+                    work.push((target.0, carried.clone()));
+                }
+            } else {
+                for phi in created {
+                    work.push((target.0, phi));
+                }
+            }
+        }
+    }
+}
+
+/// Point `positions` of `target` at fresh payload phis and rename the
+/// shell alias through that block. One shell variable shared by several
+/// slots becomes one phi.
+fn install_payload_phis(
+    graph: &mut FunctionGraph,
+    target: crate::model::BlockId,
+    positions: &[usize],
+    carried: &Variable,
+) -> Vec<Variable> {
+    let mut created: Vec<(Variable, Variable)> = Vec::new();
+    let mut fresh = Vec::new();
+    for &pos in positions {
+        let Some(old) = graph.blocks[target.0].inputargs.get(pos).cloned() else {
+            continue;
+        };
+        if old == *carried || is_payload_phi(&old) {
+            continue;
+        }
+        if let Some((_, phi)) = created.iter().find(|(prev, _)| prev == &old) {
+            graph.blocks[target.0].inputargs[pos] = phi.clone();
+            continue;
+        }
+        let mut phi = graph.alloc_value_var();
+        // The name is the mark that this inputarg already carries `T`.
+        // A later edge into the same block must reuse it.
+        phi.rename("exc_payload");
+        created.push((old, phi.clone()));
+        graph.blocks[target.0].inputargs[pos] = phi.clone();
+        fresh.push(phi);
+    }
+    for (old, phi) in &created {
+        remap_var_uses_in_block(graph, target, old, phi);
+        // The slot now carries `T`. A `ControlFlow::Continue` / `Result::Ok`
+        // `__pos_0` read left on that value projects a shell that is no
+        // longer there; `promote_gc_field_bases` would then rebank the
+        // scalar payload as a ref. The payload's own `__pos_0` (a tuple
+        // element, a struct field) stays: forwarding that read would give
+        // the element the aggregate's kind.
+        collapse_payload_projection(graph, phi);
+    }
+    fresh
+}
+
+fn is_payload_phi(var: &Variable) -> bool {
+    // `Variable::rename` keeps a trailing `_` (`clean_name`).
+    var.name_prefix() == "exc_payload_"
+}
+
+/// A `__pos_0` read that still names the `Result` / `ControlFlow` shell
+/// after its base was rewritten to the payload.
+///
+/// `Option::Some` is not included. `fast_local_index` returns
+/// `Result<Option<usize>, PyError>`; the `usize` index is
+/// `Option::Some.__pos_0` of that payload. Forwarding it to the `Option`
+/// would put a ref in the virtualizable array index.
+fn projects_exc_shell(field: &crate::model::FieldDescriptor) -> bool {
+    let Some(owner) = field.owner_root.as_deref() else {
+        return false;
+    };
+    let variant = owner.rsplit("::").next().unwrap_or(owner);
+    matches!(variant, "Ok" | "Err" | "Continue" | "Break")
+        && (owner.contains("Result") || owner.contains("ControlFlow"))
+}
+
+/// Delete shell `__pos_0` projections of `payload` and use `payload` itself.
+fn collapse_payload_projection(graph: &mut FunctionGraph, payload: &Variable) {
+    let reads: Vec<Variable> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { base, field, .. }
+                if base == payload && projects_exc_shell(field) =>
+            {
+                op.result.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    for result in reads {
+        let _ = crate::front::mir::forward_identity(graph, &result, payload);
+    }
+}
+
+fn remap_var_uses_in_block(
+    graph: &mut FunctionGraph,
+    target: crate::model::BlockId,
+    from: &Variable,
+    to: &Variable,
+) {
+    let rename = |var: &Variable| {
+        if var == from { to.clone() } else { var.clone() }
+    };
+    let block = &mut graph.blocks[target.0];
+    for op in &mut block.operations {
+        op.kind = crate::inline::remap_op_kind(&op.kind, &rename);
+    }
+    let (exitswitch, exits) = crate::model::remap_control_flow_metadata_var(
+        &block.exitswitch,
+        &block.exits,
+        rename,
+        |block_id| block_id,
+    );
+    block.exitswitch = exitswitch;
+    block.exits = exits;
+}
+
 /// Replace `from` with `to` on every Value arg of `block`'s exits.
 fn replace_exit_value(graph: &mut FunctionGraph, block: usize, from: &Variable, to: &Variable) {
     for link in &mut graph.blocks[block].exits {
@@ -5709,6 +5923,33 @@ mod static_result_shell_tests {
                 .iter()
                 .any(|arg| matches!(arg, LinkArg::Value(value) if *value == payload))
         );
+    }
+
+    #[test]
+    fn ok_payload_forward_does_not_reuse_the_shell_phi() {
+        let (mut graph, shell, payload) = ok_shell_with_tag(0);
+        let entry = graph.startblock;
+        let mid = graph.create_block();
+        let shell_phi = graph.alloc_value_var();
+        graph.push_inputarg_var(mid, shell_phi.clone());
+        graph.set_goto(entry, mid, vec![shell.clone()]);
+        graph.set_return(mid, Some(shell_phi.clone()));
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+                .expect("intermediate forward lowers"),
+            1
+        );
+        separate_payload_from_shell(&mut graph, entry.0, &payload);
+        let mid_phi = graph.blocks[mid.0].inputargs[0].clone();
+        assert_ne!(mid_phi, shell);
+        assert_ne!(mid_phi, shell_phi);
+        assert!(
+            matches!(&graph.blocks[mid.0].exits[0].args[0], LinkArg::Value(var) if *var == mid_phi)
+        );
+        let returned = graph.blocks[graph.returnblock.0].inputargs[0].clone();
+        assert_ne!(returned, shell);
+        assert_ne!(returned, shell_phi);
+        assert_ne!(returned, mid_phi);
     }
 
     #[test]

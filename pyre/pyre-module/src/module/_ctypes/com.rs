@@ -264,7 +264,7 @@ pub(super) fn error(hresult: i32, iid: usize, this: usize) -> pyre_interpreter::
             let instance_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(instance);
             let mut error = win32_error();
-            error.exc_object = pyre_object::gc_roots::shadow_stack_get(instance_slot);
+            error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(instance_slot));
             error
         }
         Err(error) => error,

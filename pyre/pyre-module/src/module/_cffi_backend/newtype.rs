@@ -528,7 +528,7 @@ pub fn detect_custom_layout(
         args.push(pyre_object::w_str_new_managed(&format!(
             "{name}: {msg} (cdef says {cdef_value}, but C compiler says {compiler_value}). fix it or use \"...;\" as the last field in the cdef for {name} to make it flexible"
         )));
-        err.exc_object = pyre_interpreter::builtins::exc_exception_new(&args.take())?;
+        err.set_exc_object(pyre_interpreter::builtins::exc_exception_new(&args.take())?);
         return Err(err);
     }
     ct.flags |= ctypeobj::CTypeFlags::CUSTOM_FIELD_POS.bits();

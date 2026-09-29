@@ -4354,7 +4354,7 @@ fn input_eof_error() -> crate::PyError {
     if let Some(cls) = lookup_exc_class("EOFError") {
         let args = [cls];
         if let Ok(exc) = exc_exception_new(&args) {
-            error.exc_object = exc;
+            error.set_exc_object(exc);
         }
     }
     error

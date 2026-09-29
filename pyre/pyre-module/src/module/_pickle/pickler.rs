@@ -296,7 +296,7 @@ fn add_pickle_object_note(
             );
         }
     }
-    err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     err
 }
 
@@ -3233,7 +3233,7 @@ fn identifier_encoding_error(
         pyre_object::gc_roots::shadow_stack_get(exc_slot),
         pyre_object::gc_roots::shadow_stack_get(context_slot),
     );
-    error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     error
 }
 
