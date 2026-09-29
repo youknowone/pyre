@@ -31,12 +31,7 @@
 # every frame it propagates over, so a level that already had a node from
 # somewhere else would show up twice.  Each line is a full chain, so a doubled
 # node is as visible as a missing one.
-#
-# Keep the trip count on the clamped side of the pypy exec floor. At 240000
-# iterations ubuntu dynasm measured pypy exec 0.01s, over `EXEC_TIME_FLOOR_S`,
-# and applied this ceiling (79.0x > 37x). The ceiling was fitted at 8000,
-# while that exec was clamped. 60000 scales the 0.01s back under the clamp.
-N = 60000
+N = 240000
 
 
 def leaf(i, n):
