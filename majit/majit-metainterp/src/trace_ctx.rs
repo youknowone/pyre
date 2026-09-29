@@ -821,6 +821,12 @@ pub struct ReconstructRecipe {
     pub registers_r: Vec<OpRef>,
     pub registers_f: Vec<OpRef>,
     pub concrete_r: Vec<majit_ir::Value>,
+    /// The level's `frame` red, decoded from its resume section like every
+    /// other live register (`resume.py consume_boxes`).  The walk resumes the
+    /// callee on this box, so the frame the parent trace entered — the one its
+    /// `virtual_ref` scope and the callee frames' `f_backref` name — stays the
+    /// frame that runs.  `NONE` for a level that has no frame red.
+    pub frame: OpRef,
     pub nargs: usize,
     /// Set only for a level that reconstructs NO frame: on the way out it
     /// discards its callee's result and yields this box to its own caller
@@ -1616,6 +1622,17 @@ impl TraceCtx {
     pub fn innermost_virtualref_virtual(&self) -> Option<(OpRef, usize)> {
         let len = self.virtualref_boxes.len();
         (len >= 2).then(|| self.virtualref_boxes[len - 2])
+    }
+
+    /// The scope enclosing the innermost one — `virtualref_boxes[-4]`, the
+    /// caller frame's `virtualbox` when that caller is itself an open scope —
+    /// with its current concrete address.
+    pub fn enclosing_virtualref_virtual(&self) -> Option<(OpRef, usize)> {
+        let len = self.virtualref_boxes.len();
+        (len >= 4).then(|| {
+            let entry = self.virtualref_boxes[len - 4];
+            (entry.0, self.virtualref_entry_ptr(entry))
+        })
     }
 
     /// The innermost still-open scope's `vrefbox` —

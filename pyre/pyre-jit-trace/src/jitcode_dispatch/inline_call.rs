@@ -4862,6 +4862,7 @@ pub(crate) fn walker_ec_leave(
             // `f_back = frame.f_backref()` with the parens.
             let f_back = (*concrete_frame).get_f_back();
             if !f_back.is_null() {
+                record_caller_mark_as_escaped(ctx, f_back);
                 (*f_back).mark_as_escaped();
             }
             // `frame_vref()` — force the leaving frame's own vref so it
@@ -4905,6 +4906,33 @@ pub(crate) fn walker_ec_leave(
     }
     // `jit.virtual_ref_finish(frame_vref, frame)`.
     ctx.opimpl_virtual_ref_finish(callee_frame);
+}
+
+/// `f_back.mark_as_escaped()` in the trace, for a caller that is itself an
+/// open `virtual_ref` scope.
+///
+/// Forcing a vref the trace still tracks yields its virtual, so `f_back` is
+/// that scope's frame box and the store is an ordinary `flags` setfield on it.
+/// Recorded before the concrete store, which leaves the heap cache and the
+/// caller frame agreeing on `flags` for every later read.  A caller outside
+/// the open scopes (the portal frame) keeps the concrete store alone.
+fn record_caller_mark_as_escaped(ctx: &mut TraceCtx, f_back: *mut pyre_interpreter::PyFrame) {
+    let Some((f_back_box, f_back_ptr)) = ctx.enclosing_virtualref_virtual() else {
+        return;
+    };
+    if f_back_ptr != f_back as usize {
+        return;
+    }
+    let flags_descr = crate::descr::pyframe_flags_descr();
+    let live_flags = crate::state::opimpl_getfield_gc_i(ctx, f_back_box, flags_descr.clone());
+    let escaped_bit = ctx.const_int(i64::from(pyre_interpreter::PyFrame::FLAG_ESCAPED));
+    let new_flags = ctx.record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[f_back_box, new_flags],
+        flags_descr.clone(),
+    );
+    ctx.heapcache_setfield_cached(f_back_box, flags_descr.index(), new_flags);
 }
 
 /// `executioncontext.py ExecutionContext.enter`'s frame-chain half, recorded
