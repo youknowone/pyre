@@ -1113,6 +1113,37 @@ mod tests {
     }
 
     #[test]
+    fn a_null_chosen_field_offset_has_no_layout() {
+        // A generic enum whose payload seat is `chosen: null` and whose
+        // discriminator was not recorded. The whole layout stays absent.
+        let doc = r#"{"charon_version":"t","has_errors":false,
+            "translated":{"crate_name":"c","fun_decls":[],"type_decls":[{
+                "def_id":0,
+                "item_meta":{"name":[{"Ident":["Option",0]}],
+                    "span":{"data":{"file_id":0,"beg":{"line":1,"col":0},"end":{"line":1,"col":1}}},
+                    "source_text":null,
+                    "attr_info":{"attributes":[],"inline":null,"rename":null,"public":true},
+                    "is_local":false},
+                "kind":{"Enum":[]},
+                "layout":[{"key":"t","value":{
+                    "size":{"chosen":null},
+                    "discriminator":null,
+                    "variant_layouts":[
+                        {"field_offsets":[]},
+                        {"field_offsets":[{"guarantee":{"GuaranteedAlignment":{"Deduplicated":720}},"chosen":null}]}
+                    ]
+                }}]
+            }]}}"#;
+        let l = Llbc::from_slice(doc.as_bytes()).expect("fixture parses");
+        assert!(
+            l.type_by_id(0)
+                .expect("decl")
+                .layout_for_target(&l, "t")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn a_payload_free_type_kind_is_a_string_body() {
         // `!` hash-conses as `{"Value": [id, "Never"]}`; a monomorphized
         // `ControlFlow<Result<!, E>, T>` names it among its instance

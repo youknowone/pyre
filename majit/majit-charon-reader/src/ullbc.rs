@@ -625,7 +625,7 @@ impl TypeLayout {
         let offset = self.discriminant_offset()?;
         let (signed, bits) = tag_int_ty(branch.get("int_ty")?)?;
         let children = branch.get("children").and_then(Value::as_array)?;
-        let encoding = tag_encoding(children, branch.get("fallback"))?;
+        let encoding = tag_encoding(children, branch.get("fallback"), bits)?;
         Some(TagLayout {
             offset,
             signed,
@@ -707,7 +707,20 @@ fn tag_dest(value: &Value) -> Option<TagDest> {
     None
 }
 
-fn tag_encoding(children: &[Value], fallback: Option<&Value>) -> Option<TagEncoding> {
+fn tag_width_mask(bits: u32, raw: u128) -> u128 {
+    if bits >= 128 {
+        raw
+    } else {
+        raw & ((1u128 << bits) - 1)
+    }
+}
+
+/// `TagEncoding::Niche` (`rustc_abi`): a variant `i` other than
+/// `untagged_variant` stores `niche_start + (i - niche_variants.start)`
+/// in the tag width. `niche_variants` is the span of those variants and
+/// may contain `untagged_variant` as a dead value. A raw word outside
+/// the span is `untagged_variant`.
+fn tag_encoding(children: &[Value], fallback: Option<&Value>, bits: u32) -> Option<TagEncoding> {
     let mut known: Vec<(u128, u128, usize)> = Vec::new();
     for child in children {
         let pair = child.as_array()?;
@@ -721,62 +734,38 @@ fn tag_encoding(children: &[Value], fallback: Option<&Value>) -> Option<TagEncod
     }
     let fallback = fallback.and_then(tag_dest);
     if let Some(TagDest::Known(untagged)) = fallback {
-        let mut niche: Vec<(u128, usize)> = known
-            .into_iter()
-            .filter(|(_, _, variant)| *variant != untagged)
-            .map(|(start, end, variant)| {
-                if end != start {
-                    return None;
-                }
-                Some((start, variant))
-            })
-            .collect::<Option<_>>()?;
+        let mut niche: Vec<(u128, usize)> = Vec::new();
+        for (start, end, variant) in known {
+            if variant == untagged {
+                continue;
+            }
+            if end != start {
+                return None;
+            }
+            niche.push((tag_width_mask(bits, start), variant));
+        }
         if niche.is_empty() {
             return None;
         }
-        niche.sort_by_key(|(start, _)| *start);
-        let dense_start = niche[0].0;
-        let first = niche[0].1;
-        let dense = niche.iter().enumerate().all(|(i, (start, variant))| {
-            *variant == first + i && *start == dense_start.wrapping_add(i as u128)
-        });
-        if dense {
-            let last = niche.last()?.1;
-            return Some(TagEncoding::Niche {
-                untagged_variant: untagged,
-                niche_variants: first..=last,
-                niche_start: dense_start,
-            });
-        }
-        // The untagged index sits in a hole of the niche variants. The
-        // raw range still covers `lo..=hi`, and the hole decodes as the
-        // untagged variant.
-        let lo = niche
-            .iter()
-            .map(|(_, variant)| *variant)
-            .min()?
-            .min(untagged);
-        let hi = niche
-            .iter()
-            .map(|(_, variant)| *variant)
-            .max()?
-            .max(untagged);
-        if untagged < lo || untagged > hi {
-            return None;
-        }
-        let mut niche_start: Option<u128> = None;
+        let lo = niche.iter().map(|(_, variant)| *variant).min()?;
+        let hi = niche.iter().map(|(_, variant)| *variant).max()?;
+        let niche_start = niche.iter().find(|(_, variant)| *variant == lo)?.0;
+        let mut seen = vec![false; hi - lo + 1];
         for (start, variant) in &niche {
-            let guess = start.wrapping_sub((*variant - lo) as u128);
-            match niche_start {
-                None => niche_start = Some(guess),
-                Some(prev) if prev != guess => return None,
-                Some(_) => {}
+            let slot = variant - lo;
+            if seen[slot] {
+                return None;
             }
+            let expect = tag_width_mask(bits, niche_start.wrapping_add(slot as u128));
+            if *start != expect {
+                return None;
+            }
+            seen[slot] = true;
         }
         return Some(TagEncoding::Niche {
             untagged_variant: untagged,
             niche_variants: lo..=hi,
-            niche_start: niche_start?,
+            niche_start,
         });
     }
     if known.is_empty() || known.iter().any(|(start, end, _)| start != end) {
@@ -789,7 +778,7 @@ fn tag_encoding(children: &[Value], fallback: Option<&Value>) -> Option<TagEncod
         if seen[variant] {
             return None;
         }
-        tags[variant] = start;
+        tags[variant] = tag_width_mask(bits, start);
         seen[variant] = true;
     }
     if seen.iter().any(|present| !present) {
@@ -1919,40 +1908,44 @@ mod tests {
         assert!(layout.tag().is_none());
     }
 
-    /// Direct tags, a one-value niche, and a niche whose unused hole is
-    /// `Invalid`. Shapes copied from real `Branch` discriminators.
+    fn layout_from(discriminator: &str, variants: &str) -> TypeLayout {
+        serde_json::from_str(&format!(
+            r#"{{"discriminator":{discriminator},"variant_layouts":{variants}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// Direct tags, a one-value niche, and a niche whose untagged variant
+    /// sits in a hole of the span. Discriminator objects are copied from
+    /// three concrete decls plus one niche whose `Invalid` child is the
+    /// dead tag of the untagged index.
     #[test]
     fn branch_tag_is_direct_or_niche() {
-        let direct: TypeLayout = serde_json::from_str(
-            r#"{"discriminator":{"Branch":{"offset":{"chosen":0},"int_ty":{"Unsigned":"U8"},
-                "children":[
-                    [{"start":{"Unsigned":["U8","0"]},"end":{"Unsigned":["U8","0"]}},{"Known":0}],
-                    [{"start":{"Unsigned":["U8","1"]},"end":{"Unsigned":["U8","1"]}},{"Known":1}]
-                ],
-                "fallback":"Invalid"}},
-                "variant_layouts":[{"field_offsets":[]},{"field_offsets":[]}]}"#,
-        )
-        .unwrap();
+        // Fieldless three-variant branch, fallback `Invalid`.
+        let direct = layout_from(
+            r#"{"Branch":{"offset":{"guarantee":null,"chosen":0},"int_ty":{"Unsigned":"U8"},"children":[[{"start":{"Unsigned":["U8","0"]},"end":{"Unsigned":["U8","0"]}},{"Known":0}],[{"start":{"Unsigned":["U8","1"]},"end":{"Unsigned":["U8","1"]}},{"Known":1}],[{"start":{"Unsigned":["U8","2"]},"end":{"Unsigned":["U8","2"]}},{"Known":2}]],"fallback":"Invalid"}}"#,
+            r#"[{"field_offsets":[]},{"field_offsets":[]},{"field_offsets":[]}]"#,
+        );
         assert_eq!(
             direct.tag(),
             Some(TagLayout {
                 offset: 0,
                 signed: false,
                 bits: 8,
-                encoding: TagEncoding::Direct { tags: vec![0, 1] },
+                encoding: TagEncoding::Direct {
+                    tags: vec![0, 1, 2],
+                },
             })
         );
 
-        // `rhai::grain::vm::Site`: variant 0 is the niche value 0, variant 1
-        // is the untagged fallback.
-        let site: TypeLayout = serde_json::from_str(
-            r#"{"discriminator":{"Branch":{"offset":{"guarantee":null,"chosen":0},
-                "int_ty":{"Signed":"Isize"},
-                "children":[[{"start":{"Signed":["Isize","0"]},"end":{"Signed":["Isize","0"]}},{"Known":0}]],
-                "fallback":{"Known":1}}},
-                "variant_layouts":[{"field_offsets":[]},{"field_offsets":[]}]}"#,
-        )
-        .unwrap();
+        // Niche value 0 is variant 0; variant 1 is the untagged fallback.
+        // Payload seats: variant 0 at 8, variant 1 at 0.
+        let site = layout_from(
+            r#"{"Branch":{"offset":{"guarantee":null,"chosen":0},"int_ty":{"Signed":"Isize"},"children":[[{"start":{"Signed":["Isize","0"]},"end":{"Signed":["Isize","0"]}},{"Known":0}]],"fallback":{"Known":1}}}"#,
+            r#"[{"field_offsets":[{"guarantee":null,"chosen":8}]},{"field_offsets":[{"guarantee":null,"chosen":0}]}]"#,
+        );
+        assert_eq!(site.field_offset(0, 0), Some(8));
+        assert_eq!(site.field_offset(1, 0), Some(0));
         assert_eq!(
             site.tag(),
             Some(TagLayout {
@@ -1967,19 +1960,16 @@ mod tests {
             })
         );
 
-        // `rhai::ast::stmt::RangeCase`: variant 0 is tag 2, variant 1 is
-        // untagged, and 3..=255 is the unused hole.
-        let range_case: TypeLayout = serde_json::from_str(
-            r#"{"discriminator":{"Branch":{"offset":{"guarantee":null,"chosen":24},
-                "int_ty":{"Unsigned":"U8"},
-                "children":[
-                    [{"start":{"Unsigned":["U8","2"]},"end":{"Unsigned":["U8","2"]}},{"Known":0}],
-                    [{"start":{"Unsigned":["U8","3"]},"end":{"Unsigned":["U8","255"]}},"Invalid"]
-                ],
-                "fallback":{"Known":1}}},
-                "variant_layouts":[{"field_offsets":[0]},{"field_offsets":[0]}]}"#,
-        )
-        .unwrap();
+        // Variant 0 is tag 2 at byte 24; variant 1 is untagged. 3..=255 is
+        // the unused hole. Field seats are 0/16 and 8/0.
+        let range_case = layout_from(
+            r#"{"Branch":{"offset":{"guarantee":null,"chosen":24},"int_ty":{"Unsigned":"U8"},"children":[[{"start":{"Unsigned":["U8","2"]},"end":{"Unsigned":["U8","2"]}},{"Known":0}],[{"start":{"Unsigned":["U8","3"]},"end":{"Unsigned":["U8","255"]}},"Invalid"]],"fallback":{"Known":1}}}"#,
+            r#"[{"field_offsets":[{"guarantee":null,"chosen":0},{"guarantee":null,"chosen":16}]},{"field_offsets":[{"guarantee":null,"chosen":8},{"guarantee":null,"chosen":0}]}]"#,
+        );
+        assert_eq!(range_case.field_offset(0, 0), Some(0));
+        assert_eq!(range_case.field_offset(0, 1), Some(16));
+        assert_eq!(range_case.field_offset(1, 0), Some(8));
+        assert_eq!(range_case.field_offset(1, 1), Some(0));
         assert_eq!(
             range_case.tag(),
             Some(TagLayout {
@@ -1994,18 +1984,19 @@ mod tests {
             })
         );
 
-        // Untagged variant 1 sits between niche variants 0 and 2. The
-        // raw values are i64::MIN, i64::MIN+1, i64::MIN+3.
-        let holed: TypeLayout = serde_json::from_str(
-            r#"{"discriminator":{"Branch":{"offset":{"chosen":0},"int_ty":{"Unsigned":"U64"},
-                "children":[
-                    [{"start":{"Unsigned":["U64","9223372036854775808"]},"end":{"Unsigned":["U64","9223372036854775808"]}},{"Known":0}],
-                    [{"start":{"Unsigned":["U64","9223372036854775810"]},"end":{"Unsigned":["U64","9223372036854775810"]}},{"Known":2}]
-                ],
-                "fallback":{"Known":1}}},
-                "variant_layouts":[{"field_offsets":[]},{"field_offsets":[]},{"field_offsets":[]}]}"#,
-        )
-        .unwrap();
+        // Generic `Option`: no concrete discriminator.
+        let option = layout_from(
+            "null",
+            r#"[{"field_offsets":[]},{"field_offsets":[{"guarantee":{"GuaranteedAlignment":{"Deduplicated":720}},"chosen":null}]}]"#,
+        );
+        assert!(option.tag().is_none());
+
+        // Untagged variant 7 sits inside 0..=8. The point `Invalid` child
+        // is the dead tag `niche_start + 7`; variant 8 is `niche_start + 8`.
+        let holed = layout_from(
+            r#"{"Branch":{"offset":{"guarantee":null,"chosen":0},"int_ty":{"Unsigned":"U64"},"children":[[{"start":{"Unsigned":["U64","9223372036854775808"]},"end":{"Unsigned":["U64","9223372036854775808"]}},{"Known":0}],[{"start":{"Unsigned":["U64","9223372036854775809"]},"end":{"Unsigned":["U64","9223372036854775809"]}},{"Known":1}],[{"start":{"Unsigned":["U64","9223372036854775810"]},"end":{"Unsigned":["U64","9223372036854775810"]}},{"Known":2}],[{"start":{"Unsigned":["U64","9223372036854775811"]},"end":{"Unsigned":["U64","9223372036854775811"]}},{"Known":3}],[{"start":{"Unsigned":["U64","9223372036854775812"]},"end":{"Unsigned":["U64","9223372036854775812"]}},{"Known":4}],[{"start":{"Unsigned":["U64","9223372036854775813"]},"end":{"Unsigned":["U64","9223372036854775813"]}},{"Known":5}],[{"start":{"Unsigned":["U64","9223372036854775814"]},"end":{"Unsigned":["U64","9223372036854775814"]}},{"Known":6}],[{"start":{"Unsigned":["U64","9223372036854775815"]},"end":{"Unsigned":["U64","9223372036854775815"]}},"Invalid"],[{"start":{"Unsigned":["U64","9223372036854775816"]},"end":{"Unsigned":["U64","9223372036854775816"]}},{"Known":8}],[{"start":{"Unsigned":["U64","9223372036854775817"]},"end":{"Unsigned":["U64","18446744073709551615"]}},"Invalid"]],"fallback":{"Known":7}}}"#,
+            r#"[{"field_offsets":[]},{"field_offsets":[]},{"field_offsets":[]},{"field_offsets":[]},{"field_offsets":[]},{"field_offsets":[]},{"field_offsets":[]},{"field_offsets":[]},{"field_offsets":[]}]"#,
+        );
         assert_eq!(
             holed.tag(),
             Some(TagLayout {
@@ -2013,9 +2004,29 @@ mod tests {
                 signed: false,
                 bits: 64,
                 encoding: TagEncoding::Niche {
-                    untagged_variant: 1,
-                    niche_variants: 0..=2,
+                    untagged_variant: 7,
+                    niche_variants: 0..=8,
                     niche_start: 9223372036854775808,
+                },
+            })
+        );
+
+        // An uninhabited index inside the span does not pull an untagged
+        // variant that sits past the span into `niche_variants`.
+        let outside = layout_from(
+            r#"{"Branch":{"offset":{"chosen":0},"int_ty":{"Unsigned":"U8"},"children":[[{"start":{"Unsigned":["U8","10"]},"end":{"Unsigned":["U8","10"]}},{"Known":0}],[{"start":{"Unsigned":["U8","12"]},"end":{"Unsigned":["U8","12"]}},{"Known":2}]],"fallback":{"Known":5}}}"#,
+            r#"[{"field_offsets":[]},{"field_offsets":[]},{"field_offsets":[]}]"#,
+        );
+        assert_eq!(
+            outside.tag(),
+            Some(TagLayout {
+                offset: 0,
+                signed: false,
+                bits: 8,
+                encoding: TagEncoding::Niche {
+                    untagged_variant: 5,
+                    niche_variants: 0..=2,
+                    niche_start: 10,
                 },
             })
         );
