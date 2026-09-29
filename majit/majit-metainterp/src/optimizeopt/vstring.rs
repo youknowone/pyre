@@ -386,19 +386,16 @@ impl OptString {
     }
 
     /// vstring.py StrPtrInfo.force_box — delegate to PtrInfo::force_box.
-    fn force_box(&mut self, op: &Operand, ctx: &mut OptContext) -> OpRef {
-        // One chain walk; the position view falls back to the source.
-        let resolved_box = ctx.resolve_operand_operand_opt(op);
-        let resolved = resolved_box
-            .as_ref()
-            .map_or_else(|| op.to_opref(), |b| b.to_opref());
-        if resolved_box.as_ref().is_some_and(|b| ctx.is_virtual(b)) {
-            let resolved_box = resolved_box.expect("recorder-populated");
-            let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
-            let forced = info.force_box(&resolved_box, ctx);
-            return ctx.resolve_operand_operand(&forced).to_opref();
+    fn force_box(&mut self, op: &Operand, ctx: &mut OptContext) -> Operand {
+        match ctx.resolve_operand_operand_opt(op) {
+            Some(resolved) if ctx.is_virtual(&resolved) => {
+                let mut info = ctx.take_ptr_info(&resolved).unwrap();
+                let forced = info.force_box(&resolved, ctx);
+                ctx.resolve_operand_operand(&forced)
+            }
+            Some(resolved) => resolved,
+            None => op.clone(),
         }
-        resolved
     }
 
     /// vstring.py StrPtrInfo.getstrlen — delegates to

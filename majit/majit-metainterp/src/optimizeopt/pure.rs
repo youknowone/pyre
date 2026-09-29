@@ -451,13 +451,10 @@ pub struct OptPure {
     cache: SharedPureOps,
     /// Postponed OVF operation: INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF.
     /// pure.py: postponed_op — deferred until GUARD_NO_OVERFLOW is seen.
-    postponed_op: Option<Op>,
-    /// Bound operand of `postponed_op`, captured from the live `OpRc` at
-    /// postponement. The OVF op is `Remove`d before emit, so its head box
-    /// is never bound by the emit path; capturing it here (where the op
-    /// object is live) gives `make_equal_to` a bound receiver without an
-    /// `materialize_operand_at` round-trip through the opref.
-    postponed_box: Option<Operand>,
+    /// `self.postponed_op = op` keeps the op object itself, so a later
+    /// `make_equal_to` / `make_constant` on it and its eventual emission
+    /// name the same box.
+    postponed_op: Option<OpRc>,
     /// Indices into new_operations of emitted CALL_PURE ops.
     /// pure.py: call_pure_positions — tracked for short preamble generation.
     call_pure_positions: Vec<usize>,
@@ -493,7 +490,6 @@ impl OptPure {
                 crate::jit::PARAMETERS.pureop_historylength as usize,
             ))),
             postponed_op: None,
-            postponed_box: None,
             call_pure_positions: Vec::new(),
             pending_call_pure_position: false,
             last_emitted_was_removed: false,
@@ -830,8 +826,8 @@ impl OptPure {
     /// then flushes BETWEEN the OVF op and its GUARD_NO_OVERFLOW — breaking
     /// the adjacency `aarch64/assembler.py _walk_operations`
     /// asserts and the backends rely on to read the overflow flags.
-    fn emit_postponed_downstream(&mut self, postponed: Op, ctx: &mut OptContext) {
-        ctx.emit_extra(ctx.current_pass_idx, postponed);
+    fn emit_postponed_downstream(&mut self, postponed: OpRc, ctx: &mut OptContext) {
+        ctx.emit_extra_rc(ctx.current_pass_idx, postponed);
     }
 
     /// pure.py _same_args
@@ -906,23 +902,18 @@ impl Default for OptPure {
 }
 
 impl OptPure {
-    fn force_box(&mut self, op: &Operand, ctx: &mut OptContext) -> OpRef {
-        // Single resolve through the operand terminal; the OpRef view is the
-        // terminal's `to_opref()` (keystone equivalence, #113), so the prior
-        // paired `get_box_replacement` + `get_box_replacement_operand_opt` of the
-        // same operand was a redundant double walk.
-        let resolved_box = ctx.resolve_operand_operand_opt(op);
-        let resolved = resolved_box
-            .as_ref()
-            .map(|b| b.to_opref())
-            .unwrap_or_else(|| op.to_opref());
-        if resolved_box.as_ref().is_some_and(|b| ctx.is_virtual(b)) {
-            let resolved_box = resolved_box.expect("recorder-populated");
-            let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
-            let forced = info.force_box(&resolved_box, ctx);
-            return ctx.resolve_operand_operand(&forced).to_opref();
+    fn force_box(&mut self, op: &Operand, ctx: &mut OptContext) -> Operand {
+        // optimizer.py force_box: `op = get_box_replacement(op)`, then force
+        // the virtual behind it.
+        match ctx.resolve_operand_operand_opt(op) {
+            Some(resolved) if ctx.is_virtual(&resolved) => {
+                let mut info = ctx.take_ptr_info(&resolved).unwrap();
+                let forced = info.force_box(&resolved, ctx);
+                ctx.resolve_operand_operand(&forced)
+            }
+            Some(resolved) => resolved,
+            None => op.clone(),
         }
-        resolved
     }
 
     /// optimizer.py _can_optimize_call_pure.
@@ -939,9 +930,7 @@ impl OptPure {
         let mut arg_consts = Vec::with_capacity(op.num_args().saturating_sub(start_index));
         for i in start_index..op.num_args() {
             let forced = self.force_box(&op.arg(i), ctx);
-            let const_value = ctx
-                .get_box_replacement_operand_opt(forced)
-                .and_then(|b| ctx.get_constant_box(&b))?;
+            let const_value = ctx.get_constant_box(&forced)?;
             arg_consts.push(const_value);
         }
         self.call_pure_results.get(&arg_consts)
@@ -1010,17 +999,13 @@ impl Optimization for OptPure {
         // INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF are deferred until we see
         // GUARD_NO_OVERFLOW, so we can try CSE on the OVF op + guard pair.
         if op.opcode.is_ovf() {
-            self.postponed_op = Some(op.clone());
-            self.postponed_box = Some(Operand::from_bound_op(op_rc));
+            self.postponed_op = Some(op_rc.clone());
             return OptimizationResult::Remove;
         }
 
         // Handle the postponed OVF op when we see GUARD_NO_OVERFLOW.
-        if let Some(mut postponed) = self.postponed_op.take() {
-            let postponed_box = self
-                .postponed_box
-                .take()
-                .expect("postponed_box is set whenever postponed_op is set");
+        if let Some(postponed) = self.postponed_op.take() {
+            let postponed_box = Operand::from_bound_op(&postponed);
             if op.opcode == OpCode::GuardNoOverflow {
                 // pure.py — only call `constant_fold` when every
                 // arg has resolved to a `Const*` via `get_constant_box`
@@ -1034,8 +1019,7 @@ impl Optimization for OptPure {
                         .is_some()
                 });
                 if all_args_const && let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
-                    let b = ctx.materialize_operand_at(postponed.pos().get());
-                    ctx.make_constant_box(&b, Value::Int(folded));
+                    ctx.make_constant_box(&postponed_box, Value::Int(folded));
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
                 }
@@ -1060,7 +1044,7 @@ impl Optimization for OptPure {
                 let key = PureOpKey::from_operand_op(&postponed);
                 for i in 0..postponed.num_args() {
                     let forced = self.force_box(&postponed.arg(i), ctx);
-                    postponed.setarg(i, ctx.materialize_operand_at(forced));
+                    postponed.setarg(i, forced);
                 }
                 // Record and emit both the OVF op and the guard.
                 self.cache.borrow_mut().insert(key, postponed_box.clone());
@@ -1072,7 +1056,7 @@ impl Optimization for OptPure {
                 // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
                 for i in 0..postponed.num_args() {
                     let forced = self.force_box(&postponed.arg(i), ctx);
-                    postponed.setarg(i, ctx.materialize_operand_at(forced));
+                    postponed.setarg(i, forced);
                 }
                 self.emit_postponed_downstream(postponed, ctx);
             }
@@ -1306,7 +1290,6 @@ impl Optimization for OptPure {
     fn setup(&mut self) {
         self.cache.borrow_mut().clear();
         self.postponed_op = None;
-        self.postponed_box = None;
         self.call_pure_positions.clear();
         self.pending_call_pure_position = false;
         self.last_emitted_was_removed = false;
@@ -2083,7 +2066,6 @@ mod tests {
         opt.add_pass(Box::new(OptPure {
             cache: Rc::new(RefCell::new(RecentPureOpTable::new(16))),
             postponed_op: None,
-            postponed_box: None,
             call_pure_positions: Vec::new(),
             pending_call_pure_position: false,
             last_emitted_was_removed: false,
