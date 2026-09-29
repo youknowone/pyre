@@ -140,98 +140,68 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
     }
 }
 
-/// #124: walker-native truth specialization for the `truth_fn` residual
-/// (oopspec [`majit_ir::RuntimeHelperKind::Truth`]).  When the sole Ref operand
-/// is a concrete boxed `W_IntObject` (excluding `W_BoolObject`, which shares
-/// the `intval: i64` layout but carries a distinct `BOOL_TYPE` `ob_type`, so
-/// the emitted `GUARD_CLASS INT` would not match it), unbox it
-/// (`GUARD_CLASS INT` + `getfield intval`) and record `int_is_true`, stamping
-/// the folded concrete truth.  Returns the raw truth `OpRef` on success;
-/// `None` when the operand is not a concrete int — the caller then falls
-/// through to the generic may-force residual, which runs `__bool__` /
-/// `__len__`.
-///
-/// Declining a subclass on the *recorded* operand is not enough: `is_int`
-/// and the `GUARD_CLASS` below both read `ob_type`, so a trace compiled from
-/// an exact int still admits a subclass that arrives later.  The `w_class`
-/// pin is what rejects it.
-///
-/// Eliding the `CALL_MAY_FORCE` here also removes its `GUARD_NOT_FORCED` /
-/// `GUARD_NO_EXCEPTION`, whose kept-stack blackhole resume reads NULL peeled
-/// outer-Label slots in the short-circuit value-context shape
-/// (`(i % 7) and ...`).
-pub(crate) fn try_walker_specialize_truth_int<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-) -> Result<Option<OpRef>, DispatchError> {
-    let Some(obj) = walker_concrete_ref_object(ctx, operand) else {
-        return Ok(None);
-    };
-    let val = unsafe {
-        // `is_int` reads `ob_type`, which an `int` subclass shares, so it alone
-        // admits one here.  Two things then go wrong at once: the walk folds the
-        // truth straight off the payload instead of running the subclass's
-        // `__bool__`, and `walker_numeric_builtin_class` answers with the
-        // canonical `int` — a `w_class` the recorded operand does not carry, so
-        // the pin below becomes a guard that fails on the very value that
-        // recorded it.  Decline before unboxing; `walker_numeric_builtin_class`
-        // documents this gate as its precondition.
-        if !pyre_object::is_int(obj)
-            || pyre_object::is_bool(obj)
-            || !pyre_object::is_exact_builtin_instance(obj)
-        {
-            return Ok(None);
+const TRUTH_VALUE_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::opcode_ops::truth_value",
+    commit_label: "truth_value_commit",
+    call_site_label: "truth_value_call_site",
+    decline_tag: "TRUTH-VALUE-SUBWALK",
+};
+
+/// `is_true_slot` answers these exact builtins from the object layout.
+/// Anything else reaches `is_true_lookup`, which runs `__bool__` / `__len__`.
+fn truth_layout_builtin(obj: pyre_object::PyObjectRef) -> bool {
+    unsafe {
+        if !pyre_object::is_exact_builtin_instance(obj) {
+            return false;
         }
-        pyre_object::w_int_get_value(obj)
-    };
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let raw = walker_unbox_int_exact(
-        ctx,
-        op_pc,
-        operand,
-        int_type_addr,
-        crate::descr::int_intval_descr(),
-        walker_numeric_builtin_class(obj),
-    )?;
-    let truth = ctx.trace_ctx.record_op(OpCode::IntIsTrue, &[raw]);
-    ctx.trace_ctx
-        .set_opref_concrete(truth, majit_ir::Value::Int((val != 0) as i64));
-    Ok(Some(truth))
+        pyre_object::is_bool(obj)
+            || pyre_object::is_int(obj)
+            || pyre_object::is_long(obj)
+            || pyre_object::is_float(obj)
+            || pyre_object::is_complex(obj)
+            || pyre_object::is_str(obj)
+            || pyre_object::is_bytes(obj)
+            || pyre_object::is_bytearray(obj)
+            || pyre_object::is_list(obj)
+            || pyre_object::is_tuple(obj)
+            || pyre_object::is_dict(obj)
+            || pyre_object::is_set_or_frozenset(obj)
+            || pyre_object::is_w_range(obj)
+            || pyre_object::is_none(obj)
+    }
 }
 
-/// Truth specialization for a concrete `W_BoolObject` operand — the sibling
-/// [`try_walker_specialize_truth_int`] declines it, because it emits
-/// `GUARD_CLASS INT` and a bool carries `BOOL_TYPE`.  Same `intval: i64`
-/// layout, so only the guarded class constant differs; `is_true` on the
-/// unboxed field is `W_BoolObject.is_true`'s `self.intval != 0`.
+/// Exact-builtin truth residual: walk `opcode_ops::truth_value`.
 ///
-/// This is the shape every `if a == b:` reaches: `COMPARE_OP` leaves a boxed
-/// bool the following `TO_BOOL` / `POP_JUMP_IF_*` tests, so without this arm a
-/// comparison costs two `CALL_MAY_FORCE`s and two force/exception guard pairs
-/// instead of one call and a field read.  When the comparison itself already
-/// specialized, its result is the `space.newbool` singleton and both the class
-/// guard and the field read below fold off that constant.
-pub(crate) fn try_walker_specialize_truth_bool<Sym: WalkSym>(
+/// The generated body is `is_true` then `is_true_slot`, and the jitcode
+/// returns the raw bool in the int bank. A subclass, or an exact builtin
+/// with no layout arm, stays on the residual: `is_true_lookup` calls Python.
+pub(crate) fn try_walker_orthodox_truth<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     operand: OpRef,
-) -> Result<Option<OpRef>, DispatchError> {
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'i' {
+        return Ok(None);
+    }
     let Some(obj) = walker_concrete_ref_object(ctx, operand) else {
         return Ok(None);
     };
-    let val = unsafe {
-        if !pyre_object::is_bool(obj) {
-            return Ok(None);
-        }
-        pyre_object::w_int_get_value(obj)
-    };
-    let bool_type_addr = &pyre_object::pyobject::BOOL_TYPE as *const _ as i64;
-    let raw = walker_unbox_int(ctx, op_pc, operand, bool_type_addr)?;
-    let truth = ctx.trace_ctx.record_op(OpCode::IntIsTrue, &[raw]);
-    ctx.trace_ctx
-        .set_opref_concrete(truth, majit_ir::Value::Int((val != 0) as i64));
-    Ok(Some(truth))
+    if !truth_layout_builtin(obj) {
+        return Ok(None);
+    }
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[],
+        &[(operand, obj)],
+        &[],
+        dst,
+        dst_bank,
+        &TRUTH_VALUE_DESCENT,
+    )
 }
 
 /// The `W_LongObject.value` payload of a concrete long, read the way the folds
@@ -479,8 +449,7 @@ pub(crate) fn try_walker_specialize_binary_op_int_zero_div<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    // Same exactness gate as `try_walker_specialize_truth_int`: `is_int` reads
-    // `ob_type`, which an `int` subclass shares, and
+    // `is_int` reads `ob_type`, which an `int` subclass shares, and
     // `walker_numeric_builtin_class` answers with the canonical `int` for one.
     unsafe {
         for obj in [lhs_obj, rhs_obj] {
@@ -6230,8 +6199,7 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
 
     // The match is a constant at trace time: emit the immortal bool singleton
     // as a `const_ref`.  The following `is_true` (the `except` clause's
-    // `POP_JUMP_IF_FALSE`) reads a constant W_Bool, which
-    // `try_walker_specialize_truth_bool` folds off its concrete.
+    // `POP_JUMP_IF_FALSE`) reads that constant W_Bool.
     let result_obj = pyre_object::w_bool_from(matched);
     let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
     ctx.trace_ctx.set_opref_concrete(
@@ -6448,9 +6416,8 @@ pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
 }
 
 /// Write an immortal `bool` singleton into a residual call's Ref dst.  An
-/// immediately following `is_true` (`POP_JUMP_IF_*`) reads a constant W_Bool,
-/// which [`try_walker_specialize_truth_bool`] folds off its concrete rather
-/// than unboxing through a residual.
+/// immediately following `is_true` (`POP_JUMP_IF_*`) reads that constant
+/// W_Bool.
 fn walker_write_const_bool_result<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,

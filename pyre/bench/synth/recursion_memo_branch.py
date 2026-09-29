@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=binary_op_descent,truth_bool,compare_op_descent
+# pyre-check: spec-folds=binary_op_descent,compare_op_descent
 # These three carry most of the corpus's fold traffic, and nothing
 # declared any of them, so switching one off was a silent change. This fixture
 # fires all three repeatedly, the widest margin of any fixture doing so.
