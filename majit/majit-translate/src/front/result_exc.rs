@@ -1009,7 +1009,9 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
-        | OpKind::NewWithVtable { .. } => Vec::new(),
+        | OpKind::NewWithVtable { .. }
+        | OpKind::RawMalloc { .. } => Vec::new(),
+        OpKind::RawFree { ptr } => vec![ptr.clone()],
 
         OpKind::RawLoad { base, offset, .. } => vec![base.clone(), offset.clone()],
         OpKind::RawStore {

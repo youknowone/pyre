@@ -484,6 +484,13 @@ pub(crate) fn remap_op_kind(
             owner: owner.clone(),
             vtable: *vtable,
         },
+        OpKind::RawMalloc { owner, zero } => OpKind::RawMalloc {
+            owner: owner.clone(),
+            zero: *zero,
+        },
+        OpKind::RawFree { ptr } => OpKind::RawFree {
+            ptr: remap_var(ptr),
+        },
         OpKind::NewArray {
             length,
             item_ty,
@@ -989,9 +996,11 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
-        | OpKind::NewWithVtable { .. } => {
+        | OpKind::NewWithVtable { .. }
+        | OpKind::RawMalloc { .. } => {
             vec![]
         }
+        OpKind::RawFree { ptr } => vec![clone_var(ptr)],
         OpKind::NewTuple { args } => args.iter().map(clone_var).collect(),
         OpKind::NewList { args } => args.iter().map(clone_var).collect(),
         // `new_array_clear(v_length, arraydescr)` — only the length Variable
@@ -1230,6 +1239,8 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // Python `is` object identity would break.
         OpKind::New { .. }
         | OpKind::NewWithVtable { .. }
+        | OpKind::RawMalloc { .. }
+        | OpKind::RawFree { .. }
         | OpKind::NewArray { .. }
         | OpKind::NewArrayClear { .. }
         | OpKind::NewListClear { .. }

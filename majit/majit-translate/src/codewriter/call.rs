@@ -8397,9 +8397,10 @@ impl CallControl {
                         // `NewArrayClear` is `new_array_clear`
                         // (jtransform.py), and `NewListClear` allocates
                         // a GcStruct plus a cleared items array
-                        // (pyjitpl.py opimpl_newlist_clear). This graph model carries no
-                        // `flavor='raw'` allocation, so there is no flavour test
-                        // to make — every allocation op here is a GC one.
+                        // (pyjitpl.py opimpl_newlist_clear). `RawMalloc` /
+                        // `RawFree` are `flavor='raw'` (`jtransform.py
+                        // _rewrite_raw_malloc` / `rewrite_op_free`) and do
+                        // not collect, so they stay on the fallthrough.
                         OpKind::New { .. }
                         | OpKind::NewWithVtable { .. }
                         | OpKind::NewArray { .. }
@@ -10712,6 +10713,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // varsize allocation, same class.
         OpKind::New { .. }
         | OpKind::NewWithVtable { .. }
+        | OpKind::RawMalloc { .. }
         | OpKind::NewArray { .. }
         | OpKind::NewArrayClear { .. }
         | OpKind::NewListClear { .. } => RaiseClass::MemoryErrorOnly,
@@ -10720,7 +10722,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
             RaiseClass::No
         }
         // RPython LL: raw_load, raw_store → cannot raise
-        OpKind::RawLoad { .. } | OpKind::RawStore { .. } => RaiseClass::No,
+        OpKind::RawLoad { .. } | OpKind::RawStore { .. } | OpKind::RawFree { .. } => RaiseClass::No,
         // RPython LL: getinteriorfield_gc, setinteriorfield_gc → cannot raise
         OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => RaiseClass::No,
         // RPython LL: int_add, int_sub, int_lt, int_and, etc → cannot raise

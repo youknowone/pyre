@@ -952,6 +952,23 @@ pub enum OpKind {
     New {
         owner: String,
     },
+    /// `lltype.malloc(T, flavor='raw')` for a fixed-size struct.
+    ///
+    /// `jtransform.py _rewrite_raw_malloc` turns this into a residual
+    /// direct call of `raw_malloc_fixedsize` (the `_zero` helper when
+    /// `zero` is set). The result is a Signed address. No front-end
+    /// producer emits this yet.
+    RawMalloc {
+        owner: String,
+        zero: bool,
+    },
+    /// `lltype.free(p, flavor='raw')`.
+    ///
+    /// `jtransform.py rewrite_op_free` rewrites this to a residual of
+    /// `raw_free` carrying `OopSpecIndex::RawFree`. The call cannot raise.
+    RawFree {
+        ptr: crate::flowspace::model::Variable,
+    },
     /// RPython `malloc(STRUCT, flavor='gc')` for a fixed-size GcStruct: the
     /// heap allocation of a boxed object (`runtime_object::lltype::malloc_typed`).
     /// Lowered to the `new_with_vtable` jitcode op (executor

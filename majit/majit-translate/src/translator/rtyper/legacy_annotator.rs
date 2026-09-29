@@ -295,6 +295,10 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::FieldWrite { .. } => ValueType::Void,
         OpKind::New { owner } => ValueType::Ref(Some(owner.clone())),
         OpKind::NewWithVtable { owner, .. } => ValueType::Ref(Some(owner.clone())),
+        // Fixed-size `lltype.malloc(T, flavor='raw')` returns a Signed
+        // address. `lltype.free(p, flavor='raw')` returns nothing.
+        OpKind::RawMalloc { .. } => ValueType::Int,
+        OpKind::RawFree { .. } => ValueType::Void,
         // `new_array_clear` yields a `Ref` to the freshly allocated,
         // zero-cleared items array (`Ptr(GcArray(OBJECTPTR))`).
         OpKind::NewArray { .. } | OpKind::NewArrayClear { .. } => ValueType::Ref(None),

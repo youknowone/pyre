@@ -5042,6 +5042,146 @@ mod tests {
             assert_eq!(bh.return_type, BhReturnType::Int);
         }
 
+        /// `p = malloc(T, flavor='raw'); setfield; getfield; free` returns
+        /// the stored word. The helpers are the real `ll_raw_*` addresses.
+        #[test]
+        fn blackhole_raw_malloc_fixedsize_roundtrip_returns_x() {
+            use majit_translate::assembler::AssemblerExt;
+            use majit_translate::call::{CallControl, StructFieldLayout, StructLayout};
+            use majit_translate::jtransform::{GraphTransformConfig, Transformer};
+            use majit_translate::model::{
+                FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType,
+            };
+            use majit_translate::{CallPath, ConcreteType, RegKind};
+            use std::collections::HashMap;
+
+            let owner = "Tuple<i64>";
+            let mut cc = CallControl::new();
+            let sid = majit_ir::descr::struct_id_for_name(owner).expect("Tuple<i64> shape id");
+            cc.set_struct_layout(
+                sid,
+                StructLayout {
+                    size: 8,
+                    align: 8,
+                    gckind: majit_translate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    fields: vec![StructFieldLayout {
+                        name: "f".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    }],
+                },
+            );
+            cc.register_function_fnaddr(
+                CallPath::from_segments(["majit_rlib", "rffi", "ll_raw_malloc_fixedsize"]),
+                majit_rlib::rffi::ll_raw_malloc_fixedsize as *const () as usize as i64,
+            );
+            cc.register_function_fnaddr(
+                CallPath::from_segments(["majit_rlib", "rffi", "ll_raw_free"]),
+                majit_rlib::rffi::ll_raw_free as *const () as usize as i64,
+            );
+
+            let mut graph = FunctionGraph::new("raw_fixedsize_bh");
+            let x = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "x".into(),
+                        ty: ValueType::Int,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .expect("input");
+            graph.push_inputarg_var(graph.startblock, x.clone());
+            FunctionGraph::set_concretetype_of_inline(&x, ConcreteType::Signed);
+            let field = FieldDescriptor::new("f", Some(owner.into()));
+            let p = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::RawMalloc {
+                        owner: owner.into(),
+                        zero: false,
+                    },
+                    true,
+                )
+                .expect("raw malloc result");
+            let _ = graph.push_op_var(
+                graph.startblock,
+                OpKind::FieldWrite {
+                    base: p.clone(),
+                    field: field.clone(),
+                    value: LinkArg::Value(x.clone()),
+                    ty: ValueType::Int,
+                },
+                false,
+            );
+            let y = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::FieldRead {
+                        base: p.clone(),
+                        field,
+                        ty: ValueType::Int,
+                        pure: false,
+                    },
+                    true,
+                )
+                .expect("field read result");
+            let _ = graph.push_op_var(graph.startblock, OpKind::RawFree { ptr: p }, false);
+            graph.set_return(graph.startblock, Some(y.clone()));
+            FunctionGraph::set_concretetype_of_inline(&y, ConcreteType::Signed);
+
+            let config = GraphTransformConfig::default();
+            let mut rewritten = {
+                let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+                transformer.transform(&graph).graph
+            };
+            let except_args = rewritten.block(rewritten.exceptblock).inputargs.clone();
+            FunctionGraph::set_concretetype_of_inline(&except_args[0], ConcreteType::Signed);
+            FunctionGraph::set_concretetype_of_inline(&except_args[1], ConcreteType::GcRef);
+            let mut regallocs = HashMap::new();
+            for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+                regallocs.insert(
+                    kind,
+                    majit_translate::regalloc::perform_register_allocation(&rewritten, kind),
+                );
+            }
+            let mut flat = majit_translate::flatten_graph(&rewritten, &mut regallocs);
+            let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
+            let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+            let x_color = regallocs
+                .get(&RegKind::Int)
+                .and_then(|alloc| alloc.color_for_variable(&x))
+                .expect("x has an int color");
+
+            let core = majit_jitcode::jitcode::JitCode::new("raw_fixedsize_bh");
+            core.set_body(body);
+            let mut runtime = crate::jitcode::JitCode::from_canonical(core);
+            runtime.exec.descrs = asm
+                .snapshot_descrs()
+                .into_iter()
+                .map(|descr| crate::jitcode::RuntimeBhDescr::Descr(Box::new(descr)).into_resolved())
+                .collect();
+
+            let cpu = crate::pyjitpl::BackendImpl::new();
+            let mut builder = BlackholeInterpBuilder::new();
+            builder.set_cpu(&cpu);
+            builder.setup_insns(&asm.insns);
+            wire_bhimpl_handlers(&mut builder);
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(runtime), 0);
+            let x_value = 0x1357_9BDF;
+            bh.setarg_i(x_color, x_value);
+            match bh.run() {
+                BhRunOutcome::LeaveFrame => {}
+                other => panic!("expected LeaveFrame, got {other:?}"),
+            }
+            assert_eq!(bh.get_tmpreg_i(), x_value);
+        }
+
         #[test]
         fn test_bh_interp_unary_neg() {
             let mut b = JitCodeBuilder::default();

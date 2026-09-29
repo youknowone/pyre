@@ -559,6 +559,8 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         | OpKind::ConstRefAddr(_)
         | OpKind::New { .. }
         | OpKind::NewWithVtable { .. }
+        | OpKind::RawMalloc { .. }
+        | OpKind::RawFree { .. }
         | OpKind::ArrayLen { .. }
         | OpKind::GuardTrue { .. }
         | OpKind::GuardFalse { .. }
