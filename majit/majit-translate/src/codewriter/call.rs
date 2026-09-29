@@ -15920,6 +15920,33 @@ mod tests {
         assert_eq!(write_fields(&m), vec![0]);
     }
 
+    #[test]
+    fn host_layout_for_returns_the_registered_host_layout() {
+        let sid = majit_ir::descr::StructId::from_canonical("HostLayoutOwner");
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            "HostLayoutOwner".to_string(),
+            Some(sid),
+        )]));
+        let host = crate::front::host_layout::HostLayout {
+            size: 4,
+            align: 1,
+            variant_field_offsets: vec![vec![0]],
+            tag: None,
+        };
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size: 4,
+                align: 1,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![],
+                host: Some(host.clone()),
+            },
+        );
+        assert_eq!(cc.host_layout_for("HostLayoutOwner").as_ref(), Some(&host));
+    }
+
     /// A layout registered after the first mint has to be visible on the
     /// next call. The first call has no `struct_layouts` row, so the offset
     /// source is the accumulator; `set_struct_layout` then makes the same
