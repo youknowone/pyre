@@ -8374,7 +8374,12 @@ impl<'a> Lowering<'a> {
                     // (`getfield_gc` / `setfield_gc`, `getarrayitem_gc` /
                     // `setarrayitem_gc`).
                     if let Some(place) = borrowed_place_referent(&rvalue) {
-                        self.atomic_ref_place.insert(i as usize, place);
+                        // `&raw const *p` is the address `p`, not the loaded
+                        // word. Recording that local as a scalar alias makes
+                        // the later `*q` skip `RawLoad`.
+                        if self.raw_primitive_reborrow_inner(&place).is_none() {
+                            self.atomic_ref_place.insert(i as usize, place);
+                        }
                     }
                     // `_i = Ordering::<V>` — the ordering the store arm has
                     // to read before it may fold.
@@ -10034,7 +10039,13 @@ impl<'a> Lowering<'a> {
             // Same aliasing model as `Ref`: the JIT treats raw pointers
             // and references identically at the IR level (lifetime
             // tracking lives outside the JIT).
+            // `&raw const *p` is the address `p`. Resolving the deref
+            // would `RawLoad` the pointee (`rewrite_op_raw_load`).
             Rvalue::RawPtr { place, .. } => {
+                if let Some(inner) = self.raw_primitive_reborrow_inner(&place) {
+                    let v = self.resolve_place(mir_bb, inner)?;
+                    return Ok((None, v));
+                }
                 let projection = Self::place_ref_is_address_of(&place);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
@@ -11156,6 +11167,33 @@ fn fat_field_producer(
 }
 
 impl<'a> Lowering<'a> {
+    /// Inner place of `&raw const *p` / `&raw mut *p` when that deref
+    /// would `RawLoad` a primitive.
+    ///
+    /// The rvalue's value is the address. A pointer recorded on
+    /// `atomic_ref_place` is a scalar alias, and resolving its deref
+    /// already yields that scalar, so this returns `None`.
+    fn raw_primitive_reborrow_inner(&self, place: &Place) -> Option<Place> {
+        let PlaceKind::Projection(inner, ProjectionElem::Atom(name)) = &place.kind else {
+            return None;
+        };
+        if name != "Deref" {
+            return None;
+        }
+        if !tyref_is_raw_pointer(&inner.ty, self.llbc)
+            || !tyref_is_primitive_scalar(&place.ty, self.llbc)
+            || self.raw_word_descr(&place.ty).is_none()
+        {
+            return None;
+        }
+        if let PlaceKind::Local(local) = inner.kind
+            && self.atomic_ref_place.contains_key(&(local as usize))
+        {
+            return None;
+        }
+        Some(clone_place(inner))
+    }
+
     /// Whether `&<place>` / `&raw [mut] <place>` takes the address of a
     /// place, as opposed to reading the value one holds.
     ///
@@ -11750,8 +11788,9 @@ impl<'a> Lowering<'a> {
                 // deref stays the collapse below: `Rvalue::Ref` already
                 // aliased the scalar, and loading through it would treat
                 // that word as an address. A raw pointer bound by
-                // `&raw const place` is that same alias, so a local on
-                // `atomic_ref_place` is excluded too.
+                // `&raw` of a scalar place is that same alias, so a local
+                // on `atomic_ref_place` is excluded. `&raw const *p` of an
+                // address is not recorded there.
                 if let ProjectionElem::Atom(name) = &elem
                     && name == "Deref"
                     && tyref_is_raw_pointer(&inner.ty, self.llbc)
