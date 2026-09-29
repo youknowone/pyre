@@ -7166,88 +7166,79 @@ fn emit_attached_bridge_dispatch(
 ///    prologue reads inputs from JITFRAME positions 0..N — exactly the
 ///    positions `emit_guard_exit`'s fail-arg writes have just populated.
 /// 3. return the target's deadframe verbatim to the caller.
-fn emit_attached_loop_dispatch(
+/// Where a closing JUMP's three dispatch values come from.
+///
+/// `assembler.py closing_jump` emits `JMP imm(target_token._ll_loop_code)`
+/// once the target is compiled. `LoopTargetDescr::set_dispatch_target` publishes
+/// `(ll_loop_code, label_block_id, target_frame_depth)` once per LABEL and does
+/// not re-point it, so a non-zero code cell at this compile is the address the
+/// JMP immediate would have named. A zero cell is a forward reference and keeps
+/// the runtime loads.
+#[derive(Clone, Copy)]
+enum ClosingJumpTarget {
+    Cells {
+        ll_loop_code_addr: usize,
+        label_block_id_addr: usize,
+        target_frame_depth_addr: usize,
+    },
+    Baked {
+        ll_loop_code: usize,
+        label_block_id: u32,
+        target_frame_depth: usize,
+    },
+}
+
+fn emit_loop_tail_call(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    target_code_ptr: CValue,
+    dispatch_jf_ptr: CValue,
+    dispatch_key: CValue,
+) {
+    // Both this body and the target body were compiled with
+    // `CallConv::Tail`, so `return_call_indirect` replaces the current
+    // frame with the callee's — the cranelift analogue of
+    // `assembler.py closing_jump`'s raw `JMP imm(target)`.
+    // The host call_conv cannot speak tail calls; hard-code `Tail` here
+    // so this matches the body's signature regardless of which call_conv
+    // the enclosing `emit_guard_exit` received for its non-tail helper calls.
+    let mut target_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
+    target_sig.params.push(AbiParam::new(ptr_type));
+    target_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
+    target_sig.returns.push(AbiParam::new(ptr_type));
+    let target_sig_ref = builder.import_signature(target_sig);
+    builder.ins().return_call_indirect(
+        target_sig_ref,
+        target_code_ptr,
+        &[dispatch_jf_ptr, dispatch_key],
+    );
+}
+
+/// Shared closing-JUMP tail: frame-capacity check, realloc, tail call.
+///
+/// `target_depth == None` skips the check. The caller supplies `target_code_ptr`,
+/// `dispatch_key` and `target_depth` either as `iconst` (already-published
+/// target) or as the cell loads (forward reference).
+fn emit_closing_jump_tail(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
-    ll_loop_code_addr: usize,
-    label_block_id_addr: usize,
-    target_frame_depth_addr: usize,
+    target_code_ptr: CValue,
+    dispatch_key: CValue,
+    target_depth: Option<CValue>,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
 ) {
-    // `LoopTargetDescr::set_dispatch_target` (descr.rs)
-    // releases `target_frame_depth` and `label_block_id` BEFORE
-    // `ll_loop_code`; an `atomic_load` on `ll_loop_code` synchronizes
-    // against those releases so the subsequent plain loads observe
-    // matching companion values.  Without the acquire ordering, on
-    // weakly-ordered targets (aarch64) the CPU could reorder the
-    // companion loads ahead of the readiness check and tail-call
-    // through a non-null `ll_loop_code` while still seeing stale
-    // `label_block_id == 0` or `target_frame_depth == 0`.
-    let cell_ptr = builder.ins().iconst(ptr_type, ll_loop_code_addr as i64);
-    let entry = builder
-        .ins()
-        .atomic_load(ptr_type, MemFlagsData::trusted(), cell_ptr);
-    let null = builder.ins().iconst(ptr_type, 0);
-    let has_entry = builder.ins().icmp(IntCC::NotEqual, entry, null);
-    let check_block_id = builder.create_block();
-    builder.append_block_param(check_block_id, ptr_type);
-    let miss_block = builder.create_block();
-    builder.ins().brif(
-        has_entry,
-        check_block_id,
-        &[BlockArg::from(entry)],
-        miss_block,
-        &[],
-    );
-
-    builder.switch_to_block(check_block_id);
-    builder.seal_block(check_block_id);
-    let target_code_ptr = builder.block_params(check_block_id)[0];
-    // `assembler.py:990-993` per-LABEL `_ll_loop_code` parity: PyPy exposes
-    // one code address per LABEL and a JUMP branches straight to the target
-    // LABEL's address.  Cranelift exposes a single function entry, so the
-    // target LABEL is selected by the `dispatch_key` argument the body's
-    // entry `br_table`s on.  Load the target descr's `label_block_id`; after
-    // the depth check, pass `label_block_id + 1` as `dispatch_key` (return_call
-    // below) because key 0 is reserved for the preamble.  The target re-enters
-    // at exactly that LABEL with its carried values read from the jitframe
-    // slots this JUMP's `emit_guard_exit` populated, instead of always
-    // re-running the first LABEL's preamble.
-    let lbid_ptr = builder.ins().iconst(ptr_type, label_block_id_addr as i64);
-    let lbid = builder
-        .ins()
-        .load(cl_types::I32, MemFlagsData::trusted(), lbid_ptr, 0);
-    let check_depth_block = builder.create_block();
-    builder.append_block_param(check_depth_block, ptr_type);
-    builder
-        .ins()
-        .jump(check_depth_block, &[BlockArg::from(target_code_ptr)]);
-
-    builder.switch_to_block(check_depth_block);
-    builder.seal_block(check_depth_block);
-    let target_code_ptr = builder.block_params(check_depth_block)[0];
+    let Some(target_depth) = target_depth else {
+        emit_loop_tail_call(builder, ptr_type, target_code_ptr, jf_ptr, dispatch_key);
+        return;
+    };
     // `assembler.py:927 _check_frame_depth_bridge` parity, deferred for
     // closing-jump: bridges insert this check in their own prologue
     // (compiler.rs), but loops reached via closing-jump skip the
-    // bridge prologue entirely.  `run_compiled_code_inner` only sized
-    // the JITFRAME for the originally entered loop, so a tail-call
-    // into a target whose `max_output_slots + num_ref_roots` exceeds
-    // the current frame's length would overrun the allocation when
-    // the target writes guard outputs or ref roots.  Read the target
-    // depth from the descr's `target_frame_depth` cell (published with
-    // Release ordering before `ll_loop_code` — see
-    // `LoopTargetDescr::set_dispatch_target`) and compare against the
+    // bridge prologue entirely.  Compare `target_depth` against the
     // current frame's `JF_FRAME_LENGTH` word; if the frame is too small,
     // reallocate it in-place below and keep the closing-jump transfer in
     // generated code.
-    let depth_cell_ptr = builder
-        .ins()
-        .iconst(ptr_type, target_frame_depth_addr as i64);
-    let target_depth =
-        builder
-            .ins()
-            .load(cl_types::I64, MemFlagsData::trusted(), depth_cell_ptr, 0);
     let frame_len = builder.ins().load(
         cl_types::I64,
         MemFlagsData::trusted(),
@@ -7280,9 +7271,6 @@ fn emit_attached_loop_dispatch(
     // prologue's `_check_frame_depth` (compiler.rs) applied to the
     // closing-jump path: the loaders read the target LABEL's carried values
     // from the new frame's slots `cranelift_realloc_frame` just copied.
-    // Falling back to the host `execute_token` instead would re-enter the
-    // target at the preamble (dispatch_key 0) and re-derive loop state from
-    // the elided fastlocals writeback (stale -> frozen counter).
     builder.switch_to_block(realloc_block);
     builder.seal_block(realloc_block);
     let realloc_target_code_ptr = builder.block_params(realloc_block)[0];
@@ -7318,49 +7306,146 @@ fn emit_attached_loop_dispatch(
     builder.seal_block(take_block);
     let target_code_ptr = builder.block_params(take_block)[0];
     let dispatch_jf_ptr = builder.block_params(take_block)[1];
-    // The earlier nbody_50k corruption (-0.03513214049650899 vs. the
-    // reference -0.035132020348426815) and the per-dispatch SP growth were
-    // both consequences of `emit_attached_bridge_dispatch` doing a nested
-    // call+return into the bridge, not a cranelift Tail-conv defect: under
-    // closing_jump the bridge tail-calls forward and never returns, so each
-    // dispatch stranded a return frame.  With the bridge dispatch itself
-    // now a tail-call, this loop dispatch is balanced on both x86_64 and
-    // aarch64 (tail_sp_leak.rs: zero drift over 5M tail-calls).
-    //
     // The shadow stack is left alone: `closing_jump` transfers to the target on
-    // the source's own JITFRAME, and `IN_CODE_ENTRY_KEY_FLAG` makes the target's
-    // entry inherit the source's root-stack entry instead of pushing a second
-    // one.  The `miss_block` fall-through below reaches the deadframe exit,
-    // which keeps its own `_call_footer_shadowstack`.
-    // Both this body and the target body were compiled with
-    // `CallConv::Tail`, so `return_call_indirect` replaces the current
-    // frame with the callee's — the cranelift analogue of
-    // `assembler.py:2456-2462 closing_jump`'s raw `JMP imm(target)`.
-    // The host call_conv (`apple_aarch64`) cannot speak tail calls;
-    // hard-code `Tail` here so this matches the body's signature
-    // regardless of which call_conv the enclosing emit_guard_exit
-    // received for its non-tail helper calls.
-    let mut target_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
-    target_sig.params.push(AbiParam::new(ptr_type));
-    target_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
-    target_sig.returns.push(AbiParam::new(ptr_type));
-    let target_sig_ref = builder.import_signature(target_sig);
-    // x86/regalloc.py:1397 per-TargetToken `_ll_loop_code` parity: re-enter the
-    // target at the LABEL the JUMP names, not always the first.  The target
-    // body's entry `br_table` reserves dispatch_key 0 for its preamble, so a
-    // re-entry at LABEL L passes `label_block_id + 1`.
-    let label_selector = builder.ins().iadd_imm_s(lbid, 1);
-    let dispatch_key = builder
-        .ins()
-        .bor_imm_u(label_selector, IN_CODE_ENTRY_KEY_FLAG as i64);
-    builder.ins().return_call_indirect(
-        target_sig_ref,
+    // the source's own JITFRAME, and `IN_CODE_ENTRY_KEY_FLAG` (already in
+    // `dispatch_key`) makes the target's entry inherit the source's root-stack
+    // entry instead of pushing a second one.
+    emit_loop_tail_call(
+        builder,
+        ptr_type,
         target_code_ptr,
-        &[dispatch_jf_ptr, dispatch_key],
+        dispatch_jf_ptr,
+        dispatch_key,
     );
+}
 
-    builder.switch_to_block(miss_block);
-    builder.seal_block(miss_block);
+fn emit_attached_loop_dispatch(
+    builder: &mut FunctionBuilder,
+    jf_ptr: CValue,
+    target: ClosingJumpTarget,
+    guaranteed_frame_depth: i64,
+    ptr_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> bool {
+    match target {
+        ClosingJumpTarget::Baked {
+            ll_loop_code,
+            label_block_id,
+            target_frame_depth,
+        } => {
+            // `assembler.py closing_jump`: `JMP imm(target_token._ll_loop_code)`.
+            // The three cells were published by `set_dispatch_target` before this
+            // compile, so the address, LABEL selector and depth are immediates.
+            let target_code_ptr = builder.ins().iconst(ptr_type, ll_loop_code as i64);
+            let key_bits = (label_block_id as i64 + 1) | (IN_CODE_ENTRY_KEY_FLAG as i64);
+            let dispatch_key = builder.ins().iconst(cl_types::I32, key_bits);
+            // The prologue already rejected a frame shorter than
+            // `guaranteed_frame_depth`, so a target that fits in that depth
+            // needs no second compare.
+            let depth = if (target_frame_depth as i64) <= guaranteed_frame_depth {
+                None
+            } else {
+                Some(
+                    builder
+                        .ins()
+                        .iconst(cl_types::I64, target_frame_depth as i64),
+                )
+            };
+            emit_closing_jump_tail(
+                builder,
+                jf_ptr,
+                target_code_ptr,
+                dispatch_key,
+                depth,
+                ptr_type,
+                call_conv,
+            );
+            false
+        }
+        ClosingJumpTarget::Cells {
+            ll_loop_code_addr,
+            label_block_id_addr,
+            target_frame_depth_addr,
+        } => {
+            // `LoopTargetDescr::set_dispatch_target` (descr.rs)
+            // releases `target_frame_depth` and `label_block_id` BEFORE
+            // `ll_loop_code`; an `atomic_load` on `ll_loop_code` synchronizes
+            // against those releases so the subsequent plain loads observe
+            // matching companion values.  Without the acquire ordering, on
+            // weakly-ordered targets (aarch64) the CPU could reorder the
+            // companion loads ahead of the readiness check and tail-call
+            // through a non-null `ll_loop_code` while still seeing stale
+            // `label_block_id == 0` or `target_frame_depth == 0`.
+            let cell_ptr = builder.ins().iconst(ptr_type, ll_loop_code_addr as i64);
+            let entry = builder
+                .ins()
+                .atomic_load(ptr_type, MemFlagsData::trusted(), cell_ptr);
+            let null = builder.ins().iconst(ptr_type, 0);
+            let has_entry = builder.ins().icmp(IntCC::NotEqual, entry, null);
+            let check_block_id = builder.create_block();
+            builder.append_block_param(check_block_id, ptr_type);
+            let miss_block = builder.create_block();
+            builder.ins().brif(
+                has_entry,
+                check_block_id,
+                &[BlockArg::from(entry)],
+                miss_block,
+                &[],
+            );
+
+            builder.switch_to_block(check_block_id);
+            builder.seal_block(check_block_id);
+            let target_code_ptr = builder.block_params(check_block_id)[0];
+            // `assembler.py fixup_target_tokens` per-LABEL `_ll_loop_code`: upstream exposes
+            // one code address per LABEL and a JUMP branches straight to the target
+            // LABEL's address.  Cranelift exposes a single function entry, so the
+            // target LABEL is selected by the `dispatch_key` argument the body's
+            // entry `br_table`s on.  Load the target descr's `label_block_id` and
+            // pass `label_block_id + 1` as `dispatch_key` because key 0 is reserved
+            // for the preamble.
+            let lbid_ptr = builder.ins().iconst(ptr_type, label_block_id_addr as i64);
+            let lbid = builder
+                .ins()
+                .load(cl_types::I32, MemFlagsData::trusted(), lbid_ptr, 0);
+            let check_depth_block = builder.create_block();
+            builder.append_block_param(check_depth_block, ptr_type);
+            builder
+                .ins()
+                .jump(check_depth_block, &[BlockArg::from(target_code_ptr)]);
+
+            builder.switch_to_block(check_depth_block);
+            builder.seal_block(check_depth_block);
+            let target_code_ptr = builder.block_params(check_depth_block)[0];
+            let depth_cell_ptr = builder
+                .ins()
+                .iconst(ptr_type, target_frame_depth_addr as i64);
+            let target_depth =
+                builder
+                    .ins()
+                    .load(cl_types::I64, MemFlagsData::trusted(), depth_cell_ptr, 0);
+            // x86/regalloc.py per-TargetToken `_ll_loop_code` parity: re-enter the
+            // target at the LABEL the JUMP names, not always the first.  The target
+            // body's entry `br_table` reserves dispatch_key 0 for its preamble, so a
+            // re-entry at LABEL L passes `label_block_id + 1`.
+            let label_selector = builder.ins().iadd_imm_s(lbid, 1);
+            let dispatch_key = builder
+                .ins()
+                .bor_imm_u(label_selector, IN_CODE_ENTRY_KEY_FLAG as i64);
+            emit_closing_jump_tail(
+                builder,
+                jf_ptr,
+                target_code_ptr,
+                dispatch_key,
+                Some(target_depth),
+                ptr_type,
+                call_conv,
+            );
+
+            builder.switch_to_block(miss_block);
+            builder.seal_block(miss_block);
+            true
+        }
+    }
 }
 
 /// genop_finish (assembler.py) parity:
@@ -7604,6 +7689,221 @@ fn propagate_cold_blocks(func: &mut Function) {
     }
 }
 
+/// Ops whose non-exiting emission stores `JF_FRAME_ITEM0_OFS + j*8`.
+///
+/// `spill_guard_fail_args` (call_may_force, call_release_gil, call_assembler),
+/// `GuardNotForced2`'s force spill, and `spill_ref_roots` inside
+/// `emit_collecting_gc_call` plus the malloc / call_assembler / call_release_gil
+/// slow paths. Guard exits, FINISH and the closing-JUMP publish leave the
+/// function and are not listed. A demoted home is stored at
+/// `ref_root_base_ofs` or `nonref_home_base_ofs`, both past
+/// `max_output_slots`, so it does not end residency of slots `[0, arity)`.
+fn op_writes_jitframe_output_slot(op: &Op) -> bool {
+    matches!(
+        op.opcode,
+        OpCode::CallMayForceI
+            | OpCode::CallMayForceR
+            | OpCode::CallMayForceF
+            | OpCode::CallMayForceN
+            | OpCode::CallReleaseGilI
+            | OpCode::CallReleaseGilF
+            | OpCode::CallReleaseGilN
+            | OpCode::CallAssemblerI
+            | OpCode::CallAssemblerR
+            | OpCode::CallAssemblerF
+            | OpCode::CallAssemblerN
+            | OpCode::GuardNotForced2
+            | OpCode::CallMallocNursery
+            | OpCode::CallMallocNurseryHeaderless
+            | OpCode::CallMallocNurseryVarsize
+            | OpCode::CallMallocNurseryVarsizeHeaderless
+            | OpCode::CallMallocNurseryVarsizeFrame
+            | OpCode::New
+            | OpCode::NewWithVtable
+            | OpCode::NewArray
+            | OpCode::NewArrayClear
+            | OpCode::Newstr
+            | OpCode::Newunicode
+    )
+}
+
+/// Per-exit flags for skipping a positional fail-arg store.
+///
+/// Walks the trace once. A segment starts at the bridge entry (no LABEL yet)
+/// or at a LABEL. While the segment is live, fail arg slot `s` is skipped when
+/// its type is Int or Float, `fail_locs[s] == k`, and the value is argument
+/// `k` of that segment and still occupies slot `k`. A LABEL targeted by a JUMP
+/// in this function carries back-edge values, so its arguments are not
+/// resident. Returns the Int/Float arguments a key-0 fall-through must store
+/// into slot `k` before entering the LABEL; the loader edge already has them.
+///
+/// Carried values cross the function-entry dispatcher through jitframe slots,
+/// so a skipped store is the slot-level form of `jump.py remap_frame_layout`
+/// ignoring a move "x = x": `x86/assembler.py _build_failure_recovery` saves
+/// only registers (`_push_all_regs_to_frame`) and leaves a fail arg that
+/// already lives in the frame where it is.
+fn record_entry_resident_failargs(
+    ops: &[Op],
+    inputargs: &[InputArgRc],
+    max_output_slots: usize,
+    guaranteed_frame_depth: i64,
+    guard_infos: &mut [GuardInfo],
+) -> Vec<(usize, Vec<bool>)> {
+    let num_inputs = inputargs.len();
+    let label_arity_by_descr: IndexMap<u32, usize> = ops
+        .iter()
+        .filter(|op| op.opcode == OpCode::Label)
+        .filter_map(|op| op.getdescr().map(|d| (d.index(), op.num_args())))
+        .collect();
+    // Same rule the JUMP emitter uses to pick a local target: the descr's
+    // `index()` names a LABEL of the same arity. `index()` is not unique
+    // within a trace, so every LABEL sharing it counts as targeted.
+    let mut jump_targets: Vec<u32> = Vec::new();
+    for op in ops {
+        if op.opcode != OpCode::Jump {
+            continue;
+        }
+        let Some(descr) = op.getdescr() else {
+            continue;
+        };
+        let index = descr.index();
+        let local = label_arity_by_descr
+            .get(&index)
+            .is_some_and(|&arity| arity == op.num_args());
+        if local && !jump_targets.contains(&index) {
+            jump_targets.push(index);
+        }
+    }
+    // A JUMP with no descr targets `loop_block`: the last LABEL, or the
+    // synthetic self-loop header when the trace has no LABEL. That header's
+    // parameters are back-edge values, not the entry loads.
+    let implicit_self_jump = ops
+        .iter()
+        .any(|op| op.opcode == OpCode::Jump && !op.has_descr());
+    let implicit_loop_label = implicit_self_jump.then(|| {
+        ops.iter()
+            .enumerate()
+            .rev()
+            .find(|(_, op)| op.opcode == OpCode::Label)
+            .map(|(idx, _)| idx)
+    });
+
+    let mut loaded: Vec<Option<u32>> = inputargs.iter().map(|ia| Some(ia.index)).collect();
+    let mut live = implicit_loop_label != Some(None);
+    let mut seen_terminator = false;
+    let mut info_idx = 0usize;
+    // `(label op index, per-arg seed)`. A true flag stores that Int/Float
+    // into slot k on the key-0 fall-through.
+    let mut fallthrough_seeds: Vec<(usize, Vec<bool>)> = Vec::new();
+
+    for (op_idx, op) in ops.iter().enumerate() {
+        if op.opcode == OpCode::Label {
+            let args = op.getarglist();
+            let targeted = implicit_loop_label == Some(Some(op_idx))
+                || op
+                    .getdescr()
+                    .is_some_and(|descr| jump_targets.contains(&descr.index()));
+            // What the fall-through path leaves in each slot: the entry
+            // loader's or an earlier LABEL's contents, as long as no op since
+            // wrote an output slot.
+            let fallthrough_slots = std::mem::replace(&mut loaded, vec![None; args.len()]);
+            if targeted {
+                live = false;
+            } else {
+                let key0_reaches = !seen_terminator;
+                // The prologue `_check_frame_depth` guarantees
+                // `guaranteed_frame_depth` slots, which is what the LABEL's
+                // `br_table` loader reads (`0..arity`). A shorter frame cannot
+                // hold the seed.
+                let frame_fits = (args.len() as i64) <= guaranteed_frame_depth;
+                let mut seed = vec![false; args.len()];
+                for (k, arg) in args.iter().enumerate() {
+                    if arg.is_none() || arg.is_constant() {
+                        continue;
+                    }
+                    let opref = arg.to_opref();
+                    let raw = opref.raw();
+                    if key0_reaches {
+                        let already_in_slot =
+                            live && fallthrough_slots.get(k).copied().flatten() == Some(raw);
+                        let redefined = ops[..op_idx].iter().enumerate().any(|(i, earlier)| {
+                            earlier.result_type() != Type::Void
+                                && op_var_index(earlier, i, num_inputs) as u32 == raw
+                        });
+                        if already_in_slot && !redefined {
+                            loaded[k] = Some(raw);
+                        } else if frame_fits
+                            // Slots from `max_output_slots` on are the ref-root
+                            // region, which a seed must not overwrite.
+                            && k < max_output_slots
+                            && matches!(opref.ty(), Some(Type::Int) | Some(Type::Float))
+                        {
+                            // The fall-through stores this SSA value into slot
+                            // k, so the segment agrees with the loader.
+                            seed[k] = true;
+                            loaded[k] = Some(raw);
+                        }
+                    } else {
+                        // Only this LABEL's `br_table` loader reaches it, and
+                        // that loader reads argument k from slot k.
+                        loaded[k] = Some(raw);
+                    }
+                }
+                if seed.iter().any(|flag| *flag) {
+                    fallthrough_seeds.push((op_idx, seed));
+                }
+                live = true;
+            }
+        }
+
+        let is_guard = op.opcode.is_guard();
+        let is_finish = op.opcode == OpCode::Finish;
+        let is_external_jump = op.opcode == OpCode::Jump
+            && op
+                .getdescr()
+                .is_some_and(|d| match label_arity_by_descr.get(&d.index()) {
+                    None => true,
+                    Some(&arity) => arity != op.num_args(),
+                });
+        if is_guard || is_finish || is_external_jump {
+            let info = &mut guard_infos[info_idx];
+            info.guaranteed_frame_depth = guaranteed_frame_depth;
+            info.entry_resident_skip = info
+                .fail_arg_refs
+                .iter()
+                .enumerate()
+                .map(|(slot, arg)| {
+                    if !live || arg.is_none() || arg.is_constant() {
+                        return false;
+                    }
+                    let Some(ty) = arg.ty() else {
+                        return false;
+                    };
+                    if !matches!(ty, Type::Int | Type::Float) {
+                        return false;
+                    }
+                    let k = info.fail_locs[slot];
+                    loaded.get(k).copied().flatten() == Some(arg.raw())
+                })
+                .collect();
+            info_idx += 1;
+        }
+
+        if op_writes_jitframe_output_slot(op) {
+            live = false;
+        }
+        if op.opcode == OpCode::Jump || op.opcode == OpCode::Finish {
+            seen_terminator = true;
+        }
+    }
+    assert_eq!(
+        info_idx,
+        guard_infos.len(),
+        "entry-resident scan and collect_guards disagreed on exit count"
+    );
+    fallthrough_seeds
+}
+
 fn emit_guard_exit(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
@@ -7691,6 +7991,10 @@ fn emit_guard_exit(
         } else if skip_store.get(slot).copied().unwrap_or(false) {
             // Already at the frame home `rd_locs` names. Copying it into
             // the positional slot is a frame-to-frame move.
+        } else if info.entry_resident_skip.get(slot).copied().unwrap_or(false) {
+            // Entry-loaded Int/Float still occupies `fail_locs[slot]`, the
+            // "x = x" move `jump.py remap_frame_layout` drops. `rd_locs`
+            // stays positional; only the store is omitted.
         } else {
             let val = resolve_failarg_opref(
                 builder,
@@ -7807,21 +8111,24 @@ fn emit_guard_exit(
     // `return_call_indirect` signature instead would need one entry
     // signature covering the union of every LABEL's arity, which is why
     // they go through the frame.
-    if let Some((ll_loop_code_addr, label_block_id_addr, target_frame_depth_addr)) =
-        info.external_jump_ll_loop_code_addr
-    {
+    if let Some(target) = info.closing_jump_target.clone() {
         let enabled = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
             && std::env::var_os("MAJIT_CL_NO_CLOSING_JUMP").is_none();
         if enabled {
-            emit_attached_loop_dispatch(
+            let fall_through = emit_attached_loop_dispatch(
                 builder,
                 jf_ptr,
-                ll_loop_code_addr,
-                label_block_id_addr,
-                target_frame_depth_addr,
+                target,
+                info.guaranteed_frame_depth,
                 ptr_type,
                 call_conv,
             );
+            // A baked target has no miss block: the tail call terminates
+            // this exit. The cell path lands on its miss block so the
+            // deadframe return below still compiles.
+            if !fall_through {
+                return;
+            }
         }
     }
 
@@ -8853,21 +9160,19 @@ struct GuardInfo {
     /// vector accumulator variable and reduction operator.
     accum_info: Vec<AccumInfo>,
     /// `assembler.py closing_jump` parity for cross-loop JUMP.
-    /// `Some((ll_addr, lbid_addr, depth_addr))` ⇔ this is an external-JUMP
-    /// exit; `ll_addr` is the heap-stable address of the target
-    /// `LoopTargetDescr`'s `ll_loop_code: AtomicUsize` slot, `lbid_addr` the
-    /// address of its `label_block_id: AtomicU32` slot, `depth_addr` the
-    /// address of its `target_frame_depth` slot.  `emit_attached_loop_dispatch`
-    /// reads them in-code.  If `ll_loop_code != 0`, it first ensures the
-    /// current frame is wide enough for `target_frame_depth` (reallocating the
-    /// JITFRAME in place when needed), then tail-calls into the target and
-    /// selects the named LABEL — first or not — via
-    /// `dispatch_key = label_block_id + 1`, the cranelift analogue of PyPy's
-    /// `JMP imm(target._ll_loop_code)`.  Only a not-yet-compiled target falls
-    /// through to the deadframe exit, where the host loop re-enters via
-    /// `execute_token` (`host_reentry_dispatch_key` likewise routes every LABEL
-    /// to its loader).
-    external_jump_ll_loop_code_addr: Option<(usize, usize, usize)>,
+    /// `Some(Baked)` when `ll_loop_code` was already published (Acquire on
+    /// `ll_loop_code_ptr`) at this compile: the emitter uses `iconst` for the
+    /// code pointer, `label_block_id + 1 | IN_CODE_ENTRY_KEY_FLAG`, and the
+    /// depth. `Some(Cells)` is a forward reference and keeps the three cell
+    /// addresses for the runtime loads. `None` for every non-JUMP exit.
+    closing_jump_target: Option<ClosingJumpTarget>,
+    /// Depth the prologue `_check_frame_depth` compares `JF_FRAME_LENGTH`
+    /// against. Filled once `max_output_slots + reserved_tail` is known.
+    guaranteed_frame_depth: i64,
+    /// One flag per fail arg. True when the positional store is redundant:
+    /// the arg is an entry-loaded Int or Float that still occupies
+    /// `fail_locs[slot]`. Does not retarget `rd_locs`.
+    entry_resident_skip: Vec<bool>,
 }
 
 fn identity_recovery_layout(
@@ -9089,6 +9394,9 @@ pub struct CraneliftBackend {
     /// clone so the attachments outlive this backend for the lifetime of
     /// emitted code that baked the handle as an immediate.
     descr_attachments: CpuDescrHandle,
+    /// CLIF of the body most recently compiled by this backend.
+    #[cfg(test)]
+    last_body_clif: String,
 }
 
 impl Default for CraneliftBackend {
@@ -9351,6 +9659,8 @@ impl CraneliftBackend {
             // Callers configure pyre's PyObject layout via set_vtable_offset.
             vtable_offset: None,
             descr_attachments: Arc::new(majit_backend::CpuDescrCell::default()),
+            #[cfg(test)]
+            last_body_clif: String::new(),
         }
     }
 
@@ -10217,6 +10527,29 @@ impl CraneliftBackend {
             .map(|(&li, keep)| nonref_demoted_positions(li, keep, ops, &ref_root_slots).len())
             .sum();
         let reserved_tail = ref_root_slots.len() + num_nonref_homes;
+        // `assembler.py assemble_bridge` sizes the bridge frame as
+        // `max(self.current_clt.frame_info.jfi_frame_depth, own)`. A baked
+        // closing JUMP's target depth is that `jfi_frame_depth`: the prologue
+        // `_check_frame_depth` then already guarantees it, and the JUMP does
+        // not compare again. Cells targets still check at the tail call.
+        let own_depth = (max_output_slots + reserved_tail) as i64;
+        let baked_target_depth =
+            guard_infos
+                .iter()
+                .fold(0i64, |acc, info| match info.closing_jump_target {
+                    Some(ClosingJumpTarget::Baked {
+                        target_frame_depth, ..
+                    }) => acc.max(target_frame_depth as i64),
+                    _ => acc,
+                });
+        let guaranteed_frame_depth = own_depth.max(baked_target_depth);
+        let label_fallthrough_seeds = record_entry_resident_failargs(
+            ops,
+            inputargs,
+            max_output_slots,
+            guaranteed_frame_depth,
+            &mut guard_infos,
+        );
 
         let gc_nursery_addrs =
             with_cranelift_gc(|gc| (gc.nursery_free_addr(), gc.nursery_top_addr()));
@@ -10400,7 +10733,7 @@ impl CraneliftBackend {
             // inputargs, counter slots, and the GUARD_NOT_FORCED_2 force-spill
             // tail.  Using the older precomputed bridge width here omitted
             // that tail and let the bridge write beyond `jf_frame.length`.
-            let expected_size = (max_output_slots + reserved_tail) as i64;
+            let expected_size = guaranteed_frame_depth;
             // jitframe.py:84 — `jf_frame.length` is the count of `Signed`
             // payload slots after the length word.  aarch64/assembler.py:935
             // `LDR_ri(r.ip0.value, r.fp.value, ofs)` parity.
@@ -11198,6 +11531,39 @@ impl CraneliftBackend {
                         // before the last collection, and the header's
                         // `sync_ref_root_var` would then write that dead address
                         // back over the live one.
+                        // Key-0 fall-through otherwise enters with SSA values
+                        // while the `br_table` loader reads slot k. Store each
+                        // Int/Float arg the scan marked so both edges agree.
+                        if let Some((_, seed)) = label_fallthrough_seeds
+                            .iter()
+                            .find(|(label_idx, _)| *label_idx == op_idx)
+                        {
+                            let mut seed_jf_ptr = None;
+                            let label_args = ops[op_idx].getarglist();
+                            for (k, arg) in label_args.iter().enumerate() {
+                                if !seed.get(k).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                let value = resolve_local_jump_arg(
+                                    &mut builder,
+                                    &opref_var_map,
+                                    &constants,
+                                    ptr_type,
+                                    &mut seed_jf_ptr,
+                                    &demoted_failarg_slots,
+                                    arg.to_opref(),
+                                );
+                                let value = coerce_ty(&mut builder, value, cl_types::I64);
+                                let jf_ptr =
+                                    cached_pinned_reg(&mut builder, ptr_type, &mut seed_jf_ptr);
+                                builder.ins().store(
+                                    MemFlagsData::trusted(),
+                                    value,
+                                    jf_ptr,
+                                    JF_FRAME_ITEM0_OFS + (k as i32) * 8,
+                                );
+                            }
+                        }
                         let mut fallthrough_jf_ptr = None;
                         let vals: Vec<CValue> = ops[op_idx]
                             .getarglist()
@@ -17002,6 +17368,10 @@ impl CraneliftBackend {
                 ctx.func.display()
             );
         }
+        #[cfg(test)]
+        {
+            self.last_body_clif = ctx.func.display().to_string();
+        }
         if let Err(e) = self.module.define_function(func_id, &mut ctx) {
             if majit_ir::debug::have_debug_prints() {
                 let _s = majit_ir::debug::scope("jit-backend");
@@ -18207,28 +18577,33 @@ fn collect_guards(
         } else {
             None
         };
-        // `assembler.py closing_jump`: capture the heap-stable
-        // address of the target `LoopTargetDescr.ll_loop_code` slot so
-        // the in-code dispatch in `emit_guard_exit` can read the latest
-        // entry on every JUMP exit (parity with the raw `JMP imm(target)`
-        // PyPy emits — the immediate is rewritten when the target
-        // compiles).  `op.descr` IS the target descr for external JUMPs;
-        // for non-JUMP exits this stays `None`.  We also capture the
-        // `label_block_id` slot so the dispatch can select the named LABEL
-        // through the target body's `dispatch_key = label_block_id + 1`
-        // loader, including LABEL 0; key 0 remains reserved for initial
-        // preamble entry (`assembler.py:990-993` per-LABEL `_ll_loop_code`
-        // parity).
-        let external_jump_ll_loop_code_addr = if is_external_jump {
+        // `assembler.py closing_jump`: `JMP imm(target_token._ll_loop_code)`
+        // when the target is already compiled. Acquire on `ll_loop_code_ptr`
+        // is the same load the runtime reader uses; a non-zero value means
+        // `set_dispatch_target` has published the code pointer and, before it,
+        // `label_block_id` and `target_frame_depth`. A zero cell is a forward
+        // reference and keeps the three cell addresses.
+        let closing_jump_target = if is_external_jump {
             op.getdescr()
                 .as_ref()
                 .and_then(|d| d.as_loop_target_descr())
                 .map(|ltd| {
-                    (
-                        ltd.ll_loop_code_ptr() as usize,
-                        ltd.label_block_id_ptr() as usize,
-                        ltd.target_frame_depth_ptr() as usize,
-                    )
+                    let code = unsafe {
+                        (*ltd.ll_loop_code_ptr()).load(std::sync::atomic::Ordering::Acquire)
+                    };
+                    if code != 0 {
+                        ClosingJumpTarget::Baked {
+                            ll_loop_code: code,
+                            label_block_id: ltd.label_block_id(),
+                            target_frame_depth: ltd.target_frame_depth(),
+                        }
+                    } else {
+                        ClosingJumpTarget::Cells {
+                            ll_loop_code_addr: ltd.ll_loop_code_ptr() as usize,
+                            label_block_id_addr: ltd.label_block_id_ptr() as usize,
+                            target_frame_depth_addr: ltd.target_frame_depth_ptr() as usize,
+                        }
+                    }
                 })
         } else {
             None
@@ -18306,7 +18681,9 @@ fn collect_guards(
             fail_descr_ptr,
             bridge_cache_addrs,
             accum_info,
-            external_jump_ll_loop_code_addr,
+            closing_jump_target,
+            guaranteed_frame_depth: 0,
+            entry_resident_skip: Vec::new(),
         });
     }
 
@@ -26511,6 +26888,276 @@ mod tests {
         assert!(raw.is_finish);
         assert_eq!(raw.outputs, vec![5]);
         assert_eq!(raw.typed_outputs, vec![Value::Int(5)]);
+    }
+
+    #[test]
+    fn test_baked_closing_jump_to_compiled_loop_has_no_atomic_load() {
+        let mut backend = CraneliftBackend::new();
+        let loop_descr = make_label_descr(1_500_360);
+
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
+        let root_ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                loop_descr.clone(),
+            ),
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                1,
+            ),
+            guard,
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+
+        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        root_constants.insert(100, 0);
+        backend.set_constants(root_constants);
+
+        let token = JitCellToken::new(1_500_361);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
+
+        let failed = backend.execute_token(&token, &[Value::Int(0)]);
+        let guard_descr =
+            get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
+
+        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        bridge_constants.insert(101, 5);
+        backend.set_constants(bridge_constants);
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                1,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                loop_descr,
+            ),
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .unwrap();
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            !clif.contains("atomic_load"),
+            "baked closing JUMP must not reload ll_loop_code:\n{clif}"
+        );
+
+        backend.set_constants(indexmap::IndexMap::new());
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 5);
+    }
+
+    #[test]
+    fn test_key0_fallthrough_seeds_label_slots_for_guard_and_loader() {
+        let mut backend = CraneliftBackend::new();
+        let head = make_label_descr(1_500_380);
+        let field = make_field_descr(8, 8, Type::Int, true);
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![
+            rb(OpRef::int_op(1)),
+            rb(OpRef::int_op(2))
+        ]);
+        let root_ops = vec![
+            mk_op_with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], 1, field),
+            mk_op(OpCode::IntSub, &[OpRef::int_op(1), OpRef::int_op(1)], 2),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::int_op(1), OpRef::int_op(2)],
+                OpRef::NONE.raw(),
+                head.clone(),
+            ),
+            guard,
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::int_op(1), OpRef::int_op(2)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let token = JitCellToken::new(1_500_381);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
+
+        let mut data: Vec<i64> = vec![0, 5];
+        let ptr = data.as_mut_ptr() as usize;
+        let failed = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
+        let guard_descr =
+            get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
+        assert_eq!(backend.get_int_value(&failed, 0), 5);
+        assert_eq!(backend.get_int_value(&failed, 1), 0);
+
+        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        bridge_constants.insert(100, 1);
+        backend.set_constants(bridge_constants);
+        let bridge_inputs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let bridge_ops = vec![mk_op_with_descr(
+            OpCode::Jump,
+            &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+            OpRef::NONE.raw(),
+            head,
+        )];
+        backend
+            .compile_bridge(guard_descr, &bridge_inputs, &bridge_ops, &token, &[], None)
+            .unwrap();
+
+        backend.set_constants(indexmap::IndexMap::new());
+        let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 5);
+        assert_eq!(backend.get_int_value(&frame, 1), 1);
+    }
+
+    #[test]
+    fn test_second_fallthrough_label_sees_the_first_labels_seeds() {
+        // LABEL A swaps the entry values, so its fall-through seeds slot 0
+        // with i1 and slot 1 with i0. LABEL B names them in entry order again,
+        // and its guard must still publish i0 to slot 0.
+        let mut backend = CraneliftBackend::new();
+        let label_a = make_label_descr(1_500_390);
+        let label_b = make_label_descr(1_500_391);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1))
+        ]);
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(1), OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label_a,
+            ),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+                label_b,
+            ),
+            guard,
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let token = JitCellToken::new(1_500_392);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let failed = backend.execute_token(&token, &[Value::Int(0), Value::Int(7)]);
+        assert!(get_latest_descr_from_deadframe(&failed).is_ok());
+        assert_eq!(backend.get_int_value(&failed, 0), 0);
+        assert_eq!(backend.get_int_value(&failed, 1), 7);
+    }
+
+    #[test]
+    fn test_bridge_closing_jump_keeps_resident_int_and_ref_failargs() {
+        let mut backend = CraneliftBackend::new();
+        let head = make_label_descr(1_500_370);
+        let tail = make_label_descr(1_500_371);
+        let inputargs = vec![
+            InputArg::new_int_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_ref_rc(2),
+        ];
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1)),
+            rb(OpRef::input_arg_ref(2)),
+        ]);
+        let root_ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_ref(2),
+                ],
+                OpRef::NONE.raw(),
+                head,
+            ),
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                3,
+            ),
+            guard,
+            mk_op_with_descr(
+                OpCode::Label,
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_ref(2),
+                ],
+                OpRef::NONE.raw(),
+                tail.clone(),
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_ref(2),
+                ],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        root_constants.insert(100, 0);
+        backend.set_constants(root_constants);
+        let token = JitCellToken::new(1_500_372);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
+
+        let failed = backend.execute_token(
+            &token,
+            &[Value::Int(0), Value::Int(7), Value::Ref(GcRef(0x1234))],
+        );
+        let guard_descr =
+            get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
+
+        let bridge_ops = vec![mk_op_with_descr(
+            OpCode::Jump,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::input_arg_int(1),
+                OpRef::input_arg_ref(2),
+            ],
+            OpRef::NONE.raw(),
+            tail,
+        )];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .unwrap();
+
+        backend.set_constants(indexmap::IndexMap::new());
+        let frame = backend.execute_token(
+            &token,
+            &[Value::Int(0), Value::Int(7), Value::Ref(GcRef(0x1234))],
+        );
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(backend.get_int_value(&frame, 1), 7);
+        assert_eq!(backend.get_ref_value(&frame, 2), GcRef(0x1234));
     }
 
     #[test]
