@@ -14,8 +14,8 @@ pub use majit_macros::{
     call_aroundstate_target, external_compilation_info, jit_close_stack, llexternal,
 };
 
-/// `rffi.CHAR`.
-pub type CHAR = std::ffi::c_char;
+/// `rffi.CHAR` (`lltype.Char`, 0..=255; `size_and_sign` reports it unsigned).
+pub type CHAR = u8;
 /// `rffi.UCHAR`.
 pub type UCHAR = std::ffi::c_uchar;
 /// `rffi.SHORT`.
@@ -51,11 +51,11 @@ pub type VOIDP = *mut std::ffi::c_void;
 /// `rffi.CONST_VOIDP`.
 pub type CONST_VOIDP = *const std::ffi::c_void;
 /// `rffi.CCHARP`.
-pub type CCHARP = *mut std::ffi::c_char;
+pub type CCHARP = *mut CHAR;
 /// `rffi.CONST_CCHARP`.
-pub type CONST_CCHARP = *const std::ffi::c_char;
+pub type CONST_CCHARP = *const CHAR;
 /// `rffi.CCHARPP`.
-pub type CCHARPP = *mut *mut std::ffi::c_char;
+pub type CCHARPP = *mut CCHARP;
 /// `wchar_t` behind [`CWCHARP`]. wasm32-unknown-unknown has no `libc`.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) type Wchar = libc::wchar_t;
@@ -76,22 +76,23 @@ pub use crate::setintfield;
 pub use buffer::*;
 pub use convert::*;
 
-// `rffi.c_memcpy` / `rffi.c_memset`: `releasegil=False`, `calling_conv='c'`,
-// `_nowrapper=True`. The result type is `lltype.Void`.
+// `rffi.c_memcpy` / `rffi.c_memset`: `releasegil=False`, `calling_conv='c'`.
+// Upstream declares `lltype.Void` and an `lltype.Signed` fill byte and the C
+// compiler converts at the call through `<string.h>`'s prototype. A Rust
+// `extern` block is that prototype, so it spells the C signature: `void *`
+// result and an `int` fill byte.
 llexternal!(
     pub c_memcpy = "memcpy",
     [VOIDP, CONST_VOIDP, SIZE_T],
-    (),
+    VOIDP,
     releasegil = false,
-    _nowrapper = true,
     calling_conv = "c",
 );
 llexternal!(
     pub c_memset = "memset",
-    [VOIDP, SIGNED, SIZE_T],
-    (),
+    [VOIDP, INT, SIZE_T],
+    VOIDP,
     releasegil = false,
-    _nowrapper = true,
     calling_conv = "c",
 );
 
@@ -517,6 +518,21 @@ mod tests {
             free_charp(src, true);
             keep_buffer_alive_until_here(buf, gc, case);
         }
+    }
+
+    #[test]
+    fn utf82wcharp_ex_writes_a_surrogate_pair_above_the_bmp() {
+        let text = "a😀\u{ffff}";
+        let w = utf82wcharp_ex(text.as_bytes(), 3, true);
+        let units: Vec<u32> = (0..5).map(|i| unsafe { *w.add(i) } as u32).collect();
+        unsafe { free_wcharp(w, true) };
+        assert_eq!(units, [0x61, 0xD83D, 0xDE00, 0xFFFF, 0]);
+    }
+
+    #[test]
+    fn char_is_unsigned() {
+        assert_eq!(size_and_sign::<CHAR>(), (1, true));
+        assert_eq!(cast::<CHAR>(-1i32), 0xFF);
     }
 }
 

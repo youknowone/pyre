@@ -362,10 +362,50 @@ pub fn utf82wcharp(utf8: &[u8], utf8len: usize, track_allocation: bool) -> CWCHA
     }
 }
 
+/// `utf82wcharp_ex`. Like [`utf82wcharp`], but a code point above `0xffff`
+/// becomes a surrogate pair, the layout a 2-byte `wchar_t` needs. Surrogates
+/// in the input pass through. `unilen` is accepted and unused, and the block
+/// holds `wlen + 3` units, where `wlen` counts the units written before the
+/// zero terminator.
+pub fn utf82wcharp_ex(utf8: &[u8], unilen: usize, track_allocation: bool) -> CWCHARP {
+    let _ = (unilen, track_allocation);
+    let mut wlen: usize = 0;
+    let mut pos = 0;
+    while let Some(ch) = next_codepoint(utf8, &mut pos) {
+        if ch > 0xffff {
+            wlen += 1;
+        }
+        wlen += 1;
+    }
+    let bytes = wlen
+        .checked_add(3)
+        .and_then(|n| n.checked_mul(core::mem::size_of::<Wchar>()))
+        .expect("utf82wcharp_ex size overflow");
+    unsafe {
+        let w = raw_malloc(bytes).cast::<Wchar>();
+        let mut index = 0;
+        let mut pos = 0;
+        while let Some(ch) = next_codepoint(utf8, &mut pos) {
+            if ch > 0xffff {
+                *w.add(index) = (0xD800 | ((ch - 0x10000) >> 10)) as Wchar;
+                index += 1;
+                *w.add(index) = (0xDC00 | ((ch - 0x10000) & 0x3FF)) as Wchar;
+            } else {
+                *w.add(index) = ch as Wchar;
+            }
+            index += 1;
+        }
+        *w.add(index) = 0;
+        assert_eq!(wlen, index);
+        w
+    }
+}
+
 /// `free_wcharp`. `free` of a block from [`utf82wcharp`].
 ///
 /// # Safety
-/// `cp` is null or a pointer returned by [`utf82wcharp`] that has not been freed.
+/// `cp` is null or a pointer returned by [`utf82wcharp`] or [`utf82wcharp_ex`]
+/// that has not been freed.
 pub unsafe fn free_wcharp(cp: CWCHARP, track_allocation: bool) {
     let _ = track_allocation;
     unsafe { raw_free(cp.cast()) }

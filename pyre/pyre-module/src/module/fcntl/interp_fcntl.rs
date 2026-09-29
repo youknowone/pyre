@@ -565,6 +565,11 @@ const ARG_BUFSZ: usize = 1024;
 /// it, and that is the only way the overrun can be seen at all — so the bytes
 /// are the module's, verbatim, starting with the NUL the staged copy is
 /// terminated by.
+///
+/// [3.14-spec] guard at `len` ↔ interp_fcntl.py `ioctl` (no guard; stages
+/// `max(IOCTL_BUFSZ, len)` and returns `len` bytes) — a write past the
+/// argument raises SystemError "buffer overflow"; evidence: fcntlmodule.c
+/// `fcntl_ioctl_impl` / `fcntl_fcntl_impl` `memcmp(buf + len, guard, GUARDSZ)`.
 #[cfg(all(unix, feature = "host_env"))]
 const ARG_GUARD: [u8; 8] = [0x00, 0xfa, 0x69, 0xc4, 0x67, 0xa3, 0x6c, 0x58];
 
