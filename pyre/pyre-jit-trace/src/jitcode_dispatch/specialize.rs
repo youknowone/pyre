@@ -19998,11 +19998,15 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
 /// Trace the three frame reads at the head of `pyopcode.py IMPORT_NAME`.
 ///
 /// PyPy does not leave calls for `get_builtin`, `getdebug`, or
-/// `get_w_globals` in the optimized loop: they are ordinary reads from the
-/// live red frame.  Pyre's bytecode frontend spells them as three residual
-/// helpers, so recognize those helpers here and emit the same field/cell
-/// shape.  Only the standard virtualizable is handled; an inlined callee has
-/// its own red frame and stays on the residual path until the generic
+/// `get_w_globals` in the optimized loop. `get_builtin` and the debug-data
+/// reads are ordinary field reads from the live red frame. `get_w_globals`
+/// is `pyframe.py PyFrame.get_w_globals`: `debugdata.w_globals` when debug
+/// data is present, otherwise `jit.promote(self.pycode).w_globals`
+/// (`pycode.py` `"w_globals?"`) — a constant, one `QUASIIMMUT_FIELD`, and a
+/// `GUARD_NOT_INVALIDATED`. Pyre's bytecode frontend spells them as three
+/// residual helpers, so recognize those helpers here and emit that shape.
+/// Only the standard virtualizable is handled; an inlined callee has its own
+/// red frame and stays on the residual path until the generic
 /// nonstandard-virtualizable field descent can represent it directly.
 pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -20171,19 +20175,47 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
                 );
                 live
             } else {
-                let live = crate::state::frame_get_globals_obj(ctx.trace_ctx, frame_op);
-                let w_globals = frame.get_w_globals();
+                // `pyframe.py PyFrame.get_w_globals`:
+                // `jit.promote(self.pycode).w_globals` (`pycode.py` `"w_globals?"`).
+                // A code object whose globals were never stamped keeps the residual.
+                let Some((pycode_op, majit_ir::Value::Ref(pycode_ref))) = ctx
+                    .trace_ctx
+                    .virtualizable_entry_at(crate::virtualizable_spec::PYCODE_VABLE_FIELD_INDEX)
+                else {
+                    return Ok(false);
+                };
+                if pycode_ref == majit_ir::GcRef::NO_CONCRETE || pycode_ref.as_usize() == 0 {
+                    return Ok(false);
+                }
+                let pycode = pycode_ref.as_usize() as pyre_object::PyObjectRef;
+                let pycode_const = ctx.trace_ctx.const_ref(pycode as i64);
+                if pycode_op.is_constant()
+                    && ctx.trace_ctx.const_value(pycode_op) != Some(pycode as i64)
+                {
+                    return Ok(false);
+                }
+                let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(pycode) };
                 if w_globals.is_null() {
                     return Ok(false);
                 }
-                if live.is_constant() && ctx.trace_ctx.const_value(live) != Some(w_globals as i64) {
-                    return Ok(false);
+                if !pycode_op.is_constant() {
+                    walker_emit_fold_guard_with_snapshot(
+                        ctx,
+                        op_pc,
+                        OpCode::GuardValue,
+                        &[pycode_op, pycode_const],
+                    )?;
+                    ctx.trace_ctx
+                        .heap_cache_mut()
+                        .replace_box(pycode_op, pycode_const);
                 }
-                ctx.trace_ctx.set_opref_concrete(
-                    live,
-                    majit_ir::Value::Ref(majit_ir::GcRef(w_globals as usize)),
+                crate::state::record_quasiimmut_field(
+                    ctx.trace_ctx,
+                    pycode_const,
+                    crate::descr::pycode_w_globals_quasi_descr(),
                 );
-                live
+                walker_flush_guard_not_invalidated(ctx, op_pc)?;
+                ctx.trace_ctx.const_ref(w_globals as i64)
             }
         }
         _ => unreachable!("helper was filtered above"),
