@@ -1176,7 +1176,7 @@ impl CrateLoweringState {
             .collect();
         // `objectmodel.py @not_rpython` sets `func._not_rpython_`; the
         // flowspace refuses that function before executing its body
-        // (`flowspace/objspace.py:21-22 assert_rpythonic`).  Apply the same gate
+        // (`flowspace/objspace.py assert_rpythonic`).  Apply the same gate
         // before MIR lowering, which also prevents host-only carrier types (for
         // example rbigint.fromlong's i128 test surface) from becoming spurious
         // translated graph-coverage failures.
@@ -6812,8 +6812,8 @@ fn pygraph_initial_block(
         // resolves through the unique-impl map
         // (`trait_unique_impls`, keyed by qualified path).
         // RPython's GC transformer casts a GC helper's pointer *argument*
-        // to `llmemory.GCREF` before the call — `gct_gc_identityhash`
-        // (`framework.py:1174-1182`) does
+        // to `llmemory.GCREF` before the call —
+        // `framework.py gct_gc_identityhash` does
         // `[v_ptr] = hop.spaceop.args; v_ptr = hop.genop("cast_opaque_ptr",
         // [v_ptr], resulttype=llmemory.GCREF)`.  Rust's `PyObjectRef`
         // parameter is the physical carrier for that opaque slot, not a
