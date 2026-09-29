@@ -3689,16 +3689,15 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
         // `rclass.py hook_setfield` runs `jit_force_quasi_immutable` ahead of
         // every store to a `?` field (`pycode.py` `"w_globals?"`). The hook
         // does not look at the new value, so storing the value already there
-        // invalidates too. `is_installed` is `mutatebox.nonnull()`: a code
-        // object no loop watches pays one load.
-        let code = obj as *const PyCode;
-        if (*code).w_globals_watchers.is_installed() {
-            pyre_object::quasiimmut::sweep_quasi_immut_field(&(*code).w_globals_watchers);
-        }
-        std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!(
-            (*(obj as *mut PyCode)).w_globals
-        ))
-        .store(w_globals, std::sync::atomic::Ordering::Release);
+        // invalidates too. The sweep and the store share the watcher lock:
+        // an `is_installed` test outside it lets a recorder publish a watcher
+        // for the old pointer after the test and before the store.
+        let code = obj as *mut PyCode;
+        pyre_object::quasiimmut::publish_quasi_immut_ptr(
+            &(*code).w_globals_watchers,
+            std::ptr::addr_of_mut!((*code).w_globals),
+            w_globals,
+        );
     }
     if !w_globals.is_null() {
         let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
@@ -3741,24 +3740,19 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
             publish_code_slot_store_rooting(roots.get(root_base), &[roots.get(root_base + 1)]);
         let obj = rooted.owner();
         let code = obj as *mut PyCode;
-        let slot = unsafe {
-            std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!((*code).w_globals))
-        };
         let w_globals = rooted.get(0);
         // `rclass.py hook_setfield` ahead of the store to `pycode.py`
-        // `"w_globals?"`, on the rooted wrapper the publication just resolved.
-        if unsafe { (*code).w_globals_watchers.is_installed() } {
-            unsafe {
-                pyre_object::quasiimmut::sweep_quasi_immut_field(&(*code).w_globals_watchers);
-            }
-        }
-        match slot.compare_exchange(
-            pyre_object::PY_NULL,
-            w_globals,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        ) {
-            Ok(_) => {
+        // `"w_globals?"`. The null check, the sweep and the store share the
+        // watcher lock. A lost race must not sweep the winner's watcher.
+        match unsafe {
+            pyre_object::quasiimmut::publish_quasi_immut_cas(
+                &(*code).w_globals_watchers,
+                std::ptr::addr_of_mut!((*code).w_globals),
+                pyre_object::PY_NULL,
+                w_globals,
+            )
+        } {
+            Ok(()) => {
                 register_live_code_wrapper(unsafe { (*code).code_ptr }, obj);
                 register_w_globals_stamped_code(obj);
                 return false;

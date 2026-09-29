@@ -20194,8 +20194,15 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
                 {
                     return Ok(false);
                 }
-                let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(pycode) };
-                if w_globals.is_null() {
+                // Null stays residual: nothing has stamped this code object, and
+                // recording a watcher for that empty slot is not the fold.
+                // A non-null read here only decides that. The constant below is
+                // the read `record_quasiimmut_field` takes after it installs
+                // the watcher (`quasiimmut.py QuasiImmutDescr.__init__` before
+                // `get_current_constant_fieldvalue`). Baking the earlier read
+                // keeps a value a store can replace once the watcher exists.
+                let probed = unsafe { pyre_interpreter::w_code_get_w_globals(pycode) };
+                if probed.is_null() {
                     return Ok(false);
                 }
                 if !pycode_op.is_constant() {
@@ -20209,13 +20216,16 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
                         .heap_cache_mut()
                         .replace_box(pycode_op, pycode_const);
                 }
-                crate::state::record_quasiimmut_field(
+                let captured = crate::state::record_quasiimmut_field(
                     ctx.trace_ctx,
                     pycode_const,
                     crate::descr::pycode_w_globals_quasi_descr(),
                 );
                 walker_flush_guard_not_invalidated(ctx, op_pc)?;
-                ctx.trace_ctx.const_ref(w_globals as i64)
+                captured.unwrap_or_else(|| {
+                    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(pycode) };
+                    ctx.trace_ctx.const_ref(w_globals as i64)
+                })
             }
         }
         _ => unreachable!("helper was filtered above"),
