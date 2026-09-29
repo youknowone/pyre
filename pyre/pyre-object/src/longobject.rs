@@ -273,8 +273,7 @@ pub extern "C" fn jit_bigint_from_u64(value: u64) -> JitBigIntResult {
 /// shallow handle, rather than either descending into the classdef-less Rust
 /// fields or collapsing the clone to reference identity.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_clone(value: i64) -> JitBigIntResult {
-    let value = value as *const BigInt;
+pub extern "C" fn jit_bigint_clone(value: *const BigInt) -> JitBigIntResult {
     unsafe {
         encode_jit_bigint_result(majit_rlib::rbigint::alloc_rbigint_clone_nursery_collecting(
             (*value).clone(),
@@ -286,8 +285,7 @@ macro_rules! bigint_comparison_residual {
     ($name:ident, $method:ident) => {
         #[doc = "Bare-RBigInt comparison residual using the translated GC-reference ABI."]
         #[majit_macros::elidable_cannot_raise]
-        pub extern "C" fn $name(a: i64, b: i64) -> i64 {
-            let (a, b) = (a as *const BigInt, b as *const BigInt);
+        pub extern "C" fn $name(a: *const BigInt, b: *const BigInt) -> i64 {
             unsafe { BigInt::$method(&*a, &*b) as i64 }
         }
     };
@@ -304,8 +302,7 @@ macro_rules! bigint_scalar_residual {
     ($name:ident, $body:expr) => {
         #[doc = "Bare-RBigInt scalar residual using the translated GC-reference ABI."]
         #[majit_macros::elidable_cannot_raise]
-        pub extern "C" fn $name(value: i64) -> i64 {
-            let value = value as *const BigInt;
+        pub extern "C" fn $name(value: *const BigInt) -> i64 {
             let value = unsafe { &*value };
             ($body)(value) as i64
         }
@@ -377,8 +374,7 @@ pub unsafe fn w_long_get_raw_value(obj: PyObjectRef) -> *mut BigInt {
 ///
 /// Unlike `rbigint.toint()`, upstream `fits_int()` is not marked
 /// `@jit.elidable`, so keep this call cannot-raise but non-elidable.
-pub extern "C" fn jit_w_long_fits_int(obj: i64) -> i64 {
-    let obj = obj as PyObjectRef;
+pub extern "C" fn jit_w_long_fits_int(obj: PyObjectRef) -> i64 {
     unsafe { w_long_fits_int(obj) as i64 }
 }
 
@@ -390,11 +386,8 @@ pub extern "C" fn jit_w_long_fits_int(obj: i64) -> i64 {
 /// not fit) passes the guard and falls through to `NewWithVtable(W_LONG)`.
 /// Non-elidable, cannot-raise (mirrors [`jit_w_long_fits_int`]).
 ///
-/// # Safety note: `extern "C"` over an `i64`-encoded `*mut BigInt`, matching the
-/// raw-helper ABI. The pointer is a live GC bigint produced by a preceding
-/// raw op in the same trace.
-pub extern "C" fn jit_bigint_fits_int(num: i64) -> i64 {
-    let num = num as *const BigInt;
+/// The pointer is a live GC bigint produced by a preceding raw op in the same trace.
+pub extern "C" fn jit_bigint_fits_int(num: *const BigInt) -> i64 {
     unsafe { jit_bigint_to_i64_fits(&*num) }
 }
 
@@ -475,8 +468,7 @@ pub fn jit_bigint_to_f64_or_nan(num: &BigInt) -> f64 {
 /// that unreachability as a panic. There is no `_int_w_unsafe` upstream —
 /// this is the elidable `toint` after a `fits_int` guard.
 #[majit_macros::elidable]
-pub extern "C" fn jit_w_long_toint(obj: i64) -> i64 {
-    let obj = obj as PyObjectRef;
+pub extern "C" fn jit_w_long_toint(obj: PyObjectRef) -> i64 {
     unsafe {
         let big = w_long_get_value(obj);
         i64::try_from(big).unwrap_or_else(|_| {
@@ -489,7 +481,7 @@ pub extern "C" fn jit_w_long_toint(obj: i64) -> i64 {
 /// payload half of `W_LongObject._add` (`pypy/objspace/std/longobject.py`).
 /// Both operands are guaranteed `W_LongObject` by a preceding
 /// `GuardClass(LONG_TYPE)` on each, so the BigInt payloads are read
-/// directly. Returns a freshly heap-allocated `*mut BigInt` (as i64) — the
+/// directly. Returns a freshly heap-allocated `*mut BigInt` — the
 /// arithmetic only, with no Python-object wrapper. `add` allocates a new
 /// bigint, so its only failure mode is MemoryError: `EF_ELIDABLE_OR_MEMORYERROR`
 /// (`call.py`, `cr == "mem"`). The value is still a pure function of the
@@ -506,87 +498,81 @@ pub extern "C" fn jit_w_long_toint(obj: i64) -> i64 {
 /// operand wrappers are not read after the digit malloc here, so a caller that
 /// holds them natively across this call must root them itself.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_w_long_add_raw(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+pub extern "C" fn jit_w_long_add_raw(a: PyObjectRef, b: PyObjectRef) -> *mut BigInt {
     unsafe {
         let av = w_long_get_raw_value(a);
         let bv = w_long_get_raw_value(b);
         if (*av).get_sign() == 0 {
-            return bv as i64;
+            return bv;
         }
         if (*bv).get_sign() == 0 {
-            return av as i64;
+            return av;
         }
         // Digit malloc is the collecting call; `_x_add` / `_x_sub` root the
         // operand digit arrays across it (`push_roots(livevars)`).
-        alloc_bigint_nursery(BigInt::add(&*av, &*bv)) as i64
+        alloc_bigint_nursery(BigInt::add(&*av, &*bv))
     }
 }
 
 /// `rbigint.sub` over `W_LongObject` operands (collecting digit malloc). See
 /// [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_w_long_sub_raw(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+pub extern "C" fn jit_w_long_sub_raw(a: PyObjectRef, b: PyObjectRef) -> *mut BigInt {
     unsafe {
         let av = w_long_get_raw_value(a);
         let bv = w_long_get_raw_value(b);
         if (*bv).get_sign() == 0 {
-            return av as i64;
+            return av;
         }
-        alloc_bigint_nursery(BigInt::sub(&*av, &*bv)) as i64
+        alloc_bigint_nursery(BigInt::sub(&*av, &*bv))
     }
 }
 
 /// `rbigint.mul` over `W_LongObject` operands (collecting digit malloc). See
 /// [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_w_long_mul_raw(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+pub extern "C" fn jit_w_long_mul_raw(a: PyObjectRef, b: PyObjectRef) -> *mut BigInt {
     unsafe {
         alloc_bigint_nursery(BigInt::mul(
             &*w_long_get_raw_value(a),
             &*w_long_get_raw_value(b),
-        )) as i64
+        ))
     }
 }
 
 /// `rbigint.and_` over `W_LongObject` operands (collecting digit malloc). See
 /// [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_w_long_and_raw(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+pub extern "C" fn jit_w_long_and_raw(a: PyObjectRef, b: PyObjectRef) -> *mut BigInt {
     unsafe {
         alloc_bigint_nursery(BigInt::and_(
             &*w_long_get_raw_value(a),
             &*w_long_get_raw_value(b),
-        )) as i64
+        ))
     }
 }
 
 /// `rbigint.or_` over `W_LongObject` operands (collecting digit malloc). See
 /// [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_w_long_or_raw(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+pub extern "C" fn jit_w_long_or_raw(a: PyObjectRef, b: PyObjectRef) -> *mut BigInt {
     unsafe {
         alloc_bigint_nursery(BigInt::or_(
             &*w_long_get_raw_value(a),
             &*w_long_get_raw_value(b),
-        )) as i64
+        ))
     }
 }
 
 /// `rbigint.xor_` over `W_LongObject` operands (collecting digit malloc). See
 /// [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as PyObjectRef, b as PyObjectRef);
+pub extern "C" fn jit_w_long_xor_raw(a: PyObjectRef, b: PyObjectRef) -> *mut BigInt {
     unsafe {
         alloc_bigint_nursery(BigInt::xor(
             &*w_long_get_raw_value(a),
             &*w_long_get_raw_value(b),
-        )) as i64
+        ))
     }
 }
 
@@ -602,67 +588,60 @@ pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
 /// callee copies around `_x_add`'s digit-list allocation, matching RPython's
 /// `push_roots(livevars)`. Thus dead bigints are reclaimed by minor
 /// collections instead of accumulating in old-gen. Returns a freshly
-/// heap-allocated `*mut BigInt` (as i64). Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
+/// heap-allocated `*mut BigInt`. Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
 ///
-/// # Safety note: `extern "C"` over `i64`-encoded `*const BigInt`. The pointers
-/// are live GC bigints (the operands' value fields) for the duration of the call.
+/// The pointers are live GC bigints (the operands' value fields) for the duration of the call.
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as *const BigInt, b as *const BigInt);
+pub extern "C" fn jit_bigint_add(a: *const BigInt, b: *const BigInt) -> *mut BigInt {
     unsafe {
         // `rbigint.add` (rbigint.py) returns the *other operand itself*
         // when one side is zero; the raw-pointer ABI spells that identity as
         // returning the incoming payload instead of re-wrapping an alias.
         if (&*a).get_sign() == 0 {
-            return b as i64;
+            return b as *mut BigInt;
         }
         if (&*b).get_sign() == 0 {
-            return a as i64;
+            return a as *mut BigInt;
         }
-        alloc_bigint_nursery_collecting(BigInt::add(&*a, &*b)) as i64
+        alloc_bigint_nursery_collecting(BigInt::add(&*a, &*b))
     }
 }
 
 /// `rbigint.sub` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as *const BigInt, b as *const BigInt);
+pub extern "C" fn jit_bigint_sub(a: *const BigInt, b: *const BigInt) -> *mut BigInt {
     unsafe {
         // `rbigint.sub` (rbigint.py) returns `self` itself for a zero
         // subtrahend; see [`jit_bigint_add`] for the raw-pointer spelling.
         if (&*b).get_sign() == 0 {
-            return a as i64;
+            return a as *mut BigInt;
         }
-        alloc_bigint_nursery_collecting(BigInt::sub(&*a, &*b)) as i64
+        alloc_bigint_nursery_collecting(BigInt::sub(&*a, &*b))
     }
 }
 
 /// `rbigint.mul` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { alloc_bigint_nursery_collecting(BigInt::mul(&*a, &*b)) as i64 }
+pub extern "C" fn jit_bigint_mul(a: *const BigInt, b: *const BigInt) -> *mut BigInt {
+    unsafe { alloc_bigint_nursery_collecting(BigInt::mul(&*a, &*b)) }
 }
 
 /// `rbigint.and_` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_and(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { alloc_bigint_nursery_collecting(BigInt::and_(&*a, &*b)) as i64 }
+pub extern "C" fn jit_bigint_and(a: *const BigInt, b: *const BigInt) -> *mut BigInt {
+    unsafe { alloc_bigint_nursery_collecting(BigInt::and_(&*a, &*b)) }
 }
 
 /// `rbigint.or_` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_or(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { alloc_bigint_nursery_collecting(BigInt::or_(&*a, &*b)) as i64 }
+pub extern "C" fn jit_bigint_or(a: *const BigInt, b: *const BigInt) -> *mut BigInt {
+    unsafe { alloc_bigint_nursery_collecting(BigInt::or_(&*a, &*b)) }
 }
 
 /// `rbigint.xor_` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { alloc_bigint_nursery_collecting(BigInt::xor(&*a, &*b)) as i64 }
+pub extern "C" fn jit_bigint_xor(a: *const BigInt, b: *const BigInt) -> *mut BigInt {
+    unsafe { alloc_bigint_nursery_collecting(BigInt::xor(&*a, &*b)) }
 }
 
 /// `rbigint` comparison — returns the sign of `a <=> b` as `-1` / `0` / `1`.
@@ -681,9 +660,8 @@ pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> i64 {
 /// built is read back through the heap cache and can stay virtual instead of
 /// being forced into a real allocation just to be handed to a comparison.
 #[majit_macros::elidable_cannot_raise]
-pub extern "C" fn jit_bigint_cmp(a: i64, b: i64) -> i64 {
+pub extern "C" fn jit_bigint_cmp(a: *const BigInt, b: *const BigInt) -> i64 {
     use core::cmp::Ordering;
-    let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
         match (*a).cmp(&*b) {
             Ordering::Less => -1,
@@ -734,31 +712,31 @@ mod tests {
     #[test]
     fn test_jit_w_long_fits_int_in_range() {
         let obj = w_long_from_i64(123);
-        assert_eq!(jit_w_long_fits_int(obj as i64), 1);
+        assert_eq!(jit_w_long_fits_int(obj), 1);
         let obj = w_long_from_i64(i64::MAX);
-        assert_eq!(jit_w_long_fits_int(obj as i64), 1);
+        assert_eq!(jit_w_long_fits_int(obj), 1);
         let obj = w_long_from_i64(i64::MIN);
-        assert_eq!(jit_w_long_fits_int(obj as i64), 1);
+        assert_eq!(jit_w_long_fits_int(obj), 1);
     }
 
     #[test]
     fn test_jit_w_long_fits_int_out_of_range() {
         let big = BigInt::from(i64::MAX) + BigInt::from(1);
         let obj = w_long_new(big);
-        assert_eq!(jit_w_long_fits_int(obj as i64), 0);
+        assert_eq!(jit_w_long_fits_int(obj), 0);
         let big = BigInt::from(i64::MIN) - BigInt::from(1);
         let obj = w_long_new(big);
-        assert_eq!(jit_w_long_fits_int(obj as i64), 0);
+        assert_eq!(jit_w_long_fits_int(obj), 0);
     }
 
     #[test]
     fn test_jit_w_long_toint_extracts_i64() {
         let obj = w_long_from_i64(42);
-        assert_eq!(jit_w_long_toint(obj as i64), 42);
+        assert_eq!(jit_w_long_toint(obj), 42);
         let obj = w_long_from_i64(i64::MAX);
-        assert_eq!(jit_w_long_toint(obj as i64), i64::MAX);
+        assert_eq!(jit_w_long_toint(obj), i64::MAX);
         let obj = w_long_from_i64(i64::MIN);
-        assert_eq!(jit_w_long_toint(obj as i64), i64::MIN);
+        assert_eq!(jit_w_long_toint(obj), i64::MIN);
     }
 
     #[test]
@@ -767,7 +745,7 @@ mod tests {
         // with no Python-object wrapper.
         let a = w_long_new(BigInt::from(i64::MAX));
         let b = w_long_new(BigInt::from(i64::MAX));
-        let raw = jit_w_long_add_raw(a as i64, b as i64) as *mut BigInt;
+        let raw = jit_w_long_add_raw(a, b);
         unsafe {
             assert_eq!(*raw, BigInt::from(i64::MAX) * 2);
         }
@@ -782,15 +760,15 @@ mod tests {
         let a = w_long_new(x.clone());
         let b = w_long_new(y.clone());
         unsafe {
-            let sub = jit_w_long_sub_raw(a as i64, b as i64) as *mut BigInt;
+            let sub = jit_w_long_sub_raw(a, b);
             assert_eq!(*sub, &x - &y);
-            let mul = jit_w_long_mul_raw(a as i64, b as i64) as *mut BigInt;
+            let mul = jit_w_long_mul_raw(a, b);
             assert_eq!(*mul, &x * &y);
-            let and = jit_w_long_and_raw(a as i64, b as i64) as *mut BigInt;
+            let and = jit_w_long_and_raw(a, b);
             assert_eq!(*and, &x & &y);
-            let or = jit_w_long_or_raw(a as i64, b as i64) as *mut BigInt;
+            let or = jit_w_long_or_raw(a, b);
             assert_eq!(*or, &x | &y);
-            let xor = jit_w_long_xor_raw(a as i64, b as i64) as *mut BigInt;
+            let xor = jit_w_long_xor_raw(a, b);
             assert_eq!(*xor, &x ^ &y);
         }
     }
@@ -802,7 +780,7 @@ mod tests {
         // matching `newlong` which does not demote).
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
         let b = w_long_new(BigInt::from(-1) - BigInt::from(i64::MAX));
-        let raw = jit_w_long_add_raw(a as i64, b as i64) as *mut BigInt;
+        let raw = jit_w_long_add_raw(a, b);
         unsafe {
             assert_eq!(*raw, BigInt::from(0));
         }
@@ -815,22 +793,10 @@ mod tests {
         let zero_payload = unsafe { w_long_get_raw_value(zero_obj) };
         let value_payload = unsafe { w_long_get_raw_value(value_obj) };
 
-        assert_eq!(
-            jit_w_long_add_raw(zero_obj as i64, value_obj as i64) as *mut BigInt,
-            value_payload
-        );
-        assert_eq!(
-            jit_w_long_add_raw(value_obj as i64, zero_obj as i64) as *mut BigInt,
-            value_payload
-        );
-        assert_eq!(
-            jit_bigint_add(zero_payload as i64, value_payload as i64) as *mut BigInt,
-            value_payload
-        );
-        assert_eq!(
-            jit_bigint_add(value_payload as i64, zero_payload as i64) as *mut BigInt,
-            value_payload
-        );
+        assert_eq!(jit_w_long_add_raw(zero_obj, value_obj), value_payload);
+        assert_eq!(jit_w_long_add_raw(value_obj, zero_obj), value_payload);
+        assert_eq!(jit_bigint_add(zero_payload, value_payload), value_payload);
+        assert_eq!(jit_bigint_add(value_payload, zero_payload), value_payload);
         unsafe {
             assert_eq!(&*zero_payload, &BigInt::from(0));
             assert_eq!(
@@ -844,9 +810,9 @@ mod tests {
     fn test_bare_bigint_constructor_comparison_and_scalar_residuals() {
         let a = jit_bigint_from_i64(-42);
         let b = jit_bigint_from_u64(42);
-        let cloned = jit_bigint_clone(a as i64);
+        let cloned = jit_bigint_clone(a);
         let prebuilt_zero = jit_bigint_from_i64(0);
-        let cloned_zero = jit_bigint_clone(prebuilt_zero as i64);
+        let cloned_zero = jit_bigint_clone(prebuilt_zero);
         unsafe {
             assert_eq!(&*a, &BigInt::from(-42));
             assert_eq!(&*b, &BigInt::from(42));
@@ -855,13 +821,13 @@ mod tests {
             assert_eq!(&*cloned_zero, &*prebuilt_zero);
             assert_ne!(cloned_zero, prebuilt_zero);
         }
-        assert_eq!(jit_bigint_eq(a as i64, b as i64), 0);
-        assert_eq!(jit_bigint_lt(a as i64, b as i64), 1);
-        assert_eq!(jit_bigint_ge(b as i64, a as i64), 1);
+        assert_eq!(jit_bigint_eq(a, b), 0);
+        assert_eq!(jit_bigint_lt(a, b), 1);
+        assert_eq!(jit_bigint_ge(b, a), 1);
         assert_eq!(jit_bigint_sign_i64(unsafe { &*a }), -1);
-        assert_eq!(jit_bigint_is_zero(a as i64), 0);
-        assert_eq!(jit_bigint_tobool(a as i64), 1);
-        assert_eq!(jit_bigint_bits(b as i64), 6);
-        assert_eq!(jit_bigint_hash(b as i64), 42);
+        assert_eq!(jit_bigint_is_zero(a), 0);
+        assert_eq!(jit_bigint_tobool(a), 1);
+        assert_eq!(jit_bigint_bits(b), 6);
+        assert_eq!(jit_bigint_hash(b), 42);
     }
 }

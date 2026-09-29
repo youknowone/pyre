@@ -6200,13 +6200,16 @@ pub(crate) fn handle_fromlist_fast(
 /// Three outcomes share the result register: `Ok(Some(p))` is `p`,
 /// `Ok(None)` is null, and an error is published then answered as
 /// [`import_lookup_err_ptr`].
-pub extern "C" fn handle_fromlist_fast_jit_abi(w_mod: i64, w_fromlist: i64) -> i64 {
-    match handle_fromlist_fast(w_mod as PyObjectRef, w_fromlist as PyObjectRef) {
-        Ok(Some(result)) => result as i64,
-        Ok(None) => 0,
+pub extern "C" fn handle_fromlist_fast_jit_abi(
+    w_mod: PyObjectRef,
+    w_fromlist: PyObjectRef,
+) -> PyObjectRef {
+    match handle_fromlist_fast(w_mod, w_fromlist) {
+        Ok(Some(result)) => result,
+        Ok(None) => pyre_object::PY_NULL,
         Err(error) => {
             crate::runtime_ops::jit_publish_residual_error(error);
-            import_lookup_err_ptr() as i64
+            import_lookup_err_ptr()
         }
     }
 }
@@ -6984,21 +6987,15 @@ pub fn dunder_import_name_obj(
 
 /// One-word residual-call ABI for [`dunder_import_name_obj`].
 pub extern "C" fn dunder_import_name_obj_jit_abi(
-    w_name: i64,
-    w_globals: i64,
-    w_locals: i64,
-    w_fromlist: i64,
+    w_name: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
     level: i64,
-) -> i64 {
-    match dunder_import_name_obj(
-        w_name as PyObjectRef,
-        w_globals as PyObjectRef,
-        w_locals as PyObjectRef,
-        w_fromlist as PyObjectRef,
-        level,
-    ) {
-        Ok(result) => result as i64,
-        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+) -> PyObjectRef {
+    match dunder_import_name_obj(w_name, w_globals, w_locals, w_fromlist, level) {
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
     }
 }
 
@@ -7396,17 +7393,12 @@ pub(crate) fn handle_fromlist(
 ///
 /// `Ok(())` is 1; an error is published and answered as 0.
 pub extern "C" fn handle_fromlist_jit_abi(
-    w_mod: i64,
-    w_fromlist: i64,
+    w_mod: PyObjectRef,
+    w_fromlist: PyObjectRef,
     recursive: i64,
-    execution_context: i64,
+    execution_context: *const PyExecutionContext,
 ) -> i64 {
-    match handle_fromlist(
-        w_mod as PyObjectRef,
-        w_fromlist as PyObjectRef,
-        recursive != 0,
-        execution_context as *const PyExecutionContext,
-    ) {
+    match handle_fromlist(w_mod, w_fromlist, recursive != 0, execution_context) {
         Ok(()) => 1,
         Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
     }

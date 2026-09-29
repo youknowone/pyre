@@ -32,7 +32,11 @@
 pub struct Cpu {
     /// `bhimpl_residual_call` general entry point.
     /// `(callable, null_or_self, arg0) → result`.
-    pub call_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub call_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
     /// Per-arity `bhimpl_residual_call_<n>` helpers
     /// (`call_fn_0(callable, null_or_self)` ...
     /// `call_fn_14(callable, null_or_self, a0..a13)`).  RPython
@@ -44,358 +48,722 @@ pub struct Cpu {
     /// i64s, and the backend dispatch table (`call_stub.rs::
     /// dispatch_arity_body!`, `MAX_HOST_CALL_ARITY` = 16) tops out at
     /// 16 i64 arguments.
-    pub call_fn_0: extern "C" fn(i64, i64) -> i64,
-    pub call_fn_2: extern "C" fn(i64, i64, i64, i64) -> i64,
-    pub call_fn_3: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_4: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_9: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_10:
-        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_11:
-        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_12:
-        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_0: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
+    pub call_fn_2: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_fn_3: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_fn_4: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_fn_5: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_fn_6: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_fn_7: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_fn_8: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_fn_9: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_fn_10: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_fn_11: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_fn_12: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
     pub call_fn_13: extern "C" fn(
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
     ) -> i64,
     pub call_fn_14: extern "C" fn(
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
     ) -> i64,
     /// `bhimpl_load_global` — namespace/code from getfield_vable_r plus live frame.
-    pub load_global_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub load_global_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        *mut pyre_interpreter::PyFrame,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// `bh_load_from_dict_or_globals_fn(dict, code, frame, namei)` —
     /// LOAD_FROM_DICT_OR_GLOBALS: try the popped mapping then frame globals.
-    pub load_from_dict_or_globals_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub load_from_dict_or_globals_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        *mut pyre_interpreter::PyFrame,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// `bh_call_function_ex_fn(callable, self_or_null, starargs, kwargs_or_null)`
     /// — CALL_FUNCTION_EX: unpack `*`/`**` and dispatch.
-    pub call_function_ex_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub call_function_ex_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef,
     /// Per-arity `bh_call_kw_<n>` helpers for CALL_KW, ABI
     /// `(callable, null_or_self, kwnames, arg0..arg{n-1})` = 3 + n i64.
     /// The kwnames slot leaves room for nargs 0..=13 within the backend's
     /// `MAX_HOST_CALL_ARITY` = 16 ceiling; CALL_KW with nargs > 13 aborts.
-    pub call_kw_fn_0: extern "C" fn(i64, i64, i64) -> i64,
-    pub call_kw_fn_1: extern "C" fn(i64, i64, i64, i64) -> i64,
-    pub call_kw_fn_2: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
-    pub call_kw_fn_3: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_kw_fn_4: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_kw_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_kw_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_kw_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_kw_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_kw_fn_9:
-        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_kw_fn_10:
-        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_kw_fn_11:
-        extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_kw_fn_0: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_kw_fn_1: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_kw_fn_2: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_kw_fn_3: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_kw_fn_4: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_kw_fn_5: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_kw_fn_6: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_kw_fn_7: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_kw_fn_8: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_kw_fn_9: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_kw_fn_10: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
+    pub call_kw_fn_11: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
     pub call_kw_fn_12: extern "C" fn(
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
     ) -> i64,
     pub call_kw_fn_13: extern "C" fn(
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
     ) -> i64,
     /// LOOKUP_METHOD attribute half — `(obj, code, name_idx) → attr`.
     /// Reproduces `PyFrame::load_method`'s `getattr` for blackhole resume.
-    pub load_attr_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub load_attr_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// LOOKUP_METHOD `null_or_self` half — `(obj, attr, code, name_idx) →
     /// bound`. Pure binding decision shared with the interpreter.
-    pub load_method_self_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub load_method_self_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// LOAD_SPECIAL attribute half — `(obj, method_kind) → attr`.
-    pub load_special_fn: extern "C" fn(i64, i64) -> i64,
+    pub load_special_fn: extern "C" fn(pyre_object::PyObjectRef, i64) -> pyre_object::PyObjectRef,
     /// WITH_EXCEPT_START — `(exit_func, exit_self, exception) → bool-like result`.
-    pub with_except_start_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub with_except_start_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef,
     /// STORE_ATTR residual — `(obj, value, code, name_idx) → void`.
     /// Resolves the name from the code object and runs generic `setattr`.
-    pub store_attr_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub store_attr_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> i64,
     /// BINARY_SLICE residual — `(obj, start, stop) → obj[start:stop]`.
-    pub binary_slice_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub binary_slice_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef,
     /// STORE_SLICE residual — `(obj, start, stop, value) → void`
     /// (`obj[start:stop] = value`).
-    pub store_slice_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub store_slice_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
     /// DELETE_SUBSCR residual — `(obj, index) → void` (`del obj[index]`).
-    pub delete_subscr_fn: extern "C" fn(i64, i64) -> i64,
+    pub delete_subscr_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
     /// LIST_EXTEND residual — `(list, iterable) → void` (`list.extend(iterable)`,
     /// list peeked + mutated in place).
-    pub list_extend_fn: extern "C" fn(i64, i64) -> i64,
+    pub list_extend_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
     /// SET_ADD residual — `(set, value) → void` (`set.add(value)`, peeked).
-    pub set_add_fn: extern "C" fn(i64, i64) -> i64,
+    pub set_add_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
     /// SET_UPDATE residual — `(set, iterable) → void` (`set.update`, peeked).
-    pub set_update_fn: extern "C" fn(i64, i64) -> i64,
+    pub set_update_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
     /// DICT_UPDATE residual — `(dict, source) → void` (`dict.update`, peeked).
-    pub dict_update_fn: extern "C" fn(i64, i64) -> i64,
+    pub dict_update_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
     /// MAP_ADD residual — `(dict, key, value) → void` (`dict[key]=value`, peeked).
-    pub map_add_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub map_add_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
     /// DICT_MERGE residual — `(dict, source, callable) → void` (`**` merge,
     /// peeked; callable only for error-message prefixes).
-    pub dict_merge_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub dict_merge_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
     /// LIST_APPEND residual — `(list, value) → void` (`list.append(value)`,
     /// list peeked + mutated in place).  The full-body walker's #171 fold
     /// intercepts it (`RuntimeHelperKind::ListAppendValue`); this is the decline
     /// fallback, identical to the residual the retired MIFrame tracer recorded.
-    pub list_append_fn: extern "C" fn(i64, i64) -> i64,
+    pub list_append_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
     /// DELETE_ATTR residual — `(obj, code, name_idx) → void` (`del obj.name`).
     /// Resolves the name from the code object and runs generic `delattr`.
-    pub delete_attr_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub delete_attr_fn:
+        extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef, i64) -> i64,
     /// FORMAT_SIMPLE residual — `value → str` (`f"{x}"`, empty spec).
     /// User `__format__` may run Python (fallible).
-    pub format_simple_fn: extern "C" fn(i64) -> i64,
+    pub format_simple_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// FORMAT_WITH_SPEC residual — `(value, spec) → str` (`f"{x:.2f}"`).
     /// User `__format__` may run Python (fallible).
-    pub format_with_spec_fn: extern "C" fn(i64, i64) -> i64,
+    pub format_with_spec_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef,
     /// CONVERT_VALUE residual — `(value, conv) → str` (`f"{x!r}"`).
     /// `conv` is a `runtime_ops::convert_value_code`; user `__str__` /
     /// `__repr__` may run Python (fallible).
-    pub convert_value_fn: extern "C" fn(i64, i64) -> i64,
+    pub convert_value_fn: extern "C" fn(pyre_object::PyObjectRef, i64) -> pyre_object::PyObjectRef,
     /// `bh_import_from_fn(module, code, name_idx)` — IMPORT_FROM residual;
     /// resolves the attribute name from the code object and runs
     /// `importing::import_from` on the peeked module (attribute lookup, then a
     /// `sys.modules` fallback; a user `__getattribute__` / `__getattr__` may
     /// run Python → fallible).
-    pub import_from_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub import_from_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// `bh_load_super_attr_fn(global_super, self, cls, frame, code, name_idx,
     /// is_two_arg)` — LOAD_SUPER_ATTR residual. Calls the actual global
     /// callable with zero or two args, then resolves the attribute.
-    pub load_super_attr_fn: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub load_super_attr_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        *mut pyre_interpreter::PyFrame,
+        pyre_object::PyObjectRef,
+        i64,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// `bh_super_attr_unwrap_fn(raw, which)` — LOAD_SUPER_ATTR method-form
     /// unwrap (`which` 0 = func slot, 1 = self slot); pure / infallible.
-    pub super_attr_unwrap_fn: extern "C" fn(i64, i64) -> i64,
+    pub super_attr_unwrap_fn:
+        extern "C" fn(pyre_object::PyObjectRef, i64) -> pyre_object::PyObjectRef,
     /// `bh_load_deref_value_fn(cell, code, deref_idx)` — LOAD_DEREF
     /// dereference residual (cell contents, raising the named unbound-variable
     /// `NameError` resolved via `code` + `deref_idx`).
-    pub load_deref_value_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub load_deref_value_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// `bh_store_deref_value_fn(cell, value)` — STORE_DEREF residual: mutate
     /// the cell's contents (returning the unchanged cell) or return the raw
     /// `value` for a non-cell slot; infallible.
-    pub store_deref_value_fn: extern "C" fn(i64, i64) -> i64,
+    pub store_deref_value_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef,
     /// `bh_make_cell_fn(current, code, slot)` — MAKE_CELL residual: wrap a raw
     /// slot value in a fresh cell of the `code` + `slot` cell family (or return
     /// an existing cell unchanged); infallible.
-    pub make_cell_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub make_cell_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// `jit_make_function_from_globals(globals, code)` — MAKE_FUNCTION residual:
     /// wrap a code object into a function using the given globals object;
     /// allocates but runs no user code and never raises.
-    pub make_function_fn: extern "C" fn(i64, i64) -> i64,
+    pub make_function_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef,
     /// `jit_set_function_attribute(func, attr, flag)` — SET_FUNCTION_ATTRIBUTE
     /// residual: stamp one attribute (`flag` discriminant) on `func`, returning
     /// `func`; sets a typed field but runs no user code and never raises.
-    pub set_function_attribute_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub set_function_attribute_fn:
+        extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef, i64) -> i64,
     /// `bh_get_iter_fn(obj)` — GET_ITER `iter(obj)` residual
     /// (a user `__iter__` may run Python → fallible).
-    pub get_iter_fn: extern "C" fn(i64) -> i64,
+    pub get_iter_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// `jit_next(iter)` — FOR_ITER `next(iter)` residual; returns the next
     /// item, PY_NULL on StopIteration exhaustion (the trailing for-iter
     /// GuardNonnull catches it), or publishes a real exception into the
     /// backend exception cells on error.
-    pub for_iter_next_fn: extern "C" fn(i64) -> i64,
+    pub for_iter_next_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// MRO-aware Python exception match used by the FOR_ITER catch arm.
     /// Returns a raw bool-as-int and cannot raise.
-    pub for_iter_exception_match_fn: extern "C" fn(i64, i64) -> i64,
+    pub for_iter_exception_match_fn:
+        extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
     /// interp_jit.py `jump_absolute` residual: the `bytecode_trace` slow
     /// path.  Void result (`residual_call_r_v`):
     /// always returns 0; an exception is published for `GuardNoException`.
-    pub bytecode_trace_jitted_slow_fn: extern "C" fn(i64, i64) -> i64,
+    pub bytecode_trace_jitted_slow_fn: extern "C" fn(
+        *mut pyre_interpreter::PyExecutionContext,
+        *mut pyre_interpreter::PyFrame,
+    ) -> i64,
     /// `bh_unary_negative_fn(value)` — UNARY_NEGATIVE `-value` residual
     /// (a user `__neg__` may run Python → fallible).
-    pub unary_negative_fn: extern "C" fn(i64) -> i64,
+    pub unary_negative_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// `bh_unary_invert_fn(value)` — UNARY_INVERT `~value` residual
     /// (a user `__invert__` may run Python → fallible).
-    pub unary_invert_fn: extern "C" fn(i64) -> i64,
+    pub unary_invert_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// `bh_unary_positive_fn(value)` — UNARY_POSITIVE `+value` residual
     /// (a user `__pos__` may run Python → fallible).
-    pub unary_positive_fn: extern "C" fn(i64) -> i64,
+    pub unary_positive_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// `bh_load_common_constant_fn(disc)` — LOAD_COMMON_CONSTANT residual
     /// resolving a `CommonConstant` discriminant to its pushed object
     /// (allocates for the `all`/`any` builtin variants → `MayForce`).
-    pub load_common_constant_fn: extern "C" fn(i64) -> i64,
+    pub load_common_constant_fn: extern "C" fn(i64) -> pyre_object::PyObjectRef,
     /// `bh_list_to_tuple_fn(value)` — CALL_INTRINSIC_1 ListToTuple residual
     /// (`list_to_tuple`, allocates a fresh tuple; non-list → TypeError).
-    pub list_to_tuple_fn: extern "C" fn(i64) -> i64,
+    pub list_to_tuple_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// `bh_get_len_fn(subject)` — GET_LEN residual; pushes `len(subject)`
     /// without consuming it (runs `__len__`).
-    pub get_len_fn: extern "C" fn(i64) -> i64,
+    pub get_len_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// `bh_match_sequence_fn(subject)` — MATCH_SEQUENCE residual; reads the
     /// subject type's PATMA marker (no user code).
-    pub match_sequence_fn: extern "C" fn(i64) -> i64,
+    pub match_sequence_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// `bh_match_mapping_fn(subject)` — MATCH_MAPPING residual, mirroring
     /// `match_sequence_fn`.
-    pub match_mapping_fn: extern "C" fn(i64) -> i64,
+    pub match_mapping_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// `bh_match_keys_fn(subject, keys)` — MATCH_KEYS residual; looks each
     /// pattern key up via `get` (user code; duplicate key → ValueError).
-    pub match_keys_fn: extern "C" fn(i64, i64) -> i64,
+    pub match_keys_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef,
     /// `bh_match_class_fn(subject, cls, kwd_attrs, count)` — MATCH_CLASS
     /// residual; runs `isinstance` and attribute lookups.
-    pub match_class_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub match_class_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// `bh_unary_not_fn(value)` — UNARY_NOT `not value` residual returning a
     /// bool (a user `__bool__` / `__len__` may run Python; infallible).
-    pub unary_not_fn: extern "C" fn(i64) -> i64,
+    pub unary_not_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// `bh_load_fast_check_fn(value, code, name_idx)` — LOAD_FAST_CHECK
     /// unbound-local guard (returns `value`, or raises `NameError`).
-    pub load_fast_check_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub load_fast_check_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// `bh_unbound_local_error_fn(code, name_idx)` — construct and return the
     /// UnboundLocalError value for DELETE_FAST without publishing it.
-    pub unbound_local_error_fn: extern "C" fn(i64, i64) -> i64,
+    pub unbound_local_error_fn:
+        extern "C" fn(pyre_object::PyObjectRef, i64) -> pyre_object::PyObjectRef,
     /// Residual-fallback entry point for the `compare_value_from_tag` graph.
-    pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub compare_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// Residual-fallback entry point for the `binary_value_from_tag` graph.
-    pub binary_op_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub binary_op_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// `bhimpl_w_int_new` — box a raw integer into a PyObject.
-    pub box_int_fn: extern "C" fn(i64) -> i64,
+    pub box_int_fn: extern "C" fn(i64) -> pyre_object::PyObjectRef,
     /// `bhimpl_truth` — PyObjectRef → raw 0 or 1.
-    pub truth_fn: extern "C" fn(i64) -> i64,
+    pub truth_fn: extern "C" fn(pyre_object::PyObjectRef) -> i64,
     /// `bhimpl_load_const` — load constant from frame's code object.
-    pub load_const_fn: extern "C" fn(i64, i64) -> i64,
+    pub load_const_fn: extern "C" fn(pyre_object::PyObjectRef, i64) -> pyre_object::PyObjectRef,
     /// `bhimpl_store_subscr` — obj[key] = value.
-    pub store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub store_subscr_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
     /// `bhimpl_getattr` — `getattr(obj, w_name)`.
     /// `(obj: Ref, w_name: Ref) → Ref` with `w_name` an interned str
     /// constant.  Blackhole/deopt lowering of `LOAD_ATTR`
     /// (`rclass.py rtype_getattr`).
-    pub getattr_fn: extern "C" fn(i64, i64) -> i64,
+    pub getattr_fn: extern "C" fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef,
     /// `bhimpl_load_name` — `(frame: Ref, w_name: Ref, namei: Int) → Ref`
     /// with `w_name` an interned str constant.  Blackhole/deopt lowering
     /// of `LOAD_NAME` (`pyopcode.py`).
-    pub load_name_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub load_name_fn: extern "C" fn(
+        *mut pyre_interpreter::PyFrame,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// `bhimpl_store_name` — `(frame: Ref, w_name: Ref, value: Ref) → Void`
     /// with `w_name` an interned str constant.  Blackhole/deopt lowering
     /// of `STORE_NAME` (`pyopcode.py`).
-    pub store_name_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub store_name_fn: extern "C" fn(
+        *mut pyre_interpreter::PyFrame,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
     /// `bhimpl_store_global` — `(frame: Ref, w_name: Ref, value: Ref) →
     /// Void` with `w_name` an interned str constant.  Blackhole/deopt
     /// lowering of `STORE_GLOBAL` (`pyopcode.py`); writes directly
     /// into `w_globals`, bypassing `w_locals`.
-    pub store_global_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub store_global_fn: extern "C" fn(
+        *mut pyre_interpreter::PyFrame,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> i64,
     /// `bh_delete_name_fn` — `(frame: Ref, w_name: Ref) → Void`, the
     /// lowering of `DELETE_NAME`; deletes the binding from `w_locals` and
     /// raises `NameError` when it is absent.
-    pub delete_name_fn: extern "C" fn(i64, i64) -> i64,
+    pub delete_name_fn:
+        extern "C" fn(*mut pyre_interpreter::PyFrame, pyre_object::PyObjectRef) -> i64,
     /// `bh_delete_global_fn` — `(frame: Ref, w_name: Ref) → Void`, the
     /// lowering of `DELETE_GLOBAL`; deletes directly from `w_globals`,
     /// bypassing `w_locals`.
-    pub delete_global_fn: extern "C" fn(i64, i64) -> i64,
+    pub delete_global_fn:
+        extern "C" fn(*mut pyre_interpreter::PyFrame, pyre_object::PyObjectRef) -> i64,
     /// `bh_load_locals_fn` — `(frame: Ref) → Ref`, the lowering of
     /// `LOAD_LOCALS` (`pyopcode.py`); hands back the frame's own
     /// `w_locals` mapping.
-    pub load_locals_fn: extern "C" fn(i64) -> i64,
+    pub load_locals_fn: extern "C" fn(*mut pyre_interpreter::PyFrame) -> pyre_object::PyObjectRef,
     /// `bh_load_build_class_fn` — `(frame: Ref) → Ref`, the lowering of
     /// `LOAD_BUILD_CLASS` (`pyopcode.py`); reads `__build_class__` out of
     /// the frame's builtin mapping.
-    pub load_build_class_fn: extern "C" fn(i64) -> i64,
+    pub load_build_class_fn:
+        extern "C" fn(*mut pyre_interpreter::PyFrame) -> pyre_object::PyObjectRef,
     /// Load `builtins.__import__` for IMPORT_NAME.  Kept separate from the
     /// call itself so the generated jitcode has the same ordinary Python
     /// call boundary as PyPy's `IMPORT_NAME` implementation.
-    pub load_import_fn: extern "C" fn(i64) -> i64,
+    pub load_import_fn: extern "C" fn(*mut pyre_interpreter::PyFrame) -> pyre_object::PyObjectRef,
     /// Load IMPORT_NAME's locals argument.  Separate from `load_import_fn`
     /// because `pyopcode.py`'s `IMPORT_NAME` reads two independent things off the
     /// frame before the call.
-    pub load_import_locals_fn: extern "C" fn(i64) -> i64,
+    pub load_import_locals_fn:
+        extern "C" fn(*mut pyre_interpreter::PyFrame) -> pyre_object::PyObjectRef,
     /// IMPORT_NAME's globals argument — `self.get_w_globals()`.  (frame) → ref.
-    pub load_import_globals_fn: extern "C" fn(i64) -> i64,
+    pub load_import_globals_fn:
+        extern "C" fn(*mut pyre_interpreter::PyFrame) -> pyre_object::PyObjectRef,
     /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.
     /// The array is the forced `popvalues` list; length travels inside
     /// the array, so any arity fits.
-    pub newtuple_from_array_fn: extern "C" fn(i64) -> i64,
+    pub newtuple_from_array_fn:
+        extern "C" fn(*const pyre_object::object_array::GcTypedArray) -> pyre_object::PyObjectRef,
     /// BUILD_MAP — the forced `[k0, v0, ...]` pair array → dict.  Length
     /// travels inside the array, so any arity fits.
-    pub build_map_from_array_fn: extern "C" fn(i64) -> i64,
+    pub build_map_from_array_fn:
+        extern "C" fn(*const pyre_object::object_array::GcTypedArray) -> pyre_object::PyObjectRef,
     /// BUILD_SET — the forced element array → set (fallible: element
     /// hashing may run user `__hash__` / raise on a non-hashable element).
-    pub build_set_from_array_fn: extern "C" fn(i64) -> i64,
+    pub build_set_from_array_fn:
+        extern "C" fn(*const pyre_object::object_array::GcTypedArray) -> pyre_object::PyObjectRef,
     /// BUILD_STRING — the forced fragment array → concatenated str.
     /// Fragments are already strings (formatted first), so this runs no
     /// user code and is infallible (`Plain`).
-    pub build_string_from_array_fn: extern "C" fn(i64) -> i64,
+    pub build_string_from_array_fn:
+        extern "C" fn(*const pyre_object::object_array::GcTypedArray) -> pyre_object::PyObjectRef,
     /// `newlist(list_w)` (`objspace.py`) — (ref array) → new list.  The
     /// array is the forced `popvalues_mutable` list; length travels
     /// inside the array, so any arity fits.
-    pub newlist_from_array_fn: extern "C" fn(i64) -> i64,
+    pub newlist_from_array_fn:
+        extern "C" fn(*const pyre_object::object_array::GcTypedArray) -> pyre_object::PyObjectRef,
     /// `bhimpl_unpack_sequence` — (count, seq) → validated tuple of items.
-    pub unpack_sequence_fn: extern "C" fn(i64, i64) -> i64,
+    pub unpack_sequence_fn:
+        extern "C" fn(i64, pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// Read item `index` out of the validated unpack tuple — (index, seq) → item.
-    pub unpack_item_fn: extern "C" fn(i64, i64) -> i64,
+    pub unpack_item_fn: extern "C" fn(i64, pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// UNPACK_EX residual — `(before, after, seq) → tuple` of the
     /// `before + 1 + after` slots (head items, starred list, tail items)
     /// in TOS order; read back with `unpack_item_fn`.
-    pub unpack_ex_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub unpack_ex_fn: extern "C" fn(i64, i64, pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// `bhimpl_build_slice` — (argc, start, stop, step) → new slice.
-    pub build_slice_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub build_slice_fn: extern "C" fn(
+        i64,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef,
     /// `RAISE_VARARGS` normalization helper used before `raise/r`.
     /// `(frame: Ref, exc: Ref, cause: Ref) → Ref` — normalization reads the
     /// current activation's execution context, as `space.getexecutioncontext()`.
-    pub normalize_raise_varargs_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub normalize_raise_varargs_fn: extern "C" fn(
+        *const pyre_interpreter::PyFrame,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef,
     /// Read per-thread `CURRENT_EXCEPTION` — used by a catch-covered bare
     /// `RAISE_VARARGS(0)`.
-    pub get_current_exception_fn: extern "C" fn() -> i64,
+    pub get_current_exception_fn: extern "C" fn() -> pyre_object::PyObjectRef,
     /// The value `PUSH_EXC_INFO` saves: the current exception, or `None`.
-    pub current_exception_or_none_fn: extern "C" fn() -> i64,
+    pub current_exception_or_none_fn: extern "C" fn() -> pyre_object::PyObjectRef,
     /// `raise_varargs(0)` value — the active exception, or a fresh
     /// `RuntimeError("No active exception to reraise")` when none is live.
     /// Used by a bare `RAISE_VARARGS(0)` with no static `last_exception` pair.
-    pub reraise_varargs_zero_fn: extern "C" fn() -> i64,
+    pub reraise_varargs_zero_fn: extern "C" fn() -> pyre_object::PyObjectRef,
     /// Write per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`
     /// (set to new exc) and `POP_EXCEPT` (restore saved prev).
-    pub set_current_exception_fn: extern "C" fn(i64),
+    pub set_current_exception_fn: extern "C" fn(pyre_object::PyObjectRef),
     /// Clear the exception-propagation carrier after `PUSH_EXC_INFO` has
     /// transferred ownership to `CURRENT_EXCEPTION`.
     pub clear_in_flight_exception_fn: extern "C" fn(),

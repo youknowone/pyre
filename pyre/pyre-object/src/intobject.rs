@@ -344,13 +344,13 @@ pub unsafe fn descr_str(obj: PyObjectRef) -> PyObjectRef {
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_w_int_new(value: i64) -> i64 {
-    w_int_new(value) as i64
+pub extern "C" fn jit_w_int_new(value: i64) -> PyObjectRef {
+    w_int_new(value)
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_w_small_int_const(value: i64) -> i64 {
-    w_small_int_const(value) as i64
+pub extern "C" fn jit_w_small_int_const(value: i64) -> PyObjectRef {
+    w_small_int_const(value)
 }
 
 /// True iff `value` falls inside the prebuilt-int cache range AND

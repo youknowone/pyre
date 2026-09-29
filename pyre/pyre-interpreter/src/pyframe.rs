@@ -7007,8 +7007,8 @@ fn delitem_str_object(w_obj: PyObjectRef, name: &str) -> Result<(), crate::PyErr
 /// pins the frame's absent mapping with a guard and hands this dict out
 /// directly, which for an OPTIMIZED frame is already the independent copy
 /// `frame_locals_snapshot` returns.
-pub extern "C" fn jit_locals_dict_new() -> i64 {
-    unsafe { pyre_object::w_dict_new() as i64 }
+pub extern "C" fn jit_locals_dict_new() -> PyObjectRef {
+    unsafe { pyre_object::w_dict_new() }
 }
 
 /// `pyframe.py fast2locals` for ONE visible fastlocal slot: bind
@@ -7030,17 +7030,17 @@ pub extern "C" fn jit_locals_dict_new() -> i64 {
 /// `dict` must be a live dict, `code` a live `CodeObject` with
 /// `index < varnames.len()`, and `value` a live non-null `W_Root`.
 pub extern "C" fn jit_locals_dict_setitem_local(
-    dict: i64,
-    code: i64,
+    dict: PyObjectRef,
+    code: *const CodeObject,
     index: i64,
-    value: i64,
-) -> i64 {
+    value: PyObjectRef,
+) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(dict as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(dict);
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(value as PyObjectRef);
-    let code = unsafe { &*(code as usize as *const CodeObject) };
+    let _ = pyre_object::gc_roots::pin_root(value);
+    let code = unsafe { &*(code) };
     let name: &str = &code.varnames[index as usize];
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str(
@@ -7049,7 +7049,7 @@ pub extern "C" fn jit_locals_dict_setitem_local(
             pyre_object::gc_roots::shadow_stack_get(value_slot),
         );
     }
-    pyre_object::gc_roots::shadow_stack_get(dict_slot) as i64
+    pyre_object::gc_roots::shadow_stack_get(dict_slot)
 }
 
 /// `pyframe.py fast2locals` for ONE cell or freevar slot: bind
@@ -7068,17 +7068,17 @@ pub extern "C" fn jit_locals_dict_setitem_local(
 /// `dict` must be a live dict, `code` a live `CodeObject` with `index` inside
 /// [`PyFrame::cell_slot_names`], and `value` a live non-null `W_Root`.
 pub extern "C" fn jit_locals_dict_setitem_cell(
-    dict: i64,
-    code: i64,
+    dict: PyObjectRef,
+    code: *const CodeObject,
     index: i64,
-    value: i64,
-) -> i64 {
+    value: PyObjectRef,
+) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(dict as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(dict);
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(value as PyObjectRef);
-    let code = unsafe { &*(code as usize as *const CodeObject) };
+    let _ = pyre_object::gc_roots::pin_root(value);
+    let code = unsafe { &*(code) };
     let name = PyFrame::cell_slot_names(code)
         .nth(index as usize)
         .expect("cell slot index is inside cell_slot_names");
@@ -7089,7 +7089,7 @@ pub extern "C" fn jit_locals_dict_setitem_cell(
             pyre_object::gc_roots::shadow_stack_get(value_slot),
         );
     }
-    pyre_object::gc_roots::shadow_stack_get(dict_slot) as i64
+    pyre_object::gc_roots::shadow_stack_get(dict_slot)
 }
 
 /// `pyframe.py fast2locals` for ONE visible fastlocal slot that is
@@ -7110,11 +7110,15 @@ pub extern "C" fn jit_locals_dict_setitem_cell(
 /// # Safety
 /// `dict` must be a live dict and `code` a live `CodeObject` with
 /// `index < varnames.len()`.
-pub extern "C" fn jit_locals_dict_delitem_local(dict: i64, code: i64, index: i64) -> i64 {
+pub extern "C" fn jit_locals_dict_delitem_local(
+    dict: PyObjectRef,
+    code: *const CodeObject,
+    index: i64,
+) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(dict as PyObjectRef);
-    let code = unsafe { &*(code as usize as *const CodeObject) };
+    let _ = pyre_object::gc_roots::pin_root(dict);
+    let code = unsafe { &*(code) };
     let name: &str = &code.varnames[index as usize];
     let key_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_str_new_managed(name) });
@@ -7125,12 +7129,12 @@ pub extern "C" fn jit_locals_dict_delitem_local(dict: i64, code: i64, index: i64
         )
     };
     match deleted {
-        Ok(_) => pyre_object::gc_roots::shadow_stack_get(dict_slot) as i64,
+        Ok(_) => pyre_object::gc_roots::shadow_stack_get(dict_slot),
         Err(_) => {
             let _ = crate::baseobjspace::take_pending_dict_key_error(
                 pyre_object::gc_roots::shadow_stack_get(key_slot),
             );
-            pyre_object::PY_NULL as i64
+            pyre_object::PY_NULL
         }
     }
 }
@@ -7144,10 +7148,10 @@ pub extern "C" fn jit_locals_dict_delitem_local(dict: i64, code: i64, index: i64
 ///
 /// # Safety
 /// `w_locals` must be a live mapping.
-pub extern "C" fn jit_locals_dict_snapshot(w_locals: i64) -> i64 {
+pub extern "C" fn jit_locals_dict_snapshot(w_locals: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let locals_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_locals as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(w_locals);
     let snapshot_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_dict_new() });
     // `dict_update` walks a mapping's `keys()`, so both sides are reloaded
@@ -7158,8 +7162,8 @@ pub extern "C" fn jit_locals_dict_snapshot(w_locals: i64) -> i64 {
         pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
         pyre_object::gc_roots::shadow_stack_get(locals_slot),
     ) {
-        Ok(()) => pyre_object::gc_roots::shadow_stack_get(snapshot_slot) as i64,
-        Err(_) => pyre_object::PY_NULL as i64,
+        Ok(()) => pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
+        Err(_) => pyre_object::PY_NULL,
     }
 }
 
@@ -7178,18 +7182,18 @@ pub extern "C" fn jit_locals_dict_snapshot(w_locals: i64) -> i64 {
 ///
 /// # Safety
 /// `dst` and `src` must be live mappings.
-pub extern "C" fn jit_locals_dict_update(dst: i64, src: i64) -> i64 {
+pub extern "C" fn jit_locals_dict_update(dst: PyObjectRef, src: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let dst_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(dst as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(dst);
     let src_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(src as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(src);
     match merge_extra_locals(
         pyre_object::gc_roots::shadow_stack_get(dst_slot),
         pyre_object::gc_roots::shadow_stack_get(src_slot),
     ) {
-        Ok(()) => pyre_object::gc_roots::shadow_stack_get(dst_slot) as i64,
-        Err(_) => pyre_object::PY_NULL as i64,
+        Ok(()) => pyre_object::gc_roots::shadow_stack_get(dst_slot),
+        Err(_) => pyre_object::PY_NULL,
     }
 }
 

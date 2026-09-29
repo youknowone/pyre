@@ -1779,8 +1779,8 @@ pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
 /// `Ok(false)` and a published error both answer 0. The residual is a
 /// raising `dont_look_inside` call, so `GUARD_NO_EXCEPTION` after it
 /// distinguishes them.
-pub extern "C" fn is_true_lookup_jit_abi(obj: i64) -> i64 {
-    match is_true_lookup(obj as PyObjectRef) {
+pub extern "C" fn is_true_lookup_jit_abi(obj: PyObjectRef) -> i64 {
+    match is_true_lookup(obj) {
         Ok(value) => value as i64,
         Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
     }
@@ -1801,8 +1801,8 @@ pub(crate) fn bool_must_return_bool(w_res: PyObjectRef) -> PyError {
 ///
 /// The helper only constructs an error; the bridge publishes it and
 /// returns 0.
-pub extern "C" fn bool_must_return_bool_jit_abi(obj: i64) -> i64 {
-    crate::runtime_ops::jit_publish_residual_error(bool_must_return_bool(obj as PyObjectRef))
+pub extern "C" fn bool_must_return_bool_jit_abi(obj: PyObjectRef) -> i64 {
+    crate::runtime_ops::jit_publish_residual_error(bool_must_return_bool(obj))
 }
 
 /// Direct truthiness body for `is_true`: the by-layout fast paths for exact
@@ -21240,16 +21240,16 @@ pub fn generatorentry_portal(
 
 /// C ABI of [`generatorentry_portal`]. `CALL_ASSEMBLER` and
 /// `ll_portal_runner` both enter here.
-pub extern "C" fn generatorentry_portal_c(pycode: i64, w_gen: i64, w_arg: i64) -> i64 {
-    match generatorentry_portal(
-        pycode as PyObjectRef,
-        w_gen as PyObjectRef,
-        w_arg as PyObjectRef,
-    ) {
-        Ok(result) => result as i64,
+pub extern "C" fn generatorentry_portal_c(
+    pycode: PyObjectRef,
+    w_gen: PyObjectRef,
+    w_arg: PyObjectRef,
+) -> PyObjectRef {
+    match generatorentry_portal(pycode, w_gen, w_arg) {
+        Ok(result) => result,
         Err(mut err) => {
             crate::stack_check::park_jit_pending_error(err);
-            0
+            PY_NULL
         }
     }
 }
@@ -23164,7 +23164,7 @@ fn contains_list(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyE
         // Call the registered residual, not `contains_int_list_locked`.
         // That helper is `dont_look_inside` and returns `Result`, so the
         // codewriter has no word-ABI target for it; descent would decline.
-        return Ok(crate::listobject::jit_list_contains_int(haystack as i64, needle as i64) != 0);
+        return Ok(crate::listobject::jit_list_contains_int(haystack, needle) != 0);
     }
     Ok(matches!(
         crate::listobject::w_list_find_or_count(haystack, needle, 0, i64::MAX, false)?,

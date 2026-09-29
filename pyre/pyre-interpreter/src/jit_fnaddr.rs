@@ -103,42 +103,27 @@ extern "C" fn bh_probe_note_store_word(obj: i64, offset: i64, site: i64) {
 /// `descr_pop` graph still owns the IndexError. `Option<PyObjectRef>` is two
 /// words with no pointer niche, so publishing the Rust function would return
 /// the `Some` discriminant instead of the popped object.
-extern "C" fn w_list_pop_end_word(obj: i64) -> i64 {
-    match unsafe {
-        pyre_object::listobject::w_list_pop_end(obj as usize as pyre_object::PyObjectRef)
-    } {
-        Some(item) => item as usize as i64,
-        None => 0,
-    }
+extern "C" fn w_list_pop_end_word(obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::listobject::w_list_pop_end(obj) }.unwrap_or(pyre_object::PY_NULL)
 }
 
 /// One-word residual ABI for the descended `w_list_pop_end_inner` body.
-extern "C" fn w_list_pop_end_inner_word(obj: i64) -> i64 {
-    match unsafe {
-        pyre_object::listobject::w_list_pop_end_inner(obj as usize as pyre_object::PyObjectRef)
-    } {
-        Some(item) => item as usize as i64,
-        None => 0,
-    }
+extern "C" fn w_list_pop_end_inner_word(obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::listobject::w_list_pop_end_inner(obj) }.unwrap_or(pyre_object::PY_NULL)
 }
 
-/// Word-ABI bridge for the scalar bytecode read used by translated residual
-/// calls.  The backends call integer helpers uniformly as `(i64, ..) -> i64`;
-/// the raw Rust function is `(pointer, usize) -> u16`, which is a different
-/// `call_indirect` table type on wasm32.
-extern "C" fn bh_code_unit_at(code: i64, index: i64) -> i64 {
-    let code = unsafe { &*(code as usize as *const crate::CodeObject) };
+/// `extern "C"` bridge for the scalar bytecode read used by translated
+/// residual calls: the raw Rust function takes `&CodeObject` and returns
+/// `u16`, which this widens to a word.
+extern "C" fn bh_code_unit_at(code: *const crate::CodeObject, index: i64) -> i64 {
+    let code = unsafe { &*code };
     i64::from(crate::pyopcode::code_unit_at(code, index as usize))
 }
 
-/// Word-ABI bridge for the loop-header predicate. Residual calls use a word
-/// ABI; on wasm32 the raw signature uses `i32` for pointer/`bool` while the
-/// residual call site is `(i64 x n) -> i64`.
-extern "C" fn code_pc_is_loop_header_word(code: i64, pc: i64) -> i64 {
-    crate::loop_headers::code_pc_is_loop_header(
-        code as usize as pyre_object::PyObjectRef,
-        pc as usize,
-    ) as i64
+/// `extern "C"` bridge for the loop-header predicate, widening its `bool`
+/// result to a word.
+extern "C" fn code_pc_is_loop_header_word(code: pyre_object::PyObjectRef, pc: i64) -> i64 {
+    crate::loop_headers::code_pc_is_loop_header(code, pc as usize) as i64
 }
 
 /// `descr.py CallDescr.create_call_stub`: call with the actual RESULT type,
@@ -146,21 +131,17 @@ extern "C" fn code_pc_is_loop_header_word(code: i64, pc: i64) -> i64 {
 /// the result on x86, while our residual dispatcher reads a whole word.
 /// The policy macro cannot emit this bridge from the opaque `PyObjectRef`
 /// alias spelling, so supply it at the source-only registry boundary.
-extern "C" fn bh_w_type_issubtype(w_type: i64, cls: i64) -> i64 {
-    unsafe {
-        pyre_object::w_type_issubtype(
-            w_type as pyre_object::PyObjectRef,
-            cls as pyre_object::PyObjectRef,
-        ) as i64
-    }
+extern "C" fn bh_w_type_issubtype(
+    w_type: pyre_object::PyObjectRef,
+    cls: pyre_object::PyObjectRef,
+) -> i64 {
+    unsafe { pyre_object::w_type_issubtype(w_type, cls) as i64 }
 }
 
 /// `w_type_is_cpython_immutabletype` returns `bool`. Same widening as
 /// [`bh_w_type_issubtype`]: the residual dispatcher reads a whole word.
-extern "C" fn bh_w_type_is_cpython_immutabletype(w_type: i64) -> i64 {
-    unsafe {
-        pyre_object::w_type_is_cpython_immutabletype(w_type as pyre_object::PyObjectRef) as i64
-    }
+extern "C" fn bh_w_type_is_cpython_immutabletype(w_type: pyre_object::PyObjectRef) -> i64 {
+    unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) as i64 }
 }
 
 /// `LoadAttr::name_idx` returns `u32`. Residual calls read an `i64` result.
@@ -672,8 +653,8 @@ fn push_raw_fnaddr(
 /// signature before returning, and by the time the address arrives here there
 /// is nothing left for [`ResidualSlot`] / [`ResidualRet`] to read. The check
 /// is not skipped, only moved: each accessor takes its address through
-/// `runtime_ops`'s `word_fn_addr!`, which ascribes the fn item to an explicit
-/// `extern "C" fn(i64, ..) -> i64` first. Publishing through this helper
+/// `runtime_ops`'s `word_fn_addr!`, which passes the fn item through an
+/// `extern "C" fn(A1, ..) -> R` bounded by the same two traits first. Publishing through this helper
 /// asserts that the address came from such an accessor; anything else uses
 /// the checked publishers above.
 fn push_word_accessor_alias_pair(
@@ -1687,16 +1668,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // The rest of the scope-local API a bracket body calls on its guard: the
     // slice-taking pair through the one-word array ABI `publish_roots` uses,
     // and the run normalize and slot write, whose arguments are words.
-    let scope_publish: extern "C" fn(&pyre_object::gc_roots::RootScope, i64) -> i64 =
-        pyre_object::gc_roots::RootScope::publish_jit_abi;
+    let scope_publish: extern "C" fn(
+        &pyre_object::gc_roots::RootScope,
+        *const pyre_object::object_array::GcTypedArray,
+    ) -> i64 = pyre_object::gc_roots::RootScope::publish_jit_abi;
     cpa2(
         &mut entries,
         "pyre_object::gc_roots::RootScope::publish",
         "gc_roots::RootScope::publish",
         scope_publish,
     );
-    let scope_pin_roots: extern "C" fn(&pyre_object::gc_roots::RootScope, i64) -> i64 =
-        pyre_object::gc_roots::RootScope::pin_roots_jit_abi;
+    let scope_pin_roots: extern "C" fn(
+        &pyre_object::gc_roots::RootScope,
+        *const pyre_object::object_array::GcTypedArray,
+    ) -> i64 = pyre_object::gc_roots::RootScope::pin_roots_jit_abi;
     cpa2(
         &mut entries,
         "pyre_object::gc_roots::RootScope::pin_roots",
@@ -5951,7 +5936,8 @@ mod tests {
         // before casting to Signed. The trampoline implements that
         // conversion for the word-returning residual ABI; a raw Rust bool
         // function leaves the upper return-register bits undefined on x86.
-        let target: extern "C" fn(i64, i64) -> i64 = super::bh_w_type_issubtype;
+        let target: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64 =
+            super::bh_w_type_issubtype;
         let entries = jit_trace_fnaddrs();
         for path in [
             "pyre_object::typeobject::w_type_issubtype",

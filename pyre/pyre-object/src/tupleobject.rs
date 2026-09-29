@@ -743,10 +743,10 @@ pub unsafe fn w_tuple_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
 }
 
 #[majit_macros::elidable]
-pub extern "C" fn jit_tuple_getitem(tuple: i64, index: i64) -> i64 {
+pub extern "C" fn jit_tuple_getitem(tuple: PyObjectRef, index: i64) -> PyObjectRef {
     unsafe {
-        match w_tuple_getitem(tuple as PyObjectRef, index) {
-            Some(value) => value as i64,
+        match w_tuple_getitem(tuple, index) {
+            Some(value) => value,
             None => panic!("tuple index out of range in JIT"),
         }
     }
@@ -821,7 +821,7 @@ mod tests {
         let tup = w_tuple_new(vec![w_int_new(3), w_int_new(5)]);
         unsafe {
             assert_eq!(
-                crate::intobject::w_int_get_value(jit_tuple_getitem(tup as i64, 1) as PyObjectRef),
+                crate::intobject::w_int_get_value(jit_tuple_getitem(tup, 1)),
                 5
             );
         }

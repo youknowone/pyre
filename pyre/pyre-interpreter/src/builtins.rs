@@ -5336,20 +5336,11 @@ pub(crate) unsafe fn abs_uses_builtin(obj: PyObjectRef) -> bool {
     .any(|tp| std::ptr::eq(src, pyre_object::get_instantiate(tp)))
 }
 
-/// Word-ABI residual bridge for [`abs_uses_builtin`].
-///
-/// The residual-call ABI is uniformly `(i64xn) -> i64`
-/// (`majit-backend-wasm/src/codegen.rs residual_call_i64_arity`), while
-/// `fn(PyObjectRef) -> bool` is `(i32) -> i32` on wasm32, so publishing the
-/// Rust function itself makes the direct `call_indirect` trap on a table-entry
-/// type mismatch.  Word-width agreement on 64-bit targets hides the
-/// difference there.  `jit_force_vref` (`pyre-jit-trace/src/helpers.rs`) is
-/// the same bridge for the same reason.
-///
-/// The receiver arrives as the residual word carrying a live `PyObjectRef`,
-/// which is what the caller already guarantees for the wrapped call.
-pub(crate) extern "C" fn bh_abs_uses_builtin(obj: i64) -> i64 {
-    i64::from(unsafe { abs_uses_builtin(obj as usize as PyObjectRef) })
+/// `extern "C"` residual bridge for [`abs_uses_builtin`], widening its `bool`
+/// result to a word: a raw `-> bool` target defines only the low byte of the
+/// result on x86, while the residual dispatcher reads a whole word.
+pub(crate) extern "C" fn bh_abs_uses_builtin(obj: PyObjectRef) -> i64 {
+    i64::from(unsafe { abs_uses_builtin(obj) })
 }
 
 fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -18686,14 +18677,14 @@ fn dir_names_from_locals_mapping(
 /// `str` keys only.  An error is nevertheless reported as `PY_NULL` rather
 /// than published, and the caller side-exits on it, so the residual `dir()`
 /// re-runs and raises from the interpreter.
-pub extern "C" fn jit_dir_names_from_locals(mapping: i64) -> i64 {
+pub extern "C" fn jit_dir_names_from_locals(mapping: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let mapping_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(mapping as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(mapping);
     let mapping = pyre_object::gc_roots::shadow_stack_get(mapping_slot);
     match dir_names_from_locals_mapping(mapping) {
-        Ok(names) => names as i64,
-        Err(_) => pyre_object::PY_NULL as i64,
+        Ok(names) => names,
+        Err(_) => pyre_object::PY_NULL,
     }
 }
 
@@ -25236,15 +25227,18 @@ pub(crate) fn builtin_dunder_import_keyword(
 /// The result is one word; `args: &[PyObjectRef]` is still a fat pointer
 /// and is not a residual slot. The address is published through the
 /// argument hatch so the walker refuses the call.
-pub extern "C" fn builtin_dunder_import_keyword_jit_abi(args_ptr: i64, args_len: i64) -> i64 {
-    let args = if args_ptr == 0 || args_len <= 0 {
+pub extern "C" fn builtin_dunder_import_keyword_jit_abi(
+    args_ptr: *const PyObjectRef,
+    args_len: i64,
+) -> PyObjectRef {
+    let args = if args_ptr.is_null() || args_len <= 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(args_ptr as *const PyObjectRef, args_len as usize) }
+        unsafe { std::slice::from_raw_parts(args_ptr, args_len as usize) }
     };
     match builtin_dunder_import_keyword(args) {
-        Ok(result) => result as i64,
-        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
     }
 }
 
@@ -25378,21 +25372,15 @@ pub(crate) fn import_bound_objects_index_level(
 
 /// One-word residual-call ABI for [`import_bound_objects_index_level`].
 pub extern "C" fn import_bound_objects_index_level_jit_abi(
-    name_obj: i64,
-    w_globals: i64,
-    w_locals: i64,
-    w_fromlist: i64,
-    level_obj: i64,
-) -> i64 {
-    match import_bound_objects_index_level(
-        name_obj as PyObjectRef,
-        w_globals as PyObjectRef,
-        w_locals as PyObjectRef,
-        w_fromlist as PyObjectRef,
-        level_obj as PyObjectRef,
-    ) {
-        Ok(result) => result as i64,
-        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    name_obj: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    level_obj: PyObjectRef,
+) -> PyObjectRef {
+    match import_bound_objects_index_level(name_obj, w_globals, w_locals, w_fromlist, level_obj) {
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
     }
 }
 

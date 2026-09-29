@@ -130,8 +130,7 @@ const PLACEHOLDER_CALLEE: u16 = 0;
 /// (`jit_publish_residual_error`): `BH_LAST_EXC_VALUE` for the blackhole
 /// handler and the compiled `GUARD_NO_EXCEPTION` cell. The return is the
 /// residual ABI's zero; the handler does not read it.
-pub extern "C" fn bh_len_tail(dunder_result: i64) -> i64 {
-    let w_res = dunder_result as pyre_object::PyObjectRef;
+pub extern "C" fn bh_len_tail(w_res: pyre_object::PyObjectRef) -> i64 {
     match pyre_interpreter::baseobjspace::len_result_tail(w_res) {
         Ok(length) => pyre_object::w_int_new(length) as i64,
         Err(err) => {
@@ -334,7 +333,7 @@ mod tests {
     fn the_len_tail_applies_check_len_result() {
         let cell = &majit_metainterp::blackhole::BH_LAST_EXC_VALUE;
         cell.with(|c| c.set(0));
-        let answer = bh_len_tail(pyre_object::w_bool_from(true) as i64);
+        let answer = bh_len_tail(pyre_object::w_bool_from(true));
         assert_eq!(cell.with(|c| c.get()), 0, "a valid length must not raise");
         let answer = answer as pyre_object::PyObjectRef;
         assert!(
@@ -347,7 +346,7 @@ mod tests {
             "the answer is the checked length",
         );
 
-        bh_len_tail(pyre_object::w_int_new(-1) as i64);
+        bh_len_tail(pyre_object::w_int_new(-1));
         assert_ne!(
             cell.with(|c| c.get()),
             0,

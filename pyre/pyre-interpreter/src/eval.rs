@@ -322,8 +322,8 @@ pub fn frame_anchor_release(depth: usize) {
 /// Each spelling gets its own bridge because `jit_trace_fnaddrs()` reads one
 /// address back as one function: two unrelated paths sharing an address is
 /// what `registered_paths_sharing_an_address_are_alias_spellings` refuses.
-pub extern "C" fn frame_anchor_push_jit_abi(frame: i64) -> i64 {
-    frame_anchor_push(frame as *mut PyFrame) as i64
+pub extern "C" fn frame_anchor_push_jit_abi(frame: *mut PyFrame) -> i64 {
+    frame_anchor_push(frame) as i64
 }
 
 /// One-word residual-call ABI for [`frame_anchor_live`].
@@ -342,10 +342,10 @@ pub extern "C" fn frame_anchor_release_jit_abi(depth: i64) {
 /// The anchor is one word, and the trace keeps that word: the construction is
 /// handed back without running `Drop`, exactly as the aggregate return did
 /// when the method itself was the registered target.
-pub extern "C" fn frame_anchor_new_jit_abi(frame: i64) -> i64 {
+pub extern "C" fn frame_anchor_new_jit_abi(frame: *mut PyFrame) -> i64 {
     // SAFETY: the residual's slot holds the frame the walked graph read it
     // from, or null, which `from_raw` anticipates.
-    let anchor = unsafe { FrameAnchor::from_raw(frame as *mut PyFrame) };
+    let anchor = unsafe { FrameAnchor::from_raw(frame) };
     let depth = anchor.depth;
     std::mem::forget(anchor);
     depth as i64

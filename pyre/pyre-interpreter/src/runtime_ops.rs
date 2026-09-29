@@ -36,21 +36,23 @@ pub fn make_function_from_code_obj_with_globals_obj(
     crate::function::function_new_from_code(code_obj, w_globals)
 }
 
-fn decode_name(name_ptr: i64, name_len: i64) -> Option<&'static str> {
-    if name_ptr == 0 || name_len < 0 {
+fn decode_name(name_ptr: *const u8, name_len: i64) -> Option<&'static str> {
+    if name_ptr.is_null() || name_len < 0 {
         return None;
     }
-    let bytes = unsafe { slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
+    let bytes = unsafe { slice::from_raw_parts(name_ptr, name_len as usize) };
     std::str::from_utf8(bytes).ok()
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_make_function_from_globals(globals: i64, code_obj: i64) -> i64 {
-    // `globals` is the globals OBJECT (the JIT threads the vable
+pub extern "C" fn jit_make_function_from_globals(
+    w_globals: PyObjectRef,
+    code_obj: PyObjectRef,
+) -> PyObjectRef {
+    // `w_globals` is the globals OBJECT (the JIT threads the vable
     // `w_globals` slot).  Capture it directly; the raw `*mut DictStorage`
     // is recovered from the object wherever a frame still needs it.
-    let w_globals = globals as PyObjectRef;
-    make_function_from_code_obj_with_globals_obj(code_obj as PyObjectRef, w_globals) as i64
+    make_function_from_code_obj_with_globals_obj(code_obj, w_globals)
 }
 
 /// SET_FUNCTION_ATTRIBUTE residual: stamp one attribute on `func` per the
@@ -64,9 +66,11 @@ pub extern "C" fn jit_make_function_from_globals(globals: i64, code_obj: i64) ->
 /// `SetFunctionAttribute` arm.  Sets a typed field on the function; runs no
 /// user code and never raises → `Plain`.
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_set_function_attribute(func: i64, attr: i64, flag: i64) -> i64 {
-    let func = func as PyObjectRef;
-    let attr = attr as PyObjectRef;
+pub extern "C" fn jit_set_function_attribute(
+    func: PyObjectRef,
+    attr: PyObjectRef,
+    flag: i64,
+) -> i64 {
     match flag {
         0 => unsafe { crate::function_set_defaults(func, attr) },
         1 => unsafe { crate::function::function_set_kwdefaults_from_definition(func, attr) },
@@ -96,14 +100,13 @@ pub extern "C" fn jit_set_function_attribute(func: i64, attr: i64, flag: i64) ->
 
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_load_name_from_namespace(
-    frame_ptr: i64,
-    namespace_ptr: i64,
-    name_ptr: i64,
+    frame_ptr: *const crate::pyframe::PyFrame,
+    mut w_globals: PyObjectRef,
+    name_ptr: *const u8,
     name_len: i64,
-) -> i64 {
-    let mut w_globals = namespace_ptr as PyObjectRef;
+) -> PyObjectRef {
     let Some(name) = decode_name(name_ptr, name_len) else {
-        return 0;
+        return PY_NULL;
     };
     // `pyopcode.py _load_global`: `space.finditem_str(w_globals,
     // varname)`.  finditem_str takes the borrowed-string fast path for real
@@ -117,11 +120,11 @@ pub extern "C" fn jit_load_name_from_namespace(
             Ok(value) => value,
             Err(mut error) => {
                 jit_publish_exception(error.to_exc_object());
-                return 0;
+                return PY_NULL;
             }
         };
         if let Some(v) = value {
-            return v as i64;
+            return v;
         }
     }
     // Globals miss: `_load_global` (pyopcode.py) falls back to
@@ -135,8 +138,8 @@ pub extern "C" fn jit_load_name_from_namespace(
     // raises NameError.  The accessor still prefers the picked module when a
     // frame does carry one, so a mid-execution `__builtins__` rebind is
     // honoured exactly as before.
-    let w_builtin = if frame_ptr != 0 {
-        unsafe { (*(frame_ptr as *const crate::pyframe::PyFrame)).get_builtin() }
+    let w_builtin = if !frame_ptr.is_null() {
+        unsafe { (*frame_ptr).get_builtin() }
     } else {
         std::ptr::null_mut()
     };
@@ -144,7 +147,7 @@ pub extern "C" fn jit_load_name_from_namespace(
         if let Some(v) =
             unsafe { crate::eval::load_global_via_cache_extern(w_globals, w_builtin, name) }
         {
-            return v as i64;
+            return v;
         }
     } else if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
         // `_load_global` builtin fallback also fires on non-module-dict
@@ -153,20 +156,19 @@ pub extern "C" fn jit_load_name_from_namespace(
         if !w_builtin_dict.is_null()
             && let Ok(Some(v)) = crate::baseobjspace::finditem_str(w_builtin_dict, name)
         {
-            return v as i64;
+            return v;
         }
     }
-    std::ptr::null_mut::<()>() as i64
+    PY_NULL
 }
 
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_store_name_to_namespace(
-    namespace_ptr: i64,
-    name_ptr: i64,
+    w_globals: PyObjectRef,
+    name_ptr: *const u8,
     name_len: i64,
-    value: i64,
+    value: PyObjectRef,
 ) -> i64 {
-    let w_globals = namespace_ptr as PyObjectRef;
     let Some(name) = decode_name(name_ptr, name_len) else {
         return 0;
     };
@@ -177,15 +179,11 @@ pub extern "C" fn jit_store_name_to_namespace(
     if !w_globals.is_null() {
         if unsafe { pyre_object::is_dict(w_globals) } {
             unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str(
-                    w_globals,
-                    name,
-                    value as PyObjectRef,
-                );
+                pyre_object::dictmultiobject::w_dict_setitem_str(w_globals, name, value);
             }
         } else {
             let _key_roots = pyre_object::gc_roots::push_roots();
-            let live = pyre_object::gc_roots::pin_roots(&[w_globals, value as PyObjectRef]);
+            let live = pyre_object::gc_roots::pin_roots(&[w_globals, value]);
             let key_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
             if let Err(mut error) = crate::baseobjspace::setitem(
@@ -200,8 +198,12 @@ pub extern "C" fn jit_store_name_to_namespace(
     0
 }
 
-type JitFunctionCaller =
-    extern "C" fn(frame_ptr: i64, callable: i64, args: *const i64, nargs: i64) -> i64;
+type JitFunctionCaller = extern "C" fn(
+    frame_ptr: *const crate::pyframe::PyFrame,
+    callable: PyObjectRef,
+    args: *const PyObjectRef,
+    nargs: i64,
+) -> i64;
 
 static JIT_FUNCTION_CALLER: OnceLock<JitFunctionCaller> = OnceLock::new();
 
@@ -257,11 +259,19 @@ pub(crate) fn jit_publish_exception(exc_obj: PyObjectRef) {
 /// Publish a residual-call error through both exception channels and return
 /// the one-word sentinel required by the residual-call ABI.
 #[inline]
-pub(crate) fn jit_publish_residual_error(mut error: PyError) -> i64 {
+pub fn jit_publish_residual_error(mut error: PyError) -> i64 {
     let exc_obj = error.to_exc_object();
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(exc_obj as i64));
     jit_publish_exception(exc_obj);
     0
+}
+
+/// [`jit_publish_residual_error`] for a residual whose result is an object:
+/// the null reference is the garbage result the following
+/// `GuardNoException` never reads.
+pub fn jit_publish_residual_error_ref(error: PyError) -> PyObjectRef {
+    jit_publish_residual_error(error);
+    PY_NULL
 }
 
 impl majit_ir::helper_fnaddr::ResidualError for PyError {
@@ -275,9 +285,8 @@ impl majit_ir::helper_fnaddr::ResidualError for PyError {
 /// plus the leading code slot.
 const MAX_KNOWN_BUILTIN_ARGS: usize = 9;
 
-fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
+fn call_builtin_with_args(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
     debug_assert!(args.len() <= MAX_KNOWN_BUILTIN_ARGS);
-    let callable = callable as PyObjectRef;
     let code = unsafe { crate::getcode(callable) } as PyObjectRef;
     // `args` is the compiled call's own argument array; no root walker updates
     // it, and `builtin_code_call` roots nothing of its own — the direct call
@@ -288,7 +297,7 @@ fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
     let root_base = _roots.base();
     let _ = _roots.pin_root(code);
     for &arg in args {
-        let _ = _roots.pin_root(arg as PyObjectRef);
+        let _ = _roots.pin_root(arg);
     }
     let mut rooted = [PY_NULL; MAX_KNOWN_BUILTIN_ARGS];
     for (index, slot) in rooted[..args.len()].iter_mut().enumerate() {
@@ -303,21 +312,25 @@ fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
     }
 }
 
-fn jit_call_user_function_with_args(frame_ptr: i64, callable: i64, args: &[i64]) -> i64 {
+fn jit_call_user_function_with_args(
+    frame_ptr: *const crate::pyframe::PyFrame,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> i64 {
     let Some(caller) = JIT_FUNCTION_CALLER.get().copied() else {
-        let callable = callable as PyObjectRef;
         let code_ptr = unsafe { function_get_code(callable) };
         panic!("jit function caller bridge is not installed for code_ptr={code_ptr:p}");
     };
     caller(frame_ptr, callable, args.as_ptr(), args.len() as i64)
 }
 
-fn call_callable_with_args(frame_ptr: i64, callable: i64, args: &[i64]) -> i64 {
+fn call_callable_with_args(
+    frame_ptr: *const crate::pyframe::PyFrame,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> i64 {
     let _ = frame_ptr;
-    let callable_ref = callable as PyObjectRef;
-    let arg_slice =
-        unsafe { std::slice::from_raw_parts(args.as_ptr() as *const PyObjectRef, args.len()) };
-    match crate::call::call_function_impl_result(callable_ref, arg_slice) {
+    match crate::call::call_function_impl_result(callable, args) {
         Ok(result) => result as i64,
         Err(mut err) => {
             jit_publish_exception(err.to_exc_object());
@@ -329,7 +342,11 @@ fn call_callable_with_args(frame_ptr: i64, callable: i64, args: &[i64]) -> i64 {
 macro_rules! define_callable_call_helper {
     ($name:ident $(, $arg:ident)*) => {
         #[majit_macros::jit_may_force]
-        pub extern "C" fn $name(frame_ptr: i64, callable: i64 $(, $arg: i64)*) -> i64 {
+        pub extern "C" fn $name(
+            frame_ptr: *const crate::pyframe::PyFrame,
+            callable: PyObjectRef
+            $(, $arg: PyObjectRef)*
+        ) -> i64 {
             call_callable_with_args(frame_ptr, callable, &[$($arg),*])
         }
     };
@@ -338,7 +355,7 @@ macro_rules! define_callable_call_helper {
 macro_rules! define_known_builtin_call_helper {
     ($name:ident $(, $arg:ident)*) => {
         #[majit_macros::jit_may_force]
-        pub extern "C" fn $name(callable: i64 $(, $arg: i64)*) -> i64 {
+        pub extern "C" fn $name(callable: PyObjectRef $(, $arg: PyObjectRef)*) -> i64 {
             call_builtin_with_args(callable, &[$($arg),*])
         }
     };
@@ -347,7 +364,11 @@ macro_rules! define_known_builtin_call_helper {
 macro_rules! define_known_function_call_helper {
     ($name:ident $(, $arg:ident)*) => {
         #[majit_macros::jit_may_force]
-        pub extern "C" fn $name(frame_ptr: i64, callable: i64 $(, $arg: i64)*) -> i64 {
+        pub extern "C" fn $name(
+            frame_ptr: *const crate::pyframe::PyFrame,
+            callable: PyObjectRef
+            $(, $arg: PyObjectRef)*
+        ) -> i64 {
             jit_call_user_function_with_args(frame_ptr, callable, &[$($arg),*])
         }
     };
@@ -355,8 +376,8 @@ macro_rules! define_known_function_call_helper {
 
 macro_rules! define_flat_ref_helper {
     ($inner:ident, $name:ident $(, $arg:ident)*) => {
-        pub extern "C" fn $name($($arg: i64),*) -> i64 {
-            $inner(&[$($arg as PyObjectRef),*])
+        pub extern "C" fn $name($($arg: PyObjectRef),*) -> PyObjectRef {
+            $inner(&[$($arg),*])
         }
     };
 }
@@ -643,9 +664,11 @@ pub fn compare_op_from_tag(tag: i64) -> Option<ComparisonOperator> {
 ///
 /// The items argument is a length-prefixed `GcTypedArray` (`bh_newlist_from_array`).
 #[majit_macros::dont_look_inside]
-pub extern "C" fn build_list_from_refs_jit_abi(array: i64) -> i64 {
+pub extern "C" fn build_list_from_refs_jit_abi(
+    array: *const pyre_object::object_array::GcTypedArray,
+) -> PyObjectRef {
     let items = pyre_object::gc_roots::gcarray_ref_items(array);
-    build_list_from_refs(&items) as i64
+    build_list_from_refs(&items)
 }
 
 pub fn build_list_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
@@ -664,9 +687,11 @@ pub fn build_list_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
 ///
 /// Same length-prefixed array word as [`build_list_from_refs_jit_abi`].
 #[majit_macros::dont_look_inside]
-pub extern "C" fn build_tuple_from_refs_jit_abi(array: i64) -> i64 {
+pub extern "C" fn build_tuple_from_refs_jit_abi(
+    array: *const pyre_object::object_array::GcTypedArray,
+) -> PyObjectRef {
     let items = pyre_object::gc_roots::gcarray_ref_items(array);
-    build_tuple_from_refs(&items) as i64
+    build_tuple_from_refs(&items)
 }
 
 pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
@@ -1005,38 +1030,38 @@ pub fn binary_slice_values(
     }
 }
 
-fn build_list_from_args(args: &[PyObjectRef]) -> i64 {
-    build_list_from_refs(args) as i64
+fn build_list_from_args(args: &[PyObjectRef]) -> PyObjectRef {
+    build_list_from_refs(args)
 }
 
-fn build_tuple_from_args(args: &[PyObjectRef]) -> i64 {
-    build_tuple_from_refs(args) as i64
+fn build_tuple_from_args(args: &[PyObjectRef]) -> PyObjectRef {
+    build_tuple_from_refs(args)
 }
 
-fn build_map_from_args(args: &[PyObjectRef]) -> i64 {
+fn build_map_from_args(args: &[PyObjectRef]) -> PyObjectRef {
     // Legacy fixed-arity BUILD_MAP residual reached only on the blackhole /
     // deopt path (the codewriter lowers BUILD_MAP through the array-based
     // `bh_build_map_from_array`).  An unhashable key raises; signal it through
     // `BH_LAST_EXC_VALUE` and return PY_NULL, like the other blackhole-only
     // residuals.
     match build_map_from_refs(args) {
-        Ok(dict) => dict as i64,
+        Ok(dict) => dict,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-            PY_NULL as i64
+            PY_NULL
         }
     }
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_build_list_0() -> i64 {
-    w_list_new(vec![]) as i64
+pub extern "C" fn jit_build_list_0() -> PyObjectRef {
+    w_list_new(vec![])
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_build_tuple_0() -> i64 {
-    w_tuple_new(vec![]) as i64
+pub extern "C" fn jit_build_tuple_0() -> PyObjectRef {
+    w_tuple_new(vec![])
 }
 
 define_flat_ref_helper!(build_list_from_args, jit_build_list_1, arg0);
@@ -1173,59 +1198,82 @@ define_flat_ref_helper!(
     arg7
 );
 
-/// Take a helper's residual-call address with its word signature spelled out.
+/// Take a helper's residual-call address with its signature checked.
 ///
 /// The arity-to-address accessors below erase the signature, so the checked
 /// publishers in `jit_fnaddr` (`ResidualSlot` / `ResidualRet`) never see it and
-/// cannot reject a helper the residual ABI is unable to describe.  Ascribing
-/// the fn item to an explicit `extern "C" fn(i64, ..) -> i64` pointer restores
-/// that check at the one point where the type still exists: a helper whose
-/// parameters or result stop being machine words fails to compile here instead
-/// of being published and then called with the wrong number of registers.
+/// cannot reject a helper the residual ABI is unable to describe.  Passing the
+/// fn item through `residual_extern_addr_N`, whose parameters and result are
+/// bounded by those same traits, restores that check at the one point where
+/// the type still exists: a helper with a parameter or result the residual ABI
+/// cannot describe fails to compile here instead of being published and then
+/// called with the wrong number of registers.
 ///
 /// The second argument is the helper's machine-argument count, which is not
 /// the Python argument count the accessor matches on: a `jit_call_callable_N`
 /// carries the frame and the callable ahead of its `N` arguments, a
 /// `jit_call_known_builtin_N` carries the callable, and a `jit_build_map_N`
 /// takes a key and a value per pair.  Getting that count wrong is the same
-/// build error as a helper drifting off the word ABI: writing `3` for
-/// `jit_call_callable_2` reports `non-primitive cast: extern "C" fn(i64, i64,
-/// i64, i64) -> i64 {jit_call_callable_2} as extern "C" fn(i64, i64, i64) ->
-/// i64`, naming the call site.  That is how the check is exercised without a
-/// helper that actually violates it.
+/// build error: writing `3` for `jit_call_callable_2` reports a mismatched
+/// fn-pointer type naming `jit_call_callable_2` at the call site.
+macro_rules! residual_extern_addr_fns {
+    ($($name:ident($($a:ident),*);)*) => {$(
+        #[inline]
+        fn $name<$($a: crate::jit_fnaddr::ResidualSlot,)* R: crate::jit_fnaddr::ResidualRet>(
+            f: extern "C" fn($($a),*) -> R,
+        ) -> *const () {
+            f as *const ()
+        }
+    )*};
+}
+
+residual_extern_addr_fns! {
+    residual_extern_addr_0();
+    residual_extern_addr_1(A1);
+    residual_extern_addr_2(A1, A2);
+    residual_extern_addr_3(A1, A2, A3);
+    residual_extern_addr_4(A1, A2, A3, A4);
+    residual_extern_addr_5(A1, A2, A3, A4, A5);
+    residual_extern_addr_6(A1, A2, A3, A4, A5, A6);
+    residual_extern_addr_7(A1, A2, A3, A4, A5, A6, A7);
+    residual_extern_addr_8(A1, A2, A3, A4, A5, A6, A7, A8);
+    residual_extern_addr_9(A1, A2, A3, A4, A5, A6, A7, A8, A9);
+    residual_extern_addr_10(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
+}
+
 macro_rules! word_fn_addr {
     ($f:ident, 0) => {
-        $f as extern "C" fn() -> i64 as *const ()
+        residual_extern_addr_0($f)
     };
     ($f:ident, 1) => {
-        $f as extern "C" fn(i64) -> i64 as *const ()
+        residual_extern_addr_1($f)
     };
     ($f:ident, 2) => {
-        $f as extern "C" fn(i64, i64) -> i64 as *const ()
+        residual_extern_addr_2($f)
     };
     ($f:ident, 3) => {
-        $f as extern "C" fn(i64, i64, i64) -> i64 as *const ()
+        residual_extern_addr_3($f)
     };
     ($f:ident, 4) => {
-        $f as extern "C" fn(i64, i64, i64, i64) -> i64 as *const ()
+        residual_extern_addr_4($f)
     };
     ($f:ident, 5) => {
-        $f as extern "C" fn(i64, i64, i64, i64, i64) -> i64 as *const ()
+        residual_extern_addr_5($f)
     };
     ($f:ident, 6) => {
-        $f as extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 as *const ()
+        residual_extern_addr_6($f)
     };
     ($f:ident, 7) => {
-        $f as extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 as *const ()
+        residual_extern_addr_7($f)
     };
     ($f:ident, 8) => {
-        $f as extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 as *const ()
+        residual_extern_addr_8($f)
     };
     ($f:ident, 9) => {
-        $f as extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 as *const ()
+        residual_extern_addr_9($f)
     };
     ($f:ident, 10) => {
-        $f as extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 as *const ()
+        residual_extern_addr_10($f)
     };
 }
 
@@ -1516,13 +1564,13 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_sequence_getitem(seq: i64, index: i64) -> i64 {
-    match sequence_getitem(seq as PyObjectRef, index as usize) {
-        Ok(value) => value as i64,
+pub extern "C" fn jit_sequence_getitem(seq: PyObjectRef, index: i64) -> PyObjectRef {
+    match sequence_getitem(seq, index as usize) {
+        Ok(value) => value,
         // Return PY_NULL on out-of-bounds — the guard after this call
         // will detect the null and side-exit to the interpreter.
         // RPython: residual calls that fail trigger guard failure, not crash.
-        Err(_) => pyre_object::PY_NULL as i64,
+        Err(_) => pyre_object::PY_NULL,
     }
 }
 
@@ -1936,9 +1984,9 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_range_iter_next_or_null(iter: i64) -> i64 {
-    match range_iter_next_or_null(iter as PyObjectRef) {
-        Ok(value) => value as i64,
+pub extern "C" fn jit_range_iter_next_or_null(iter: PyObjectRef) -> PyObjectRef {
+    match range_iter_next_or_null(iter) {
+        Ok(value) => value,
         Err(err) => panic!("range iter next failed in JIT: {err}"),
     }
 }
@@ -2010,19 +2058,19 @@ pub fn via_space_next(iter: PyObjectRef) -> bool {
 /// two seams in sync mirrors `call_jit::publish_residual_call_exception`, the
 /// dual-publish every other MayForce residual uses.
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_next(iter: i64) -> i64 {
-    match crate::baseobjspace::next(iter as PyObjectRef) {
-        Ok(value) => value as i64,
+pub extern "C" fn jit_next(iter: PyObjectRef) -> PyObjectRef {
+    match crate::baseobjspace::next(iter) {
+        Ok(value) => value,
         // StopIteration is not a frame-level exception for FOR_ITER; return
         // null so the GuardNonnull (not GuardNoException) fires.
-        Err(err) if err.matches_stop_iteration() => 0,
+        Err(err) if err.matches_stop_iteration() => PY_NULL,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
             if exc_obj != PY_NULL {
                 majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
             }
             jit_publish_exception(exc_obj);
-            0
+            PY_NULL
         }
     }
 }
@@ -2040,10 +2088,10 @@ pub extern "C" fn jit_next(iter: i64) -> i64 {
 ///
 /// Returns `None`. A raising `__hash__` publishes through both exception
 /// channels and answers PY_NULL, the residual-call ABI [`jit_next`] documents.
-pub extern "C" fn jit_set_add_method(set: i64, value: i64) -> i64 {
-    match crate::opcode_ops::set_add_value(set as PyObjectRef, value as PyObjectRef) {
-        Ok(()) => pyre_object::w_none() as i64,
-        Err(err) => jit_publish_residual_error(err),
+pub extern "C" fn jit_set_add_method(set: PyObjectRef, value: PyObjectRef) -> PyObjectRef {
+    match crate::opcode_ops::set_add_value(set, value) {
+        Ok(()) => pyre_object::w_none(),
+        Err(err) => jit_publish_residual_error_ref(err),
     }
 }
 
@@ -2052,8 +2100,8 @@ pub extern "C" fn jit_set_add_method(set: i64, value: i64) -> i64 {
 /// are Python-level objects, so use the same MRO-aware helper as
 /// CHECK_EXC_MATCH. This is infallible and deliberately never publishes a
 /// backend or blackhole exception.
-pub extern "C" fn jit_exception_match(exc: i64, match_class: i64) -> i64 {
-    crate::eval::check_exc_match_against(exc as PyObjectRef, match_class as PyObjectRef) as i64
+pub extern "C" fn jit_exception_match(exc: PyObjectRef, match_class: PyObjectRef) -> i64 {
+    crate::eval::check_exc_match_against(exc, match_class) as i64
 }
 
 /// Ref-returning bridge for the `next(w_iterator)` residual call in
@@ -2066,16 +2114,16 @@ pub extern "C" fn jit_exception_match(exc: i64, match_class: i64) -> i64 {
 /// StopIteration.  `jit_next`'s null-for-StopIteration convention exists for
 /// `FOR_ITER`'s `GuardNonnull` and is wrong here.
 #[majit_macros::jit_may_force]
-pub extern "C" fn bh_next(iter: i64) -> i64 {
-    match crate::baseobjspace::next(iter as PyObjectRef) {
-        Ok(value) => value as i64,
+pub extern "C" fn bh_next(iter: PyObjectRef) -> PyObjectRef {
+    match crate::baseobjspace::next(iter) {
+        Ok(value) => value,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
             if exc_obj != PY_NULL {
                 majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
             }
             jit_publish_exception(exc_obj);
-            0
+            PY_NULL
         }
     }
 }
@@ -2084,16 +2132,16 @@ pub extern "C" fn bh_next(iter: i64) -> i64 {
 /// `__iter__`, so the trace treats this as may-force and consumes the
 /// published exception through the ordinary guards.
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_get_iter(iterable: i64) -> i64 {
-    match crate::baseobjspace::iter(iterable as PyObjectRef) {
-        Ok(iterator) => iterator as i64,
+pub extern "C" fn jit_get_iter(iterable: PyObjectRef) -> PyObjectRef {
+    match crate::baseobjspace::iter(iterable) {
+        Ok(iterator) => iterator,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
             if exc_obj != PY_NULL {
                 majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
             }
             jit_publish_exception(exc_obj);
-            0
+            PY_NULL
         }
     }
 }
@@ -2148,9 +2196,9 @@ mod tests {
     #[test]
     fn test_jit_range_iter_helper_shares_iterator_semantics() {
         let iter = pyre_object::w_range_iter_new(1, 2, 1);
-        let first = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
-        let second = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
-        let done = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
+        let first = jit_range_iter_next_or_null(iter);
+        let second = jit_range_iter_next_or_null(iter);
+        let done = jit_range_iter_next_or_null(iter);
         unsafe {
             assert_eq!(w_int_get_value(first), 1);
             assert_eq!(w_int_get_value(second), 2);
@@ -2161,7 +2209,7 @@ mod tests {
     #[test]
     fn test_jit_sequence_getitem_shares_runtime_sequence_semantics() {
         let tuple = pyre_object::w_tuple_new(vec![w_int_new(3), w_int_new(5)]);
-        let item = jit_sequence_getitem(tuple as i64, 1) as PyObjectRef;
+        let item = jit_sequence_getitem(tuple, 1);
         unsafe {
             assert_eq!(w_int_get_value(item), 5);
         }

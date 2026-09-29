@@ -559,7 +559,10 @@ pub mod rbuilder_runtime {
         if ll_jit_try_append_slice(builder, ll_str, 0, size) {
             return;
         }
-        jit_ll_append_res0(builder, ll_str);
+        jit_ll_append_res0(
+            builder as crate::PyObjectRef,
+            ll_str as *mut crate::unicodeobject::Utf8Str,
+        );
     }
 
     /// `rbuilder.py make_func_for_size` — `@dont_look_inside` copy of
@@ -668,7 +671,12 @@ pub mod rbuilder_runtime {
     /// target the codewriter binds when an append cannot be inlined; mutates the
     /// builder in place and returns void.
     #[majit_macros::dont_look_inside]
-    pub extern "C" fn jit_ll_append_res0(builder: i64, ll_str: i64) {
+    pub extern "C" fn jit_ll_append_res0(
+        builder: crate::PyObjectRef,
+        ll_str: *mut crate::unicodeobject::Utf8Str,
+    ) {
+        let builder = builder as i64;
+        let ll_str = ll_str as i64;
         let size = bh_lowlevel_string_len(ll_str) as i64;
         _ll_append(builder, ll_str, 0, size, STR_ITEM_SIZE);
     }
@@ -677,8 +685,19 @@ pub mod rbuilder_runtime {
     /// `_ll_append(ll_builder, ll_str, start, end - start)` (`rbuilder.py`). The
     /// slice helper takes `end`; `_ll_append` takes the count, so convert here.
     #[majit_macros::dont_look_inside]
-    pub extern "C" fn jit_ll_append_res_slice(builder: i64, ll_str: i64, start: i64, end: i64) {
-        _ll_append(builder, ll_str, start, end - start, STR_ITEM_SIZE);
+    pub extern "C" fn jit_ll_append_res_slice(
+        builder: crate::PyObjectRef,
+        ll_str: *mut crate::unicodeobject::Utf8Str,
+        start: i64,
+        end: i64,
+    ) {
+        _ll_append(
+            builder as i64,
+            ll_str as i64,
+            start,
+            end - start,
+            STR_ITEM_SIZE,
+        );
     }
 
     #[cfg(test)]

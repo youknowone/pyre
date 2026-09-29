@@ -1116,9 +1116,9 @@ fn _dict_merge_loop(
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_truth_value(value: i64) -> i64 {
+pub extern "C" fn jit_truth_value(value: PyObjectRef) -> i64 {
     let _roots = pyre_object::gc_roots::push_roots();
-    let value = pyre_object::gc_roots::pin_root(value as PyObjectRef);
+    let value = pyre_object::gc_roots::pin_root(value);
     match truth_value(value) {
         Ok(truth) => truth as i64,
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
@@ -1135,56 +1135,64 @@ pub extern "C" fn jit_bool_value_from_truth(value: i64) -> i64 {
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
+pub extern "C" fn jit_binary_value_from_tag(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op_tag: i64,
+) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[a as PyObjectRef, b as PyObjectRef]);
+    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
     let a = pyre_object::gc_roots::shadow_stack_get(base);
     let b = pyre_object::gc_roots::shadow_stack_get(base + 1);
     match binary_value_from_tag_inner(a, b, op_tag) {
-        Ok(value) => value as i64,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+        Ok(value) => value,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
+pub extern "C" fn jit_compare_value_from_tag(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op_tag: i64,
+) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[a as PyObjectRef, b as PyObjectRef]);
+    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
     let a = pyre_object::gc_roots::shadow_stack_get(base);
     let b = pyre_object::gc_roots::shadow_stack_get(base + 1);
     match compare_value_from_tag_inner(a, b, op_tag) {
-        Ok(value) => value as i64,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+        Ok(value) => value,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_unary_negative_value(value: i64) -> i64 {
+pub extern "C" fn jit_unary_negative_value(value: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
-    let value = pyre_object::gc_roots::pin_root(value as PyObjectRef);
+    let value = pyre_object::gc_roots::pin_root(value);
     match unary_negative_value(value) {
-        Ok(result) => result as i64,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+        Ok(result) => result,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
+pub extern "C" fn jit_unary_invert_value(value: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
-    let value = pyre_object::gc_roots::pin_root(value as PyObjectRef);
+    let value = pyre_object::gc_roots::pin_root(value);
     match unary_invert_value(value) {
-        Ok(result) => result as i64,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+        Ok(result) => result,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_unary_positive_value(value: i64) -> i64 {
+pub extern "C" fn jit_unary_positive_value(value: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
-    let value = pyre_object::gc_roots::pin_root(value as PyObjectRef);
+    let value = pyre_object::gc_roots::pin_root(value);
     match unary_positive_value(value) {
-        Ok(result) => result as i64,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+        Ok(result) => result,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
@@ -1198,87 +1206,87 @@ pub extern "C" fn jit_unary_positive_value(value: i64) -> i64 {
 // address, because address-keyed runtime rebinding would otherwise be
 // ambiguous.
 #[inline(never)]
-pub extern "C" fn jit_descroperation_neg(value: i64) -> i64 {
+pub extern "C" fn jit_descroperation_neg(value: PyObjectRef) -> PyObjectRef {
     jit_unary_negative_value(value)
 }
 
 #[inline(never)]
-pub extern "C" fn jit_descroperation_invert(value: i64) -> i64 {
+pub extern "C" fn jit_descroperation_invert(value: PyObjectRef) -> PyObjectRef {
     jit_unary_invert_value(value)
 }
 
 #[inline(never)]
-pub extern "C" fn jit_descroperation_pos(value: i64) -> i64 {
+pub extern "C" fn jit_descroperation_pos(value: PyObjectRef) -> PyObjectRef {
     jit_unary_positive_value(value)
 }
 
 #[inline(never)]
-pub extern "C" fn jit_runtime_ops_is_op(w_1: i64, w_2: i64, invert: i64) -> i64 {
-    crate::runtime_ops::is_op(w_1 as PyObjectRef, w_2 as PyObjectRef, invert) as i64
+pub extern "C" fn jit_runtime_ops_is_op(
+    w_1: PyObjectRef,
+    w_2: PyObjectRef,
+    invert: i64,
+) -> PyObjectRef {
+    crate::runtime_ops::is_op(w_1, w_2, invert)
 }
 
 #[inline(never)]
-pub extern "C" fn jit_baseobjspace_not_(value: i64) -> i64 {
+pub extern "C" fn jit_baseobjspace_not_(value: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
-    let value = pyre_object::gc_roots::pin_root(value as PyObjectRef);
+    let value = pyre_object::gc_roots::pin_root(value);
     match unary_not_value(value) {
-        Ok(result) => result as i64,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+        Ok(result) => result,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
 #[inline(never)]
-pub extern "C" fn jit_baseobjspace_len(value: i64) -> i64 {
-    match crate::baseobjspace::len(value as PyObjectRef) {
-        Ok(result) => result as i64,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+pub extern "C" fn jit_baseobjspace_len(value: PyObjectRef) -> PyObjectRef {
+    match crate::baseobjspace::len(value) {
+        Ok(result) => result,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
 #[inline(never)]
-pub extern "C" fn jit_baseobjspace_delitem(obj: i64, key: i64) -> i64 {
-    match crate::baseobjspace::delitem(obj as PyObjectRef, key as PyObjectRef) {
+pub extern "C" fn jit_baseobjspace_delitem(obj: PyObjectRef, key: PyObjectRef) -> i64 {
+    match crate::baseobjspace::delitem(obj, key) {
         Ok(()) => 0,
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }
 
 #[inline(never)]
-pub extern "C" fn jit_type_methods_format_simple_w(value: i64) -> i64 {
-    match crate::type_methods::format_simple_w(value as PyObjectRef) {
-        Ok(result) => result as i64,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+pub extern "C" fn jit_type_methods_format_simple_w(value: PyObjectRef) -> PyObjectRef {
+    match crate::type_methods::format_simple_w(value) {
+        Ok(result) => result,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
 #[inline(never)]
-pub extern "C" fn jit_runtime_ops_convert_value(value: i64, conv: i64) -> i64 {
-    match crate::runtime_ops::convert_value(value as PyObjectRef, conv) {
-        Ok(result) => result as i64,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+pub extern "C" fn jit_runtime_ops_convert_value(value: PyObjectRef, conv: i64) -> PyObjectRef {
+    match crate::runtime_ops::convert_value(value, conv) {
+        Ok(result) => result,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
+pub extern "C" fn jit_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[obj as PyObjectRef, index as PyObjectRef]);
+    let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let index = pyre_object::gc_roots::shadow_stack_get(base + 1);
     match getitem(obj, index) {
-        Ok(value) => value as i64,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+        Ok(value) => value,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) {
+pub extern "C" fn jit_setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[
-        obj as PyObjectRef,
-        index as PyObjectRef,
-        value as PyObjectRef,
-    ]);
+    let base = pyre_object::gc_roots::pin_roots(&[obj, index, value]);
     match crate::setitem(
         pyre_object::gc_roots::shadow_stack_get(base),
         pyre_object::gc_roots::shadow_stack_get(base + 1),
@@ -1294,23 +1302,28 @@ pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) {
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_getattr(obj: i64, name_ptr: i64, name_len: i64) -> i64 {
-    let bytes = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
+pub extern "C" fn jit_getattr(obj: PyObjectRef, name_ptr: *const u8, name_len: i64) -> PyObjectRef {
+    let bytes = unsafe { std::slice::from_raw_parts(name_ptr, name_len as usize) };
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
     let _roots = pyre_object::gc_roots::push_roots();
-    let obj = pyre_object::gc_roots::pin_root(obj as PyObjectRef);
+    let obj = pyre_object::gc_roots::pin_root(obj);
     match crate::getattr_str(obj, name) {
-        Ok(value) => value as i64,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+        Ok(value) => value,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64) -> i64 {
-    let bytes = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
+pub extern "C" fn jit_setattr(
+    obj: PyObjectRef,
+    name_ptr: *const u8,
+    name_len: i64,
+    value: PyObjectRef,
+) -> i64 {
+    let bytes = unsafe { std::slice::from_raw_parts(name_ptr, name_len as usize) };
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[obj as PyObjectRef, value as PyObjectRef]);
+    let base = pyre_object::gc_roots::pin_roots(&[obj, value]);
     match crate::setattr_str(
         pyre_object::gc_roots::shadow_stack_get(base),
         name,
@@ -1330,8 +1343,8 @@ pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64
 /// PyError>` whose fat-enum payload does not fit the residual_call's
 /// single-register Ref-result slot.
 #[allow(improper_ctypes_definitions)]
-pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
-    let executor = unsafe { &mut *(executor_ptr as *mut crate::pyframe::PyFrame) };
+pub extern "C" fn bh_execute_store_subscr(executor_ptr: *mut crate::pyframe::PyFrame) -> i64 {
+    let executor = unsafe { &mut *(executor_ptr) };
     match crate::pyopcode::execute_store_subscr(executor) {
         Ok(_step_result) => 1,
         Err(mut err) => {
@@ -1370,10 +1383,11 @@ pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
 /// the backend cells after an Err (`jitcode_dispatch.rs` execute-raised
 /// arm), so the extra publish does not leak into tracing.
 #[allow(improper_ctypes_definitions)]
-pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
-    let obj = obj as pyre_object::PyObjectRef;
-    let key = key as pyre_object::PyObjectRef;
-    let value = value as pyre_object::PyObjectRef;
+pub extern "C" fn bh_store_subscr_fn(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> i64 {
     if let Err(mut err) = crate::baseobjspace::setitem(obj, key, value) {
         let exc_obj = err.to_exc_object();
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
@@ -1388,9 +1402,9 @@ pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
 /// `bool` parameter does not match the integer arg slot a residual call
 /// supplies, so normalise it from `i64` here before forwarding.
 #[allow(improper_ctypes_definitions)]
-pub extern "C" fn bh_w_type_set_uses_object_setattr(obj: i64, v: i64) {
+pub extern "C" fn bh_w_type_set_uses_object_setattr(obj: PyObjectRef, v: i64) {
     unsafe {
-        pyre_object::typeobject::w_type_set_uses_object_setattr(obj as PyObjectRef, v != 0);
+        pyre_object::typeobject::w_type_set_uses_object_setattr(obj, v != 0);
     }
 }
 
@@ -1398,9 +1412,9 @@ pub extern "C" fn bh_w_type_set_uses_object_setattr(obj: i64, v: i64) {
 /// [`pyre_object::typeobject::w_type_set_uses_object_getattribute`], the
 /// [`bh_w_type_set_uses_object_setattr`] twin.
 #[allow(improper_ctypes_definitions)]
-pub extern "C" fn bh_w_type_set_uses_object_getattribute(obj: i64, v: i64) {
+pub extern "C" fn bh_w_type_set_uses_object_getattribute(obj: PyObjectRef, v: i64) {
     unsafe {
-        pyre_object::typeobject::w_type_set_uses_object_getattribute(obj as PyObjectRef, v != 0);
+        pyre_object::typeobject::w_type_set_uses_object_getattribute(obj, v != 0);
     }
 }
 
@@ -1429,16 +1443,16 @@ pub extern "C" fn bh_lookup_exc_class_for_kind(kind_disc: i64) -> i64 {
 /// on the native targets. Spelling the parameter as the pointer would declare
 /// an `i32` argument there while the emitted `call_indirect` supplies a word,
 /// and the mismatch traps.
-pub extern "C" fn bh_w_exception_get_kind(evalue: i64) -> i64 {
-    pyre_object::interp_exceptions::exc_kind_discriminant(evalue as pyre_object::PyObjectRef)
+pub extern "C" fn bh_w_exception_get_kind(evalue: PyObjectRef) -> i64 {
+    pyre_object::interp_exceptions::exc_kind_discriminant(evalue)
 }
 
 /// C-ABI residual bridge for `exception_object_matches_stop_iteration`: the
 /// caught exception value rides in through the integer arg slot, the
 /// [`bh_w_exception_get_kind`] twin; its boolean result rides back in the
 /// integer result slot.
-pub extern "C" fn bh_exception_object_matches_stop_iteration(evalue: i64) -> i64 {
-    crate::error::exception_object_matches_stop_iteration(evalue as pyre_object::PyObjectRef) as i64
+pub extern "C" fn bh_exception_object_matches_stop_iteration(evalue: PyObjectRef) -> i64 {
+    crate::error::exception_object_matches_stop_iteration(evalue) as i64
 }
 
 #[cfg(test)]
@@ -1525,10 +1539,9 @@ mod tests {
 
     #[test]
     fn test_jit_abi_helpers_share_same_objspace_semantics() {
-        assert_eq!(jit_truth_value(w_int_new(0) as i64), 0);
-        let neg = jit_unary_negative_value(w_int_new(4) as i64) as PyObjectRef;
-        let cmp =
-            jit_compare_value_from_tag(w_int_new(2) as i64, w_int_new(7) as i64, 0) as PyObjectRef;
+        assert_eq!(jit_truth_value(w_int_new(0)), 0);
+        let neg = jit_unary_negative_value(w_int_new(4));
+        let cmp = jit_compare_value_from_tag(w_int_new(2), w_int_new(7), 0);
         unsafe {
             assert_eq!(w_int_get_value(neg), -4);
             assert!(w_bool_get_value(cmp));
@@ -1566,12 +1579,9 @@ mod tests {
         // ValueError escapes the outer `except TypeError`.
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
         let exc = crate::PyError::value_error("x").to_exc_object();
-        let result = jit_compare_value_from_tag(
-            exc as i64,
-            w_int_new(5) as i64,
-            crate::runtime_ops::ISINSTANCE_OP_TAG,
-        );
-        assert_eq!(result, 0);
+        let result =
+            jit_compare_value_from_tag(exc, w_int_new(5), crate::runtime_ops::ISINSTANCE_OP_TAG);
+        assert_eq!(result, std::ptr::null_mut());
         let published = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.get());
         assert_ne!(published, 0, "TypeError must reach BH_LAST_EXC_VALUE");
     }
@@ -1579,12 +1589,12 @@ mod tests {
     #[test]
     fn test_jit_getitem_and_setitem_share_objspace_semantics() {
         let list = pyre_object::w_list_new(vec![w_int_new(2), w_int_new(4)]);
-        let item = jit_getitem(list as i64, w_int_new(1) as i64) as PyObjectRef;
+        let item = jit_getitem(list, w_int_new(1));
         unsafe {
             assert_eq!(w_int_get_value(item), 4);
         }
-        jit_setitem(list as i64, w_int_new(0) as i64, w_int_new(9) as i64);
-        let updated = jit_getitem(list as i64, w_int_new(0) as i64) as PyObjectRef;
+        jit_setitem(list, w_int_new(0), w_int_new(9));
+        let updated = jit_getitem(list, w_int_new(0));
         unsafe {
             assert_eq!(w_int_get_value(updated), 9);
         }
