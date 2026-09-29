@@ -323,9 +323,74 @@ impl ValueLocals {
             }
         }
 
-        let mut types = Vec::new();
-        let mut root_locals = vec![None; num_vars as usize];
-        for id in 0..by_id.len() {
+        let n = by_id.len();
+        let mut def_at = vec![i32::MAX; n];
+        let mut last_use = vec![-1i32; n];
+        for ia in inputargs {
+            let i = ia.index as usize;
+            if i < n {
+                def_at[i] = -1;
+            }
+        }
+        for (oi, op) in ops.iter().enumerate() {
+            let at = oi as i32;
+            let result = op.pos().get();
+            if result != OpRef::NONE && !result.is_constant() {
+                let i = result.raw() as usize;
+                if i < n && def_at[i] == i32::MAX {
+                    def_at[i] = at;
+                }
+            }
+            if op.opcode == OpCode::Label {
+                for arg in op.getarglist() {
+                    let arg = arg.to_opref();
+                    if arg != OpRef::NONE && !arg.is_constant() {
+                        let i = arg.raw() as usize;
+                        if i < n && def_at[i] == i32::MAX {
+                            def_at[i] = at;
+                        }
+                    }
+                }
+            }
+            for arg in op.getarglist() {
+                let arg = arg.to_opref();
+                if arg != OpRef::NONE && !arg.is_constant() {
+                    let i = arg.raw() as usize;
+                    if i < n {
+                        last_use[i] = last_use[i].max(at);
+                    }
+                }
+            }
+            if let Some(failargs) = op.getfailargs() {
+                for arg in failargs {
+                    let arg = arg.to_opref();
+                    if arg != OpRef::NONE && !arg.is_constant() {
+                        let i = arg.raw() as usize;
+                        if i < n {
+                            last_use[i] = last_use[i].max(at);
+                        }
+                    }
+                }
+            }
+            // The JUMP writes each LABEL phi. The slot stays that phi's
+            // through the write, including the gap after its last body read.
+            if op.opcode == OpCode::Jump
+                && let Some(label_idx) = find_jump_target_label_index(ops, op)
+            {
+                for arg in ops[label_idx].getarglist() {
+                    let arg = arg.to_opref();
+                    if arg != OpRef::NONE && !arg.is_constant() {
+                        let i = arg.raw() as usize;
+                        if i < n {
+                            last_use[i] = last_use[i].max(at);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut root_of = vec![usize::MAX; n];
+        for id in 0..n {
             if by_id[id].is_none() {
                 continue;
             }
@@ -342,15 +407,60 @@ impl ValueLocals {
                 root = source;
                 remaining -= 1;
             }
-            let local = if let Some(local) = root_locals[root] {
-                local
+            root_of[id] = root;
+        }
+
+        let mut root_start = vec![i32::MAX; n];
+        let mut root_end = vec![-1i32; n];
+        let mut roots = Vec::new();
+        for id in 0..n {
+            let root = root_of[id];
+            if root == usize::MAX {
+                continue;
+            }
+            if root_start[root] == i32::MAX {
+                roots.push(root);
+            }
+            let start = if def_at[id] == i32::MAX {
+                last_use[id]
+            } else {
+                def_at[id]
+            };
+            root_start[root] = root_start[root].min(start);
+            root_end[root] = root_end[root].max(last_use[id].max(start));
+        }
+        roots.sort_by(|&a, &b| root_start[a].cmp(&root_start[b]).then(a.cmp(&b)));
+
+        // Non-overlapping ranges share a local of the same wasm type. A
+        // range ends at its last read, so the next def (a later op) may
+        // reuse it: emit reads the op's args before it writes the result.
+        let mut types = Vec::new();
+        let mut local_end: Vec<i32> = Vec::new();
+        let mut root_locals: Vec<Option<u32>> = vec![None; n];
+        for root in roots {
+            let start = root_start[root];
+            let end = root_end[root];
+            let ty = id_types[root];
+            let reused = local_end
+                .iter()
+                .enumerate()
+                .find(|&(li, &lend)| lend < start && types[li] == ty)
+                .map(|(li, _)| li);
+            let local = if let Some(li) = reused {
+                local_end[li] = end;
+                li as u32 + first_local
             } else {
                 let local = types.len() as u32 + first_local;
-                root_locals[root] = Some(local);
-                types.push(id_types[root]);
+                types.push(ty);
+                local_end.push(end);
                 local
             };
-            by_id[id] = Some(local);
+            root_locals[root] = Some(local);
+        }
+        for id in 0..n {
+            if root_of[id] != usize::MAX {
+                by_id[id] = root_locals[root_of[id]];
+            }
         }
         Self {
             by_id,
