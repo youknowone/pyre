@@ -6897,15 +6897,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // body reads `self.attr` — was admitted here only once the
                 // receiver was proven not to be a type object, because a type
                 // receiver's read went through `type.__getattribute__` and
-                // reached the deferred abort path.  That read folds now
-                // ([`try_walker_specialize_load_type_name_attr`]), so a type
-                // receiver reaches no residual to abort on either and the proof
-                // is no longer what admits it: a classmethod body reading
-                // `cls.__name__` measured 1082 ns/iter on the decline against
-                // 1.6 once admitted.  A body whose attribute read does NOT fold
-                // — any metaclass other than `type` — still aborts once and is
-                // denied, which is what this arm's promise has always rested
-                // on.
+                // reached the deferred abort path.  `cls.__name__` on a class
+                // whose metaclass is `type` is traced through the metatype
+                // data descriptor, so that receiver leaves no residual to
+                // abort on.  Any other metaclass still aborts once and is
+                // denied.
                 //
                 // A callee with its own exception handler has protected-region
                 // state that must be restored at the callee's precise resume
