@@ -13,8 +13,9 @@
 //! translator reading `func._elidable_function_` off the function
 //! object.
 //!
-//! The harvested map is keyed and ordered so that `merge_hints_from_llbcs`
-//! can apply the hints to each function order- and multiplicity-exact.
+//! The harvested map is keyed and ordered so that a function's header
+//! (`front::mir` `SemanticFunctionHeader::new`) can apply the hints to it
+//! order-exact.
 
 use majit_charon_reader::{
     Llbc,

@@ -4022,8 +4022,13 @@ fn bh_field_lookup(cc: &CallControl, field: &crate::model::FieldDescriptor) -> B
         }
     }
     cc.struct_layout_for(owner)
-        .and_then(|layout| layout.fields.iter().find(|row| row.name == field.name))
-        .cloned()
+        .and_then(|layout| {
+            layout
+                .fields
+                .iter()
+                .find(|row| row.name == field.name)
+                .cloned()
+        })
         .map(BhFieldLookup::Layout)
         .unwrap_or(BhFieldLookup::Missing)
 }

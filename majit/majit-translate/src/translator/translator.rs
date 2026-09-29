@@ -346,18 +346,17 @@ impl TranslationContext {
             return Ok(pygraph);
         }
 
-        // If the eager pre-pass at
-        // `cutover::populate_call_registry_from_call_graphs` recorded
-        // a lift failure for this host, surface that error instead of
-        // the generic "missing code object" fallback below.  Mirrors
+        // If the lift of this host's lowered body
+        // (`FunctionDesc::build_source_graph`) recorded a failure,
+        // surface that error instead of the generic "missing code
+        // object" fallback below.  Mirrors
         // upstream `bookkeeper.getdesc → newfuncdesc → buildgraph`
         // where the original construction error propagates from the
         // lazy `cachedgraph` consumer
         // (`rpython/annotator/description.py`).
         if let Some(lift_err) = self._lift_errors.borrow().get(&func).cloned() {
             return Err(format!(
-                "buildflowgraph({}): source lift failed during \
-                 populate_call_registry_from_call_graphs (recorded \
+                "buildflowgraph({}): source lift failed (recorded \
                  lazy-failure error): {lift_err}",
                 graph_func.name,
             ));

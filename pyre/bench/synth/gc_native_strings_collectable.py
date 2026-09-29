@@ -1,6 +1,6 @@
 # pyre-check: no-cpython
-# pyre-check: skip-backends=wasm,cranelift
-# cranelift runs the core build, which has no `pyre-module` and so no `mmap`.
+# pyre-check: skip-backends=wasm
+# pyre-check: requires-modules=mmap
 
 import _io
 import gc

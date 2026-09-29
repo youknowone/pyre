@@ -276,6 +276,10 @@ impl CodeWriter {
             callcontrol.candidate_graphs(),
             callcontrol.function_graphs(),
         );
+        // The annotator is complete and no graph is built after it. The
+        // pending bodies share their graphs with `function_graphs`, which
+        // the codewriter mutates from here on.
+        registry.release_source_graphs();
     }
 
     /// Port of `CodeWriter.transform_graph_to_jitcode`.
@@ -1108,7 +1112,11 @@ impl CodeWriter {
                 }
                 continue;
             }
-            let Some(graph) = callcontrol.function_graphs().get(&path).cloned() else {
+            let Some(graph) = callcontrol
+                .function_graphs()
+                .get(&path)
+                .map(|g| FunctionGraph::clone(&g))
+            else {
                 // RPython `enum_pending_graphs` (codewriter.py)
                 // never yields a jitcode whose graph is missing —
                 // `get_jitcode()` only allocates shells for paths that

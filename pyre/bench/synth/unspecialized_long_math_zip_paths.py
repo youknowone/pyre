@@ -1,6 +1,5 @@
 # pyre-check: spec-folds=zip_two_tuple_iters,math_frexp
-# pyre-check: skip-backends=cranelift
-# cranelift runs the core build, which has no `pyre-module` and so no `math`.
+# pyre-check: requires-modules=math
 # Throughput gate for the hand-written folds this file still fires: `zip`
 # over two tuples (positional and `strict=True`), and `math.frexp`.
 # `bigint ** int` is the descended `long_pow` body and `math.ldexp` the

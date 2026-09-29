@@ -104,6 +104,10 @@ pub struct Llbc {
     /// `trait_impls` is immutable after parse, so the map is built once.
     /// See [`TraitAssocIndex`].
     trait_assoc_index: std::sync::OnceLock<TraitAssocIndex>,
+    /// ADT def_ids named as the `Self` type of a `Drop` impl, sorted.
+    /// `trait_impls` is immutable after parse, so the set is built once.
+    /// See [`Llbc::has_explicit_drop_impl`].
+    drop_impl_owners: std::sync::OnceLock<Vec<u64>>,
 }
 
 /// Register-bank shape of a `#[repr(transparent)]` scalar wrapper.
@@ -286,6 +290,7 @@ impl Llbc {
             root_stack_effects: parking_lot::RwLock::new((Vec::new(), Vec::new())),
             eval_fn_type_id: std::sync::OnceLock::new(),
             trait_assoc_index: std::sync::OnceLock::new(),
+            drop_impl_owners: std::sync::OnceLock::new(),
         })
     }
 
@@ -642,6 +647,49 @@ impl Llbc {
             .get(entry_index)?
             .get("skip_binder")?
             .get("value")
+    }
+
+    /// Whether a `trait_impls` row implements `Drop` for the ADT
+    /// `adt_def_id`: its first generic type names that ADT, and its trait
+    /// is `core::ops::drop::Drop` or has no declaration here to prove it
+    /// is not. `adt_of` reads the ADT a type expression names; the owner
+    /// set is built with the first caller's `adt_of`.
+    pub fn has_explicit_drop_impl(
+        &self,
+        adt_def_id: u64,
+        adt_of: impl Fn(&serde_json::Value) -> Option<u64>,
+    ) -> bool {
+        self.drop_impl_owners
+            .get_or_init(|| {
+                let mut owners: Vec<u64> = self
+                    .file
+                    .translated
+                    .trait_impls
+                    .iter()
+                    .filter_map(|row| {
+                        let impl_trait = row.get("impl_trait")?;
+                        let owner = impl_trait
+                            .get("generics")
+                            .and_then(|generics| generics.get("types"))
+                            .and_then(serde_json::Value::as_array)
+                            .and_then(|types| types.first())
+                            .and_then(|owner| adt_of(owner))?;
+                        impl_trait
+                            .get("id")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|trait_id| self.trait_by_id(trait_id))
+                            .is_none_or(|decl| {
+                                decl.item_meta.name_path() == "core::ops::drop::Drop"
+                            })
+                            .then_some(owner)
+                    })
+                    .collect();
+                owners.sort_unstable();
+                owners.dedup();
+                owners
+            })
+            .binary_search(&adt_def_id)
+            .is_ok()
     }
 
     /// The `trait_impls` row whose `def_id` is `id` — the impl block

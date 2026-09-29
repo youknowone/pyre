@@ -515,23 +515,33 @@ pub fn register_struct_ids(table: std::collections::HashMap<String, Option<Struc
     *guard = table;
 }
 
+/// `raw` without its leading reference / raw-pointer markers: each of
+/// `*const `, `*mut `, `&mut `, `&` repeated, in that order, then trimmed.
+fn strip_pointer_markers(raw: &str) -> &str {
+    fn strip_repeated<'a>(mut s: &'a str, prefix: &str) -> &'a str {
+        while let Some(rest) = s.strip_prefix(prefix) {
+            s = rest;
+        }
+        s
+    }
+    let s = strip_repeated(raw, "*const ");
+    let s = strip_repeated(s, "*mut ");
+    let s = strip_repeated(s, "&mut ");
+    strip_repeated(s, "&").trim()
+}
+
 /// Look up the canonical [`StructId`] for a struct / enum-variant name in
 /// any spelling, stripping a leading reference / raw-pointer marker first
 /// (`&T` / `&mut T` / `*const T` / `*mut T` → `T`).  Returns `None` when
 /// the name is unknown or its bare leaf is cross-module-ambiguous.
 pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
-    let s = raw
-        .trim_start_matches("*const ")
-        .trim_start_matches("*mut ")
-        .trim_start_matches("&mut ")
-        .trim_start_matches('&')
-        .trim();
+    let s = strip_pointer_markers(raw);
     let guard = STRUCT_ID_BY_NAME.lock();
     if let Some(id) = guard.get(s).copied().flatten() {
         return Some(id);
     }
     if is_shaped_tuple_name(s) || is_shaped_array_name(s) {
-        return None;
+        return positional_shape_id(s);
     }
     let generic_args = generic_args_span(s)?;
     let template = strip_generic_args(s);
@@ -548,22 +558,37 @@ pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
 /// class/template and uses this lookup; physical layouts use
 /// [`struct_id_for_name`] instead.
 pub fn struct_template_id_for_name(raw: &str) -> Option<StructId> {
-    let s = raw
-        .trim_start_matches("*const ")
-        .trim_start_matches("*mut ")
-        .trim_start_matches("&mut ")
-        .trim_start_matches('&')
-        .trim();
+    let s = strip_pointer_markers(raw);
     let template = if is_shaped_tuple_name(s) || is_shaped_array_name(s) {
         std::borrow::Cow::Borrowed(s)
     } else {
         strip_generic_args(s)
     };
-    STRUCT_ID_BY_NAME
+    let registered = STRUCT_ID_BY_NAME
         .lock()
         .get(template.as_ref())
         .copied()
-        .flatten()
+        .flatten();
+    registered.or_else(|| positional_shape_id(template.as_ref()))
+}
+
+/// The identity of the positional aggregate `name` spells (`Tuple<A,B>`,
+/// `Array<T;N>`), made from the spelling itself: `rtuple.py` builds one
+/// `TUPLE_TYPE` per item shape when a representation first needs it, so
+/// the identity does not wait for a registration to name it. `None` for
+/// any other name, and for a shape with no items.
+pub fn positional_shape_id(name: &str) -> Option<StructId> {
+    let inner = name.strip_suffix('>')?.split_once('<')?.1;
+    let well_formed = if is_shaped_tuple_name(name) {
+        !inner.trim().is_empty()
+    } else if is_shaped_array_name(name) {
+        inner.rsplit_once(';').is_some_and(|(item, len)| {
+            !item.trim().is_empty() && len.trim().parse::<usize>().is_ok()
+        })
+    } else {
+        false
+    };
+    well_formed.then(|| StructId::from_canonical(name))
 }
 
 /// The first balanced generic argument group in `name`, including brackets.

@@ -977,13 +977,18 @@ pub struct FunctionDesc {
     /// access `graph.signature` / `graph.defaults` for the
     /// description.py comparison.
     pub(crate) cache: RefCell<HashMap<GraphCacheKey, Rc<PyGraph>>>,
-    /// Pyre-only lazy-failure record for registry-prefilled callable
-    /// graphs.  RPython builds these graphs lazily inside
-    /// `cachedgraph -> buildgraph`; pyre may attempt an eager lift first.
-    /// If that eager lift fails, cache misses must surface the recorded
-    /// producer-side error here instead of falling through to
-    /// `buildflowgraph`'s generic synthetic-function failure.
+    /// Failure of the lift of [`Self::source_graph`]. RPython propagates a
+    /// graph-construction error out of `cachedgraph -> buildgraph`; the
+    /// lift runs outside `buildgraph`, so cache misses surface the recorded
+    /// error here instead of falling through to `buildflowgraph`'s generic
+    /// synthetic-function failure.
     pub(crate) lift_error: RefCell<Option<String>>,
+    /// The lowered Rust body this callable's default graph is lifted from,
+    /// until the graph is first observed. RPython builds a callable's graph
+    /// on the `cachedgraph` miss (`buildgraph` ->
+    /// `translator.buildflowgraph`), not when the callable becomes known;
+    /// the call registry installs the lift here instead of running it.
+    pub(crate) source_graph: RefCell<Option<SourceGraph>>,
     /// Upstream `self.pyobj._signature_` (description.py:294, :315).
     /// Carried on FunctionDesc rather than HostObject because
     /// `_signature_` is a function-level attribute.
@@ -1053,17 +1058,62 @@ impl FunctionDesc {
             specializer,
             cache: RefCell::new(HashMap::new()),
             lift_error: RefCell::new(None),
+            source_graph: RefCell::new(None),
             annsignature: None,
             annenforceargs: None,
         }
     }
 
     /// RPython `FunctionDesc.getgraphs()` (description.py).
+    ///
+    /// Upstream reads `_cache` alone: it holds exactly the graphs
+    /// annotation built. The call registry installs every callable before
+    /// annotation and its default graph stays pending in
+    /// [`Self::source_graph`], so an observer of the cache builds that
+    /// graph first ([`Self::build_source_graph`]), as the registry's former
+    /// eager prefill of the default key did.
     pub fn getgraphs(&self) -> Vec<Rc<PyGraph>> {
+        self.build_source_graph();
         self.cache.borrow().values().cloned().collect()
     }
 
-    /// Record a pyre eager-lift failure to be observed at the same
+    /// Install the lowered body the default graph is built from.
+    pub(crate) fn set_source_graph(&self, source: SourceGraph) {
+        *self.source_graph.borrow_mut() = Some(source);
+    }
+
+    /// Build the default graph from the pending lowered body, once. The
+    /// graph lands in `_cache` under the default key; a failure lands in
+    /// `lift_error`, which the next `cachedgraph` surfaces.
+    pub(crate) fn build_source_graph(&self) {
+        let Some(SourceGraph(build)) = self.source_graph.borrow_mut().take() else {
+            return;
+        };
+        match build() {
+            Ok(pygraph) => {
+                self.cache.borrow_mut().insert(GraphCacheKey::None, pygraph);
+            }
+            Err(message) => {
+                if let (Some(annotator), Some(pyobj)) =
+                    (self.base.bookkeeper.try_annotator(), &self.base.pyobj)
+                {
+                    annotator
+                        .translator
+                        ._lift_errors
+                        .borrow_mut()
+                        .insert(pyobj.clone(), message.clone());
+                }
+                self.record_lift_error(message);
+            }
+        }
+    }
+
+    /// Drop a lowered body whose graph nothing asked for.
+    pub(crate) fn release_source_graph(&self) {
+        self.source_graph.borrow_mut().take();
+    }
+
+    /// Record a lift failure to be observed at the same
     /// lazy `cachedgraph` use-site where upstream would run
     /// `buildgraph` and propagate the original construction error.
     pub(crate) fn record_lift_error(&self, message: String) {
@@ -1231,6 +1281,7 @@ impl FunctionDesc {
         alt_name: Option<&str>,
         builder: Option<GraphBuilder<'_>>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
+        self.build_source_graph();
         if let Some(existing) = self.cache.borrow().get(&key) {
             // Append the lifted callee graph to `translator.graphs`,
             // mirroring `buildflowgraph`'s build-time append
@@ -1238,15 +1289,14 @@ impl FunctionDesc {
             // a second append site: the MISS path below routes through
             // `buildgraph` -> `buildflowgraph` (in `description.rs` /
             // `translator.rs`), which already appends exactly like
-            // upstream. Only graphs prefilled by the Rust-source adapter
-            // (`cutover::lift_callee_to_pygraph` -> `prefill_default_cache`)
-            // reach a HIT without ever passing through `buildflowgraph`, so
-            // those never entered `translator.graphs`. The first HIT is the
-            // demand point at which upstream's MISS -> build -> append would
-            // have fired for a non-prefilled callee (pyre moved the build
-            // eager into the prefill), so appending on first HIT is the
-            // faithful compensation; the `Rc::ptr_eq` guard makes it fire
-            // once (upstream's `_cache` build-once), matching
+            // upstream. Only graphs lifted from a lowered body
+            // (`build_source_graph` above) or prefilled by the registry
+            // (`prefill_default_cache`) reach a HIT without ever passing
+            // through `buildflowgraph`, so those never entered
+            // `translator.graphs`. The first HIT is the demand point at
+            // which upstream's MISS -> build -> append fires, so appending
+            // on first HIT is the faithful compensation; the `Rc::ptr_eq`
+            // guard makes it fire once (upstream's `_cache` build-once), matching
             // `buildflowgraph`'s walker-hit guard. The flowspace effect
             // analyzers (`canraise::RaiseAnalyzer` et al.) then resolve
             // `funcobj.graph` through `translator.graphs` (graphanalyze.rs)
@@ -1265,8 +1315,7 @@ impl FunctionDesc {
         }
         if let Some(lift_err) = self.lift_error_message() {
             return Err(AnnotatorError::new(format!(
-                "{}.cachedgraph: source lift failed during \
-                 populate_call_registry_from_call_graphs (recorded \
+                "{}.cachedgraph: source lift failed (recorded \
                  lazy-failure error): {lift_err}",
                 self.name,
             )));
@@ -1306,6 +1355,22 @@ impl FunctionDesc {
         let graph = self.buildgraph(computed_alt_name.as_deref(), builder)?;
         self.cache.borrow_mut().insert(key, graph.clone());
         Ok(graph)
+    }
+}
+
+/// A pending lift of a lowered Rust body into a callable's default graph
+/// ([`FunctionDesc::source_graph`]).
+pub(crate) struct SourceGraph(Box<dyn FnOnce() -> Result<Rc<PyGraph>, String>>);
+
+impl SourceGraph {
+    pub(crate) fn new(build: impl FnOnce() -> Result<Rc<PyGraph>, String> + 'static) -> Self {
+        Self(Box::new(build))
+    }
+}
+
+impl std::fmt::Debug for SourceGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceGraph(..)")
     }
 }
 
@@ -1525,6 +1590,8 @@ impl FunctionDesc {
     /// as an optional bool mirroring the same "attribute absent"
     /// default-to-False contract.
     pub fn getuniquegraph(&self) -> Result<Rc<PyGraph>, AnnotatorError> {
+        // A pending registry graph is built first; see `getgraphs`.
+        self.build_source_graph();
         let cache = self.cache.borrow();
         if cache.len() != 1 {
             return Err(AnnotatorError::new(format!(
@@ -1564,6 +1631,8 @@ impl FunctionDesc {
     /// `(AccessDirect, key)`.
     #[allow(dead_code)] // RPython top-level port surface; called via specialize.rs wrapper.
     pub(crate) fn getuniquenondirectgraph(&self) -> Result<Rc<PyGraph>, AnnotatorError> {
+        // A pending registry graph is built first; see `getgraphs`.
+        self.build_source_graph();
         let mut result = Vec::new();
         for (key, graph) in self.cache.borrow().iter() {
             let is_access_direct = matches!(

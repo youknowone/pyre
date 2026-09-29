@@ -1410,6 +1410,26 @@ fn dyn_trait_dispatch_ops(
     Ok(ops)
 }
 
+/// `objectmodel.instantiate(cls)`: allocate an instance of the constant
+/// class `cls` without calling its `__init__` (`robjmodel_instantiate`,
+/// `rtype_instantiate`).
+fn instantiate_op(class_host: HostObject, result: Hlvalue) -> Result<FlowspaceOp, TyperError> {
+    let instantiate = HOST_ENV
+        .import_module("rpython.rlib.objectmodel")
+        .and_then(|module| module.module_get("instantiate"))
+        .ok_or_else(|| {
+            TyperError::message("objectmodel.instantiate missing from HOST_ENV bootstrap")
+        })?;
+    Ok(FlowspaceOp::new(
+        "simple_call",
+        vec![
+            Hlvalue::Constant(Constant::new(ConstValue::HostObject(instantiate))),
+            Hlvalue::Constant(Constant::new(ConstValue::HostObject(class_host))),
+        ],
+        result,
+    ))
+}
+
 pub fn translate_op(
     op: &SpaceOperation,
     value_map: &HashMap<Variable, Hlvalue>,
@@ -1591,11 +1611,11 @@ pub fn translate_op(
         // The model-graph op carries the boxing struct leaf `owner` and flows
         // straight to the codewriter/assembler (`new_with_vtable`).  For the
         // ephemeral annotation / rtype type-oracle it mirrors the
-        // `SyntheticTransparentCtor` struct path (flowspace_adapter.rs): a
-        // zero-arg `simple_call` against the interned class host annotates the
-        // result as a fresh `SomeInstance(owner)`.  `getuniqueclassdef_for_
-        // struct_root` first forces the struct's field rows to be projected so
-        // the trailing payload `FieldWrite(result, …)` resolves.
+        // `SyntheticTransparentCtor` struct path: `instantiate(cls)` against
+        // the interned class host annotates the result as a fresh
+        // `SomeInstance(owner)`.  `getuniqueclassdef_for_struct_root` first
+        // forces the struct's field rows to be projected so the trailing
+        // payload `FieldWrite(result, …)` resolves.
         OpKind::New { owner } | OpKind::NewWithVtable { owner, .. } => {
             let bk = call_registry.bookkeeper();
             bk.getuniqueclassdef_for_struct_root(owner).map_err(|e| {
@@ -1603,18 +1623,11 @@ pub fn translate_op(
                     "translate_op: allocation owner {owner:?} is not a known struct root: {e}"
                 ))
             })?;
-            // Same call-site wrapper as `SyntheticTransparentCtor`: the
-            // constant stays the canonical class for annotation, and
-            // `ClassesPBCRepr.redispatch_call` allocates with
-            // `rtype_new_instance` without dispatching a seeded `__init__`.
-            let host = HostObject::new_transparent_class_ctor(bk.intern_class_by_qualname(owner));
-            let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
             let result = resolve_result_hlvalue(op, value_map)?;
-            Ok(vec![FlowspaceOp::new(
-                "simple_call",
-                vec![callable],
+            Ok(vec![instantiate_op(
+                bk.intern_class_by_qualname(owner),
                 result,
-            )])
+            )?])
         }
 
         // ─── `LoadStatic` — single-segment static lookup ─
@@ -2837,29 +2850,6 @@ pub fn translate_op(
                     // 3c. Unknown prefix — `TyperError` (caller must
                     //     register the path or import the prefix).
                     let callable_host = if let Some(entry) = call_registry.lookup(&key) {
-                        // Fail-closed: an entry whose pyre-side body failed to
-                        // lift (recorded by
-                        // `populate_call_registry_from_call_graphs` Pass 2 via
-                        // `record_lift_error`) is NOT a resolved callable.
-                        // Binding its `host_object` would let a graph
-                        // referencing an unbuildable foreign callee false-Match
-                        // through the dual gate and partial-codewrite with the
-                        // callee's pre-real residual kind. Treat it as
-                        // unresolved so the referencing graph deterministically
-                        // Skips to the legacy walker (unbuildable callee →
-                        // caller Skips).
-                        if let Some(lift_err) = entry.lift_error() {
-                            return Err(TyperError::message(format!(
-                                "translate_op: OpKind::Call::FunctionPath \
-                                 {{ segments: {:?} }} resolves to a \
-                                 CallRegistry entry whose source lift \
-                                 failed ({lift_err}); the referencing graph \
-                                 falls back to the legacy walker. \
-                                 Result slot = {}",
-                                segments,
-                                fmt_op_result(op),
-                            )));
-                        }
                         entry.host_object.clone()
                     } else if let Some(host) = flowspace_model::host_env_callable(segments) {
                         // Branch 3b — builtin leaf or fully-qualified inline
@@ -2884,22 +2874,6 @@ pub fn translate_op(
                         // same-leaf matches converge on a single `host_object`
                         // identity, otherwise `None` falls through to the hard
                         // error below.
-                        //
-                        // Same fail-closed rule as the exact-lookup branch: a
-                        // lift-errored entry is unresolved, so the referencing
-                        // graph Skips to the legacy walker.
-                        if let Some(lift_err) = entry.lift_error() {
-                            return Err(TyperError::message(format!(
-                                "translate_op: OpKind::Call::FunctionPath \
-                                 {{ segments: {:?} }} leaf-matches a \
-                                 CallRegistry entry whose source lift \
-                                 failed ({lift_err}); the referencing graph \
-                                 falls back to the legacy walker. \
-                                 Result slot = {}",
-                                segments,
-                                fmt_op_result(op),
-                            )));
-                        }
                         entry.host_object.clone()
                     } else {
                         return Err(TyperError::message(format!(
@@ -3088,17 +3062,19 @@ pub fn translate_op(
                             }
                         }
                     };
-                    // Keep the canonical class identity for annotation, but
-                    // retain that this is Rust `T { fields }`, not a semantic
-                    // Python `T(...)` call.  ClassesPBCRepr consumes this
-                    // wrapper by selecting only RPython's rtype_new_instance
-                    // step, so a registered app-level `__init__` cannot run.
-                    let host = HostObject::new_transparent_class_ctor(class_host);
-                    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
-                    let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
-                    call_args.push(callable);
-                    call_args.extend(arg_hls);
-                    Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+                    // Rust `T { fields }` allocates without running any
+                    // `__init__`; the field initializers are the FieldWrite
+                    // chain that follows.
+                    if !arg_hls.is_empty() {
+                        return Err(TyperError::message(format!(
+                            "translate_op: SyntheticTransparentCtor {name:?} carries {} \
+                             operands; a Rust aggregate is an allocation followed by \
+                             its field writes. Result slot = {}",
+                            arg_hls.len(),
+                            fmt_op_result(op),
+                        )));
+                    }
+                    Ok(vec![instantiate_op(class_host, result)?])
                 }
                 CallTarget::Method { name, .. } => {
                     let mut iter = arg_hls.into_iter();
@@ -3609,8 +3585,8 @@ fn legacy_const_define_hlvalue(
             // lift succeeds instead of recording a lazy-failure that poisons
             // every attr-lookup caller:
             //   1. no graph is rtyped yet (every arg `concretetype` is `None`);
-            //   2. the callee is not lifted yet (registry-population order),
-            //      so its pygraph is not cached;
+            //   2. the callee's graph is still being built (a fn-const
+            //      cycle), so its pygraph is not cached;
             //   3. the callee's BODY does not lift — e.g. an unregistered
             //      iterator/container adapter, a separate front-lowering gap
             //      (#65).  The address is still valid; only JIT-compiling the
@@ -3619,8 +3595,8 @@ fn legacy_const_define_hlvalue(
             // `None`; the site then fails closed with the most specific
             // diagnosis, exactly as before.
             use crate::translator::rtyper::lltypesystem::lltype;
-            let lift_error = entry.lift_error();
             let graphs = entry.function_desc.borrow().getgraphs();
+            let lift_error = entry.lift_error();
             let maybe_graph = graphs.into_iter().next();
             // Precise fn-ptr only when the callee is lifted (cached graph, no
             // recorded lift error) AND rtyped; every other case routes to the
@@ -7474,41 +7450,50 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_call_synthetic_transparent_ctor_lowers_to_simple_call() {
+    fn translate_op_call_synthetic_transparent_ctor_lowers_to_instantiate() {
         // Call::SyntheticTransparentCtor mirrors Rust's `Class { fields }`
-        // ctor.  Flowspace still receives `simple_call(class_const, fields)`,
-        // but its call-site wrapper keeps rtyping on rtype_new_instance and
-        // prevents a registered semantic `__init__` from being dispatched.
+        // ctor: an allocation without `__init__`, i.e.
+        // `objectmodel.instantiate(Class)`; the field writes follow it.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 11); // vars[0..11]
         value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
         value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
-        let op = SpaceOperation {
+        let ctor = |args: Vec<Variable>| SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::synthetic_transparent_ctor("Point"),
-                args: crate::model::call_args(vec![vars[1].clone()]),
+                args: crate::model::call_args(args),
                 result_ty: ValueType::Ref(None),
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let translated = translate_op(&ctor(Vec::new()), &value_map, &empty_call_registry())
             .expect("Call::SyntheticTransparentCtor must lower");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "simple_call");
-        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
-            panic!("simple_call callable must be a Constant");
+        let [
+            Hlvalue::Constant(Constant {
+                value: ConstValue::HostObject(ref callable),
+                ..
+            }),
+            Hlvalue::Constant(Constant {
+                value: ConstValue::HostObject(ref class),
+                ..
+            }),
+        ] = translated[0].args[..]
+        else {
+            panic!("expected simple_call(instantiate, class)");
         };
-        let ConstValue::HostObject(ref host) = callable.value else {
-            panic!("ctor callable must be ConstValue::HostObject");
-        };
-        assert_eq!(host.qualname(), "Point");
-        assert_eq!(
-            host.transparent_class_target()
-                .expect("synthetic ctor must retain its call-site marker")
-                .qualname(),
-            "Point"
-        );
+        assert_eq!(callable.qualname(), "rpython.rlib.objectmodel.instantiate");
+        assert!(class.is_class());
+        assert_eq!(class.qualname(), "Point");
+
+        translate_op(
+            &ctor(vec![vars[1].clone()]),
+            &value_map,
+            &empty_call_registry(),
+        )
+        .expect_err("a Rust aggregate ctor carries no call operands");
     }
 
     #[test]
@@ -7766,7 +7751,7 @@ mod tests {
             body.set_return(body.startblock, Some(inputs[0].clone()));
             let mut graphs = GraphStore::default();
             graphs.insert(CallPath::from_segments(segments.clone()), body);
-            let registry = empty_call_registry();
+            let registry = std::rc::Rc::new(empty_call_registry());
             populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
                 .expect("register ordinary helper body");
             let entry = registry
@@ -9152,9 +9137,10 @@ mod tests {
             let crate::flowspace::model::ConstValue::HostObject(ref host) = callable.value else {
                 panic!("allocation callable must be a HostObject");
             };
-            assert!(
-                host.transparent_class_target().is_some(),
-                "New/NewWithVtable must keep the transparent-ctor marker"
+            assert_eq!(
+                host.qualname(),
+                "rpython.rlib.objectmodel.instantiate",
+                "New/NewWithVtable allocate through objectmodel.instantiate"
             );
         }
     }

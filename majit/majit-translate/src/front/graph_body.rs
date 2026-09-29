@@ -14,16 +14,24 @@
 //! which is what a [`GraphBodyProvider`] owns.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::rc::Rc;
 
 use majit_charon_reader::Llbc;
 
-use crate::front::mir::{self, LowerError};
-use crate::model::{FunctionGraph, ValueType};
+use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations};
+use crate::front::mir::{
+    self, CrateLowering, CrateLoweringState, DeclBuildError, GraphStamp, LowerError,
+};
+use crate::front::semantic::{SemanticFunction, SemanticProgram};
+use crate::model::{FunctionGraph, GraphKey, LazyGraph};
 
 /// Where a funcobj's body comes from: the LLBC that carries it and the
 /// Charon `def_id` that indexes it there (`Llbc::fn_by_id`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no funcobj records its body source yet")
+)]
 pub(crate) struct GraphBodySource {
     pub llbc_index: u32,
     pub def_id: u64,
@@ -31,32 +39,44 @@ pub(crate) struct GraphBodySource {
 
 /// Owns the extracted LLBC set and everything else the lowering reads, so
 /// a funcobj's body can be built after the whole-program pass has run.
+/// Each funcobj's [`LazyGraph`] holds its crate and the tables, and builds
+/// its body from them on first demand.
+pub(crate) struct GraphBodyProvider {
+    crates: Vec<Rc<ProvidedCrate>>,
+    tables: Rc<ProviderTables>,
+}
+
+/// What every crate's lowering reads besides its own artefact and state.
 ///
 /// The three `HostStaticAddrs` tables and the error-carrier spec are held
 /// owned because [`crate::HostStaticAddrs`] borrows all of them from the
-/// caller's frame; the borrowed view is rebuilt per
-/// [`GraphBodyProvider::build`] call, which only a demanded body pays for.
-pub(crate) struct GraphBodyProvider {
-    llbcs: Vec<Llbc>,
-    /// Per-LLBC struct field-attribute map, the same one the whole-program
-    /// loop lowered that LLBC's decls with.  `derive_program_metadata` is a
-    /// pure function of the LLBC, so recovering it here reproduces the
-    /// map exactly; it is computed on the first body demanded from each
-    /// LLBC rather than for every LLBC up front.
-    struct_field_attrs: Vec<OnceLock<HashMap<String, Vec<(String, ValueType)>>>>,
-    /// Per-LLBC duplicate-leaf tombstones. Computed on the first body
-    /// demanded from that LLBC, the same cache as `struct_field_attrs`.
-    tombstoned_leaves: Vec<OnceLock<HashSet<String>>>,
-    /// Duplicate-leaf verdict across every LLBC this provider owns.
-    /// A leaf that collides only across artefacts is in this set and in
-    /// none of the per-LLBC sets.
-    cross_tombstoned_leaves: OnceLock<HashSet<String>>,
+/// caller's frame; the borrowed view is rebuilt per lowering call.
+struct ProviderTables {
+    jitdriver_receiver_roots: Vec<String>,
     pytypes: Vec<(String, i64)>,
     pytypes_by_struct: Vec<(String, i64)>,
     refs: Vec<(String, i64)>,
     int_values: Vec<(String, i64)>,
     error_carrier: OwnedErrorCarrierSpec,
     scalar_field_stores: Vec<OwnedScalarFieldStore>,
+    /// The funcobj hint attributes harvested across the whole input; every
+    /// crate's headers read them ([`CrateLoweringState`]).
+    func_hints: HashMap<String, Vec<String>>,
+    /// Where the funcobjs declared apart from a crate's program go: the
+    /// clause specializations, each declared when the body whose call names
+    /// it is built (`specialize.py default_specialize` runs as the annotator
+    /// reaches the call).
+    declarations: FuncObjDeclarations,
+    /// Where every crate logs a declaration whose body did not lower; the
+    /// pipeline reports it once the bodies it builds are built.
+    skipped: mir::LoweringSkips,
+}
+
+/// One lowered crate: its artefact and the lowering state its decls were
+/// lowered with.
+struct ProvidedCrate {
+    llbc: Llbc,
+    state: CrateLoweringState,
 }
 
 /// Owned mirror of [`crate::ErrorCarrierSpec`], held for the same reason as
@@ -119,17 +139,18 @@ impl OwnedErrorCarrierSpec {
 }
 
 impl GraphBodyProvider {
-    pub(crate) fn new(llbcs: Vec<Llbc>, static_addrs: crate::HostStaticAddrs<'_>) -> Self {
+    pub(crate) fn new(
+        static_addrs: crate::HostStaticAddrs<'_>,
+        jitdriver_receiver_roots: &[String],
+        func_hints: HashMap<String, Vec<String>>,
+        declarations: FuncObjDeclarations,
+        skipped: mir::LoweringSkips,
+    ) -> Self {
         let own = |rows: &[(&str, i64)]| -> Vec<(String, i64)> {
             rows.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
         };
-        let struct_field_attrs = llbcs.iter().map(|_| OnceLock::new()).collect();
-        let tombstoned_leaves = llbcs.iter().map(|_| OnceLock::new()).collect();
-        Self {
-            llbcs,
-            struct_field_attrs,
-            tombstoned_leaves,
-            cross_tombstoned_leaves: OnceLock::new(),
+        let tables = ProviderTables {
+            jitdriver_receiver_roots: jitdriver_receiver_roots.to_vec(),
             pytypes: own(static_addrs.pytypes),
             pytypes_by_struct: own(static_addrs.pytypes_by_struct),
             refs: own(static_addrs.refs),
@@ -140,7 +161,86 @@ impl GraphBodyProvider {
                 .iter()
                 .map(OwnedScalarFieldStore::own)
                 .collect(),
+            func_hints,
+            declarations,
+            skipped,
+        };
+        Self {
+            crates: Vec::new(),
+            tables: Rc::new(tables),
         }
+    }
+
+    /// Declare the funcobjs of one already-linked artefact and keep it. No
+    /// body is built here: each is built when something first asks for its
+    /// graph (`description.py FunctionDesc.getgraphs` / `cachedgraph`), and
+    /// building one declares the clause specializations it names. The
+    /// caller applied
+    /// `discover_transparent_scalar_kinds` and `discover_foldable_const_lits`
+    /// across the whole set first, and `cross_tombstoned_leaves` is the
+    /// duplicate-leaf verdict across that set.
+    pub(crate) fn lower_prelinked_crate(
+        &mut self,
+        llbc: Llbc,
+        module_paths: &[&str],
+        cross_tombstoned_leaves: &HashSet<String>,
+    ) -> SemanticProgram {
+        let module_filter = mir::normalize_module_filter(module_paths);
+        let paint_tombstones = mir::prelink_crate(&llbc, cross_tombstoned_leaves);
+        let state = CrateLoweringState::new(
+            &llbc,
+            &paint_tombstones,
+            self.tables.func_hints.clone(),
+            self.tables.skipped.clone(),
+        );
+        let krate = Rc::new(ProvidedCrate { llbc, state });
+        let functions = self.declare_crate(&krate, module_filter.as_ref());
+        let mut program = krate.state.finish(functions);
+        mir::harden_duplicate_leaf_metadata(
+            &mut program.struct_fields,
+            &mut program.struct_origins,
+            &mut program.enum_variant_by_discriminant,
+            Some(&program.struct_ids),
+        );
+        self.crates.push(krate);
+        program
+    }
+
+    /// A funcobj per declaration of `krate` the membership gates admit,
+    /// each holding its body unbuilt.
+    fn declare_crate(
+        &self,
+        krate: &Rc<ProvidedCrate>,
+        module_filter: Option<&HashSet<String>>,
+    ) -> Vec<SemanticFunction> {
+        krate.lowering(&self.tables, |lowering| {
+            krate
+                .llbc
+                .iter_local_fns()
+                .filter(|fd| lowering.admit_decl(fd, module_filter, None))
+                .filter_map(|fd| {
+                    let header = lowering.decl_header(fd);
+                    let stamp = header.graph_stamp();
+                    // A declaration with no body (a required trait method,
+                    // an extern) is no function object.
+                    let Some(declared) = lowering.decl_header_graph(fd, &stamp) else {
+                        lowering.record_decl_failure(fd, DeclBuildError::NoBody);
+                        return None;
+                    };
+                    let declared = Rc::new(declared);
+                    if lowering.declare_llexternal(fd) {
+                        return Some(header.into_semantic(LazyGraph::external(declared)));
+                    }
+                    let (krate, tables, def_id) = (krate.clone(), self.tables.clone(), fd.def_id);
+                    let graph = LazyGraph::deferred(declared.clone(), move || {
+                        let graph = krate.build_decl_graph(&tables, def_id, &stamp, &declared);
+                        krate.declare_queued_specs(&tables);
+                        graph
+                    });
+                    Some(header.into_semantic(graph))
+                })
+                .collect()
+        })
     }
 
     /// Locate the funcobj whose Charon `name_path()` is `name_path`, if
@@ -157,10 +257,11 @@ impl GraphBodyProvider {
     ///
     /// Linear over the corpus, so it is a registration-time helper (and
     /// the test seam), not a per-demand lookup.
+    #[cfg(test)]
     pub(crate) fn source_for_name_path(&self, name_path: &str) -> Option<GraphBodySource> {
         let mut found = None;
-        for (i, llbc) in self.llbcs.iter().enumerate() {
-            for fd in llbc.iter_local_fns() {
+        for (i, krate) in self.crates.iter().enumerate() {
+            for fd in krate.llbc.iter_local_fns() {
                 if fd.item_meta.name_path() != name_path {
                     continue;
                 }
@@ -176,30 +277,160 @@ impl GraphBodyProvider {
         found
     }
 
-    /// Lower the funcobj `src` names, reproducing what the whole-program
-    /// loop produced for it.
-    pub(crate) fn build(&self, src: GraphBodySource) -> Result<FunctionGraph, LowerError> {
+    /// Build the funcobj `src` names with the state its crate was lowered
+    /// with, reproducing what the whole-program loop produced for it. Which
+    /// funcobjs exist is decided when they are registered, so no membership
+    /// gate runs here, and a body that does not lower answers its own error.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no funcobj records its body source yet")
+    )]
+    pub(crate) fn build(&self, src: GraphBodySource) -> Result<SemanticFunction, LowerError> {
         let idx = src.llbc_index as usize;
-        let llbc = self
-            .llbcs
+        let krate = self
+            .crates
             .get(idx)
             .ok_or_else(|| LowerError::Unsupported(format!("llbc index {idx} out of range")))?;
-        let fd = llbc.fn_by_id(src.def_id).ok_or_else(|| {
+        let fd = krate.llbc.fn_by_id(src.def_id).ok_or_else(|| {
             LowerError::Unsupported(format!("no FunDecl for def_id {}", src.def_id))
         })?;
-        let attrs = self.struct_field_attrs[idx].get_or_init(|| mir::struct_field_attrs_of(llbc));
-        let local_tombstones = self.tombstoned_leaves[idx]
-            .get_or_init(|| mir::tombstoned_leaves_of(llbc))
-            .clone();
-        let cross = self.cross_tombstoned_leaves.get_or_init(|| {
-            let mut facts = mir::DuplicateLeafFacts::default();
-            for llbc in &self.llbcs {
-                facts.absorb(mir::DuplicateLeafFacts::discover(llbc));
+        krate
+            .lowering(&self.tables, |lowering| lowering.build_decl(fd))
+            .map_err(|e| match e {
+                DeclBuildError::NoBody => LowerError::Unsupported(format!(
+                    "{}: no Unstructured body",
+                    fd.item_meta.name_path()
+                )),
+                DeclBuildError::Lower { error, .. } => error,
+            })
+    }
+}
+
+impl ProvidedCrate {
+    /// Declare the clause specializations the bodies built so far queued,
+    /// in queue order.
+    fn declare_queued_specs(self: &Rc<Self>, tables: &Rc<ProviderTables>) {
+        while let Some(req) = self.lowering(tables, |lowering| lowering.pop_spec()) {
+            if let Some(spec) = self.declare_spec(tables, req) {
+                tables.declarations.push(spec);
             }
-            facts.tombstoned_leaves()
-        });
-        let mut tombstoned = local_tombstones;
-        tombstoned.extend(cross.iter().cloned());
+        }
+    }
+
+    /// The funcobj of the clause specialization `req`, its graph unbuilt.
+    /// `None`, recorded, when its body does not substitute.
+    fn declare_spec(
+        self: &Rc<Self>,
+        tables: &Rc<ProviderTables>,
+        req: crate::front::clause_spec::SpecRequest,
+    ) -> Option<DeclaredFuncObj> {
+        self.lowering(tables, |lowering| {
+            let spec = lowering.declare_spec(req)?;
+            let stamp = spec.header.graph_stamp();
+            let declared = Rc::new(lowering.spec_header_graph(&spec));
+            let (krate, tables, body) = (self.clone(), tables.clone(), spec.body.clone());
+            let graph = LazyGraph::deferred(declared.clone(), move || {
+                let graph = krate.lowering(&tables, |lowering| lowering.build_spec_body(&body));
+                krate.declare_queued_specs(&tables);
+                Some(stamp_declared(&stamp, graph?, &declared))
+            });
+            Some(spec.into_declared(graph))
+        })
+    }
+
+    /// Run `f` over this crate's lowering context.
+    fn lowering<R>(&self, tables: &ProviderTables, f: impl FnOnce(&CrateLowering<'_>) -> R) -> R {
+        tables.with_static_addrs(|static_addrs| {
+            f(&CrateLowering::new(
+                &self.llbc,
+                static_addrs,
+                &tables.jitdriver_receiver_roots,
+                &self.state,
+            ))
+        })
+    }
+
+    /// Build the body of the declaration `def_id` and stamp its header on
+    /// it. `None`, recorded as the declaration's failure, when it does not
+    /// lower.
+    fn build_decl_graph(
+        &self,
+        tables: &ProviderTables,
+        def_id: u64,
+        stamp: &GraphStamp,
+        declared: &FunctionGraph,
+    ) -> Option<FunctionGraph> {
+        let fd = self.llbc.fn_by_id(def_id)?;
+        self.lowering(tables, |lowering| match lowering.build_decl_body(fd) {
+            Ok(graph) => Some(stamp_declared(stamp, graph, declared)),
+            Err(error) => {
+                lowering.record_decl_failure(fd, error);
+                None
+            }
+        })
+    }
+}
+
+/// Stamp the funcobj's header on its built body, which must keep what the
+/// funcobj declared.
+fn stamp_declared(
+    stamp: &GraphStamp,
+    graph: FunctionGraph,
+    declared: &FunctionGraph,
+) -> FunctionGraph {
+    let graph = stamp.apply(graph);
+    assert_eq!(
+        declaration(&graph),
+        declaration(declared),
+        "the built body of {} departs from its declaration",
+        graph.name
+    );
+    graph
+}
+
+/// The part of a graph its declaration fixes: identity, `FUNC.RESULT`,
+/// and the startblock's parameters with their declared types.
+fn declaration(
+    graph: &FunctionGraph,
+) -> (
+    GraphKey,
+    Option<String>,
+    Vec<String>,
+    usize,
+    Vec<(String, crate::model::ValueType, Option<String>)>,
+) {
+    let startblock = graph.block(graph.startblock);
+    let inputs = startblock
+        .operations
+        .iter()
+        .filter_map(|op| match &op.kind {
+            crate::model::OpKind::Input {
+                name,
+                ty,
+                class_root,
+            } => {
+                let index = startblock
+                    .inputargs
+                    .iter()
+                    .position(|arg| op.result.as_ref() == Some(arg))?;
+                Some((format!("{index}:{name}"), ty.clone(), class_root.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    (
+        graph.graph_key(),
+        graph.return_type.clone(),
+        graph.hints.clone(),
+        startblock.inputargs.len(),
+        inputs,
+    )
+}
+
+impl ProviderTables {
+    /// Run `f` with the borrowed [`crate::HostStaticAddrs`] view of the
+    /// owned tables.
+    fn with_static_addrs<R>(&self, f: impl FnOnce(crate::HostStaticAddrs<'_>) -> R) -> R {
         let pytypes = borrowed(&self.pytypes);
         let pytypes_by_struct = borrowed(&self.pytypes_by_struct);
         let refs = borrowed(&self.refs);
@@ -212,28 +443,22 @@ impl GraphBodyProvider {
             .map(OwnedScalarFieldStore::borrowed)
             .collect();
         let to_exc_object = carrier.to_exc_object.as_deref().map(borrowed_segments);
-        mir::lower_fun_decl_with_static_addrs_and_attrs(
-            llbc,
-            fd,
-            crate::HostStaticAddrs {
-                pytypes: &pytypes,
-                pytypes_by_struct: &pytypes_by_struct,
-                refs: &refs,
-                int_values: &int_values,
-                error_carrier: crate::ErrorCarrierSpec {
-                    carrier_path: &carrier.carrier_path,
-                    carrier_wrappers: &carrier_wrappers,
-                    to_exc_object: to_exc_object.as_deref(),
-                    from_exc_object: carrier
-                        .from_exc_object
-                        .as_ref()
-                        .map(|(receiver, method)| (receiver.as_str(), method.as_str())),
-                },
-                scalar_field_stores: &scalar_field_stores,
+        f(crate::HostStaticAddrs {
+            pytypes: &pytypes,
+            pytypes_by_struct: &pytypes_by_struct,
+            refs: &refs,
+            int_values: &int_values,
+            error_carrier: crate::ErrorCarrierSpec {
+                carrier_path: &carrier.carrier_path,
+                carrier_wrappers: &carrier_wrappers,
+                to_exc_object: to_exc_object.as_deref(),
+                from_exc_object: carrier
+                    .from_exc_object
+                    .as_ref()
+                    .map(|(receiver, method)| (receiver.as_str(), method.as_str())),
             },
-            attrs,
-            &tombstoned,
-        )
+            scalar_field_stores: &scalar_field_stores,
+        })
     }
 }
 
@@ -247,7 +472,10 @@ fn borrowed_segments(segments: &[String]) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::model::FunctionGraph;
 
     const CORPUS: &str = crate::runtime_names::artifacts::CHARON_CORPUS_ULLBC;
 
@@ -315,40 +543,95 @@ mod tests {
     /// loop built: same graph shape, from the same `FunDecl`, for every
     /// funcobj in the corpus that lowers at all.
     ///
-    /// Also asserts every lowerable funcobj's name path is unique in the
+    /// Also asserts every lowered funcobj's name path is unique in the
     /// corpus: `source_for_name_path` resolves an ambiguous name to
     /// `None`, so a duplicate surfaces here as a lookup miss.
     #[test]
     fn provider_reproduces_the_eagerly_lowered_body() {
         let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
-        let attrs = mir::struct_field_attrs_of(&llbc);
-        let tombstoned = mir::tombstoned_leaves_of(&llbc);
-        let mut eager: Vec<(String, _)> = Vec::new();
-        for fd in llbc.iter_local_fns() {
-            if fd.unstructured().is_none() || fd.is_global_initializer().is_some() {
+        let mut provider = GraphBodyProvider::new(
+            crate::HostStaticAddrs::default(),
+            &[],
+            HashMap::new(),
+            FuncObjDeclarations::default(),
+            Default::default(),
+        );
+        let program = provider.lower_prelinked_crate(llbc, &[], &HashSet::new());
+        let mut compared = 0;
+        for f in &program.functions {
+            let Some(fd) = f
+                .fun_decl_id
+                .and_then(|id| provider.crates[0].llbc.fn_by_id(id))
+            else {
                 continue;
-            }
-            if let Ok(g) = mir::lower_fun_decl_with_static_addrs_and_attrs(
-                &llbc,
-                fd,
-                crate::HostStaticAddrs::default(),
-                &attrs,
-                &tombstoned,
-            ) {
-                eager.push((fd.item_meta.name_path(), shape(&g)));
-            }
-        }
-        assert!(!eager.is_empty(), "corpus fixture lowered no bodies at all");
-
-        let provider = GraphBodyProvider::new(vec![llbc], crate::HostStaticAddrs::default());
-        for (name_path, want) in &eager {
+            };
+            let name_path = fd.item_meta.name_path();
             let src = provider
-                .source_for_name_path(name_path)
+                .source_for_name_path(&name_path)
                 .unwrap_or_else(|| panic!("no unique GraphBodySource for {name_path}"));
             let got = provider
                 .build(src)
                 .unwrap_or_else(|e| panic!("provider failed to build {name_path}: {e}"));
-            assert_eq!(&shape(&got), want, "{name_path}");
+            // A clause specialization shares its generic's `FunDecl` under
+            // its own name.
+            if got.name != f.name {
+                continue;
+            }
+            assert_eq!(shape(got.graph()), shape(f.graph()), "{name_path}");
+            compared += 1;
         }
+        assert!(compared > 0, "corpus fixture lowered no bodies at all");
+    }
+
+    /// A funcobj's harvested `_jit_*_` attributes land on it and on its
+    /// graph when the header is built, with no pass over the program
+    /// afterwards.
+    #[test]
+    fn a_harvested_hint_is_stamped_as_the_funcobj_is_built() {
+        let fn_path = |f: &SemanticFunction| {
+            if f.module_path.is_empty() {
+                f.name.clone()
+            } else {
+                format!("{}::{}", f.module_path, f.name)
+            }
+        };
+        let unhinted = GraphBodyProvider::new(
+            crate::HostStaticAddrs::default(),
+            &[],
+            HashMap::new(),
+            FuncObjDeclarations::default(),
+            Default::default(),
+        )
+        .lower_prelinked_crate(
+            Llbc::load(CORPUS).expect("load corpus.ullbc"),
+            &[],
+            &HashSet::new(),
+        );
+        let target = unhinted
+            .functions
+            .iter()
+            .find(|f| f.hints.is_empty())
+            .map(fn_path)
+            .expect("corpus has an unhinted funcobj");
+        let hints = HashMap::from([(target.clone(), vec!["unroll_safe".to_string()])]);
+        let program = GraphBodyProvider::new(
+            crate::HostStaticAddrs::default(),
+            &[],
+            hints,
+            FuncObjDeclarations::default(),
+            Default::default(),
+        )
+        .lower_prelinked_crate(
+            Llbc::load(CORPUS).expect("load corpus.ullbc"),
+            &[],
+            &HashSet::new(),
+        );
+        let f = program
+            .functions
+            .iter()
+            .find(|f| fn_path(f) == target)
+            .expect("the hinted funcobj still lowers");
+        assert_eq!(f.hints, vec!["unroll_safe".to_string()]);
+        assert!(f.graph().hints.iter().any(|h| h == "unroll_safe"));
     }
 }

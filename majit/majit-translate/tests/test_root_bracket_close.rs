@@ -280,8 +280,8 @@ fn moved_out_locals(body: &Unstructured) -> std::collections::HashSet<u64> {
     let mut moved = std::collections::HashSet::new();
     let mut stack: Vec<&serde_json::Value> = Vec::new();
     for bb in &body.body {
-        stack.extend(bb.statements.iter().map(|st| &st.kind));
-        stack.push(&bb.terminator.kind);
+        stack.extend(bb.statements.iter().map(|st| st.kind_value()));
+        stack.push(bb.terminator.kind_value());
     }
     while let Some(node) = stack.pop() {
         match node {

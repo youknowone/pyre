@@ -2,9 +2,10 @@
 //! walk, but whose address and scalar ABI are known.
 //!
 //! `extfunc.py` `register_external` / `ExtFuncEntry` is the owner: a residual
-//! call of the real function returns the runtime value.  Callers enumerate
-//! the functions `build_semantic_program` declined with `unsupported MIR:
-//! atomic load ordering`, and this module keeps only a word-only reader:
+//! call of the real function returns the runtime value.  The front end
+//! declares each [`WORD_LOAD_LLEXTERNALS`] path as a function object with no
+//! graph (`rffi.py` `llexternal`) and records its signature, and this module
+//! keeps only a word-only reader:
 //! a function that loads one word from a process-global `AtomicU32` and
 //! returns it, with no allocation, collection, blocking, or thread
 //! creation.
@@ -20,11 +21,9 @@
 //! creates a thread.  Registering one as a signature-only external
 //! tells the rest of the pipeline nothing about any of that.
 //!
-//! The harvested [`DeclinedFunDecl`] has path, scalar lltypes, and the
-//! decline reason; it has no body.  The harvest lives in `front::mir`
-//! and does not attach one.  The decline string is not a gate: the MIR
-//! loop already records an ordered load on `ordered_atomic_load_reasons`.
-//! The gate therefore requires:
+//! The front end records a [`DeclinedFunDecl`] for each declaration it
+//! declares as an `llexternal`: path, scalar lltypes and a reason, no
+//! body.  The reason string is not a gate.  The gate requires:
 //!
 //! - no translatable body
 //! - zero arguments (a process-global cell; a pointer argument is a
@@ -83,12 +82,8 @@ pub const WORD_LOAD_LLEXTERNALS: &[WordLoadLlexternal] = &[
     },
 ];
 
-/// Needle of the `LowerError::Unsupported` Display string
-/// `build_semantic_program` records in its local `skipped` vec.
-pub const ATOMIC_LOAD_ORDERING_DECLINE: &str = "atomic load ordering";
-
-/// One function `build_semantic_program` declined, presented as a
-/// signature-only declaration.
+/// One function the front end declares as an `llexternal`, presented as
+/// a signature-only declaration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclinedFunDecl {
     pub segments: Vec<String>,
@@ -96,8 +91,7 @@ pub struct DeclinedFunDecl {
     pub result_lltype: LowLevelType,
     /// `true` when a SemanticFunction graph exists.  An external has none.
     pub has_translatable_body: bool,
-    /// `LowerError` Display (`unsupported MIR: atomic load ordering …`)
-    /// or another `skipped` / `declaration-has-no-unstructured-body` reason.
+    /// Why the declaration has no graph.
     pub decline_reason: String,
 }
 

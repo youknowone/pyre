@@ -216,21 +216,18 @@ impl FunctionEntry {
 
     /// Record a per-entry lift failure so consumers surfacing through
     /// `cachedgraph` see the producer-side error instead of the
-    /// generic `buildflowgraph: missing code object` fallback.  Called
-    /// from `cutover::populate_call_registry_from_call_graphs`'s Pass
-    /// 2 when `lift_callee_to_pygraph` returns Err.
+    /// generic `buildflowgraph: missing code object` fallback.
     pub fn record_lift_error(&self, message: String) {
         self.function_desc.borrow().record_lift_error(message);
     }
 
     /// Read-side twin of [`record_lift_error`]: the recorded pyre-side
     /// lift failure message, or `None` when the entry's body lifted
-    /// cleanly.  `translate_op` consults this to fail-closed on a callee
-    /// whose graph could not be built (unbuildable callee → caller Skips
-    /// to the legacy walker), instead of binding a `host_object` that
-    /// would partial-codewrite with a pre-real residual kind.
+    /// cleanly. Asking builds the graph first.
     pub fn lift_error(&self) -> Option<String> {
-        self.function_desc.borrow().lift_error_message()
+        let fd = self.function_desc.borrow();
+        fd.build_source_graph();
+        fd.lift_error_message()
     }
 
     /// Store the callee's declared LLBC fn-ptr signature (see
@@ -338,7 +335,15 @@ pub struct CallRegistry {
             Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
         )>,
     >,
+    /// Makes the entry of a function object seen after the registry was
+    /// populated, on its first lookup (`bookkeeper.py getdesc`: the
+    /// descriptor is created the first time the object is seen).
+    getdesc: RefCell<Option<Getdesc>>,
 }
+
+/// [`CallRegistry::set_getdesc`]'s callback: the entry for a path the
+/// registry has none for, or `None` when the path names no function object.
+pub type Getdesc = Rc<dyn Fn(&FunctionPathKey) -> Option<Rc<FunctionEntry>>>;
 
 impl CallRegistry {
     /// Construct an empty registry sharing `bookkeeper`.
@@ -349,6 +354,21 @@ impl CallRegistry {
             aliases: RefCell::new(HashMap::new()),
             two_phase: RefCell::new(TwoPhaseTypeCache::default()),
             session: RefCell::new(None),
+            getdesc: RefCell::new(None),
+        }
+    }
+
+    /// Describe a function object the registry has no entry for through
+    /// `getdesc`, on its first lookup.
+    pub fn set_getdesc(&self, getdesc: Getdesc) {
+        *self.getdesc.borrow_mut() = Some(getdesc);
+    }
+
+    /// Drop every lowered body whose graph was never asked for. The
+    /// annotator is complete; no graph is built after it.
+    pub fn release_source_graphs(&self) {
+        for entry in self.entries.borrow().values() {
+            entry.function_desc.borrow().release_source_graph();
         }
     }
 
@@ -713,9 +733,23 @@ impl CallRegistry {
     /// resolves through `aliases` to the canonical key and re-reads.
     /// Mirrors RPython `Bookkeeper.getdesc(pyobj)`'s "obj_key direct
     /// lookup" plus alias indirection (`bookkeeper.py`).
+    ///
+    /// A path with no entry yet is handed to the [`Self::set_getdesc`]
+    /// callback, which makes the entry of a function object seen after
+    /// the registry was populated.
     pub fn lookup(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
-        if let Some(entry) = self.entries.borrow().get(key) {
-            return Some(entry.clone());
+        if let Some(entry) = self.lookup_registered(key) {
+            return Some(entry);
+        }
+        let getdesc = self.getdesc.borrow().clone()?;
+        getdesc(key)
+    }
+
+    /// [`Self::lookup`] over the entries made so far.
+    fn lookup_registered(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
+        let entry = self.entries.borrow().get(key).cloned();
+        if entry.is_some() {
+            return entry;
         }
         let canonical = self.aliases.borrow().get(key).cloned()?;
         self.entries.borrow().get(&canonical).cloned()
@@ -964,7 +998,7 @@ impl CallRegistry {
         signature: Signature,
         graph_func: GraphFunc,
     ) -> Rc<FunctionEntry> {
-        if let Some(existing) = self.lookup(&key) {
+        if let Some(existing) = self.lookup_registered(&key) {
             assert_eq!(
                 existing.function_desc.borrow().signature,
                 signature,

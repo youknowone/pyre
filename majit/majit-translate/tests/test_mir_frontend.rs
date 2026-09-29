@@ -1836,7 +1836,7 @@ fn mem_replace_through_box_deref_names_enum_fields() {
             .unwrap_or_else(|| panic!("missing {name}"));
         let mut replace_calls = 0usize;
         let mut writes = Vec::new();
-        for block in &func.graph.blocks {
+        for block in &func.graph().blocks {
             for op in &block.operations {
                 match &op.kind {
                     OpKind::FieldWrite { field, .. } => writes.push(field.name.clone()),
@@ -1862,7 +1862,7 @@ fn mem_replace_through_box_deref_names_enum_fields() {
         let mut cc = CallControl::new();
         cc.set_struct_fields(program.struct_fields.clone());
         let path = CallPath::from_segments([name]);
-        cc.register_function_graph(path.clone(), func.graph.clone());
+        cc.register_function_graph(path.clone(), func.graph().clone());
         cc.add_candidate_graph(path);
         let mut cache = AnalysisCache::default();
         let op = SpaceOperation {
@@ -1873,7 +1873,7 @@ fn mem_replace_through_box_deref_names_enum_fields() {
                 result_ty: ValueType::Void,
             },
         };
-        let nargs = func.graph.block(func.graph.startblock).inputargs.len();
+        let nargs = func.graph().block(func.graph().startblock).inputargs.len();
         let descriptor = cc.getcalldescr(
             &op,
             vec![Type::Ref; nargs],

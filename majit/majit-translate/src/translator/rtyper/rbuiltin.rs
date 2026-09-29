@@ -298,6 +298,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "free_non_gc_object",
             rtype_free_non_gc_object,
         ),
+        // rbuiltin.py
+        ("rpython.rlib.objectmodel", "instantiate", rtype_instantiate),
         // rbuiltin.py — `rtype_const_result` is registered for
         // four upstream callables.  `front::mir` synthesises the
         // production dispatch path; these entries keep the registry
@@ -1888,10 +1890,74 @@ pub fn rtype_offsetof(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
 /// RPython `@typer_for(objectmodel.instantiate) def rtype_instantiate`
 /// (rbuiltin.py).
 ///
-/// This needs PBC class handling plus `rclass.rtype_new_instance` /
-/// `_instantiate_runtime_class`.
-pub fn rtype_instantiate(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
-    Err(rbuiltin_deferred("rtype_instantiate"))
+/// ```python
+/// @typer_for(objectmodel.instantiate)
+/// def rtype_instantiate(hop, i_nonmovable=None):
+///     hop.exception_cannot_occur()
+///     s_class = hop.args_s[0]
+///     assert isinstance(s_class, annmodel.SomePBC)
+///     v_nonmovable, = parse_kwds(hop, (i_nonmovable, None))
+///     nonmovable = (i_nonmovable is not None and v_nonmovable.value)
+///     if len(s_class.descriptions) != 1:
+///         # instantiate() on a variable class
+///         if nonmovable:
+///             raise TyperError("instantiate(x, nonmovable=True) cannot be used "
+///                              "if x is not a constant class")
+///         vtypeptr, = hop.inputargs(rclass.get_type_repr(hop.rtyper))
+///         r_class = hop.args_r[0]
+///         return r_class._instantiate_runtime_class(hop, vtypeptr,
+///                                                   hop.r_result.lowleveltype)
+///     classdef = s_class.any_description().getuniqueclassdef()
+///     return rclass.rtype_new_instance(hop.rtyper, classdef, hop.llops,
+///                                      nonmovable=nonmovable)
+/// ```
+pub fn rtype_instantiate(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::description::DescEntry;
+    use crate::flowspace::model::Hlvalue;
+
+    hop.exception_cannot_occur()?;
+    let s_class = hop.args_s.borrow()[0].clone();
+    let SomeValue::PBC(s_class) = s_class else {
+        return Err(TyperError::message(
+            "rtype_instantiate: the class argument is not a SomePBC",
+        ));
+    };
+    let i_nonmovable = kwds_i.get("i_nonmovable").copied();
+    let kw = parse_kwds(hop, &[(i_nonmovable, None)])?;
+    let nonmovable = i_nonmovable.is_some()
+        && matches!(
+            kw.into_iter().next().flatten(),
+            Some(Hlvalue::Constant(Constant {
+                value: ConstValue::Bool(true),
+                ..
+            }))
+        );
+    if s_class.descriptions.len() != 1 {
+        if nonmovable {
+            return Err(TyperError::message(
+                "instantiate(x, nonmovable=True) cannot be used if x is not a constant class",
+            ));
+        }
+        return Err(rbuiltin_deferred(
+            "rtype_instantiate: ClassesPBCRepr._instantiate_runtime_class",
+        ));
+    }
+    let Some(DescEntry::Class(classdesc)) = s_class.any_description() else {
+        return Err(TyperError::message(
+            "rtype_instantiate: the class argument's description is not a ClassDesc",
+        ));
+    };
+    let classdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(classdesc)
+        .map_err(|e| TyperError::message(e.to_string()))?;
+    let mut llops = hop.llops.borrow_mut();
+    let v_instance = crate::translator::rtyper::rclass::rtype_new_instance(
+        &hop.rtyper,
+        Some(&classdef),
+        &mut llops,
+        None,
+        nonmovable,
+    )?;
+    Ok(Some(v_instance))
 }
 
 /// RPython `@typer_for(OrderedDict)`, `objectmodel.r_dict`, and
@@ -4990,7 +5056,6 @@ mod tests {
             ),
             ("rtype_WindowsError__init__", rtype_WindowsError__init__),
             ("rtype_hlinvoke", rtype_hlinvoke),
-            ("rtype_instantiate", rtype_instantiate),
             ("rtype_dict_constructor", rtype_dict_constructor),
         ];
 

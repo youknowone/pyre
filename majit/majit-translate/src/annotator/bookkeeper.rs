@@ -1359,15 +1359,6 @@ impl Bookkeeper {
         if let Some(existing) = self.descs.borrow().get(pyobj) {
             return Ok(existing.clone());
         }
-        // A SyntheticTransparentCtor is a call-site marker around the ONE
-        // canonical class object, not another class.  Reuse the target's
-        // ClassDesc exactly; ClassesPBCRepr later reads the wrapper constant to
-        // select rtype_new_instance without the optional __init__ dispatch.
-        if let Some(class_obj) = pyobj.transparent_class_target() {
-            let entry = self.getdesc(class_obj)?;
-            self.descs.borrow_mut().insert(pyobj.clone(), entry.clone());
-            return Ok(entry);
-        }
         let entry = if pyobj.is_user_function() {
             // upstream `newfuncdesc` already returns a MemoDesc or
             // FunctionDesc per the specializer.
@@ -3850,7 +3841,7 @@ impl Bookkeeper {
         // upstream bookkeeper.py:315-316 — `elif tp is type: result =
         // SomeConstantType(x, self)`. Implemented as a constant
         // SomePBC over the real [`ClassDesc`] returned by [`Self::getdesc`].
-        if obj.is_class() || obj.transparent_class_target().is_some() {
+        if obj.is_class() {
             let entry = self.getdesc(obj)?;
             let mut pbc = SomePBC::new(vec![entry], false);
             pbc.base.const_box = Some(Constant::new(raw.clone()));
@@ -4998,7 +4989,7 @@ mod tests {
             .find(|function| function.name == "memoryview_is_native_release_descr")
             .expect("memoryview caller graph");
         let written = target
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -5013,7 +5004,7 @@ mod tests {
             .expect("memoryview closure Args tuple payload write");
         assert!(
             target
-                .graph
+                .graph()
                 .blocks
                 .iter()
                 .flat_map(|block| &block.operations)
@@ -7460,21 +7451,11 @@ mod tests {
         );
         bk.set_struct_fields(Rc::new(reg));
 
+        // Minting the shape class projects its rows (`_init_classdef`), so
+        // the untyped force shell is already reset when the classdef is
+        // returned; a later projection is a no-op.
         let tuple_host = bk.intern_class_by_qualname(tuple);
         let tuple_cd = bk.getuniqueclassdef(&tuple_host).expect("tuple classdef");
-        {
-            let attrs = tuple_cd.borrow();
-            for field in ["__pos_0", "__pos_1"] {
-                let value = &attrs.attrs.get(field).expect("tuple field").s_value;
-                assert!(
-                    matches!(value, SomeValue::Instance(inst)
-                    if inst.classdef.is_none() && !inst.can_be_none
-                        && inst.flags.is_empty() && inst.base.const_box.is_none()),
-                    "{field} pre-seed must be untyped force shell, got {value:?}"
-                );
-                eprintln!("probe {field} after force seeding, before projection: {value:?}");
-            }
-        }
         bk.project_struct_rows(tuple).expect("tuple rows project");
         {
             let attrs = tuple_cd.borrow();

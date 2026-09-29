@@ -176,7 +176,7 @@ pub struct MethodInfo {
     pub name: String,
     /// Canonical semantic graph for this method when available.
     #[serde(skip, default)]
-    pub graph: Option<model::FunctionGraph>,
+    pub graph: Option<model::LazyGraph>,
     /// RPython: op.result.concretetype — return type for array identity.
     #[serde(default)]
     pub return_type: Option<String>,
@@ -204,6 +204,8 @@ fn build_semantic_program_via_active_frontend(
     static_addrs: HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
     explicit_llbc_paths: Option<&[&str]>,
+    funcobj_declarations: &call::FuncObjDeclarations,
+    lowering_skips: &front::mir::LoweringSkips,
     prof: &mut PhaseProfiler,
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
@@ -232,13 +234,12 @@ fn build_semantic_program_via_active_frontend(
                     .filter(|paths: &Vec<String>| !paths.is_empty())
             });
         if let Some(paths) = resolved_paths {
-            // Parse one artefact at a time. Holding every crate's Llbc
-            // (interpreter ~825MB JSON plus its typed tree) together with
-            // the merged SemanticProgram is what blew a 12GB container.
+            // The harvest loop parses one artefact at a time and drops it.
             // The second loop reloads each file after
             // `register_transparent_scalar_kinds` so cross-crate
-            // `repr(transparent)` scalar returns resolve; that extra
-            // parse is the cost of not keeping every tree live.
+            // `repr(transparent)` scalar returns resolve, and hands it to
+            // the `GraphBodyProvider`, which keeps it and the state its
+            // decls were lowered with.
             let mut discovered = Vec::new();
             let mut foldable_cross = Vec::new();
             let mut foldable_impl_by_ord = Vec::new();
@@ -296,6 +297,13 @@ fn build_semantic_program_via_active_frontend(
             let cross_tombstoned_leaves = duplicate_leaf_facts.tombstoned_leaves();
             crate::local_crates::register_local_crate_roots(crate_names);
 
+            let mut graph_bodies = front::graph_body::GraphBodyProvider::new(
+                static_addrs,
+                jitdriver_receiver_roots,
+                hints.clone(),
+                funcobj_declarations.clone(),
+                lowering_skips.clone(),
+            );
             let mut merged = None;
             let mut seen_function_keys = std::collections::HashSet::new();
             let mut seen_struct_names = std::collections::HashSet::new();
@@ -323,14 +331,11 @@ fn build_semantic_program_via_active_frontend(
                     .extend(front::mir::collect_marked_class_ctor_stubs_from_llbc(&llbc));
                 foreign_opaque_method_externals
                     .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
-                let prog = front::mir::build_semantic_program_from_prelinked_llbc(
-                    &llbc,
-                    static_addrs,
+                let prog = graph_bodies.lower_prelinked_crate(
+                    llbc,
                     module_paths,
-                    jitdriver_receiver_roots,
                     &cross_tombstoned_leaves,
-                )
-                .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower {p}: {e}"));
+                );
                 prof.mark(&format!("    lower {p}"));
                 front::mir::absorb_semantic_program(
                     &mut merged,
@@ -363,7 +368,7 @@ fn build_semantic_program_via_active_frontend(
                 &mut program.enum_variant_by_discriminant,
                 Some(&program.struct_ids),
             );
-            merge_hints_from_map(&mut program, &hints);
+            program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
@@ -381,67 +386,6 @@ fn build_semantic_program_via_active_frontend(
          `MAJIT_MIR_FRONTEND_LLBC` to an OS path-list \
          (`;`-separated on Windows, `:` elsewhere) explicitly."
     );
-}
-
-/// Merge JIT-hint markers harvested from the ullbc surrogate consts
-/// into a MIR-driven SemanticProgram.
-///
-/// `front::llbc_hints::harvest_hints_from_llbcs` reads the
-/// `#[doc(hidden)]` marker consts the `majit_macros` proc-macros emit
-/// (`_elidable_function_<NAME>`, `_jit_elidable_cannot_raise_<NAME>`,
-/// `_jit_cannot_raise_<NAME>`, `_jit_look_inside_<NAME>`, …) out of
-/// Charon's `global_decls`,
-/// keyed by the crate-stripped function path.  Each `SemanticFunction`
-/// is matched by its `{module_path}::{name}` path so same-named helpers
-/// in different modules cannot inherit each other's hints.
-#[cfg(feature = "mir-frontend")]
-#[allow(dead_code)] // llbc_hints harvest merged onto SemanticProgram
-fn merge_hints_from_llbcs(
-    program: &mut front::SemanticProgram,
-    llbcs: &[majit_charon_reader::Llbc],
-) {
-    let hints_by_path = front::llbc_hints::harvest_hints_from_llbcs(llbcs);
-    merge_hints_from_map(program, &hints_by_path);
-}
-
-#[cfg(feature = "mir-frontend")]
-fn merge_hints_from_map(
-    program: &mut front::SemanticProgram,
-    hints_by_path: &std::collections::HashMap<String, Vec<String>>,
-) {
-    program.harvested_hints.clone_from(hints_by_path);
-    for f in &mut program.functions {
-        let path = if f.module_path.is_empty() {
-            f.name.clone()
-        } else {
-            format!("{}::{}", f.module_path, f.name)
-        };
-        if let Some(h) = hints_by_path.get(&path) {
-            f.hints.clone_from(h);
-            // BFS reads `_jit_*_` off `FunctionGraph.hints`. Stamping
-            // the harvested bag here means the first
-            // `register_function_graph` already carries `unroll_safe`.
-            front::llbc_hints::merge_hints_into_graph(&mut f.graph, h);
-            // A `dont_look_inside` callee returning `*mut PyObject`
-            // (`SemanticFunction::returns_objectptr`, set structurally by
-            // `front::mir::output_type_is_objectptr`) residualizes as an
-            // opaque call.  The MIR driver leaves `return_type` `None`,
-            // which the cutover residual prefill maps `None`→`Void` — a
-            // miscompile for a callee the caller reads as a pointer.
-            // Stamp the object-pointer marker so the residual reports a
-            // `Ref` result instead.  Gated on the hint so non-opaque
-            // object-pointer-returning fns keep `return_type == None`
-            // (the call-signature validator's TyRef-label-misclassify
-            // safeguard, `front::mir`).
-            if f.return_type.is_none()
-                && f.returns_objectptr
-                && h.iter().any(|hint| hint == "dont_look_inside")
-            {
-                f.return_type =
-                    Some(translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
-            }
-        }
-    }
 }
 
 /// `make_virtualizable_infos` constructor closure type — mirrors the
@@ -694,6 +638,22 @@ pub fn analyze_multiple_pipeline_from_llbc_with_modules(
     )
 }
 
+/// A registration of the funcobj `graph` that stamps the source return type
+/// (`funcptr._obj.TO.RESULT`) and then `hints` onto its copy of the graph.
+fn lazy_graph_source(
+    graph: &model::LazyGraph,
+    return_type: &Option<String>,
+    hints: &[String],
+) -> call::GraphSource {
+    call::GraphSource::Lazy {
+        graph: graph.clone(),
+        transform: call::GraphTransform {
+            return_type: return_type.clone(),
+            hints: hints.to_vec(),
+        },
+    }
+}
+
 /// Register a free-function graph under one alias path.  Panics if the
 /// same alias is already mapped to a different `func.name` — this is
 /// the parity guard against silent cross-crate name-tail collisions.
@@ -705,14 +665,11 @@ pub fn analyze_multiple_pipeline_from_llbc_with_modules(
 /// per-alias deep copy of `FunctionGraph.blocks` multiplied the whole
 /// free-function graph set by the alias count.
 fn register_function_graph_alias(
-    graphs: &mut std::collections::HashMap<
-        crate::parse::CallPath,
-        std::sync::Arc<crate::model::FunctionGraph>,
-    >,
+    graphs: &mut std::collections::HashMap<crate::parse::CallPath, call::GraphSource>,
     sources: &mut std::collections::HashMap<crate::parse::CallPath, String>,
     path: crate::parse::CallPath,
     source_name: &str,
-    graph: &std::sync::Arc<crate::model::FunctionGraph>,
+    graph: &call::GraphSource,
 ) {
     if let Some(prev) = sources.get(&path) {
         assert!(
@@ -724,7 +681,7 @@ fn register_function_graph_alias(
         return;
     }
     sources.insert(path.clone(), source_name.to_string());
-    graphs.insert(path, std::sync::Arc::clone(graph));
+    graphs.insert(path, graph.clone());
 }
 
 /// Compute the full alias spelling set for a free function lifted
@@ -1122,6 +1079,14 @@ fn analyze_pipeline_from_module_paths(
     // `scripts/extract-llbc.py`), supplied explicitly by the consumer or
     // located via `MAJIT_MIR_FRONTEND_LLBC`.
     mark_phase!("known_statics + struct_field_attrs populated");
+    // The funcobjs the front end declares apart from `program.functions`,
+    // registered by `CallControl` on lookup. A clause specialization is
+    // another graph of its generic funcobj (`description.py
+    // FunctionDesc.cachedgraph(key)`), reached only from the call sites
+    // that name it: it is declared under that one path, with no alias
+    // spelling, class member or indirect-call family row of its own.
+    let funcobj_declarations = call::FuncObjDeclarations::default();
+    let lowering_skips = front::mir::LoweringSkips::default();
     // `rlib/jit.py`'s `hint` entry reads `classdesc.get_param('_virtualizable_')`
     // off the class before it mints `access_directly`. Pyre has no `ClassDesc`
     // at that point, so the declaration arrives with the config — and it is
@@ -1140,6 +1105,8 @@ fn analyze_pipeline_from_module_paths(
         static_addrs,
         &config.pipeline.transform.jitdriver_receiver_roots,
         explicit_llbc_paths,
+        &funcobj_declarations,
+        &lowering_skips,
         &mut prof,
     );
     // Publish the `(bare struct leaf → defining crate-relative module
@@ -1179,19 +1146,28 @@ fn analyze_pipeline_from_module_paths(
         }
     }
     mark_phase!("build_semantic_program_from_parsed_files");
+    // A clause specialization is another graph of its generic funcobj
+    // (`description.py FunctionDesc.cachedgraph(key)`), reached only from
+    // the call sites that name it: it is declared under that one path, with
+    // no alias spelling, class member or indirect-call family row of its
+    // own.
     prof.note(|| {
+        // Counts the bodies built so far; the note builds none.
+        let built = || {
+            program
+                .functions
+                .iter()
+                .map(|f| f.lazy_graph())
+                .filter(|graph| graph.is_built())
+                .filter_map(|graph| graph.get())
+        };
         format!(
-            "  program: {} functions, {} blocks, {} ops, {} struct_fields, {} type layouts",
+            "  program: {} functions ({} built: {} blocks, {} ops), {} struct_fields, {} type layouts",
             program.functions.len(),
-            program
-                .functions
-                .iter()
-                .map(|f| f.graph.blocks.len())
-                .sum::<usize>(),
-            program
-                .functions
-                .iter()
-                .flat_map(|f| f.graph.blocks.iter())
+            built().count(),
+            built().map(|g| g.blocks.len()).sum::<usize>(),
+            built()
+                .flat_map(|g| g.blocks.iter())
                 .map(|b| b.operations.len())
                 .sum::<usize>(),
             program.struct_fields.fields.len(),
@@ -1244,9 +1220,12 @@ fn analyze_pipeline_from_module_paths(
         String,
         Option<String>,
         Vec<String>,
-        crate::model::FunctionGraph,
+        crate::model::LazyGraph,
     )> = Vec::new();
-    let mut canonical_function_graphs = std::collections::HashMap::new();
+    let mut canonical_function_graphs: std::collections::HashMap<
+        crate::parse::CallPath,
+        call::GraphSource,
+    > = std::collections::HashMap::new();
     // `bookkeeper.py getdesc` / `newfuncdesc` keys on the host
     // function-object identity, so two unrelated `crate_a::helper` and
     // `crate_b::helper` resolve to distinct `FunctionDesc` instances.
@@ -1332,7 +1311,7 @@ fn analyze_pipeline_from_module_paths(
                     owner.clone(),
                     func.return_type.clone(),
                     func.hints.clone(),
-                    func.graph.clone(),
+                    func.lazy_graph().clone(),
                 ));
                 let types = trait_concrete_impl_types
                     .entry(trait_leaf.as_str())
@@ -1348,7 +1327,7 @@ fn analyze_pipeline_from_module_paths(
                     for_type: owner.clone(),
                     self_ty_root: Some(owner.clone()),
                     name: func.name.clone(),
-                    graph: func.graph.clone(),
+                    graph: func.lazy_graph().clone(),
                     return_type: func.return_type.clone(),
                     hints: func.hints.clone(),
                 });
@@ -1364,7 +1343,7 @@ fn analyze_pipeline_from_module_paths(
                     self_ty_root: None,
                     methods: vec![MethodInfo {
                         name: func.name.clone(),
-                        graph: Some(func.graph.clone()),
+                        graph: Some(func.lazy_graph().clone()),
                         return_type: func.return_type.clone(),
                         hints: func.hints.clone(),
                     }],
@@ -1376,7 +1355,7 @@ fn analyze_pipeline_from_module_paths(
                     for_type: owner.clone(),
                     self_ty_root: Some(owner.clone()),
                     name: func.name.clone(),
-                    graph: func.graph.clone(),
+                    graph: func.lazy_graph().clone(),
                     return_type: func.return_type.clone(),
                     hints: func.hints.clone(),
                 });
@@ -1389,16 +1368,19 @@ fn analyze_pipeline_from_module_paths(
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
     // Use program.functions' graphs which were built with full struct_fields
     // context, NOT re-parsed graphs (which lose array_type_id etc.).
-    for func in &program.functions {
+    // One graph object per free function, shared by every alias spelling
+    // and by the hint registration below: upstream's aliases name the same
+    // Python graph object.
+    let mut free_function_graphs: Vec<Option<call::GraphSource>> =
+        vec![None; program.functions.len()];
+    for (index, func) in program.functions.iter().enumerate() {
         if func.self_ty_root.is_none() {
             // Stamp the source return type onto the graph so the JIT
             // codewriter signature validator reads `FUNC.RESULT`
             // directly off the callee graph (RPython
             // `funcptr._obj.TO.RESULT`).
-            let graph = std::sync::Arc::new(match &func.return_type {
-                Some(rt) => func.graph.clone().with_return_type(rt),
-                None => func.graph.clone(),
-            });
+            let graph = lazy_graph_source(func.lazy_graph(), &func.return_type, &func.hints);
+            free_function_graphs[index] = Some(graph.clone());
             // Free function: register under every canonical alias
             // spelling computed by `free_function_alias_paths` — bare
             // segments, `crate::` prefix, three pyre-crate prefixes,
@@ -1423,6 +1405,7 @@ fn analyze_pipeline_from_module_paths(
     // ── Build CallControl (RPython call.py) ──
     // Populate with all discovered function graphs and trait impl methods.
     let mut call_control = call::CallControl::new();
+    call_control.use_funcobj_declarations(funcobj_declarations);
     // RPython: known struct types for get_type_flag(ARRAY.OF) → FLAG_STRUCT.
     call_control.set_known_struct_names(program.known_struct_names.clone());
     // RPython: struct field types for op.args[0].concretetype resolution.
@@ -1689,7 +1672,7 @@ fn analyze_pipeline_from_module_paths(
         // `insert_function_graph_indexed` can fold that spelling's pending
         // external-funcobj effects onto the one stored graph; `GraphStore`
         // keys on the funcobj, so the copy is transient.
-        call_control.register_function_graph(path.clone(), graph.as_ref().clone());
+        call_control.register_function_graph(path.clone(), graph.clone());
     }
     prof.mark("  register_function_graph (free fns)");
     // RPython `CallControl.graphs_from` obtains the graph from the concrete
@@ -1704,10 +1687,7 @@ fn analyze_pipeline_from_module_paths(
             continue;
         };
         let path = crate::parse::CallPath::for_trait_impl_method(owner, impl_id, &func.name);
-        let graph = match &func.return_type {
-            Some(return_type) => func.graph.clone().with_return_type(return_type),
-            None => func.graph.clone(),
-        };
+        let graph = lazy_graph_source(func.lazy_graph(), &func.return_type, &[]);
         if func.hints.is_empty() {
             call_control.register_function_graph(path, graph);
         } else {
@@ -1740,13 +1720,12 @@ fn analyze_pipeline_from_module_paths(
     // hint set.  Missing the source-module-qualified aliases silently
     // disables `_jit_look_inside_` etc. for module-qualified callers,
     // which `CallControl::find_all_graphs` looks up by callee path.
-    for func in &program.functions {
+    for (func, graph) in program.functions.iter().zip(&free_function_graphs) {
         if func.self_ty_root.is_some() || func.hints.is_empty() {
             continue;
         }
-        let graph = match &func.return_type {
-            Some(rt) => func.graph.clone().with_return_type(rt),
-            None => func.graph.clone(),
+        let Some(graph) = graph else {
+            continue;
         };
         for path in free_function_alias_paths(&func.name, &func.module_path) {
             call_control.register_function_graph_with_hints(
@@ -1848,22 +1827,18 @@ fn analyze_pipeline_from_module_paths(
             // for the handful of MIR-uncovered entries, though every
             // method registered above carries a graph so the fallback
             // is effectively unreached.
-            let mir_graph: Option<&model::FunctionGraph> = if is_default {
+            let mir_graph: Option<&model::LazyGraph> = if is_default {
                 mir_graph_lookup.lookup_trait_default(&impl_info.trait_name, &method.name)
             } else {
                 mir_graph_lookup.lookup_impl_method(impl_type, &method.name)
             };
-            let graph_source: Option<model::FunctionGraph> =
-                mir_graph.cloned().or_else(|| method.graph.clone());
+            let graph_source: Option<&model::LazyGraph> = mir_graph.or(method.graph.as_ref());
             if let Some(graph) = graph_source {
                 // Stamp the source return type onto the graph itself so
                 // the JIT codewriter signature validator reads
                 // `FUNC.RESULT` directly off the callee graph
                 // (RPython `funcptr._obj.TO.RESULT`).
-                let graph = match &method.return_type {
-                    Some(rt) => graph.with_return_type(rt),
-                    None => graph,
-                };
+                let graph = lazy_graph_source(graph, &method.return_type, &[]);
                 call_control.register_trait_method(&method.name, trait_root, impl_type, graph);
                 // Parity with upstream `rpython/annotator/classdesc.py lookup
                 // lookup` MRO walk: a trait default body is the
@@ -1893,20 +1868,13 @@ fn analyze_pipeline_from_module_paths(
                         Some((impl_type, override_info)) => (
                             mir_graph_lookup
                                 .lookup_impl_method(impl_type, &method.name)
-                                .cloned()
-                                .or_else(|| Some(override_info.graph.clone())),
-                            override_info.return_type.as_ref(),
+                                .or(Some(override_info.lazy_graph())),
+                            &override_info.return_type,
                         ),
-                        None => (
-                            mir_graph.cloned().or_else(|| method.graph.clone()),
-                            method.return_type.as_ref(),
-                        ),
+                        None => (mir_graph.or(method.graph.as_ref()), &method.return_type),
                     };
                     if let Some(g) = direct_source {
-                        let direct_graph = match direct_return_type {
-                            Some(rt) => g.with_return_type(rt),
-                            None => g,
-                        };
+                        let direct_graph = lazy_graph_source(g, direct_return_type, &[]);
                         call_control.register_function_graph(direct_path, direct_graph);
                     }
                 }
@@ -2122,10 +2090,7 @@ fn analyze_pipeline_from_module_paths(
         // peek_at`), the two collide on the `(owner, name)` key and the
         // lookup resolves to `Err(())` (ambiguous), silently dropping the
         // single-impl devirtualization.  The carried graph is unambiguous.
-        let graph = match return_type {
-            Some(rt) => graph.clone().with_return_type(rt),
-            None => graph.clone(),
-        };
+        let graph = lazy_graph_source(graph, return_type, &[]);
         let direct_path =
             crate::parse::CallPath::from_segments([trait_leaf.as_str(), method_name.as_str()]);
         call_control.register_function_graph(direct_path.clone(), graph);
@@ -2163,10 +2128,9 @@ fn analyze_pipeline_from_module_paths(
         // residual fallback for the handful of MIR-uncovered entries,
         // effectively unreached because every inherent method
         // registered above carries a graph.
-        let graph: model::FunctionGraph = mir_graph_lookup
+        let graph: &model::LazyGraph = mir_graph_lookup
             .lookup_impl_method(impl_type, &method_info.name)
-            .cloned()
-            .unwrap_or_else(|| method_info.graph.clone());
+            .unwrap_or(&method_info.graph);
         // Pair the graph with the method's hints so the BFS-driven
         // `look_inside_graph` synthesises a `SemanticFunction` whose
         // `_reject_function("elidable")` mirrors RPython's
@@ -2177,10 +2141,7 @@ fn analyze_pipeline_from_module_paths(
         // codewriter signature validator reads `FUNC.RESULT` directly off
         // the callee graph (`funcptr._obj.TO.RESULT`), matching the
         // free-function and trait-method registration paths above.
-        let graph = match &method_info.return_type {
-            Some(rt) => graph.with_return_type(rt),
-            None => graph,
-        };
+        let graph = lazy_graph_source(graph, &method_info.return_type, &[]);
         if method_info.hints.is_empty() {
             call_control.register_function_graph(path.clone(), graph);
         } else {
@@ -2254,54 +2215,8 @@ fn analyze_pipeline_from_module_paths(
             // `#[cannot_collect]` / elidable hint.
             free_function_alias_paths(&func.name, &func.module_path)
         };
-        for hint in &func.hints {
-            for p in &paths {
-                // rlib/jit.py — `@oopspec(spec)` registers func.oopspec = spec.
-                if let Some(spec) = hint.strip_prefix("oopspec:") {
-                    call_control.mark_oopspec(p.clone(), spec.to_string());
-                    continue;
-                }
-                if call_control.mark_aroundstate_hint(p.clone(), hint) {
-                    continue;
-                }
-                // `support.py argnames = ll_func.__code__.co_varnames[:nb_args]`
-                // — companion hint emitted by `front::llbc_hints::harvest_hints_from_llbcs`
-                // when `#[oopspec(...)]` is paired with a function signature.
-                // Threads the declaration-order parameter names into
-                // `CallControl::oopspec_argnames` so `parse_oopspec`
-                // (`support.py:701-715` port) can resolve identifier
-                // slots in the spec's `(...)` pattern.
-                if let Some(names) = hint.strip_prefix("oopspec_argnames:") {
-                    let argnames: Vec<String> = names
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if !argnames.is_empty() {
-                        call_control.mark_oopspec_argnames(p.clone(), argnames);
-                    }
-                    continue;
-                }
-                match hint.as_str() {
-                    "elidable" => call_control.mark_elidable(p.clone()),
-                    "elidable_cannot_raise" => call_control.mark_cannot_raise_assertion(p.clone()),
-                    "cannot_raise" => call_control.mark_cannot_raise_assertion(p.clone()),
-                    "elidable_or_memerror" => call_control.mark_memerror_only_assertion(p.clone()),
-                    "loopinvariant" => call_control.mark_loopinvariant(p.clone()),
-                    "close_stack" => call_control.mark_close_stack(p.clone()),
-                    "cannot_collect" => call_control.mark_cannot_collect(p.clone()),
-                    // rlib/jit.py — @not_in_trace sets func.oopspec = "jit.not_in_trace()"
-                    "not_in_trace" => {
-                        call_control.mark_oopspec(p.clone(), "jit.not_in_trace".to_string());
-                    }
-                    // RPython: random_effects_on_gcobjs is on external funcobj only.
-                    // Only register for paths WITHOUT a graph (external functions).
-                    "gc_effects" if !call_control.function_graphs().contains_key(p) => {
-                        call_control.mark_external_gc_effects(p.clone());
-                    }
-                    _ => {}
-                }
-            }
+        for path in &paths {
+            call_control.mark_decorator_hints(path, &func.hints);
         }
     }
     // A `dont_look_inside` helper is residualized and may never appear in
@@ -2562,6 +2477,8 @@ fn analyze_pipeline_from_module_paths(
     // remaining residual force ops. Looked-inside copies are already
     // deleted by `rewrite_op_jit_force_virtualizable`.
     call_control.finish();
+    // Every body the pipeline builds is built by now.
+    front::mir::report_lowering_skips(&lowering_skips);
     // callee census: how many callees the six `getcalldescr` analyzers answer as
     // upstream's declared-external arm without a declaration behind them.
     // Off by default — it is a whole extra walk of the registered universe,
@@ -2659,7 +2576,9 @@ fn register_configured_jitdrivers(
                 call_control
                     .function_graphs()
                     .get(&previous.portal)
-                    .is_some_and(|previous_graph| std::ptr::eq(previous_graph, portal_graph))
+                    .is_some_and(|previous_graph| {
+                        std::rc::Rc::ptr_eq(&previous_graph, &portal_graph)
+                    })
             }),
             "duplicate JIT driver portal graph for `{}`; aliases of one graph \
              must share one JitDriverStaticData",
@@ -2764,7 +2683,7 @@ fn register_configured_jitdrivers(
             // producer stays as a real operation because operands are
             // Variables, so only the block is asserted.
             assert_eq!(
-                crate::codewriter::support::find_jit_merge_point(registered, driver_roots)
+                crate::codewriter::support::find_jit_merge_point(&registered, driver_roots)
                     .map(|(block, _)| block),
                 Some(split_start),
                 "registered portal path aliased away from the split graph body"
@@ -3494,7 +3413,7 @@ mod portal_driver_tests {
         assert!(split_graph.func.dont_inline);
         assert!(
             crate::codewriter::support::find_jit_merge_point(
-                split_graph,
+                &split_graph,
                 &GraphTransformConfig::default().jitdriver_receiver_roots,
             )
             .is_some()

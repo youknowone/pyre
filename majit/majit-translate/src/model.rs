@@ -7014,6 +7014,135 @@ impl FuncEffects {
     }
 }
 
+/// Identity of a source funcobj: `(source_identity or owner_root, name)`.
+///
+/// `name` is the graph's `name_path()` — Charon's fully-qualified path for
+/// a free function (unique per source), `owner_root` the impl type for a
+/// method (so two impls' same-named methods, e.g. `PyFrame::push_value` vs
+/// `MIFrame::push_value`, stay distinct).  Every alias spelling of one
+/// source funcobj resolves to the same `GraphKey`.
+pub type GraphKey = (Option<String>, String);
+
+/// A funcobj's flow graph, built on first demand
+/// (`description.py FunctionDesc.cachedgraph`). Clones share the one graph.
+#[derive(Clone)]
+pub struct LazyGraph(std::rc::Rc<LazyGraphCell>);
+
+struct LazyGraphCell {
+    graph: std::cell::OnceCell<Option<std::rc::Rc<FunctionGraph>>>,
+    build: std::cell::Cell<Option<Box<dyn FnOnce() -> Option<FunctionGraph>>>>,
+    /// What the funcobj declares before its body is built — the
+    /// `pygraph.py PyGraph.__init__` part, taken from the code object: the
+    /// startblock with the parameters, and the header fields. `None` for a
+    /// graph that was built from the start.
+    header: Option<std::rc::Rc<FunctionGraph>>,
+}
+
+impl LazyGraph {
+    /// A graph that is already built.
+    pub fn built(graph: impl Into<std::rc::Rc<FunctionGraph>>) -> Self {
+        Self(std::rc::Rc::new(LazyGraphCell {
+            graph: std::cell::OnceCell::from(Some(graph.into())),
+            build: std::cell::Cell::new(None),
+            header: None,
+        }))
+    }
+
+    /// A graph `build` produces on first demand; `None` from `build` means
+    /// the funcobj has no graph. `header` is what the funcobj declares: the
+    /// built graph starts from it.
+    pub fn deferred(
+        header: impl Into<std::rc::Rc<FunctionGraph>>,
+        build: impl FnOnce() -> Option<FunctionGraph> + 'static,
+    ) -> Self {
+        Self(std::rc::Rc::new(LazyGraphCell {
+            graph: std::cell::OnceCell::new(),
+            build: std::cell::Cell::new(Some(Box::new(build))),
+            header: Some(header.into()),
+        }))
+    }
+
+    /// A funcobj declared with no graph: an external function object
+    /// (`rffi.llexternal`), whose `header` is what it declares.
+    pub fn external(header: impl Into<std::rc::Rc<FunctionGraph>>) -> Self {
+        Self(std::rc::Rc::new(LazyGraphCell {
+            graph: std::cell::OnceCell::from(None),
+            build: std::cell::Cell::new(None),
+            header: Some(header.into()),
+        }))
+    }
+
+    /// Whether the funcobj is known to have no graph, read without building
+    /// one.
+    pub fn is_graphless(&self) -> bool {
+        matches!(self.0.graph.get(), Some(None))
+    }
+
+    /// The funcobj identity, read without building the graph.
+    pub fn graph_key(&self) -> GraphKey {
+        self.header().graph_key()
+    }
+
+    /// What the funcobj declares, read without building the graph: the
+    /// declared header, or the graph of one built from the start.
+    pub fn header(&self) -> &FunctionGraph {
+        match (&self.0.header, self.0.graph.get()) {
+            (Some(header), _) => header,
+            (None, Some(Some(graph))) => graph,
+            (None, _) => unreachable!("a LazyGraph without a header is built"),
+        }
+    }
+
+    /// The graph, built on the first call.
+    pub fn get(&self) -> Option<&std::rc::Rc<FunctionGraph>> {
+        let cell = &*self.0;
+        cell.graph
+            .get_or_init(|| cell.build.take()?().map(std::rc::Rc::new))
+            .as_ref()
+    }
+
+    /// Whether the graph has been built (or found absent) already.
+    pub fn is_built(&self) -> bool {
+        self.0.graph.get().is_some()
+    }
+
+    /// The graph for writing. A graph another holder shares is copied
+    /// first, so the write is seen through this handle only.
+    pub fn get_mut(&mut self) -> Option<&mut FunctionGraph> {
+        if std::rc::Rc::get_mut(&mut self.0).is_none() {
+            *self = match self.get() {
+                Some(graph) => Self::built(graph.clone()),
+                None => return None,
+            };
+        }
+        let cell = std::rc::Rc::get_mut(&mut self.0).expect("unshared handle");
+        if cell.graph.get().is_none() {
+            let built = cell
+                .build
+                .take()
+                .and_then(|build| build())
+                .map(std::rc::Rc::new);
+            let _ = cell.graph.set(built);
+        }
+        cell.graph.get_mut()?.as_mut().map(std::rc::Rc::make_mut)
+    }
+
+    /// Whether both handles share one graph.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl fmt::Debug for LazyGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.graph.get() {
+            Some(Some(graph)) => graph.fmt(f),
+            Some(None) => f.write_str("LazyGraph(<no graph>)"),
+            None => f.write_str("LazyGraph(<not built>)"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionGraph {
     pub name: String,
@@ -7084,19 +7213,11 @@ pub struct FunctionGraph {
     /// Upstream writes it at exactly one place, `specialize.py
     /// default_specialize`, for a graph whose ARGUMENT annotation arrived
     /// carrying the flag that the `hint` ExtRegistryEntry in `rlib/jit.py`
-    /// mints on `SomeInstance.flags`. The flowspace pipeline ports that on
-    /// `PyGraph::access_directly`; the LLBC path has no annotator to carry a
-    /// flag on an annotation, so `front::semantic::propagate_access_directly`
-    /// does the same propagation over the op stream and writes this field.
-    /// That port is narrower than upstream in three named ways, recorded on
-    /// its own doc: a callee reached through both flagged and unflagged calls
-    /// stays unflagged, because one graph per function cannot carry both
-    /// access modes and `policy::look_inside_graph` aborts on a flag it
-    /// cannot honour; the alias closure follows only `Link`s and the
-    /// representation casts; and a value is taken for a virtualizable
-    /// instance only when the lowered graph records a class root the
-    /// consumer declared through `virtualizable_decl`. A `false` here
-    /// therefore does not mean the value never reached the graph.
+    /// mints on `SomeInstance.flags`. That is ported on the annotator's
+    /// `PyGraph::access_directly`; the prepass annotator runs after
+    /// `find_all_graphs`, so its flag is checked by
+    /// `cutover::check_access_directly_sanity` and nothing sets this field
+    /// before the policy reads it.
     pub access_directly: bool,
     /// Per-function effect attributes RPython reads off `graph.func`
     /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default
@@ -7289,6 +7410,16 @@ impl FunctionGraph {
     pub fn with_return_type(mut self, rt: impl Into<String>) -> Self {
         self.return_type = Some(rt.into());
         self
+    }
+
+    /// The source funcobj's [`GraphKey`].
+    pub fn graph_key(&self) -> GraphKey {
+        (
+            self.source_identity
+                .clone()
+                .or_else(|| self.owner_root.clone()),
+            self.name.clone(),
+        )
     }
 
     /// Builder-style setter for `hints`. Production registration paths

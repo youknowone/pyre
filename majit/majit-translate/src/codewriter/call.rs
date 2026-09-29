@@ -20,12 +20,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::argument::Signature;
-use crate::front::semantic::SemanticFunction;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::parse::CallPath;
 use crate::policy::JitPolicy;
-use crate::translator::backendopt::graphanalyze::AnalyzerResult;
+use crate::tool::algo::unionfind::UnionFind;
+use crate::translator::backendopt::graphanalyze::{AnalyzerResult, Dependency, DependencyTracker};
 
 // Decline-census gate names.  Declared in `crate::decline::gate` so a
 // gate name cannot exist without the recorder that consumes it; aliased
@@ -132,85 +132,124 @@ fn raise_class_can_raise(value: RaiseClass, ignore_memoryerror: bool) -> bool {
     }
 }
 
-/// RPython: DependencyTracker equivalent — caches transitive analysis results.
-///
-/// Each analyzer in RPython has its own `seen` set (via `analyze_direct_call`).
-/// We cache the final result per CallPath so repeated queries are O(1).
-#[derive(Default)]
-pub struct AnalysisCache {
-    can_raise: HashMap<CallPath, CanRaise>,
-    forces_virtualizable: HashMap<CallPath, bool>,
-    random_effects: HashMap<CallPath, bool>,
-    can_invalidate: HashMap<CallPath, bool>,
-    /// RPython: collect_analyzer (collectanalyze.py) — can this call trigger GC?
-    can_collect: HashMap<CallPath, bool>,
+/// `GraphAnalyzer._analyzed_calls` (graphanalyze.py) of one bool analyzer
+/// over the flat codewriter graph: a `UnionFind` of `Dependency` cells, so
+/// every graph a walk enters keeps its verdict and a call cycle shares one.
+type AnalyzedCalls = UnionFind<CallPath, Dependency<bool>>;
+
+/// `DependencyTracker(self)` (graphanalyze.py), made fresh per top-level
+/// `analyze_direct_call`.
+type CallTracker = DependencyTracker<bool, CallPath>;
+
+/// `GraphAnalyzer.__init__`'s `self._analyzed_calls = UnionFind(lambda graph:
+/// Dependency(self))`.
+fn new_analyzed_calls() -> AnalyzedCalls {
+    UnionFind::new(|_| Dependency::new(bool::bottom_result()))
 }
 
-/// RPython: readwrite_analyzer.analyze(op) return value.
-///
-/// Represents the set of read/write effects collected from graph traversal.
-/// RPython uses a set of tuples like `("struct", T, fieldname)` and
-/// `compute_bitstrings(all_descrs)` (`effectinfo.py`) materializes
-/// the EffectInfo bitstrings at the end via
-/// `bitstring.make_bitstring([descr.ei_index for descr in set])`.  Pyre
-/// telescopes that pipeline by collecting the per-descr `ei_index`
-/// values directly (DescrIndexRegistry already holds them); each `Vec<u32>`
-/// is the running equivalent of one of PyPy's `_readonly_*`/`_write_*`
-/// frozensets, deduped + sorted at conversion time.  Storing as `Vec<u32>`
-/// rather than `u64` removes the 64-descr ceiling so bitstrings scale
-/// with the global descr count, matching PyPy's arbitrary-length
-/// `bitstring.py make_bitstring` output.
-#[derive(Clone)]
-pub struct WriteAnalysis {
-    pub read_fields: Vec<u32>,
-    pub write_fields: Vec<u32>,
-    pub read_arrays: Vec<u32>,
-    pub write_arrays: Vec<u32>,
-    pub read_interiorfields: Vec<u32>,
-    pub write_interiorfields: Vec<u32>,
-    /// `effectinfo.py` `readonly_descrs_fields = []`
-    /// populated via `add_struct → cpu.fielddescrof(T, fieldname)` from
-    /// `("readstruct", T, fieldname)` tuples.
-    pub field_read_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// `effectinfo.py` `write_descrs_fields = []` from
-    /// `("struct", T, fieldname)` tuples.
-    pub field_write_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// `effectinfo.py` `readonly_descrs_interiorfields = []`
-    /// populated via `add_interiorfield → cpu.interiorfielddescrof(T,
-    /// fieldname)` from `("readinteriorfield", T, fieldname)` tuples.
-    pub interior_read_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// `effectinfo.py` `write_descrs_interiorfields = []`
-    /// from `("interiorfield", T, fieldname)` tuples.
-    pub interior_write_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// `effectinfo.py` `readonly_descrs_arrays = []` populated
-    /// via `add_array → cpu.arraydescrof(ARRAY)` from `("readarray", T)`
-    /// tuples (plus `("readinteriorfield", T, _)` tuples synthesised into
-    /// `("readarray", T)` at `effectinfo.py`).
-    pub array_read_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// `effectinfo.py` `write_descrs_arrays = []` mirror of
-    /// the read side, populated from `("array", T)` tuples (plus
-    /// `("interiorfield", T, _)` synthesised into `("array", T)`).
-    pub array_write_descrs: Vec<(
-        majit_ir::descr::DescrRef,
-        Option<majit_ir::effectinfo::DescrSetMember>,
-    )>,
-    /// RPython: `effects is top_set` — unanalyzable (random effects).
-    pub is_top: bool,
+/// The `_analyzed_calls` of every effect analyzer `CallControl.__init__`
+/// builds (call.py).
+pub struct AnalysisCache {
+    /// `raise_analyzer`.
+    can_raise: AnalyzedCalls,
+    /// `raise_analyzer_ignore_memoryerror`.
+    can_raise_ignore_memoryerror: AnalyzedCalls,
+    /// `virtualizable_analyzer`.
+    forces_virtualizable: AnalyzedCalls,
+    /// `randomeffects_analyzer`.
+    random_effects: AnalyzedCalls,
+    /// `quasiimmut_analyzer`.
+    can_invalidate: AnalyzedCalls,
+    /// `collect_analyzer` (collectanalyze.py) — can this call trigger GC?
+    can_collect: AnalyzedCalls,
+    /// `readwrite_analyzer` (writeanalyze.py `ReadWriteAnalyzer`).
+    readwrite: ReadWriteAnalyzedCalls,
+}
+
+impl Default for AnalysisCache {
+    fn default() -> Self {
+        Self {
+            can_raise: new_analyzed_calls(),
+            can_raise_ignore_memoryerror: new_analyzed_calls(),
+            forces_virtualizable: new_analyzed_calls(),
+            random_effects: new_analyzed_calls(),
+            can_invalidate: new_analyzed_calls(),
+            can_collect: new_analyzed_calls(),
+            readwrite: UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
+        }
+    }
+}
+
+/// The first element of one `writeanalyze.py` effect tuple.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RwTag {
+    /// `("struct", T, fieldname)`.
+    Struct,
+    /// `("readstruct", T, fieldname)`.
+    ReadStruct,
+    /// `("array", T)`.
+    Array,
+    /// `("readarray", T)`.
+    ReadArray,
+    /// `("interiorfield", T, fieldname)`.
+    InteriorField,
+    /// `("readinteriorfield", T, fieldname)`.
+    ReadInteriorField,
+}
+
+/// One effect tuple's identity. `index` is the `DescrIndexRegistry` slot
+/// of `(T, fieldname)` / `ARRAY`. That slot is keyed by the owner's name
+/// alone, so a struct effect also carries the owner's `StructId`: two
+/// structs spelled with one name are two `T`s.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RwKey {
+    tag: RwTag,
+    index: u32,
+    owner_id: Option<majit_ir::descr::StructId>,
+}
+
+/// The rest of an effect tuple: what `add_struct` / `add_array` /
+/// `add_interiorfield` (`effectinfo.py`) hand to `cpu.*descrof`.
+#[derive(Clone, Debug)]
+pub enum RwOperand {
+    Field {
+        owner_root: Option<String>,
+        owner_id: Option<majit_ir::descr::StructId>,
+        name: String,
+    },
+    Array {
+        array_type_id: Option<String>,
+        ir_type: majit_ir::value::Type,
+        len_offset: Option<usize>,
+    },
+    InteriorField {
+        array_type_id: Option<String>,
+        field_name: String,
+        len_offset: Option<usize>,
+    },
+}
+
+/// `readwrite_analyzer.analyze(op)` result (`writeanalyze.py`): `top_set`,
+/// or a set of effect tuples. The set keeps insertion order, and the first
+/// operand stored for a key stays.
+#[derive(Clone, Debug)]
+pub enum ReadWriteEffects {
+    Top,
+    Set(std::sync::Arc<indexmap::IndexMap<RwKey, RwOperand>>),
+}
+
+impl ReadWriteEffects {
+    fn insert(&mut self, key: RwKey, operand: RwOperand) {
+        if let Self::Set(set) = self {
+            std::sync::Arc::make_mut(set).entry(key).or_insert(operand);
+        }
+    }
+
+    fn singleton(key: RwKey, operand: RwOperand) -> Self {
+        let mut result = Self::bottom_result();
+        result.insert(key, operand);
+        result
+    }
 }
 
 type EffectDescr = (
@@ -218,94 +257,20 @@ type EffectDescr = (
     Option<majit_ir::effectinfo::DescrSetMember>,
 );
 
-fn extend_indices(dest: &mut Vec<u32>, src: &[u32]) {
-    if dest.is_empty() {
-        dest.extend_from_slice(src);
-        return;
-    }
-    for idx in src {
-        if !dest.contains(idx) {
-            dest.push(*idx);
-        }
-    }
-}
-
-fn extend_descrs(dest: &mut Vec<EffectDescr>, src: Vec<EffectDescr>) {
-    for item in src {
-        let idx = item.0.index();
-        if dest.iter().any(|have| have.0.index() == idx) {
-            continue;
-        }
-        dest.push(item);
-    }
-}
-
-/// `add_to_result` / `join_two_results` (`writeanalyze.py`).
-///
-/// Index and descr vectors keep the first-seen order of a seen-set
-/// walk: a graph already accounted for contributes nothing the second
-/// time. `top_set` swallows the other side.
-fn merge_write_analysis(into: &mut WriteAnalysis, other: WriteAnalysis) {
-    if into.is_top || other.is_top {
-        *into = WriteAnalysis::top_result();
-        return;
-    }
-    extend_indices(&mut into.read_fields, &other.read_fields);
-    extend_indices(&mut into.write_fields, &other.write_fields);
-    extend_indices(&mut into.read_arrays, &other.read_arrays);
-    extend_indices(&mut into.write_arrays, &other.write_arrays);
-    extend_indices(&mut into.read_interiorfields, &other.read_interiorfields);
-    extend_indices(&mut into.write_interiorfields, &other.write_interiorfields);
-    extend_descrs(&mut into.field_read_descrs, other.field_read_descrs);
-    extend_descrs(&mut into.field_write_descrs, other.field_write_descrs);
-    extend_descrs(&mut into.interior_read_descrs, other.interior_read_descrs);
-    extend_descrs(&mut into.interior_write_descrs, other.interior_write_descrs);
-    extend_descrs(&mut into.array_read_descrs, other.array_read_descrs);
-    extend_descrs(&mut into.array_write_descrs, other.array_write_descrs);
-}
-
-impl AnalyzerResult for WriteAnalysis {
+impl AnalyzerResult for ReadWriteEffects {
     /// `bottom_result` (`writeanalyze.py`): `empty_set`.
     fn bottom_result() -> Self {
-        Self {
-            read_fields: Vec::new(),
-            write_fields: Vec::new(),
-            read_arrays: Vec::new(),
-            write_arrays: Vec::new(),
-            read_interiorfields: Vec::new(),
-            write_interiorfields: Vec::new(),
-            field_read_descrs: Vec::new(),
-            field_write_descrs: Vec::new(),
-            interior_read_descrs: Vec::new(),
-            interior_write_descrs: Vec::new(),
-            array_read_descrs: Vec::new(),
-            array_write_descrs: Vec::new(),
-            is_top: false,
-        }
+        Self::Set(std::sync::Arc::default())
     }
 
     /// `top_result` (`writeanalyze.py`): `top_set`.
     fn top_result() -> Self {
-        Self {
-            read_fields: Vec::new(),
-            write_fields: Vec::new(),
-            read_arrays: Vec::new(),
-            write_arrays: Vec::new(),
-            read_interiorfields: Vec::new(),
-            write_interiorfields: Vec::new(),
-            field_read_descrs: Vec::new(),
-            field_write_descrs: Vec::new(),
-            interior_read_descrs: Vec::new(),
-            interior_write_descrs: Vec::new(),
-            array_read_descrs: Vec::new(),
-            array_write_descrs: Vec::new(),
-            is_top: true,
-        }
+        Self::Top
     }
 
     /// `is_top_result` (`writeanalyze.py`): `result is top_set`.
     fn is_top_result(result: &Self) -> bool {
-        result.is_top
+        matches!(result, Self::Top)
     }
 
     /// `result_builder` (`writeanalyze.py`): `set()`.
@@ -314,13 +279,24 @@ impl AnalyzerResult for WriteAnalysis {
     }
 
     /// `add_to_result` (`writeanalyze.py`).
-    fn add_to_result(mut result: Self, other: Self) -> Self {
-        merge_write_analysis(&mut result, other);
-        result
+    fn add_to_result(result: Self, other: Self) -> Self {
+        match (result, other) {
+            (Self::Top, _) | (_, Self::Top) => Self::Top,
+            (Self::Set(mut set), Self::Set(other)) => {
+                if set.is_empty() {
+                    return Self::Set(other);
+                }
+                let into = std::sync::Arc::make_mut(&mut set);
+                for (key, operand) in other.iter() {
+                    into.entry(*key).or_insert_with(|| operand.clone());
+                }
+                Self::Set(set)
+            }
+        }
     }
 
-    /// `finalize_builder` (`writeanalyze.py`). The builder is already
-    /// the deduped effect set, so freezing is the identity.
+    /// `finalize_builder` (`writeanalyze.py`): `frozenset(result)`. The
+    /// `Arc` is the frozen set: every later merge copies it on write.
     fn finalize_builder(result: Self) -> Self {
         result
     }
@@ -331,52 +307,14 @@ impl AnalyzerResult for WriteAnalysis {
     }
 }
 
-/// One local op the read/write walk replays. Field and array indices are
-/// assigned at replay time, in the same DFS order as a fresh graph scan.
-/// Array identity and call targets are resolved then too: both read the
-/// call-control registries, which can still gain a graph after the first
-/// time this one is reached.
-enum ReadWriteReplayOp {
-    FieldRead {
-        owner_root: Option<String>,
-        owner_id: Option<majit_ir::descr::StructId>,
-        name: String,
-    },
-    FieldWrite {
-        owner_root: Option<String>,
-        owner_id: Option<majit_ir::descr::StructId>,
-        name: String,
-    },
-    ArrayRead {
-        base: crate::flowspace::model::Variable,
-        item_ty: crate::model::ValueType,
-        array_type_id: Option<String>,
-        nolength: bool,
-    },
-    ArrayWrite {
-        base: crate::flowspace::model::Variable,
-        item_ty: crate::model::ValueType,
-        array_type_id: Option<String>,
-        nolength: bool,
-    },
-    InteriorRead {
-        base: crate::flowspace::model::Variable,
-        field_name: String,
-        array_type_id: Option<String>,
-    },
-    InteriorWrite {
-        base: crate::flowspace::model::Variable,
-        field_name: String,
-        array_type_id: Option<String>,
-    },
-    Call(CallTarget),
-    /// `None` is an unknown indirect family (`top_set`).
-    Indirect(Option<Vec<CallPath>>),
-}
+/// `readwrite_analyzer._analyzed_calls`, keyed by the graph a path names.
+type ReadWriteAnalyzedCalls = UnionFind<GraphKey, Dependency<ReadWriteEffects>>;
 
-/// What `producer_array_identity` reads off a result. The answer is still
-/// computed at lookup from `CallControl`, because field types and callee
-/// return types can change after the graph is scanned.
+/// `DependencyTracker(self.readwrite_analyzer)` (`call.py` `seen_rw`).
+type ReadWriteTracker = DependencyTracker<ReadWriteEffects, GraphKey>;
+
+/// What `resolve_array_identity` reads off a result, standing in for
+/// `op.args[0].concretetype`.
 enum ValueProducer {
     Field {
         owner_root: Option<String>,
@@ -390,20 +328,173 @@ enum ValueProducer {
     },
 }
 
-/// Local ops of one graph, scanned once. `value_producers` / `phi_sources`
-/// keep the shape `resolve_array_identity` reads off the live graph.
-struct ReadWriteReplay {
-    ops: Vec<ReadWriteReplayOp>,
+/// `FreshMallocs` (writeanalyze.py): which variables can only hold an
+/// object this graph allocated itself.
+struct FreshMallocs {
+    graph_name: String,
+    nonfresh: std::collections::HashSet<crate::flowspace::model::Variable>,
+    allvariables: std::collections::HashSet<crate::flowspace::model::Variable>,
+}
+
+impl FreshMallocs {
+    fn new(graph: &FunctionGraph) -> Self {
+        let mut this = Self {
+            graph_name: graph.name.clone(),
+            nonfresh: graph.blocks[graph.startblock.0]
+                .inputargs
+                .iter()
+                .cloned()
+                .collect(),
+            allvariables: std::collections::HashSet::new(),
+        };
+        let mut pendingblocks: Vec<crate::model::BlockId> =
+            graph.blocks.iter().map(|block| block.id).collect();
+        for block in &graph.blocks {
+            this.allvariables.extend(block.inputargs.iter().cloned());
+        }
+        pendingblocks.reverse();
+        while let Some(block_id) = pendingblocks.pop() {
+            let block = &graph.blocks[block_id.0];
+            for op in &block.operations {
+                let Some(result) = op.result.as_ref() else {
+                    continue;
+                };
+                this.allvariables.insert(result.clone());
+                match &op.kind {
+                    // `malloc` / `malloc_varsize` / `new`.
+                    OpKind::New { .. }
+                    | OpKind::NewWithVtable { .. }
+                    | OpKind::NewArray { .. }
+                    | OpKind::NewArrayClear { .. } => continue,
+                    // `cast_pointer` / `same_as`.
+                    OpKind::UnaryOp { op, operand, .. }
+                        if (op == "cast_pointer" || op == "same_as")
+                            && this.is_fresh_malloc(operand) =>
+                    {
+                        continue;
+                    }
+                    // `cast_pointer` spelled as the `cast_instance` shim.
+                    OpKind::Call { args, .. }
+                        if crate::model::cast_instance_root(&op.kind).is_some()
+                            && matches!(args.first(),
+                                Some(LinkArg::Value(operand)) if this.is_fresh_malloc(operand)) =>
+                    {
+                        continue;
+                    }
+                    _ => {}
+                }
+                this.nonfresh.insert(result.clone());
+            }
+            for link in &block.exits {
+                // `link.getextravars()`.
+                for extra in [&link.last_exception, &link.last_exc_value] {
+                    if let Some(LinkArg::Value(var)) = extra {
+                        this.nonfresh.insert(var.clone());
+                        this.allvariables.insert(var.clone());
+                    }
+                }
+                let prevlen = this.nonfresh.len();
+                let target = &graph.blocks[link.target.0];
+                for (v1, v2) in link.args.iter().zip(target.inputargs.iter()) {
+                    let fresh = match v1 {
+                        LinkArg::Value(var) => this.is_fresh_malloc(var),
+                        LinkArg::Const(_) => false,
+                    };
+                    if !fresh {
+                        this.nonfresh.insert(v2.clone());
+                    }
+                }
+                if this.nonfresh.len() > prevlen {
+                    pendingblocks.push(link.target);
+                }
+            }
+        }
+        this
+    }
+
+    fn is_fresh_malloc(&self, v: &crate::flowspace::model::Variable) -> bool {
+        // `if not isinstance(v, Variable): return False`. The flat graph
+        // leaves a Void value undefined where the rtyped graph has a Void
+        // `Constant`.
+        if v.concretetype()
+            == Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void)
+            && !self.allvariables.contains(v)
+        {
+            return false;
+        }
+        assert!(
+            self.allvariables.contains(v),
+            "{v:?} is not in the graph {}",
+            self.graph_name
+        );
+        !self.nonfresh.contains(v)
+    }
+}
+
+/// `compute_graph_info(graph)` of the read/write analyzer: `FreshMallocs(graph)`,
+/// plus the `value_producers` / `phi_sources` that give each array
+/// operand its ARRAY type.
+struct ReadWriteGraphInfo {
+    fresh_mallocs: FreshMallocs,
     value_producers: HashMap<crate::flowspace::model::Variable, ValueProducer>,
     phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>>,
 }
 
-impl Default for ReadWriteReplay {
-    fn default() -> Self {
+impl ReadWriteGraphInfo {
+    fn new(graph: &FunctionGraph) -> Self {
+        let mut value_producers: HashMap<crate::flowspace::model::Variable, ValueProducer> =
+            HashMap::new();
+        for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+            let Some(var) = op.result.as_ref() else {
+                continue;
+            };
+            // `producer_array_identity` returns `None` for every other kind,
+            // including `ArrayRead` with no `array_type_id` and `Input`, the
+            // same answer as a missing key. A later ignored result clears an
+            // earlier kept one so last-insert still wins.
+            let kept = match &op.kind {
+                OpKind::FieldRead { field, .. } => Some(ValueProducer::Field {
+                    owner_root: field.owner_root.clone(),
+                    name: field.name.clone(),
+                }),
+                OpKind::ArrayRead {
+                    array_type_id: Some(array_type_id),
+                    ..
+                } => Some(ValueProducer::Array {
+                    array_type_id: array_type_id.clone(),
+                }),
+                OpKind::Call { target, .. } => Some(ValueProducer::Call {
+                    target: target.clone(),
+                }),
+                _ => None,
+            };
+            match kept {
+                Some(kind) => {
+                    value_producers.insert(var.clone(), kind);
+                }
+                None => {
+                    value_producers.remove(var);
+                }
+            }
+        }
+        let mut phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>> =
+            HashMap::new();
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if let Some(target_block) = graph.blocks.get(link.target.0) {
+                    for (target_arg, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+                        phi_sources
+                            .entry(target_arg.clone())
+                            .and_modify(|entry| *entry = None)
+                            .or_insert_with(|| Some(src.clone()));
+                    }
+                }
+            }
+        }
         Self {
-            ops: Vec::new(),
-            value_producers: HashMap::new(),
-            phi_sources: HashMap::new(),
+            fresh_mallocs: FreshMallocs::new(graph),
+            value_producers,
+            phi_sources,
         }
     }
 }
@@ -849,14 +940,7 @@ pub struct JitDriverStaticData {
     pub greenfield_info: Option<std::sync::Arc<dyn GreenFieldInfoHandle>>,
 }
 
-/// Identity of a source funcobj: `(owner_root, name)`.
-///
-/// `name` is the graph's `name_path()` — Charon's fully-qualified path for
-/// a free function (unique per source), `owner_root` the impl type for a
-/// method (so two impls' same-named methods, e.g. `PyFrame::push_value` vs
-/// `MIFrame::push_value`, stay distinct).  Every alias spelling of one
-/// source funcobj resolves to the same `GraphKey`.
-type GraphKey = (Option<String>, String);
+use crate::model::GraphKey;
 
 /// Storage for registered graphs that mirrors RPython's
 /// `{name: funcobj}` indirection: many call-path spellings (aliases) name
@@ -878,10 +962,101 @@ type GraphKey = (Option<String>, String);
 /// from the retired per-effect `GraphId` surrogate: effects live on
 /// `graph.func` inside the shared graph, never in a side table keyed by a
 /// surrogate token.
-#[derive(Default)]
-pub(crate) struct GraphStore {
-    path_to_key: HashMap<CallPath, GraphKey>,
-    graphs: HashMap<GraphKey, GraphSlot>,
+///
+/// The store is shared with the call registry's pending lifts
+/// ([`StoredBody`]), the way `FunctionDesc.buildgraph` reaches the
+/// translator's graphs through the bookkeeper. A write while a pending lift
+/// still holds the store copies it, so the lift reads the store as it was
+/// when the registry was populated.
+#[derive(Clone, Default)]
+pub(crate) struct GraphStore(std::rc::Rc<StoreCore>);
+
+impl std::ops::Deref for GraphStore {
+    type Target = StoreCore;
+
+    fn deref(&self) -> &StoreCore {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for GraphStore {
+    fn deref_mut(&mut self) -> &mut StoreCore {
+        std::rc::Rc::make_mut(&mut self.0)
+    }
+}
+
+impl GraphStore {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The graph of the funcobj `path` names, for a reader that outlives
+    /// this borrow of the store.
+    pub(crate) fn body(&self, path: &CallPath) -> Option<StoredBody> {
+        Some(StoredBody {
+            store: std::rc::Rc::clone(&self.0),
+            key: self.key_for(path)?,
+        })
+    }
+}
+
+/// A funcobj's graph as its [`GraphStore`] builds it on first demand.
+#[derive(Clone)]
+pub(crate) struct StoredBody {
+    store: std::rc::Rc<StoreCore>,
+    key: GraphKey,
+}
+
+impl StoredBody {
+    /// The funcobj's graph; `None` when its build produced no graph.
+    pub(crate) fn graph(&self) -> Option<std::rc::Rc<FunctionGraph>> {
+        let slot = self.store.graphs.borrow().get(&self.key).cloned()?;
+        let graph = self.store.slot_graph(&slot)?.graph.clone();
+        Some(graph)
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct StoreCore {
+    path_to_key: std::cell::RefCell<HashMap<CallPath, GraphKey>>,
+    /// Slots are shared with the copies of the store a pending lift holds
+    /// ([`GraphStore`]); a write copies the one slot it changes.
+    graphs: std::cell::RefCell<HashMap<GraphKey, std::rc::Rc<GraphSlot>>>,
+    /// Whole-store rewrites that have run, in order, with the inputs each
+    /// read. A slot built after a rewrite ran gets it when it is built, the
+    /// way `rtyper.py specialize_more_blocks` hands the graphs that appear
+    /// after a pass to that pass on arrival.
+    passes: Vec<StorePass>,
+    /// The funcobjs the front end declares, registered on this store's
+    /// next lookup (`bookkeeper.py getdesc`: a `FunctionDesc` exists from
+    /// the first time a function object is seen).
+    declarations: FuncObjDeclarations,
+    /// How many of `declarations` this store has registered.
+    declared_upto: std::cell::Cell<usize>,
+}
+
+/// A funcobj the front end declared under the path its call sites name:
+/// its graph, built on first demand, and its registration's stamps.
+#[derive(Clone)]
+pub(crate) struct DeclaredFuncObj {
+    pub(crate) path: CallPath,
+    pub(crate) graph: crate::model::LazyGraph,
+    pub(crate) transform: GraphTransform,
+}
+
+/// The funcobjs the front end has declared, in order. Shared by every copy
+/// of the store, each registering the ones it has not seen yet.
+#[derive(Clone, Default)]
+pub(crate) struct FuncObjDeclarations(std::rc::Rc<std::cell::RefCell<Vec<DeclaredFuncObj>>>);
+
+impl FuncObjDeclarations {
+    pub(crate) fn push(&self, declared: DeclaredFuncObj) {
+        self.0.borrow_mut().push(declared);
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<DeclaredFuncObj> {
+        self.0.borrow().get(index).cloned()
+    }
 }
 
 /// One source funcobj's stored graph plus the metadata derived from it at
@@ -893,22 +1068,350 @@ pub(crate) struct GraphStore {
 /// callee's signature off the *code object* and never walks the built
 /// graph.  Pyre's lifted callees carry no `PyGraph` wrapper, so the
 /// signature is recovered from the startblock's `Input` ops
-/// ([`crate::model::FunctionGraph::value_name_for`]) — but once, here,
-/// while the body is in hand, rather than on every registry consumer.
+/// ([`crate::model::FunctionGraph::value_name_for`]) once, when the graph
+/// is built, rather than on every registry consumer.
+///
+/// `graph` is built on first demand from `source`
+/// (`description.py FunctionDesc.cachedgraph`); a build that produces no
+/// graph leaves the funcobj unregistered. Once built, the graph is shared
+/// with the call registry's pending lift of this body
+/// (`FunctionDesc::source_graph`). A write while a pending lift still holds
+/// it copies the graph, so the lift reads the body as it was registered.
+#[derive(Clone)]
 struct GraphSlot {
-    graph: FunctionGraph,
+    graph: std::cell::OnceCell<Option<BuiltGraph>>,
+    /// The funcobj the graph is built from; `None` for a slot registered
+    /// with a built graph.
+    source: Option<SlotSource>,
+    /// Attributes written onto the funcobj before its graph was built.
+    /// The build stamps them onto the graph; afterwards writes go to the
+    /// graph itself.
+    attrs: FuncObjAttrs,
+    /// Number of store passes that had run when the funcobj was
+    /// registered: its build catches up on the ones after.
+    since: usize,
+    /// Set while the build runs, so the slot reads as absent to the store
+    /// passes the build catches up on, as it does while a whole-store pass
+    /// has taken it out of the store.
+    building: std::cell::Cell<bool>,
+    /// Whether the funcobj came from the front end's declarations
+    /// ([`FuncObjDeclarations`]) rather than a registration.
+    declared: bool,
+}
+
+#[derive(Clone)]
+struct SlotSource {
+    graph: crate::model::LazyGraph,
+    transform: GraphTransform,
+}
+
+#[derive(Clone)]
+struct BuiltGraph {
+    graph: std::rc::Rc<FunctionGraph>,
     signature: Signature,
 }
 
-impl GraphStore {
-    fn new() -> Self {
-        Self::default()
+/// A graph handed to [`CallControl`] registration: built already, or the
+/// funcobj's [`LazyGraph`](crate::model::LazyGraph) together with the
+/// registration's own stamps, applied when the graph is built.
+#[derive(Clone)]
+pub enum GraphSource {
+    Built(std::rc::Rc<FunctionGraph>),
+    Lazy {
+        graph: crate::model::LazyGraph,
+        transform: GraphTransform,
+    },
+}
+
+impl From<FunctionGraph> for GraphSource {
+    fn from(graph: FunctionGraph) -> Self {
+        Self::Built(std::rc::Rc::new(graph))
+    }
+}
+
+impl From<std::rc::Rc<FunctionGraph>> for GraphSource {
+    fn from(graph: std::rc::Rc<FunctionGraph>) -> Self {
+        Self::Built(graph)
+    }
+}
+
+/// What a registration stamps onto its copy of the funcobj's graph: the
+/// source return type (`with_return_type`) and the hints, in that order.
+#[derive(Clone, Debug, Default)]
+pub struct GraphTransform {
+    pub return_type: Option<String>,
+    pub hints: Vec<String>,
+}
+
+impl GraphTransform {
+    fn apply(&self, graph: &mut FunctionGraph) {
+        if let Some(rt) = &self.return_type {
+            graph.return_type = Some(rt.clone());
+        }
+        crate::front::llbc_hints::merge_hints_into_graph(graph, &self.hints);
+    }
+}
+
+/// `graph.func` attributes, hints and return type written onto a funcobj
+/// whose graph is not built yet, folded onto the graph when it is.
+#[derive(Clone, Default)]
+struct FuncObjAttrs {
+    func: crate::model::FuncEffects,
+    hints: Vec<String>,
+    return_type: Option<String>,
+}
+
+/// A `func` attribute a decorator sets (`rlib/jit.py` `@elidable`,
+/// `@oopspec`, `@loop_invariant`, the GC transformer hints), as its
+/// harvested hint spells it.
+pub(crate) enum DecoratorAttr {
+    Oopspec(String),
+    /// `support.py argnames = ll_func.__code__.co_varnames[:nb_args]`,
+    /// paired with `#[oopspec(...)]` by
+    /// `front::llbc_hints::harvest_hints_from_llbcs`.
+    OopspecArgnames(Vec<String>),
+    AroundstateTarget(String, i64),
+    Elidable,
+    CannotRaise,
+    MemerrorOnly,
+    LoopInvariant,
+    CloseStack,
+    CannotCollect,
+    /// `random_effects_on_gcobjs`, read off the funcobj by
+    /// `analyze_external_call` alone, so it only speaks for a funcobj that
+    /// ends up with no graph.
+    GcEffects,
+}
+
+impl DecoratorAttr {
+    pub(crate) fn from_hint(hint: &str) -> Option<Self> {
+        if let Some(spec) = hint.strip_prefix("oopspec:") {
+            return Some(Self::Oopspec(spec.to_string()));
+        }
+        if let Some(rest) = hint.strip_prefix("aroundstate_target:") {
+            let Some((save, identity)) = rest.split_once(':') else {
+                panic!("aroundstate_target hint `{hint}` is missing save_err");
+            };
+            let Ok(save_err) = save.parse::<i64>() else {
+                panic!("aroundstate_target hint `{hint}` has an undecodable save_err");
+            };
+            return Some(Self::AroundstateTarget(identity.to_string(), save_err));
+        }
+        if let Some(names) = hint.strip_prefix("oopspec_argnames:") {
+            let argnames: Vec<String> = names
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return (!argnames.is_empty()).then_some(Self::OopspecArgnames(argnames));
+        }
+        Some(match hint {
+            "elidable" => Self::Elidable,
+            "elidable_cannot_raise" | "cannot_raise" => Self::CannotRaise,
+            "elidable_or_memerror" => Self::MemerrorOnly,
+            "loopinvariant" => Self::LoopInvariant,
+            "close_stack" => Self::CloseStack,
+            "cannot_collect" => Self::CannotCollect,
+            // rlib/jit.py — @not_in_trace sets func.oopspec = "jit.not_in_trace()"
+            "not_in_trace" => Self::Oopspec("jit.not_in_trace".to_string()),
+            "gc_effects" => Self::GcEffects,
+            _ => return None,
+        })
+    }
+}
+
+impl FuncObjAttrs {
+    /// The attributes the decorators behind `hints` set on a fresh funcobj:
+    /// what [`CallControl::mark_decorator_hints`] writes, and the hint tokens
+    /// it stamps.
+    fn from_decorator_hints(hints: &[String]) -> Self {
+        let mut attrs = Self::default();
+        for attr in hints
+            .iter()
+            .filter_map(|hint| DecoratorAttr::from_hint(hint))
+        {
+            let func = &mut attrs.func;
+            let token = match attr {
+                DecoratorAttr::Oopspec(spec) => {
+                    func.oopspec = Some(spec);
+                    None
+                }
+                DecoratorAttr::OopspecArgnames(argnames) => {
+                    func.oopspec_argnames = argnames;
+                    None
+                }
+                DecoratorAttr::AroundstateTarget(identity, save_err) => {
+                    func.call_aroundstate_target = Some((identity, save_err));
+                    Some("aroundstate")
+                }
+                DecoratorAttr::Elidable => {
+                    func.elidable = true;
+                    Some("elidable")
+                }
+                DecoratorAttr::CannotRaise => {
+                    assert!(
+                        !func.memerror_only_assertion,
+                        "conflicting elidable exception assertions: \
+                         already marked memerror-only, cannot also mark cannot-raise"
+                    );
+                    func.cannot_raise_assertion = true;
+                    None
+                }
+                DecoratorAttr::MemerrorOnly => {
+                    assert!(
+                        !func.cannot_raise_assertion,
+                        "conflicting elidable exception assertions: \
+                         already marked cannot-raise, cannot also mark memerror-only"
+                    );
+                    func.memerror_only_assertion = true;
+                    None
+                }
+                DecoratorAttr::LoopInvariant => {
+                    func.loop_invariant = true;
+                    Some("loopinvariant")
+                }
+                DecoratorAttr::CloseStack => {
+                    func.close_stack = true;
+                    Some("close_stack")
+                }
+                DecoratorAttr::CannotCollect => {
+                    func.cannot_collect = true;
+                    None
+                }
+                DecoratorAttr::GcEffects => {
+                    func.random_effects_on_gcobjs = true;
+                    None
+                }
+            };
+            if let Some(token) = token {
+                attrs.merge_hints(&[token.to_string()]);
+            }
+        }
+        attrs
     }
 
+    fn merge_hints(&mut self, hints: &[String]) {
+        for hint in hints {
+            if !self.hints.contains(hint) {
+                self.hints.push(hint.clone());
+            }
+        }
+    }
+
+    /// The fold [`GraphStore::insert`] does for another alias of the same
+    /// graph: effects accumulate, hints append, a missing return type is
+    /// adopted.
+    fn apply(&self, graph: &mut FunctionGraph) {
+        graph.func.merge_from(&self.func);
+        crate::front::llbc_hints::merge_hints_into_graph(graph, &self.hints);
+        if graph.return_type.is_none() {
+            graph.return_type = self.return_type.clone();
+        }
+    }
+}
+
+/// A whole-store rewrite [`GraphStore::run_pass`] ran, with the inputs it
+/// read at that point.
+#[derive(Clone)]
+enum StorePass {
+    /// [`CallControl::materialize_deferred_indirect_families`].
+    MaterializeIndirectFamilies(std::rc::Rc<TraitMethodImpls>),
+    /// [`CallControl::lower_registered_indirect_calls`].
+    LowerIndirectCalls {
+        trait_method_impls: std::rc::Rc<TraitMethodImpls>,
+        builtin_wrappers: std::rc::Rc<[CallPath]>,
+    },
+    /// [`CallControl::replace_force_virtualizable_with_call`].
+    ReplaceForceVirtualizable,
+}
+
+/// `(trait_root, method_name) -> impl owner roots`.
+type TraitMethodImpls = HashMap<(String, String), Vec<String>>;
+
+impl GraphSlot {
+    fn built(graph: std::rc::Rc<FunctionGraph>) -> Self {
+        let signature = StoreCore::signature_from_graph(&graph);
+        Self {
+            graph: std::cell::OnceCell::from(Some(BuiltGraph { graph, signature })),
+            source: None,
+            attrs: FuncObjAttrs::default(),
+            since: 0,
+            building: std::cell::Cell::new(false),
+            declared: false,
+        }
+    }
+
+    fn lazy(graph: crate::model::LazyGraph, transform: GraphTransform, since: usize) -> Self {
+        Self {
+            graph: std::cell::OnceCell::new(),
+            source: Some(SlotSource { graph, transform }),
+            attrs: FuncObjAttrs::default(),
+            since,
+            building: std::cell::Cell::new(false),
+            declared: false,
+        }
+    }
+
+    /// Whether the slot's graph comes from the funcobj `graph`.
+    fn is_source(&self, graph: &crate::model::LazyGraph) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|source| source.graph.ptr_eq(graph))
+    }
+
+    /// The funcobj attributes to write to without building the graph: the
+    /// built graph's, or the [`FuncObjAttrs`] of an unbuilt one. A funcobj
+    /// whose build produced no graph is external, and its [`FuncObjAttrs`]
+    /// stay its attributes.
+    fn attrs_mut(&mut self) -> AttrsMut<'_> {
+        match self.graph.get_mut() {
+            Some(Some(built)) => AttrsMut::Graph(std::rc::Rc::make_mut(&mut built.graph)),
+            Some(None) | None => AttrsMut::Pending(&mut self.attrs),
+        }
+    }
+}
+
+enum AttrsMut<'a> {
+    Graph(&'a mut FunctionGraph),
+    Pending(&'a mut FuncObjAttrs),
+}
+
+impl<'a> AttrsMut<'a> {
+    fn func(self) -> &'a mut crate::model::FuncEffects {
+        match self {
+            AttrsMut::Graph(graph) => &mut graph.func,
+            AttrsMut::Pending(attrs) => &mut attrs.func,
+        }
+    }
+
+    fn merge_hints(self, hints: &[String]) {
+        match self {
+            AttrsMut::Graph(graph) => {
+                crate::front::llbc_hints::merge_hints_into_graph(graph, hints)
+            }
+            AttrsMut::Pending(attrs) => attrs.merge_hints(hints),
+        }
+    }
+
+    fn fold(self, other: &FuncObjAttrs) {
+        match self {
+            AttrsMut::Graph(graph) => other.apply(graph),
+            AttrsMut::Pending(attrs) => {
+                attrs.func.merge_from(&other.func);
+                attrs.merge_hints(&other.hints);
+                if attrs.return_type.is_none() {
+                    attrs.return_type = other.return_type.clone();
+                }
+            }
+        }
+    }
+}
+
+impl StoreCore {
     /// Derive a funcobj's parameter [`Signature`] from its startblock
     /// inputargs.  `varargname` / `kwargname` are `None`: a Rust-source
     /// funcobj has no `*args` / `**kwargs` formal.
-    fn signature_from_graph(graph: &FunctionGraph) -> Signature {
+    pub(crate) fn signature_from_graph(graph: &FunctionGraph) -> Signature {
         let startblock = graph.block(graph.startblock);
         let argnames: Vec<String> = startblock
             .inputargs
@@ -923,6 +1426,182 @@ impl GraphStore {
         Signature::new(argnames, None, None)
     }
 
+    /// Read declarations from `declarations`, which this store registers
+    /// from now on. Only a store that has registered none can switch.
+    pub(crate) fn use_declarations(&mut self, declarations: FuncObjDeclarations) {
+        assert_eq!(
+            self.declared_upto.get(),
+            self.declarations.0.borrow().len(),
+            "the store switches declarations with some unregistered"
+        );
+        self.declarations = declarations;
+        self.declared_upto.set(0);
+    }
+
+    /// Register the funcobjs declared since the last lookup.
+    fn register_declared(&self) {
+        loop {
+            let upto = self.declared_upto.get();
+            let Some(declared) = self.declarations.get(upto) else {
+                return;
+            };
+            self.declared_upto.set(upto + 1);
+            self.declare(declared);
+        }
+    }
+
+    /// Register a declared funcobj without building its graph, carrying the
+    /// attributes its decorators set. A declaration precedes every store
+    /// pass, so its build catches up on all of them. Another alias of the
+    /// same funcobj folds its stamps onto the stored slot. A path already
+    /// declared keeps its first funcobj, as `FunctionDesc.cachedgraph`
+    /// returns the graph it built first for a key.
+    fn declare(&self, declared: DeclaredFuncObj) {
+        let DeclaredFuncObj {
+            path,
+            graph,
+            transform,
+        } = declared;
+        if self.path_to_key.borrow().contains_key(&path) {
+            return;
+        }
+        let key = graph.graph_key();
+        let mut attrs = FuncObjAttrs::from_decorator_hints(&transform.hints);
+        let mut graphs = self.graphs.borrow_mut();
+        match graphs.get_mut(&key) {
+            None => {
+                let mut slot = GraphSlot::lazy(graph, transform, 0);
+                slot.attrs = attrs;
+                slot.declared = true;
+                graphs.insert(key.clone(), std::rc::Rc::new(slot));
+            }
+            Some(slot) => {
+                assert!(
+                    slot.is_source(&graph),
+                    "declared funcobj {path:?} names the graph of another funcobj"
+                );
+                attrs.hints.splice(0..0, transform.hints);
+                attrs.return_type = transform.return_type;
+                std::rc::Rc::make_mut(slot).attrs_mut().fold(&attrs);
+            }
+        }
+        self.path_to_key.borrow_mut().insert(path, key);
+    }
+
+    /// The slot of the funcobj `path` names.
+    fn slot_for(&self, path: &CallPath) -> Option<std::rc::Rc<GraphSlot>> {
+        self.register_declared();
+        let key = self.path_to_key.borrow().get(path)?.clone();
+        self.graphs.borrow().get(&key).cloned()
+    }
+
+    /// The slot registered under `key`, for writing. A slot a copy of the
+    /// store still shares is copied first.
+    fn slot_mut(&mut self, key: &GraphKey) -> Option<&mut GraphSlot> {
+        self.graphs
+            .get_mut()
+            .get_mut(key)
+            .map(std::rc::Rc::make_mut)
+    }
+
+    /// The slot's graph, built and caught up with every store pass on
+    /// first demand. `None` when the build produced no graph, or while the
+    /// slot's own build is running.
+    fn slot_graph<'s>(&self, slot: &'s GraphSlot) -> Option<&'s BuiltGraph> {
+        if slot.building.get() {
+            return None;
+        }
+        slot.graph
+            .get_or_init(|| {
+                let source = slot.source.as_ref()?;
+                slot.building.set(true);
+                let built = source.graph.get().map(|graph| {
+                    let mut graph = FunctionGraph::clone(graph);
+                    source.transform.apply(&mut graph);
+                    slot.attrs.apply(&mut graph);
+                    for pass in &self.passes[slot.since..] {
+                        self.apply_pass(pass, &mut graph);
+                    }
+                    graph
+                });
+                slot.building.set(false);
+                built.map(|graph| BuiltGraph {
+                    signature: Self::signature_from_graph(&graph),
+                    graph: std::rc::Rc::new(graph),
+                })
+            })
+            .as_ref()
+    }
+
+    /// What the slot's funcobj declares, read without building its graph:
+    /// the built graph, or the header the funcobj was declared with under
+    /// this registration's stamps and the attributes written onto it. The
+    /// store passes rewrite operations only, so the header needs none of
+    /// them. `None` when the build produced no graph.
+    fn slot_declaration(&self, slot: &GraphSlot) -> Option<std::rc::Rc<FunctionGraph>> {
+        if slot.building.get() {
+            return None;
+        }
+        match slot.graph.get() {
+            Some(built) => built.as_ref().map(|built| built.graph.clone()),
+            None => {
+                let source = slot.source.as_ref()?;
+                if source.graph.is_graphless() {
+                    return None;
+                }
+                let mut header = FunctionGraph::clone(source.graph.header());
+                source.transform.apply(&mut header);
+                slot.attrs.apply(&mut header);
+                Some(std::rc::Rc::new(header))
+            }
+        }
+    }
+
+    fn apply_pass(&self, pass: &StorePass, graph: &mut FunctionGraph) {
+        match pass {
+            StorePass::MaterializeIndirectFamilies(trait_method_impls) => {
+                materialize_indirect_families(graph, trait_method_impls);
+            }
+            StorePass::LowerIndirectCalls {
+                trait_method_impls,
+                builtin_wrappers,
+            } => {
+                let families = StoreIndirectFamilies {
+                    store: self,
+                    trait_method_impls,
+                    builtin_wrappers,
+                };
+                crate::translator::rtyper::rpbc::lower_indirect_calls_with(graph, &families, false);
+            }
+            StorePass::ReplaceForceVirtualizable => {
+                replace_force_virtualizable_in(graph);
+            }
+        }
+    }
+
+    /// Run `pass` over every built graph and record it for the slots built
+    /// later. Each graph is taken out of the store while the pass rewrites
+    /// it, so the pass never reads the graph it is writing. A slot the pass
+    /// builds on the way (reading another funcobj) catches up on it there.
+    fn run_pass(&mut self, pass: StorePass) {
+        self.register_declared();
+        let keys: Vec<GraphKey> = self
+            .graphs
+            .get_mut()
+            .iter()
+            .filter(|(_, slot)| slot.graph.get().is_some_and(Option::is_some))
+            .map(|(key, _)| key.clone())
+            .collect();
+        self.passes.push(pass.clone());
+        for key in keys {
+            let Some(mut graph) = self.take_graph(&key) else {
+                continue;
+            };
+            self.apply_pass(&pass, &mut graph);
+            self.restore_graph(key, graph);
+        }
+    }
+
     /// Register `graph` under `path`.  When another alias of the same
     /// source funcobj (same `GraphKey`) is already stored, keep the one
     /// shared graph object and fold this registration's attributes onto it
@@ -931,113 +1610,325 @@ impl GraphStore {
     /// hint-less first insert drops metadata a later alias carried.  The
     /// signature stays that of the shared graph, which the aliases resolve
     /// to anyway.
-    pub(crate) fn insert(&mut self, path: CallPath, graph: FunctionGraph) {
-        let key = (
-            graph
-                .source_identity
-                .clone()
-                .or_else(|| graph.owner_root.clone()),
-            graph.name.clone(),
-        );
-        match self.graphs.get_mut(&key) {
-            Some(existing) => {
-                existing.graph.func.merge_from(&graph.func);
+    pub(crate) fn insert(&mut self, path: CallPath, graph: impl Into<std::rc::Rc<FunctionGraph>>) {
+        let graph = graph.into();
+        let key = graph.graph_key();
+        self.register_declared();
+        if let Some(slot) = self.graphs.get_mut().get(&key).cloned() {
+            self.slot_graph(&slot);
+        }
+        match self.slot_mut(&key).and_then(|slot| slot.graph.get_mut()) {
+            // Another alias of the very graph object already stored: the
+            // fold below would be a no-op.
+            Some(Some(existing)) if std::rc::Rc::ptr_eq(&existing.graph, &graph) => {}
+            Some(Some(existing)) => {
+                let existing = std::rc::Rc::make_mut(&mut existing.graph);
+                existing.func.merge_from(&graph.func);
                 // Monotonic, like `func`: upstream's aliases are the same
                 // Python graph object, so `graph.access_directly = True`
                 // written through one of them is visible through all. Here
                 // the aliases are separate `FunctionGraph` values folded onto
                 // one `GraphSlot`, so "any alias said true" has to survive
                 // the fold or the flag depends on registration order.
-                existing.graph.access_directly |= graph.access_directly;
-                crate::front::llbc_hints::merge_hints_into_graph(&mut existing.graph, &graph.hints);
-                if existing.graph.return_type.is_none() {
-                    existing.graph.return_type = graph.return_type;
+                existing.access_directly |= graph.access_directly;
+                crate::front::llbc_hints::merge_hints_into_graph(existing, &graph.hints);
+                if existing.return_type.is_none() {
+                    existing.return_type = graph.return_type.clone();
                 }
-                if existing.graph.fun_decl_id.is_none() {
-                    existing.graph.fun_decl_id = graph.fun_decl_id;
+                if existing.fun_decl_id.is_none() {
+                    existing.fun_decl_id = graph.fun_decl_id;
                 }
             }
-            None => {
-                let signature = Self::signature_from_graph(&graph);
+            Some(None) | None => {
                 self.graphs
-                    .insert(key.clone(), GraphSlot { graph, signature });
+                    .get_mut()
+                    .insert(key.clone(), std::rc::Rc::new(GraphSlot::built(graph)));
             }
         }
-        self.path_to_key.insert(path, key);
+        self.path_to_key.get_mut().insert(path, key);
+    }
+
+    /// Register the funcobj `graph` under `path` without building its
+    /// graph. `transform` is this registration's stamp on the graph and
+    /// `func` the effects already marked on `path`. Another alias of the
+    /// same funcobj folds them onto the stored slot the way
+    /// [`Self::insert`] folds a graph; a different funcobj under the same
+    /// key has its graph built and folded by [`Self::insert`].
+    pub(crate) fn insert_lazy(
+        &mut self,
+        path: CallPath,
+        graph: crate::model::LazyGraph,
+        transform: GraphTransform,
+        func: Option<crate::model::FuncEffects>,
+    ) {
+        let key = graph.graph_key();
+        let since = self.passes.len();
+        self.register_declared();
+        match self.slot_mut(&key) {
+            None => {
+                let mut slot = GraphSlot::lazy(graph, transform, since);
+                if let Some(func) = func {
+                    slot.attrs.func = func;
+                }
+                self.graphs
+                    .get_mut()
+                    .insert(key.clone(), std::rc::Rc::new(slot));
+            }
+            // The graph and its own attributes are already the slot's, so
+            // only this registration's stamps and marks fold.
+            Some(slot) if slot.is_source(&graph) => {
+                let attrs = FuncObjAttrs {
+                    func: func.unwrap_or_default(),
+                    hints: transform.hints,
+                    return_type: transform.return_type,
+                };
+                slot.attrs_mut().fold(&attrs);
+            }
+            Some(_) => {
+                let Some(built) = graph.get() else {
+                    return;
+                };
+                let mut built = FunctionGraph::clone(built);
+                transform.apply(&mut built);
+                if let Some(func) = func {
+                    built.func.merge_from(&func);
+                }
+                self.insert(path, built);
+                return;
+            }
+        }
+        self.path_to_key.get_mut().insert(path, key);
+    }
+
+    /// Register a funcobj whose graph is built on first demand under `key`.
+    /// A build that produces no graph leaves `path` unregistered.
+    #[cfg(test)]
+    pub(crate) fn insert_deferred(
+        &mut self,
+        path: CallPath,
+        key: GraphKey,
+        build: impl FnOnce() -> Option<FunctionGraph> + 'static,
+    ) {
+        let (identity, name) = key;
+        let mut header = FunctionGraph::new(name);
+        header.source_identity = identity;
+        let graph = crate::model::LazyGraph::deferred(header, build);
+        self.insert_lazy(path, graph, GraphTransform::default(), None);
+    }
+
+    /// Write `graph.func` of the funcobj `path` names without building its
+    /// graph. `None` when `path` names no funcobj or its build produced no
+    /// graph.
+    pub(crate) fn func_mut(&mut self, path: &CallPath) -> Option<&mut crate::model::FuncEffects> {
+        self.register_declared();
+        let key = self.path_to_key.get_mut().get(path)?.clone();
+        Some(self.slot_mut(&key)?.attrs_mut().func())
+    }
+
+    /// The attributes of the funcobj `path` names when its build produced
+    /// no graph: it is an external funcobj, and what was written onto it
+    /// before and after the build is its record. Builds the graph.
+    pub(crate) fn external_func(&self, path: &CallPath) -> Option<crate::model::FuncEffects> {
+        let slot = self.slot_for(path)?;
+        if slot.building.get() || self.slot_graph(&slot).is_some() {
+            return None;
+        }
+        Some(slot.attrs.func.clone())
+    }
+
+    /// Add `hints` to the funcobj `path` names without building its graph.
+    pub(crate) fn merge_hints(&mut self, path: &CallPath, hints: &[String]) {
+        self.register_declared();
+        let Some(key) = self.path_to_key.get_mut().get(path).cloned() else {
+            return;
+        };
+        if let Some(slot) = self.slot_mut(&key) {
+            slot.attrs_mut().merge_hints(hints);
+        }
+    }
+
+    /// The graph of `path` if it is built already; never builds it.
+    pub(crate) fn get_built(&self, path: &CallPath) -> Option<std::rc::Rc<FunctionGraph>> {
+        let slot = self.slot_for(path)?;
+        let graph = slot.graph.get()?.as_ref()?.graph.clone();
+        Some(graph)
+    }
+
+    /// [`Self::get_built`] for writing.
+    pub(crate) fn get_built_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
+        self.register_declared();
+        let key = self.path_to_key.get_mut().get(path)?.clone();
+        let built = self.slot_mut(&key)?.graph.get_mut()?.as_mut()?;
+        Some(std::rc::Rc::make_mut(&mut built.graph))
+    }
+
+    /// The declaration of the funcobj `path` names when it came from the
+    /// front end's declarations, read without building its graph.
+    pub(crate) fn declared_funcobj(&self, path: &CallPath) -> Option<std::rc::Rc<FunctionGraph>> {
+        let slot = self.slot_for(path)?;
+        if !slot.declared {
+            return None;
+        }
+        self.slot_declaration(&slot)
     }
 
     /// `GraphKey` of the funcobj `path` names. Alias spellings of one
     /// source graph share this key; a path with no registration has none.
     pub(crate) fn key_for(&self, path: &CallPath) -> Option<GraphKey> {
-        self.path_to_key.get(path).cloned()
+        self.register_declared();
+        self.path_to_key.borrow().get(path).cloned()
     }
 
-    pub(crate) fn get(&self, path: &CallPath) -> Option<&FunctionGraph> {
-        self.graphs
-            .get(self.path_to_key.get(path)?)
-            .map(|s| &s.graph)
+    /// The graph of the funcobj `path` names, built on first demand.
+    pub(crate) fn get(&self, path: &CallPath) -> Option<std::rc::Rc<FunctionGraph>> {
+        let slot = self.slot_for(path)?;
+        let graph = self.slot_graph(&slot)?.graph.clone();
+        Some(graph)
     }
 
     pub(crate) fn get_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
-        let key = self.path_to_key.get(path)?.clone();
-        self.graphs.get_mut(&key).map(|s| &mut s.graph)
+        self.get(path)?;
+        self.get_built_mut(path)
     }
 
     /// The formal parameter [`Signature`] of the funcobj `path` names —
     /// the `FunctionDesc` signature upstream takes from `code.signature`.
-    pub(crate) fn signature(&self, path: &CallPath) -> Option<&Signature> {
-        self.graphs
-            .get(self.path_to_key.get(path)?)
-            .map(|s| &s.signature)
+    pub(crate) fn signature(&self, path: &CallPath) -> Option<Signature> {
+        let slot = self.slot_for(path)?;
+        let signature = self.slot_graph(&slot)?.signature.clone();
+        Some(signature)
+    }
+
+    /// Whether `path` names a registered funcobj, built or not. Never
+    /// builds: a funcobj whose build later produces no graph still answers
+    /// `true`, as the external funcobj it then is.
+    pub(crate) fn names_funcobj(&self, path: &CallPath) -> bool {
+        self.register_declared();
+        self.path_to_key.borrow().contains_key(path)
     }
 
     pub(crate) fn contains_key(&self, path: &CallPath) -> bool {
-        self.path_to_key.contains_key(path)
+        self.get(path).is_some()
     }
 
     /// Every registered alias spelling (one entry per `CallPath`, not per
     /// shared graph) — matches the old `HashMap<CallPath, _>::keys()`.
     #[cfg(test)]
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &CallPath> {
-        self.path_to_key.keys()
+    pub(crate) fn keys(&self) -> Vec<CallPath> {
+        self.iter().into_iter().map(|(path, _)| path).collect()
     }
 
-    /// `(alias path, shared graph)` for every registered spelling.  The
-    /// same graph appears once per alias, mirroring the old per-path map.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&CallPath, &FunctionGraph)> {
-        self.path_to_key
+    /// `(alias path, shared graph)` for every registered spelling, each
+    /// graph built.  The same graph appears once per alias, mirroring the
+    /// old per-path map.
+    pub(crate) fn iter(&self) -> Vec<(CallPath, std::rc::Rc<FunctionGraph>)> {
+        self.register_declared();
+        let paths: Vec<CallPath> = self.path_to_key.borrow().keys().cloned().collect();
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                let graph = self.get(&path)?;
+                Some((path, graph))
+            })
+            .collect()
+    }
+
+    /// `(alias path, declaration)` for every registered spelling, without
+    /// building a graph: the `code` object each `FunctionDesc` is made
+    /// from (`bookkeeper.py getdesc`), its graph built at `cachedgraph`.
+    pub(crate) fn iter_declared(&self) -> Vec<(CallPath, std::rc::Rc<FunctionGraph>)> {
+        self.register_declared();
+        let path_to_key = self.path_to_key.borrow();
+        let graphs = self.graphs.borrow();
+        path_to_key
             .iter()
-            .filter_map(move |(p, k)| self.graphs.get(k).map(|s| (p, &s.graph)))
+            .filter_map(|(path, key)| {
+                let declared = self.slot_declaration(graphs.get(key)?)?;
+                Some((path.clone(), declared))
+            })
+            .collect()
     }
 
-    /// Every source funcobj graph exactly once, irrespective of how many
-    /// alias paths name it.  Used by the rtyping boundary that attaches the
-    /// final PBC family to deferred indirect-call operations.
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut FunctionGraph> {
-        self.graphs.values_mut().map(|slot| &mut slot.graph)
-    }
-
-    /// Source-funcobj identities, one per stored graph.
-    fn graph_keys(&self) -> Vec<GraphKey> {
-        self.graphs.keys().cloned().collect()
-    }
-
-    /// Remove one source graph so a caller can mutate it while still
+    /// Remove one built graph so a caller can mutate it while still
     /// borrowing the rest of the store. Alias paths keep their `GraphKey`.
     fn take_graph(&mut self, key: &GraphKey) -> Option<FunctionGraph> {
-        self.graphs.remove(key).map(|slot| slot.graph)
+        self.register_declared();
+        let graphs = self.graphs.get_mut();
+        let slot = graphs.remove(key)?;
+        if slot.graph.get().is_some_and(Option::is_some) {
+            let slot = std::rc::Rc::unwrap_or_clone(slot);
+            let built = slot.graph.into_inner().flatten()?;
+            return Some(std::rc::Rc::unwrap_or_clone(built.graph));
+        }
+        // Not built: put it back untouched.
+        graphs.insert(key.clone(), slot);
+        None
     }
 
     /// Put back a graph taken by [`Self::take_graph`] under the same key.
     fn restore_graph(&mut self, key: GraphKey, graph: FunctionGraph) {
-        let signature = Self::signature_from_graph(&graph);
-        self.graphs.insert(key, GraphSlot { graph, signature });
+        self.graphs.get_mut().insert(
+            key,
+            std::rc::Rc::new(GraphSlot::built(std::rc::Rc::new(graph))),
+        );
     }
 
     /// Number of registered alias spellings (path count), matching the old
     /// `HashMap<CallPath, _>::len()` so `iter()`-sized allocations stay correct.
     pub(crate) fn len(&self) -> usize {
-        self.path_to_key.len()
+        self.register_declared();
+        self.path_to_key.borrow().len()
+    }
+}
+
+/// A funcobj's `graph.func`, or the record of an external funcobj.
+pub(crate) enum FuncRef<'a> {
+    Graph(std::rc::Rc<FunctionGraph>),
+    External(crate::model::FuncEffects),
+    Record(&'a crate::model::FuncEffects),
+}
+
+impl std::ops::Deref for FuncRef<'_> {
+    type Target = crate::model::FuncEffects;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            FuncRef::Graph(g) => &g.func,
+            FuncRef::External(f) => f,
+            FuncRef::Record(f) => f,
+        }
+    }
+}
+
+/// [`crate::translator::rtyper::rpbc::IndirectCallFamilies`] as a store pass
+/// recorded them: the impl map and wrapper family it read, and the store's
+/// graphs for the declared result type.
+struct StoreIndirectFamilies<'a> {
+    store: &'a StoreCore,
+    trait_method_impls: &'a TraitMethodImpls,
+    builtin_wrappers: &'a [CallPath],
+}
+
+impl crate::translator::rtyper::rpbc::IndirectCallFamilies for StoreIndirectFamilies<'_> {
+    fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath> {
+        impls_for_indirect(self.trait_method_impls, trait_root, method_name)
+    }
+
+    fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath] {
+        self.builtin_wrappers
+    }
+
+    fn declared_result_type_for_indirect(
+        &self,
+        trait_root: &str,
+        method_name: &str,
+    ) -> Option<Type> {
+        declared_result_type(
+            trait_root,
+            method_name,
+            self.all_impls_for_indirect(trait_root, method_name),
+            |path| self.store.get(path),
+        )
     }
 }
 
@@ -1647,21 +2538,21 @@ pub struct CallControl {
     /// (`effectinfo.py compute_bitstrings`).  Lives on `CallControl`
     /// (not `AnalysisCache`) so the bytecode emit path
     /// (`assembler.rs::arraydescrof`) and the writeanalyze walker
-    /// (`collect_readwrite_effects`) consult a single source of truth — two
+    /// (`readwrite_simple_operation`) consult a single source of truth — two
     /// independent registries would assign different indices to the
     /// same `(item_ty, array_type_id)` pair and alias distinct ARRAY
     /// identities onto each other at `force_from_effectinfo`
     /// (`heap.py:540-560`, `heap.rs`'s `array_effect_index`).
     pub descr_indices: DescrIndexRegistry,
 
-    /// Local read/write ops of one graph, scanned once. Later queries
-    /// replay this list with a fresh `seen` set, so descr-mint side
-    /// effects stay in the same DFS order as a walk of the live graph.
-    /// Keyed by [`GraphKey`] (resolved through `path_to_key`): every alias
-    /// spelling of one source funcobj shares the entry, and a mutation of
-    /// that graph drops exactly that entry. A graph that is not registered
-    /// yet is left out of the map.
-    readwrite_replay: std::cell::RefCell<HashMap<GraphKey, std::sync::Arc<ReadWriteReplay>>>,
+    /// The effect analyzers' `_analyzed_calls` results. `call.py`
+    /// builds `raise_analyzer`, `virtualizable_analyzer`,
+    /// `quasiimmut_analyzer`, `randomeffects_analyzer` and
+    /// `collect_analyzer` once in `CallControl.__init__`, so a callee's
+    /// verdict is computed once for the whole codewriting run, not once per
+    /// graph that calls it. A [`crate::jtransform::Transformer`] borrows
+    /// the cache while it rewrites one graph.
+    pub(crate) analysis_cache: AnalysisCache,
     /// Names passed to `compute_struct_size_with_path` while a
     /// `fielddescrof_concrete` miss is running. `None` when not recording.
     struct_size_log: std::cell::RefCell<Option<Vec<String>>>,
@@ -1722,8 +2613,11 @@ pub struct CallControl {
     /// When registered, provides exact (offset, size) for struct fields,
     /// bypassing the type-string heuristic. The runtime/proc-macro populates
     /// this via `set_struct_layout()`. Writes go through that setter so
-    /// `fielddescrof_memo` is dropped with the layout.
-    struct_layouts: HashMap<majit_ir::descr::StructId, StructLayout>,
+    /// `fielddescrof_memo` is dropped with the layout. A positional
+    /// aggregate's layout is filled on its first lookup
+    /// ([`Self::layout_of`]).
+    struct_layouts:
+        std::cell::RefCell<HashMap<majit_ir::descr::StructId, std::rc::Rc<StructLayout>>>,
     /// Consumer-supplied low-level storage kind, keyed by the same nominal
     /// struct identity as `struct_layouts`. RPython stores this on the lltype
     /// STRUCT; the Rust source declaration alone cannot distinguish a host
@@ -1818,8 +2712,7 @@ pub struct CallControl {
 /// `get_size`) when they reach constant emission.
 impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for CallControl {
     fn field_offset(&self, struct_name: &str, fldname: &str) -> Option<i64> {
-        let sid = majit_ir::descr::struct_id_for_name(struct_name)?;
-        let layout = self.struct_layouts.get(&sid)?;
+        let layout = self.struct_layout_for(struct_name)?;
         layout
             .fields
             .iter()
@@ -1828,8 +2721,7 @@ impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for CallCon
     }
 
     fn struct_size(&self, struct_name: &str) -> Option<i64> {
-        let sid = majit_ir::descr::struct_id_for_name(struct_name)?;
-        self.struct_layouts.get(&sid).map(|l| l.size as i64)
+        self.struct_layout_for(struct_name).map(|l| l.size as i64)
     }
 }
 
@@ -1910,7 +2802,7 @@ fn is_known_by_value_struct(
     {
         return false;
     }
-    known_structs.contains(type_name)
+    known_structs.contains(type_name) || majit_ir::descr::positional_shape_id(type_name).is_some()
 }
 
 /// Layout-transparent `core::sync::atomic` wrappers. `AtomicI64` occupies
@@ -2154,7 +3046,7 @@ impl StructLayout {
 #[derive(Default)]
 pub struct DescrIndexRegistry {
     /// Interior-mutable so that both the writeanalyze walker
-    /// (`collect_readwrite_effects`) and the bytecode emit path
+    /// (`readwrite_simple_operation`) and the bytecode emit path
     /// (`assembler.rs::arraydescrof`) can publish ei_index through
     /// `&CallControl` without threading a `&mut` borrow through
     /// `getcalldescr(&self, …)` and `assemble_with_callcontrol`.
@@ -2298,7 +3190,7 @@ impl CallControl {
             has_libffi_call: false,
             callinfocollection: majit_ir::CallInfoCollection::new(),
             descr_indices: DescrIndexRegistry::default(),
-            readwrite_replay: std::cell::RefCell::new(HashMap::new()),
+            analysis_cache: AnalysisCache::default(),
             struct_size_log: std::cell::RefCell::new(None),
             field_footprint: std::cell::RefCell::new(FieldDescrofMemoEntry::default()),
             fielddescrof_memo: std::cell::RefCell::new(HashMap::new()),
@@ -2313,7 +3205,7 @@ impl CallControl {
             // = sizeof(Signed) = WORD. Standard GcArray has a length field before items.
             //
             array_header_size: crate::layout::target_word_size(),
-            struct_layouts: HashMap::new(),
+            struct_layouts: Default::default(),
             immutable_fields_by_struct: HashMap::new(),
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
@@ -2449,7 +3341,9 @@ impl CallControl {
         struct_id: majit_ir::descr::StructId,
         layout: StructLayout,
     ) {
-        self.struct_layouts.insert(struct_id, layout);
+        self.struct_layouts
+            .get_mut()
+            .insert(struct_id, std::rc::Rc::new(layout));
         self.clear_fielddescrof_memo();
     }
 
@@ -2500,9 +3394,39 @@ impl CallControl {
     /// `None` for an unknown or cross-module-ambiguous name — the layout
     /// channel is keyed by object identity, so a name that does not
     /// resolve to one identity has no layout.
-    pub fn struct_layout_for(&self, name: &str) -> Option<&StructLayout> {
+    pub fn struct_layout_for(&self, name: &str) -> Option<std::rc::Rc<StructLayout>> {
         let sid = majit_ir::descr::struct_id_for_name(name)?;
-        self.struct_layouts.get(&sid)
+        self.layout_of(sid, name)
+    }
+
+    /// The layout stored under `sid`, whose spelling is `name`. A
+    /// positional aggregate (`Tuple<A,B>` / `Array<T;N>`) has no layout
+    /// until something asks for it: `TupleRepr` lays out `TUPLE_TYPE` from
+    /// its items on demand (`rtuple.py`) and `symbolic.get_size` /
+    /// `get_field_token` size it when the backend first asks
+    /// (`symbolic.py`). Every item row is a scalar, a pointer or an inline
+    /// array, so the layout depends on the spelling alone.
+    fn layout_of(
+        &self,
+        sid: majit_ir::descr::StructId,
+        name: &str,
+    ) -> Option<std::rc::Rc<StructLayout>> {
+        if let Some(layout) = self.struct_layouts.borrow().get(&sid) {
+            return Some(layout.clone());
+        }
+        if majit_ir::descr::positional_shape_id(name) != Some(sid) {
+            return None;
+        }
+        let rows = crate::front::mir::positional_shape_rows(name)?;
+        let layout = std::rc::Rc::new(StructLayout::from_type_strings(
+            rows,
+            &self.known_struct_names,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        ));
+        self.struct_layouts.borrow_mut().insert(sid, layout.clone());
+        Some(layout)
     }
 
     /// Byte offset of the first item of a length-prefixed array whose length
@@ -3136,10 +4060,12 @@ impl CallControl {
                 let (struct_size, struct_size_path) =
                     compute_struct_size_with_path(self, owner_root);
                 let offset_of = |sid| {
-                    self.struct_layouts
-                        .get(&sid)
-                        .and_then(|l| l.fields.iter().find(|f| f.name.as_str() == field_name))
-                        .map(|f| f.offset)
+                    self.layout_of(sid, owner_root).and_then(|l| {
+                        l.fields
+                            .iter()
+                            .find(|f| f.name.as_str() == field_name)
+                            .map(|f| f.offset)
+                    })
                 };
                 let concrete_offset = owner_id.and_then(offset_of);
                 let template_offset = if concrete_offset.is_none() {
@@ -3510,24 +4436,25 @@ impl CallControl {
 
     /// Insert into `function_graphs`. All graph writes go through this
     /// helper so pending external-funcobj marks fold onto the graph.
-    fn insert_function_graph_indexed(&mut self, path: CallPath, mut graph: FunctionGraph) {
+    fn insert_function_graph_indexed(&mut self, path: CallPath, graph: GraphSource) {
         // Fold any effect marks recorded before the graph existed: a
         // `mark_*` called ahead of registration lands on the graph-less
         // external funcobj record for `path`; carry it onto `graph.func`
         // so the typed effect carrier is registration-order-insensitive
         // (RPython attaches `func` attributes regardless of when the
         // graph is discovered).
-        if let Some(pending) = self.external_funcobjs.remove(&path) {
-            graph.func.merge_from(&pending);
-        }
-        self.function_graphs.insert(path.clone(), graph);
-        // A new key has no replay yet. An overwrite merges into the slot
-        // this path now names (`GraphStore::insert`): that shared graph is
-        // the one whose replay is stale, including every alias already
-        // pointing at the same key. A previous key this path left behind
-        // is not modified.
-        if let Some(key) = self.function_graphs.key_for(&path) {
-            self.readwrite_replay.borrow_mut().remove(&key);
+        let pending = self.external_funcobjs.remove(&path);
+        match graph {
+            GraphSource::Built(mut graph) => {
+                if let Some(pending) = pending {
+                    std::rc::Rc::make_mut(&mut graph).func.merge_from(&pending);
+                }
+                self.function_graphs.insert(path, graph);
+            }
+            GraphSource::Lazy { graph, transform } => {
+                self.function_graphs
+                    .insert_lazy(path, graph, transform, pending);
+            }
         }
     }
 
@@ -3538,11 +4465,21 @@ impl CallControl {
     /// This is the `graph.func` / external-`funcobj` read RPython does
     /// directly off the call op's target — every per-function effect is
     /// carried here rather than in a separate per-effect side table.
-    fn func_effects(&self, path: &CallPath) -> Option<&crate::model::FuncEffects> {
+    fn func_effects(&self, path: &CallPath) -> Option<FuncRef<'_>> {
         self.function_graphs
             .get(path)
-            .map(|g| &g.func)
-            .or_else(|| self.external_funcobjs.get(path))
+            .map(FuncRef::Graph)
+            .or_else(|| self.external_funcobj(path))
+    }
+
+    /// The external funcobj `path` names, for a target with no graph: a
+    /// registered funcobj whose build produced none, or a graph-less
+    /// record the `mark_*` setters created.
+    fn external_funcobj(&self, path: &CallPath) -> Option<FuncRef<'_>> {
+        self.function_graphs
+            .external_func(path)
+            .map(FuncRef::External)
+            .or_else(|| self.external_funcobjs.get(path).map(FuncRef::Record))
     }
 
     /// Mutable [`FuncEffects`](crate::model::FuncEffects) for `path`,
@@ -3550,15 +4487,15 @@ impl CallControl {
     /// graph-less external funcobj record (created on demand) otherwise.
     /// The `mark_*` setters route every effect write through here.
     fn func_effects_mut(&mut self, path: &CallPath) -> &mut crate::model::FuncEffects {
-        if let Some(graph) = self.function_graphs.get_mut(path) {
-            &mut graph.func
+        if let Some(func) = self.function_graphs.func_mut(path) {
+            func
         } else {
             self.external_funcobjs.entry(path.clone()).or_default()
         }
     }
 
     /// Resolve a call target to its [`FuncEffects`](crate::model::FuncEffects).
-    fn target_func_effects(&self, target: &CallTarget) -> Option<&crate::model::FuncEffects> {
+    fn target_func_effects(&self, target: &CallTarget) -> Option<FuncRef<'_>> {
         if let Some(path) = self.target_to_path(target) {
             return self.func_effects_with_crate_alias(&path);
         }
@@ -3572,7 +4509,7 @@ impl CallControl {
 
     /// Look up effects on `path`, then on the crate-stripped spelling
     /// `harvest_hints_from_llbcs` uses (`rhai::grain::…` → `grain::…`).
-    fn func_effects_with_crate_alias(&self, path: &CallPath) -> Option<&crate::model::FuncEffects> {
+    fn func_effects_with_crate_alias(&self, path: &CallPath) -> Option<FuncRef<'_>> {
         if let Some(effects) = self.func_effects(path) {
             return Some(effects);
         }
@@ -3589,8 +4526,14 @@ impl CallControl {
 
     /// Register a free function graph.
     /// RPython: graphs are discovered via funcptr linkage.
-    pub fn register_function_graph(&mut self, path: CallPath, graph: FunctionGraph) {
-        self.insert_function_graph_indexed(path.clone(), graph);
+    /// Register the funcobjs `declarations` holds, now and as the front
+    /// end declares more.
+    pub(crate) fn use_funcobj_declarations(&mut self, declarations: FuncObjDeclarations) {
+        self.function_graphs.use_declarations(declarations);
+    }
+
+    pub fn register_function_graph(&mut self, path: CallPath, graph: impl Into<GraphSource>) {
+        self.insert_function_graph_indexed(path.clone(), graph.into());
         // The deferred `Some([])` marker is resolvable as soon as its
         // `(trait, method)` impls are registered. Fill it on the stored
         // graph so a later analyzer does not fold the empty family to
@@ -3607,7 +4550,31 @@ impl CallControl {
             function_graphs,
             ..
         } = self;
-        let Some(graph) = function_graphs.get_mut(path) else {
+        let fillable = |graphs: &Option<Vec<CallPath>>, family_key: &Option<(String, String)>| {
+            graphs.as_deref().is_some_and(<[_]>::is_empty)
+                && family_key
+                    .as_ref()
+                    .is_some_and(|(trait_root, method_name)| {
+                        trait_method_impls
+                            .get(&(trait_root.clone(), method_name.clone()))
+                            .is_some_and(|impls| !impls.is_empty())
+                    })
+        };
+        // Look before writing: the stored graph can be shared with its
+        // other aliases and with the pending lift. A graph not built yet
+        // is left alone: `materialize_deferred_indirect_families` fills
+        // every family marker before any reader walks it.
+        let Some(graph) = function_graphs.get_built(path) else {
+            return;
+        };
+        let any_fillable = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(&op.kind, OpKind::IndirectCall { graphs, family_key, .. }
+                if fillable(graphs, family_key))
+        });
+        if !any_fillable {
+            return;
+        }
+        let Some(graph) = function_graphs.get_built_mut(path) else {
             return;
         };
         for block in &mut graph.blocks {
@@ -3646,15 +4613,14 @@ impl CallControl {
     /// after the flowspace prepass (which still needs `family_key`) and
     /// before `transform_graph_to_jitcode`.
     pub(crate) fn lower_registered_indirect_calls(&mut self) {
-        let _frozen = self.builtin_wrapper_indirect_graphs();
-        let keys = self.function_graphs.graph_keys();
-        for key in keys {
-            let Some(mut graph) = self.function_graphs.take_graph(&key) else {
-                continue;
-            };
-            crate::translator::rtyper::rpbc::lower_indirect_calls_with(&mut graph, self, false);
-            self.function_graphs.restore_graph(key, graph);
-        }
+        let builtin_wrappers: std::rc::Rc<[CallPath]> =
+            self.builtin_wrapper_indirect_graphs().into();
+        let trait_method_impls = std::rc::Rc::new(self.trait_method_impls.clone());
+        self.function_graphs
+            .run_pass(StorePass::LowerIndirectCalls {
+                trait_method_impls,
+                builtin_wrappers,
+            });
     }
 
     /// Whether a graph is registered under `path`.
@@ -3676,10 +4642,27 @@ impl CallControl {
     pub fn register_function_graph_with_hints(
         &mut self,
         path: CallPath,
-        mut graph: FunctionGraph,
+        graph: impl Into<GraphSource>,
         hints: Vec<String>,
     ) {
-        crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &hints);
+        let mut graph = graph.into();
+        match &mut graph {
+            GraphSource::Built(graph) => {
+                if hints.iter().any(|hint| !graph.hints.contains(hint)) {
+                    crate::front::llbc_hints::merge_hints_into_graph(
+                        std::rc::Rc::make_mut(graph),
+                        &hints,
+                    );
+                }
+            }
+            GraphSource::Lazy { transform, .. } => {
+                for hint in hints {
+                    if !transform.hints.contains(&hint) {
+                        transform.hints.push(hint);
+                    }
+                }
+            }
+        }
         self.register_function_graph(path, graph);
     }
 
@@ -3689,10 +4672,8 @@ impl CallControl {
     /// insert) and need the graph's `_jit_*_` / `_elidable_function_` hints
     /// populated so `look_inside_graph` reads them off `graph.hints`.
     pub fn register_function_hints_for(&mut self, path: CallPath, hints: Vec<String>) {
-        if !hints.is_empty()
-            && let Some(graph) = self.function_graphs.get_mut(&path)
-        {
-            crate::front::llbc_hints::merge_hints_into_graph(graph, &hints);
+        if !hints.is_empty() {
+            self.function_graphs.merge_hints(&path, &hints);
         }
     }
 
@@ -3861,7 +4842,7 @@ impl CallControl {
         method_name: &str,
         trait_root: Option<&str>,
         impl_type: &str,
-        graph: FunctionGraph,
+        graph: impl Into<GraphSource>,
     ) {
         if let Some(trait_root) = trait_root {
             self.register_trait_family_member(method_name, trait_root, impl_type);
@@ -3876,11 +4857,11 @@ impl CallControl {
         // `push_value` stay separate.
         let qualified_path = CallPath::for_impl_method(impl_type, method_name);
         // Impl-method graphs carry `owner_root = Some(impl_type)`.
-        if !self.function_graphs.contains_key(&qualified_path) {
+        if !self.function_graphs.names_funcobj(&qualified_path) {
             // Each impl method registers exactly once under a distinct
             // qualified path; its `owner_root = Some(impl_type)` keeps it
             // separate from other impls' same-named methods.
-            self.insert_function_graph_indexed(qualified_path, graph);
+            self.insert_function_graph_indexed(qualified_path, graph.into());
         }
     }
 
@@ -4413,32 +5394,9 @@ impl CallControl {
     /// keeps the helper Call and is stripped to the virtualizable
     /// argument (`op.args = [c_funcptr, op.args[0]]`). The residual
     /// helper is already `executioncontext::jit_force_virtualizable`.
-    fn replace_force_virtualizable_with_call(&mut self) -> usize {
-        self.readwrite_replay.borrow_mut().clear();
-        let mut count = 0;
-        for graph in self.function_graphs.values_mut() {
-            for block in &mut graph.blocks {
-                let mut newops = Vec::with_capacity(block.operations.len());
-                for mut op in block.operations.drain(..) {
-                    if let OpKind::Call { target, args, .. } = &op.kind {
-                        if is_residual_jit_force_virtualizable(target) {
-                            if args.last().is_some_and(link_arg_access_directly) {
-                                continue;
-                            }
-                            if let OpKind::Call { args, .. } = &mut op.kind {
-                                if args.len() > 1 {
-                                    args.truncate(1);
-                                }
-                            }
-                            count += 1;
-                        }
-                    }
-                    newops.push(op);
-                }
-                block.operations = newops;
-            }
-        }
-        count
+    fn replace_force_virtualizable_with_call(&mut self) {
+        self.function_graphs
+            .run_pass(StorePass::ReplaceForceVirtualizable);
     }
 
     /// `Transformer.get_vinfo` name-token half. `is_vtypeptr` stays the
@@ -4531,8 +5489,7 @@ impl CallControl {
     ///
     /// Discovers all candidate graphs reachable from the portal entry
     /// points. RPython uses `policy.look_inside_graph` to decide whether
-    /// to follow each callee; we synthesize a `SemanticFunction` from the
-    /// callee graph's own `hints` and pass it through.
+    /// to follow each callee.
     pub fn find_all_graphs(&mut self, policy: &mut dyn JitPolicy) {
         assert!(
             !self.jitdrivers_sd.is_empty(),
@@ -4562,7 +5519,7 @@ impl CallControl {
                 !roots[..index].iter().any(|previous| {
                     self.function_graphs
                         .get(previous)
-                        .is_some_and(|prev| std::ptr::eq(prev, graph))
+                        .is_some_and(|prev| std::rc::Rc::ptr_eq(&prev, &graph))
                 }),
                 "duplicate helper root graph for {root:?}; aliases of one graph must share one JitCode"
             );
@@ -4580,7 +5537,7 @@ impl CallControl {
     pub fn find_all_graphs_for_tests(&mut self) {
         self.materialize_deferred_indirect_families();
         if self.jitdrivers_sd.is_empty() {
-            let all_paths: Vec<CallPath> = self.function_graphs.keys().cloned().collect();
+            let all_paths: Vec<CallPath> = self.function_graphs.keys();
             for path in all_paths {
                 self.candidate_graphs.insert(path);
             }
@@ -4603,44 +5560,9 @@ impl CallControl {
     /// and the recursive effect analyzers inspect the registered source graph
     /// first and would read `graphs: None` as an unknown family/top result.
     fn materialize_deferred_indirect_families(&mut self) {
-        self.readwrite_replay.borrow_mut().clear();
-        let trait_method_impls = &self.trait_method_impls;
-        let function_graphs = &mut self.function_graphs;
-        for graph in function_graphs.values_mut() {
-            for op in graph
-                .blocks
-                .iter_mut()
-                .flat_map(|block| block.operations.iter_mut())
-            {
-                let OpKind::IndirectCall {
-                    graphs, family_key, ..
-                } = &mut op.kind
-                else {
-                    continue;
-                };
-                // Read the key without clearing it. The two-phase prepass runs
-                // after this fill on the same shared store, and its flowspace
-                // adapter needs the same `(trait_root, method_name)` to emit
-                // the pre-rtyper `getattr` + `simple_call` shape — an
-                // `indirect_call` op does not exist before rtyping. The later
-                // `rpbc::lower_indirect_calls` re-enters its own `take()` arm
-                // and recomputes `graphs` through `all_impls_for_indirect`,
-                // which is this same lookup over the same map, so the value it
-                // writes is unchanged.
-                let Some((trait_root, method_name)) = family_key.clone() else {
-                    continue;
-                };
-                let family = trait_method_impls
-                    .get(&(trait_root.clone(), method_name.clone()))
-                    .into_iter()
-                    .flatten()
-                    .map(|impl_type| {
-                        CallPath::for_impl_method(impl_type.as_str(), method_name.as_str())
-                    })
-                    .collect::<Vec<_>>();
-                *graphs = (!family.is_empty()).then_some(family);
-            }
-        }
+        let trait_method_impls = std::rc::Rc::new(self.trait_method_impls.clone());
+        self.function_graphs
+            .run_pass(StorePass::MaterializeIndirectFamilies(trait_method_impls));
     }
 
     fn find_all_graphs_bfs(&mut self, policy: &mut dyn JitPolicy, helper_roots: &[CallPath]) {
@@ -5025,26 +5947,8 @@ impl CallControl {
                             }
                         };
                         // RPython call.py:84,87: callee must satisfy
-                        // policy.look_inside_graph(graph). Synthesize a
-                        // SemanticFunction from the stored graph + hints so
-                        // the policy's `_jit_*_` / `_elidable_function_`
-                        // checks fire identically to upstream.
-                        let hints = graph_ref.hints.clone();
-                        let graph = graph_ref.clone();
-                        let func = SemanticFunction {
-                            name: callee_path.last_segment().unwrap_or_default().to_string(),
-                            graph,
-                            return_type: None,
-                            self_ty_root: None,
-                            trait_impl_id: None,
-                            fun_decl_id: None,
-                            hints,
-                            module_path: String::new(),
-                            trait_root: None,
-                            trait_qualified: None,
-                            returns_objectptr: false,
-                        };
-                        if policy.look_inside_graph(&func) {
+                        // policy.look_inside_graph(graph).
+                        if policy.look_inside_graph(&graph_ref) {
                             self.candidate_graphs.insert(callee_path.clone());
                             todo.push(callee_path);
                         } else {
@@ -5231,7 +6135,8 @@ impl CallControl {
     /// scoped `Result<T, PyError>` is projected through `T` and where any
     /// other `Result` keeps the ADT's own kind.
     pub fn declared_return_kind(&self, path: &CallPath) -> Option<char> {
-        let s = self.function_graphs.get(path)?.return_type.as_ref()?.trim();
+        let graph = self.function_graphs.get(path)?;
+        let s = graph.return_type.as_ref()?.trim();
         Some(return_type_string_to_kind(s))
     }
 
@@ -5266,7 +6171,7 @@ impl CallControl {
         let Some((_, graph)) = self.target_to_path_and_graph(target) else {
             return args.to_vec();
         };
-        let declared = graph_arg_types(graph);
+        let declared = graph_arg_types(&graph);
         if declared.len() != args.len() {
             // Leave malformed arity untouched so `getcalldescr` reports the
             // orthodox hard error instead of silently hiding an argument.
@@ -5306,7 +6211,7 @@ impl CallControl {
         else {
             return drop_void_concretetype();
         };
-        let declared = graph_arg_types(graph);
+        let declared = graph_arg_types(&graph);
         if declared.len() != args.len() {
             return drop_void_concretetype();
         }
@@ -5328,24 +6233,116 @@ impl CallControl {
         trait_root: &str,
         method_name: &str,
     ) -> Option<Type> {
-        let mut declared = self
-            .all_impls_for_indirect(trait_root, method_name)
-            .into_iter()
-            .filter_map(|path| self.function_graphs.get(&path))
-            .filter_map(|graph| graph.return_type.as_ref())
-            .map(|result| {
-                let effective = crate::front::typestr::transparent_result_ok_type(result)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| result.clone());
-                return_type_string_to_value_type(Some(&effective))
-            });
-        let first = declared.next()?;
-        assert!(
-            declared.all(|result| result == first),
-            "indirect-call family {trait_root}::{method_name} has inconsistent result types"
-        );
-        Some(first)
+        declared_result_type(
+            trait_root,
+            method_name,
+            self.all_impls_for_indirect(trait_root, method_name),
+            |path| self.function_graphs.get(path),
+        )
     }
+}
+
+/// `CallPath`s of the impls `trait_method_impls` records for
+/// `(trait_root, method_name)`.
+fn impls_for_indirect(
+    trait_method_impls: &TraitMethodImpls,
+    trait_root: &str,
+    method_name: &str,
+) -> Vec<CallPath> {
+    trait_method_impls
+        .get(&(trait_root.to_string(), method_name.to_string()))
+        .into_iter()
+        .flatten()
+        .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name))
+        .collect()
+}
+
+/// The result type every registered member of an indirect-call family
+/// declares.
+fn declared_result_type(
+    trait_root: &str,
+    method_name: &str,
+    family: Vec<CallPath>,
+    graph_of: impl Fn(&CallPath) -> Option<std::rc::Rc<FunctionGraph>>,
+) -> Option<Type> {
+    let mut declared = family
+        .into_iter()
+        .filter_map(|path| graph_of(&path))
+        .filter_map(|graph| graph.return_type.clone())
+        .map(|result| {
+            let effective = crate::front::typestr::transparent_result_ok_type(&result)
+                .map(str::to_string)
+                .unwrap_or_else(|| result.clone());
+            return_type_string_to_value_type(Some(&effective))
+        });
+    let first = declared.next()?;
+    assert!(
+        declared.all(|result| result == first),
+        "indirect-call family {trait_root}::{method_name} has inconsistent result types"
+    );
+    Some(first)
+}
+
+/// [`CallControl::materialize_deferred_indirect_families`] on one graph.
+fn materialize_indirect_families(graph: &mut FunctionGraph, trait_method_impls: &TraitMethodImpls) {
+    for op in graph
+        .blocks
+        .iter_mut()
+        .flat_map(|block| block.operations.iter_mut())
+    {
+        let OpKind::IndirectCall {
+            graphs, family_key, ..
+        } = &mut op.kind
+        else {
+            continue;
+        };
+        // Read the key without clearing it. The two-phase prepass runs
+        // after this fill on the same shared store, and its flowspace
+        // adapter needs the same `(trait_root, method_name)` to emit
+        // the pre-rtyper `getattr` + `simple_call` shape — an
+        // `indirect_call` op does not exist before rtyping. The later
+        // `rpbc::lower_indirect_calls` re-enters its own `take()` arm
+        // and recomputes `graphs` through `all_impls_for_indirect`,
+        // which is this same lookup over the same map, so the value it
+        // writes is unchanged.
+        let Some((trait_root, method_name)) = family_key.clone() else {
+            continue;
+        };
+        let family = trait_method_impls
+            .get(&(trait_root.clone(), method_name.clone()))
+            .into_iter()
+            .flatten()
+            .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name.as_str()))
+            .collect::<Vec<_>>();
+        *graphs = (!family.is_empty()).then_some(family);
+    }
+}
+
+/// [`CallControl::replace_force_virtualizable_with_call`] on one graph.
+/// Returns how many residual forces it kept.
+fn replace_force_virtualizable_in(graph: &mut FunctionGraph) -> usize {
+    let mut count = 0;
+    for block in &mut graph.blocks {
+        let mut newops = Vec::with_capacity(block.operations.len());
+        for mut op in block.operations.drain(..) {
+            if let OpKind::Call { target, args, .. } = &op.kind {
+                if is_residual_jit_force_virtualizable(target) {
+                    if args.last().is_some_and(link_arg_access_directly) {
+                        continue;
+                    }
+                    if let OpKind::Call { args, .. } = &mut op.kind {
+                        if args.len() > 1 {
+                            args.truncate(1);
+                        }
+                    }
+                    count += 1;
+                }
+            }
+            newops.push(op);
+        }
+        block.operations = newops;
+    }
+    count
 }
 
 /// Map a Rust return-type string to the BhCallDescr kind char used by
@@ -5679,11 +6676,11 @@ impl CallControl {
     /// Look up the single callee `FunctionGraph` for a direct call.
     ///
     /// Convenience accessor for call sites (majit `inline.rs`) that
-    /// still work with one `&FunctionGraph` at a time.  RPython
+    /// still work with one `FunctionGraph` at a time.  RPython
     /// `call.py:97-101` returns the graph value inside the list, but
-    /// majit callers want a borrow against `function_graphs` so we keep
+    /// majit callers want the graph stored in `function_graphs` so we keep
     /// this lookup separate from the op-based `graphs_from`.
-    pub fn direct_graph_for(&self, target: &CallTarget) -> Option<&FunctionGraph> {
+    pub fn direct_graph_for(&self, target: &CallTarget) -> Option<std::rc::Rc<FunctionGraph>> {
         let path = self.target_to_path(target)?;
         if !self.candidate_graphs.contains(&path) {
             return None;
@@ -5727,11 +6724,6 @@ impl CallControl {
         op_idx: usize,
         resolved: CallPath,
     ) {
-        // Replay is keyed by the shared graph, so every alias of this
-        // caller drops together. The stamp mutates that one graph.
-        if let Some(key) = self.function_graphs.key_for(caller) {
-            self.readwrite_replay.borrow_mut().remove(&key);
-        }
         let Some(graph) = self.function_graphs.get_mut(caller) else {
             return;
         };
@@ -5754,7 +6746,7 @@ impl CallControl {
 
     /// Look up the registered graph alongside its `CallPath` in a single
     /// step — `call.py:97` `funcobj.graph` direct read.  The returned
-    /// `&FunctionGraph` is the same identity registered under the path,
+    /// graph is the same identity registered under the path,
     /// without the `candidate_graphs` filter `direct_graph_for` imposes
     /// (callers that want the candidate-only view continue to use
     /// `direct_graph_for`).  The `CallPath` byproduct stays available
@@ -5762,7 +6754,7 @@ impl CallControl {
     pub(crate) fn target_to_path_and_graph(
         &self,
         target: &CallTarget,
-    ) -> Option<(CallPath, &FunctionGraph)> {
+    ) -> Option<(CallPath, std::rc::Rc<FunctionGraph>)> {
         let path = self.target_to_path(target)?;
         let graph = self.function_graphs.get(&path)?;
         Some((path, graph))
@@ -5779,14 +6771,10 @@ impl CallControl {
                 if crate::model::fn_const_segments(target).is_some() {
                     return None;
                 }
-                let path = CallPath::from_segments(segments.iter().map(String::as_str));
-                if self.has_callable_graph(&path) {
-                    return Some(path);
-                }
                 // The spelled path, even when no graph is registered:
                 // `fnaddr_for_target` and oopspec marks key on it.
                 // `graphs_from` still requires `has_callable_graph`.
-                Some(path)
+                Some(CallPath::from_segments(segments.iter().map(String::as_str)))
             }
             CallTarget::Method {
                 name,
@@ -6033,7 +7021,7 @@ impl CallControl {
         name: &str,
         receiver_root: Option<&str>,
         resolved_path: Option<&CallPath>,
-    ) -> Option<&FunctionGraph> {
+    ) -> Option<std::rc::Rc<FunctionGraph>> {
         if let Some(path) = resolved_path
             && let Some(g) = self.function_graphs.get(path)
         {
@@ -6132,12 +7120,7 @@ impl CallControl {
     /// where the goal is to reject mixed `_elidable_function_` etc.
     /// even among residual members (`call.py:259-280`).
     pub fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath> {
-        self.trait_method_impls
-            .get(&(trait_root.to_string(), method_name.to_string()))
-            .into_iter()
-            .flatten()
-            .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name))
-            .collect()
+        impls_for_indirect(&self.trait_method_impls, trait_root, method_name)
     }
 
     /// Candidate PBC family for the generated `BuiltinCode.func`
@@ -6229,9 +7212,9 @@ impl CallControl {
     pub fn check_indirect_call_family(&self, candidates: &[CallPath]) -> Result<(), String> {
         for graph in candidates {
             let effects = self.func_effects(graph);
-            let err = if effects.is_some_and(|f| f.elidable) {
+            let err = if effects.as_ref().is_some_and(|f| f.elidable) {
                 Some("@jit.elidable")
-            } else if effects.is_some_and(|f| f.loop_invariant) {
+            } else if effects.as_ref().is_some_and(|f| f.loop_invariant) {
                 Some("@jit.loop_invariant")
             } else if self.graph_has_hint(graph, "aroundstate") {
                 Some("_call_aroundstate_target_")
@@ -6294,7 +7277,7 @@ impl CallControl {
     // tokens `look_inside` / `unroll_safe` / `aroundstate`).  It is
     // seeded at registration (`register_function_graph_with_hints` /
     // `register_function_hints_for`) and matched by
-    // `codewriter::policy` against the synthesized `SemanticFunction`.
+    // `codewriter::policy` against the callee graph.
     // The effect analyzers below instead read the typed carrier
     // [`crate::model::FuncEffects`] (`graph.func`) for the
     // `_elidable_function_` / `_jit_loop_invariant_` /
@@ -6313,18 +7296,14 @@ impl CallControl {
     /// Ensure the hint `tok` is present on the registered graph for `path`
     /// (idempotent; no-op when no graph is registered under `path`).
     fn stamp_graph_hint(&mut self, path: &CallPath, tok: &str) {
-        if let Some(g) = self.function_graphs.get_mut(path)
-            && !g.hints.iter().any(|h| h == tok)
-        {
-            g.hints.push(tok.to_string());
-        }
+        self.function_graphs.merge_hints(path, &[tok.to_string()]);
     }
 
     /// RPython: `getattr(func, "_elidable_function_", False)` (call.py).
     /// Mark a target as elidable (pure function). Sets the typed
     /// `func.elidable` (read by the analyzers, order-insensitive via the
     /// external-funcobj merge) and stamps the `"elidable"` token onto
-    /// `graph.hints` for the policy `SemanticFunction` path.
+    /// `graph.hints` for `codewriter::policy`.
     pub fn mark_elidable(&mut self, path: CallPath) {
         self.func_effects_mut(&path).elidable = true;
         self.stamp_graph_hint(&path, "elidable");
@@ -6480,8 +7459,7 @@ impl CallControl {
             .get(path)
             .is_some_and(|graph| graph.func.cannot_raise_assertion)
             || self
-                .external_funcobjs
-                .get(path)
+                .external_funcobj(path)
                 .is_some_and(|effects| effects.cannot_raise_assertion)
     }
 
@@ -6549,17 +7527,43 @@ impl CallControl {
     /// Harvested `aroundstate_target:<save_err>:<identity>` hint.  Returns
     /// whether `hint` was that token.
     pub fn mark_aroundstate_hint(&mut self, path: CallPath, hint: &str) -> bool {
-        let Some(rest) = hint.strip_prefix("aroundstate_target:") else {
+        if !hint.starts_with("aroundstate_target:") {
             return false;
+        }
+        let Some(DecoratorAttr::AroundstateTarget(identity, save_err)) =
+            DecoratorAttr::from_hint(hint)
+        else {
+            unreachable!("an aroundstate_target hint decodes to its attribute");
         };
-        let Some((save, identity)) = rest.split_once(':') else {
-            panic!("aroundstate_target hint `{hint}` is missing save_err");
-        };
-        let Ok(save_err) = save.parse::<i64>() else {
-            panic!("aroundstate_target hint `{hint}` has an undecodable save_err");
-        };
-        self.mark_call_aroundstate_target(path, identity.to_string(), save_err);
+        self.mark_call_aroundstate_target(path, identity, save_err);
         true
+    }
+
+    /// Write the `func` attributes the decorators behind `hints` set onto the
+    /// funcobj `path` names.
+    pub fn mark_decorator_hints(&mut self, path: &CallPath, hints: &[String]) {
+        for attr in hints
+            .iter()
+            .filter_map(|hint| DecoratorAttr::from_hint(hint))
+        {
+            let path = path.clone();
+            match attr {
+                DecoratorAttr::Oopspec(spec) => self.mark_oopspec(path, spec),
+                DecoratorAttr::OopspecArgnames(argnames) => {
+                    self.mark_oopspec_argnames(path, argnames)
+                }
+                DecoratorAttr::AroundstateTarget(identity, save_err) => {
+                    self.mark_call_aroundstate_target(path, identity, save_err)
+                }
+                DecoratorAttr::Elidable => self.mark_elidable(path),
+                DecoratorAttr::CannotRaise => self.mark_cannot_raise_assertion(path),
+                DecoratorAttr::MemerrorOnly => self.mark_memerror_only_assertion(path),
+                DecoratorAttr::LoopInvariant => self.mark_loopinvariant(path),
+                DecoratorAttr::CloseStack => self.mark_close_stack(path),
+                DecoratorAttr::CannotCollect => self.mark_cannot_collect(path),
+                DecoratorAttr::GcEffects => self.mark_external_gc_effects(path),
+            }
+        }
     }
 
     /// `call.py` `getcalldescr`: `assert getattr(funcobj, 'natural_arity', -1) == -1`
@@ -6660,7 +7664,9 @@ impl CallControl {
     }
 
     /// RPython: collectanalyze.py — `funcobj.random_effects_on_gcobjs`.
-    /// Mark an external target as having random GC effects.
+    /// Mark a target as having random GC effects. The analyzers read it in
+    /// their `analyze_external_call` arm only, so it speaks for a target
+    /// with no graph.
     pub fn mark_external_gc_effects(&mut self, path: CallPath) {
         self.func_effects_mut(&path).random_effects_on_gcobjs = true;
     }
@@ -6695,9 +7701,9 @@ impl CallControl {
     }
 
     /// RPython: `getattr(func, 'oopspec', None)` — look up oopspec for a target.
-    pub fn get_oopspec(&self, target: &CallTarget) -> Option<&str> {
+    pub fn get_oopspec(&self, target: &CallTarget) -> Option<String> {
         self.target_func_effects(target)
-            .and_then(|f| f.oopspec.as_deref())
+            .and_then(|f| f.oopspec.clone())
     }
 
     /// `support.py argnames = ll_func.__code__.co_varnames[:nb_args]` —
@@ -6721,9 +7727,9 @@ impl CallControl {
     /// Per-target argname lookup paired with `get_oopspec`.  Returns
     /// `None` when the target has no registered argname list
     /// (the dominant case today).
-    pub fn get_oopspec_argnames(&self, target: &CallTarget) -> Option<&[String]> {
+    pub fn get_oopspec_argnames(&self, target: &CallTarget) -> Option<Vec<String>> {
         self.target_func_effects(target)
-            .map(|f| f.oopspec_argnames.as_slice())
+            .map(|f| f.oopspec_argnames.clone())
             .filter(|names| !names.is_empty())
     }
 
@@ -6806,7 +7812,7 @@ impl CallControl {
                                 .insert(segmented.clone());
                             let bucket = if self.function_graphs.contains_key(&path) {
                                 &mut census.with_graph
-                            } else if self.external_funcobjs.contains_key(&path) {
+                            } else if self.external_funcobj(&path).is_some() {
                                 &mut census.declared_external
                             } else {
                                 &mut census.unknown
@@ -6828,13 +7834,14 @@ impl CallControl {
         }
         // Index every registered graph path by its leaf segment once, rather
         // than rescanning `function_graphs` per declaration.
+        let all_graphs = self.function_graphs.iter();
         let mut graphs_by_leaf: HashMap<&str, Vec<(&CallPath, &FunctionGraph)>> = HashMap::new();
-        for (path, graph) in self.function_graphs.iter() {
+        for (path, graph) in &all_graphs {
             if let Some(leaf) = path.segments.last() {
                 graphs_by_leaf
                     .entry(leaf.as_str())
                     .or_default()
-                    .push((path, graph));
+                    .push((path, &**graph));
             }
         }
         let mut declared: Vec<DeclaredExternalKey> = self
@@ -6890,8 +7897,10 @@ impl CallControl {
     // The five `analyze_*` methods below walk
     // `crate::model::FunctionGraph` (the flat codewriter graph), inlining
     // the generic `GraphAnalyzer.analyze_direct_call` traversal
-    // (`graphanalyze.py`) into each per-analysis body with a
-    // bottom-on-cycle `seen` guard. The orthodox versions are
+    // (`graphanalyze.py`) into each per-analysis body. Each body enters
+    // and leaves the analyzer's `DependencyTracker` against that analyzer's
+    // `_analyzed_calls` (`AnalysisCache`), so a verdict outlives the query
+    // that computed it. The orthodox versions are
     // ported over the flowspace graph model: `RaiseAnalyzer`
     // (`backendopt/canraise.rs`), `CollectAnalyzer`
     // (`backendopt/collectanalyze.rs`), and the shared `GraphAnalyzer`
@@ -6914,135 +7923,147 @@ impl CallControl {
     fn analyze_can_raise_impl(
         &self,
         path: &CallPath,
-        seen: &mut HashSet<CallPath>,
+        seen: &mut CallTracker,
+        analyzed: &mut AnalyzedCalls,
         ignore_memoryerror: bool,
     ) -> bool {
-        if !seen.insert(path.clone()) {
-            return false; // cycle → bottom_result
-        }
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             // `canraise.py analyze_external_call`: getattr(fnobj, 'canraise', True)
             None => {
                 return self
-                    .external_funcobjs
-                    .get(path)
+                    .external_funcobj(path)
                     .map(|funcobj| funcobj.canraise)
                     .unwrap_or(true);
             }
         };
-        for block in &graph.blocks {
-            // RPython: analyze_simple_operation(op) per operation.
-            // canraise.py: LL_OPERATIONS[op.opname].canraise
-            for op in &block.operations {
-                let op_result = match &op.kind {
-                    OpKind::Call { target, .. } => {
-                        let callee_path = match self.target_to_path(target) {
-                            Some(p) => p,
-                            None => return true, // unresolvable → conservative
-                        };
-                        self.analyze_can_raise_impl(&callee_path, seen, ignore_memoryerror)
-                    }
-                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => true, // graphanalyze.py → top_result()
-                        Some(graphs) => {
-                            for callee_path in graphs {
-                                if self.analyze_can_raise_impl(
+        if !seen.enter(path.clone(), analyzed) {
+            return seen.get_cached_result(path.clone(), analyzed);
+        }
+        let result = 'walk: {
+            for block in &graph.blocks {
+                // RPython: analyze_simple_operation(op) per operation.
+                // canraise.py: LL_OPERATIONS[op.opname].canraise
+                for op in &block.operations {
+                    let op_result = match &op.kind {
+                        OpKind::Call { target, .. } => {
+                            let callee_path = match self.target_to_path(target) {
+                                Some(p) => p,
+                                None => break 'walk true, // unresolvable → conservative
+                            };
+                            self.analyze_can_raise_impl(
+                                &callee_path,
+                                seen,
+                                analyzed,
+                                ignore_memoryerror,
+                            )
+                        }
+                        OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                            None => true, // graphanalyze.py → top_result()
+                            Some(graphs) => graphs.iter().any(|callee_path| {
+                                self.analyze_can_raise_impl(
                                     callee_path,
                                     seen,
+                                    analyzed,
                                     ignore_memoryerror,
-                                ) {
-                                    return true;
-                                }
-                            }
-                            false
-                        }
-                    },
-                    other => raise_class_can_raise(op_can_raise(other), ignore_memoryerror),
-                };
-                if op_result {
-                    return true;
+                                )
+                            }),
+                        },
+                        other => raise_class_can_raise(op_can_raise(other), ignore_memoryerror),
+                    };
+                    if op_result {
+                        break 'walk true;
+                    }
                 }
             }
-        }
-        // RPython `backendopt/canraise.py analyze_exceptblock_in_graph`
-        // only applies the re-raise suppression in the ignore-MemoryError
-        // analyzer. The normal analyzer always treats exceptblock exits as
-        // raising.
-        if graph
-            .blocks
-            .iter()
-            .flat_map(|block| block.exits.iter())
-            .any(|link| link.target == graph.exceptblock)
-        {
-            if ignore_memoryerror && exceptblock_is_reraise_of_caught_exception(graph) {
-                return false;
-            }
-            return true;
-        }
-        false
+            // RPython `backendopt/canraise.py analyze_exceptblock_in_graph`
+            // only applies the re-raise suppression in the ignore-MemoryError
+            // analyzer. The normal analyzer always treats exceptblock exits as
+            // raising.
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.exits.iter())
+                .any(|link| link.target == graph.exceptblock)
+                && !(ignore_memoryerror && exceptblock_is_reraise_of_caught_exception(&graph))
+        };
+        seen.leave_with(path.clone(), result, analyzed);
+        result
     }
 
     /// RPython: VirtualizableAnalyzer.analyze() (effectinfo.py).
     ///
     /// analyze_simple_operation: op.opname in ('jit_force_virtualizable',
     ///                                         'jit_force_virtual')
-    fn analyze_forces_virtualizable(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
-        if !seen.insert(path.clone()) {
-            return false;
-        }
+    fn analyze_forces_virtualizable(
+        &self,
+        path: &CallPath,
+        seen: &mut CallTracker,
+        analyzed: &mut AnalyzedCalls,
+    ) -> bool {
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             // RPython: external call → analyze_external_call → bottom_result (False).
             // VirtualizableAnalyzer does not override analyze_external_call.
             None => return false,
         };
-        for block in &graph.blocks {
-            for op in &block.operations {
-                match &op.kind {
-                    // RPython: jit_force_virtualizable / jit_force_virtual
-                    // The analyzer runs over the rtyped graph, before
-                    // `jtransform.rewrite_op_jit_force_virtualizable` deletes
-                    // this marker from looked-inside code.  Match the upstream
-                    // opname leaf directly; `VableForce` is retained only for
-                    // already-transformed compatibility graphs.
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        ..
-                    } if segments.last().is_some_and(|leaf| {
-                        matches!(
-                            leaf.as_str(),
-                            "jit_force_virtualizable" | "jit_force_virtual"
-                        )
-                    }) =>
-                    {
-                        return true;
-                    }
-                    OpKind::VableForce { .. } => return true,
-                    OpKind::Call { target, .. } => {
-                        let callee_path = match self.target_to_path(target) {
-                            Some(p) => p,
-                            None => continue, // external call → False
-                        };
-                        if self.analyze_forces_virtualizable(&callee_path, seen) {
-                            return true;
+        if !seen.enter(path.clone(), analyzed) {
+            return seen.get_cached_result(path.clone(), analyzed);
+        }
+        let result = 'walk: {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    match &op.kind {
+                        // RPython: jit_force_virtualizable / jit_force_virtual
+                        // The analyzer runs over the rtyped graph, before
+                        // `jtransform.rewrite_op_jit_force_virtualizable` deletes
+                        // this marker from looked-inside code.  Match the upstream
+                        // opname leaf directly; `VableForce` is retained only for
+                        // already-transformed compatibility graphs.
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.last().is_some_and(|leaf| {
+                            matches!(
+                                leaf.as_str(),
+                                "jit_force_virtualizable" | "jit_force_virtual"
+                            )
+                        }) =>
+                        {
+                            break 'walk true;
                         }
-                    }
-                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => return true, // BoolGraphAnalyzer.top_result()
-                        Some(graphs) => {
-                            for callee_path in graphs {
-                                if self.analyze_forces_virtualizable(callee_path, seen) {
-                                    return true;
-                                }
+                        OpKind::VableForce { .. } => break 'walk true,
+                        OpKind::Call { target, .. } => {
+                            let callee_path = match self.target_to_path(target) {
+                                Some(p) => p,
+                                None => continue, // external call → False
+                            };
+                            if self.analyze_forces_virtualizable(&callee_path, seen, analyzed) {
+                                break 'walk true;
                             }
                         }
-                    },
-                    _ => {}
+                        OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                            None => break 'walk true, // BoolGraphAnalyzer.top_result()
+                            Some(graphs) => {
+                                for callee_path in graphs {
+                                    if self.analyze_forces_virtualizable(
+                                        callee_path,
+                                        seen,
+                                        analyzed,
+                                    ) {
+                                        break 'walk true;
+                                    }
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
                 }
             }
-        }
-        false
+            false
+        };
+        seen.leave_with(path.clone(), result, analyzed);
+        result
     }
 
     /// RPython: RandomEffectsAnalyzer.analyze() (effectinfo.py).
@@ -7065,51 +8086,59 @@ impl CallControl {
     /// In majit: functions without graphs are external calls — returns
     /// True if the external funcobj has `random_effects_on_gcobjs`, False
     /// otherwise.
-    fn analyze_random_effects(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
-        if !seen.insert(path.clone()) {
-            return false; // cycle → bottom_result
-        }
+    fn analyze_random_effects(
+        &self,
+        path: &CallPath,
+        seen: &mut CallTracker,
+        analyzed: &mut AnalyzedCalls,
+    ) -> bool {
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             None => {
                 // RPython: analyze_external_call → bottom_result (False)
                 // unless funcobj.random_effects_on_gcobjs → True.
                 return self
-                    .external_funcobjs
-                    .get(path)
+                    .external_funcobj(path)
                     .is_some_and(|f| f.random_effects_on_gcobjs);
             }
         };
+        if !seen.enter(path.clone(), analyzed) {
+            return seen.get_cached_result(path.clone(), analyzed);
+        }
         // RPython: analyze_simple_operation always returns False.
         // Only recursive calls into graphs can propagate random effects.
-        for block in &graph.blocks {
-            for op in &block.operations {
-                match &op.kind {
-                    OpKind::Call { target, .. } => {
-                        let callee_path = match self.target_to_path(target) {
-                            Some(p) => p,
-                            // Unresolvable target = external call → False
-                            None => continue,
-                        };
-                        if self.analyze_random_effects(&callee_path, seen) {
-                            return true;
-                        }
-                    }
-                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => return true, // BoolGraphAnalyzer.top_result()
-                        Some(graphs) => {
-                            for callee_path in graphs {
-                                if self.analyze_random_effects(callee_path, seen) {
-                                    return true;
-                                }
+        let result = 'walk: {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    match &op.kind {
+                        OpKind::Call { target, .. } => {
+                            let callee_path = match self.target_to_path(target) {
+                                Some(p) => p,
+                                // Unresolvable target = external call → False
+                                None => continue,
+                            };
+                            if self.analyze_random_effects(&callee_path, seen, analyzed) {
+                                break 'walk true;
                             }
                         }
-                    },
-                    _ => {}
+                        OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                            None => break 'walk true, // BoolGraphAnalyzer.top_result()
+                            Some(graphs) => {
+                                for callee_path in graphs {
+                                    if self.analyze_random_effects(callee_path, seen, analyzed) {
+                                        break 'walk true;
+                                    }
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
                 }
             }
-        }
-        false
+            false
+        };
+        seen.leave_with(path.clone(), result, analyzed);
+        result
     }
 
     /// RPython: `GraphAnalyzer.explain_analyze_slowly` (graphanalyze.py)
@@ -7152,8 +8181,7 @@ impl CallControl {
                 // `random_effects_on_gcobjs` external is a witness.
                 let reached = witness == EffectWitness::RandomEffects
                     && self
-                        .external_funcobjs
-                        .get(path)
+                        .external_funcobj(path)
                         .is_some_and(|funcobj| funcobj.random_effects_on_gcobjs);
                 if reached {
                     chain.push(format!("{name} is external with random_effects_on_gcobjs"));
@@ -7239,43 +8267,52 @@ impl CallControl {
     /// In majit: we don't have quasi-immutable ops in the model yet,
     /// so this always returns false. The transitive call check is still
     /// performed for future-proofing.
-    fn analyze_can_invalidate(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
-        if !seen.insert(path.clone()) {
-            return false;
-        }
+    fn analyze_can_invalidate(
+        &self,
+        path: &CallPath,
+        seen: &mut CallTracker,
+        analyzed: &mut AnalyzedCalls,
+    ) -> bool {
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             None => return false, // no graph → cannot invalidate (not conservative here)
         };
-        for block in &graph.blocks {
-            for op in &block.operations {
-                // RPython: jit_force_quasi_immutable → true
-                // majit: no such op yet, but check calls transitively
-                match &op.kind {
-                    OpKind::Call { target, .. } => {
-                        let callee_path = match self.target_to_path(target) {
-                            Some(p) => p,
-                            None => continue,
-                        };
-                        if self.analyze_can_invalidate(&callee_path, seen) {
-                            return true;
-                        }
-                    }
-                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => return true, // BoolGraphAnalyzer.top_result()
-                        Some(graphs) => {
-                            for callee_path in graphs {
-                                if self.analyze_can_invalidate(callee_path, seen) {
-                                    return true;
-                                }
+        if !seen.enter(path.clone(), analyzed) {
+            return seen.get_cached_result(path.clone(), analyzed);
+        }
+        let result = 'walk: {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    // RPython: jit_force_quasi_immutable → true
+                    // majit: no such op yet, but check calls transitively
+                    match &op.kind {
+                        OpKind::Call { target, .. } => {
+                            let callee_path = match self.target_to_path(target) {
+                                Some(p) => p,
+                                None => continue,
+                            };
+                            if self.analyze_can_invalidate(&callee_path, seen, analyzed) {
+                                break 'walk true;
                             }
                         }
-                    },
-                    _ => {}
+                        OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                            None => break 'walk true, // BoolGraphAnalyzer.top_result()
+                            Some(graphs) => {
+                                for callee_path in graphs {
+                                    if self.analyze_can_invalidate(callee_path, seen, analyzed) {
+                                        break 'walk true;
+                                    }
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
                 }
             }
-        }
-        false
+            false
+        };
+        seen.leave_with(path.clone(), result, analyzed);
+        result
     }
 
     /// RPython: CollectAnalyzer (collectanalyze.py).
@@ -7292,10 +8329,12 @@ impl CallControl {
     /// - analyze_external_call (graphanalyze.py): bottom_result() (False).
     /// - _gctransformer_hint_cannot_collect_ (collectanalyze.py):
     ///   functions whose `func.cannot_collect` is set are known not to collect.
-    fn analyze_can_collect(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
-        if !seen.insert(path.clone()) {
-            return false;
-        }
+    fn analyze_can_collect(
+        &self,
+        path: &CallPath,
+        seen: &mut CallTracker,
+        analyzed: &mut AnalyzedCalls,
+    ) -> bool {
         // collectanalyze.py:15: _gctransformer_hint_cannot_collect_ → False
         if self.func_effects(path).is_some_and(|f| f.cannot_collect) {
             return false;
@@ -7320,59 +8359,65 @@ impl CallControl {
                 // `RandomEffectsAnalyzer.analyze_simple_operation` does
                 // (effectinfo.py).
                 return self
-                    .external_funcobjs
-                    .get(path)
+                    .external_funcobj(path)
                     .is_some_and(|f| f.random_effects_on_gcobjs || f.canmallocgc);
             }
         };
-        for block in &graph.blocks {
-            for op in &block.operations {
-                // collectanalyze.py: analyze_simple_operation
-                // RPython checks: malloc/malloc_varsize with flavor='gc' → True
-                //                 LL_OPERATIONS[op.opname].canmallocgc → True
-                match &op.kind {
-                    // collectanalyze.py — `malloc` / `malloc_varsize`
-                    // with `flavor='gc'`. These four variants are that
-                    // operation on this side of jtransform: `New` and
-                    // `NewWithVtable` are `malloc(GcStruct, flavor='gc')`
-                    // (`rewrite_op_malloc`, jtransform.py),
-                    // `NewArrayClear` is `new_array_clear`
-                    // (jtransform.py), and `NewListClear` allocates
-                    // a GcStruct plus a cleared items array
-                    // (pyjitpl.py opimpl_newlist_clear). This graph model carries no
-                    // `flavor='raw'` allocation, so there is no flavour test
-                    // to make — every allocation op here is a GC one.
-                    OpKind::New { .. }
-                    | OpKind::NewWithVtable { .. }
-                    | OpKind::NewArray { .. }
-                    | OpKind::NewArrayClear { .. }
-                    | OpKind::NewListClear { .. } => return true,
-                    OpKind::Call { target, .. } => {
-                        // graphanalyze.py: analyze_direct_call — recurse
-                        let callee_path = match self.target_to_path(target) {
-                            Some(p) => p,
-                            // graphanalyze.py: external call → bottom_result (False)
-                            None => continue,
-                        };
-                        if self.analyze_can_collect(&callee_path, seen) {
-                            return true;
-                        }
-                    }
-                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => return true, // BoolGraphAnalyzer.top_result()
-                        Some(graphs) => {
-                            for callee_path in graphs {
-                                if self.analyze_can_collect(callee_path, seen) {
-                                    return true;
-                                }
+        if !seen.enter(path.clone(), analyzed) {
+            return seen.get_cached_result(path.clone(), analyzed);
+        }
+        let result = 'walk: {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    // collectanalyze.py: analyze_simple_operation
+                    // RPython checks: malloc/malloc_varsize with flavor='gc' → True
+                    //                 LL_OPERATIONS[op.opname].canmallocgc → True
+                    match &op.kind {
+                        // collectanalyze.py — `malloc` / `malloc_varsize`
+                        // with `flavor='gc'`. These four variants are that
+                        // operation on this side of jtransform: `New` and
+                        // `NewWithVtable` are `malloc(GcStruct, flavor='gc')`
+                        // (`rewrite_op_malloc`, jtransform.py),
+                        // `NewArrayClear` is `new_array_clear`
+                        // (jtransform.py), and `NewListClear` allocates
+                        // a GcStruct plus a cleared items array
+                        // (pyjitpl.py opimpl_newlist_clear). This graph model carries no
+                        // `flavor='raw'` allocation, so there is no flavour test
+                        // to make — every allocation op here is a GC one.
+                        OpKind::New { .. }
+                        | OpKind::NewWithVtable { .. }
+                        | OpKind::NewArray { .. }
+                        | OpKind::NewArrayClear { .. }
+                        | OpKind::NewListClear { .. } => break 'walk true,
+                        OpKind::Call { target, .. } => {
+                            // graphanalyze.py: analyze_direct_call — recurse
+                            let callee_path = match self.target_to_path(target) {
+                                Some(p) => p,
+                                // graphanalyze.py: external call → bottom_result (False)
+                                None => continue,
+                            };
+                            if self.analyze_can_collect(&callee_path, seen, analyzed) {
+                                break 'walk true;
                             }
                         }
-                    },
-                    _ => {}
+                        OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                            None => break 'walk true, // BoolGraphAnalyzer.top_result()
+                            Some(graphs) => {
+                                for callee_path in graphs {
+                                    if self.analyze_can_collect(callee_path, seen, analyzed) {
+                                        break 'walk true;
+                                    }
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
                 }
             }
-        }
-        false
+            false
+        };
+        seen.leave_with(path.clone(), result, analyzed);
+        result
     }
 
     /// Cached version of _canraise for a CallTarget.
@@ -7380,22 +8425,19 @@ impl CallControl {
     /// RPython call.py — `_canraise()` returns the tri-state
     /// `{False, "mem", True}` collapsed here to [`CanRaise`].
     fn cached_can_raise_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> CanRaise {
-        if let Some(&result) = cache.can_raise.get(path) {
-            return result;
-        }
-        let mut seen = HashSet::new();
-        let result = if !self.analyze_can_raise_impl(path, &mut seen, false) {
+        if !self.analyze_can_raise_impl(path, &mut CallTracker::new(), &mut cache.can_raise, false)
+        {
             CanRaise::No
+        } else if self.analyze_can_raise_impl(
+            path,
+            &mut CallTracker::new(),
+            &mut cache.can_raise_ignore_memoryerror,
+            true,
+        ) {
+            CanRaise::Yes
         } else {
-            let mut seen_ignore_memoryerror = HashSet::new();
-            if self.analyze_can_raise_impl(path, &mut seen_ignore_memoryerror, true) {
-                CanRaise::Yes
-            } else {
-                CanRaise::MemoryErrorOnly
-            }
-        };
-        cache.can_raise.insert(path.clone(), result);
-        result
+            CanRaise::MemoryErrorOnly
+        }
     }
 
     fn cached_can_raise(&self, target: &CallTarget, cache: &mut AnalysisCache) -> CanRaise {
@@ -7429,13 +8471,11 @@ impl CallControl {
     /// Cached version of analyze_forces_virtualizable for a CallTarget.
     /// RPython: VirtualizableAnalyzer external calls → bottom_result (False).
     fn cached_forces_virtualizable_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.forces_virtualizable.get(path) {
-            return result;
-        }
-        let mut seen = HashSet::new();
-        let result = self.analyze_forces_virtualizable(path, &mut seen);
-        cache.forces_virtualizable.insert(path.clone(), result);
-        result
+        self.analyze_forces_virtualizable(
+            path,
+            &mut CallTracker::new(),
+            &mut cache.forces_virtualizable,
+        )
     }
 
     fn cached_forces_virtualizable(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
@@ -7463,13 +8503,7 @@ impl CallControl {
     /// Cached version of analyze_random_effects for a CallTarget.
     /// RPython: RandomEffectsAnalyzer defaults to False for external calls.
     fn cached_random_effects_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.random_effects.get(path) {
-            return result;
-        }
-        let mut seen = HashSet::new();
-        let result = self.analyze_random_effects(path, &mut seen);
-        cache.random_effects.insert(path.clone(), result);
-        result
+        self.analyze_random_effects(path, &mut CallTracker::new(), &mut cache.random_effects)
     }
 
     fn cached_random_effects(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
@@ -7496,13 +8530,7 @@ impl CallControl {
 
     /// Cached version of analyze_can_invalidate for a CallTarget.
     fn cached_can_invalidate_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.can_invalidate.get(path) {
-            return result;
-        }
-        let mut seen = HashSet::new();
-        let result = self.analyze_can_invalidate(path, &mut seen);
-        cache.can_invalidate.insert(path.clone(), result);
-        result
+        self.analyze_can_invalidate(path, &mut CallTracker::new(), &mut cache.can_invalidate)
     }
 
     fn cached_can_invalidate(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
@@ -7531,13 +8559,7 @@ impl CallControl {
     /// RPython: collect_analyzer.analyze(op, self.seen_gc) (collectanalyze.py).
     /// graphanalyze.py: analyze_external_call → bottom_result() (False).
     fn cached_can_collect_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.can_collect.get(path) {
-            return result;
-        }
-        let mut seen = HashSet::new();
-        let result = self.analyze_can_collect(path, &mut seen);
-        cache.can_collect.insert(path.clone(), result);
-        result
+        self.analyze_can_collect(path, &mut CallTracker::new(), &mut cache.can_collect)
     }
 
     fn cached_can_collect(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
@@ -7702,7 +8724,7 @@ impl CallControl {
                 // upstream's hard-fail semantics.
                 if let Some((_, graph)) = self.target_to_path_and_graph(target) {
                     {
-                        let expected_arg_types = graph_non_void_arg_types(graph);
+                        let expected_arg_types = graph_non_void_arg_types(&graph);
                         // RPython call.py:223-228 compares the full
                         // `concretetype` list. Pyre's caller-side
                         // `arg_types` comes from `resolve_non_void_arg_types`
@@ -7797,7 +8819,7 @@ impl CallControl {
                     .flatten()
                     .find_map(|path| self.function_graphs.get(path).map(|g| (path, g)))
                 {
-                    let expected_arg_types = graph_non_void_arg_types(witness_graph);
+                    let expected_arg_types = graph_non_void_arg_types(&witness_graph);
                     if arg_types != expected_arg_types {
                         panic!(
                             "indirect_call in family including {witness_path:?}: \
@@ -7981,15 +9003,8 @@ impl CallControl {
             ),
         };
         let effects = match shape {
-            CallShape::Direct(target) => {
-                analyze_readwrite(target, &self.function_graphs, self, &self.descr_indices)
-            }
-            CallShape::Indirect(graphs) => analyze_readwrite_indirect_family(
-                graphs,
-                &self.function_graphs,
-                self,
-                &self.descr_indices,
-            ),
+            CallShape::Direct(target) => self.cached_readwrite(target, cache),
+            CallShape::Indirect(graphs) => self.cached_readwrite_family(graphs, cache),
         };
         let can_collect = match shape {
             CallShape::Direct(target) => self.cached_can_collect(target, cache),
@@ -8006,7 +9021,7 @@ impl CallControl {
             CallShape::Indirect(_) => EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
         };
         let effectinfo = effectinfo_from_writeanalyze(
-            effects,
+            &effects,
             extraeffect,
             oopspecindex,
             can_invalidate,
@@ -8097,91 +9112,288 @@ impl Default for CallControl {
     }
 }
 
-// ── readwrite_analyzer / collect_analyzer (effectinfo.py effectinfo_from_writeanalyze) ──
+// ── readwrite_analyzer (writeanalyze.py ReadWriteAnalyzer) ──
 //
 // RPython: self.readwrite_analyzer.analyze(op, self.seen_rw) → effects
-// RPython: self.collect_analyzer.analyze(op, self.seen_gc) → can_collect
 // Then: effectinfo_from_writeanalyze(effects, cpu, ..., can_collect)
 
-/// RPython: readwrite_analyzer.analyze(op, self.seen_rw).
-///
-/// Traverses the call graph to collect read/write effects as a WriteAnalysis.
-/// This is the Rust equivalent of RPython's ReadWriteAnalyzer producing a
-/// set of ("struct"/"array"/"interiorfield", T, fieldname) tuples.
-/// Each graph's local ops are scanned once; every query still walks the
-/// closure so descr-mint side effects match a fresh seen-set DFS.
-fn analyze_readwrite(
-    target: &CallTarget,
-    function_graphs: &GraphStore,
-    cc: &CallControl,
-    descr_indices: &DescrIndexRegistry,
-) -> WriteAnalysis {
-    let Some(path) = cc.target_to_path(target) else {
-        return WriteAnalysis::bottom_result();
-    };
-    let mut analysis = WriteAnalysis::bottom_result();
-    let mut minted = MintedDescrs::default();
-    let mut seen = HashSet::new();
-    let mut is_top = false;
-    apply_readwrite_replay(
-        &path,
-        function_graphs,
-        cc,
-        descr_indices,
-        &mut seen,
-        &mut analysis,
-        &mut minted,
-        &mut is_top,
-    );
-    analysis.is_top = is_top;
-    analysis
-}
-
-/// RPython `readwrite_analyzer.analyze(op, seen)` for `indirect_call`.
-///
-/// Unknown families (`graphs=None`) are `top_set`; known families are the
-/// union of every member graph's effects (`analyze_indirect_call`).
-fn analyze_readwrite_indirect_family(
-    graphs: Option<&[CallPath]>,
-    function_graphs: &GraphStore,
-    cc: &CallControl,
-    descr_indices: &DescrIndexRegistry,
-) -> WriteAnalysis {
-    let Some(graphs) = graphs else {
-        return WriteAnalysis::top_result();
-    };
-    let mut analysis = WriteAnalysis::bottom_result();
-    let mut minted = MintedDescrs::default();
-    let mut seen = HashSet::new();
-    let mut is_top = false;
-    for path in graphs {
-        apply_readwrite_replay(
-            path,
-            function_graphs,
-            cc,
-            descr_indices,
-            &mut seen,
-            &mut analysis,
-            &mut minted,
-            &mut is_top,
-        );
-        if is_top {
-            break;
+impl CallControl {
+    /// `readwrite_analyzer.analyze(op, self.seen_rw)` (`call.py`
+    /// `getcalldescr`) for a `direct_call`.
+    fn cached_readwrite(&self, target: &CallTarget, cache: &mut AnalysisCache) -> ReadWriteEffects {
+        match self.target_to_path(target) {
+            Some(path) => {
+                self.analyze_readwrite(&path, &mut ReadWriteTracker::new(), &mut cache.readwrite)
+            }
+            None => ReadWriteEffects::bottom_result(),
         }
     }
-    analysis.is_top = is_top;
-    analysis
-}
 
-//
-// In RPython, the ReadWriteAnalyzer produces a set of tuples like:
-//   ("struct", T, fieldname), ("readstruct", T, fieldname),
-//   ("array", T), ("readarray", T), etc.
-// These are converted to field/array descriptor bitsets.
-//
-// In majit, we scan the callee graph's ops directly for
-// FieldRead/FieldWrite/ArrayRead/ArrayWrite and collect their
-// descriptor indices into EffectInfo's bitset fields.
+    /// `readwrite_analyzer.analyze(op, self.seen_rw)` for an
+    /// `indirect_call`: `graphs is None` is `top_result()`.
+    fn cached_readwrite_family(
+        &self,
+        graphs: Option<&[CallPath]>,
+        cache: &mut AnalysisCache,
+    ) -> ReadWriteEffects {
+        match graphs {
+            Some(graphs) => self.analyze_readwrite_indirect(
+                graphs,
+                &mut ReadWriteTracker::new(),
+                &mut cache.readwrite,
+            ),
+            None => ReadWriteEffects::top_result(),
+        }
+    }
+
+    /// `analyze_direct_call(graph, seen)` (graphanalyze.py) of the
+    /// read/write analyzer.
+    fn analyze_readwrite(
+        &self,
+        path: &CallPath,
+        seen: &mut ReadWriteTracker,
+        analyzed: &mut ReadWriteAnalyzedCalls,
+    ) -> ReadWriteEffects {
+        // `analyze_external_call`: a funcobj without a graph has no
+        // `_callbacks` here, so `bottom_result()`.
+        let (Some(key), Some(graph)) = (
+            self.function_graphs.key_for(path),
+            self.function_graphs.get(path),
+        ) else {
+            return ReadWriteEffects::bottom_result();
+        };
+        if !seen.enter(key.clone(), analyzed) {
+            return seen.get_cached_result(key, analyzed);
+        }
+        let graphinfo = ReadWriteGraphInfo::new(&graph);
+        let mut result = ReadWriteEffects::result_builder();
+        'blocks: for block in &graph.blocks {
+            for op in &block.operations {
+                // graphanalyze.py `analyze(op, seen, graphinfo)`.
+                let effects = match &op.kind {
+                    OpKind::Call { target, .. } => match self.target_to_path(target) {
+                        Some(callee) => self.analyze_readwrite(&callee, seen, analyzed),
+                        None => ReadWriteEffects::bottom_result(),
+                    },
+                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                        Some(graphs) => self.analyze_readwrite_indirect(graphs, seen, analyzed),
+                        None => ReadWriteEffects::top_result(),
+                    },
+                    kind => self.readwrite_simple_operation(kind, &graphinfo),
+                };
+                result = ReadWriteEffects::add_to_result(result, effects);
+                if ReadWriteEffects::is_top_result(&result) {
+                    break 'blocks;
+                }
+            }
+        }
+        let result = ReadWriteEffects::finalize_builder(result);
+        seen.leave_with(key, result.clone(), analyzed);
+        result
+    }
+
+    /// `analyze_indirect_call(graphs, seen)` (graphanalyze.py).
+    fn analyze_readwrite_indirect(
+        &self,
+        graphs: &[CallPath],
+        seen: &mut ReadWriteTracker,
+        analyzed: &mut ReadWriteAnalyzedCalls,
+    ) -> ReadWriteEffects {
+        let mut result = ReadWriteEffects::result_builder();
+        for graph in graphs {
+            result = ReadWriteEffects::add_to_result(
+                result,
+                self.analyze_readwrite(graph, seen, analyzed),
+            );
+            if ReadWriteEffects::is_top_result(&result) {
+                break;
+            }
+        }
+        ReadWriteEffects::finalize_builder(result)
+    }
+
+    /// `ReadWriteAnalyzer.analyze_simple_operation` (writeanalyze.py),
+    /// with the write half of `WriteAnalyzer.analyze_simple_operation`.
+    fn readwrite_simple_operation(
+        &self,
+        kind: &OpKind,
+        graphinfo: &ReadWriteGraphInfo,
+    ) -> ReadWriteEffects {
+        // A write into an object this graph allocated is not an effect.
+        if let OpKind::FieldWrite { base, .. }
+        | OpKind::ArrayWrite { base, .. }
+        | OpKind::InteriorFieldWrite { base, .. } = kind
+            && graphinfo.fresh_mallocs.is_fresh_malloc(base)
+        {
+            return ReadWriteEffects::bottom_result();
+        }
+        match kind {
+            // `getfield` / `setfield`.
+            OpKind::FieldRead { field, .. } => {
+                self.readwrite_struct_result(RwTag::ReadStruct, field)
+            }
+            OpKind::FieldWrite { field, .. } => self.readwrite_struct_result(RwTag::Struct, field),
+            // `getarrayitem` / `setarrayitem`.
+            OpKind::ArrayRead {
+                base,
+                item_ty,
+                array_type_id,
+                nolength,
+                ..
+            } => self.readwrite_array_result(
+                RwTag::ReadArray,
+                base,
+                item_ty,
+                array_type_id,
+                *nolength,
+                graphinfo,
+            ),
+            OpKind::ArrayWrite {
+                base,
+                item_ty,
+                array_type_id,
+                nolength,
+                ..
+            } => self.readwrite_array_result(
+                RwTag::Array,
+                base,
+                item_ty,
+                array_type_id,
+                *nolength,
+                graphinfo,
+            ),
+            // `getinteriorfield` / `setinteriorfield`.
+            OpKind::InteriorFieldRead {
+                base,
+                field,
+                array_type_id,
+                ..
+            } => self.readwrite_interiorfield_result(
+                RwTag::ReadInteriorField,
+                base,
+                &field.name,
+                array_type_id,
+                graphinfo,
+            ),
+            OpKind::InteriorFieldWrite {
+                base,
+                field,
+                array_type_id,
+                ..
+            } => self.readwrite_interiorfield_result(
+                RwTag::InteriorField,
+                base,
+                &field.name,
+                array_type_id,
+                graphinfo,
+            ),
+            _ => ReadWriteEffects::bottom_result(),
+        }
+    }
+
+    /// `frozenset([(tag, op.args[0].concretetype, op.args[1].value)])`.
+    fn readwrite_struct_result(
+        &self,
+        tag: RwTag,
+        field: &crate::model::FieldDescriptor,
+    ) -> ReadWriteEffects {
+        let index = self
+            .descr_indices
+            .field_index(&field.owner_root, &field.name);
+        ReadWriteEffects::singleton(
+            RwKey {
+                tag,
+                index,
+                owner_id: field.owner_id,
+            },
+            RwOperand::Field {
+                owner_root: field.owner_root.clone(),
+                owner_id: field.owner_id,
+                name: field.name.clone(),
+            },
+        )
+    }
+
+    /// `_array_result(op.args[0].concretetype)`.
+    fn readwrite_array_result(
+        &self,
+        tag: RwTag,
+        base: &crate::flowspace::model::Variable,
+        item_ty: &crate::model::ValueType,
+        array_type_id: &Option<String>,
+        nolength: bool,
+        graphinfo: &ReadWriteGraphInfo,
+    ) -> ReadWriteEffects {
+        let resolved_id = resolve_array_identity(
+            base,
+            array_type_id,
+            &graphinfo.value_producers,
+            &graphinfo.phi_sources,
+            self,
+        )
+        .or_else(|| array_type_id.clone());
+        let headerless =
+            nolength || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
+        let len_offset = if headerless { None } else { Some(0) };
+        let index = self.descr_indices.array_index(
+            value_type_discriminant(item_ty),
+            &resolved_id,
+            len_offset,
+        );
+        ReadWriteEffects::singleton(
+            RwKey {
+                tag,
+                index,
+                owner_id: None,
+            },
+            RwOperand::Array {
+                array_type_id: resolved_id,
+                ir_type: effect_array_ir_type(item_ty),
+                len_offset,
+            },
+        )
+    }
+
+    /// `_interiorfield_result(op.args[0].concretetype, name)`.
+    fn readwrite_interiorfield_result(
+        &self,
+        tag: RwTag,
+        base: &crate::flowspace::model::Variable,
+        field_name: &str,
+        array_type_id: &Option<String>,
+        graphinfo: &ReadWriteGraphInfo,
+    ) -> ReadWriteEffects {
+        let resolved_id = resolve_array_identity(
+            base,
+            array_type_id,
+            &graphinfo.value_producers,
+            &graphinfo.phi_sources,
+            self,
+        )
+        .or_else(|| array_type_id.clone());
+        let len_offset =
+            if crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref()) {
+                None
+            } else {
+                Some(0)
+            };
+        let index = self
+            .descr_indices
+            .interiorfield_index(&resolved_id, field_name);
+        ReadWriteEffects::singleton(
+            RwKey {
+                tag,
+                index,
+                owner_id: None,
+            },
+            RwOperand::InteriorField {
+                array_type_id: resolved_id,
+                field_name: field_name.to_string(),
+                len_offset,
+            },
+        )
+    }
+}
 
 /// `effectinfo.py` `effectinfo_from_writeanalyze`: a top set or
 /// `EF_RANDOM_EFFECTS` keeps every descr list `None` and forces
@@ -8266,58 +9478,252 @@ fn canonicalize_keyed_descrs(
     Some((descrs, keys))
 }
 
+/// `add_struct` (`effectinfo.py`): `cpu.fielddescrof(T, fieldname)`.
+fn add_struct(
+    indices: &mut Vec<u32>,
+    descrs: &mut Vec<EffectDescr>,
+    index: u32,
+    operand: &RwOperand,
+    cc: &CallControl,
+) {
+    let RwOperand::Field {
+        owner_root,
+        owner_id,
+        name,
+    } = operand
+    else {
+        unreachable!("struct effect {operand:?} carries no field");
+    };
+    indices.push(index);
+    if let Some(owner) = owner_root.as_deref()
+        && let Some((descr, key)) = cc.fielddescrof_keyed(index, owner, *owner_id, name)
+    {
+        descrs.push((descr, Some(key)));
+    }
+}
+
+/// `add_array` (`effectinfo.py`): `cpu.arraydescrof(ARRAY)`.
+fn add_array(
+    indices: &mut Vec<u32>,
+    descrs: &mut Vec<EffectDescr>,
+    index: u32,
+    operand: &RwOperand,
+    cc: &CallControl,
+) {
+    let RwOperand::Array {
+        array_type_id,
+        ir_type,
+        len_offset,
+    } = operand
+    else {
+        unreachable!("array effect {operand:?} carries no array");
+    };
+    indices.push(index);
+    descrs.push(cc.arraydescrof_keyed(index, array_type_id, *ir_type, *len_offset));
+}
+
+/// `add_interiorfield` (`effectinfo.py`):
+/// `cpu.interiorfielddescrof(T, fieldname)`.
+fn add_interiorfield(
+    indices: &mut Vec<u32>,
+    descrs: &mut Vec<EffectDescr>,
+    index: u32,
+    operand: &RwOperand,
+    cc: &CallControl,
+) {
+    let RwOperand::InteriorField {
+        array_type_id,
+        field_name,
+        ..
+    } = operand
+    else {
+        unreachable!("interiorfield effect {operand:?} carries no interior field");
+    };
+    indices.push(index);
+    if let Some((descr, key)) = cc.interiorfielddescrof_keyed(index, array_type_id, field_name) {
+        descrs.push((descr, Some(key)));
+    }
+}
+
 pub fn effectinfo_from_writeanalyze(
-    effects: WriteAnalysis,
+    effects: &ReadWriteEffects,
     extraeffect: ExtraEffect,
     oopspecindex: OopSpecIndex,
     can_invalidate: bool,
     can_collect: bool,
     extradescrs: Option<Vec<DescrRef>>,
     callee_path: &str,
-    _cc: &CallControl,
+    cc: &CallControl,
     call_release_gil_target: (u64, i32),
 ) -> EffectInfo {
-    // `effectinfo_from_writeanalyze`: top_set or EF_RANDOM_EFFECTS ⇒ every
-    // descr list is None and extraeffect is EF_RANDOM_EFFECTS. can_collect
-    // is True (the same function: forces ⇒ can_collect, and random
-    // effects are above that threshold).
-    if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
-        return effectinfo_random_effects(
-            oopspecindex,
-            extradescrs.clone(),
-            can_invalidate,
-            call_release_gil_target,
+    let effects = match effects {
+        ReadWriteEffects::Set(effects) if extraeffect != ExtraEffect::RandomEffects => effects,
+        // `effectinfo_from_writeanalyze`: top_set or EF_RANDOM_EFFECTS ⇒
+        // every descr list is None and extraeffect is EF_RANDOM_EFFECTS.
+        // can_collect is True (the same function: forces ⇒ can_collect,
+        // and random effects are above that threshold).
+        _ => {
+            return effectinfo_random_effects(
+                oopspecindex,
+                extradescrs.clone(),
+                can_invalidate,
+                call_release_gil_target,
+            );
+        }
+    };
+
+    // a read or a write to an interiorfield, inside an array of structs, is
+    // additionally recorded as a read or write of the array itself
+    let mut extraef: Vec<(RwKey, RwOperand)> = Vec::new();
+    for (key, operand) in effects.iter() {
+        let tag = match key.tag {
+            RwTag::InteriorField => RwTag::Array,
+            RwTag::ReadInteriorField => RwTag::ReadArray,
+            _ => continue,
+        };
+        let RwOperand::InteriorField {
+            array_type_id,
+            len_offset,
+            ..
+        } = operand
+        else {
+            unreachable!("interiorfield effect {operand:?} carries no interior field");
+        };
+        let index = cc.descr_indices.array_index(
+            value_type_discriminant(&crate::model::ValueType::Ref(None)),
+            array_type_id,
+            *len_offset,
         );
+        let val = RwKey {
+            tag,
+            index,
+            owner_id: None,
+        };
+        if !effects.contains_key(&val) {
+            extraef.push((
+                val,
+                RwOperand::Array {
+                    array_type_id: array_type_id.clone(),
+                    ir_type: majit_ir::value::Type::Ref,
+                    len_offset: *len_offset,
+                },
+            ));
+        }
     }
+    // preserve order in the added effects issue #2984
+    let extraef_keys: rustc_hash::FxHashSet<RwKey> = extraef.iter().map(|(key, _)| *key).collect();
+    let in_effects = |key: RwKey| effects.contains_key(&key) || extraef_keys.contains(&key);
 
-    // effectinfo.py:345-360: readonly = reads that have NO corresponding write.
-    // PyPy semantics: `tupw not in effects` — set difference at the per-tuple
-    // level.  Pyre operates on the descr-index lift of the same sets.
-    let readonly_descrs_fields = subtract_index_set(&effects.read_fields, &effects.write_fields);
-    let readonly_descrs_arrays = subtract_index_set(&effects.read_arrays, &effects.write_arrays);
-    let readonly_descrs_interiorfields =
-        subtract_index_set(&effects.read_interiorfields, &effects.write_interiorfields);
-
-    let mut write_descrs_fields = effects.write_fields;
-    let mut write_descrs_arrays = effects.write_arrays;
-    let mut write_descrs_interiorfields = effects.write_interiorfields;
-    let field_read_descrs_raw = effects.field_read_descrs;
-    let mut field_write_descrs = effects.field_write_descrs;
-    let interior_read_descrs_raw = effects.interior_read_descrs;
-    let mut interior_write_descrs = effects.interior_write_descrs;
-    let array_read_descrs_raw = effects.array_read_descrs;
-    let mut array_write_descrs = effects.array_write_descrs;
-    // Sort + dedupe the write sets so the raw `_*_descrs_*` slot we hand
-    // to `compute_bitstrings` matches PyPy's `frozenset[Descr]` semantics
-    // (canonical, no duplicates). `subtract_index_set` already does this
-    // for the readonly sets; the write paths feed straight from the
-    // analyzer.
-    write_descrs_fields.sort_unstable();
-    write_descrs_fields.dedup();
-    write_descrs_arrays.sort_unstable();
-    write_descrs_arrays.dedup();
-    write_descrs_interiorfields.sort_unstable();
-    write_descrs_interiorfields.dedup();
+    let mut readonly_descrs_fields = Vec::new();
+    let mut write_descrs_fields = Vec::new();
+    let mut readonly_descrs_arrays = Vec::new();
+    let mut write_descrs_arrays = Vec::new();
+    let mut readonly_descrs_interiorfields = Vec::new();
+    let mut write_descrs_interiorfields = Vec::new();
+    let mut field_read_descrs_raw = Vec::new();
+    let mut field_write_descrs = Vec::new();
+    let mut array_read_descrs_raw = Vec::new();
+    let mut array_write_descrs = Vec::new();
+    let mut interior_read_descrs_raw = Vec::new();
+    let mut interior_write_descrs = Vec::new();
+    let all_effects = effects
+        .iter()
+        .map(|(key, operand)| (*key, operand))
+        .chain(extraef.iter().map(|(key, operand)| (*key, operand)));
+    for (key, operand) in all_effects {
+        let index = key.index;
+        match key.tag {
+            RwTag::Struct => add_struct(
+                &mut write_descrs_fields,
+                &mut field_write_descrs,
+                index,
+                operand,
+                cc,
+            ),
+            RwTag::ReadStruct => {
+                if !in_effects(RwKey {
+                    tag: RwTag::Struct,
+                    ..key
+                }) {
+                    add_struct(
+                        &mut readonly_descrs_fields,
+                        &mut field_read_descrs_raw,
+                        index,
+                        operand,
+                        cc,
+                    );
+                }
+            }
+            RwTag::InteriorField => add_interiorfield(
+                &mut write_descrs_interiorfields,
+                &mut interior_write_descrs,
+                index,
+                operand,
+                cc,
+            ),
+            RwTag::ReadInteriorField => {
+                if !in_effects(RwKey {
+                    tag: RwTag::InteriorField,
+                    ..key
+                }) {
+                    add_interiorfield(
+                        &mut readonly_descrs_interiorfields,
+                        &mut interior_read_descrs_raw,
+                        index,
+                        operand,
+                        cc,
+                    );
+                }
+            }
+            RwTag::Array => add_array(
+                &mut write_descrs_arrays,
+                &mut array_write_descrs,
+                index,
+                operand,
+                cc,
+            ),
+            RwTag::ReadArray => {
+                if !in_effects(RwKey {
+                    tag: RwTag::Array,
+                    ..key
+                }) {
+                    add_array(
+                        &mut readonly_descrs_arrays,
+                        &mut array_read_descrs_raw,
+                        index,
+                        operand,
+                        cc,
+                    );
+                }
+            }
+        }
+    }
+    // Sort + dedupe the index lists so the bitstrings match PyPy's
+    // `frozenset[Descr]` semantics (canonical, no duplicates):
+    // `extraef` can name one array twice, and two struct effects that
+    // differ only in `owner_id` share a slot. A shared slot that is written
+    // is not readonly.
+    for indices in [
+        &mut readonly_descrs_fields,
+        &mut readonly_descrs_arrays,
+        &mut readonly_descrs_interiorfields,
+        &mut write_descrs_fields,
+        &mut write_descrs_arrays,
+        &mut write_descrs_interiorfields,
+    ] {
+        indices.sort_unstable();
+        indices.dedup();
+    }
+    for (readonly, write) in [
+        (&mut readonly_descrs_fields, &write_descrs_fields),
+        (&mut readonly_descrs_arrays, &write_descrs_arrays),
+        (
+            &mut readonly_descrs_interiorfields,
+            &write_descrs_interiorfields,
+        ),
+    ] {
+        readonly.retain(|index| write.binary_search(index).is_err());
+    }
 
     // The `read \ write` exclusion sets are captured HERE, before the
     // elidable/loop-invariant write blanking below, because
@@ -8506,24 +9912,6 @@ pub fn effectinfo_from_writeanalyze(
     }
 }
 
-/// `effectinfo.py:345-360` set difference (`tupw not in effects`).
-///
-/// Returns the deduped sorted list of indices in `read` that have no
-/// matching entry in `write`.  PyPy's reference implementation works on
-/// frozensets of descr objects; pyre operates on the descr-index lift
-/// already produced by `DescrIndexRegistry`.
-fn subtract_index_set(read: &[u32], write: &[u32]) -> Vec<u32> {
-    let write_set: std::collections::HashSet<u32> = write.iter().copied().collect();
-    let mut diff: Vec<u32> = read
-        .iter()
-        .copied()
-        .filter(|idx| !write_set.contains(idx))
-        .collect();
-    diff.sort_unstable();
-    diff.dedup();
-    diff
-}
-
 /// RPython: `op.args[0].concretetype` — resolve full ARRAY identity.
 ///
 /// Returns the full ARRAY type string (e.g. `"Vec<Point>"`, `"Vec<i64>"`),
@@ -8661,313 +10049,6 @@ pub(crate) fn extract_element_type_from_str(type_str: &str) -> Option<String> {
     None
 }
 
-/// Transitive read/write effect collection.
-///
-/// Each graph is scanned once into a replay list. Every query walks that
-/// list with a fresh `seen` set and one shared descr-dedup accumulator —
-/// the same cut as a walk of the live graph — so the first `fielddescrof`
-/// / `arraydescrof` / `interiorfielddescrof` of each index still happens
-/// on the first DFS visit, and a later query repeats the mints that walk
-/// repeated.
-/// The `index()` of every descr already in each `WriteAnalysis` descr
-/// list, so a push tests membership without scanning the list.
-#[derive(Default)]
-struct MintedDescrs {
-    field_read: rustc_hash::FxHashSet<u32>,
-    field_write: rustc_hash::FxHashSet<u32>,
-    array_read: rustc_hash::FxHashSet<u32>,
-    array_write: rustc_hash::FxHashSet<u32>,
-    interior_read: rustc_hash::FxHashSet<u32>,
-    interior_write: rustc_hash::FxHashSet<u32>,
-}
-
-fn apply_readwrite_replay(
-    path: &CallPath,
-    function_graphs: &GraphStore,
-    cc: &CallControl,
-    descr_indices: &DescrIndexRegistry,
-    seen: &mut HashSet<CallPath>,
-    acc: &mut WriteAnalysis,
-    minted: &mut MintedDescrs,
-    is_top: &mut bool,
-) {
-    if *is_top {
-        return;
-    }
-    if !seen.insert(path.clone()) {
-        return;
-    }
-    let replay = readwrite_replay_ops(path, function_graphs, cc);
-    for op in &replay.ops {
-        match op {
-            ReadWriteReplayOp::FieldRead {
-                owner_root,
-                owner_id,
-                name,
-            } => push_field_effect(
-                &mut acc.read_fields,
-                &mut acc.field_read_descrs,
-                &mut minted.field_read,
-                descr_indices,
-                cc,
-                owner_root,
-                *owner_id,
-                name,
-            ),
-            ReadWriteReplayOp::FieldWrite {
-                owner_root,
-                owner_id,
-                name,
-            } => push_field_effect(
-                &mut acc.write_fields,
-                &mut acc.field_write_descrs,
-                &mut minted.field_write,
-                descr_indices,
-                cc,
-                owner_root,
-                *owner_id,
-                name,
-            ),
-            ReadWriteReplayOp::ArrayRead {
-                base,
-                item_ty,
-                array_type_id,
-                nolength,
-            } => {
-                let resolved_id = resolve_array_identity(
-                    base,
-                    array_type_id,
-                    &replay.value_producers,
-                    &replay.phi_sources,
-                    cc,
-                )
-                .or_else(|| array_type_id.clone());
-                let headerless = *nolength
-                    || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
-                let len_offset = if headerless { None } else { Some(0) };
-                push_array_effect(
-                    &mut acc.read_arrays,
-                    &mut acc.array_read_descrs,
-                    &mut minted.array_read,
-                    descr_indices,
-                    cc,
-                    &resolved_id,
-                    item_ty,
-                    len_offset,
-                );
-            }
-            ReadWriteReplayOp::ArrayWrite {
-                base,
-                item_ty,
-                array_type_id,
-                nolength,
-            } => {
-                let resolved_id = resolve_array_identity(
-                    base,
-                    array_type_id,
-                    &replay.value_producers,
-                    &replay.phi_sources,
-                    cc,
-                )
-                .or_else(|| array_type_id.clone());
-                let headerless = *nolength
-                    || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
-                let len_offset = if headerless { None } else { Some(0) };
-                push_array_effect(
-                    &mut acc.write_arrays,
-                    &mut acc.array_write_descrs,
-                    &mut minted.array_write,
-                    descr_indices,
-                    cc,
-                    &resolved_id,
-                    item_ty,
-                    len_offset,
-                );
-            }
-            ReadWriteReplayOp::InteriorRead {
-                base,
-                field_name,
-                array_type_id,
-            } => {
-                let resolved_id = resolve_array_identity(
-                    base,
-                    array_type_id,
-                    &replay.value_producers,
-                    &replay.phi_sources,
-                    cc,
-                )
-                .or_else(|| array_type_id.clone());
-                let len_offset =
-                    if crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref()) {
-                        None
-                    } else {
-                        Some(0)
-                    };
-                push_interior_effect(
-                    &mut acc.read_interiorfields,
-                    &mut acc.interior_read_descrs,
-                    &mut minted.interior_read,
-                    &mut acc.read_arrays,
-                    &mut acc.array_read_descrs,
-                    &mut minted.array_read,
-                    descr_indices,
-                    cc,
-                    &resolved_id,
-                    field_name,
-                    len_offset,
-                );
-            }
-            ReadWriteReplayOp::InteriorWrite {
-                base,
-                field_name,
-                array_type_id,
-            } => {
-                let resolved_id = resolve_array_identity(
-                    base,
-                    array_type_id,
-                    &replay.value_producers,
-                    &replay.phi_sources,
-                    cc,
-                )
-                .or_else(|| array_type_id.clone());
-                let len_offset =
-                    if crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref()) {
-                        None
-                    } else {
-                        Some(0)
-                    };
-                push_interior_effect(
-                    &mut acc.write_interiorfields,
-                    &mut acc.interior_write_descrs,
-                    &mut minted.interior_write,
-                    &mut acc.write_arrays,
-                    &mut acc.array_write_descrs,
-                    &mut minted.array_write,
-                    descr_indices,
-                    cc,
-                    &resolved_id,
-                    field_name,
-                    len_offset,
-                );
-            }
-            // A direct call does not stop the caller when the callee is
-            // `top_set`. Later calls in this graph see `is_top` at entry
-            // and return; later field ops in this graph still mint.
-            ReadWriteReplayOp::Call(target) => {
-                if let Some(callee) = cc.target_to_path(target) {
-                    apply_readwrite_replay(
-                        &callee,
-                        function_graphs,
-                        cc,
-                        descr_indices,
-                        seen,
-                        acc,
-                        minted,
-                        is_top,
-                    );
-                }
-            }
-            ReadWriteReplayOp::Indirect(None) => {
-                *is_top = true;
-                return;
-            }
-            ReadWriteReplayOp::Indirect(Some(graphs)) => {
-                for callee in graphs {
-                    apply_readwrite_replay(
-                        callee,
-                        function_graphs,
-                        cc,
-                        descr_indices,
-                        seen,
-                        acc,
-                        minted,
-                        is_top,
-                    );
-                    if *is_top {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn push_field_effect(
-    indices: &mut Vec<u32>,
-    descrs: &mut Vec<EffectDescr>,
-    minted: &mut rustc_hash::FxHashSet<u32>,
-    descr_indices: &DescrIndexRegistry,
-    cc: &CallControl,
-    owner_root: &Option<String>,
-    owner_id: Option<majit_ir::descr::StructId>,
-    name: &str,
-) {
-    let idx = descr_indices.field_index(owner_root, name);
-    indices.push(idx);
-    if let Some(owner) = owner_root.as_deref()
-        && !minted.contains(&idx)
-        && let Some(descr) = cc.fielddescrof_keyed(idx, owner, owner_id, name)
-    {
-        minted.insert(descr.0.index());
-        descrs.push((descr.0, Some(descr.1)));
-    }
-}
-
-fn push_array_effect(
-    indices: &mut Vec<u32>,
-    descrs: &mut Vec<EffectDescr>,
-    minted: &mut rustc_hash::FxHashSet<u32>,
-    descr_indices: &DescrIndexRegistry,
-    cc: &CallControl,
-    resolved_id: &Option<String>,
-    item_ty: &crate::model::ValueType,
-    len_offset: Option<usize>,
-) {
-    let idx = descr_indices.array_index(value_type_discriminant(item_ty), resolved_id, len_offset);
-    indices.push(idx);
-    if !minted.contains(&idx) {
-        let descr =
-            cc.arraydescrof_keyed(idx, resolved_id, effect_array_ir_type(item_ty), len_offset);
-        minted.insert(descr.0.index());
-        descrs.push(descr);
-    }
-}
-
-fn push_interior_effect(
-    interior_indices: &mut Vec<u32>,
-    interior_descrs: &mut Vec<EffectDescr>,
-    interior_minted: &mut rustc_hash::FxHashSet<u32>,
-    array_indices: &mut Vec<u32>,
-    array_descrs: &mut Vec<EffectDescr>,
-    array_minted: &mut rustc_hash::FxHashSet<u32>,
-    descr_indices: &DescrIndexRegistry,
-    cc: &CallControl,
-    resolved_id: &Option<String>,
-    field_name: &str,
-    len_offset: Option<usize>,
-) {
-    let ifield_idx = descr_indices.interiorfield_index(resolved_id, field_name);
-    interior_indices.push(ifield_idx);
-    if !interior_minted.contains(&ifield_idx)
-        && let Some(descr) = cc.interiorfielddescrof_keyed(ifield_idx, resolved_id, field_name)
-    {
-        interior_minted.insert(descr.0.index());
-        interior_descrs.push((descr.0, Some(descr.1)));
-    }
-    let arr_idx = descr_indices.array_index(
-        value_type_discriminant(&crate::model::ValueType::Ref(None)),
-        resolved_id,
-        len_offset,
-    );
-    array_indices.push(arr_idx);
-    if !array_minted.contains(&arr_idx) {
-        let descr =
-            cc.arraydescrof_keyed(arr_idx, resolved_id, majit_ir::value::Type::Ref, len_offset);
-        array_minted.insert(descr.0.index());
-        array_descrs.push(descr);
-    }
-}
-
 fn effect_array_ir_type(item_ty: &crate::model::ValueType) -> majit_ir::value::Type {
     match item_ty {
         crate::model::ValueType::Int
@@ -8991,157 +10072,6 @@ fn effect_array_ir_type(item_ty: &crate::model::ValueType) -> majit_ir::value::T
                  (history.py:62)"
             )
         }
-    }
-}
-
-fn readwrite_replay_ops(
-    path: &CallPath,
-    function_graphs: &GraphStore,
-    cc: &CallControl,
-) -> std::sync::Arc<ReadWriteReplay> {
-    // A graph registered later must still be walked. Caching the miss
-    // would freeze an empty op list for every later query. The key is the
-    // shared funcobj, so an alias analysed after a sibling hits the same
-    // entry and a mutation of that funcobj drops it for every alias.
-    let Some(key) = function_graphs.key_for(path) else {
-        return std::sync::Arc::new(ReadWriteReplay::default());
-    };
-    if let Some(hit) = cc.readwrite_replay.borrow().get(&key) {
-        return std::sync::Arc::clone(hit);
-    }
-    let Some(graph) = function_graphs.get(path) else {
-        return std::sync::Arc::new(ReadWriteReplay::default());
-    };
-    let built = std::sync::Arc::new(build_readwrite_replay(graph));
-    cc.readwrite_replay
-        .borrow_mut()
-        .insert(key, std::sync::Arc::clone(&built));
-    built
-}
-
-fn build_readwrite_replay(graph: &FunctionGraph) -> ReadWriteReplay {
-    let mut value_producers: HashMap<crate::flowspace::model::Variable, ValueProducer> =
-        HashMap::new();
-    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
-        let Some(var) = op.result.as_ref() else {
-            continue;
-        };
-        // `producer_array_identity` returns `None` for every other kind,
-        // including `ArrayRead` with no `array_type_id` and `Input`, the
-        // same answer as a missing key. A later ignored result clears an
-        // earlier kept one so last-insert still wins. `Call` keeps only
-        // `target`; the lookup reads the callee return type from `cc`.
-        let kept = match &op.kind {
-            OpKind::FieldRead { field, .. } => Some(ValueProducer::Field {
-                owner_root: field.owner_root.clone(),
-                name: field.name.clone(),
-            }),
-            OpKind::ArrayRead {
-                array_type_id: Some(array_type_id),
-                ..
-            } => Some(ValueProducer::Array {
-                array_type_id: array_type_id.clone(),
-            }),
-            OpKind::Call { target, .. } => Some(ValueProducer::Call {
-                target: target.clone(),
-            }),
-            _ => None,
-        };
-        match kept {
-            Some(kind) => {
-                value_producers.insert(var.clone(), kind);
-            }
-            None => {
-                value_producers.remove(var);
-            }
-        }
-    }
-    let mut phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>> =
-        HashMap::new();
-    for block in &graph.blocks {
-        for link in &block.exits {
-            if let Some(target_block) = graph.blocks.get(link.target.0) {
-                for (target_arg, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                    phi_sources
-                        .entry(target_arg.clone())
-                        .and_modify(|entry| *entry = None)
-                        .or_insert_with(|| Some(src.clone()));
-                }
-            }
-        }
-    }
-    let mut ops = Vec::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
-            match &op.kind {
-                OpKind::FieldRead { field, .. } => ops.push(ReadWriteReplayOp::FieldRead {
-                    owner_root: field.owner_root.clone(),
-                    owner_id: field.owner_id,
-                    name: field.name.clone(),
-                }),
-                OpKind::FieldWrite { field, .. } => ops.push(ReadWriteReplayOp::FieldWrite {
-                    owner_root: field.owner_root.clone(),
-                    owner_id: field.owner_id,
-                    name: field.name.clone(),
-                }),
-                OpKind::ArrayRead {
-                    base,
-                    item_ty,
-                    array_type_id,
-                    nolength,
-                    ..
-                } => ops.push(ReadWriteReplayOp::ArrayRead {
-                    base: base.clone(),
-                    item_ty: item_ty.clone(),
-                    array_type_id: array_type_id.clone(),
-                    nolength: *nolength,
-                }),
-                OpKind::ArrayWrite {
-                    base,
-                    item_ty,
-                    array_type_id,
-                    nolength,
-                    ..
-                } => ops.push(ReadWriteReplayOp::ArrayWrite {
-                    base: base.clone(),
-                    item_ty: item_ty.clone(),
-                    array_type_id: array_type_id.clone(),
-                    nolength: *nolength,
-                }),
-                OpKind::InteriorFieldRead {
-                    base,
-                    field,
-                    array_type_id,
-                    ..
-                } => ops.push(ReadWriteReplayOp::InteriorRead {
-                    base: base.clone(),
-                    field_name: field.name.clone(),
-                    array_type_id: array_type_id.clone(),
-                }),
-                OpKind::InteriorFieldWrite {
-                    base,
-                    field,
-                    array_type_id,
-                    ..
-                } => ops.push(ReadWriteReplayOp::InteriorWrite {
-                    base: base.clone(),
-                    field_name: field.name.clone(),
-                    array_type_id: array_type_id.clone(),
-                }),
-                OpKind::Call { target, .. } => {
-                    ops.push(ReadWriteReplayOp::Call(target.clone()));
-                }
-                OpKind::IndirectCall { graphs, .. } => {
-                    ops.push(ReadWriteReplayOp::Indirect(graphs.clone()));
-                }
-                _ => {}
-            }
-        }
-    }
-    ReadWriteReplay {
-        ops,
-        value_producers,
-        phi_sources,
     }
 }
 
@@ -10305,23 +11235,8 @@ mod tests {
             stored.hints.iter().any(|h| h == "unroll_safe"),
             "harvested unroll_safe was not merged into FunctionGraph.hints"
         );
-        let hints = stored.hints.clone();
-        let graph = stored.clone();
-        let func = SemanticFunction {
-            name: "loopy".into(),
-            graph,
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints,
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        };
         let mut policy = crate::policy::DefaultJitPolicy::new();
-        assert!(policy.look_inside_graph(&func));
+        assert!(policy.look_inside_graph(&stored));
     }
 
     /// Two aliases of one source funcobj fold onto a single `GraphSlot`.
@@ -10736,20 +11651,23 @@ mod tests {
 
         // alias_a observes it.
         assert_eq!(
-            cc.get_oopspec(&CallTarget::function_path(["alias_a"])),
+            cc.get_oopspec(&CallTarget::function_path(["alias_a"]))
+                .as_deref(),
             Some("list.append(l, v)"),
         );
         // alias_b observes it too — both names reach the one shared funcobj
         // graph, so the effect attribute is shared (RPython parity).
         assert_eq!(
-            cc.get_oopspec(&CallTarget::function_path(["alias_b"])),
+            cc.get_oopspec(&CallTarget::function_path(["alias_b"]))
+                .as_deref(),
             Some("list.append(l, v)"),
             "a mark on one alias is observed through every sibling alias of \
              the same source funcobj",
         );
         // The distinct source graph is unaffected.
         assert_eq!(
-            cc.get_oopspec(&CallTarget::function_path(["other_alias"])),
+            cc.get_oopspec(&CallTarget::function_path(["other_alias"]))
+                .as_deref(),
             None,
         );
     }
@@ -10782,11 +11700,13 @@ mod tests {
         );
 
         assert_eq!(
-            cc.get_oopspec(&CallTarget::function_path(["PyFrame", "push_value"])),
+            cc.get_oopspec(&CallTarget::function_path(["PyFrame", "push_value"]))
+                .as_deref(),
             Some("stepper.push(f, v)"),
         );
         assert_eq!(
-            cc.get_oopspec(&CallTarget::function_path(["MIFrame", "push_value"])),
+            cc.get_oopspec(&CallTarget::function_path(["MIFrame", "push_value"]))
+                .as_deref(),
             None,
             "same-named methods of distinct impls keep separate func metadata",
         );
@@ -11268,9 +12188,8 @@ mod tests {
             let path = CallPath::from_segments(["allocating"]);
             cc.register_function_graph(path.clone(), graph);
 
-            let mut seen = HashSet::new();
             assert!(
-                cc.analyze_can_collect(&path, &mut seen),
+                cc.analyze_can_collect(&path, &mut CallTracker::new(), &mut new_analyzed_calls()),
                 "a graph whose only operation is {label} must analyse as collecting"
             );
         }
@@ -11278,9 +12197,8 @@ mod tests {
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["allocation_free"]);
         cc.register_function_graph(path.clone(), simple_graph("allocation_free"));
-        let mut seen = HashSet::new();
         assert!(
-            !cc.analyze_can_collect(&path, &mut seen),
+            !cc.analyze_can_collect(&path, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "a graph with no allocation and no call must analyse as not collecting"
         );
     }
@@ -11336,23 +12254,20 @@ mod tests {
         };
 
         let cc = build(false);
-        let mut seen = HashSet::new();
         assert!(
-            !cc.analyze_can_collect(&caller, &mut seen),
+            !cc.analyze_can_collect(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "an undeclared graph-less callee must answer `false` — otherwise \
              the positive case below would not be attributable to the mark"
         );
 
         let cc = build(true);
-        let mut seen = HashSet::new();
         assert!(
-            cc.analyze_can_collect(&caller, &mut seen),
+            cc.analyze_can_collect(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "collectanalyze.py:27-33 — a caller of a graph-less callee declared \
              `canmallocgc` collects"
         );
-        let mut seen = HashSet::new();
         assert!(
-            !cc.analyze_random_effects(&caller, &mut seen),
+            !cc.analyze_random_effects(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "effectinfo.py:417-418 — the same allocation answers \
              `RandomEffectsAnalyzer` False, so an elidable caller stays legal"
         );
@@ -11617,7 +12532,11 @@ mod tests {
             graph.set_return(graph.startblock, None);
             let path = CallPath::from_segments(["entry"]);
             cc.register_function_graph(path.clone(), graph);
-            assert!(!cc.analyze_forces_virtualizable(&path, &mut HashSet::new()));
+            assert!(!cc.analyze_forces_virtualizable(
+                &path,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls()
+            ));
         }
     }
 
@@ -11714,6 +12633,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("accessor");
         let base_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
             OpKind::FieldRead {
@@ -11743,7 +12663,7 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
             &direct_call_op(target.clone()),
-            Vec::new(),
+            vec![Type::Ref],
             Type::Void,
             OopSpecIndex::None,
             None,
@@ -11772,6 +12692,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("opaque_writer");
         let base_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
             OpKind::FieldWrite {
@@ -11791,7 +12712,7 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
             &direct_call_op(CallTarget::function_path(["opaque_writer"])),
-            Vec::new(),
+            vec![Type::Ref],
             Type::Void,
             OopSpecIndex::None,
             None,
@@ -12098,6 +13019,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("pure_writer");
         let base_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
             OpKind::FieldWrite {
@@ -12118,7 +13040,7 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
             &direct_call_op(target.clone()),
-            Vec::new(),
+            vec![Type::Ref],
             Type::Int,
             OopSpecIndex::None,
             None,
@@ -12157,6 +13079,7 @@ mod tests {
         );
         let mut graph = FunctionGraph::new("pure_cache");
         let base_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
             OpKind::FieldRead {
@@ -12186,7 +13109,7 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
             &direct_call_op(CallTarget::function_path(["pure_cache"])),
-            Vec::new(),
+            vec![Type::Ref],
             Type::Int,
             OopSpecIndex::None,
             None,
@@ -12237,7 +13160,7 @@ mod tests {
         assert!(
             cache
                 .can_raise
-                .contains_key(&CallPath::from_segments(["raiser"]))
+                .contains(&CallPath::from_segments(["raiser"]))
         );
 
         let r2 = cc._canraise(&target, &mut cache);
@@ -12360,8 +13283,12 @@ mod tests {
         let path = CallPath::from_segments(["reraise_only"]);
         cc.register_function_graph(path.clone(), reraise_only_graph("reraise_only"));
 
-        let mut seen = HashSet::new();
-        assert!(!cc.analyze_can_raise_impl(&path, &mut seen, true));
+        assert!(!cc.analyze_can_raise_impl(
+            &path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+            true
+        ));
     }
 
     /// Graph-model unification (test-only): prove the orthodox
@@ -12551,6 +13478,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("rw_same_field");
         let base_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, base_var.clone());
         let field = crate::model::FieldDescriptor::new("x", Some("Point".into()));
         // Both read AND write the same field "x"
         graph.push_op_var(
@@ -12582,7 +13510,7 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
             &direct_call_op(target.clone()),
-            Vec::new(),
+            vec![Type::Ref],
             Type::Void,
             OopSpecIndex::None,
             None,
@@ -13264,13 +14192,12 @@ mod tests {
         graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["residual_force"]);
         cc.register_function_graph(path.clone(), graph);
-        assert_eq!(cc.replace_force_virtualizable_with_call(), 2);
-        let ops = &cc
+        cc.replace_force_virtualizable_with_call();
+        let graph = cc
             .function_graphs()
             .get(&path)
-            .expect("registered residual graph")
-            .block(crate::model::BlockId(0))
-            .operations;
+            .expect("registered residual graph");
+        let ops = &graph.block(crate::model::BlockId(0)).operations;
         assert_eq!(
             ops.len(),
             2,
@@ -13399,6 +14326,201 @@ mod tests {
             Some(2),
             "the registered source graph must carry the complete PBC family"
         );
+    }
+
+    fn deferred_family_caller(name: &str) -> FunctionGraph {
+        let mut caller = FunctionGraph::new(name);
+        let funcptr = caller.alloc_value_var();
+        caller
+            .block_mut(caller.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::IndirectCall {
+                    funcptr,
+                    args: Vec::new(),
+                    graphs: None,
+                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    result_ty: ValueType::Void,
+                },
+            });
+        caller
+    }
+
+    fn handler_call_control() -> CallControl {
+        let mut cc = CallControl::new();
+        for owner in ["A", "B"] {
+            cc.register_function_graph(
+                CallPath::for_impl_method(owner, "run"),
+                FunctionGraph::new(format!("{owner}::run")),
+            );
+            cc.register_trait_family_member("run", "Handler", owner);
+        }
+        cc
+    }
+
+    fn first_op_kind(cc: &CallControl, path: &CallPath) -> String {
+        let graph = cc.function_graphs.get(path).expect("registered graph");
+        let OpKind::IndirectCall {
+            graphs, family_key, ..
+        } = &graph.block(graph.startblock).operations[0].kind
+        else {
+            panic!("the caller's operation must stay an indirect call");
+        };
+        format!("graphs: {graphs:?}, family_key: {family_key:?}")
+    }
+
+    /// A funcobj registered before the store passes ran and built after
+    /// them reads the same graph as one built at registration: its build
+    /// catches up on every pass, in order, with the inputs each pass read.
+    #[test]
+    fn a_deferred_slot_catches_up_on_the_store_passes() {
+        let eager_path = CallPath::from_segments(["eager"]);
+        let lazy_path = CallPath::from_segments(["lazy"]);
+        let mut cc = handler_call_control();
+        cc.register_function_graph(eager_path.clone(), deferred_family_caller("caller"));
+        let mut lazy = handler_call_control();
+        lazy.function_graphs.insert_deferred(
+            lazy_path.clone(),
+            (None, "caller".to_string()),
+            Box::new(|| Some(deferred_family_caller("caller"))),
+        );
+        for cc in [&mut cc, &mut lazy] {
+            cc.materialize_deferred_indirect_families();
+            cc.lower_registered_indirect_calls();
+            cc.replace_force_virtualizable_with_call();
+        }
+        assert!(
+            lazy.function_graphs.graphs.borrow()[&(None, "caller".to_string())]
+                .graph
+                .get()
+                .is_none(),
+            "no pass may build a slot nobody asked for"
+        );
+        assert_eq!(
+            first_op_kind(&lazy, &lazy_path),
+            first_op_kind(&cc, &eager_path)
+        );
+    }
+
+    /// A pass that has run is not replayed on a funcobj registered after
+    /// it: that graph never went through it.
+    #[test]
+    fn a_slot_registered_after_a_pass_does_not_get_it() {
+        let path = CallPath::from_segments(["late"]);
+        let mut cc = handler_call_control();
+        cc.materialize_deferred_indirect_families();
+        cc.function_graphs.insert_deferred(
+            path.clone(),
+            (None, "late".to_string()),
+            Box::new(|| Some(deferred_family_caller("late"))),
+        );
+        let kind = first_op_kind(&cc, &path);
+        assert!(kind.contains("graphs: None"), "{kind}");
+    }
+
+    /// A funcobj whose build produces no graph is not registered.
+    #[test]
+    fn a_slot_whose_build_fails_is_unregistered() {
+        let path = CallPath::from_segments(["broken"]);
+        let mut cc = CallControl::new();
+        cc.function_graphs.insert_deferred(
+            path.clone(),
+            (None, "broken".to_string()),
+            Box::new(|| None),
+        );
+        assert!(!cc.function_graphs.contains_key(&path));
+        assert!(cc.function_graphs.get(&path).is_none());
+        assert!(cc.function_graphs.signature(&path).is_none());
+    }
+
+    /// Effects and hints marked on a funcobj before its graph is built
+    /// are the graph's once it is.
+    #[test]
+    fn a_mark_on_an_unbuilt_funcobj_lands_on_its_graph() {
+        let path = CallPath::from_segments(["pure"]);
+        let key = (None, "pure".to_string());
+        let mut cc = CallControl::new();
+        cc.function_graphs
+            .insert_deferred(path.clone(), key.clone(), || {
+                Some(FunctionGraph::new("pure"))
+            });
+        cc.mark_elidable(path.clone());
+        cc.register_function_hints_for(path.clone(), vec!["unroll_safe".to_string()]);
+        assert!(
+            cc.function_graphs.graphs.borrow()[&key]
+                .graph
+                .get()
+                .is_none(),
+            "a mark must not build the graph"
+        );
+        let graph = cc.function_graphs.get(&path).expect("registered graph");
+        assert!(graph.func.elidable);
+        assert_eq!(graph.hints, ["elidable", "unroll_safe"]);
+    }
+
+    /// A funcobj whose build produces no graph is external, and the marks
+    /// written onto it before and after the build are its record.
+    #[test]
+    fn a_funcobj_whose_build_fails_keeps_its_marks_as_the_external_record() {
+        let path = CallPath::from_segments(["opaque"]);
+        let mut cc = CallControl::new();
+        cc.function_graphs
+            .insert_deferred(path.clone(), (None, "opaque".to_string()), || None);
+        cc.mark_external_gc_effects(path.clone());
+        assert!(cc.function_graphs.get(&path).is_none());
+        cc.mark_cannot_collect(path.clone());
+        assert!(!cc.external_funcobjs.contains_key(&path));
+        let effects = cc.func_effects(&path).expect("the external funcobj");
+        assert!(effects.random_effects_on_gcobjs);
+        assert!(effects.cannot_collect);
+        assert!(cc.analyze_random_effects(
+            &path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls()
+        ));
+    }
+
+    /// Alias registrations of one funcobj share one slot and build its
+    /// graph once, on demand, with every registration's stamps folded.
+    #[test]
+    fn aliases_of_one_funcobj_share_one_unbuilt_slot() {
+        let builds = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = builds.clone();
+        let funcobj = crate::model::LazyGraph::deferred(FunctionGraph::new("helper"), move || {
+            counter.set(counter.get() + 1);
+            Some(FunctionGraph::new("helper"))
+        });
+        let first = CallPath::from_segments(["helper"]);
+        let second = CallPath::from_segments(["crate", "helper"]);
+        let mut cc = CallControl::new();
+        cc.register_function_graph(
+            first.clone(),
+            GraphSource::Lazy {
+                graph: funcobj.clone(),
+                transform: GraphTransform {
+                    return_type: Some("i64".to_string()),
+                    hints: Vec::new(),
+                },
+            },
+        );
+        cc.register_function_graph_with_hints(
+            second.clone(),
+            GraphSource::Lazy {
+                graph: funcobj,
+                transform: GraphTransform::default(),
+            },
+            vec!["elidable".to_string()],
+        );
+        assert_eq!(builds.get(), 0, "registration must not build the graph");
+        let graph = cc.function_graphs.get(&second).expect("registered graph");
+        assert_eq!(graph.return_type.as_deref(), Some("i64"));
+        assert_eq!(graph.hints, ["elidable"]);
+        assert!(std::rc::Rc::ptr_eq(
+            &graph,
+            &cc.function_graphs.get(&first).expect("registered graph")
+        ));
+        assert_eq!(builds.get(), 1);
     }
 
     /// `graphs_from(op)` for an `OpKind::IndirectCall` must filter by
@@ -14344,9 +15466,9 @@ mod tests {
             "BFS must follow the registered alias, not skip it as unregistered"
         );
         assert!(
-            std::ptr::eq(
-                cc.function_graphs.get(&registered).expect("canonical") as *const FunctionGraph,
-                cc.function_graphs.get(&call_spelling).expect("alias") as *const FunctionGraph,
+            std::rc::Rc::ptr_eq(
+                &cc.function_graphs.get(&registered).expect("canonical"),
+                &cc.function_graphs.get(&call_spelling).expect("alias"),
             ),
             "crate-alias and canonical registration share one graph"
         );
@@ -14489,12 +15611,11 @@ mod tests {
         );
         assert_eq!(cc.target_to_path(&alias_target), Some(alias.clone()));
         assert!(
-            std::ptr::eq(
-                cc.function_graphs.get(&canonical).expect("canonical graph")
-                    as *const FunctionGraph,
-                cc.target_to_path_and_graph(&alias_target)
+            std::rc::Rc::ptr_eq(
+                &cc.function_graphs.get(&canonical).expect("canonical graph"),
+                &cc.target_to_path_and_graph(&alias_target)
                     .expect("alias graph")
-                    .1 as *const FunctionGraph
+                    .1
             ),
             "crate-alias and canonical path must share one graph object"
         );
@@ -14602,26 +15723,41 @@ mod tests {
         let mut graph = FunctionGraph::new(name);
         let entry = graph.startblock;
         for op in ops {
+            // The written object is an argument, not a `FreshMallocs` one.
+            if let OpKind::FieldWrite { base, .. } = &op {
+                graph.push_inputarg_var(entry, base.clone());
+            }
             graph.push_op_var(entry, op, false);
         }
         cc.register_function_graph(CallPath::from_segments([name]), graph);
     }
 
-    fn rw_of(cc: &CallControl, name: &str) -> WriteAnalysis {
-        analyze_readwrite(
-            &CallTarget::function_path([name]),
-            &cc.function_graphs,
-            cc,
-            &cc.descr_indices,
-        )
+    fn rw_of(cc: &CallControl, cache: &mut AnalysisCache, name: &str) -> ReadWriteEffects {
+        cc.cached_readwrite(&CallTarget::function_path([name]), cache)
     }
 
-    /// Each query walks with a fresh `seen` set. `field_index` keeps the
-    /// first assignment, so a later query replays those indices in that
-    /// query's own DFS order.
+    fn is_top(effects: &ReadWriteEffects) -> bool {
+        ReadWriteEffects::is_top_result(effects)
+    }
+
+    /// The `("struct", T, fieldname)` indices of `effects`, in set order.
+    fn write_fields(effects: &ReadWriteEffects) -> Vec<u32> {
+        match effects {
+            ReadWriteEffects::Top => Vec::new(),
+            ReadWriteEffects::Set(set) => set
+                .keys()
+                .filter(|key| key.tag == RwTag::Struct)
+                .map(|key| key.index)
+                .collect(),
+        }
+    }
+
+    /// Every graph a walk enters keeps its set in `_analyzed_calls`; a
+    /// later query of a callee returns that set without walking it again.
     #[test]
     fn readwrite_effects_are_cached_per_graph() {
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(&mut cc, "d", vec![rw_write_field("D", "d")]);
         rw_register(&mut cc, "b", vec![rw_write_field("B", "b"), rw_call("d")]);
         rw_register(&mut cc, "c", vec![rw_write_field("C", "c"), rw_call("d")]);
@@ -14631,39 +15767,42 @@ mod tests {
             vec![rw_write_field("A", "a"), rw_call("b"), rw_call("c")],
         );
 
-        // First DFS: A's write, then b (B, then d's D), then c (C; d skipped).
-        let a = rw_of(&cc, "a");
-        assert!(!a.is_top);
-        assert_eq!(a.write_fields, vec![0, 1, 2, 3]);
-        assert_eq!(rw_of(&cc, "b").write_fields, vec![1, 2]);
-        assert_eq!(rw_of(&cc, "d").write_fields, vec![2]);
-        assert_eq!(rw_of(&cc, "c").write_fields, vec![3, 2]);
-        assert_eq!(rw_of(&cc, "a").write_fields, vec![0, 1, 2, 3]);
+        // A's write, then b (B, then d's D), then c (C, then d's cached D).
+        let a = rw_of(&cc, &mut cache, "a");
+        assert!(!is_top(&a));
+        assert_eq!(write_fields(&a), vec![0, 1, 2, 3]);
+        for name in ["a", "b", "c", "d"] {
+            let key = cc
+                .function_graphs
+                .key_for(&CallPath::from_segments([name]))
+                .unwrap();
+            assert!(cache.readwrite.contains(&key), "{name} was entered");
+        }
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "b")), vec![1, 2]);
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "d")), vec![2]);
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "c")), vec![3, 2]);
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "a")), vec![0, 1, 2, 3]);
 
-        let family = analyze_readwrite_indirect_family(
+        let family = cc.cached_readwrite_family(
             Some(&[
                 CallPath::from_segments(["b"]),
                 CallPath::from_segments(["c"]),
             ]),
-            &cc.function_graphs,
-            &cc,
-            &cc.descr_indices,
+            &mut cache,
         );
-        assert!(!family.is_top);
-        assert_eq!(family.write_fields, vec![1, 2, 3]);
+        assert!(!is_top(&family));
+        assert_eq!(write_fields(&family), vec![1, 2, 3]);
 
-        let unknown =
-            analyze_readwrite_indirect_family(None, &cc.function_graphs, &cc, &cc.descr_indices);
-        assert!(unknown.is_top);
-        assert!(unknown.write_fields.is_empty());
+        let unknown = cc.cached_readwrite_family(None, &mut cache);
+        assert!(is_top(&unknown));
     }
 
-    /// Two alias paths name one graph. Analysing through B fills the shared
-    /// replay; stamping the method resolution through A mutates that graph,
-    /// so the next analysis through B must walk the updated call.
+    /// Two alias paths name one graph, so they share one `_analyzed_calls`
+    /// entry: the method resolution stamped through A is what B reads.
     #[test]
-    fn readwrite_replay_invalidates_every_alias_of_a_mutated_graph() {
+    fn readwrite_aliases_share_one_analyzed_graph() {
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(&mut cc, "leaf", vec![rw_write_field("Leaf", "x")]);
 
         let caller = || {
@@ -14685,36 +15824,42 @@ mod tests {
         cc.register_function_graph(alias_a.clone(), caller());
         cc.register_function_graph(alias_b.clone(), caller());
 
-        assert!(
-            rw_of(&cc, "alias_b").write_fields.is_empty(),
-            "the unresolved method is not followed"
+        assert_eq!(
+            cc.function_graphs.key_for(&alias_a),
+            cc.function_graphs.key_for(&alias_b)
         );
         cc.stamp_method_resolved_path(&alias_a, 0, 0, CallPath::from_segments(["leaf"]));
         assert_eq!(
-            rw_of(&cc, "alias_b").write_fields,
+            write_fields(&rw_of(&cc, &mut cache, "alias_b")),
             vec![0],
             "alias B observes the stamp applied through alias A"
         );
+        let key = cc.function_graphs.key_for(&alias_a).unwrap();
+        assert!(cache.readwrite.contains(&key));
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "alias_a")), vec![0]);
     }
 
-    /// A cycle stops when `seen` already holds the graph. The root's
-    /// order is its DFS order; the other member is reachable.
+    /// Entering a graph already on the stack unions the cycle
+    /// (`DependencyTracker.enter`); the cycle's shared `Dependency` then
+    /// holds both members' effects.
     #[test]
     fn readwrite_cycle_unions_both_graphs() {
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(&mut cc, "p", vec![rw_write_field("P", "p"), rw_call("q")]);
         rw_register(&mut cc, "q", vec![rw_write_field("Q", "q"), rw_call("p")]);
 
-        let p = rw_of(&cc, "p");
-        assert_eq!(p.write_fields, vec![0, 1]);
-        let mut q_fields = rw_of(&cc, "q").write_fields;
+        let p = rw_of(&cc, &mut cache, "p");
+        assert_eq!(write_fields(&p), vec![0, 1]);
+        let mut q_fields = write_fields(&rw_of(&cc, &mut cache, "q"));
         q_fields.sort_unstable();
         assert_eq!(q_fields, vec![0, 1]);
 
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(&mut cc, "p", vec![rw_write_field("P", "p"), rw_call("q")]);
         rw_register(&mut cc, "q", vec![rw_write_field("Q", "q"), rw_call("p")]);
-        assert_eq!(rw_of(&cc, "q").write_fields, vec![0, 1]);
+        assert_eq!(write_fields(&rw_of(&cc, &mut cache, "q")), vec![0, 1]);
     }
 
     /// `indirect_call` with `graphs=None` is `top_set`. A later query of
@@ -14722,6 +15867,7 @@ mod tests {
     #[test]
     fn readwrite_unknown_indirect_is_top_and_cached() {
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(
             &mut cc,
             "t",
@@ -14734,19 +15880,20 @@ mod tests {
             }],
         );
         rw_register(&mut cc, "u", vec![rw_write_field("U", "u"), rw_call("t")]);
-        assert!(rw_of(&cc, "u").is_top);
-        assert!(rw_of(&cc, "t").is_top);
-        assert!(rw_of(&cc, "u").is_top);
+        assert!(is_top(&rw_of(&cc, &mut cache, "u")));
+        assert!(is_top(&rw_of(&cc, &mut cache, "t")));
+        assert!(is_top(&rw_of(&cc, &mut cache, "u")));
 
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         rw_register(
             &mut cc,
             "m",
             vec![rw_write_field("M", "m"), rw_call("missing")],
         );
-        let m = rw_of(&cc, "m");
-        assert!(!m.is_top);
-        assert_eq!(m.write_fields, vec![0]);
+        let m = rw_of(&cc, &mut cache, "m");
+        assert!(!is_top(&m));
+        assert_eq!(write_fields(&m), vec![0]);
     }
 
     /// A layout registered after the first mint has to be visible on the
@@ -14800,31 +15947,94 @@ mod tests {
         assert!(after.cache_hit_offset > before.cache_hit_offset);
     }
 
-    /// Replacing the graph stored under a path drops the replay of the
-    /// previous body.
+    /// `FreshMallocs`: a write into an object the graph allocated, directly
+    /// or through `same_as`, is not an effect; a write into an argument is.
     #[test]
-    fn readwrite_reregistered_graph_drops_cached_effects() {
+    fn readwrite_skips_writes_into_fresh_mallocs() {
         let mut cc = CallControl::new();
-        rw_register(&mut cc, "g", vec![rw_write_field("G", "slot")]);
-        assert_eq!(rw_of(&cc, "g").write_fields, vec![0]);
-        cc.register_function_graph(
-            CallPath::from_segments(["g"]),
-            FunctionGraph::new("g_replacement"),
-        );
-        let again = rw_of(&cc, "g");
-        assert!(!again.is_top);
-        assert!(again.write_fields.is_empty());
+        let mut cache = AnalysisCache::default();
+        let mut graph = FunctionGraph::new("fresh");
+        let entry = graph.startblock;
+        let arg = graph.alloc_value_var();
+        graph.push_inputarg_var(entry, arg.clone());
+        let fresh = graph
+            .push_op_var(
+                entry,
+                OpKind::New {
+                    owner: "Fresh".to_string(),
+                },
+                true,
+            )
+            .unwrap();
+        let alias = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "same_as".to_string(),
+                    operand: fresh.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        for (base, name) in [(&fresh, "a"), (&alias, "b"), (&arg, "c")] {
+            graph.push_op_var(
+                entry,
+                OpKind::FieldWrite {
+                    base: base.clone(),
+                    field: crate::model::FieldDescriptor::new(name, Some("Fresh".to_string())),
+                    value: LinkArg::Value(arg.clone()),
+                    ty: ValueType::Int,
+                },
+                false,
+            );
+        }
+        cc.register_function_graph(CallPath::from_segments(["fresh"]), graph);
+        let effects = rw_of(&cc, &mut cache, "fresh");
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("fresh-malloc writes are not top");
+        };
+        assert_eq!(set.len(), 1);
+        let (key, operand) = set.first().unwrap();
+        assert_eq!(key.tag, RwTag::Struct);
+        assert!(matches!(operand, RwOperand::Field { name, .. } if name == "c"));
     }
 
-    /// An indirect call cached while `graphs` is still `None` is `top_set`.
-    /// Filling the family afterwards unions the members instead of replaying
-    /// that top result.
+    /// Two structs spelled with one owner name are two `T`s: each keeps its
+    /// own `("struct", T, fieldname)` tuple though they share one index.
     #[test]
-    fn readwrite_materialized_indirect_family_replaces_cached_top() {
+    fn readwrite_struct_effect_is_keyed_by_owner_id() {
         let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        let write = |id: &str| {
+            let mut op = rw_write_field("Entry", "key");
+            if let OpKind::FieldWrite { field, .. } = &mut op {
+                field.owner_id = Some(majit_ir::descr::StructId::from_canonical(id));
+            }
+            op
+        };
+        rw_register(&mut cc, "two", vec![write("m1::Entry"), write("m2::Entry")]);
+        let effects = rw_of(&cc, &mut cache, "two");
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("two field writes are not top");
+        };
+        assert_eq!(set.len(), 2);
+        assert_eq!(write_fields(&effects), vec![0, 0]);
+    }
+
+    /// `find_all_graphs` fills a deferred indirect family before any
+    /// analysis, so the call is the union of its members, not `top_set`.
+    #[test]
+    fn readwrite_materialized_indirect_family_unions_members() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
         let mut impl_graph = FunctionGraph::new("impl_m");
         let entry = impl_graph.startblock;
-        impl_graph.push_op_var(entry, rw_write_field("Impl", "slot"), false);
+        let write = rw_write_field("Impl", "slot");
+        if let OpKind::FieldWrite { base, .. } = &write {
+            impl_graph.push_inputarg_var(entry, base.clone());
+        }
+        impl_graph.push_op_var(entry, write, false);
         cc.register_trait_method("m", Some("Trait"), "Impl", impl_graph);
         let mut caller = FunctionGraph::new("caller");
         let entry = caller.startblock;
@@ -14840,10 +16050,9 @@ mod tests {
             false,
         );
         cc.register_function_graph(CallPath::from_segments(["caller"]), caller);
-        assert!(rw_of(&cc, "caller").is_top);
         cc.find_all_graphs_for_tests();
-        let again = rw_of(&cc, "caller");
-        assert!(!again.is_top);
-        assert_eq!(again.write_fields, vec![0]);
+        let effects = rw_of(&cc, &mut cache, "caller");
+        assert!(!is_top(&effects));
+        assert_eq!(write_fields(&effects), vec![0]);
     }
 }

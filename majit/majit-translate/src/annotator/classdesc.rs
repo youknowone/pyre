@@ -301,6 +301,26 @@ pub(crate) fn register_struct_fields(qualname: &str, fields: &[(String, crate::m
     });
 }
 
+/// The forced attributes of a positional aggregate class (`Tuple<A,B>` /
+/// `Array<T;N>`), one per `__pos_N` item, shelled as
+/// [`register_struct_fields`] shells a struct's rows. `TupleRepr` reads
+/// the items off the tuple's own annotation whenever it is asked
+/// (`rtuple.py`), so the shape needs no prior row in the table.
+fn positional_shape_forced_attributes(
+    qualname: &str,
+) -> Option<indexmap::IndexMap<String, SomeValue>> {
+    let (_, attrs) = crate::front::mir::positional_shape_metadata(qualname)?;
+    Some(
+        attrs
+            .iter()
+            .filter_map(|(name, vt)| {
+                crate::codewriter::annotation_state::valuetype_to_someshell(vt)
+                    .map(|s_value| (name.clone(), s_value))
+            })
+            .collect(),
+    )
+}
+
 /// Project a constructor-minted host-class qualname — dot-joined and
 /// crate-included, e.g. `"pyre_interpreter.pyframe.FrameBlock"`
 /// (flowspace_adapter `SyntheticTransparentCtor` arm) — onto the
@@ -1279,31 +1299,33 @@ impl ClassDesc {
         let canonical = majit_ir::descr::canonical_struct_name(&qualname);
         let dotted_key = struct_force_key_from_dotted_qualname(&qualname);
         let overrides: Option<indexmap::IndexMap<String, SomeValue>> =
-            FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
-                let table = cell.borrow();
-                table
-                    .get(qualname.as_str())
-                    .or_else(|| {
-                        if canonical != qualname {
-                            table.get(canonical.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .or_else(|| {
-                        // The dotted projection names a struct row; gate
-                        // it on the struct-derived key set so a leaf
-                        // collision with a hand-coded exception entry
-                        // (`pkg.EnvironmentError` → `EnvironmentError`)
-                        // cannot force exception attributes onto an
-                        // unrelated constructor-minted class.
-                        dotted_key
-                            .as_deref()
-                            .filter(|k| STRUCT_FORCE_KEYS.with(|s| s.borrow().contains(*k)))
-                            .and_then(|k| table.get(k))
-                    })
-                    .cloned()
-            });
+            FORCE_ATTRIBUTES_INTO_CLASSES
+                .with(|cell| {
+                    let table = cell.borrow();
+                    table
+                        .get(qualname.as_str())
+                        .or_else(|| {
+                            if canonical != qualname {
+                                table.get(canonical.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .or_else(|| {
+                            // The dotted projection names a struct row; gate
+                            // it on the struct-derived key set so a leaf
+                            // collision with a hand-coded exception entry
+                            // (`pkg.EnvironmentError` → `EnvironmentError`)
+                            // cannot force exception attributes onto an
+                            // unrelated constructor-minted class.
+                            dotted_key
+                                .as_deref()
+                                .filter(|k| STRUCT_FORCE_KEYS.with(|s| s.borrow().contains(*k)))
+                                .and_then(|k| table.get(k))
+                        })
+                        .cloned()
+                })
+                .or_else(|| positional_shape_forced_attributes(&qualname));
         if let Some(overrides) = overrides {
             for (attr_name, s_value) in &overrides {
                 ClassDef::generalize_attr(&classdef, attr_name, Some(s_value.clone()))?;
@@ -1349,6 +1371,14 @@ impl ClassDesc {
                 None,
             )?;
             assert!(super::model::s_none().contains(&s));
+        }
+        // A positional aggregate class (`Tuple<A,B>` / `Array<T;N>`) is
+        // minted when annotation first meets it, after the session prologue
+        // projected every registered struct root. Project its item rows
+        // now, before any flow reads the class, as that prologue does for a
+        // registered root (`Bookkeeper::getuniqueclassdef_for_struct_root`).
+        if crate::front::mir::positional_shape_metadata(&qualname).is_some() {
+            bk.getuniqueclassdef_for_struct_root(&qualname)?;
         }
         Ok(classdef)
     }

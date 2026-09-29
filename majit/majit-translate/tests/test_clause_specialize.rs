@@ -49,10 +49,10 @@ fn rdict_string_and_objectkey_instantiations_resolve_distinct_eq() {
         "instantiation keys collided: {names:?}"
     );
 
-    let string_eq = specialized.iter().any(|f| graph_calls_str_eq(&f.graph));
+    let string_eq = specialized.iter().any(|f| graph_calls_str_eq(&f.graph()));
     let object_eq = specialized
         .iter()
-        .any(|f| graph_calls_object_key_eq(&f.graph));
+        .any(|f| graph_calls_object_key_eq(&f.graph()));
     assert!(
         string_eq,
         "String-key instantiation did not reach <str as PartialEq>::eq"
@@ -64,8 +64,8 @@ fn rdict_string_and_objectkey_instantiations_resolve_distinct_eq() {
     assert!(
         specialized
             .iter()
-            .filter(|f| graph_calls_str_eq(&f.graph))
-            .all(|f| !graph_calls_object_key_eq(&f.graph))
+            .filter(|f| graph_calls_str_eq(&f.graph()))
+            .all(|f| !graph_calls_object_key_eq(&f.graph()))
     );
 }
 
@@ -100,12 +100,12 @@ fn mk_i64_and_string_spec_graphs_have_int_and_ref_returns() {
     assert_ne!(specs[0].name, specs[1].name);
     let mut kinds = Vec::new();
     for spec in &specs {
-        let kind = graph_return_kind(&spec.graph);
+        let kind = graph_return_kind(&spec.graph());
         assert!(
             kind == "Int" || kind == "Ref",
             "{} return kind {kind}, ops {:?}",
             spec.name,
-            op_kinds(&spec.graph)
+            op_kinds(&spec.graph())
         );
         kinds.push(kind);
     }
@@ -132,7 +132,7 @@ fn str_key_eqv_spec_calls_the_str_key_borrow_and_str_eq() {
     let eqv: Vec<_> = program
         .functions
         .iter()
-        .filter(|f| f.name.contains("equivalent__spec_") && graph_calls_str_eq(&f.graph))
+        .filter(|f| f.name.contains("equivalent__spec_") && graph_calls_str_eq(&f.graph()))
         .collect();
     assert!(
         !eqv.is_empty(),
@@ -146,18 +146,18 @@ fn str_key_eqv_spec_calls_the_str_key_borrow_and_str_eq() {
     );
     for spec in &eqv {
         assert!(
-            graph_calls_path(&spec.graph, &["celldict", "StrKey", "borrow"]),
+            graph_calls_path(&spec.graph(), &["celldict", "StrKey", "borrow"]),
             "{} does not call StrKey::borrow: {:?}",
             spec.name,
-            op_kinds(&spec.graph)
+            op_kinds(&spec.graph())
         );
         assert!(
-            !graph_calls_trait_borrow(&spec.graph),
+            !graph_calls_trait_borrow(&spec.graph()),
             "{} still calls the Borrow::borrow trait method",
             spec.name
         );
         assert!(
-            graph_calls_string_eq_impl(&spec.graph),
+            graph_calls_string_eq_impl(&spec.graph()),
             "{} does not call the str eq",
             spec.name
         );
@@ -192,13 +192,13 @@ fn put_unit_spec_graph_drops_the_value_arg() {
             .map(|f| f.name.as_str())
             .collect::<Vec<_>>()
     );
-    let kinds = non_void_input_kinds(&puts[0].graph);
+    let kinds = non_void_input_kinds(&puts[0].graph());
     assert_eq!(
         kinds,
         vec!["Ref"],
         "{} non-void inputs {kinds:?}, ops {:?}",
         puts[0].name,
-        op_kinds(&puts[0].graph)
+        op_kinds(&puts[0].graph())
     );
 }
 
@@ -232,10 +232,10 @@ fn spec_copy_keeps_bare_lltype_malloc_typed() {
             .collect::<Vec<_>>()
     );
     assert!(
-        graph_calls_bare_malloc_typed(&wraps[0].graph),
+        graph_calls_bare_malloc_typed(&wraps[0].graph()),
         "{} dropped the bare malloc_typed call, ops {:?}",
         wraps[0].name,
-        op_kinds(&wraps[0].graph)
+        op_kinds(&wraps[0].graph())
     );
     assert!(
         program

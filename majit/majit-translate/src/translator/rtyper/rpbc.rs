@@ -34,6 +34,7 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::model::{
     BlockId, CallTarget, FunctionGraph as JitFunctionGraph, OpKind, SpaceOperation, ValueType,
 };
+use crate::parse::CallPath;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, DelayedPointer, FuncType, MallocFlavor, Ptr as LLPtr, PtrTarget, Struct,
@@ -333,13 +334,44 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
     lower_indirect_calls_with(graph, call_control, true);
 }
 
+/// What [`lower_indirect_calls_with`] reads to fill an indirect call's
+/// `c_graphs` row: the call family of each `(trait_root, method_name)`, the
+/// builtin-wrapper family, and the result type the family declares.
+pub(crate) trait IndirectCallFamilies {
+    fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath>;
+    fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath];
+    fn declared_result_type_for_indirect(
+        &self,
+        trait_root: &str,
+        method_name: &str,
+    ) -> Option<majit_ir::value::Type>;
+}
+
+impl IndirectCallFamilies for CallControl {
+    fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath> {
+        CallControl::all_impls_for_indirect(self, trait_root, method_name)
+    }
+
+    fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath] {
+        CallControl::builtin_wrapper_indirect_graphs(self)
+    }
+
+    fn declared_result_type_for_indirect(
+        &self,
+        trait_root: &str,
+        method_name: &str,
+    ) -> Option<majit_ir::value::Type> {
+        CallControl::declared_result_type_for_indirect(self, trait_root, method_name)
+    }
+}
+
 /// Same as [`lower_indirect_calls`]. `collapse_unresolved` rewrites an
 /// empty lookup to the unknown family (`graphs: None`). The in-place pass
 /// passes `false` and leaves that marker: the one empty family it still
 /// sees is not registered on any translated graph.
 pub(crate) fn lower_indirect_calls_with(
     graph: &mut JitFunctionGraph,
-    call_control: &CallControl,
+    call_control: &dyn IndirectCallFamilies,
     collapse_unresolved: bool,
 ) {
     // Generated gateway wrappers enter the MIR graph as a plain function-
@@ -6279,21 +6311,6 @@ impl ClassesPBCRepr {
             },
             _ => return Err(unported("s_result is not a SomeInstance")),
         };
-        // The flowspace adapter wraps SyntheticTransparentCtor constants so
-        // Rust aggregate construction keeps the canonical ClassDef but cannot
-        // be mistaken for a semantic class call.  RPython class construction
-        // allocates first (`rtype_new_instance`, rpbc.py) and only
-        // then optionally dispatches `__init__` (rpbc.py).  A Rust
-        // `T { fields }` expresses only the first step; the following setattr
-        // chain expresses its field initializers.  Preserve that boundary even
-        // when method seeding placed a Python-level `__init__` on the class.
-        let transparent_ctor = matches!(
-            hop.args_v.borrow().first(),
-            Some(Hlvalue::Constant(Constant {
-                value: ConstValue::HostObject(host),
-                ..
-            })) if host.transparent_class_target().is_some()
-        );
         // upstream `s_init = classdef.classdesc.s_read_attribute('__init__')`.
         let classdesc = classdef.borrow().classdesc.clone();
         let s_init = ClassDesc::s_read_attribute(&classdesc, "__init__")
@@ -6331,21 +6348,6 @@ impl ClassesPBCRepr {
             if classdef.borrow().minid.is_none() {
                 return Err(unported("class not numbered (assign_inheritance_ids)"));
             }
-        }
-
-        if transparent_ctor && hop.nb_args() == 1 {
-            let v_instance = {
-                let mut llops = hop.llops.borrow_mut();
-                crate::translator::rtyper::rclass::rtype_new_instance(
-                    &rtyper,
-                    Some(&classdef),
-                    &mut llops,
-                    Some(hop),
-                    false,
-                )?
-            };
-            hop.exception_cannot_occur()?;
-            return Ok(Some(v_instance));
         }
 
         // upstream `ClassesPBCRepr.redispatch_call` — a class with

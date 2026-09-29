@@ -102,6 +102,7 @@ fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
     let lookup = MirGraphLookup::from_program(&program);
     let dispatcher = lookup
         .lookup_free("execute_opcode_step")
+        .and_then(|graph| graph.get())
         .expect("execute_opcode_step must lower to one unambiguous free-function graph");
     let switch = dispatcher.block(dispatcher.startblock);
     assert!(

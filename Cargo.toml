@@ -339,6 +339,17 @@ codegen-units = 1
 inherits = "release"
 lto = "thin"
 
+# The core edit-build loop (`pyre/scripts/build-jit-core.sh`). Same
+# optimisation level as `release`, but no cross-crate LTO and parallel,
+# incremental codegen: the release link of `pyre-dynasm` alone (thin LTO,
+# one codegen unit) takes over three minutes per interpreter edit. The
+# product binaries and every gate stay on `release`.
+[profile.jit-core]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true
+
 # The `pyre-jit-trace` build script runs the whole RPython-style translation
 # pipeline (flowspace → annotator → rtyper → codewriter) over the interpreter.
 # Cargo's default build-override profile compiles it at `opt-level = 0`, so that
@@ -346,5 +357,17 @@ lto = "thin"
 # runs unoptimized.
 [profile.release.build-override]
 opt-level = 1
+
+# The translator crates that analysis spends its time in are built at full
+# optimisation even as build dependencies; a named package outranks
+# `build-override`. Measured on the pinned LLBC set: 7.52e11 -> 6.34e11
+# instructions retired for one prepass run.
+[profile.release.package.majit-translate]
+opt-level = 3
+[profile.release.package.majit-charon-reader]
+opt-level = 3
+[profile.release.package.serde_json]
+opt-level = 3
+
 [profile.dev.build-override]
 opt-level = 1

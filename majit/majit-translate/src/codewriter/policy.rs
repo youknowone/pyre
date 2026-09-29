@@ -31,7 +31,6 @@
 use std::collections::HashSet;
 
 use crate::flowspace::model::ConstValue;
-use crate::front::semantic::SemanticFunction;
 use crate::model::{Block, BlockId, FunctionGraph, LinkArg, OpKind, ValueType};
 
 /// policy.py: shared mutable state and the default classifier.
@@ -112,7 +111,12 @@ pub trait JitPolicy {
 
     /// policy.py — return `True` for every function by default.
     /// `StopAtXPolicy` overrides this.
-    fn look_inside_function(&self, _func: &SemanticFunction) -> bool {
+    ///
+    /// Upstream passes `graph.func`. The function object's attributes this
+    /// policy reads live on the graph here: `name`, the `_jit_*_` /
+    /// `_elidable_function_` markers in `hints`, and `func.__module__` in
+    /// `func.module`.
+    fn look_inside_function(&self, _func: &FunctionGraph) -> bool {
         true
     }
 
@@ -122,7 +126,7 @@ pub trait JitPolicy {
     /// opaque) and the `rpython.rtyper.module.*` opaque helpers.  Pyre
     /// has no `rpython.rtyper.module` namespace, so only the `elidable`
     /// hint is consulted.
-    fn _reject_function(&self, func: &SemanticFunction) -> bool {
+    fn _reject_function(&self, func: &FunctionGraph) -> bool {
         if func.hints.iter().any(|h| h == "elidable") {
             return true;
         }
@@ -135,23 +139,19 @@ pub trait JitPolicy {
     /// combine `look_inside_function` and `_reject_function`.  Loops
     /// disqualify a graph unless it is `_jit_unroll_safe_`.  A
     /// reject due to loops is recorded in `unsafe_loopy_graphs`.
-    fn look_inside_graph(&mut self, func: &SemanticFunction) -> bool {
-        let mut contains_loop = !find_backedges(&func.graph).is_empty();
-        let see_function = if let Some(flag) = jit_look_inside_hint(&func.hints) {
+    fn look_inside_graph(&mut self, graph: &FunctionGraph) -> bool {
+        let mut contains_loop = !find_backedges(graph).is_empty();
+        let see_function = if let Some(flag) = jit_look_inside_hint(&graph.hints) {
             // policy.py:56-57: `_jit_look_inside_` override.
             flag
         } else {
-            self.look_inside_function(func) && !self._reject_function(func)
+            self.look_inside_function(graph) && !self._reject_function(graph)
         };
-        // `_jit_unroll_safe_` opts back in despite a loop. Harvested
-        // tokens live on `FunctionGraph.hints` (the BFS carrier);
-        // `func.hints` is the same bag when the caller synthesized the
-        // `SemanticFunction` around a registered graph.
-        contains_loop = contains_loop && !has_unroll_safe(func);
+        contains_loop = contains_loop && !graph.hints.iter().any(|h| h == "unroll_safe");
 
         let res = see_function
             && !contains_unsupported_variable_type(
-                &func.graph,
+                graph,
                 self.state().supports_floats,
                 self.state().supports_longlong,
                 self.state().supports_singlefloats,
@@ -159,7 +159,7 @@ pub trait JitPolicy {
         if res && contains_loop {
             self.state_mut()
                 .unsafe_loopy_graphs
-                .insert(func.name.clone());
+                .insert(graph.name.clone());
         }
         let res = res && !contains_loop;
         // policy.py:71-83 `access_directly` virtualizable safety gate.
@@ -179,25 +179,20 @@ pub trait JitPolicy {
         // virtualizable from the JIT's view; upstream therefore aborts
         // translation loudly. Pyre carries the same flag where upstream
         // does, on the graph: `FunctionGraph::access_directly`, beside
-        // `hints`. It has to live there because this gate is reached from
-        // the codewriter's BFS, which holds a registered `FunctionGraph`
-        // and synthesizes the `SemanticFunction` around it — a field on
-        // the front end's own record never travels here. The flowspace
-        // pipeline writes the flag through `description.rs
-        // default_specialize`; the LLBC path writes it through
-        // `front::semantic::propagate_access_directly`, which walks the op
-        // stream because there is no annotator to carry a flag on an
-        // annotation.
+        // `hints`.
         //
-        // This is the first of upstream's two gates on the flag. The
-        // second, `warmspot.py check_access_directly_sanity`, walks
-        // everything reachable from the entry point and asserts that no
-        // graph outside the JIT graph set is `access_directly`; it has no
-        // port here.
-        if see_function && !res && func.graph.access_directly {
+        // This is the first of upstream's two gates on the flag. Upstream
+        // annotates before `find_all_graphs`; the prepass annotator
+        // (`description.rs default_specialize`) runs after it, so its flag
+        // reaches the second gate, `warmspot.py
+        // check_access_directly_sanity`
+        // (`cutover::check_access_directly_sanity`, after Phase A), which
+        // asserts that no graph outside the JIT graph set is
+        // `access_directly`.
+        if see_function && !res && graph.access_directly {
             panic!(
                 "access_directly on a function which we don't see: {}",
-                func.name
+                graph.name
             );
         }
         // A `false` here is the policy's refusal to let this callee become
@@ -210,9 +205,9 @@ pub trait JitPolicy {
         // measure.
         if !res && crate::decline::enabled() {
             let reason = if !see_function {
-                if jit_look_inside_hint(&func.hints) == Some(false) {
+                if jit_look_inside_hint(&graph.hints) == Some(false) {
                     "dont_look_inside-hint"
-                } else if self._reject_function(func) {
+                } else if self._reject_function(graph) {
                     "elidable-hint"
                 } else {
                     "look_inside_function-said-no"
@@ -227,10 +222,10 @@ pub trait JitPolicy {
                 reason,
                 format_args!(
                     "{}",
-                    func.graph
+                    graph
                         .source_identity
                         .as_deref()
-                        .unwrap_or(func.name.as_str())
+                        .unwrap_or(graph.name.as_str())
                 ),
             );
         }
@@ -290,16 +285,9 @@ impl JitPolicy for StopAtXPolicy {
         &mut self.state
     }
     /// policy.py: `return func not in self.funcs`.
-    fn look_inside_function(&self, func: &SemanticFunction) -> bool {
+    fn look_inside_function(&self, func: &FunctionGraph) -> bool {
         !self.funcs.iter().any(|f| f == &func.name)
     }
-}
-
-/// `_jit_unroll_safe_` on the function, carried on `func.hints` and on
-/// `graph.hints` (the registration carrier the BFS copies).
-fn has_unroll_safe(func: &SemanticFunction) -> bool {
-    func.hints.iter().any(|h| h == "unroll_safe")
-        || func.graph.hints.iter().any(|h| h == "unroll_safe")
 }
 
 /// policy.py:56 `getattr(func, '_jit_look_inside_', ...)`.
@@ -675,20 +663,10 @@ mod tests {
     use super::*;
     use crate::model::FunctionGraph;
 
-    fn make_func(name: &str, hints: Vec<&str>) -> SemanticFunction {
-        SemanticFunction {
-            name: name.into(),
-            graph: FunctionGraph::new(name),
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints: hints.into_iter().map(|h| h.to_string()).collect(),
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        }
+    fn make_func(name: &str, hints: Vec<&str>) -> FunctionGraph {
+        let mut graph = FunctionGraph::new(name);
+        graph.hints = hints.into_iter().map(|h| h.to_string()).collect();
+        graph
     }
 
     #[test]
@@ -722,10 +700,8 @@ mod tests {
     }
 
     /// `policy.py:71-83`: a graph the codewriter refuses to look inside must
-    /// not be `access_directly`. Pins the carrier as well as the gate — the
-    /// flag has to reach here on the `FunctionGraph`, because the production
-    /// caller (`call.rs`) synthesizes the `SemanticFunction` around a
-    /// registered graph and can put nothing else on it.
+    /// not be `access_directly`. Pins the carrier as well as the gate: the
+    /// flag reaches here on the `FunctionGraph`.
     #[test]
     #[should_panic(expected = "access_directly on a function which we don't see")]
     fn access_directly_on_a_loopy_graph_aborts() {
@@ -734,19 +710,7 @@ mod tests {
         let entry = g.startblock;
         g.set_goto(entry, entry, Vec::new());
         g.access_directly = true;
-        policy.look_inside_graph(&SemanticFunction {
-            name: "loopy".into(),
-            graph: g,
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints: vec![],
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        });
+        policy.look_inside_graph(&g);
     }
 
     /// The same graph without the flag is an ordinary decline, not an abort.
@@ -756,19 +720,7 @@ mod tests {
         let mut g = FunctionGraph::new("loopy");
         let entry = g.startblock;
         g.set_goto(entry, entry, Vec::new());
-        assert!(!policy.look_inside_graph(&SemanticFunction {
-            name: "loopy".into(),
-            graph: g,
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints: vec![],
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        }));
+        assert!(!policy.look_inside_graph(&g));
     }
 
     /// `policy.py`: a graph holding a value `history.getkind`
@@ -904,19 +856,7 @@ mod tests {
             },
             true,
         );
-        assert!(!policy.look_inside_graph(&SemanticFunction {
-            name: "wide".into(),
-            graph: g,
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints: vec![],
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        }));
+        assert!(!policy.look_inside_graph(&g));
     }
 
     #[test]
@@ -926,37 +866,13 @@ mod tests {
         let mut g = FunctionGraph::new("loopy");
         let entry = g.startblock;
         g.set_goto(entry, entry, Vec::new());
-        let loopy = SemanticFunction {
-            name: "loopy".into(),
-            graph: g.clone(),
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints: vec![],
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        };
         // Without `unroll_safe`, the loop disqualifies the graph.
-        assert!(!policy.look_inside_graph(&loopy));
+        assert!(!policy.look_inside_graph(&g));
         assert!(policy.state().unsafe_loopy_graphs.contains("loopy"));
 
         // With `unroll_safe`, the loop is ignored.
-        let unroll_safe = SemanticFunction {
-            name: "loopy_safe".into(),
-            graph: g,
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints: vec!["unroll_safe".into()],
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        };
+        let mut unroll_safe = g;
+        unroll_safe.hints = vec!["unroll_safe".into()];
         assert!(policy.look_inside_graph(&unroll_safe));
     }
 
@@ -979,7 +895,7 @@ mod tests {
             fn state_mut(&mut self) -> &mut JitPolicyState {
                 &mut self.0
             }
-            fn look_inside_function(&self, _: &SemanticFunction) -> bool {
+            fn look_inside_function(&self, _: &FunctionGraph) -> bool {
                 false
             }
         }
@@ -1012,9 +928,7 @@ mod tests {
         assert_eq!(edges, vec![(entry.0, entry.0)]);
     }
 
-    /// `FunctionGraph.hints` is the carrier BFS copies onto the synthesized
-    /// `SemanticFunction`. Harvested `unroll_safe` lands there; an empty
-    /// `func.hints` must not hide it.
+    /// Harvested `unroll_safe` lands on `FunctionGraph.hints`.
     #[test]
     fn unroll_safe_on_graph_hints_opts_in_a_loop() {
         let mut policy = DefaultJitPolicy::new();
@@ -1022,19 +936,7 @@ mod tests {
         let entry = g.startblock;
         g.set_goto(entry, entry, Vec::new());
         g.hints = vec!["unroll_safe".into()];
-        assert!(policy.look_inside_graph(&SemanticFunction {
-            name: "loopy".into(),
-            graph: g,
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints: vec![],
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        }));
+        assert!(policy.look_inside_graph(&g));
     }
 
     /// `iterblocks()` never yields a block the startblock cannot reach.
@@ -1049,19 +951,7 @@ mod tests {
         g.set_goto(orphan, orphan, Vec::new());
         assert!(find_backedges(&g).is_empty());
         let mut policy = DefaultJitPolicy::new();
-        assert!(policy.look_inside_graph(&SemanticFunction {
-            name: "linear".into(),
-            graph: g,
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints: vec![],
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        }));
+        assert!(policy.look_inside_graph(&g));
     }
 
     /// A `dead` stub (orphan `on_unwind` cleanup) may still have a
@@ -1076,18 +966,6 @@ mod tests {
         g.block_mut(dead).dead = true;
         assert!(find_backedges(&g).is_empty());
         let mut policy = DefaultJitPolicy::new();
-        assert!(policy.look_inside_graph(&SemanticFunction {
-            name: "dead_loop".into(),
-            graph: g,
-            return_type: None,
-            self_ty_root: None,
-            trait_impl_id: None,
-            fun_decl_id: None,
-            hints: vec![],
-            module_path: String::new(),
-            trait_root: None,
-            trait_qualified: None,
-            returns_objectptr: false,
-        }));
+        assert!(policy.look_inside_graph(&g));
     }
 }

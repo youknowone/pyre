@@ -78,7 +78,7 @@ fn find_inline_sites(graph: &FunctionGraph, call_control: &CallControl) -> Vec<I
                 continue;
             }
             let callee = match call_control.direct_graph_for(target) {
-                Some(g) => g.clone(),
+                Some(g) => FunctionGraph::clone(&g),
                 None => continue,
             };
             sites.push(InlineSite {
