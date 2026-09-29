@@ -779,6 +779,9 @@ struct FrameWriteBarrier {
     type_idx: u32,
     flag_byteofs: i32,
     if_flag: u8,
+    /// Function index of the outlined body. `None` emits the body here,
+    /// which is also how that function is built.
+    helper: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -2689,6 +2692,13 @@ fn emit_frame_write_barrier(sink: &mut PeepSink<'_, '_>) {
     let Some(wb) = sink.frame_wb else {
         return;
     };
+    // The flag test does not depend on the call site. A hot trace calls one
+    // copy of this body; local 0 is the items base on both sides.
+    if let Some(helper) = wb.helper {
+        sink.local_get(0);
+        sink.call(helper);
+        return;
+    }
     sink.local_get(0);
     sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_sub();
@@ -5580,6 +5590,88 @@ pub(crate) fn build_wasm_module_reporting_shortage(
             Vec::new(),
         );
     }
+    // After the spill types so neither a residual `call_indirect` nor a spill
+    // function's type index moves. The body is `(param i32)`: the items base.
+    let frame_wb_sites = if wb.fn_ptr != 0
+        && residual_max_arity.is_some()
+        && (ca.jf_top_addr.is_some() || ca.ca_reload_fn_ptr != 0 || ca.emit_ca)
+    {
+        analysis_ops.iter().filter(|op| collecting_site(op)).count()
+    } else {
+        0
+    };
+    let frame_wb_type_idx = if outline_frame_write_barrier(frame_wb_sites) {
+        let idx = next_type_idx;
+        next_type_idx += 1;
+        types.ty().function(vec![ValType::I32], vec![]);
+        Some(idx)
+    } else {
+        None
+    };
+    // After the frame-barrier type, for the same reason: a later family must
+    // not shift either helper's type index. The blob is a host box, not a
+    // wasm data segment, so declaring the type does not put it in the module.
+    let mut inline_fail: Vec<u32> = emitted_bridges
+        .iter()
+        .map(|bridge| fail_index_base.wrapping_add(bridge.source_fail_index))
+        .collect();
+    inline_fail.sort_unstable();
+    let planned_guard_exits = plan_guard_exit_outline(
+        analysis_ops,
+        inputargs,
+        &ref_homes,
+        *frame,
+        constants,
+        *gc_table_base,
+        &gc_table_bases,
+        ca.exit_table_base,
+        *fail_index_base,
+        *invalidated_flag_addr,
+        &inline_fail,
+    );
+    let guard_exit_addrs = if planned_guard_exits.save > GUARD_EXIT_OUTLINE_COST
+        && !planned_guard_exits.words.is_empty()
+    {
+        let base = crate::release::park_guard_exit_blob(
+            ca.gcmap_sink,
+            planned_guard_exits.words.into_boxed_slice(),
+        );
+        // A zero address is the inline sentinel (`emit_outlined_guard_exit`).
+        // `exit_table_base == 0` never reaches here; this only rejects a box
+        // whose low 32 bits are zero.
+        if base == 0 {
+            None
+        } else {
+            Some(
+                planned_guard_exits
+                    .rel
+                    .into_iter()
+                    .map(|off| {
+                        if off == u32::MAX {
+                            0
+                        } else {
+                            base.wrapping_add(off)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+    } else {
+        None
+    };
+    let guard_exit_type_idx = if guard_exit_addrs.is_some() {
+        let idx = next_type_idx;
+        next_type_idx += 1;
+        types
+            .ty()
+            .function(vec![ValType::I32, ValType::I32, ValType::I64], vec![]);
+        Some(idx)
+    } else {
+        None
+    };
+    // These types are last in the section. Keep the cursor consumed so a later
+    // family cannot reuse an index.
+    let _ = next_type_idx;
     module.section(&types);
 
     // Import section
@@ -5635,6 +5727,12 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         functions.function(bridge_entry_type_idx.unwrap_or(0));
     }
     for &type_idx in &spill_helper_type_indices {
+        functions.function(type_idx);
+    }
+    if let Some(type_idx) = frame_wb_type_idx {
+        functions.function(type_idx);
+    }
+    if let Some(type_idx) = guard_exit_type_idx {
         functions.function(type_idx);
     }
     module.section(&functions);
@@ -5721,6 +5819,13 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         label_param_entry,
         inline_trip.map(|probe| (probe, inline_trip_type_idx)),
         &spill_helper_indices,
+        frame_wb_type_idx.map(|_| first_spill_func_idx + spill_arities.len() as u32),
+        guard_exit_addrs.as_deref().map(|addrs| GuardExitOutline {
+            func: first_spill_func_idx
+                + spill_arities.len() as u32
+                + u32::from(frame_wb_type_idx.is_some()),
+            addrs,
+        }),
     )?;
     if label_param_entry {
         codes.function(&build_label_param_shim(*frame, trace_func_idx + 1));
@@ -5728,6 +5833,18 @@ pub(crate) fn build_wasm_module_reporting_shortage(
     codes.function(&func);
     for &arity in &spill_arities {
         codes.function(&build_spill_helper(arity));
+    }
+    if frame_wb_type_idx.is_some() {
+        codes.function(&build_frame_wb_helper(FrameWriteBarrier {
+            fn_ptr: wb.fn_ptr,
+            type_idx: residual_type_base + 1,
+            flag_byteofs: wb.flag_byteofs,
+            if_flag: wb.if_flag,
+            helper: None,
+        }));
+    }
+    if guard_exit_type_idx.is_some() {
+        codes.function(&build_guard_exit_helper());
     }
     module.section(&codes);
 
@@ -5763,6 +5880,20 @@ fn build_label_param_shim(frame: FrameGeometry, wide_func_idx: u32) -> Function 
 /// function's own fixed cost near 0.06 ms, about forty instructions of body.
 /// Charging it here keeps the near-break-even counts out.
 const SPILL_HELPER_FIXED_INSTRS: usize = 40;
+
+/// Operators in the inline frame-barrier body (`emit_frame_write_barrier`
+/// with no helper), and in the `local.get 0; call` site that replaces it.
+const FRAME_WB_BODY_OPS: usize = 17;
+const FRAME_WB_CALL_OPS: usize = 2;
+
+/// `_reload_frame_if_necessary` tails into `_write_barrier_fastpath` at every
+/// collecting site. The flag test and the helper `call_indirect` do not
+/// depend on which call just returned, so one `(param i32)` function can hold
+/// them. Admitted only when the copied operators pay for that function; the
+/// fixed cost is [`SPILL_HELPER_FIXED_INSTRS`].
+fn outline_frame_write_barrier(sites: usize) -> bool {
+    sites * (FRAME_WB_BODY_OPS - FRAME_WB_CALL_OPS) > FRAME_WB_BODY_OPS + SPILL_HELPER_FIXED_INSTRS
+}
 
 /// Fail-argument counts worth a shared spill function, from the guard exits
 /// this module is about to emit.
@@ -5833,6 +5964,311 @@ fn build_spill_helper(arity: usize) -> Function {
     func
 }
 
+/// The outlined `_write_barrier_fastpath` for a frame. Parameter 0 is the
+/// items base the trace passes from local 0.
+fn build_frame_wb_helper(wb: FrameWriteBarrier) -> Function {
+    let mut func = Function::new(Vec::new());
+    let mut raw_sink = func.instructions();
+    let mut sink = PeepSink::new(&mut raw_sink);
+    sink.frame_wb = Some(FrameWriteBarrier { helper: None, ..wb });
+    emit_frame_write_barrier(&mut sink);
+    sink.end();
+    sink.flush();
+    drop(sink);
+    func
+}
+
+/// Homes one outlined guard exit can name. Past this the exit stays inline.
+const GUARD_EXIT_MAX_HOMES: usize = 48;
+const GUARD_EXIT_FLAG_EXC: u32 = 1;
+const GUARD_EXIT_FLAG_COUNTER: u32 = 2;
+/// Byte offset of the source-home array inside a record. The header is
+/// `n, flags, exit_word_addr, counter_ofs` (four u32s).
+const GUARD_EXIT_SRC_BYTE: u32 = 16;
+const GUARD_EXIT_DEST_BYTE: u32 = GUARD_EXIT_SRC_BYTE + (GUARD_EXIT_MAX_HOMES as u32) * 4;
+const GUARD_EXIT_REC_WORDS: usize = 4 + 2 * GUARD_EXIT_MAX_HOMES;
+/// Body of [`build_guard_exit_helper`] plus [`SPILL_HELPER_FIXED_INSTRS`].
+/// Padded past the counted operators so a handful of exits does not admit
+/// a function that fails to pay for itself.
+const GUARD_EXIT_OUTLINE_COST: usize = 160;
+
+/// `(param i32 frame, i32 record, i64 counter) -> ()`.
+///
+/// A failing guard used to reload every fail-arg home, call the positional
+/// spill helper, then reload `jf_descr` / `jf_gcmap` from the exit table.
+/// Those runs are most of a pickle trace module: dynasm patches
+/// `emit_op_guard_not_invalidated` into a NOP (`invalidate_loop`), and wasm
+/// has to spill on the cold edge instead. The homes and the two header
+/// words differ per exit only in their immediates, so one helper reads them
+/// from a host box parked like [`crate::release::LoopAsmResources::exit_table`].
+/// The bridge-cell `local.set` and the `br` stay at the site: a callee cannot
+/// write the caller's locals or branch to the caller's block.
+fn build_guard_exit_helper() -> Function {
+    // params: 0 frame, 1 record, 2 counter value. Locals: 3 index, 4 count, 5 value.
+    let mut func = Function::new(vec![(2, ValType::I32), (1, ValType::I64)]);
+    let mut raw_sink = func.instructions();
+    let mut sink = PeepSink::new(&mut raw_sink);
+
+    sink.local_get(1);
+    sink.i32_load(mem32(0));
+    sink.local_set(4);
+    sink.i32_const(0);
+    sink.local_set(3);
+    sink.block(BlockType::Empty);
+    sink.loop_(BlockType::Empty);
+    sink.local_get(3);
+    sink.local_get(4);
+    sink.i32_lt_u();
+    sink.i32_eqz();
+    sink.br_if(1);
+    sink.local_get(1);
+    sink.local_get(3);
+    sink.i32_const(2);
+    sink.i32_shl();
+    sink.i32_add();
+    sink.i32_load(mem32(GUARD_EXIT_SRC_BYTE as u64));
+    sink.local_get(0);
+    sink.i32_add();
+    sink.i64_load(mem64(0));
+    sink.local_set(5);
+    sink.local_get(0);
+    sink.local_get(1);
+    sink.local_get(3);
+    sink.i32_const(2);
+    sink.i32_shl();
+    sink.i32_add();
+    sink.i32_load(mem32(GUARD_EXIT_DEST_BYTE as u64));
+    sink.i32_add();
+    sink.local_get(5);
+    sink.i64_store(mem64(0));
+    sink.local_get(3);
+    sink.i32_const(1);
+    sink.i32_add();
+    sink.local_set(3);
+    sink.br(0);
+    sink.end();
+    sink.end();
+
+    sink.local_get(1);
+    sink.i32_load(mem32(4));
+    sink.i32_const(GUARD_EXIT_FLAG_COUNTER as i32);
+    sink.i32_and();
+    sink.if_(BlockType::Empty);
+    sink.local_get(0);
+    sink.local_get(1);
+    sink.i32_load(mem32(12));
+    sink.i32_add();
+    sink.local_get(2);
+    sink.i64_store(mem64(0));
+    sink.end();
+
+    emit_dynamic_exit_header(&mut sink, majit_backend::jitframe::JF_DESCR_OFS as u64, 0);
+    emit_dynamic_exit_header(&mut sink, majit_backend::jitframe::JF_GCMAP_OFS as u64, 4);
+
+    sink.local_get(1);
+    sink.i32_load(mem32(4));
+    sink.i32_const(GUARD_EXIT_FLAG_EXC as i32);
+    sink.i32_and();
+    sink.if_(BlockType::Empty);
+    emit_store_guard_exc_raw(&mut sink);
+    sink.end();
+
+    sink.end();
+    sink.flush();
+    drop(sink);
+    func
+}
+
+/// `jf_descr` / `jf_gcmap` from the record's exit-word address. Word 0 is
+/// the descr cell; word 1 is four bytes later, matching
+/// [`emit_load_exit_word`]'s wasm32 stride.
+fn emit_dynamic_exit_header(sink: &mut PeepSink<'_, '_>, field: u64, word_byte: u32) {
+    emit_header_base(sink);
+    sink.local_get(1);
+    sink.i32_load(mem32(8));
+    if word_byte != 0 {
+        sink.i32_const(word_byte as i32);
+        sink.i32_add();
+    }
+    sink.i32_load(mem32(0));
+    sink.i32_store(memarg(field, 2));
+}
+
+/// Byte offset of a fail arg `emit_resolve_failarg` would load from a Ref
+/// home, or `None` when the exit resolves it any other way.
+fn home_load_offset(
+    opref: OpRef,
+    gc_table_slots: &HashMap<u32, (u32, i64)>,
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
+) -> Option<u64> {
+    if opref.is_none() || opref.is_constant() {
+        return None;
+    }
+    // `emit_resolve_failarg` prefers a preamble `LoadFromGcTable` over the home.
+    if gc_table_slots.contains_key(&opref.raw()) {
+        return None;
+    }
+    let home = ref_homes.home(opref)?;
+    Some(frame.home_ofs(home as u64))
+}
+
+fn guard_exit_emits_spill(
+    op: &Op,
+    guard_idx: u32,
+    inline_fail: &[u32],
+    invalidated_flag_addr: u32,
+) -> bool {
+    if inline_fail.binary_search(&guard_idx).is_ok() {
+        return false;
+    }
+    if matches!(op.opcode, OpCode::Finish | OpCode::GuardNotForced2) {
+        return false;
+    }
+    if op.opcode == OpCode::GuardNotInvalidated && invalidated_flag_addr == 0 {
+        return false;
+    }
+    op.opcode.is_guard()
+}
+
+/// Smaller of the two inline shapes: the spill-helper call, not the direct
+/// stores. Direct stores are larger, so this under-admits them.
+fn guard_exit_outline_save(n: usize, exc: bool, counter: bool) -> usize {
+    let inline = 2 * n + 14 + usize::from(exc) * 13 + usize::from(counter) * 3;
+    let site = 4 + usize::from(counter);
+    inline.saturating_sub(site)
+}
+
+struct PlannedGuardExits {
+    /// Per guard-local index, byte offset of the record in [`Self::words`],
+    /// or `u32::MAX` when that exit stays inline.
+    rel: Vec<u32>,
+    words: Vec<u32>,
+    save: usize,
+}
+
+fn plan_guard_exit_outline(
+    ops: &[Op],
+    inputargs: &[InputArgRc],
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
+    constants: &indexmap::IndexMap<u32, i64>,
+    gc_table_base: u32,
+    gc_table_bases: &HashMap<u32, u32>,
+    exit_table_base: u32,
+    fail_index_base: u32,
+    invalidated_flag_addr: u32,
+    inline_fail: &[u32],
+) -> PlannedGuardExits {
+    if exit_table_base == 0 {
+        return PlannedGuardExits {
+            rel: Vec::new(),
+            words: Vec::new(),
+            save: 0,
+        };
+    }
+    let gc_table_slots = gc_table_failarg_slots(ops, constants, gc_table_base, gc_table_bases);
+    let counter_slot = counter_slot(inputargs, ops);
+    let mut rel = Vec::new();
+    let mut words = Vec::new();
+    let mut save = 0usize;
+    let mut guard_idx = fail_index_base;
+    for op in ops {
+        if !(op.opcode.is_guard() || op.opcode == OpCode::Finish) {
+            continue;
+        }
+        let outlined = guard_exit_emits_spill(op, guard_idx, inline_fail, invalidated_flag_addr)
+            .then(|| {
+                outline_guard_record(
+                    op,
+                    guard_idx,
+                    fail_index_base,
+                    exit_table_base,
+                    &gc_table_slots,
+                    ref_homes,
+                    frame,
+                    counter_slot,
+                )
+            })
+            .flatten();
+        if let Some((record, site_save)) = outlined {
+            rel.push((words.len() * 4) as u32);
+            words.extend(record);
+            save += site_save;
+        } else {
+            rel.push(u32::MAX);
+        }
+        guard_idx += 1;
+    }
+    PlannedGuardExits { rel, words, save }
+}
+
+fn outline_guard_record(
+    op: &Op,
+    guard_idx: u32,
+    fail_index_base: u32,
+    exit_table_base: u32,
+    gc_table_slots: &HashMap<u32, (u32, i64)>,
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
+    counter_slot: Option<usize>,
+) -> Option<(Vec<u32>, usize)> {
+    let args = live_exit_fail_args(op);
+    if args.len() > GUARD_EXIT_MAX_HOMES {
+        return None;
+    }
+    let mut srcs = Vec::with_capacity(args.len());
+    let mut dests = Vec::with_capacity(args.len());
+    for (i, arg) in args.iter().enumerate() {
+        let src = home_load_offset(*arg, gc_table_slots, ref_homes, frame)?;
+        let dest = frame.spill_slot_ofs(i as u64);
+        srcs.push(u32::try_from(src).ok()?);
+        dests.push(u32::try_from(dest).ok()?);
+    }
+    let counter = counter_value_spill(op, &exit_fail_args(op)).zip(counter_slot);
+    let counter_ofs = match counter {
+        Some((_, slot)) => Some(u32::try_from(frame.spill_slot_ofs(slot as u64)).ok()?),
+        None => None,
+    };
+    let exc = matches!(
+        op.opcode,
+        OpCode::GuardNoException | OpCode::GuardException | OpCode::GuardNotForced
+    );
+    let mut flags = 0u32;
+    if exc {
+        flags |= GUARD_EXIT_FLAG_EXC;
+    }
+    if counter_ofs.is_some() {
+        flags |= GUARD_EXIT_FLAG_COUNTER;
+    }
+    let local = (guard_idx - fail_index_base) as usize;
+    // `emit_load_exit_word` addresses pair `local` as two wasm32 words.
+    let exit_addr = exit_table_base.wrapping_add((local * 2 * 4) as u32);
+    let mut record = vec![0u32; GUARD_EXIT_REC_WORDS];
+    record[0] = srcs.len() as u32;
+    record[1] = flags;
+    record[2] = exit_addr;
+    record[3] = counter_ofs.unwrap_or(0);
+    let src_base = (GUARD_EXIT_SRC_BYTE / 4) as usize;
+    let dest_base = (GUARD_EXIT_DEST_BYTE / 4) as usize;
+    for (i, src) in srcs.iter().enumerate() {
+        record[src_base + i] = *src;
+    }
+    for (i, dest) in dests.iter().enumerate() {
+        record[dest_base + i] = *dest;
+    }
+    let site_save = guard_exit_outline_save(srcs.len(), exc, counter_ofs.is_some());
+    Some((record, site_save))
+}
+
+/// Absolute guest addresses of outlined records, indexed by
+/// `guard_idx - fail_index_base`. Zero keeps that exit inline.
+#[derive(Clone, Copy)]
+struct GuardExitOutline<'a> {
+    func: u32,
+    addrs: &'a [u32],
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_function(
     entry_inputargs: &[InputArgRc],
@@ -5898,6 +6334,8 @@ fn build_function(
     label_param_entry: bool,
     inline_trip: Option<(InlineTripProbe, u32)>,
     spill_helper_indices: &indexmap::IndexMap<usize, u32>,
+    frame_wb_func_idx: Option<u32>,
+    guard_exit_outline: Option<GuardExitOutline<'_>>,
 ) -> Result<Function, BackendError> {
     // The CA arm requires residual types (the setup above forces arity >= 2
     // whenever it is emitted). Its `jit_call` fallback branches are retained
@@ -6126,6 +6564,7 @@ fn build_function(
         const_tables: &const_tables,
         const_table_base: gc_table_base,
         attached: ca.attached,
+        guard_exit: guard_exit_outline,
     };
     let mut locals = Vec::new();
     let mut start = 0;
@@ -6168,6 +6607,7 @@ fn build_function(
             type_idx: base + 1,
             flag_byteofs: wb.flag_byteofs,
             if_flag: wb.if_flag,
+            helper: frame_wb_func_idx,
         });
     }
 
@@ -11101,6 +11541,9 @@ struct BridgeDispatch<'a> {
     const_table_base: u32,
     /// See [`CaParams::attached`].
     attached: majit_backend::AttachedDescrPtrs,
+    /// Outlined cold exit, when the module admitted one helper for every
+    /// home-backed spill. `None` keeps each exit inline.
+    guard_exit: Option<GuardExitOutline<'a>>,
 }
 
 fn emit_guard_true(
@@ -11704,6 +12147,48 @@ fn emit_force_arm(
     }
 }
 
+fn emit_outlined_guard_exit(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    op: &Op,
+    guard_idx: u32,
+    dispatch: BridgeDispatch<'_>,
+) -> bool {
+    let Some(outline) = dispatch.guard_exit else {
+        return false;
+    };
+    let local = guard_idx.wrapping_sub(dispatch.fail_index_base) as usize;
+    let Some(&addr) = outline.addrs.get(local) else {
+        return false;
+    };
+    if addr == 0 {
+        return false;
+    }
+    sink.local_get(0);
+    sink.i32_const(addr as i32);
+    if let Some(operand) = counter_value_spill(op, &exit_fail_args(op))
+        .zip(dispatch.counter_slot)
+        .map(|(operand, _)| operand)
+    {
+        emit_resolve_failarg(
+            sink,
+            constants,
+            value_types,
+            operand,
+            dispatch.gc_table_slots,
+            dispatch.ref_homes,
+            dispatch.frame,
+            dispatch.const_tables,
+            dispatch.const_table_base,
+        );
+    } else {
+        sink.i64_const(0);
+    }
+    sink.call(outline.func);
+    true
+}
+
 fn emit_guard_spill(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -11719,6 +12204,9 @@ fn emit_guard_spill(
     const_table_base: u32,
     dispatch: BridgeDispatch<'_>,
 ) {
+    if emit_outlined_guard_exit(sink, constants, value_types, op, guard_idx, dispatch) {
+        return;
+    }
     emit_guard_fail_args_spill(
         sink,
         constants,
@@ -11748,6 +12236,13 @@ fn emit_store_guard_exc(sink: &mut PeepSink<'_, '_>, op: &Op) {
     ) {
         return;
     }
+    emit_store_guard_exc_raw(sink);
+}
+
+/// `llsupport/assembler.py` `must_save_exception` body. The outlined helper
+/// calls this when the record's exc flag is set; the opcode test stays at
+/// the inline site.
+fn emit_store_guard_exc_raw(sink: &mut PeepSink<'_, '_>) {
     let exc_value_addr = runtime_addr(crate::jit_exc_value_addr);
     let exc_type_addr = runtime_addr(crate::jit_exc_type_addr);
     sink.local_get(0);
@@ -13143,6 +13638,7 @@ mod tests {
             const_tables: &const_tables,
             const_table_base: 0,
             attached: majit_backend::AttachedDescrPtrs::default(),
+            guard_exit: None,
         };
 
         assert_eq!(inline_region_br_depth(&inline, &dispatch, 0), 0);

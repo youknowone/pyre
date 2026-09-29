@@ -50,6 +50,11 @@ pub struct LoopAsmResources {
     /// `[descr_cell, gcmap]` pairs the exit loads. The address is baked
     /// into the module; the allocation does not move.
     pub exit_table: Option<Box<[usize]>>,
+    /// Home-offset records the outlined guard exit reads. One box per
+    /// module that admitted the helper. The address is baked into the
+    /// trace; an active wasm data segment is not used, because it would
+    /// be mapped into the guest heap.
+    pub guard_exit_blobs: Vec<Box<[u32]>>,
     /// Deferred merges whose out-of-line bridges this emission compiled.
     /// Pushed with the bridge onto the original loop token
     /// (`push_resources`; `assembler.py` keeps bridge blocks on
@@ -153,6 +158,21 @@ pub fn park_gcmap_raw(sink: usize, map: Box<[usize]>) -> usize {
     // returns.
     let resources = unsafe { &mut *(sink as *mut LoopAsmResources) };
     resources.park_gcmap(map)
+}
+
+/// Park the outlined guard-exit blob and return the guest address baked
+/// into the module. A null sink leaks, the same way [`park_gcmap_raw`] does
+/// for a direct codegen test.
+pub fn park_guard_exit_blob(sink: usize, words: Box<[u32]>) -> u32 {
+    let addr = words.as_ptr() as usize as u32;
+    if sink == 0 {
+        Box::leak(words);
+        return addr;
+    }
+    // SAFETY: same borrow as [`park_gcmap_raw`].
+    let resources = unsafe { &mut *(sink as *mut LoopAsmResources) };
+    resources.guard_exit_blobs.push(words);
+    addr
 }
 
 pub fn push_resources(token: &JitCellToken, resources: LoopAsmResources) {
