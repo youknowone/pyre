@@ -8175,10 +8175,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::IntCall, || {
-            try_walker_specialize_int_call(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
+        && try_walker_orthodox_int_call(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }

@@ -13775,13 +13775,11 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
 
 /// `int(x)` for an exact float whose truncated value fits a machine Signed.
 ///
-/// PyPy `floatobject.py:newint_from_float` first runs
-/// `ovfcheck_float_to_int`; its success arm is exactly
-/// `CAST_FLOAT_TO_INT + space.newint`.  Emit that arm with the corresponding
-/// `-2**63 <= x < 2**63` guards, leaving NaN, infinity, out-of-range values,
-/// subclasses, and rebound constructors on the ordinary residual path.  The
-/// slow arm remains responsible for `newlong_from_float` and its exceptions.
-pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
+/// The `-2**63 <= x < 2**63` guards run first. The success arm walks
+/// `_int_from_trunc` (`to_int_unchecked` plus the managed int alloc).
+/// NaN, infinity, out-of-range values, subclasses, and rebound
+/// constructors stay on the residual, which owns `newlong_from_float`.
+pub(crate) fn try_walker_orthodox_int_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
@@ -13820,8 +13818,8 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
     if !unsafe { pyre_object::is_int(boxed_result) } {
         return Ok(None);
     }
-    let result_value = unsafe { pyre_object::w_int_get_value(boxed_result) };
 
+    let pre_guards = ctx.trace_ctx.get_trace_position();
     walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let arg_op = r_args[2];
     let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
@@ -13843,17 +13841,31 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
     walker_float_cmp_guard(ctx, op.pc, OpCode::FloatGe, &[raw_float, low], true)?;
     walker_float_cmp_guard(ctx, op.pc, OpCode::FloatLt, &[raw_float, high], true)?;
 
-    let raw_int = ctx
-        .trace_ctx
-        .record_op(OpCode::CastFloatToInt, &[raw_float]);
-    ctx.trace_ctx
-        .set_opref_concrete(raw_int, majit_ir::Value::Int(result_value));
-    let boxed = walker_box_int(ctx, op.pc, raw_int, result_value)?;
-    ctx.trace_ctx
-        .set_opref_concrete(boxed, box_int_concrete(result_value, boxed_result as i64));
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    if try_walker_orthodox_descent(
+        ctx,
+        op.pc,
+        &[],
+        &[],
+        &[(raw_float, value)],
+        dst,
+        'r',
+        &INT_FROM_TRUNC_DESCENT,
+    )?
+    .is_none()
+    {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_guards);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
     Ok(Some(()))
 }
+
+const INT_FROM_TRUNC_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_int_from_trunc",
+    commit_label: "int_from_trunc_commit",
+    call_site_label: "int_from_trunc_call_site",
+    decline_tag: "INT-FROM-TRUNC-SUBWALK",
+};
 
 /// Read a plain `bh_call_fn(callable, PY_NULL, args…)` shape's concrete
 /// operands.  `None` means the call is not that shape — a bound receiver in
