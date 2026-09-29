@@ -934,8 +934,8 @@ mod range_iter_tests {
 /// `compute_range_length`) and read back by `descr_len` / `descr_bool`.
 // Explicit `type_id` (not auto): `RANGE_DESCR_GROUP` in pyre-jit-trace bakes
 // `W_RANGE_GC_TYPE_ID` at compile time to virtualize range GET_ITER/FOR_ITER,
-// so the tid must be a const. 118 is the tail registration slot (right after
-// W_Enumerate = 117); register_pyre_class drift-checks it against the runtime
+// so the tid must be a const. 117 is the tail registration slot (right after
+// W_Enumerate = 116); register_pyre_class drift-checks it against the runtime
 // assignment order.
 #[pyre_class("range", type_id = 112, static_name = "RANGE")]
 pub struct W_Range {
