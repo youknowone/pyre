@@ -5161,15 +5161,22 @@ impl<M: Clone> MetaInterp<M> {
     /// (greens prepended as positional placeholders), matching RPython's
     /// `original_boxes[num_green_args + index_of_virtualizable]` read.
     ///
-    /// Split at `vinfo.clear_vable_token` so a parked recorder in
-    /// `compile_tracing` is not mutably borrowed across the collection
-    /// in `force_now`. Driver-descriptor numbers are read first;
-    /// [`Self::initialize_virtualizable_force`] may collect and does not
-    /// touch the ctx; [`Self::initialize_virtualizable_write_ctx`] writes
-    /// the ctx and does not borrow `MetaInterp`.
-    fn initialize_virtualizable(&mut self, ctx: &mut TraceCtx, live_values: &[Value]) {
-        let (num_green_args, virtualizable_arg_index, num_reds) =
-            Self::initialize_virtualizable_driver_layout(ctx);
+    /// The caller has stored this trace in `self.tracing`.
+    /// [`Self::initialize_virtualizable_force`] may collect inside
+    /// `clear_vable_token` and does not borrow the ctx, so
+    /// `walk_active_trace_refs` can forward `initial_inputarg_consts`
+    /// during that collection. [`Self::initialize_virtualizable_write_ctx`]
+    /// writes the ctx afterwards and does not borrow `MetaInterp`.
+    /// `initialize_state_from_start` parks the same ctx in
+    /// `compile_tracing` and calls the two halves itself.
+    fn initialize_virtualizable(&mut self, live_values: &[Value]) {
+        let Some((num_green_args, virtualizable_arg_index, num_reds)) = self
+            .tracing
+            .as_ref()
+            .map(Self::initialize_virtualizable_driver_layout)
+        else {
+            return;
+        };
         let Some(state) = self.initialize_virtualizable_force(
             live_values,
             num_green_args,
@@ -5178,7 +5185,9 @@ impl<M: Clone> MetaInterp<M> {
         ) else {
             return;
         };
-        Self::initialize_virtualizable_write_ctx(ctx, state, live_values);
+        if let Some(ctx) = self.tracing.as_mut() {
+            Self::initialize_virtualizable_write_ctx(ctx, state, live_values);
+        }
     }
 
     /// `driver_descriptor()` numbers `initialize_virtualizable` needs
@@ -5514,14 +5523,13 @@ impl<M: Clone> MetaInterp<M> {
         } = state;
 
         if !virtualizable_ptr.is_null() {
-            // Both `force_start_tracing` and `setup_tracing` call this
-            // before `self.tracing = Some(ctx)`. Write the forwarded
-            // pointer onto the ctx being initialized, not the empty slot.
+            // `clear_vable_token` reloaded this pointer from the shadow
+            // stack. The caller already published the ctx on `self.tracing`,
+            // or parked it in `compile_tracing` (`initialize_state_from_start`).
             ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
-            // `initial_inputarg_consts` was copied from `live_values` before
-            // this force. `walk_active_trace_refs` cannot forward those
-            // ConstPtrs until `self.tracing` is assigned.
-            // `orig_vable_ptr_from_trace_ctx` reads that slot first.
+            // A minor during that force forwarded the ConstPtr interned
+            // from `live_values`. `orig_vable_ptr_from_trace_ctx` reads
+            // this slot, so store the reloaded address over the pre-force one.
             let vable_const_index = virtualizable_arg_index.unwrap_or(index_of_virtualizable);
             if let Some(OpRef::ConstPtr(index)) =
                 ctx.initial_inputarg_consts.get(vable_const_index).copied()
@@ -6299,13 +6307,6 @@ impl<M: Clone> MetaInterp<M> {
                 // is the parallel trace-start entry point and must keep the
                 // same invariant.
                 self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
-                // initialize_virtualizable establishes the virtualizable heap pointer.
-                self.initialize_virtualizable(&mut ctx, live_values);
-                // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
-                // runs after `initialize_state_from_start`, which has already
-                // appended `virtualizable_boxes` onto `original_boxes`. Attach
-                // here so `Trace(max_num_inputargs)` sees the full cap.
-                ctx.attach_live_byte_recorder();
                 // `prepare_trace_segmenting` writes `JC_FORCE_FINISH` through
                 // `current_merge_points[0]`. The seed below copies
                 // `green_key_values`; without them the hash form files a
@@ -6317,26 +6318,21 @@ impl<M: Clone> MetaInterp<M> {
                 {
                     ctx.set_green_key_values(key);
                 }
-                // pyjitpl.py `_compile_and_run_once` — see `setup_tracing`.
-                ctx.seed_compile_and_run_once_merge_point();
                 // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
                 // & JC_FORCE_FINISH)` on the cell `maybe_compile_and_run` already
                 // matched. The typed door is that cell; the hash read misses it
                 // when the bucket has two owners.
-                self.force_finish_trace = {
+                let force_finish = {
                     let hashed = self.warm_state.should_force_finish_tracing(green_key);
                     let typed = Self::with_typed_decision_key(entry_hash, green_key_raw, |key| {
                         self.warm_state.should_force_finish_tracing_for_key(key)
                     });
                     typed.unwrap_or(false) || hashed
                 };
-                ctx.set_force_finish(self.force_finish_trace);
-                // pyjitpl.py _opimpl_getfield_gc_any_pureornot `self.metainterp.cpu` analog —
-                // see `setup_tracing` for the contract on raw-pointer
-                // lifetime pinning by MetaInterp ownership.
-                ctx.set_cpu(Some(&self.backend));
-                self.tracing = Some(ctx);
-                self.arm_portal_trace_positions();
+                // Store the ctx before `initialize_virtualizable`.
+                // `clear_vable_token` can minor-collect, and
+                // `walk_active_trace_refs` only sees `self.tracing`.
+                self.publish_trace_start(ctx, live_values, force_finish);
                 // pyjitpl.py:1547-1556 auto-stamp gate inputs — see
                 // `setup_tracing` for rationale.  Bridge-trace
                 // distinction now flows through
@@ -6651,6 +6647,41 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
     }
 
+    /// Install `ctx` before `initialize_virtualizable` or the trace
+    /// buffer allocation can collect.
+    ///
+    /// `clear_vable_token` allocates inside `force_now`.
+    /// `_compile_and_run_once` then calls `create_empty_history` after
+    /// `initialize_virtualizable` has appended `virtualizable_boxes`.
+    /// `initial_inputarg_consts` already interns the reds, and
+    /// `walk_active_trace_refs` forwards those ConstPtrs only from
+    /// `self.tracing`, so the ctx is stored first. `set_cpu` and
+    /// `set_force_finish` do not allocate. Bridges go through
+    /// `start_retrace_from_guard` and do not use this helper, so their
+    /// merge-point list stays empty.
+    fn publish_trace_start(
+        &mut self,
+        mut ctx: TraceCtx,
+        live_values: &[Value],
+        force_finish: bool,
+    ) {
+        // Caller read `warmstate.py bound_reached`'s `JC_FORCE_FINISH`.
+        // The bit is sticky; this only copies it onto the trace.
+        self.force_finish_trace = force_finish;
+        ctx.set_force_finish(force_finish);
+        // `_opimpl_getfield_gc_any_pureornot` reads `self.metainterp.cpu`.
+        // MetaInterp owns both `tracing` and `backend`, and tracing is
+        // torn down before `self` moves.
+        ctx.set_cpu(Some(&self.backend));
+        self.tracing = Some(ctx);
+        self.initialize_virtualizable(live_values);
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.attach_live_byte_recorder();
+            ctx.seed_compile_and_run_once_merge_point();
+        }
+        self.arm_portal_trace_positions();
+    }
+
     fn setup_tracing(
         &mut self,
         green_key: u64,
@@ -6717,31 +6748,11 @@ impl<M: Clone> MetaInterp<M> {
         // driver matching the descriptor; with the single-portal pyre
         // shell driver this collapses to slot 0.
         self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
-        // initialize_virtualizable establishes the virtualizable heap pointer.
-        self.initialize_virtualizable(&mut ctx, live_values);
-        // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
-        // runs after `initialize_state_from_start`, which has already
-        // appended `virtualizable_boxes` onto `original_boxes`. Attach
-        // here so `Trace(max_num_inputargs)` sees the full cap.
-        ctx.attach_live_byte_recorder();
-        // pyjitpl.py `_compile_and_run_once` seeds the start boxes so
-        // the first matching header visit closes. Bridges go through
-        // `start_retrace_from_guard` and stay empty.
-        ctx.seed_compile_and_run_once_merge_point();
-
-        // Computed above, before `green_key_values` moved.
-        self.force_finish_trace = force_finish;
-        // pyjitpl.py:2411: propagate force_finish_trace to TraceCtx
-        // so the proc-macro merge_fn closure can read it.
-        ctx.set_force_finish(self.force_finish_trace);
-        // pyjitpl.py _opimpl_getfield_gc_any_pureornot `self.metainterp.cpu` analog: install the
-        // backend reference for the cache-hit sanity-check load.
-        // Captures a raw pointer that stays valid for the duration of
-        // this trace because `self` (MetaInterp) owns both `tracing`
-        // and `backend`, and tracing is torn down before `self` moves.
-        ctx.set_cpu(Some(&self.backend));
-        self.tracing = Some(ctx);
-        self.arm_portal_trace_positions();
+        // Store the ctx before `initialize_virtualizable`.
+        // `force_finish` was read above, before `green_key_values` moved.
+        // `clear_vable_token` can minor-collect, and
+        // `walk_active_trace_refs` only sees `self.tracing`.
+        self.publish_trace_start(ctx, live_values, force_finish);
         // pyjitpl.py `opimpl_jit_merge_point` auto-stamp
         // gate inputs.  Both `portal_call_depth` and
         // `has_compiled_targets(ptoken)` feed the primary-trace gate;
@@ -17339,7 +17350,8 @@ impl<M: Clone> MetaInterp<M> {
         // forced virtuals fell back to NullAllocator entries and pending
         // heap writes were dropped on async forcing.
         let storage = exit_layout.storage.as_deref();
-        let rd_numb = storage.map(|s| s.rd_numb.as_ref()).unwrap_or(&[]);
+        let numb_root = storage.map(|s| &s.rd_numb);
+        let rd_numb = numb_root.map(|n| n.as_slice()).unwrap_or(&[]);
         let empty_consts: [Const; 0] = [];
         let rd_consts: &[Const] = storage.map(|s| s.rd_consts()).unwrap_or(&empty_consts);
         // resume.py _prepare(storage) parity: materialize rd_virtuals
@@ -17388,6 +17400,7 @@ impl<M: Clone> MetaInterp<M> {
                 vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
                 None, // ginfo — pyre has no greenfield mechanism
                 allocator,
+                numb_root,
             );
         if crate::majit_log_enabled() {
             eprintln!(

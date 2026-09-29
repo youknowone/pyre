@@ -9132,11 +9132,19 @@ pub fn force_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
+    numb_root: Option<&'a majit_ir::NumberingRef>,
 ) -> (Vec<i64>, Vec<i64>, i64) {
     let _bh_phase = majit_gc::BhProbePhase::enter("resume");
     // resume.py:1346
     profiler.count(crate::pyjitpl::counters::FORCE_VIRTUALIZABLES, 1);
     // resume.py:1347-1348
+    // Slice the numbering here, not at the caller. The caller may
+    // allocate before this call, and a minor would then decode the
+    // header from a stale slice while the bind below reloads the rest.
+    let rd_numb = match numb_root {
+        Some(numb) => numb.as_slice(),
+        None => rd_numb,
+    };
     let mut resumereader = ResumeDataDirectReader::new(
         rd_numb,
         rd_consts,
@@ -9146,6 +9154,9 @@ pub fn force_from_resumedata<'a>(
         None,
         allocator,
     );
+    if let Some(numb) = numb_root {
+        resumereader.resumecodereader.bind_numbering(numb);
+    }
     // resume.py common-case __init__ calls self._prepare(storage)
     // before handling_async_forcing() flips the GUARD_NOT_FORCED state.
     //

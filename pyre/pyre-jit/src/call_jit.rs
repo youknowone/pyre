@@ -7968,10 +7968,14 @@ pub fn cranelift_resumedata_deopt(
     };
 
     // 3. Extract resume payload.  Empty rd_numb → nothing to decode.
-    let Some(rd_numb) = rgd.payload.rd_numb() else {
+    // Keep the `NumberingRef`. The payload slice is taken immediately
+    // before the reader is built: a minor in between would leave the
+    // header decoded from from-space while `bind_numbering` reloads
+    // the rest from the owner root.
+    let Some(numb) = rgd.payload.rd_numb_ref() else {
         return false;
     };
-    if rd_numb.is_empty() {
+    if numb.as_slice().is_empty() {
         return false;
     }
     let rd_consts = rgd.payload.rd_consts().unwrap_or(&[]);
@@ -8004,7 +8008,7 @@ pub fn cranelift_resumedata_deopt(
     };
     let allocator = crate::eval::PyreBlackholeAllocator;
     let mut reader = resume::ResumeDataDirectReader::new(
-        rd_numb,
+        numb.as_slice(),
         rd_consts,
         &all_liveness,
         majit_backend::FailArgSource::Slice(&deadframe),
@@ -8012,6 +8016,10 @@ pub fn cranelift_resumedata_deopt(
         None,
         &allocator,
     );
+    // `resumecode.py` `Reader.next_item` reloads `numb.code` after a
+    // collection. `prepare_resume_heap_with_roots` materializes virtuals
+    // and can minor-collect. Same bind as `blackhole_from_resumedata`.
+    reader.resumecodereader.bind_numbering(numb);
 
     // 6. resume.py:1324-1325 — prepare virtuals/pendingfields, then
     //    consume the vref + vable sections that precede the per-frame

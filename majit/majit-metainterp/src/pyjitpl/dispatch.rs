@@ -1373,6 +1373,43 @@ fn refuse_walk_local_ref_args(
     Some(TraceAction::Abort)
 }
 
+/// Root for a residual Ref result across `history.py` `record_nospec`.
+///
+/// `record_nospec` reads `ConstPtr.getref_base` only after `_record_op`.
+/// `opencoder.py` `Trace._double_ops` can minor-collect inside that record,
+/// before the frontend slot exists. The shadow stack is the Const's root;
+/// [`Self::word`] is `getref_base` after the record.
+struct ResidualRefRoot {
+    depth: Option<usize>,
+}
+
+impl ResidualRefRoot {
+    fn pin(word: i64) -> Self {
+        if word == 0 {
+            return Self { depth: None };
+        }
+        let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(word as usize));
+        Self { depth: Some(depth) }
+    }
+
+    fn word(&self, fallback: i64) -> i64 {
+        match self.depth {
+            Some(depth) => majit_gc::shadow_stack::get(depth).0 as i64,
+            None => fallback,
+        }
+    }
+}
+
+impl Drop for ResidualRefRoot {
+    fn drop(&mut self) {
+        if let Some(depth) = self.depth.take() {
+            // `try_pop_to` saturates: a panic already unwinding must not
+            // assert in this drop and hide the original report.
+            majit_gc::shadow_stack::try_pop_to(depth);
+        }
+    }
+}
+
 fn host_requested_walk_abort(
     ctx: &mut TraceCtx,
     func: usize,
@@ -9127,6 +9164,12 @@ where
                                 effectinfo,
                             )
                     {
+                        // The cached i64 is not a root. The frontend slot is,
+                        // and `walk_active_trace_refs` forwards it in place.
+                        let cached_concrete = match ctx.box_value(cached_traced) {
+                            Some(majit_ir::Value::Ref(g)) => g.0 as i64,
+                            _ => cached_concrete,
+                        };
                         self.set_ref_reg(dst, Some(cached_traced), Some(cached_concrete));
                         return TraceAction::Continue;
                     }
@@ -9161,6 +9204,9 @@ where
                             )
                         }
                     };
+                    // `history.py` `ConstPtr` keeps this word alive across
+                    // `record_nospec`. Drop pops it on every return below.
+                    let residual_ref = ResidualRefRoot::pin(concrete);
                     if let Some(action) = host_requested_walk_abort(
                         ctx,
                         concrete_ptr as usize,
@@ -9192,6 +9238,7 @@ where
                             effectinfo.clone(),
                         )
                     } else if is_loopinvariant {
+                        let concrete = residual_ref.word(concrete);
                         ctx.call_loopinvariant_ref_typed_with_effect(
                             trace_ptr,
                             &args,
@@ -9209,6 +9256,7 @@ where
                     };
                     // pyjitpl.py:1946 gate (see int sibling for full cite).
                     let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+                    let concrete = residual_ref.word(concrete);
                     let traced = match patch_pos {
                         Some(patch_pos) if last_exc_value == 0 => {
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
@@ -9243,6 +9291,10 @@ where
                     // vable access on that register takes the nonstandard leg.
                     // The full-body walker already stamps its own residual
                     // results this way (`jitcode_dispatch/residual_call.rs`).
+                    // Re-read after the record. `_double_ops` may have
+                    // forwarded the shadow slot while `concrete` above was
+                    // still the nursery address captured at the call.
+                    let concrete = residual_ref.word(concrete);
                     ctx.set_opref_concrete(
                         traced,
                         majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),

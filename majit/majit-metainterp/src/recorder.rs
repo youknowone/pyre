@@ -288,6 +288,14 @@ pub struct Trace {
     /// out, and prevents every repeated ConstPtr operand from allocating a
     /// fresh `Rc<Cell<Value>>` in the meantime.
     const_ptrs: crate::FxIndexMap<u32, Operand>,
+    /// ConstPtr indexes of the op `record_bytes` is encoding.
+    ///
+    /// The index is not in `slots` until that op returns, and
+    /// `_double_ops` can minor-collect while reserving opcode bytes.
+    /// `walk_active_trace_refs` traces this list for that window.
+    /// `history.py` `ConstPtr` is the box the collector updates; the
+    /// list is the holder until the recorded slot takes over.
+    live_const_indexes: Vec<u32>,
     /// Live JIT path: `History.trace` is `opencoder.Trace`. When present,
     /// `record_*` appends bytes and a [`FrontendSlot`] instead of a 240-byte
     /// `Op`. `into_parts` materializes through `ByteTraceIter`, the
@@ -470,6 +478,7 @@ impl Trace {
             box_count: 0,
             recorded_ops_total: 0,
             const_ptrs: crate::FxIndexMap::default(),
+            live_const_indexes: Vec::new(),
             trb: None,
             slots: Vec::new(),
             unique_to_box: Vec::new(),
@@ -950,6 +959,22 @@ impl Trace {
         OcBox::ResOp(mapped)
     }
 
+    fn hold_const_indexes(&mut self, refs: &[OpRef]) -> usize {
+        let base = self.live_const_indexes.len();
+        for r in refs {
+            if let Some(index) = r.const_ptr_index() {
+                if index != 0 {
+                    self.live_const_indexes.push(index);
+                }
+            }
+        }
+        base
+    }
+
+    fn release_const_indexes(&mut self, base: usize) {
+        self.live_const_indexes.truncate(base);
+    }
+
     fn record_bytes(
         &mut self,
         opcode: OpCode,
@@ -960,6 +985,26 @@ impl Trace {
         let unique = self.op_count;
         let opref = OpRef::op_typed(unique, opcode.result_type());
         let first_arg = args.first().copied();
+        if self.trb.is_none() {
+            panic!("record_bytes requires attach_byte_buffer");
+        }
+        // Hold the indexes before any nursery growth. `arg_to_box`
+        // snapshots `ConstPtr.value` afterwards, so the collection
+        // inside `reserve_ops_bytes` has already forwarded the slots.
+        let held = self.hold_const_indexes(args);
+        if let Some(fail) = fail_args {
+            self.hold_const_indexes(fail);
+        }
+        // Opcode byte, optional arity varint, one varint per arg, descr
+        // varint. `append_int` writes at most four bytes.
+        let reserve = 1usize
+            .saturating_add(4)
+            .saturating_add(args.len().saturating_mul(4))
+            .saturating_add(4);
+        self.trb
+            .as_mut()
+            .expect("record_bytes requires attach_byte_buffer")
+            .reserve_ops_bytes(reserve);
         // history.py record0/1/2/3 take the boxes inline. JUMP and
         // other N-ary ops exceed that 0–3 surface; eight OcBoxes stay
         // off the process allocator.
@@ -995,6 +1040,8 @@ impl Trace {
         });
         self.recorded_ops_total += 1;
         self.op_count += 1;
+        // `slots` now names the indexes. Drop the recording-window hold.
+        self.release_const_indexes(held);
         opref
     }
 
@@ -1880,6 +1927,14 @@ impl Trace {
     /// explicit adaptation. Constants inserted by test-only direct-op helpers
     /// are not in the pool and are visited from their operation instead.
     pub(crate) fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        // Indexes named by the op currently being encoded. Not in
+        // `slots` yet; `_double_ops` collects before `record_op` returns.
+        let mut i = 0;
+        while i < self.live_const_indexes.len() {
+            let index = self.live_const_indexes[i];
+            majit_ir::const_ptr_table::trace_index(index, visitor);
+            i += 1;
+        }
         // Keys are `const_ptr_table` indexes (`history.py` `ConstPtr`),
         // stable across a move. Walk the operand cell, which still holds
         // the address `Value::Ref`.

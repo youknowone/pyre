@@ -11620,13 +11620,19 @@ fn walker_promote_object_mutable_cell<Sym: WalkSym>(
     cell: pyre_object::PyObjectRef,
     expected: pyre_object::PyObjectRef,
 ) -> Result<(), DispatchError> {
-    let cell_const = ctx.trace_ctx.const_ref(cell as i64);
+    // `opimpl_getfield_gc_r` records the getfield and can minor-collect
+    // while the trace buffer grows. `expected` is not a root until the
+    // guard constant below; reload it from the pin. The cell constant's
+    // table index is held by `record_bytes` across that growth.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[cell, expected]);
+    let cell_const = ctx.trace_ctx.const_ref(roots.get(base) as i64);
     let value = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         cell_const,
         crate::descr::object_mutable_cell_value_descr(),
     );
-    let expected_const = ctx.trace_ctx.const_ref(expected as i64);
+    let expected_const = ctx.trace_ctx.const_ref(roots.get(base + 1) as i64);
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[value, expected_const])?;
     ctx.trace_ctx
         .heap_cache_mut()

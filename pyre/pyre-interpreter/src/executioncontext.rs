@@ -1120,6 +1120,17 @@ impl ExecutionContext {
         // cycle guard. `topframeref` may already be a `JitVirtualRef` whose
         // address is not the frame, so compare the referent. A `debug_assert`
         // is absent from the release binary that runs the witnesses.
+        //
+        // `executioncontext.py` `enter` has no such refusal because upstream
+        // never reaches it twice for one frame: `interp_jit.py` puts
+        // `jit_merge_point` on `PyFrame.dispatch`, so the force and deopt
+        // legs of CALL_ASSEMBLER (`assembler_call_helper`) re-run only
+        // `dispatch`, below `enter`. pyre's portal is one level up, at
+        // `execute_frame`, so those legs re-enter through the portal helper
+        // and reach `enter` a second time for a frame that is already top.
+        // `install_current_frame` refuses the same case. The structural fix
+        // is moving the portal down to `dispatch`; until then this refusal
+        // keeps the re-entry from making `f_backref` a self loop.
         if std::ptr::eq(vref_referent(self.topframeref), frame) {
             return;
         }

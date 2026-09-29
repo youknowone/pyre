@@ -2050,6 +2050,17 @@ impl Trace {
         self._ops.double();
     }
 
+    /// Grow `_ops` until `extra` more bytes fit.
+    ///
+    /// `record_bytes` calls this before it snapshots a `ConstPtr`
+    /// address, so the collection inside `_double_ops` runs while the
+    /// recorder still holds those indexes.
+    pub(crate) fn reserve_ops_bytes(&mut self, extra: usize) {
+        while self._pos.saturating_add(extra) > self._ops.len {
+            self._double_ops();
+        }
+    }
+
     /// Char items of `_ops`. Re-reads the root; do not hold the slice
     /// across an allocation.
     pub fn ops_bytes(&self) -> &[u8] {
