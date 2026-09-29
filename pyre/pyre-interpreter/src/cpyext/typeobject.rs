@@ -2765,7 +2765,7 @@ pub(super) fn classmethod_descriptor_type() -> PyObjectRef {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "__get__",
-                crate::make_builtin_function("__get__", classmethod_descr_get),
+                crate::make_builtin_function("__get__", descr_classmethod_get),
             );
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
@@ -3017,7 +3017,7 @@ fn classmethod_def(
     }
 }
 
-fn classmethod_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn descr_classmethod_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
     let named = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
     let owner = classmethod_owner(carrier, named, bound_instance(args))?;

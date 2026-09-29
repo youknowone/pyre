@@ -8575,18 +8575,18 @@ pub(crate) fn exception_descr_get_dict(obj: PyObjectRef) -> PyResult {
 }
 
 /// `typedef.py descr_set_dict` — replaces the whole instance dict.
-pub(crate) fn exception_descr_set_dict(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+pub(crate) fn descr_set_dict(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
     setdict(obj, value)?;
     Ok(w_none())
 }
 
 /// `typedef.py descr_del_dict` refuses deletion of an exception dict.
-pub(crate) fn exception_descr_del_dict(_obj: PyObjectRef) -> PyResult {
+pub(crate) fn descr_del_dict(_obj: PyObjectRef) -> PyResult {
     Err(PyError::type_error("cannot delete __dict__"))
 }
 
 /// `interp_exceptions.py W_BaseException.descr_getargs`.
-pub(crate) fn exception_descr_getargs(obj: PyObjectRef) -> PyResult {
+pub(crate) fn descr_getargs(obj: PyObjectRef) -> PyResult {
     Ok(unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) })
 }
 
@@ -8603,7 +8603,7 @@ pub(crate) fn exception_descr_getcause(obj: PyObjectRef) -> PyResult {
 }
 
 /// `interp_exceptions.py descr_getcontext`.
-pub(crate) fn exception_descr_getcontext(obj: PyObjectRef) -> PyResult {
+pub(crate) fn descr_getcontext(obj: PyObjectRef) -> PyResult {
     let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_context(obj) };
     Ok(if stored.is_null() { w_none() } else { stored })
 }
@@ -8651,7 +8651,7 @@ pub(crate) fn exception_descr_get_written(obj: PyObjectRef) -> PyResult {
 }
 
 /// `interp_exceptions.py W_OSError.descr_del_written`.
-pub(crate) fn exception_descr_del_written(obj: PyObjectRef) -> PyResult {
+pub(crate) fn descr_del_written(obj: PyObjectRef) -> PyResult {
     let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
         return Ok(pyre_object::PY_NULL);
     };
@@ -8696,7 +8696,7 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
         "__dict__" => return exception_descr_get_dict(obj),
         "__traceback__" => return exception_descr_gettraceback(obj),
         "__cause__" => return exception_descr_getcause(obj),
-        "__context__" => return exception_descr_getcontext(obj),
+        "__context__" => return descr_getcontext(obj),
         "__suppress_context__" => {
             // `interp_exceptions.py descr_getsuppresscontext`
             // returns `space.newbool(self.suppress_context)`.
@@ -8706,7 +8706,7 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
                 unsafe { pyre_object::interp_exceptions::w_exception_get_suppress_context(obj) };
             return Ok(pyre_object::w_bool_from(b));
         }
-        "args" => return exception_descr_getargs(obj),
+        "args" => return descr_getargs(obj),
         "message" | "exceptions" => return exception_descr_get_group(obj, name),
         "value" => {
             // `pypy/module/exceptions/interp_exceptions.py
@@ -14161,7 +14161,7 @@ pub(crate) fn exception_attr_set(mut obj: PyObjectRef, name: &str, value: PyObje
     // line 113-117).  Storage lives on `W_BaseException`
     // directly — no side store for these four names.
     match name {
-        "__dict__" => return exception_descr_set_dict(obj, value),
+        "__dict__" => return descr_set_dict(obj, value),
         "__cause__" => {
             // `interp_exceptions.py descr_setcause` — None
             // OR an instance whose type derives from `BaseException`,
@@ -15298,7 +15298,7 @@ unsafe fn exception_deletable_slot(obj: PyObjectRef, name: &str) -> bool {
 /// `PY_NULL` means the name is not one this exception kind declares.
 pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
     match name {
-        "__dict__" => return exception_descr_del_dict(obj),
+        "__dict__" => return descr_del_dict(obj),
         "args" | "__cause__" | "__context__" | "__traceback__" => {
             return exception_descr_del_refused(name);
         }
@@ -15316,7 +15316,7 @@ pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
             return Err(PyError::type_error("can't delete numeric/char attribute"));
         }
         // `interp_exceptions.py W_OSError.descr_del_written`.
-        "characters_written" => return exception_descr_del_written(obj),
+        "characters_written" => return descr_del_written(obj),
         _ if unsafe { exception_deletable_slot(obj, name) } => {
             return object_setattr(obj, name, w_none());
         }

@@ -188,10 +188,7 @@ pub unsafe extern "C" fn PyList_Insert(
     let Some([value, item]) = arguments([object, item]) else {
         return -1;
     };
-    list_method(
-        crate::type_methods::list_method_insert,
-        &[value, index, item],
-    )
+    list_method(crate::type_methods::descr_insert, &[value, index, item])
 }
 
 /// `PyList_Sort(list)` (`listobject.py`).
@@ -209,7 +206,7 @@ pub unsafe extern "C" fn PyList_Reverse(object: *mut CPyObject) -> c_int {
     let Some(value) = internal_list(object) else {
         return -1;
     };
-    list_method(crate::type_methods::list_method_reverse, &[value])
+    list_method(crate::type_methods::descr_reverse, &[value])
 }
 
 /// `PyList_Clear(list)` — drop every item.
@@ -218,7 +215,7 @@ pub unsafe extern "C" fn PyList_Clear(object: *mut CPyObject) -> c_int {
     let Some(value) = internal_list(object) else {
         return -1;
     };
-    list_method(crate::type_methods::list_method_clear, &[value])
+    list_method(crate::type_methods::descr_clear, &[value])
 }
 
 /// `PyList_Extend(list, iterable)` — append everything `iterable` yields.
