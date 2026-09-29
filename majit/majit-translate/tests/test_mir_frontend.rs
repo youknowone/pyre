@@ -1873,10 +1873,32 @@ fn mem_replace_through_box_deref_names_enum_fields() {
                 result_ty: ValueType::Void,
             },
         };
-        let nargs = func.graph().block(func.graph().startblock).inputargs.len();
+        // `getcalldescr` compares these actual kinds with `FUNC.ARGS`.
+        // `index: usize` is `int` (`getkind`); the pointer args stay `ref`.
+        let start = func.graph().block(func.graph().startblock);
+        let arg_types: Vec<Type> = start
+            .inputargs
+            .iter()
+            .map(|arg| {
+                let ty = start.operations.iter().find_map(|op| match &op.kind {
+                    OpKind::Input { ty, .. } if op.result.as_ref() == Some(arg) => Some(ty),
+                    _ => None,
+                });
+                match ty {
+                    Some(
+                        ValueType::Int
+                        | ValueType::Unsigned
+                        | ValueType::Bool
+                        | ValueType::SingleFloat,
+                    ) => Type::Int,
+                    Some(ValueType::Float) => Type::Float,
+                    _ => Type::Ref,
+                }
+            })
+            .collect();
         let descriptor = cc.getcalldescr(
             &op,
-            vec![Type::Ref; nargs],
+            arg_types,
             Type::Ref,
             OopSpecIndex::None,
             None,

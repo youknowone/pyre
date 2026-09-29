@@ -6419,13 +6419,32 @@ fn return_type_string_to_kind(s: &str) -> char {
     }
 }
 
+/// `history.py` `getkind` reads `v.concretetype`. A hand-built graph
+/// stamps that cell and lists the variable in `inputargs` without an
+/// `OpKind::Input`. Bool and unsigned share the `Signed` cell (`getkind`
+/// is `int`); the Input op, when present, keeps the finer `ValueType`.
+/// `Unknown` stays `Unknown`, so a slot with no type still fails in
+/// `graph_non_void_arg_types`.
+fn value_type_from_param_concretetype(
+    var: &crate::flowspace::model::Variable,
+) -> crate::model::ValueType {
+    match crate::model::FunctionGraph::concretetype_of(var) {
+        crate::model::ConcreteType::Signed => crate::model::ValueType::Int,
+        crate::model::ConcreteType::GcRef => crate::model::ValueType::Ref(None),
+        crate::model::ConcreteType::Float => crate::model::ValueType::Float,
+        crate::model::ConcreteType::Void => crate::model::ValueType::Void,
+        crate::model::ConcreteType::Unknown => crate::model::ValueType::Unknown,
+    }
+}
+
 /// RPython `CallControl.getcalldescr` parity: recover the graph's complete
 /// declared `FUNC.ARGS` sequence before the caller filters `Void`. Parameters
 /// live on `Block.inputargs`, populated by `front::mir`'s parameter
 /// registration. The `OpKind::Input` operations co-emitted with each parameter
 /// carry the declared type, recovered by chasing each input variable back to
-/// its defining operation. An unresolved slot remains `Unknown`; consumers
-/// decide whether that conservative value belongs in their ABI view.
+/// its defining operation. A slot with no `OpKind::Input` uses
+/// `v.concretetype` (`getkind`); that cell is `Unknown` only before
+/// `setconcretetype`, and consumers still refuse that sentinel.
 ///
 /// TODO: when `inputargs` is empty we fall back to
 /// scanning leading `OpKind::Input` ops in the startblock.  Unit tests
@@ -6451,7 +6470,7 @@ fn graph_arg_types(graph: &FunctionGraph) -> Vec<crate::model::ValueType> {
                         }
                         _ => None,
                     })
-                    .unwrap_or(crate::model::ValueType::Unknown)
+                    .unwrap_or_else(|| value_type_from_param_concretetype(arg))
             })
             .collect();
     }
