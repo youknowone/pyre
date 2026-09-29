@@ -5317,8 +5317,7 @@ fn reversed_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 }
 
 /// `range.__new__(cls, stop)` / `range.__new__(cls, start, stop[, step])` —
-/// `rangeobject.py descr_new`.  `builtin_range` builds a fresh `W_Range`; a
-/// subclass instance is the same object with `w_class` retagged.
+/// `functional.py W_Range.descr_new`. Range is not an acceptable base type.
 fn range_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = pyre_object::with_roots!(cls => crate::builtins::builtin_range(args.get(1..).unwrap_or(&[])))?;
