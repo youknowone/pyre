@@ -768,9 +768,9 @@ impl VirtualState {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-    ) -> Result<Vec<OpRef>, VirtualStatesCantMatch> {
+    ) -> Result<Vec<Operand>, VirtualStatesCantMatch> {
         // boxes = [None] * self.numnotvirtuals
-        let mut boxes = vec![OpRef::NONE; self.num_boxes()];
+        let mut boxes = vec![Operand::None; self.num_boxes()];
         // virtualstate.py `enum_forced_boxes` receives the box. Build each
         // input box once; both passes walk the same objects. A NONE or const
         // has no producer to bind (`Operand::from_opref`).
@@ -826,7 +826,7 @@ impl VirtualState {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-    ) -> Result<(Vec<OpRef>, Vec<OpRef>), VirtualStatesCantMatch> {
+    ) -> Result<(Vec<Operand>, Vec<OpRef>), VirtualStatesCantMatch> {
         let inputargs = self.make_inputargs(concrete_refs, optimizer, ctx, force_boxes)?;
         let virtuals: Vec<OpRef> = self
             .state
@@ -856,7 +856,7 @@ impl VirtualState {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-    ) -> Result<(Vec<OpRef>, Vec<OpRef>, Vec<usize>), VirtualStatesCantMatch> {
+    ) -> Result<(Vec<Operand>, Vec<OpRef>, Vec<usize>), VirtualStatesCantMatch> {
         let (inputargs, virtuals) =
             self.make_inputargs_and_virtuals(concrete_refs, optimizer, ctx, force_boxes)?;
         let label_source_positions = self
@@ -871,7 +871,7 @@ impl VirtualState {
     fn label_source_positions_for_inputargs(
         &self,
         concrete_refs: &[OpRef],
-        inputargs: &[OpRef],
+        inputargs: &[Operand],
         ctx: &mut OptContext,
     ) -> Option<Vec<usize>> {
         if concrete_refs.len() != self.state.len() {
@@ -913,12 +913,15 @@ impl VirtualState {
         }
         inputargs
             .iter()
-            .map(|&inputarg| {
-                let resolved_inputarg = ctx.get_replacement_opref(inputarg);
+            .map(|inputarg| {
+                let resolved_inputarg = inputarg.to_opref();
                 index_by_resolved
                     .get(&resolved_inputarg)
                     .copied()
-                    .or_else(|| inputarg.is_input_arg().then_some(inputarg.raw() as usize))
+                    .or_else(|| {
+                        let r = inputarg.to_opref();
+                        r.is_input_arg().then_some(r.raw() as usize)
+                    })
             })
             .collect()
     }
@@ -954,7 +957,7 @@ impl VirtualState {
         box_: &Operand,
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
-        boxes: &mut [OpRef],
+        boxes: &mut [Operand],
         force_boxes: bool,
     ) -> Result<(), VirtualStatesCantMatch> {
         match &node.info {
@@ -1154,10 +1157,7 @@ impl VirtualState {
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
                 let resolved_box = ctx.resolve_operand_operand_opt(box_);
-                let resolved = resolved_box
-                    .as_ref()
-                    .map(|b| b.to_opref())
-                    .unwrap_or_else(|| box_.to_opref());
+                let resolved: Operand = resolved_box.clone().unwrap_or_else(|| box_.clone());
                 let forced = match resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                     // RPython: Virtualizable refs stay virtual across iterations.
                     Some(PtrInfo::Virtualizable(_)) => resolved,
@@ -1186,7 +1186,7 @@ impl VirtualState {
                             ctx,
                         );
                         ctx.current_pass_idx = saved_pass_idx;
-                        forced.to_opref()
+                        forced
                     }
                     _ => resolved,
                 };
@@ -1202,7 +1202,11 @@ impl VirtualState {
                      assigned by enum_top_level"
                 );
                 let slot = slot_i32 as usize;
-                let resolved_for_store = ctx.get_replacement_opref(forced);
+                let resolved_for_store = if forced.is_none() {
+                    Operand::None
+                } else {
+                    ctx.resolve_operand_operand(&forced)
+                };
                 // virtualstate.py NotVirtualStateInfo{Int,Ptr}: Box.type
                 // immutability. RPython dispatches `isinstance(self,
                 // NotVirtualStateInfoInt)` vs `NotVirtualStateInfoPtr` on a
@@ -1212,9 +1216,10 @@ impl VirtualState {
                 // bridge types; reject the cross here so the unrolled
                 // trace falls back to `jump_to_preamble` exactly as RPython
                 // raises VirtualStatesCantMatch.
-                if let (Some(expected), Some(actual)) =
-                    (node.info.info_type(), ctx.opref_type(resolved_for_store))
-                    && expected != actual
+                if let (Some(expected), Some(actual)) = (
+                    node.info.info_type(),
+                    ctx.opref_type(resolved_for_store.to_opref()),
+                ) && expected != actual
                 {
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -1224,7 +1229,7 @@ impl VirtualState {
                             expected,
                             actual,
                             box_.to_opref(),
-                            resolved_for_store
+                            resolved_for_store.to_opref()
                         );
                     }
                     return Err(VirtualStatesCantMatch::default());
@@ -3445,7 +3450,10 @@ mod tests {
         let inputargs = state
             .make_inputargs(&[array_ref], &mut optimizer, &mut ctx, false)
             .expect("exported virtual array must enumerate its written slot");
-        assert_eq!(inputargs, vec![written_ref]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![written_ref]
+        );
     }
 
     #[test]
@@ -3478,7 +3486,10 @@ mod tests {
         let inputargs = state
             .make_inputargs(&[struct_ref], &mut optimizer, &mut ctx, false)
             .expect("exported virtual struct must enumerate its written slot");
-        assert_eq!(inputargs, vec![written_ref]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![written_ref]
+        );
     }
 
     #[test]
@@ -3517,7 +3528,10 @@ mod tests {
                 false,
             )
             .expect("make_inputargs");
-        assert_eq!(inputargs, vec![OpRef::int_op(10), OpRef::ref_op(12)]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![OpRef::int_op(10), OpRef::ref_op(12)]
+        );
     }
 
     #[test]
@@ -3553,7 +3567,10 @@ mod tests {
                 false,
             )
             .expect("make_inputargs_and_virtuals");
-        assert_eq!(inputargs, vec![OpRef::int_op(20), OpRef::ref_op(22)]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![OpRef::int_op(20), OpRef::ref_op(22)]
+        );
         assert_eq!(virtuals, vec![OpRef::ref_op(21)]);
     }
 
@@ -3588,7 +3605,10 @@ mod tests {
             )
             .expect("make_inputargs_and_virtuals_with_source_positions");
 
-        assert_eq!(inputargs, vec![field, scalar]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![field, scalar]
+        );
         assert_eq!(virtuals, vec![object]);
         assert_eq!(
             source_positions,
@@ -3708,7 +3728,10 @@ mod tests {
         let inputargs = state
             .make_inputargs(&[outer_a_ref, outer_b_ref], &mut optimizer, &mut ctx, false)
             .expect("make_inputargs");
-        assert_eq!(inputargs, vec![inner_field_value]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![inner_field_value]
+        );
     }
 
     /// Top-level Rc dedup parity: when two jump args resolve to the
@@ -3735,7 +3758,10 @@ mod tests {
             .make_inputargs(&[outer_ref, outer_ref], &mut optimizer, &mut ctx, false)
             .expect("make_inputargs");
         // Single deduped slot, written by the first top-level visit.
-        assert_eq!(inputargs, vec![outer_ref]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![outer_ref]
+        );
     }
 
     /// `VirtualState` assignment shares the info graph (`VirtualState.__init__`
@@ -3782,7 +3808,10 @@ mod tests {
         let inputargs = state
             .make_inputargs(&[virtual_ref], &mut optimizer, &mut ctx, false)
             .expect("make_inputargs");
-        assert_eq!(inputargs, vec![field_value]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![field_value]
+        );
     }
 
     #[test]
@@ -3852,7 +3881,10 @@ mod tests {
         // forced allocation ref (which is what ctx.get_replacement
         // resolves the original virtual_ref to).
         assert_eq!(inputargs.len(), 1);
-        assert_eq!(inputargs[0], ctx.get_replacement_opref(virtual_ref));
+        assert_eq!(
+            inputargs[0].to_opref(),
+            ctx.get_replacement_opref(virtual_ref)
+        );
         assert!(virtuals.is_empty());
     }
 

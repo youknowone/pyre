@@ -1683,19 +1683,10 @@ impl UnrollOptimizer {
                         &mut final_ctx,
                         true,
                     ) {
-                        for arg in args {
-                            if arg.is_none() {
+                        for arg_box in args {
+                            if arg_box.is_none() {
                                 continue;
                             }
-                            let arg_box = if arg.is_constant() {
-                                Operand::from_opref(arg)
-                            } else {
-                                let Some(arg_box) = final_ctx.get_box_replacement_operand_opt(arg)
-                                else {
-                                    continue;
-                                };
-                                arg_box
-                            };
                             let _ = opt_p2.force_box(&arg_box, &mut final_ctx);
                         }
                     }
@@ -3260,9 +3251,14 @@ impl OptUnroll {
         {
             (label_args, virtuals, label_source_positions)
         } else {
-            virtual_state
+            let (label_boxes, virtuals, label_source_positions) = virtual_state
                 .make_inputargs_and_virtuals_with_source_positions(&end_args, optimizer, ctx, false)
-                .expect("export_state make_inputargs_and_virtuals failed")
+                .expect("export_state make_inputargs_and_virtuals failed");
+            (
+                label_boxes.iter().map(|b| b.to_opref()).collect(),
+                virtuals,
+                label_source_positions,
+            )
         };
         if crate::callee_rca_enabled() {
             eprintln!(
@@ -3894,7 +3890,7 @@ impl OptUnroll {
             // RPython: force_box emits New/SetfieldGc via emit_extra which
             // routes through passes AFTER Virtualize. The non-virtual PtrInfo
             // (Struct/Instance) on alloc_ref prevents re-absorption.
-            let (target_args, virtuals) = match target_vs.make_inputargs_and_virtuals(
+            let (target_boxes, virtuals) = match target_vs.make_inputargs_and_virtuals(
                 &args,
                 optimizer,
                 ctx,
@@ -3917,6 +3913,7 @@ impl OptUnroll {
                     continue;
                 }
             };
+            let target_args: Vec<OpRef> = target_boxes.iter().map(|b| b.to_opref()).collect();
             // unroll.py:354 `short_jump_args = args + virtuals`: the short
             // preamble's label (`short[0].getarglist()`, unroll.py) carries
             // one inputarg per `args` entry AND one per `virtuals` entry, so
@@ -4615,7 +4612,7 @@ impl OptUnroll {
             .virtual_state
             .make_inputargs(targetargs, optimizer, ctx, false)
         {
-            Ok(args) => args,
+            Ok(args) => args.iter().map(|b| b.to_opref()).collect(),
             // unroll.py:483 `raise InvalidLoop`: the imported virtual state is
             // incompatible. Recorded as a deferred signal (checked by the
             // caller) so the loop is abandoned without unwinding.

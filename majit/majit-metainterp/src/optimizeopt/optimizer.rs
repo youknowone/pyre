@@ -1864,7 +1864,14 @@ impl Optimizer {
             match preview_virtual_state
                 .make_inputargs_and_virtuals_with_source_positions(vs_args, self, &mut ctx, false)
             {
-                Ok(pair) => pair,
+                Ok(pair) => {
+                    let (label_boxes, virtuals, positions) = pair;
+                    (
+                        label_boxes.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+                        virtuals,
+                        positions,
+                    )
+                }
                 Err(_) => {
                     // unroll.py:193,207-210: on the BRIDGE path the
                     // short-preamble/export preview does not exist — VS
