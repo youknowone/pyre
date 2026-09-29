@@ -28,7 +28,7 @@ const MAGIC_CONSTANT_D: u32 = 1566083941;
 /// `&x ≡ x` model would hand `genrand32` the first word of `state` where its
 /// address was meant.  It owns no object references, so the collector forwards
 /// nothing but its header.
-#[crate::pyre_class("_random._mersenne_twister", static_name = "MERSENNE_TWISTER")]
+#[pyre_interpreter::pyre_class("_random._mersenne_twister", static_name = "MERSENNE_TWISTER")]
 pub struct Random {
     state: [u32; N],
     index: usize,
@@ -133,7 +133,7 @@ impl Random {
 
 // CPython 3.14 Modules/_randommodule.c:_random_exec uses
 // PyType_FromModuleAndSpec and does not request IMMUTABLETYPE.
-#[crate::pyre_class("_random.Random", cpython_mutable)]
+#[pyre_interpreter::pyre_class("_random.Random", cpython_mutable)]
 #[derive(Default)]
 pub struct W_Random {
     /// PyPy composes `MapdictStorageMixin` into a native-layout object when
@@ -173,7 +173,7 @@ const _: () = assert!(
     "W_Random must keep W_ObjectObject's storage offset"
 );
 
-#[crate::pyre_methods(
+#[pyre_interpreter::pyre_methods(
     doc = "Random() -> create a random number generator.\n\nNot for security or cryptographic use.",
     weakrefable
 )]
@@ -185,8 +185,11 @@ impl W_Random {
     /// the later `__init__` dispatch, which is essential for subclasses whose
     /// initializer accepts its own positional or keyword arguments.
     #[staticmethod]
-    fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(args);
+    fn __new__(
+        cls: PyObjectRef,
+        args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        let (positional, _kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
         let user_args = positional.get(1..).unwrap_or(&[]);
         let w_anything = user_args.first().copied().unwrap_or_else(w_none);
         // interp_random.py `space.allocate_instance(W_Random,
@@ -194,7 +197,7 @@ impl W_Random {
         // the allocated object's class header.  The typed payload layout is
         // shared by subclasses, exactly as `check_user_subclass` verifies.
         let random_type = type_object();
-        crate::typedef::check_user_subclass(random_type, cls)?;
+        pyre_interpreter::typedef::check_user_subclass(random_type, cls)?;
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(cls);
         let _ = pyre_object::gc_roots::pin_root(w_anything);
@@ -209,7 +212,7 @@ impl W_Random {
         let _ = pyre_object::gc_roots::pin_root(W_Random::allocate_stable(W_Random::default()));
         let obj_slot = rnd_slot + 1;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        crate::typedef::tag_subclass_instance(obj, unsafe {
+        pyre_interpreter::typedef::tag_subclass_instance(obj, unsafe {
             pyre_object::gc_roots::shadow_stack_get(cls_slot)
         });
         let random = W_Random::from_obj(obj)
@@ -226,15 +229,15 @@ impl W_Random {
     fn seed(
         &mut self,
         #[default(pyre_object::w_none())] w_n: PyObjectRef,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<(), pyre_interpreter::PyError> {
         // None: seed from os.urandom(8); fall back to a time-based int only
         // when urandom raises (interp_random.py). Under sandbox the entropy
         // comes from the trusted controller, not host getrandom.
         let w_n = if unsafe { is_none(w_n) } {
             #[cfg(not(feature = "sandbox"))]
-            let entropy = crate::importing::host::os::urandom(8).ok();
+            let entropy = pyre_interpreter::importing::host::os::urandom(8).ok();
             #[cfg(feature = "sandbox")]
-            let entropy = crate::host_seam::ops::urandom(8).ok();
+            let entropy = pyre_interpreter::host_seam::ops::urandom(8).ok();
             match entropy {
                 Some(buf) => w_bytes_from_bytes(&buf),
                 None => w_int_new(seed_from_time() as i64),
@@ -245,11 +248,11 @@ impl W_Random {
         let n = unsafe {
             if is_int_or_long(w_n) {
                 // space.abs(w_n)
-                let v = crate::builtins::obj_to_bigint(w_n);
+                let v = pyre_interpreter::builtins::obj_to_bigint(w_n);
                 if v.get_sign() < 0 { -v } else { v }
             } else {
                 // n = space.hash_w(w_n); w_n = space.newint(r_uint(n))
-                BigInt::from(crate::baseobjspace::hash_w_strict(w_n)? as u64)
+                BigInt::from(pyre_interpreter::baseobjspace::hash_w_strict(w_n)? as u64)
             }
         };
         // Split into little-endian 32-bit chunks.
@@ -271,10 +274,10 @@ impl W_Random {
         w_tuple_new(state.take())
     }
 
-    fn setstate(&mut self, w_state: PyTuple) -> Result<(), crate::PyError> {
+    fn setstate(&mut self, w_state: PyTuple) -> Result<(), pyre_interpreter::PyError> {
         unsafe {
             if w_tuple_len(w_state) != N + 1 {
-                crate::bail_value_error!("state vector is the wrong size");
+                pyre_interpreter::bail_value_error!("state vector is the wrong size");
             }
             let mut new_state = [0u32; N];
             // `obj_to_bigint` of a machine int collects; the state tuple
@@ -286,21 +289,25 @@ impl W_Random {
                     pyre_object::gc_roots::shadow_stack_get(state_slot),
                     i as i64,
                 ) else {
-                    crate::bail_value_error!("state vector is the wrong size");
+                    pyre_interpreter::bail_value_error!("state vector is the wrong size");
                 };
                 if !is_int_or_long(item) {
-                    crate::bail_type_error!("state vector must contain ints");
+                    pyre_interpreter::bail_type_error!("state vector must contain ints");
                 }
-                let mut v = crate::builtins::obj_to_bigint(item);
+                let mut v = pyre_interpreter::builtins::obj_to_bigint(item);
                 if v.get_sign() < 0 {
                     v = v.int_add(1i64 << 32);
                 }
                 // space.uint_w: every word must fit an unsigned 32-bit int.
                 if v.get_sign() < 0 {
-                    crate::bail_overflow_error!("cannot convert negative integer to unsigned int");
+                    pyre_interpreter::bail_overflow_error!(
+                        "cannot convert negative integer to unsigned int"
+                    );
                 }
                 if v.int_ge(1i64 << 32) {
-                    crate::bail_overflow_error!("int too large to convert to unsigned int");
+                    pyre_interpreter::bail_overflow_error!(
+                        "int too large to convert to unsigned int"
+                    );
                 }
                 let (_s, digits) = v.to_u32_digits();
                 new_state[i] = digits.first().copied().unwrap_or(0);
@@ -309,12 +316,12 @@ impl W_Random {
                 pyre_object::gc_roots::shadow_stack_get(state_slot),
                 N as i64,
             ) else {
-                crate::bail_value_error!("state vector is the wrong size");
+                pyre_interpreter::bail_value_error!("state vector is the wrong size");
             };
             // space.int_w: handles long overflow / non-int (TypeError).
-            let index = crate::baseobjspace::int_w(item)?;
+            let index = pyre_interpreter::baseobjspace::int_w(item)?;
             if index < 0 || index > N as i64 {
-                crate::bail_value_error!("invalid state");
+                pyre_interpreter::bail_value_error!("invalid state");
             }
             let rnd = self.rnd();
             rnd.state = new_state;
@@ -323,10 +330,10 @@ impl W_Random {
         Ok(())
     }
 
-    fn getrandbits(&mut self, k: PyIndexInt) -> Result<PyObjectRef, crate::PyError> {
+    fn getrandbits(&mut self, k: PyIndexInt) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let mut k = k;
         if k < 0 {
-            crate::bail_value_error!("number of bits must be non-negative");
+            pyre_interpreter::bail_value_error!("number of bits must be non-negative");
         }
         if k == 0 {
             return Ok(w_int_new(0));
@@ -337,11 +344,11 @@ impl W_Random {
             return Ok(w_int_new(r as i64));
         }
         let nbytes = usize::try_from(((k - 1) / 32 + 1) * 4)
-            .map_err(|_| crate::PyError::memory_error(""))?;
+            .map_err(|_| pyre_interpreter::PyError::memory_error(""))?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(nbytes)
-            .map_err(|_| crate::PyError::memory_error(""))?;
+            .map_err(|_| pyre_interpreter::PyError::memory_error(""))?;
         while k > 0 {
             let mut r = self.rnd().genrand32();
             if k < 32 {
@@ -365,11 +372,11 @@ impl W_Random {
 /// the reading to the sandbox controller and to the wasm embedder rather than
 /// to a `SystemTime` neither of them has.
 fn seed_from_time() -> u64 {
-    let secs = crate::module::time::interp_time::duration_since_epoch().as_secs_f64();
+    let secs = pyre_interpreter::module::time::interp_time::duration_since_epoch().as_secs_f64();
     (secs * 256.0) as u64
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_random",
     interpleveldefs: {
         "Random" => type_object(),
@@ -378,3 +385,41 @@ crate::py_module! {
 
 #[cfg(test)]
 mod macro_smoke;
+
+/// Custom trace for `_random.Random`. It carries the mapdict prefix like any
+/// other native-layout subclassable object, *and* the reference
+/// `interp_random.py` keeps to its own generator (`self._rnd =
+/// rrandom.Random()`). The shared prefix trace knows nothing of that field, so
+/// forward it here as well — the twister is reachable through nothing else, and
+/// the wrapper keeps answering `random()` through it after a collection.
+unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f);
+    }
+    let inst = unsafe { &mut *(obj_addr as *mut W_Random) };
+    f(std::ptr::addr_of_mut!(inst.rnd) as *mut majit_ir::GcRef);
+}
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // `allocate_instance(W_Random, w_subtype)` composes `MapdictStorageMixin`
+    // into Python subclasses, so `W_Random` has the same
+    // `[PyObject | map | storage]` prefix as `W_ObjectObject` and needs the
+    // same custom trace for boxed attributes, plus its own `rnd` edge.
+    types.push(ModuleGcType {
+        descriptor: <W_Random as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::CustomTrace(random_object_custom_trace),
+        destructor: None,
+    });
+    // `rrandom.Random` — the Mersenne Twister `interp_random.py` allocates
+    // beside its holder. Like `W_DequeBlock` it is GC-managed without being an
+    // rclass.OBJECT subclass and has no Python-visible vtable, so it takes a
+    // bare `with_gc_ptrs` id.
+    types.push(ModuleGcType {
+        descriptor: <Random as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::WithGcPtrs,
+        destructor: None,
+    });
+}

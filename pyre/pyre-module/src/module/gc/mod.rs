@@ -26,7 +26,7 @@ pub mod referents;
 
 use referents::{gcref, stats};
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "gc",
     interpleveldefs: {
         // No `callbacks`.  `moduledef.py` defines none, and the collector-side
@@ -49,44 +49,44 @@ crate::py_module! {
     inline_functions: {
         fn collect(
             #[default(w_int_new(interp_gc::NUM_GENERATIONS - 1))] generation: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             interp_gc::collect(generation)
         }
 
-        fn collect_step() -> Result<PyObjectRef, crate::PyError> {
+        fn collect_step() -> Result<PyObjectRef, pyre_interpreter::PyError> {
             interp_gc::collect_step()
         }
 
-        fn enable_finalizers() -> Result<PyObjectRef, crate::PyError> {
+        fn enable_finalizers() -> Result<PyObjectRef, pyre_interpreter::PyError> {
             interp_gc::enable_finalizers()?;
             Ok(w_none())
         }
 
-        fn disable_finalizers() -> Result<PyObjectRef, crate::PyError> {
+        fn disable_finalizers() -> Result<PyObjectRef, pyre_interpreter::PyError> {
             interp_gc::disable_finalizers();
             Ok(w_none())
         }
 
         fn get_objects(
             #[default(w_none())] generation: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             referents::get_objects(generation)
         }
 
         fn _get_stats(
             #[default(w_bool_from(false))] memory_pressure: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             // referents.py `@unwrap_spec(memory_pressure=bool)`.
-            Ok(stats::new(crate::baseobjspace::is_true(memory_pressure)?))
+            Ok(stats::new(pyre_interpreter::baseobjspace::is_true(memory_pressure)?))
         }
 
         fn get_stats(
             #[default(w_bool_from(false))] memory_pressure: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
-            app_referents::new_public_gc_stats(crate::baseobjspace::is_true(memory_pressure)?)
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            app_referents::new_public_gc_stats(pyre_interpreter::baseobjspace::is_true(memory_pressure)?)
         }
 
-        fn dump_rpy_heap(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        fn dump_rpy_heap(file: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             app_referents::dump_rpy_heap_public(file)
         }
     },
@@ -114,4 +114,37 @@ crate::py_module! {
         "unfreeze"             / 0 = interp_gc::unfreeze,
         "get_freeze_count"     / 0 = interp_gc::get_freeze_count,
     },
+}
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // `referents.py W_GcRef`: the wrapper's raw gcref field is a normal traced
+    // edge, so an internal object stays live and is forwarded in place.
+    types.push(ModuleGcType {
+        descriptor: <gcref::W_GcRef as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    // `hook.py W_AppLevelHooks`: the process-owned hooks singleton keeps the
+    // three app callbacks in ordinary traced fields.
+    types.push(ModuleGcType {
+        descriptor: <hook::W_AppLevelHooks as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    // `referents.py W_GcStats`: scalar statistics live on the W_Root itself, so
+    // the class registers even though it has no trace edges.
+    types.push(ModuleGcType {
+        descriptor: <stats::W_GcStats as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
 }

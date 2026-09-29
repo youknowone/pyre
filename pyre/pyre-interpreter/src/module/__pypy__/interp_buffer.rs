@@ -343,7 +343,11 @@ impl W_PickleBuffer {
         }
         let mv_type = memoryview_type()
             .ok_or_else(|| PyError::runtime_error("memoryview type unavailable"))?;
-        let mut mv = crate::module::_pickle::call_fn(mv_type, &[w_obj])?;
+        let mut mv = crate::baseobjspace::call_function(mv_type, &[w_obj]);
+        if mv.is_null() {
+            return Err(crate::call::take_call_error()
+                .unwrap_or_else(|| PyError::runtime_error("memoryview() failed")));
+        }
         let w_contig =
             pyre_object::with_roots!(mv => crate::baseobjspace::getattr_str(mv, "contiguous"))?;
         if !pyre_object::with_roots!(mv => crate::baseobjspace::is_true(w_contig))? {
@@ -435,7 +439,7 @@ impl W_PickleBuffer {
 /// shared type after applying PyPy's explicit final-type flag. Both
 /// `__pypy__.PickleBuffer` and `_pickle.PickleBuffer` call this accessor, so
 /// the flag is installed regardless of which module is imported first.
-pub(crate) fn picklebuffer_type_object() -> PyObjectRef {
+pub fn picklebuffer_type_object() -> PyObjectRef {
     let tp = type_object();
     unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
     tp
@@ -444,7 +448,7 @@ pub(crate) fn picklebuffer_type_object() -> PyObjectRef {
 impl W_PickleBuffer {
     /// The wrapped buffer object (`None` after `release()`), read by the
     /// `_pickle` save path.
-    pub(crate) fn wrapped(&self) -> PyObjectRef {
+    pub fn wrapped(&self) -> PyObjectRef {
         self.w_obj
     }
 }
@@ -540,7 +544,7 @@ fn is_memoryview(obj: PyObjectRef) -> bool {
 ///
 /// The contents are the bytes in physical order, which is what the buffer a
 /// `PickleBuffer` saves is defined to be.
-pub(crate) fn buffer_view(mut obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> {
+pub fn buffer_view(mut obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> {
     unsafe {
         if pyre_object::is_bytes(obj) {
             return Ok((pyre_object::bytesobject::w_bytes_data(obj).to_vec(), true));
@@ -565,7 +569,12 @@ pub(crate) fn buffer_view(mut obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyErr
         // 1-D reinterpretation is what goes into the stream.  The only caller
         // has already refused a buffer contiguous in neither order.
         let raw = crate::builtins::memoryview_raw_bytes(obj);
-        let w_data = pyre_object::with_roots!(obj => crate::module::_pickle::call_meth(raw, "tobytes", &[]))?;
+        let w_data =
+            pyre_object::with_roots!(obj => crate::baseobjspace::call_method(raw, "tobytes", &[]));
+        if w_data.is_null() {
+            return Err(crate::call::take_call_error()
+                .unwrap_or_else(|| PyError::runtime_error("tobytes() failed")));
+        }
         let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_data) }.to_vec();
         let w_ro = crate::baseobjspace::getattr_str(obj, "readonly")?;
         return Ok((data, crate::baseobjspace::is_true(w_ro)?));
@@ -581,7 +590,7 @@ pub(crate) fn buffer_view(mut obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyErr
 ///
 /// `bytes`/`bytearray`/`array` are one-dimensional and always contiguous; a
 /// `memoryview` reports through its `contiguous` flag, the `'A'` order one.
-pub(crate) fn is_contiguous(obj: PyObjectRef) -> Result<bool, PyError> {
+pub fn is_contiguous(obj: PyObjectRef) -> Result<bool, PyError> {
     if is_memoryview(obj) {
         let w = crate::baseobjspace::getattr_str(obj, "contiguous")?;
         return crate::baseobjspace::is_true(w);

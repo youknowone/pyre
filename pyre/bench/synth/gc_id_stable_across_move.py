@@ -1,3 +1,4 @@
+# pyre-check: requires-modules=gc
 # `id()` must survive the object moving.  A minor collection copies a surviving
 # nursery object to the old generation, so an `id()` that reports the current
 # address hands out a different value before and after — and every id()-keyed

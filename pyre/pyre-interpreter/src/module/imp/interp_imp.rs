@@ -773,10 +773,15 @@ fn frozen_data(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
     let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_bytes);
     let mv_type = crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE);
-    crate::module::_pickle::call_fn(
+    let w_view = crate::baseobjspace::call_function(
         mv_type,
         &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
-    )
+    );
+    if w_view.is_null() {
+        return Err(crate::call::take_call_error()
+            .unwrap_or_else(|| crate::PyError::runtime_error("memoryview() failed")));
+    }
+    Ok(w_view)
 }
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {

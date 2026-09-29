@@ -47,6 +47,8 @@ pub mod _multiprocessing;
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _overlapped;
 #[allow(non_snake_case)]
+pub mod _pickle;
+#[allow(non_snake_case)]
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod _posixshmem;
 #[allow(non_snake_case)]
@@ -56,6 +58,8 @@ pub mod _posixsubprocess;
 pub mod _pypy_generic_alias;
 #[allow(non_snake_case)]
 pub mod _queue;
+#[allow(non_snake_case)]
+pub mod _random;
 #[allow(non_snake_case)]
 #[cfg(target_os = "macos")]
 pub mod _scproxy;
@@ -82,6 +86,7 @@ pub mod bz2;
 pub mod cmath;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod fcntl;
+pub mod gc;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod grp;
 pub mod math;

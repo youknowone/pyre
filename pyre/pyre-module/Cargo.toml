@@ -14,6 +14,9 @@ host_env = [
     "pyre-native/host_env",
 ]
 sandbox = ["pyre-interpreter/sandbox", "pyre-native/sandbox"]
+# The `gc.collect` drain of `_rawrefcount_perform` reads this feature from
+# this crate, so the launcher forwards it here as well as to the interpreter.
+cpyext = ["pyre-interpreter/cpyext"]
 dynasm = ["pyre-interpreter/dynasm", "majit-metainterp/dynasm"]
 cranelift = ["pyre-interpreter/cranelift", "majit-metainterp/cranelift"]
 

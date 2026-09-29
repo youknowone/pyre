@@ -1462,7 +1462,6 @@ fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) 
     }
     crate::executioncontext::walk_space_user_del_action_roots(visitor);
     crate::module::signal::interp_signal::walk_check_signal_action_roots(visitor);
-    crate::module::gc::hook::walk_hook_roots(visitor);
     crate::module::sys::vm::walk_monitoring_tool_roots(visitor);
     crate::module::thread::walk_thread_roots(visitor);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
@@ -1566,17 +1565,17 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // The aiter/anext app-level handles are the same off-GC-slot case.
     crate::async_operation::walk_handle_roots(visitor);
     crate::app_functional::walk_handle_roots(visitor);
-    // `_compat_pickle`'s fix_imports tables are `space.fromcache(State)` off-GC
-    // slots; forward them on every collection so a minor move updates the cached
-    // mapping pointers. Placed with the ungated handle roots (not the gated
-    // prebuilt block) because the state is published lazily without
-    // `mark_prebuilt_roots_dirty`, so its possibly-young dicts must be forwarded
-    // on the first collection regardless of the prebuilt-remember bit.
+    // These `space.fromcache` tables are off-GC slots; forward them on every
+    // collection so a minor move updates the cached mapping pointers. They sit
+    // with the ungated handle roots (not the gated prebuilt block) because each
+    // is published lazily without `mark_prebuilt_roots_dirty`, so its possibly
+    // young dicts must be forwarded on the first collection regardless of the
+    // prebuilt-remember bit. `_compat_pickle`'s fix_imports tables reach this
+    // block through `walk_prebuilt_slots` below.
     {
         let mut fwd = |slot: &mut PyObjectRef| {
             visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
         };
-        crate::module::_pickle::walk_pickle_state_gc(&mut fwd);
         // `space.fromcache(AuditHolder)`'s hooks are installed by running app
         // code, so a hook callable is young when it lands and cannot wait for
         // the prebuilt-roots scan below.

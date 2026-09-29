@@ -47491,11 +47491,12 @@ mod tests {
     fn random_rnd_expect_is_niche_guard() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-        let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+        // `_random` lives in `pyre-module`, so its graphs are in that artefact.
+        let path = crate::runtime_names::artifacts::MODULE_ULLBC;
+        let llbc = Llbc::load(path).expect("load pyre-module LLBC");
         let fd = llbc
             .iter_local_fns()
-            .find(|fd| fd.item_meta.name_path() == "pyre_interpreter::module::_random::<Impl>::rnd")
+            .find(|fd| fd.item_meta.name_path() == "pyre_module::module::_random::<Impl>::rnd")
             .expect("W_Random::rnd");
         let context = super::LowerContext::new(&llbc);
         let graph = super::lower_fun_decl(&context, fd).expect("lower rnd");

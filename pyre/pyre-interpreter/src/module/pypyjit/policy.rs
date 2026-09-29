@@ -198,9 +198,7 @@ mod tests {
 
     #[test]
     fn test_pypy_module() {
-        assert!(looks_inside(
-            "pyre_interpreter::module::_random::interp_random"
-        ));
+        assert!(looks_inside("pyre_module::module::_random::interp_random"));
         assert!(looks_inside(
             "pyre_interpreter::module::_collections::interp_deque"
         ));

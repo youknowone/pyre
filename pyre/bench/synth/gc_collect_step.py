@@ -1,3 +1,4 @@
+# pyre-check: requires-modules=gc
 import gc
 
 

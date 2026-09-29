@@ -901,18 +901,6 @@ unsafe fn int_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     unsafe { pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f) };
 }
 
-/// Custom trace for `_random.Random`.  It carries the mapdict prefix like any
-/// other native-layout subclassable object, *and* the reference
-/// `interp_random.py:21` keeps to its own generator (`self._rnd =
-/// rrandom.Random()`).  The shared prefix trace knows nothing of that field, so
-/// forward it here as well — the twister is reachable through nothing else, and
-/// the wrapper keeps answering `random()` through it after a collection.
-unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    unsafe { object_object_custom_trace(obj_addr, f) };
-    let inst = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_random::W_Random) };
-    f(std::ptr::addr_of_mut!(inst.rnd) as *mut majit_ir::GcRef);
-}
-
 /// Custom trace for `W_ModuleDictObject`
 /// (`dictmultiobject.py W_ModuleDictObject`).
 ///
@@ -1988,6 +1976,20 @@ fn build_gc() -> Box<MiniMarkGC> {
                             object_tid,
                             trace,
                         )
+                    }
+                    ModuleGcLayout::WithGcPtrs => {
+                        // GC-managed without being an rclass.OBJECT subclass,
+                        // like `W_DequeBlock`: no Python-visible vtable and no
+                        // `pytype_to_tid` entry, so the shared tail below
+                        // does not apply.
+                        let type_info =
+                            TypeInfo::with_gc_ptrs(descr.object_size, descr.ptr_offsets.to_vec());
+                        let type_info = match ty.destructor {
+                            Some(destructor) => type_info.with_destructor_fn(destructor),
+                            None => type_info,
+                        };
+                        descr.gc_type_id.set(gc.register_type(type_info));
+                        continue;
                     }
                 };
                 let type_info = match ty.destructor {
@@ -3076,32 +3078,6 @@ fn build_gc() -> Box<MiniMarkGC> {
     // the descriptor's `gc_type_id` matches the order here so the
     // hardcoded `type_id` constants on the `#[pyre_class]`
     // attribute cannot silently drift.
-    // PyPy's `allocate_instance(W_Random, w_subtype)` composes
-    // `MapdictStorageMixin` into Python subclasses. `W_Random` therefore has
-    // the same `[PyObject | map | storage]` prefix as `W_ObjectObject` and
-    // needs the same custom trace for boxed attributes — plus its own `rnd`
-    // edge, which `random_object_custom_trace` adds on top. Register it in the
-    // original slot so every later type id remains stable.
-    {
-        let descr = <pyre_interpreter::module::_random::W_Random
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-            descr.object_size,
-            object_tid,
-            random_object_custom_trace,
-        ));
-        if descr.gc_type_id.is_unassigned() {
-            descr.gc_type_id.set(tid);
-        } else {
-            debug_assert_eq!(tid, descr.gc_type_id.get());
-        }
-        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, descr.pytype_ptr as usize, tid);
-        pytype_to_tid.insert(descr.pytype_ptr as usize, tid);
-        pyre_object::gc_hook::register_pyre_class_offsets(
-            descr.pytype_ptr as usize,
-            descr.ptr_offsets,
-        );
-    }
     // Per-`ExcKind` GC type ids.  The pre-registration loop at the
     // top of this function mapped every exception PyType to a
     // single `W_BASE_EXCEPTION_GC_TYPE_ID` so `new_with_vtable` knows
@@ -3246,24 +3222,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_object::_pypy_generic_alias::GenericAlias
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // W_Pickler / W_Unpickler (`_pickle` accelerator) — typed payloads
-    // via `#[pyre_class]` in AUTO-ID mode.  Both carry inline
-    // `PyObjectRef` fields (the pickler's output file; the unpickler's
-    // read/readline callables, result stack, and active frame) that the
-    // collector must walk.  Registered at the tail of the tid chain so
-    // no earlier explicit-id slot shifts.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_pickle::W_Pickler
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_pickle::W_Unpickler
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
     // W_PickleBuffer (`__pypy__.PickleBuffer`) — typed payload via
     // `#[pyre_class]` in AUTO-ID mode; its `w_obj` field is a traced
     // edge the collector must walk.  Tail of the tid chain.
@@ -3271,21 +3229,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut gc,
         &mut pytype_to_tid,
         <pyre_interpreter::module::__pypy__::W_PickleBuffer
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    // PicklerMemoProxy / UnpicklerMemoProxy — typed payloads via
-    // `#[pyre_class]` in AUTO-ID mode; each holds one traced `PyObjectRef`
-    // back-reference to its owning pickler/unpickler. Tail of the tid chain.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_pickle::PicklerMemoProxy
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_pickle::UnpicklerMemoProxy
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_ReversedIterator (`reversed`) — typed payload via `#[pyre_class]`
@@ -3870,34 +3813,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_io::W_StringIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // `pypy/module/gc/referents.py W_GcRef`: the wrapper's raw gcref
-    // field is a normal traced edge so an internal object stays live and is
-    // forwarded in place.  Register it before the target-gated DirEntry slot;
-    // this keeps every unconditional type id identical on native and wasm.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::gc::referents::gcref::W_GcRef
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    // `pypy/module/gc/hook.py W_AppLevelHooks`: the process-owned hooks
-    // singleton keeps the three app callbacks in ordinary traced fields.
-    // Append it after GcRef so every pre-existing unconditional id remains
-    // stable, and before the remaining unconditional GC classes.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::gc::hook::W_AppLevelHooks
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    // `pypy/module/gc/referents.py W_GcStats`: scalar statistics live on
-    // the W_Root itself; register the class even though it has no trace edges.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::gc::referents::stats::W_GcStats
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
 
     // `_PyLineIterator` / `_PyPositionsIterator` / `_PyBranchesIterator` —
     // each holds the code object its suspended walk reads.  All three are
@@ -3915,7 +3830,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     }
 
     // The two `step == 1` iterator shapes.  Their ids are explicit
-    // (`type_id = 164` / `165`) because their descr groups bake them at
+    // (`type_id = 156` / `157`) because their descr groups bake them at
     // compile time to guard and virtualize a FOR_ITER, and an explicit id only
     // holds where registration order does: they are unconditional, so they
     // close the ungated block here, ahead of the target-gated tail whose ids
@@ -4074,18 +3989,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         "interpreter classes must end where the module classes begin"
     );
     register_module_gc_types(&mut gc, &mut pytype_to_tid);
-    // `rrandom.Random` — the Mersenne Twister `interp_random.py` allocates
-    // beside its holder. Like W_DequeBlock it is GC-managed without being an
-    // rclass.OBJECT subclass and has no Python-visible vtable, so it takes a
-    // bare `with_gc_ptrs` id rather than a `register_pyre_class` one. Appended
-    // at the tail so no established id moves.
-    let twister_descr = <pyre_interpreter::module::_random::Random
-        as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-    let twister_tid = gc.register_type(TypeInfo::with_gc_ptrs(
-        twister_descr.object_size,
-        twister_descr.ptr_offsets.to_vec(),
-    ));
-    twister_descr.gc_type_id.set(twister_tid);
     // setobject.py stores the copied r_dict behind `sstorage`;
     // rordereddict.py makes that table a GcStruct("dicttable") the collector
     // traces itself. `set_object_custom_trace` only greys the `items` slot.

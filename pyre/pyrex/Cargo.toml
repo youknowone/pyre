@@ -63,7 +63,7 @@ sandbox = ["pyre-interpreter/sandbox", "pyre-jit/sandbox", "pyre-module?/sandbox
 # Load C extension modules built against pyre's own ABI (see pyre-interpreter).
 # Off by default; it also exports the C-API entry points the loaded object
 # resolves against, see build.rs.
-cpyext = ["pyre-interpreter/cpyext"]
+cpyext = ["pyre-interpreter/cpyext", "pyre-module?/cpyext"]
 # Backwards-compatible alias. The seccomp-bpf syscall allowlist is now installed
 # by default in any Linux `sandbox` build (see the install site in lib.rs and
 # pyre-sandbox::seccomp), so this adds nothing over `sandbox`; it is retained so

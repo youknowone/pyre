@@ -150,7 +150,7 @@ pub(crate) unsafe fn bytearray_check_exports(
         // A dead view releases its export in `W_MemoryView._finalize_`,
         // which the collections above only queue. Drain the queue the way
         // `gc.collect()` does after its collection.
-        crate::module::gc::interp_gc::run_finalizers_now();
+        crate::executioncontext::run_finalizers_now();
     }
     let obj = pyre_object::gc_roots::shadow_stack_get(slot);
     if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
@@ -6140,7 +6140,7 @@ pub fn space_index_w(mut obj: PyObjectRef) -> Result<i64, crate::PyError> {
 }
 
 /// Convert an int or long object to BigInt for comparison.
-pub(crate) unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
+pub unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
     unsafe {
         // PyPy's W_BoolObject subclasses W_IntObject and shares `intval`;
         // pyre uses a distinct layout, so preserve that upstream semantic arm
@@ -12683,7 +12683,7 @@ fn invalid_int_literal(w_source: PyObjectRef, base: u32) -> crate::PyError {
 }
 
 /// Parse an integer from a string with the given base.
-pub(crate) fn parse_int_from_str(
+pub fn parse_int_from_str(
     w_source: PyObjectRef,
     s: &str,
     base: u32,

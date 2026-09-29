@@ -29,47 +29,58 @@ fn gc_stats_public_type() -> PyObjectRef {
         store("__module__", w_str_new("gc"));
         store(
             "__init__",
-            crate::make_builtin_function_with_arity("__init__", gc_stats_public_init, 2),
+            pyre_interpreter::make_builtin_function_with_arity("__init__", gc_stats_public_init, 2),
         );
         store(
             "__repr__",
-            crate::make_builtin_function_with_arity("__repr__", gc_stats_repr, 1),
+            pyre_interpreter::make_builtin_function_with_arity("__repr__", gc_stats_repr, 1),
         );
         let bases_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(pyre_object::w_tuple_new(vec![crate::typedef::w_object()]));
+        let _ = roots.pin_root(pyre_object::w_tuple_new(vec![
+            pyre_interpreter::typedef::w_object(),
+        ]));
         let args = [
-            crate::typedef::w_type(),
+            pyre_interpreter::typedef::w_type(),
             w_str_new("GcStats"),
             pyre_object::gc_roots::shadow_stack_get(bases_slot),
             roots.get(ns_slot),
         ];
-        crate::builtins::type_descr_new(&args).expect("construct app_referents.GcStats")
+        pyre_interpreter::builtins::type_descr_new(&args).expect("construct app_referents.GcStats")
     })
 }
 
-fn gc_stats_public_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn gc_stats_public_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     populate_public_gc_stats(args[0], args[1])?;
     Ok(w_none())
 }
 
-fn gc_stats_attr_string(self_slot: usize, name: &'static str) -> Result<String, crate::PyError> {
-    let value =
-        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(self_slot), name)?;
-    Ok(unsafe { crate::display::py_str_wtf8(value)? }
+fn gc_stats_attr_string(
+    self_slot: usize,
+    name: &'static str,
+) -> Result<String, pyre_interpreter::PyError> {
+    let value = pyre_interpreter::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        name,
+    )?;
+    Ok(unsafe { pyre_interpreter::display::py_str_wtf8(value)? }
         .to_string_lossy()
         .into_owned())
 }
 
-fn gc_stats_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn gc_stats_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(args[0]);
-    let raw =
-        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(self_slot), "_s")?;
+    let raw = pyre_interpreter::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        "_s",
+    )?;
     let _ = pyre_object::gc_roots::pin_root(raw);
     let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let raw = stats::W_GcStats::from_obj(pyre_object::gc_roots::shadow_stack_get(raw_slot))
-        .ok_or_else(|| crate::PyError::type_error("GcStats._s is not a native GcStats"))?;
+        .ok_or_else(|| {
+            pyre_interpreter::PyError::type_error("GcStats._s is not a native GcStats")
+        })?;
     let total_memory_pressure = raw.total_memory_pressure;
     let total_arena_allocated = format_gc_stat(
         raw.total_allocated_memory - raw.total_rawmalloced_memory - raw.nursery_size,
@@ -91,15 +102,15 @@ fn gc_stats_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let peak_allocated_memory = gc_stats_attr_string(self_slot, "peak_allocated_memory")?;
     let jit_backend_allocated = gc_stats_attr_string(self_slot, "jit_backend_allocated")?;
     let memory_allocated_sum = gc_stats_attr_string(self_slot, "memory_allocated_sum")?;
-    let total_gc_time_obj = crate::baseobjspace::getattr_str(
+    let total_gc_time_obj = pyre_interpreter::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(self_slot),
         "total_gc_time",
     )?;
     let _ = pyre_object::gc_roots::pin_root(total_gc_time_obj);
     let total_gc_time_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let total_gc_time =
-        crate::baseobjspace::float_w(pyre_object::gc_roots::shadow_stack_get(total_gc_time_slot))?
-            / 1000.0;
+    let total_gc_time = pyre_interpreter::baseobjspace::float_w(
+        pyre_object::gc_roots::shadow_stack_get(total_gc_time_slot),
+    )? / 1000.0;
     let extra = if total_memory_pressure != -1 {
         format!("\n    memory pressure:         {total_memory_pressure_text}")
     } else {
@@ -144,14 +155,19 @@ fn gc_stats_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     )))
 }
 
-fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), crate::PyError> {
+fn populate_public_gc_stats(
+    obj: PyObjectRef,
+    raw: PyObjectRef,
+) -> Result<(), pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     let raw_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(raw);
     let raw = stats::W_GcStats::from_obj(pyre_object::gc_roots::shadow_stack_get(raw_slot))
-        .ok_or_else(|| crate::PyError::type_error("GcStats() requires a native GcStats"))?;
+        .ok_or_else(|| {
+            pyre_interpreter::PyError::type_error("GcStats() requires a native GcStats")
+        })?;
     let memory_pressure_value = if raw.total_memory_pressure == -1 {
         0
     } else {
@@ -180,7 +196,7 @@ fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), cr
         ),
     ];
     let total_gc_time = raw.total_gc_time;
-    crate::baseobjspace::setattr_str(
+    pyre_interpreter::baseobjspace::setattr_str(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
         "_s",
         pyre_object::gc_roots::shadow_stack_get(raw_slot),
@@ -189,7 +205,7 @@ fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), cr
         let text = w_str_new_managed(&format_gc_stat(value));
         let _ = pyre_object::gc_roots::pin_root(text);
         let text_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        crate::baseobjspace::setattr_str(
+        pyre_interpreter::baseobjspace::setattr_str(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             name,
             pyre_object::gc_roots::shadow_stack_get(text_slot),
@@ -201,7 +217,7 @@ fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), cr
     let time_value = w_int_new(total_gc_time);
     let _ = pyre_object::gc_roots::pin_root(time_value);
     let time_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    crate::baseobjspace::setattr_str(
+    pyre_interpreter::baseobjspace::setattr_str(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
         "total_gc_time",
         pyre_object::gc_roots::shadow_stack_get(time_slot),
@@ -209,7 +225,9 @@ fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), cr
     Ok(())
 }
 
-pub(super) fn new_public_gc_stats(memory_pressure: bool) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn new_public_gc_stats(
+    memory_pressure: bool,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let raw = stats::new(memory_pressure);
     let raw_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -229,11 +247,11 @@ fn gc_call_method(
     obj: PyObjectRef,
     name: &str,
     args: &[PyObjectRef],
-) -> Result<PyObjectRef, crate::PyError> {
-    let result = crate::baseobjspace::call_method(obj, name, args);
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let result = pyre_interpreter::baseobjspace::call_method(obj, name, args);
     if result.is_null() {
-        Err(crate::call::take_call_error()
-            .unwrap_or_else(|| crate::PyError::runtime_error("method call failed")))
+        Err(pyre_interpreter::call::take_call_error()
+            .unwrap_or_else(|| pyre_interpreter::PyError::runtime_error("method call failed")))
     } else {
         Ok(result)
     }
@@ -258,7 +276,7 @@ fn typeids_sidecar_exists(path: &std::path::Path) -> bool {
     #[cfg(feature = "sandbox")]
     {
         use std::os::unix::ffi::OsStrExt;
-        crate::host_seam::ops::stat(path.as_os_str().as_bytes()).is_ok()
+        pyre_interpreter::host_seam::ops::stat(path.as_os_str().as_bytes()).is_ok()
     }
     #[cfg(not(feature = "sandbox"))]
     {
@@ -277,16 +295,18 @@ fn typeids_sidecar_exists(path: &std::path::Path) -> bool {
 fn write_typeids_sidecar(
     path: &std::path::Path,
     payload: TypeidsPayload<'_>,
-) -> Result<(), crate::PyError> {
+) -> Result<(), pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
+    let _ = pyre_object::gc_roots::pin_root(pyre_interpreter::gateway::fsdecode_os_str(
+        path.as_os_str(),
+    ));
     let mode_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(match payload {
         TypeidsPayload::Binary(_) => "wb",
         TypeidsPayload::Text(_) => "w",
     }));
-    let opened = crate::builtins::builtin_open(&[
+    let opened = pyre_interpreter::builtins::builtin_open(&[
         pyre_object::gc_roots::shadow_stack_get(name_slot),
         pyre_object::gc_roots::shadow_stack_get(mode_slot),
     ])?;
@@ -314,7 +334,9 @@ fn write_typeids_sidecar(
     Ok(())
 }
 
-pub(super) fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn dump_rpy_heap_public(
+    file: PyObjectRef,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let file_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(file);
@@ -327,10 +349,10 @@ pub(super) fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, cra
     if unsafe { is_str(file()) } {
         // app_referents.py:22-40: filename arm opens/truncates the binary
         // dump, closes it, then materializes typeids.txt/.lst if absent.
-        let path = crate::gateway::fspath_buf(file())?;
+        let path = pyre_interpreter::gateway::fspath_buf(file())?;
         let mode_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("wb"));
-        let opened = crate::builtins::builtin_open(&[
+        let opened = pyre_interpreter::builtins::builtin_open(&[
             file(),
             pyre_object::gc_roots::shadow_stack_get(mode_slot),
         ])?;
@@ -341,7 +363,7 @@ pub(super) fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, cra
             "fileno",
             &[],
         )?;
-        let fd = crate::baseobjspace::int_w(fileno)? as i32;
+        let fd = pyre_interpreter::baseobjspace::int_w(fileno)? as i32;
         let dump_result = dump_rpy_heap_fd(fd);
         let close_result = gc_call_method(
             pyre_object::gc_roots::shadow_stack_get(opened_slot),
@@ -355,14 +377,14 @@ pub(super) fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, cra
         let typeids_txt = directory.join("typeids.txt");
         if !typeids_sidecar_exists(&typeids_txt) {
             let text = majit_gc::get_typeids_text().ok_or_else(|| {
-                crate::PyError::not_implemented("operation not implemented by this GC")
+                pyre_interpreter::PyError::not_implemented("operation not implemented by this GC")
             })?;
             write_typeids_sidecar(&typeids_txt, TypeidsPayload::Binary(&text))?;
         }
         let typeids_lst = directory.join("typeids.lst");
         if !typeids_sidecar_exists(&typeids_lst) {
             let list = majit_gc::get_typeids_list().ok_or_else(|| {
-                crate::PyError::not_implemented("operation not implemented by this GC")
+                pyre_interpreter::PyError::not_implemented("operation not implemented by this GC")
             })?;
             let data: String = list.into_iter().map(|value| format!("{value}\n")).collect();
             write_typeids_sidecar(&typeids_lst, TypeidsPayload::Text(&data))?;
@@ -371,20 +393,20 @@ pub(super) fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, cra
     }
 
     let fd = if unsafe { is_int(file()) } {
-        crate::baseobjspace::int_w(file())? as i32
+        pyre_interpreter::baseobjspace::int_w(file())? as i32
     } else {
         // app_referents.py:44-49: flush only when the attribute exists, then
         // ask for fileno. AttributeError is the only absence case upstream;
         // a present flush method's exception propagates.
-        match crate::baseobjspace::getattr_str(file(), "flush") {
+        match pyre_interpreter::baseobjspace::getattr_str(file(), "flush") {
             Ok(flush) => {
-                crate::call::call_function_impl_result(flush, &[])?;
+                pyre_interpreter::call::call_function_impl_result(flush, &[])?;
             }
-            Err(error) if error.kind == crate::PyErrorKind::AttributeError => {}
+            Err(error) if error.kind == pyre_interpreter::PyErrorKind::AttributeError => {}
             Err(error) => return Err(error),
         }
         let fileno = gc_call_method(file(), "fileno", &[])?;
-        crate::baseobjspace::int_w(fileno)? as i32
+        pyre_interpreter::baseobjspace::int_w(fileno)? as i32
     };
     dump_rpy_heap_fd(fd)?;
     Ok(w_none())

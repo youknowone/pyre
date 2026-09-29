@@ -1,18 +1,23 @@
-//! Optional builtin modules — `pypy/module/` (non-essential subset).
+//! Optional builtin modules — the `pypy/module/` subset the interpreter never
+//! reaches by name.
 //!
-//! PyPy classifies builtin modules into three tiers:
+//! A module belongs in `pyre-interpreter` when any of three things holds:
 //!
-//! | Tier       | PyPy config          | pyre location          |
-//! |------------|----------------------|------------------------|
-//! | Essential  | always loaded        | `pyre-interpreter`     |
-//! | Default    | on by default        | `pyre-module` (here)   |
-//! | Working    | opt-in               | `pyre-module` (here)   |
+//! - the interpreter reaches it by name — `import`, `absolute_import`,
+//!   `import_module`, or upstream's `space.getbuiltinmodule`;
+//! - PyPy's `essential_modules` names it (`_opcode`, `__pypy__`);
+//! - CPython's `Modules/Setup.bootstrap` names it (`_abc`, `_functools`,
+//!   `_stat`, `_symtable`, `_types`, `faulthandler`, `pwd`, `time`).
 //!
-//! Essential modules (`__builtin__`, `sys`) live in `pyre-interpreter`
-//! because they are inseparable from the interpreter bootstrap.
+//! Everything else belongs here, and the test runs in both directions: a
+//! module sitting in `pyre-interpreter` that answers none of the three belongs
+//! here instead.
 //!
-//! Everything else belongs here.  Modules will be migrated from
-//! `pyre-interpreter/src/module/` as they grow.
+//! PyPy's `default_modules` tier is not one of the three. `pypyoption.py`
+//! gives every module a `BoolOption(modname, default=modname in
+//! default_modules)`, so that tier means "on by default, switchable off" —
+//! which is what `pyrex`'s `default = [..., "pyre-module"]` already
+//! expresses. `math` and `cmath` are `default_modules` and stay here.
 
 /// Adapt a `W_Root` sweep hook (`fn(PyObjectRef)`) to the collector's
 /// address-taking `DestructorFn`.
@@ -48,6 +53,8 @@ pub fn install_optional_modules() {
     #[cfg(all(not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_ctypes", module::_ctypes::init);
     pyre_interpreter::importing::register_builtin_module("_bz2", module::bz2::init);
+    pyre_interpreter::importing::register_builtin_module("_pickle", module::_pickle::init);
+    pyre_interpreter::importing::register_builtin_module("_random", module::_random::init);
     pyre_interpreter::importing::register_builtin_module("_csv", module::_csv::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_cn", module::_codecs_cn::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_hk", module::_codecs_hk::init);
@@ -86,6 +93,7 @@ pub fn install_optional_modules() {
         module::_pypy_generic_alias::init,
     );
     pyre_interpreter::importing::register_builtin_module("_queue", module::_queue::init);
+    pyre_interpreter::importing::register_builtin_module("gc", module::gc::init);
     #[cfg(all(not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_socket", module::_socket::init);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
@@ -327,6 +335,11 @@ pub fn register() {
             walk_global_roots: walk_optional_global_roots,
             walk_prebuilt_slots: |fwd| {
                 module::_csv::walk_csv_state_gc(fwd);
+                // `_compat_pickle`'s fix_imports tables are a
+                // `space.fromcache(State)` off-GC slot published lazily without
+                // `mark_prebuilt_roots_dirty`, so its possibly young dicts must
+                // be forwarded on the first collection.
+                module::_pickle::walk_pickle_state_gc(fwd);
             },
             publish_fnaddrs: publish_optional_fnaddrs,
             mini_buffer_params: hook_mini_buffer_params,
@@ -342,8 +355,19 @@ pub fn register() {
             immortal_w_class_only_descriptors: all_immortal_w_class_only_descriptors,
             libffi_cif_shape: hook_libffi_cif_shape,
             math_builtin_name: module::math::interp_math::math_builtin_name,
+            gc_initialize: hook_gc_initialize,
+            gc_run_finalizers_now: module::gc::interp_gc::run_finalizers_now,
         },
     );
+}
+
+/// `interp_gc.py`'s hook installation. The execution context only needs the
+/// hooks bound to the shared action flag, not the object `initialize` returns.
+fn hook_gc_initialize(
+    space: pyre_object::PyObjectRef,
+    actionflag: &mut (dyn pyre_interpreter::executioncontext::ActionFlagOps + 'static),
+) {
+    let _ = module::gc::hook::initialize(space, actionflag);
 }
 
 /// `jit_libffi.py`'s reading of a `CIF_DESCRIPTION` block for the tracer.
@@ -404,6 +428,9 @@ fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
     module::_lzma::gc_types(&mut types);
     module::_lsprof::gc_types(&mut types);
     module::_queue::gc_types(&mut types);
+    module::gc::gc_types(&mut types);
+    module::_pickle::gc_types(&mut types);
+    module::_random::gc_types(&mut types);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     module::_ssl::gc_types(&mut types);
     #[cfg(all(
@@ -444,6 +471,37 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         "pymath::math::misc::ulp",
         pymath::math::ulp as *const (),
     );
+    // `rpython/rlib/rrandom.py Random.genrand32` contains the Mersenne Twister
+    // refill loops. `JitPolicy.look_inside_graph` rejects the loopy graph (it is
+    // not `@jit.unroll_safe`), so `Random.random` keeps two ordinary residual
+    // calls to the translated native helper. Publish that helper's address just
+    // as RPython's source translation/link step does; otherwise the codewriter
+    // can only emit a `symbolic_fnaddr_for_path` hash and an inline sub-walk
+    // must abort before reaching the native residual.
+    {
+        let genrand32: fn(&mut module::_random::Random) -> u32 = module::_random::Random::genrand32;
+        let addr = genrand32 as *const () as usize as i64;
+        if addr != 0 {
+            entries.push(("pyre_interpreter::module::_random::Random::genrand32", addr));
+            entries.push(("module::_random::Random::genrand32", addr));
+            entries.push(("pyre_module::module::_random::Random::genrand32", addr));
+        }
+    }
+    // `gc.collect`'s finalizer drain, residual for the reason given at
+    // `module::gc::interp_gc::run_finalizers_now`.
+    {
+        let addr = module::gc::interp_gc::run_finalizers_now as *const () as usize as i64;
+        if addr != 0 {
+            entries.push((
+                "pyre_interpreter::module::gc::interp_gc::run_finalizers_now",
+                addr,
+            ));
+            entries.push((
+                "pyre_module::module::gc::interp_gc::run_finalizers_now",
+                addr,
+            ));
+        }
+    }
     #[cfg(all(
         not(target_arch = "wasm32"),
         feature = "host_env",
@@ -1009,7 +1067,7 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
 }
 
 fn walk_optional_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let _ = visitor;
+    module::gc::hook::walk_hook_roots(visitor);
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     module::_ctypes::cdata::walk_pyobj_container_roots(visitor);
 }
@@ -1207,6 +1265,50 @@ mod tests {
                 "pyre_module::module::_lsprof::profiler_methods::__majit_wrap___new__"
             ),
             "moved _lsprof #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
+    /// `Random.genrand32` holds the Mersenne Twister refill loops that
+    /// `JitPolicy.look_inside_graph` rejects, so the codewriter needs its real
+    /// address for the residual call. Every resolver spelling binds the helper.
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_random_genrand32() {
+        crate::register();
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        let genrand32: fn(&mut crate::module::_random::Random) -> u32 =
+            crate::module::_random::Random::genrand32;
+        let expected = genrand32 as *const () as usize as i64;
+
+        assert_eq!(
+            bindings["pyre_module::module::_random::Random::genrand32"],
+            expected
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::module::_random::Random::genrand32"],
+            expected
+        );
+        assert_eq!(bindings["module::_random::Random::genrand32"], expected);
+    }
+
+    /// `gc.collect`'s drain. The interpreter reaches the same body through its
+    /// own `dont_look_inside` wrapper, which publishes separately; this module's
+    /// two spellings bind the body itself.
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_run_finalizers_now() {
+        crate::register();
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        let expected =
+            crate::module::gc::interp_gc::run_finalizers_now as *const () as usize as i64;
+
+        assert_eq!(
+            bindings["pyre_module::module::gc::interp_gc::run_finalizers_now"],
+            expected
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::module::gc::interp_gc::run_finalizers_now"],
+            expected
         );
     }
 }

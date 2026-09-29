@@ -83,6 +83,10 @@ pub(crate) mod artifacts {
         env!("CARGO_MANIFEST_DIR"),
         "/../../build/llbc/pyre-object.ullbc"
     );
+    pub(crate) const MODULE_ULLBC: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-module.ullbc"
+    );
     pub(crate) const JIT_ULLBC: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../build/llbc/pyre-jit.ullbc"

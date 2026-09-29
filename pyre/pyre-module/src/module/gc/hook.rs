@@ -1,10 +1,10 @@
 //! App-level GC hooks — PyPy: `pypy/module/gc/hook.py`.
 
-use crate::executioncontext::{
+use majit_gc::GcStepTransition;
+use pyre_interpreter::executioncontext::{
     ActionFlagOps, AsyncAction, AsyncActionControl, AsyncActionOps, ExecutionContext,
 };
-use crate::pyframe::PyFrame;
-use majit_gc::GcStepTransition;
+use pyre_interpreter::pyframe::PyFrame;
 use pyre_object::*;
 use rustpython_wtf8::Wtf8;
 use std::sync::OnceLock;
@@ -41,7 +41,7 @@ impl GcMinorHookAction {
         self.duration_max = 0.0;
     }
 
-    fn do_perform(&mut self) -> Result<(), crate::PyError> {
+    fn do_perform(&mut self) -> Result<(), pyre_interpreter::PyError> {
         // `self` is a field of this very allocation, so read the callback
         // through the pointer rather than borrowing the whole singleton.
         let Some(hooks) = app_hooks_ptr() else {
@@ -68,7 +68,7 @@ impl GcMinorHookAction {
         )?;
         let _ = pyre_object::gc_roots::pin_root(stats);
         let stats_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        crate::call::call_function_impl_result(
+        pyre_interpreter::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
             &[pyre_object::gc_roots::shadow_stack_get(stats_slot)],
         )?;
@@ -81,7 +81,7 @@ impl AsyncActionOps for GcMinorHookAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<AsyncActionControl, crate::PyError> {
+    ) -> Result<AsyncActionControl, pyre_interpreter::PyError> {
         if self.depth != 0 {
             return Ok(AsyncActionControl::Continue);
         }
@@ -132,7 +132,7 @@ impl GcCollectStepHookAction {
         self.duration_max = 0.0;
     }
 
-    fn do_perform(&mut self) -> Result<(), crate::PyError> {
+    fn do_perform(&mut self) -> Result<(), pyre_interpreter::PyError> {
         // `self` is a field of this very allocation, so read the callback
         // through the pointer rather than borrowing the whole singleton.
         let Some(hooks) = app_hooks_ptr() else {
@@ -160,7 +160,7 @@ impl GcCollectStepHookAction {
         )?;
         let _ = pyre_object::gc_roots::pin_root(stats);
         let stats_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        crate::call::call_function_impl_result(
+        pyre_interpreter::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
             &[pyre_object::gc_roots::shadow_stack_get(stats_slot)],
         )?;
@@ -173,7 +173,7 @@ impl AsyncActionOps for GcCollectStepHookAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<AsyncActionControl, crate::PyError> {
+    ) -> Result<AsyncActionControl, pyre_interpreter::PyError> {
         if self.depth != 0 {
             return Ok(AsyncActionControl::Continue);
         }
@@ -221,7 +221,7 @@ impl GcCollectHookAction {
         }
     }
 
-    fn do_perform(&mut self) -> Result<(), crate::PyError> {
+    fn do_perform(&mut self) -> Result<(), pyre_interpreter::PyError> {
         // `self` is a field of this very allocation, so read the callback
         // through the pointer rather than borrowing the whole singleton.
         let Some(hooks) = app_hooks_ptr() else {
@@ -252,7 +252,7 @@ impl GcCollectHookAction {
         )?;
         let _ = pyre_object::gc_roots::pin_root(stats);
         let stats_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        crate::call::call_function_impl_result(
+        pyre_interpreter::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
             &[pyre_object::gc_roots::shadow_stack_get(stats_slot)],
         )?;
@@ -265,7 +265,7 @@ impl AsyncActionOps for GcCollectHookAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<AsyncActionControl, crate::PyError> {
+    ) -> Result<AsyncActionControl, pyre_interpreter::PyError> {
         if self.depth != 0 {
             return Ok(AsyncActionControl::Continue);
         }
@@ -288,7 +288,7 @@ impl AsyncActionOps for GcCollectHookAction {
 /// on the singleton owner, so the generated type tracer forwards them; the
 /// three action objects are embedded exactly as its `gc_minor`,
 /// `gc_collect_step`, and `gc_collect` attributes are upstream.
-#[crate::pyre_class("GcHooks")]
+#[pyre_interpreter::pyre_class("GcHooks")]
 pub struct W_AppLevelHooks {
     pub w_on_gc_minor: PyObjectRef,
     pub w_on_gc_collect_step: PyObjectRef,
@@ -307,7 +307,7 @@ impl W_AppLevelHooks {
     }
 }
 
-#[crate::pyre_methods]
+#[pyre_interpreter::pyre_methods]
 impl W_AppLevelHooks {
     #[getter]
     fn on_gc_minor(&self) -> PyObjectRef {
@@ -345,25 +345,25 @@ impl W_AppLevelHooks {
         self.write_barrier();
     }
 
-    fn set(&mut self, w_obj: PyObjectRef) -> Result<(), crate::PyError> {
+    fn set(&mut self, w_obj: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
         // hook.py:100-107 — fetch all three first, so a missing later
         // attribute leaves the existing hook set untouched.
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(w_obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_a = crate::baseobjspace::getattr_str(
+        let w_a = pyre_interpreter::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             "on_gc_minor",
         )?;
         let _ = pyre_object::gc_roots::pin_root(w_a);
         let a_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_b = crate::baseobjspace::getattr_str(
+        let w_b = pyre_interpreter::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             "on_gc_collect_step",
         )?;
         let _ = pyre_object::gc_roots::pin_root(w_b);
         let b_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_c = crate::baseobjspace::getattr_str(
+        let w_c = pyre_interpreter::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             "on_gc_collect",
         )?;
@@ -418,7 +418,7 @@ fn app_hooks_ptr() -> Option<*mut W_AppLevelHooks> {
 
 /// Create the space-owned singleton and bind its three actions to the shared
 /// `space.actionflag`. The main ExecutionContext calls this during bootstrap;
-/// worker ECs carry [`crate::executioncontext::SpaceActionFlag`] references to
+/// worker ECs carry [`pyre_interpreter::executioncontext::SpaceActionFlag`] references to
 /// that same flag, so a collection performed by a worker fires and dispatches
 /// the same action indexes there, matching PyPy's process-owned object space.
 pub fn initialize(
@@ -467,7 +467,8 @@ pub fn hooks_object() -> PyObjectRef {
     if let Some(&addr) = HOOKS_OBJECT.get() {
         return addr as PyObjectRef;
     }
-    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
     assert!(
         !ec.is_null(),
         "gc.hooks initialized without an ExecutionContext"
@@ -551,16 +552,21 @@ pub(super) const STATE_USERDEL: u8 = GcStepTransition::STATE_FINALIZING + 1;
 fn collect_step_stat_value(
     args: &[PyObjectRef],
     name: &'static str,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let value = unsafe {
-        crate::objspace::std::mapdict::instance_node_getdictvalue(args[1], Wtf8::new(name))
+        pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue(
+            args[1],
+            Wtf8::new(name),
+        )
     };
-    value.ok_or_else(|| crate::PyError::attribute_error("uninitialized GcCollectStepStats"))
+    value.ok_or_else(|| {
+        pyre_interpreter::PyError::attribute_error("uninitialized GcCollectStepStats")
+    })
 }
 
 macro_rules! collect_step_stat_getter {
     ($function:ident, $name:literal) => {
-        fn $function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        fn $function(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             collect_step_stat_value(args, $name)
         }
     };
@@ -586,21 +592,25 @@ fn is_hidden_stat_slot(name: &str) -> bool {
     name == "__dict__" || (name.starts_with('_') && !name.starts_with("__"))
 }
 
-fn collect_step_stats_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn collect_step_stats_getattribute(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // `args` is the gateway's native copy; `text_w` can collect.
     let mut w_obj = args[0];
-    let name = pyre_object::with_roots!(w_obj => crate::baseobjspace::text_w(args[1]))?;
+    let name = pyre_object::with_roots!(w_obj => pyre_interpreter::baseobjspace::text_w(args[1]))?;
     if is_hidden_stat_slot(name) {
-        return Err(crate::PyError::attribute_error(format!(
+        return Err(pyre_interpreter::PyError::attribute_error(format!(
             "'GcCollectStepStats' object has no attribute '{name}'"
         )));
     }
-    crate::baseobjspace::object_getattribute(w_obj, name)
+    pyre_interpreter::baseobjspace::object_getattribute(w_obj, name)
 }
 
-fn collect_step_stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let name = crate::baseobjspace::text_w(args[1])?;
-    Err(crate::PyError::attribute_error(format!(
+fn collect_step_stats_setattr(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let name = pyre_interpreter::baseobjspace::text_w(args[1])?;
+    Err(pyre_interpreter::PyError::attribute_error(format!(
         "readonly attribute '{name}'"
     )))
 }
@@ -608,11 +618,11 @@ fn collect_step_stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
     static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
     TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("GcCollectStepStats", |ns| unsafe {
+        let tp = pyre_interpreter::typedef::make_builtin_type("GcCollectStepStats", |ns| unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 "__getattribute__",
-                crate::make_builtin_function_with_arity(
+                pyre_interpreter::make_builtin_function_with_arity(
                     "__getattribute__",
                     collect_step_stats_getattribute,
                     2,
@@ -621,7 +631,7 @@ pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 "__setattr__",
-                crate::make_builtin_function_with_arity(
+                pyre_interpreter::make_builtin_function_with_arity(
                     "__setattr__",
                     collect_step_stats_setattr,
                     3,
@@ -647,7 +657,10 @@ pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
                 ),
             );
             for (name, getter) in [
-                ("count", collect_step_count as crate::gateway::BuiltinCodeFn),
+                (
+                    "count",
+                    collect_step_count as pyre_interpreter::gateway::BuiltinCodeFn,
+                ),
                 ("duration", collect_step_duration),
                 ("duration_min", collect_step_duration_min),
                 ("duration_max", collect_step_duration_max),
@@ -658,8 +671,8 @@ pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
                 pyre_object::w_dict_setitem_str_no_proxy(
                     ns,
                     name,
-                    crate::typedef::make_getset_descriptor_named(
-                        crate::make_builtin_function_with_arity(name, getter, 2),
+                    pyre_interpreter::typedef::make_getset_descriptor_named(
+                        pyre_interpreter::make_builtin_function_with_arity(name, getter, 2),
                         name,
                     ),
                 );
@@ -675,7 +688,7 @@ pub(super) fn new_collect_step_stats(
     oldstate: u8,
     newstate: u8,
     major_is_done: bool,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     new_collect_step_stats_full(1, -1.0, -1.0, -1.0, oldstate, newstate, major_is_done)
 }
 
@@ -688,7 +701,7 @@ fn new_collect_step_stats_full(
     oldstate: u8,
     newstate: u8,
     major_is_done: bool,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     initialize_stats(
         gc_collect_step_stats_type(),
         &[
@@ -708,16 +721,21 @@ fn readonly_stat_value(
     args: &[PyObjectRef],
     name: &'static str,
     typename: &'static str,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let value = unsafe {
-        crate::objspace::std::mapdict::instance_node_getdictvalue(args[1], Wtf8::new(name))
+        pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue(
+            args[1],
+            Wtf8::new(name),
+        )
     };
-    value.ok_or_else(|| crate::PyError::attribute_error(format!("uninitialized {typename}")))
+    value.ok_or_else(|| {
+        pyre_interpreter::PyError::attribute_error(format!("uninitialized {typename}"))
+    })
 }
 
 macro_rules! readonly_stat_getter {
     ($function:ident, $field:literal, $typename:literal) => {
-        fn $function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        fn $function(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             readonly_stat_value(args, $field, $typename)
         }
     };
@@ -763,46 +781,50 @@ readonly_stat_getter!(
 );
 readonly_stat_getter!(collect_pinned_objects, "_pinned_objects", "GcCollectStats");
 
-fn stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let name = crate::baseobjspace::text_w(args[1])?;
-    Err(crate::PyError::attribute_error(format!(
+fn stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let name = pyre_interpreter::baseobjspace::text_w(args[1])?;
+    Err(pyre_interpreter::PyError::attribute_error(format!(
         "readonly attribute '{name}'"
     )))
 }
 
-fn stats_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn stats_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // `args` is the gateway's native copy; `text_w` can collect.
     let mut w_obj = args[0];
-    let name = pyre_object::with_roots!(w_obj => crate::baseobjspace::text_w(args[1]))?;
+    let name = pyre_object::with_roots!(w_obj => pyre_interpreter::baseobjspace::text_w(args[1]))?;
     if is_hidden_stat_slot(name) {
-        return Err(crate::PyError::attribute_error(format!(
+        return Err(pyre_interpreter::PyError::attribute_error(format!(
             "stats object has no attribute '{name}'"
         )));
     }
-    crate::baseobjspace::object_getattribute(w_obj, name)
+    pyre_interpreter::baseobjspace::object_getattribute(w_obj, name)
 }
 
 fn make_private_stats_type(
     name: &'static str,
-    fields: &[(&'static str, crate::gateway::BuiltinCodeFn)],
+    fields: &[(&'static str, pyre_interpreter::gateway::BuiltinCodeFn)],
 ) -> PyObjectRef {
-    let tp = crate::typedef::make_builtin_type(name, |ns| unsafe {
+    let tp = pyre_interpreter::typedef::make_builtin_type(name, |ns| unsafe {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__getattribute__",
-            crate::make_builtin_function_with_arity("__getattribute__", stats_getattribute, 2),
+            pyre_interpreter::make_builtin_function_with_arity(
+                "__getattribute__",
+                stats_getattribute,
+                2,
+            ),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__setattr__",
-            crate::make_builtin_function_with_arity("__setattr__", stats_setattr, 3),
+            pyre_interpreter::make_builtin_function_with_arity("__setattr__", stats_setattr, 3),
         );
         for &(field, getter) in fields {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 field,
-                crate::typedef::make_getset_descriptor_named(
-                    crate::make_builtin_function_with_arity(field, getter, 2),
+                pyre_interpreter::typedef::make_getset_descriptor_named(
+                    pyre_interpreter::make_builtin_function_with_arity(field, getter, 2),
                     field,
                 ),
             );
@@ -882,7 +904,7 @@ fn initialize_stats(
     stats_type: PyObjectRef,
     fields: &[(&'static str, StatValue)],
     typename: &'static str,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let stats_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_instance_new(stats_type));
@@ -890,14 +912,14 @@ fn initialize_stats(
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(value.materialize());
         let stored = unsafe {
-            crate::objspace::std::mapdict::instance_node_setdictvalue(
+            pyre_interpreter::objspace::std::mapdict::instance_node_setdictvalue(
                 pyre_object::gc_roots::shadow_stack_get(stats_slot),
                 Wtf8::new(name),
                 pyre_object::gc_roots::shadow_stack_get(value_slot),
             )
         };
         if !stored {
-            return Err(crate::PyError::attribute_error(format!(
+            return Err(pyre_interpreter::PyError::attribute_error(format!(
                 "cannot initialize {typename}"
             )));
         }
@@ -912,7 +934,7 @@ fn new_minor_stats(
     duration_max: f64,
     total_memory_used: usize,
     pinned_objects: usize,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     initialize_stats(
         gc_minor_stats_type(),
         &[
@@ -940,7 +962,7 @@ fn new_collect_stats(
     rawmalloc_bytes_before: usize,
     rawmalloc_bytes_after: usize,
     pinned_objects: usize,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     initialize_stats(
         gc_collect_stats_type(),
         &[

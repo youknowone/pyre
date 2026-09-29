@@ -1226,22 +1226,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::jit_sequence_getitem",
         crate::runtime_ops::jit_sequence_getitem,
     );
-    // `rpython/rlib/rrandom.py Random.genrand32` contains the Mersenne
-    // Twister refill loops.  `JitPolicy.look_inside_graph` deliberately
-    // rejects the loopy graph (it is not `@jit.unroll_safe`), so
-    // `Random.random` keeps two ordinary residual calls to the translated
-    // native helper.  Publish that helper's address just as RPython's source
-    // translation/link step does; otherwise the codewriter can only emit a
-    // `symbolic_fnaddr_for_path` hash and an inline sub-walk must abort before
-    // reaching the native residual.
-    let random_genrand32: fn(&mut crate::module::_random::Random) -> u32 =
-        crate::module::_random::Random::genrand32;
-    pa1(
-        &mut entries,
-        "pyre_interpreter::module::_random::Random::genrand32",
-        "module::_random::Random::genrand32",
-        random_genrand32,
-    );
     cpa1(
         &mut entries,
         "pyre_interpreter::runtime_ops::jit_next",
@@ -2653,13 +2637,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::register_finalizer",
         crate::executioncontext::register_finalizer,
     );
-    // `gc.collect`'s finalizer drain, residual for the reason given at
-    // `module::gc::interp_gc::run_finalizers_now`.
+    // `bytearray_check_exports` and `gc.collect` both reach the queued-finalizer
+    // drain, which is one residual call: the `gc` module owns the bracket, so
+    // the body is behind a hook and only this `dont_look_inside` wrapper has an
+    // address to bind.
     pa0(
         &mut entries,
-        "pyre_interpreter::module::gc::interp_gc::run_finalizers_now",
+        "pyre_interpreter::executioncontext::run_finalizers_now",
         "pyre_interpreter::run_finalizers_now",
-        crate::module::gc::interp_gc::run_finalizers_now,
+        crate::executioncontext::run_finalizers_now,
     );
     pa0(
         &mut entries,
@@ -6339,20 +6325,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn jit_trace_fnaddrs_covers_random_genrand32_residual() {
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let genrand32: fn(&mut crate::module::_random::Random) -> u32 =
-            crate::module::_random::Random::genrand32;
-        let expected = genrand32 as *const () as usize as i64;
-
-        assert_eq!(
-            bindings["pyre_interpreter::module::_random::Random::genrand32"],
-            expected
-        );
-        assert_eq!(bindings["module::_random::Random::genrand32"], expected);
-    }
-
     /// Every `#[pyre_methods]` `type_object()` accessor publishes its residual
     /// address.  Both the crate-qualified path (the residual `FunctionPath`)
     /// and the crate-stripped alias resolve to the accessor.
@@ -6843,16 +6815,15 @@ mod tests {
         assert_eq!(bindings["pyre_interpreter::register_finalizer"], expected);
     }
 
-    /// The finalizer drain `bytearray_check_exports` and `gc.collect` reach
-    /// is a residual call, so both resolver spellings bind the helper.
+    /// The finalizer drain `bytearray_check_exports` and `gc.collect` reach is a
+    /// residual call, so both resolver spellings bind the wrapper.
     #[test]
     fn jit_trace_fnaddrs_covers_run_finalizers_now() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected =
-            crate::module::gc::interp_gc::run_finalizers_now as *const () as usize as i64;
+        let expected = crate::executioncontext::run_finalizers_now as *const () as usize as i64;
 
         assert_eq!(
-            bindings["pyre_interpreter::module::gc::interp_gc::run_finalizers_now"],
+            bindings["pyre_interpreter::executioncontext::run_finalizers_now"],
             expected
         );
         assert_eq!(bindings["pyre_interpreter::run_finalizers_now"], expected);
