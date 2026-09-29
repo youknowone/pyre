@@ -5290,6 +5290,70 @@ fn build_jit_driver_pair() -> JitDriverPair {
             "jit_ll_strconcat",
         );
     }
+    // `jtransform.py _handle_stroruni_call` registers the `OS_STREQ_*`
+    // helpers beside `stroruni.equal` (`_register_extra_helper`); vstring's
+    // `generate_modified_call` reads them from `callinfocollection`.
+    {
+        use majit_ir::OopSpecIndex as Os;
+        use majit_ir::Type::{Int, Ref};
+        use pyre_object::lowlevel_string as ll;
+        let rows: [(Os, &[majit_ir::Type], u64, &str); 7] = [
+            (
+                Os::StreqSliceChecknull,
+                &[Ref, Int, Int, Ref],
+                ll::jit_ll_str_eq_slice_checknull as *const () as u64,
+                "_ll_4_str_eq_slice_checknull",
+            ),
+            (
+                Os::StreqSliceNonnull,
+                &[Ref, Int, Int, Ref],
+                ll::jit_ll_str_eq_slice_nonnull as *const () as u64,
+                "_ll_4_str_eq_slice_nonnull",
+            ),
+            (
+                Os::StreqSliceChar,
+                &[Ref, Int, Int, Int],
+                ll::jit_ll_str_eq_slice_char as *const () as u64,
+                "_ll_4_str_eq_slice_char",
+            ),
+            (
+                Os::StreqNonnull,
+                &[Ref, Ref],
+                ll::jit_ll_str_eq_nonnull as *const () as u64,
+                "_ll_2_str_eq_nonnull",
+            ),
+            (
+                Os::StreqNonnullChar,
+                &[Ref, Int],
+                ll::jit_ll_str_eq_nonnull_char as *const () as u64,
+                "_ll_2_str_eq_nonnull_char",
+            ),
+            (
+                Os::StreqChecknullChar,
+                &[Ref, Int],
+                ll::jit_ll_str_eq_checknull_char as *const () as u64,
+                "_ll_2_str_eq_checknull_char",
+            ),
+            (
+                Os::StreqLengthok,
+                &[Ref, Ref],
+                ll::jit_ll_str_eq_lengthok as *const () as u64,
+                "_ll_2_str_eq_lengthok",
+            ),
+        ];
+        for (oopspec, argtypes, func, name) in rows {
+            let descr = majit_metainterp::make_call_descr_with_effect(
+                argtypes,
+                Int,
+                majit_ir::EffectInfo::const_new(
+                    majit_ir::ExtraEffect::ElidableCannotRaise,
+                    oopspec,
+                ),
+            );
+            d.meta_interp_mut()
+                .ensure_oopspec_callinfo(oopspec, descr, func, name);
+        }
+    }
     // rlib/jit.py set_user_param — the translation-time `--jit STR`
     // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its

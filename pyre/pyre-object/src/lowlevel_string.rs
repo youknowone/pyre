@@ -276,9 +276,12 @@ pub extern "C" fn jit_ll_strconcat(
 /// `rstr.py LLHelpers.ll_streq` — compare two rstr `STR` payloads.
 ///
 /// `@jit.elidable`.  Upstream also tags it `@jit.oopspec('stroruni.equal(s1,
-/// s2)')`; the tag stays off until the `OS_STREQ_*` helpers vstring's
-/// `handle_str_equal_level1` / `handle_str_equal_level2` substitute are
-/// registered.  Answers 1 / 0 so the result fills a full word.
+/// s2)')`.  The tag stays off here because the direct caller,
+/// `descroperation::compare_slot`, is a legacy-typed graph: its operands are
+/// `OBJECTPTR`, not `Ptr(STR)`, and `_handle_stroruni_call` asserts on that.
+/// A string `==` / `!=` the rtyper types as `Ptr(STR)` still reaches this
+/// helper as `OS_STR_EQUAL` through `jtransform`'s string-equality rewrite.
+/// Answers 1 / 0 so the result fills a full word.
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_streq(
     s1: *const crate::unicodeobject::UnicodeValueStorage,
@@ -303,6 +306,101 @@ pub extern "C" fn jit_ll_streq(
         )
     };
     (chars1 == chars2) as i64
+}
+
+/// The `chars` array of a live rstr `STR` payload.
+fn str_chars<'a>(s: *const crate::unicodeobject::UnicodeValueStorage) -> &'a [u8] {
+    let len = bh_lowlevel_string_len(s as i64);
+    unsafe { std::slice::from_raw_parts((s as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET), len) }
+}
+
+/// `support.py _ll_4_str_eq_slice_checknull` — `str1[start : start + length]
+/// == str2`.  The `OS_STREQ_SLICE_CHECKNULL` helper `jtransform.py
+/// _handle_stroruni_call` registers beside `stroruni.equal`.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_str_eq_slice_checknull(
+    s1: *const crate::unicodeobject::UnicodeValueStorage,
+    start: i64,
+    length: i64,
+    s2: *const crate::unicodeobject::UnicodeValueStorage,
+) -> i64 {
+    if s2.is_null() {
+        return 0;
+    }
+    jit_ll_str_eq_slice_nonnull(s1, start, length, s2)
+}
+
+/// `support.py _ll_4_str_eq_slice_nonnull` — `str1[start : start + length]
+/// == str2`, assuming `str2 != NULL`.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_str_eq_slice_nonnull(
+    s1: *const crate::unicodeobject::UnicodeValueStorage,
+    start: i64,
+    length: i64,
+    s2: *const crate::unicodeobject::UnicodeValueStorage,
+) -> i64 {
+    let chars2 = str_chars(s2);
+    if chars2.len() as i64 != length {
+        return 0;
+    }
+    let start = start as usize;
+    (str_chars(s1)[start..start + chars2.len()] == *chars2) as i64
+}
+
+/// `support.py _ll_4_str_eq_slice_char` — `str1[start : start + length] ==
+/// c2`.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_str_eq_slice_char(
+    s1: *const crate::unicodeobject::UnicodeValueStorage,
+    start: i64,
+    length: i64,
+    c2: i64,
+) -> i64 {
+    if length != 1 {
+        return 0;
+    }
+    (str_chars(s1)[start as usize] as i64 == c2) as i64
+}
+
+/// `support.py _ll_2_str_eq_nonnull` — `str1 == str2`, both non-null.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_str_eq_nonnull(
+    s1: *const crate::unicodeobject::UnicodeValueStorage,
+    s2: *const crate::unicodeobject::UnicodeValueStorage,
+) -> i64 {
+    (str_chars(s1) == str_chars(s2)) as i64
+}
+
+/// `support.py _ll_2_str_eq_nonnull_char` — `str1 == c2`, `str1` non-null.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_str_eq_nonnull_char(
+    s1: *const crate::unicodeobject::UnicodeValueStorage,
+    c2: i64,
+) -> i64 {
+    matches!(str_chars(s1), [c] if *c as i64 == c2) as i64
+}
+
+/// `support.py _ll_2_str_eq_checknull_char` — `str1 == c2`.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_str_eq_checknull_char(
+    s1: *const crate::unicodeobject::UnicodeValueStorage,
+    c2: i64,
+) -> i64 {
+    if s1.is_null() {
+        return 0;
+    }
+    jit_ll_str_eq_nonnull_char(s1, c2)
+}
+
+/// `support.py _ll_2_str_eq_lengthok` — `str1 == str2` for two non-null
+/// strings already known to have the same length.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_str_eq_lengthok(
+    s1: *const crate::unicodeobject::UnicodeValueStorage,
+    s2: *const crate::unicodeobject::UnicodeValueStorage,
+) -> i64 {
+    let chars1 = str_chars(s1);
+    (*chars1 == str_chars(s2)[..chars1.len()]) as i64
 }
 
 /// `rstr.py LLHelpers.ll_strcmp` — order two rstr `STR` payloads.
@@ -641,6 +739,36 @@ mod tests {
         assert_eq!(jit_ll_strcmp(p(seven), p(seventy)), -1);
         assert_eq!(jit_ll_strcmp(p(seventy), p(eight)), -1);
         for s in [seven, seven_again, eight, seventy] {
+            bh_free_lowlevel_string(s, LOWLEVEL_STR_BASE_SIZE, 1);
+        }
+    }
+
+    #[test]
+    fn jit_ll_str_eq_helpers_match_support_py() {
+        use crate::unicodeobject::UnicodeValueStorage;
+        let p = |s: i64| s as *const UnicodeValueStorage;
+        let null = std::ptr::null::<UnicodeValueStorage>();
+        let whole = jit_ll_int2dec(12345) as i64;
+        let mid = jit_ll_int2dec(234) as i64;
+        let mid_again = jit_ll_int2dec(234) as i64;
+        let other = jit_ll_int2dec(235) as i64;
+        let three = jit_ll_int2dec(3) as i64;
+        assert_eq!(jit_ll_str_eq_slice_nonnull(p(whole), 1, 3, p(mid)), 1);
+        assert_eq!(jit_ll_str_eq_slice_nonnull(p(whole), 1, 3, p(other)), 0);
+        assert_eq!(jit_ll_str_eq_slice_nonnull(p(whole), 1, 2, p(mid)), 0);
+        assert_eq!(jit_ll_str_eq_slice_checknull(p(whole), 1, 3, null), 0);
+        assert_eq!(jit_ll_str_eq_slice_checknull(p(whole), 1, 3, p(mid)), 1);
+        assert_eq!(jit_ll_str_eq_slice_char(p(whole), 2, 1, b'3' as i64), 1);
+        assert_eq!(jit_ll_str_eq_slice_char(p(whole), 2, 2, b'3' as i64), 0);
+        assert_eq!(jit_ll_str_eq_nonnull(p(mid), p(mid_again)), 1);
+        assert_eq!(jit_ll_str_eq_nonnull(p(mid), p(whole)), 0);
+        assert_eq!(jit_ll_str_eq_nonnull_char(p(three), b'3' as i64), 1);
+        assert_eq!(jit_ll_str_eq_nonnull_char(p(mid), b'2' as i64), 0);
+        assert_eq!(jit_ll_str_eq_checknull_char(null, b'3' as i64), 0);
+        assert_eq!(jit_ll_str_eq_checknull_char(p(three), b'3' as i64), 1);
+        assert_eq!(jit_ll_str_eq_lengthok(p(mid), p(mid_again)), 1);
+        assert_eq!(jit_ll_str_eq_lengthok(p(mid), p(other)), 0);
+        for s in [whole, mid, mid_again, other, three] {
             bh_free_lowlevel_string(s, LOWLEVEL_STR_BASE_SIZE, 1);
         }
     }

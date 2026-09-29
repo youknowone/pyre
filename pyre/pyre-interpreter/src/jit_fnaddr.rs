@@ -3504,6 +3504,45 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_ll_strcmp",
         pyre_object::lowlevel_string::jit_ll_strcmp,
     );
+    // `jtransform.py _handle_stroruni_call` registers these beside
+    // `stroruni.equal` through `_register_extra_helper` →
+    // `support.builtin_func_for_spec`, which names each
+    // `_ll_<nargs>_str_eq_*` (`support.py setup_extra_builtin`).
+    cp4(
+        &mut entries,
+        "_ll_4_str_eq_slice_checknull",
+        pyre_object::lowlevel_string::jit_ll_str_eq_slice_checknull,
+    );
+    cp4(
+        &mut entries,
+        "_ll_4_str_eq_slice_nonnull",
+        pyre_object::lowlevel_string::jit_ll_str_eq_slice_nonnull,
+    );
+    cp4(
+        &mut entries,
+        "_ll_4_str_eq_slice_char",
+        pyre_object::lowlevel_string::jit_ll_str_eq_slice_char,
+    );
+    cp2(
+        &mut entries,
+        "_ll_2_str_eq_nonnull",
+        pyre_object::lowlevel_string::jit_ll_str_eq_nonnull,
+    );
+    cp2(
+        &mut entries,
+        "_ll_2_str_eq_nonnull_char",
+        pyre_object::lowlevel_string::jit_ll_str_eq_nonnull_char,
+    );
+    cp2(
+        &mut entries,
+        "_ll_2_str_eq_checknull_char",
+        pyre_object::lowlevel_string::jit_ll_str_eq_checknull_char,
+    );
+    cp2(
+        &mut entries,
+        "_ll_2_str_eq_lengthok",
+        pyre_object::lowlevel_string::jit_ll_str_eq_lengthok,
+    );
     cpa2(
         &mut entries,
         "pyre_object::lowlevel_string::jit_ll_str_mul",
@@ -4821,26 +4860,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "majit_metainterp::cast_float_to_uint",
         majit_metainterp::blackhole::cast_float_to_uint,
     );
-
-    // `_ll_2_str_eq_nonnull` (`rpython/jit/codewriter/support.py-
-    // 538`) is the helper canonically registered by `jtransform.py:
-    // 620-624 _register_extra_helper(OS_STREQ_NONNULL, "str.eq_nonnull",
-    // ...)` and `:637-641 _register_extra_helper(OS_UNIEQ_NONNULL,
-    // "str.eq_nonnull", ...)`.  Pyre intentionally does NOT register
-    // a host fnaddr for it: there is no `rstr.STR`-equivalent GC
-    // layout in pyre-object today, so a registration would have to
-    // point at a panic-stub that fails at runtime — a parity
-    // violation against `support.py:526-538`'s real `s.chars[i]`
-    // comparison body.
-    //
-    // Pyre's type state has no `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)`
-    // channel yet: the elidable-promote dual hint (`PromoteOrString`)
-    // falls through to the plain `<kind>_guard_value` arm, and direct
-    // `hint_promote_string` / `hint_promote_unicode` calls fail loud
-    // in `codewriter/jtransform.rs`.  Re-introduce the
-    // registration here together with a line-by-line port of
-    // `_ll_2_str_eq_nonnull`'s body in `majit-metainterp::blackhole`
-    // once pyre grows the backing GC struct.
 
     merge_macro_helper_fnaddrs(&mut entries);
 
@@ -6864,24 +6883,50 @@ mod tests {
         assert!(!is_list_write_barrier(0));
     }
 
-    /// Negative parity guard: pyre intentionally does NOT publish a
-    /// host fnaddr for `_ll_2_str_eq_nonnull` (see the comment block
-    /// at `jit_trace_fnaddrs` next to the `cast_float_to_uint`
-    /// registration).  A stub registration would fail at runtime
-    /// inside any guard-failure recovery; better to surface the
-    /// missing helper at codewriter time via the fail-loud
-    /// `PromoteString` / `PromoteUnicode` rewrite arms.
+    /// `jtransform.py _handle_stroruni_call` resolves the seven
+    /// `stroruni.equal` extra helpers by their `setup_extra_builtin` names;
+    /// each must name the `lowlevel_string` body over the rstr `STR` payload.
     #[test]
-    fn jit_trace_fnaddrs_omits_str_eq_nonnull_helper_until_rstr_str_layout_lands() {
+    fn jit_trace_fnaddrs_publishes_the_str_eq_extra_helpers() {
+        use pyre_object::lowlevel_string as ll;
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        assert_eq!(
-            bindings.get("_ll_2_str_eq_nonnull").copied(),
-            None,
-            "no `_ll_2_str_eq_nonnull` fnaddr should be published while pyre \
-             lacks an `rstr.STR`-equivalent GC layout — registering one would \
-             point at a panic-stub that fails at runtime, contradicting \
-             `rpython/jit/codewriter/support.py:526-538`'s real comparison body"
-        );
+        let expected: [(&str, usize); 7] = [
+            (
+                "_ll_4_str_eq_slice_checknull",
+                ll::jit_ll_str_eq_slice_checknull as *const () as usize,
+            ),
+            (
+                "_ll_4_str_eq_slice_nonnull",
+                ll::jit_ll_str_eq_slice_nonnull as *const () as usize,
+            ),
+            (
+                "_ll_4_str_eq_slice_char",
+                ll::jit_ll_str_eq_slice_char as *const () as usize,
+            ),
+            (
+                "_ll_2_str_eq_nonnull",
+                ll::jit_ll_str_eq_nonnull as *const () as usize,
+            ),
+            (
+                "_ll_2_str_eq_nonnull_char",
+                ll::jit_ll_str_eq_nonnull_char as *const () as usize,
+            ),
+            (
+                "_ll_2_str_eq_checknull_char",
+                ll::jit_ll_str_eq_checknull_char as *const () as usize,
+            ),
+            (
+                "_ll_2_str_eq_lengthok",
+                ll::jit_ll_str_eq_lengthok as *const () as usize,
+            ),
+        ];
+        for (name, addr) in expected {
+            assert_eq!(
+                bindings.get(name).copied(),
+                Some(addr as i64),
+                "{name} must publish its lowlevel_string body"
+            );
+        }
     }
 
     #[test]
