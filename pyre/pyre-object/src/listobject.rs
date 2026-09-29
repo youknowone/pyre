@@ -1890,7 +1890,7 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
         storage: std::ptr::null_mut(),
     };
     if raw.is_null() {
-        return Box::into_raw(Box::new(body)) as PyObjectRef;
+        return crate::lltype::malloc_typed(body) as PyObjectRef;
     }
     unsafe {
         std::ptr::write(raw as *mut W_ListObjectUser, body);

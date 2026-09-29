@@ -175,11 +175,7 @@ pub fn w_weakref_user_new(
     w_class: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    let base = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(w_obj_weak);
-    let _ = crate::gc_roots::pin_root(w_callable);
-    let _ = crate::gc_roots::pin_root(w_hash);
-    let _ = crate::gc_roots::pin_root(w_class);
+    let base = crate::gc_roots::pin_roots(&[w_obj_weak, w_callable, w_hash, w_class]);
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
         W_WEAKREF_USER_GC_TYPE_ID,
         W_WEAKREF_USER_OBJECT_SIZE,
@@ -198,7 +194,7 @@ pub fn w_weakref_user_new(
         storage: std::ptr::null_mut(),
     };
     if raw.is_null() {
-        return Box::into_raw(Box::new(body)) as PyObjectRef;
+        return crate::lltype::malloc_typed(body) as PyObjectRef;
     }
     unsafe {
         std::ptr::write(raw as *mut W_WeakrefUser, body);
