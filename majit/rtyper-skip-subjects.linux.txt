@@ -1711,6 +1711,8 @@ two-phase-never-a-subject	pyre_object::float_array::<Impl>::from_vec
 two-phase-never-a-subject	pyre_object::float_array::<Impl>::pop
 two-phase-never-a-subject	pyre_object::float_array::<Impl>::remove
 two-phase-never-a-subject	pyre_object::float_array::<Impl>::with_capacity
+two-phase-never-a-subject	pyre_object::functional::<Impl>::allocate_instance
+two-phase-never-a-subject	pyre_object::functional::<Impl>::type_id
 two-phase-never-a-subject	pyre_object::gc_hook::gc_identity_hash
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc_collecting_rooted
