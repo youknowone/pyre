@@ -24,8 +24,8 @@ pub mod ullbc;
 
 pub use schema::LlbcFile;
 pub use ullbc::{
-    BasicBlock, FieldDecl, FunDecl, GlobalDecl, Locals, Statement, StmtKind, TermKind, TraitDecl,
-    TypeDecl, TypeDeclKind, Unstructured, VariantDecl,
+    BasicBlock, FieldDecl, FunDecl, GlobalDecl, Locals, Statement, StmtKind, TagEncoding,
+    TagLayout, TermKind, TraitDecl, TypeDecl, TypeDeclKind, Unstructured, VariantDecl,
 };
 
 use serde::Deserialize;
@@ -1076,6 +1076,40 @@ mod tests {
             .expect("layout");
         assert_eq!(layout.size, Some(3));
         assert_eq!(layout.align, Some(0));
+    }
+
+    #[test]
+    fn a_deduplicated_field_offset_resolves_like_size() {
+        let usize_ty = r#"{"Scalar":{"Integer":{"Unsigned":"Usize"}}}"#;
+        let lit = |n: u32| format!(r#"[{{"Integer":{{"Unsigned":["Usize","{n}"]}}}},{usize_ty}]"#);
+        let doc = format!(
+            r#"{{"charon_version":"t","has_errors":false,
+            "translated":{{"crate_name":"c","fun_decls":[],"type_decls":[{{
+                "def_id":0,
+                "item_meta":{{"name":[{{"Ident":["S",0]}}],
+                    "span":{{"data":{{"file_id":0,"beg":{{"line":1,"col":0}},"end":{{"line":1,"col":1}}}}}},
+                    "source_text":null,
+                    "attr_info":{{"attributes":[],"inline":null,"rename":null,"public":true}},
+                    "is_local":true}},
+                "kind":{{"Struct":[]}},
+                "layout":[{{"key":"t","value":{{
+                    "size":8,
+                    "variant_layouts":[{{"field_offsets":[
+                        {{"chosen":{{"Deduplicated":4}}}},
+                        8
+                    ]}}]}}}}]
+            }}]}},
+            "pad":[{{"Value":[4,{{"Constant":{{"Value":[1,{sixteen}]}}}}]}}]}}"#,
+            sixteen = lit(16),
+        );
+        let l = Llbc::from_slice(doc.as_bytes()).expect("fixture parses");
+        let layout = l
+            .type_by_id(0)
+            .expect("S")
+            .layout_for_target(&l, "t")
+            .expect("layout");
+        assert_eq!(layout.struct_field_offset(0), Some(16));
+        assert_eq!(layout.struct_field_offset(1), Some(8));
     }
 
     #[test]

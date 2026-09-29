@@ -1616,6 +1616,9 @@ fn analyze_pipeline_from_module_paths(
             None => provider.get_struct_layout(struct_name),
         };
         if let Some(mut layout) = layout {
+            if let Some(host) = exact.and_then(|item| item.host.clone()) {
+                layout.host = Some(host);
+            }
             layout.gckind = if declared_gc.contains(&sid) {
                 crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
             } else {

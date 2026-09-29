@@ -74,6 +74,7 @@ pub(crate) mod from_raw_parts;
 pub(crate) mod from_size_align;
 #[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) mod graph_body;
+pub mod host_layout;
 pub(crate) mod iter_adapter;
 pub(crate) mod iter_next;
 pub mod llbc_hints;

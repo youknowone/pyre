@@ -5662,6 +5662,7 @@ mod tests {
                         rank: None,
                     },
                 ],
+                host: None,
             },
         );
 
@@ -6058,6 +6059,7 @@ mod tests {
                         rank: None,
                     },
                 ],
+                host: None,
             },
         );
 
@@ -6125,6 +6127,7 @@ mod tests {
                     field_type: majit_ir::value::Type::Int,
                     rank: None,
                 }],
+                host: None,
             },
         );
 
@@ -7974,6 +7977,7 @@ mod tests {
                 field_type: Type::Int,
                 rank: None,
             }],
+            host: None,
         }
     }
 

@@ -318,6 +318,26 @@ impl TypeDecl {
         if layout.align.is_none() {
             layout.align = layout_measure(llbc, raw.get(), target, "align");
         }
+        if layout
+            .variant_layouts
+            .iter()
+            .any(|variant| variant.field_offsets.contains(&UNRESOLVED_OFFSET))
+        {
+            if let Some(rows) = resolved_field_offset_rows(llbc, raw.get(), target) {
+                if rows.len() == layout.variant_layouts.len() {
+                    for (variant, row) in layout.variant_layouts.iter_mut().zip(rows) {
+                        variant.field_offsets = row;
+                    }
+                }
+            }
+        }
+        if layout
+            .variant_layouts
+            .iter()
+            .any(|variant| variant.field_offsets.contains(&UNRESOLVED_OFFSET))
+        {
+            return None;
+        }
         Some(layout)
     }
 
@@ -391,16 +411,46 @@ fn de_layout_opt_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u6
     Ok(value.as_ref().and_then(layout_u64_literal))
 }
 
+/// Placeholder left by [`de_layout_offsets`] when an offset is a
+/// `Deduplicated` layout expression. [`TypeDecl::layout_for_target`]
+/// replaces it through the layout-scalar table. A real field offset is
+/// never this wide.
+const UNRESOLVED_OFFSET: u64 = u64::MAX;
+
 fn de_layout_offsets<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u64>, D::Error> {
     let values = Vec::<Value>::deserialize(d)?;
-    values
+    Ok(values
         .iter()
-        .map(|v| {
-            layout_u64_literal(v).ok_or_else(|| {
-                serde::de::Error::custom(format!("field offset is not a literal: {v}"))
-            })
-        })
-        .collect()
+        .map(|v| layout_u64_literal(v).unwrap_or(UNRESOLVED_OFFSET))
+        .collect())
+}
+
+/// Per-variant field offsets, each entry resolved the same way
+/// [`layout_measure`] resolves `size` / `align`.
+fn resolved_field_offset_rows(
+    llbc: &crate::Llbc,
+    raw: &str,
+    target: &str,
+) -> Option<Vec<Vec<u64>>> {
+    let entries: Vec<Value> = serde_json::from_str(raw).ok()?;
+    let entry = entries
+        .iter()
+        .find(|e| e.get("key").and_then(Value::as_str) == Some(target))
+        .or_else(|| (entries.len() == 1).then(|| &entries[0]))?;
+    let variants = entry.get("value")?.get("variant_layouts")?.as_array()?;
+    let mut rows = Vec::with_capacity(variants.len());
+    for variant in variants {
+        let Some(offsets) = variant.get("field_offsets").and_then(Value::as_array) else {
+            rows.push(Vec::new());
+            continue;
+        };
+        let mut row = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            row.push(layout_u64_resolved(llbc, offset, 0)?);
+        }
+        rows.push(row);
+    }
+    Some(rows)
 }
 
 fn layout_measure(llbc: &crate::Llbc, raw: &str, target: &str, field: &str) -> Option<u64> {
@@ -564,6 +614,188 @@ impl TypeLayout {
             .and_then(|discriminator| discriminator.get("Branch"))
             .is_some()
     }
+
+    /// Host tag of a `Branch` discriminator: byte offset, integer width,
+    /// and either a direct tag per variant or a niche encoding.
+    ///
+    /// `None` when the discriminator is absent, its offset does not
+    /// resolve, or the child ranges are not a direct map or one niche.
+    pub fn tag(&self) -> Option<TagLayout> {
+        let branch = self.discriminator.as_ref()?.get("Branch")?;
+        let offset = self.discriminant_offset()?;
+        let (signed, bits) = tag_int_ty(branch.get("int_ty")?)?;
+        let children = branch.get("children").and_then(Value::as_array)?;
+        let encoding = tag_encoding(children, branch.get("fallback"))?;
+        Some(TagLayout {
+            offset,
+            signed,
+            bits,
+            encoding,
+        })
+    }
+}
+
+/// Physical tag of one concrete enum layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagLayout {
+    pub offset: u64,
+    /// `true` when Charon recorded `Signed`.
+    pub signed: bool,
+    /// Bit width of the tag integer. `Isize` / `Usize` are the pointer
+    /// width of the extracted target (64 on the layouts this reader sees).
+    pub bits: u32,
+    pub encoding: TagEncoding,
+}
+
+/// How a raw tag word names a variant. `Direct` stores one tag per
+/// variant index. `Niche` is rustc's niche-filling rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagEncoding {
+    Direct {
+        tags: Vec<u128>,
+    },
+    Niche {
+        untagged_variant: usize,
+        niche_variants: std::ops::RangeInclusive<usize>,
+        niche_start: u128,
+    },
+}
+
+fn tag_int_ty(int_ty: &Value) -> Option<(bool, u32)> {
+    let (signed, width) = if let Some(width) = int_ty.get("Signed").and_then(Value::as_str) {
+        (true, width)
+    } else {
+        (false, int_ty.get("Unsigned")?.as_str()?)
+    };
+    let bits = match width {
+        "I8" | "U8" => 8,
+        "I16" | "U16" => 16,
+        "I32" | "U32" => 32,
+        "I64" | "U64" | "Isize" | "Usize" => 64,
+        "I128" | "U128" => 128,
+        _ => return None,
+    };
+    Some((signed, bits))
+}
+
+fn scalar_bits(value: &Value) -> Option<u128> {
+    if let Some(n) = value.as_u64() {
+        return Some(u128::from(n));
+    }
+    let signed = value.get("Signed");
+    let pair = signed.or_else(|| value.get("Unsigned"))?.as_array()?;
+    let text = pair.get(1)?.as_str()?;
+    if signed.is_some() {
+        text.parse::<i128>().ok().map(|n| n as u128)
+    } else {
+        text.parse::<u128>().ok()
+    }
+}
+
+enum TagDest {
+    Known(usize),
+    Invalid,
+}
+
+fn tag_dest(value: &Value) -> Option<TagDest> {
+    if value.as_str() == Some("Invalid") {
+        return Some(TagDest::Invalid);
+    }
+    if let Some(id) = value.get("Known").and_then(Value::as_u64) {
+        return Some(TagDest::Known(id as usize));
+    }
+    None
+}
+
+fn tag_encoding(children: &[Value], fallback: Option<&Value>) -> Option<TagEncoding> {
+    let mut known: Vec<(u128, u128, usize)> = Vec::new();
+    for child in children {
+        let pair = child.as_array()?;
+        let range = pair.first()?;
+        let start = scalar_bits(range.get("start")?)?;
+        let end = scalar_bits(range.get("end")?)?;
+        match tag_dest(pair.get(1)?)? {
+            TagDest::Known(variant) => known.push((start, end, variant)),
+            TagDest::Invalid => {}
+        }
+    }
+    let fallback = fallback.and_then(tag_dest);
+    if let Some(TagDest::Known(untagged)) = fallback {
+        let mut niche: Vec<(u128, usize)> = known
+            .into_iter()
+            .filter(|(_, _, variant)| *variant != untagged)
+            .map(|(start, end, variant)| {
+                if end != start {
+                    return None;
+                }
+                Some((start, variant))
+            })
+            .collect::<Option<_>>()?;
+        if niche.is_empty() {
+            return None;
+        }
+        niche.sort_by_key(|(start, _)| *start);
+        let dense_start = niche[0].0;
+        let first = niche[0].1;
+        let dense = niche.iter().enumerate().all(|(i, (start, variant))| {
+            *variant == first + i && *start == dense_start.wrapping_add(i as u128)
+        });
+        if dense {
+            let last = niche.last()?.1;
+            return Some(TagEncoding::Niche {
+                untagged_variant: untagged,
+                niche_variants: first..=last,
+                niche_start: dense_start,
+            });
+        }
+        // The untagged index sits in a hole of the niche variants. The
+        // raw range still covers `lo..=hi`, and the hole decodes as the
+        // untagged variant.
+        let lo = niche
+            .iter()
+            .map(|(_, variant)| *variant)
+            .min()?
+            .min(untagged);
+        let hi = niche
+            .iter()
+            .map(|(_, variant)| *variant)
+            .max()?
+            .max(untagged);
+        if untagged < lo || untagged > hi {
+            return None;
+        }
+        let mut niche_start: Option<u128> = None;
+        for (start, variant) in &niche {
+            let guess = start.wrapping_sub((*variant - lo) as u128);
+            match niche_start {
+                None => niche_start = Some(guess),
+                Some(prev) if prev != guess => return None,
+                Some(_) => {}
+            }
+        }
+        return Some(TagEncoding::Niche {
+            untagged_variant: untagged,
+            niche_variants: lo..=hi,
+            niche_start: niche_start?,
+        });
+    }
+    if known.is_empty() || known.iter().any(|(start, end, _)| start != end) {
+        return None;
+    }
+    let max_variant = known.iter().map(|(_, _, variant)| *variant).max()?;
+    let mut tags = vec![0u128; max_variant + 1];
+    let mut seen = vec![false; max_variant + 1];
+    for (start, _, variant) in known {
+        if seen[variant] {
+            return None;
+        }
+        tags[variant] = start;
+        seen[variant] = true;
+    }
+    if seen.iter().any(|present| !present) {
+        return None;
+    }
+    Some(TagEncoding::Direct { tags })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1683,6 +1915,110 @@ mod tests {
         assert_eq!(layout.field_offset(2, 0), None);
         assert_eq!(layout.discriminant_offset(), Some(0));
         assert_eq!(layout.discriminant_int_type(), Some("u8"));
+        // No `children`: the offset is known, the encoding is not.
+        assert!(layout.tag().is_none());
+    }
+
+    /// Direct tags, a one-value niche, and a niche whose unused hole is
+    /// `Invalid`. Shapes copied from real `Branch` discriminators.
+    #[test]
+    fn branch_tag_is_direct_or_niche() {
+        let direct: TypeLayout = serde_json::from_str(
+            r#"{"discriminator":{"Branch":{"offset":{"chosen":0},"int_ty":{"Unsigned":"U8"},
+                "children":[
+                    [{"start":{"Unsigned":["U8","0"]},"end":{"Unsigned":["U8","0"]}},{"Known":0}],
+                    [{"start":{"Unsigned":["U8","1"]},"end":{"Unsigned":["U8","1"]}},{"Known":1}]
+                ],
+                "fallback":"Invalid"}},
+                "variant_layouts":[{"field_offsets":[]},{"field_offsets":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            direct.tag(),
+            Some(TagLayout {
+                offset: 0,
+                signed: false,
+                bits: 8,
+                encoding: TagEncoding::Direct { tags: vec![0, 1] },
+            })
+        );
+
+        // `rhai::grain::vm::Site`: variant 0 is the niche value 0, variant 1
+        // is the untagged fallback.
+        let site: TypeLayout = serde_json::from_str(
+            r#"{"discriminator":{"Branch":{"offset":{"guarantee":null,"chosen":0},
+                "int_ty":{"Signed":"Isize"},
+                "children":[[{"start":{"Signed":["Isize","0"]},"end":{"Signed":["Isize","0"]}},{"Known":0}]],
+                "fallback":{"Known":1}}},
+                "variant_layouts":[{"field_offsets":[]},{"field_offsets":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            site.tag(),
+            Some(TagLayout {
+                offset: 0,
+                signed: true,
+                bits: 64,
+                encoding: TagEncoding::Niche {
+                    untagged_variant: 1,
+                    niche_variants: 0..=0,
+                    niche_start: 0,
+                },
+            })
+        );
+
+        // `rhai::ast::stmt::RangeCase`: variant 0 is tag 2, variant 1 is
+        // untagged, and 3..=255 is the unused hole.
+        let range_case: TypeLayout = serde_json::from_str(
+            r#"{"discriminator":{"Branch":{"offset":{"guarantee":null,"chosen":24},
+                "int_ty":{"Unsigned":"U8"},
+                "children":[
+                    [{"start":{"Unsigned":["U8","2"]},"end":{"Unsigned":["U8","2"]}},{"Known":0}],
+                    [{"start":{"Unsigned":["U8","3"]},"end":{"Unsigned":["U8","255"]}},"Invalid"]
+                ],
+                "fallback":{"Known":1}}},
+                "variant_layouts":[{"field_offsets":[0]},{"field_offsets":[0]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            range_case.tag(),
+            Some(TagLayout {
+                offset: 24,
+                signed: false,
+                bits: 8,
+                encoding: TagEncoding::Niche {
+                    untagged_variant: 1,
+                    niche_variants: 0..=0,
+                    niche_start: 2,
+                },
+            })
+        );
+
+        // Untagged variant 1 sits between niche variants 0 and 2. The
+        // raw values are i64::MIN, i64::MIN+1, i64::MIN+3.
+        let holed: TypeLayout = serde_json::from_str(
+            r#"{"discriminator":{"Branch":{"offset":{"chosen":0},"int_ty":{"Unsigned":"U64"},
+                "children":[
+                    [{"start":{"Unsigned":["U64","9223372036854775808"]},"end":{"Unsigned":["U64","9223372036854775808"]}},{"Known":0}],
+                    [{"start":{"Unsigned":["U64","9223372036854775810"]},"end":{"Unsigned":["U64","9223372036854775810"]}},{"Known":2}]
+                ],
+                "fallback":{"Known":1}}},
+                "variant_layouts":[{"field_offsets":[]},{"field_offsets":[]},{"field_offsets":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            holed.tag(),
+            Some(TagLayout {
+                offset: 0,
+                signed: false,
+                bits: 64,
+                encoding: TagEncoding::Niche {
+                    untagged_variant: 1,
+                    niche_variants: 0..=2,
+                    niche_start: 9223372036854775808,
+                },
+            })
+        );
     }
 
     /// A fieldless enum's variant values are the tags its layout writes;

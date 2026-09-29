@@ -540,6 +540,10 @@ pub struct ExactLayout {
     pub align: Option<u64>,
     /// `field_name → byte offset within the type`.
     pub field_offsets: HashMap<String, u64>,
+    /// Host Rust layout. Absent on a heuristic-only record. Skipped by
+    /// serde: it is rebuilt from Charon whenever metadata is derived.
+    #[serde(skip)]
+    pub host: Option<crate::front::host_layout::HostLayout>,
 }
 
 #[derive(Debug, Clone, Default)]

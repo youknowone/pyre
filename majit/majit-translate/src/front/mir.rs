@@ -2519,6 +2519,7 @@ fn derive_program_metadata(
                         size: layout.size,
                         align: layout.align,
                         field_offsets,
+                        host: Some(crate::front::host_layout::host_layout_from_type(&layout)),
                     };
                     exact_layouts.insert(sid, exact);
                 }
@@ -2771,6 +2772,9 @@ fn derive_program_metadata(
                 // heuristic exactly; a single-variant type has no `Branch`
                 // tag (`discriminant_offset` → `None`) and also registers 0.
                 // Fieldless enums skip this (int-valued, no base ClassDef).
+                let host = enum_layout
+                    .as_ref()
+                    .map(crate::front::host_layout::host_layout_from_type);
                 if !fieldless {
                     if explicit_sum_shell {
                         let mut base_offsets = std::collections::HashMap::new();
@@ -2781,6 +2785,7 @@ fn derive_program_metadata(
                                 size: Some(sum_shell_size(&base_offsets)),
                                 align: Some(8),
                                 field_offsets: base_offsets,
+                                host: host.clone(),
                             },
                         );
                     } else if let Some(l) = enum_layout.as_ref() {
@@ -2793,6 +2798,7 @@ fn derive_program_metadata(
                             size: l.size,
                             align: l.align,
                             field_offsets: base_offsets,
+                            host: host.clone(),
                         };
                         exact_layouts.insert(base_sid, base_exact);
                     }
@@ -2873,6 +2879,7 @@ fn derive_program_metadata(
                                 size: Some(sum_shell_size(&voffsets)),
                                 align: Some(8),
                                 field_offsets: voffsets,
+                                host: host.clone(),
                             };
                             exact_layouts.insert(vsid, exact);
                         } else if let Some(l) = enum_layout.as_ref() {
@@ -2880,6 +2887,7 @@ fn derive_program_metadata(
                                 size: l.size,
                                 align: l.align,
                                 field_offsets: voffsets,
+                                host: host.clone(),
                             };
                             exact_layouts.insert(vsid, exact);
                         }

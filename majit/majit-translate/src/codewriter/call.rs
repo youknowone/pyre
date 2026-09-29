@@ -2742,6 +2742,8 @@ pub struct StructLayout {
     /// Per-field layout: (field_name, offset, size, type).
     /// RPython: `symbolic.get_field_token(STRUCT, name, tsc) → (offset, size)`.
     pub fields: Vec<StructFieldLayout>,
+    /// Host field offsets and tag. `None` on a heuristic layout.
+    pub host: Option<crate::front::host_layout::HostLayout>,
 }
 
 /// Single field within a `StructLayout`.
@@ -2948,6 +2950,7 @@ impl StructLayout {
             align,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
             fields: layout_fields,
+            host: None,
         }
     }
 
@@ -3443,6 +3446,11 @@ impl CallControl {
         name: &str,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::GcKind> {
         Some(self.struct_layout_for(name)?.gckind)
+    }
+
+    /// Host layout of `owner`, when Charon recorded one.
+    pub fn host_layout_for(&self, owner: &str) -> Option<crate::front::host_layout::HostLayout> {
+        self.struct_layout_for(owner)?.host.clone()
     }
 
     /// Byte offset of the first item of a length-prefixed array whose length
@@ -15949,6 +15957,7 @@ mod tests {
                     field_type: majit_ir::value::Type::Int,
                     rank: None,
                 }],
+                host: None,
             },
         );
         let before = majit_ir::descr::field_mint_census_snapshot();

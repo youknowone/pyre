@@ -5072,6 +5072,7 @@ mod tests {
                         field_type: majit_ir::value::Type::Int,
                         rank: None,
                     }],
+                    host: None,
                 },
             );
             cc.register_function_fnaddr(

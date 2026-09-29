@@ -11991,6 +11991,7 @@ mod tests {
                     field_type: majit_ir::value::Type::Int,
                     rank: None,
                 }],
+                host: None,
             },
         );
         let field = FieldDescriptor::new("count", Some(owner.into())).with_taken_by_address(true);
@@ -12032,6 +12033,7 @@ mod tests {
                             rank: None,
                         },
                     ],
+                    host: None,
                 },
             );
             let storage = if gc {
@@ -12221,6 +12223,7 @@ mod tests {
                         rank: None,
                     },
                 ],
+                host: None,
             },
         );
         cc.set_struct_storage(&[crate::StructStorageDescriptor::raw(owner)]);
@@ -12411,6 +12414,7 @@ mod tests {
                         rank: None,
                     },
                 ],
+                host: None,
             },
         );
 
@@ -16726,6 +16730,7 @@ mod tests {
                 align: 4,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![],
+                host: None,
             },
         );
         let rewritten = Transformer::new(&GraphTransformConfig::default())
