@@ -4672,6 +4672,19 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     if callable_operand.is_null() {
         return Ok(None);
     }
+    // `try_walker_trace_exception_new` turns `Exc(args)` into a virtual
+    // instance the raise fold can chain.  Descending `type.__call__` instead
+    // records `value_error_one_arg` and `exc_init_one_positional`
+    // (`dont_look_inside`), so the instance stays concrete and a caught
+    // traceback cannot leave the bridge.  A keyword call is not that CallFn
+    // shape and keeps the descent.
+    if !is_call_kw
+        && unsafe {
+            pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(callable_operand)
+        }
+    {
+        return Ok(None);
+    }
     let null_or_self = match arg_concretes[1] {
         ConcreteValue::Ref(value) => value,
         ConcreteValue::Null => pyre_object::PY_NULL,
