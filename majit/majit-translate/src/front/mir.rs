@@ -4388,7 +4388,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         };
         // Word-sized `saturating_mul` clamp (`front::saturating_mul`) splits
         // the residual call into `lo = a * b; hi = uint_mul_high(a, b); if
-        // uint_ne(hi, 0) { MAX } else { lo }`.  Same fail-safe as add.
+        // ne(hi, 0) { MAX } else { lo }`.  Same fail-safe as add.
         let _saturating_mul_rewritten = if lo.saturating_mul_sites.is_empty() {
             0
         } else {

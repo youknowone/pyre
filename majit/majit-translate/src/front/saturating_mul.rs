@@ -177,7 +177,7 @@ fn rewire_one_saturating_mul_site(
     graph.block_mut(a_id).operations.push(SpaceOperation {
         result: Some(ovf.clone()),
         kind: OpKind::BinOp {
-            op: "uint_ne".to_string(),
+            op: "ne".to_string(),
             lhs: high,
             rhs: zero,
             result_ty: ValueType::Int,
@@ -290,7 +290,7 @@ mod tests {
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::BinOp { op, .. } if op == "uint_ne"
+                OpKind::BinOp { op, .. } if op == "ne"
             )),
             "A tests the high word against zero"
         );
