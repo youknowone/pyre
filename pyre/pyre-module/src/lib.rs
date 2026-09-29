@@ -70,6 +70,18 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_json", module::_json::init);
     pyre_interpreter::importing::register_builtin_module("_lsprof", module::_lsprof::init);
     pyre_interpreter::importing::register_builtin_module("_lzma", module::_lzma::init);
+    // fficurses.py `guess_eci`: the module is present when the probe linked.
+    #[cfg(all(
+        unix,
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32"),
+        pyre_minimal_curses
+    ))]
+    pyre_interpreter::importing::register_builtin_module(
+        "_minimal_curses",
+        module::_minimal_curses::init,
+    );
     pyre_interpreter::importing::register_builtin_module(
         "_multibytecodec",
         module::_multibytecodec::init,

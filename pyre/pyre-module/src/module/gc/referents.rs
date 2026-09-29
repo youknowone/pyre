@@ -444,9 +444,16 @@ fn typeids_z_bytes() -> Result<Vec<u8>, pyre_interpreter::PyError> {
     })
 }
 
+/// `referents.py get_stats`.
+#[pyre_interpreter::pyre_function]
+pub(super) fn get_stats(#[default(false)] memory_pressure: bool) -> PyObjectRef {
+    stats::new(memory_pressure)
+}
+
 /// `referents.py get_objects`.
+#[pyre_interpreter::pyre_function]
 pub(super) fn get_objects(
-    generation: PyObjectRef,
+    #[default(w_none())] generation: PyObjectRef,
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // `referents.py get_objects` returns "a list of all
     // app-level objects" and takes no generation, but `do_get_objects`

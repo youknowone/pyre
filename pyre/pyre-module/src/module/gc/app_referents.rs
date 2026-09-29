@@ -411,3 +411,17 @@ pub(super) fn dump_rpy_heap_public(
     dump_rpy_heap_fd(fd)?;
     Ok(w_none())
 }
+
+/// `app_referents.py get_stats`.
+#[pyre_interpreter::pyre_function]
+pub(super) fn get_stats(
+    #[default(false)] memory_pressure: bool,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    new_public_gc_stats(memory_pressure)
+}
+
+/// `app_referents.py dump_rpy_heap`.
+#[pyre_interpreter::pyre_function]
+pub(super) fn dump_rpy_heap(file: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    dump_rpy_heap_public(file)
+}

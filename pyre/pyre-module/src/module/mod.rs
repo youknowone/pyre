@@ -39,6 +39,15 @@ pub mod _lsprof;
 #[allow(non_snake_case)]
 pub mod _lzma;
 #[allow(non_snake_case)]
+#[cfg(all(
+    unix,
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32"),
+    pyre_minimal_curses
+))]
+pub mod _minimal_curses;
+#[allow(non_snake_case)]
 pub mod _multibytecodec;
 #[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]
