@@ -5234,7 +5234,8 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     // one must fail loudly rather than reinterpret a headerless map-node
     // allocation as a `W_TypeObject`.  Dropping the old implicit `W_TypeObject`
     // fallback is safe: the arms below are every quasi-immutable descr this
-    // binary can mint — the thirteen hand-minted singletons, plus the nine
+    // binary can mint — the hand-minted singletons, including
+    // `GilReadyState.gil_ready`, plus the nine
     // `Function` fields `function.py` declares, which
     // `function_quasi_immut_slot` resolves as a group.  No analyzer-derived
     // descr reaches here: a `#[jit_immutable_fields]` entry would need the
@@ -5301,6 +5302,11 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
             pyre_interpreter::executioncontext::ec_current_profilefunc_qmut(
                 struct_ptr as *const pyre_interpreter::executioncontext::ExecutionContext,
             )
+        } else if index == crate::descr::gil_ready_descr().index() {
+            // `gil.py` `GILThreadLocals.gil_ready?` — one process-global
+            // watcher. `struct_ptr` is the static's address; every reader
+            // shares this invalidation.
+            Some(pyre_object::gil_ready::gil_ready_current_qmut())
         } else if index == crate::descr::w_class_descr().index() {
             // `PyObject.w_class?` — one process-global watcher; the
             // struct_ptr is unused (every instance shares the invalidation).

@@ -31,6 +31,7 @@ pub mod gc_interp;
 pub mod gc_roots;
 pub mod gc_storage;
 pub mod generator;
+pub mod gil_ready;
 pub mod identitydict;
 pub mod int_array;
 pub mod interp_array;

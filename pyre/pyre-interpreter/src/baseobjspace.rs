@@ -18263,11 +18263,23 @@ unsafe fn list_iter_descr_next(obj: PyObjectRef) -> PyResult {
     if index < 0 {
         return Err(PyError::stop_iteration());
     }
-    // Scalar acquire/release (`w_list_lock` returns a guard the tracer
-    // cannot residualize). Same stripe lock `w_list_getitem` holds.
-    let lock = pyre_object::w_list_lock_acquire(seq);
+    // `gil.py` `GILThreadLocals.gil_ready` (`_immutable_fields_ =
+    // ['gil_ready?']`). While that word is still 0 the process has no
+    // other thread (`setup_threads` publishes it before `spawn`), so the
+    // stripe lock `w_list_getitem` holds is not taken. A trace that folded
+    // the zero fails `GUARD_NOT_INVALIDATED` on publication and retraces
+    // with the acquire/release calls. The lock body stays
+    // `dont_look_inside`; only the untaken call is absent from the trace.
+    let ready = pyre_object::gil_ready::gil_ready_word();
+    let lock = if ready == 0 {
+        0
+    } else {
+        pyre_object::w_list_lock_acquire(seq)
+    };
     let item = pyre_object::w_list_getitem_inner(seq, pyre_object::seq_index_to_i64(index));
-    pyre_object::w_list_lock_release(lock);
+    if lock != 0 {
+        pyre_object::w_list_lock_release(lock);
+    }
     if let Some(item) = item {
         pyre_object::w_list_iter_set_index(obj, index + 1);
         return Ok(item);
