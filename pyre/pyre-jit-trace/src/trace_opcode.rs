@@ -19,22 +19,18 @@ use majit_metainterp::{
 use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
 
 #[allow(dead_code)]
-extern "C" fn trace_function_get_defaults(func: i64) -> i64 {
-    unsafe { function_get_defaults(func as PyObjectRef) as i64 }
+extern "C" fn trace_function_get_defaults(func: PyObjectRef) -> PyObjectRef {
+    unsafe { function_get_defaults(func) }
 }
 
 #[allow(dead_code)]
-extern "C" fn trace_function_get_kwdefaults(func: i64) -> i64 {
-    let kwdefaults = unsafe { pyre_interpreter::function_get_kwdefaults(func as PyObjectRef) };
-    kwdefaults as i64
+extern "C" fn trace_function_get_kwdefaults(func: PyObjectRef) -> PyObjectRef {
+    unsafe { pyre_interpreter::function_get_kwdefaults(func) }
 }
 
 #[allow(dead_code)]
-extern "C" fn trace_dict_lookup_jit(dict: i64, key: i64) -> i64 {
-    unsafe {
-        pyre_object::w_dict_lookup(dict as PyObjectRef, key as PyObjectRef).unwrap_or(PY_NULL)
-            as i64
-    }
+extern "C" fn trace_dict_lookup_jit(dict: PyObjectRef, key: PyObjectRef) -> PyObjectRef {
+    unsafe { pyre_object::w_dict_lookup(dict, key).unwrap_or(PY_NULL) }
 }
 
 /// floatobject.py `descr_pow` → `_pow(space, x, y)` parity.
@@ -228,8 +224,8 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
 /// `pyopcode.py` / `eval.rs`'s `push_exc_info` semantics (save the
 /// previous sys_exc_info before `CURRENT_EXCEPTION` is overwritten).
 #[allow(dead_code)]
-pub(crate) extern "C" fn trace_get_current_exception_jit() -> i64 {
-    pyre_interpreter::eval::get_current_exception() as i64
+pub(crate) extern "C" fn trace_get_current_exception_jit() -> PyObjectRef {
+    pyre_interpreter::eval::get_current_exception()
 }
 
 /// Runtime helper for traced `PUSH_EXC_INFO` / `POP_EXCEPT`: write the
@@ -237,8 +233,8 @@ pub(crate) extern "C" fn trace_get_current_exception_jit() -> i64 {
 /// `pyopcode.py/:778` / `eval.rs`'s `push_exc_info` / `pop_except`
 /// semantics.
 #[allow(dead_code)]
-pub(crate) extern "C" fn trace_set_current_exception_jit(exc: i64) {
-    pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
+pub(crate) extern "C" fn trace_set_current_exception_jit(exc: PyObjectRef) {
+    pyre_interpreter::eval::set_current_exception(exc);
 }
 use pyre_interpreter::eval::{attach_raise_cause, normalize_raise_cause};
 use pyre_interpreter::truth_value as objspace_truth_value;

@@ -112,23 +112,18 @@ extern "C" fn w_list_pop_end_inner_word(obj: pyre_object::PyObjectRef) -> pyre_o
     unsafe { pyre_object::listobject::w_list_pop_end_inner(obj) }.unwrap_or(pyre_object::PY_NULL)
 }
 
-/// Word-ABI bridge for the scalar bytecode read used by translated residual
-/// calls.  The backends call integer helpers uniformly as `(i64, ..) -> i64`;
-/// the raw Rust function is `(pointer, usize) -> u16`, which is a different
-/// `call_indirect` table type on wasm32.
-extern "C" fn bh_code_unit_at(code: i64, index: i64) -> i64 {
-    let code = unsafe { &*(code as usize as *const crate::CodeObject) };
+/// `extern "C"` bridge for the scalar bytecode read used by translated
+/// residual calls: the raw Rust function takes `&CodeObject` and returns
+/// `u16`, which this widens to a word.
+extern "C" fn bh_code_unit_at(code: *const crate::CodeObject, index: i64) -> i64 {
+    let code = unsafe { &*code };
     i64::from(crate::pyopcode::code_unit_at(code, index as usize))
 }
 
-/// Word-ABI bridge for the loop-header predicate. Residual calls use a word
-/// ABI; on wasm32 the raw signature uses `i32` for pointer/`bool` while the
-/// residual call site is `(i64 x n) -> i64`.
-extern "C" fn code_pc_is_loop_header_word(code: i64, pc: i64) -> i64 {
-    crate::loop_headers::code_pc_is_loop_header(
-        code as usize as pyre_object::PyObjectRef,
-        pc as usize,
-    ) as i64
+/// `extern "C"` bridge for the loop-header predicate, widening its `bool`
+/// result to a word.
+extern "C" fn code_pc_is_loop_header_word(code: pyre_object::PyObjectRef, pc: i64) -> i64 {
+    crate::loop_headers::code_pc_is_loop_header(code, pc as usize) as i64
 }
 
 /// `descr.py CallDescr.create_call_stub`: call with the actual RESULT type,
