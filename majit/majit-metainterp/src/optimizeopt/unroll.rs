@@ -4076,18 +4076,21 @@ impl OptUnroll {
                 && let Some(&frame_arg) = jump_args.first()
             {
                 let recipes = target_token.vable_label_arg_recipes.clone();
+                let frame_operand = ctx.materialize_operand_at(frame_arg);
                 for (opcode, descr) in recipes {
                     let tp = opcode.result_type();
-                    let frame_operand = ctx.materialize_operand_at(frame_arg);
                     let mut load = Op::new(opcode, std::slice::from_ref(&frame_operand));
                     load.setdescr(descr);
                     load.pos().set(ctx.reserve_pos_typed(tp));
-                    let loaded = load.pos().get();
-                    if let Err(e) = optimizer.send_extra_operation(&OpRc::new(load), ctx) {
+                    let load_rc = OpRc::new(load);
+                    if let Err(e) = optimizer.send_extra_operation(&load_rc, ctx) {
                         ctx.signal_invalid_loop(e.0);
                         return None;
                     }
-                    jump_args.push(ctx.get_replacement_opref(loaded));
+                    jump_args.push(
+                        ctx.resolve_operand_operand(&Operand::from_bound_op(&load_rc))
+                            .to_opref(),
+                    );
                 }
             }
             let mut jump_args_box_operand: Vec<majit_ir::operand::Operand> =
