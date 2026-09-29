@@ -1,7 +1,10 @@
-//! A suppressed unroll has two possible causes, and the log has to say which.
+//! A suppressed unroll has three possible causes, and the log has to say which.
+//! The third is `cpu.supports_guard_gc_type` being false: without it the short
+//! preamble emits guards the backend cannot compile.
 //!
-//! `compile_loop` skips the unroll optimizer when either the `MAJIT_NO_UNROLL`
-//! env override is set OR the jitdriver's `enable_opts` does not list `unroll`.
+//! `compile_loop` skips the unroll optimizer when the `MAJIT_NO_UNROLL`
+//! env override is set, OR the jitdriver's `enable_opts` does not list `unroll`,
+//! OR `cpu.supports_guard_gc_type` is false.
 //! Both paths used to emit the same line — `[jit] MAJIT_NO_UNROLL: skipping
 //! unroll optimizer` — and raise the same `InvalidLoop("MAJIT_NO_UNROLL")`.
 //!
@@ -33,7 +36,7 @@ const ALL_OPTS: &[&str] = &[
 #[test]
 fn each_cause_is_named_as_itself() {
     let with_unroll = opts(ALL_OPTS);
-    let reason = unroll_skip_reason(true, &with_unroll)
+    let reason = unroll_skip_reason(true, &with_unroll, true)
         .expect("the env override suppresses unrolling whatever the opts say");
     assert!(
         reason.contains("MAJIT_NO_UNROLL"),
@@ -42,7 +45,7 @@ fn each_cause_is_named_as_itself() {
 
     // `ALL_OPTS` minus `unroll` — the shape a frontend that opted out passes.
     let without_unroll = opts(&ALL_OPTS[..ALL_OPTS.len() - 1]);
-    let reason = unroll_skip_reason(false, &without_unroll)
+    let reason = unroll_skip_reason(false, &without_unroll, true)
         .expect("an enable_opts list without `unroll` suppresses unrolling");
     assert!(
         reason.contains("enable_opts"),
@@ -62,7 +65,7 @@ fn each_cause_is_named_as_itself() {
 #[test]
 fn a_driver_that_asked_for_unrolling_gets_it() {
     assert_eq!(
-        unroll_skip_reason(false, &opts(ALL_OPTS)),
+        unroll_skip_reason(false, &opts(ALL_OPTS), true),
         None,
         "`unroll` is listed and the env override is unset, so nothing suppresses it",
     );
@@ -77,7 +80,7 @@ fn a_driver_that_asked_for_unrolling_gets_it() {
 #[test]
 fn an_empty_option_list_suppresses_rather_than_permits() {
     assert!(
-        unroll_skip_reason(false, &[]).is_some(),
+        unroll_skip_reason(false, &[], true).is_some(),
         "an empty enable_opts does not list `unroll`, so unrolling stays off",
     );
 }
@@ -87,7 +90,27 @@ fn an_empty_option_list_suppresses_rather_than_permits() {
 #[test]
 fn a_different_option_containing_the_name_does_not_enable_unrolling() {
     assert!(
-        unroll_skip_reason(false, &opts(&["unroll_safe", "heap"])).is_some(),
+        unroll_skip_reason(false, &opts(&["unroll_safe", "heap"]), true).is_some(),
         "only an exact `unroll` entry enables unrolling",
+    );
+}
+
+/// `pyjitpl.py can_use_unroll` is also false when the cpu cannot compile the
+/// guards the short preamble emits. The reason names that capability.
+#[test]
+fn cpu_without_guard_gc_type_is_named_as_itself() {
+    let reason = unroll_skip_reason(false, &opts(ALL_OPTS), false)
+        .expect("a cpu without guard_gc_type suppresses unrolling even when `unroll` is listed");
+    assert!(
+        reason.contains("supports_guard_gc_type"),
+        "the capability cause must name supports_guard_gc_type; got {reason:?}",
+    );
+    assert!(
+        !reason.contains("MAJIT_NO_UNROLL"),
+        "must not name the env override; got {reason:?}",
+    );
+    assert!(
+        !reason.contains("enable_opts"),
+        "must not name enable_opts when `unroll` is listed; got {reason:?}",
     );
 }
