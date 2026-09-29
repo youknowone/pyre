@@ -4142,7 +4142,7 @@ impl OptUnroll {
              the backend (nothing exports ctx.const_pool)"
         );
 
-        let mut mapping: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
+        let mut mapping: crate::FxIndexMap<OpRef, Operand> = crate::FxIndexMap::default();
 
         // unroll.py `assert len(short_inputargs) == len(jump_args)` —
         // the mapping below is positional, so a length mismatch misaligns
@@ -4169,7 +4169,7 @@ impl OptUnroll {
         for (i, short_inputarg) in short_preamble.inputargs.iter().enumerate() {
             let short_inputarg = *short_inputarg;
             if let Some(&jump_arg) = jump_args.get(i) {
-                mapping.insert(short_inputarg, jump_arg);
+                mapping.insert(short_inputarg, ctx.materialize_operand_at(jump_arg));
                 // RPython: jump_arg Box inherits info via identity.
                 // In majit, propagate PtrInfo from short_inputarg (which
                 // has info from Phase 1 export) to the resolved jump_arg.
@@ -4280,10 +4280,9 @@ impl OptUnroll {
                     // indicate a structural mismatch (e.g., cross-loop bridge
                     // with incompatible short preamble). Raise InvalidLoop.
                     match mapping.get(&arg.to_opref()) {
-                        // unroll.py:367: mapping values are the replayed op
-                        // objects; bind to the registered producer (memoized
-                        // on box_cache) rather than minting an unbound box.
-                        Some(&mapped) => new_op.setarg(i, ctx.materialize_operand_at(mapped)),
+                        // unroll.py `_map_args`: mapping values are the replayed op
+                        // objects.
+                        Some(mapped) => new_op.setarg(i, mapped.clone()),
                         None => {
                             // RPython: _map_args raises KeyError for unmapped
                             // args. This is equivalent to InvalidLoop — the
@@ -4353,7 +4352,7 @@ impl OptUnroll {
                     debug_assert!(short_preamble.constants.is_empty());
                 } else if let Some(fail_args) = new_op.fail_args_mut() {
                     for arg in fail_args.iter_mut() {
-                        if let Some(&mapped) = mapping.get(&arg.to_opref()) {
+                        if let Some(mapped) = mapping.get(&arg.to_opref()) {
                             // Measured dead (PYRE_REMAP_PROBE 2026-06-11: 0
                             // fires across check.py corpus + lib tests) —
                             // only guards carry fail_args and guards take the
@@ -4366,7 +4365,7 @@ impl OptUnroll {
                                 "non-guard short-preamble op carried fail_args: {:?}",
                                 new_op.opcode
                             );
-                            *arg = ctx.materialize_operand_at(mapped);
+                            *arg = mapped.clone();
                         }
                     }
                 }
@@ -4375,14 +4374,15 @@ impl OptUnroll {
                 // unroll.py `inline_short_preamble`: mapping[sop] = op, then
                 // send_extra_operation(op). The mapping write happens before
                 // send_extra_operation.
-                mapping.insert(sp_op.pos().get(), new_ref);
+                let new_rc = OpRc::new(new_op);
+                mapping.insert(sp_op.pos().get(), Operand::from_bound_op(&new_rc));
                 replay_index += 1;
                 // unroll.py:414 lets send_extra_operation raise InvalidLoop.
                 // This function returns Vec (flag convention, as the arity /
                 // unmapped-arg signals above); propagate consumed the flag into
                 // the Err, so re-defer it for the caller's take_invalid_loop
                 // barrier and bail to jump_to_preamble.
-                if let Err(e) = optimizer.send_extra_operation(&OpRc::new(new_op), ctx) {
+                if let Err(e) = optimizer.send_extra_operation(&new_rc, ctx) {
                     ctx.signal_invalid_loop(e.0);
                     return Vec::new();
                 }
@@ -4399,12 +4399,12 @@ impl OptUnroll {
                 // already answer it by declining to InvalidLoop rather than
                 // substituting the preamble's box. Answer it the same way here
                 // instead of aborting the process.
-                let mut mapped_jump_args: Vec<OpRef> = Vec::with_capacity(num_short_jump_args);
+                let mut mapped_jump_args: Vec<Operand> = Vec::with_capacity(num_short_jump_args);
                 for jump_arg in short_jump_args.iter() {
                     let mapped = if jump_arg.is_constant() {
-                        *jump_arg
+                        Operand::from_opref(*jump_arg)
                     } else {
-                        let Some(&mapped) = mapping.get(jump_arg) else {
+                        let Some(mapped) = mapping.get(jump_arg) else {
                             if crate::optimizeopt::majit_log_enabled() {
                                 eprintln!(
                                     "[jit] inline_short_preamble: unmapped short jump arg \
@@ -4416,12 +4416,12 @@ impl OptUnroll {
                             );
                             return Vec::new();
                         };
-                        mapped
+                        mapped.clone()
                     };
-                    mapped_jump_args.push(ctx.get_replacement_opref(mapped));
+                    mapped_jump_args.push(mapped);
                 }
                 // unroll.py:419-421
-                for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
+                for &arg in args_no_virtuals.iter() {
                     if arg.is_none() {
                         continue;
                     }
@@ -4432,6 +4432,9 @@ impl OptUnroll {
                             .unwrap_or_else(|| Operand::bound_from_opref(arg))
                     };
                     let _ = optimizer.force_box(&arg_box, ctx);
+                }
+                for arg_box in mapped_jump_args.iter() {
+                    let _ = optimizer.force_box(arg_box, ctx);
                 }
                 // unroll.py:425-434: if short_jump_args did not grow we are
                 // done. If force_box grew it via add_preamble_op, only re-force
@@ -4484,7 +4487,7 @@ impl OptUnroll {
                 mapped_args.push(ctx.get_replacement_opref(jump_arg));
                 continue;
             }
-            let Some(&mapped) = mapping.get(&jump_arg) else {
+            let Some(mapped) = mapping.get(&jump_arg) else {
                 if crate::optimizeopt::majit_log_enabled() {
                     eprintln!(
                         "[jit] inline_short_preamble: unmapped short jump arg {jump_arg:?} \
@@ -4496,7 +4499,7 @@ impl OptUnroll {
                 );
                 return Vec::new();
             };
-            mapped_args.push(ctx.get_replacement_opref(mapped));
+            mapped_args.push(ctx.resolve_operand_operand(mapped).to_opref());
         }
         mapped_args
     }
