@@ -16303,6 +16303,87 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<NonNull<T> as PartialEq>::eq` / `ne` compares the two
+                // addresses (`as_ptr` with `as_ptr`). Each operand is
+                // `&NonNull<T>`, and `Rvalue::Ref` of that local is the
+                // pointer word, so the args are those two refs.
+                // `rclass.py` `pairtype(InstanceRepr, InstanceRepr)`
+                // `rtype_eq` / `rtype_ne` lower the comparison to `ptr_eq`
+                // / `ptr_ne`.
+                if args.len() == 2
+                    && (fmt_path_ends_with(&segments, &["non_null", "NonNull", "eq"])
+                        || fmt_path_ends_with(&segments, &["non_null", "NonNull", "ne"]))
+                {
+                    let leaf = if fmt_path_ends_with(&segments, &["non_null", "NonNull", "ne"]) {
+                        "ne"
+                    } else {
+                        "eq"
+                    };
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: leaf.to_string(),
+                            lhs: args[0].clone(),
+                            rhs: args[1].clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `<Option<P> as PartialEq>::eq` / `ne` on a niche nullable
+                // pointer whose payload compares by address (`*mut T` /
+                // `*const T`, `NonNull<T>`, function pointer). `None` is
+                // null and `Some(p)` is `p`, so derived equality is address
+                // identity of the two words — the same `BinOp` `rclass.py`
+                // `rtype_eq` / `rtype_ne` lower to `ptr_eq` / `ptr_ne`.
+                // The payload gate keeps `&T` (pointee by value), `Box<T>`
+                // (by value), strings, and a non-niche aggregate Option
+                // residual. Operands arrive as `&Option<P>`; peel that one
+                // reference. `Rvalue::Ref` aliases the borrow to the niche
+                // word.
+                if args.len() == 2
+                    && (fmt_path_ends_with(&segments, &["option", "Option", "eq"])
+                        || fmt_path_ends_with(&segments, &["option", "Option", "ne"]))
+                    && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
+                        .iter()
+                        .all(|ty| {
+                            ty.is_some_and(|ty| {
+                                self.tyref_peel_ref_to_pointee(ty).is_some_and(|peeled| {
+                                    self.option_niche_payload_compares_by_address(&peeled)
+                                })
+                            })
+                        })
+                {
+                    let leaf = if fmt_path_ends_with(&segments, &["option", "Option", "ne"]) {
+                        "ne"
+                    } else {
+                        "eq"
+                    };
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: leaf.to_string(),
+                            lhs: args[0].clone(),
+                            rhs: args[1].clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<T as ToString>::to_string(x)` renders `x` to an owned
                 // String — the same `str(x)` (`ll_str`) the format!
                 // expansion emits for a Display placeholder.  Lower it to
@@ -24718,6 +24799,55 @@ impl<'a> Lowering<'a> {
             payload_path.as_deref(),
             Some("core::ptr::non_null::NonNull") | Some("alloc::vec::Vec")
         )
+    }
+
+    /// `true` when `option_ty` is a niche nullable `Option<P>` and `P`
+    /// compares by address: a raw pointer (`*mut T` / `*const T`),
+    /// `NonNull<T>`, or a function pointer. Under the niche model `None`
+    /// is null and `Some(p)` is `p`, so derived equality is address
+    /// identity of the two words.
+    ///
+    /// `&T` compares the pointee by value, `Box<T>` compares by value, and
+    /// a string payload compares string contents. A leading reference is
+    /// not peeled off `P` before that test, so `Option<&NonNull<T>>` stays
+    /// out with the other `&T` payloads. An aggregate Option is not a
+    /// niche and stays out too.
+    fn option_niche_payload_compares_by_address(&self, option_ty: &TyRef) -> bool {
+        if !self.tyref_is_niche_option_ptr(option_ty) {
+            return false;
+        }
+        let Some(payload) = tyref_node(option_ty, self.llbc)
+            .and_then(|node| node.as_object())
+            .and_then(|m| m.get("Adt"))
+            .and_then(|a| a.as_object())
+            .and_then(|a| type_decl_ref_generics(a, self.llbc))
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .and_then(|t| t.first())
+        else {
+            return false;
+        };
+        // The same unique trait-projection peel `tyref_is_niche_option_ptr`
+        // applies before recognising the payload, so `Option<H::Value>`
+        // bound to `*mut PyObject` is that raw pointer.
+        let resolved_assoc = trait_payload_node(payload, self.llbc)
+            .and_then(|node| trait_assoc_projection_target(node, self.llbc));
+        let resolved_body = resolved_assoc.as_ref().and_then(|ty| self.tyref_body(ty));
+        let payload = resolved_body.unwrap_or(payload);
+        if type_node_is_fn_ptr(payload, self.llbc)
+            || type_node_raw_ptr_pointee(payload, self.llbc).is_some()
+        {
+            return true;
+        }
+        let Some(node) = strip_ty_indirections(payload, self.llbc) else {
+            return false;
+        };
+        let Some(def_id) = adt_node_def_id(node) else {
+            return false;
+        };
+        self.llbc
+            .type_by_id(def_id)
+            .is_some_and(|td| td.item_meta.name_path() == "core::ptr::non_null::NonNull")
     }
 
     /// Emit a null pointer for a nullable `Option` (`None`) as a
@@ -60651,6 +60781,99 @@ mod tests {
         assert!(
             ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq")),
             "the `&Wtf8` comparison lowers to a `BinOp(eq)`"
+        );
+    }
+
+    /// `<NonNull<T> as PartialEq>::ne` on the two type pointers in
+    /// `try_dispatch_binary_special` (`w_typ1 != w_typ2`). The operands are
+    /// the pointer words, so the comparison is `BinOp("ne")` and the
+    /// `NonNull::ne` call is gone. Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn niche_ptr_cmp_nonnull_ne_try_dispatch_binary_special() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::objspace::descroperation::try_dispatch_binary_special",
+        )
+        .expect("lower try_dispatch_binary_special");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => super::fmt_path_ends_with(segments, &["NonNull", "ne"]),
+                    _ => false,
+                })
+                .count(),
+            0,
+            "no residual `NonNull::ne` call survives the fold"
+        );
+        assert!(
+            ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")),
+            "the address comparison lowers to a `BinOp(ne)`"
+        );
+    }
+
+    /// `<Option<*mut PyObject> as PartialEq>::ne` in `try_hash_value`
+    /// (`Some(method) != base_hash`). Both words are niche nullable
+    /// pointers, so the `Option::ne` call is the same address `ne`.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn niche_ptr_cmp_option_ne_try_hash_value() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::builtins::try_hash_value")
+            .expect("lower try_hash_value");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => super::fmt_path_ends_with(segments, &["Option", "ne"]),
+                    _ => false,
+                })
+                .count(),
+            0,
+            "no residual `Option::ne` call survives the address fold"
+        );
+    }
+
+    /// `Option<&u8>` compares the `u8`, not the address. `bytes.get(1) !=
+    /// Some(&b'_')` in `shutdown_module_private_name` must stay a call.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn niche_ptr_cmp_option_ref_stays_shutdown_module_private_name() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::shutdown::shutdown_module_private_name",
+        )
+        .expect("lower shutdown_module_private_name");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert!(
+            ops().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => super::fmt_path_ends_with(segments, &["Option", "ne"]),
+                _ => false,
+            }),
+            "`Option<&u8>` inequality stays a residual `Option::ne` call"
         );
     }
 
