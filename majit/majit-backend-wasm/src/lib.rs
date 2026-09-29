@@ -2494,19 +2494,15 @@ pub extern "C" fn wasm_jit_ca_push_frame(frame_ptr: i64) -> i64 {
 /// one frame before its `call_indirect` and pops after, and a deopt resume runs
 /// on the host's own shadow stack — so removing the top entry releases exactly
 /// this callee's frame.
+///
+/// `_call_footer_shadowstack` for a module whose shadow-stack cells are not
+/// published; the inline footer is the same `SUB`. No barrier: an old
+/// callee frame was remembered by its own `_reload_frame_if_necessary`
+/// after each collecting call.
 pub extern "C" fn wasm_jit_ca_pop_frame(_items_base: i64) -> i64 {
-    // `genop_finish` publishes `assembler._finish_gcmap` before the call
-    // footer drops the execution root.  Traces without GUARD_NOT_FORCED_2
-    // now do that publish at FINISH and pop with `_call_footer_shadowstack`;
-    // this helper remains the GUARD_NOT_FORCED_2 footer.
-    // `_reload_frame_if_necessary`: the deopt helper can collect after the
-    // generated caller last refreshed its callee local. The shadow-stack root
-    // is forwarded by that collection; the argument may still name old space.
-    let jf = majit_gc::shadow_stack::jf_top_ptr().0 as *mut majit_backend::jitframe::JitFrame;
-    if jf.is_null() {
+    if majit_gc::shadow_stack::jf_top_ptr().is_null() {
         return 0;
     }
-    wasm_jit_write_barrier(jf as i64);
     majit_gc::shadow_stack::pop_jf_top();
     0
 }
@@ -4964,16 +4960,6 @@ fn dead_frame_from_forced_frame(frame_ptr: usize, fail_descr: Arc<WasmFailDescr>
     ))
 }
 
-/// The `run_compiled` frame pop, as one step: remember the (old-gen) frame so
-/// a virtualizable token that still points at it can find young homes after
-/// the shadow-stack root is gone. Production runs the same barrier and pop
-/// around `WasmFrameData::boxed`, which may collect between them.
-#[cfg(test)]
-fn remember_and_drop_execution_frame(jf: *mut majit_backend::jitframe::JitFrame, saved: usize) {
-    wasm_jit_write_barrier(jf as i64);
-    majit_gc::shadow_stack::pop_jf_to(saved);
-}
-
 fn publish_exit_slots(
     resources: &mut release::LoopAsmResources,
     guards: &[codegen::GuardExit],
@@ -6944,13 +6930,14 @@ impl majit_backend::Backend for WasmBackend {
 
                 // The pre-call pointer may name from-space. Resolve the
                 // shadow slot first (`_check_frame_depth` may also have
-                // stored `jf_forward`), then barrier that frame.
+                // stored `jf_forward`). No barrier on the way out: the entry
+                // barrier above and `_reload_frame_if_necessary`'s after each
+                // collecting call already left an old frame remembered.
                 let jf = unsafe {
                     majit_backend::jitframe::JitFrame::resolve(
                         majit_gc::shadow_stack::peek_jf(saved).0 as *mut JitFrame,
                     )
                 };
-                wasm_jit_write_barrier(jf as i64);
                 let fail_descr = descr_at(unsafe { (*jf).jf_descr })
                     .expect("invalid jf_descr from compiled wasm");
                 let data = WasmFrameData::from_live_frame(jf, fail_descr, false, true, None);
@@ -8600,13 +8587,12 @@ mod tests {
         assert_eq!(len_after, depth as isize, "old-gen frame moved/corrupted");
     }
 
-    /// Host `execute_token` pops the old-gen JitFrame after FINISH. A
-    /// virtualizable token may still hold that frame, so the pop must
-    /// remember it first — the same footer `wasm_jit_ca_pop_frame` already
-    /// runs. Without the barrier the next minor collection never walks the
-    /// homes and a recycled nursery address is left in a gcmap slot.
+    /// `llmodel.py` `execute_token`: an old frame that receives young input
+    /// refs is remembered by the entry `gc_writebarrier`, before the run.
+    /// The host pops the frame after FINISH with no second barrier, and a
+    /// minor collection after that pop still forwards the young home.
     #[test]
-    fn oldgen_jitframe_must_be_remembered_before_host_pop() {
+    fn oldgen_entry_frame_is_remembered_by_the_entry_barrier_across_the_pop() {
         let _compile_guard = failguard::lock_cpu();
         use majit_backend::jitframe::{
             FIRST_ITEM_OFFSET, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
@@ -8627,8 +8613,9 @@ mod tests {
                 gcmap.as_ptr() as *const u8;
         }
         let _gc_box = install_gc_box(Box::new(gc));
+        wasm_jit_write_barrier(frame_ptr as i64);
         let saved = majit_gc::shadow_stack::push_jf(frame);
-        remember_and_drop_execution_frame(frame_ptr, saved);
+        majit_gc::shadow_stack::pop_jf_to(saved);
         with_wasm_active_gc_mut(|gc| gc.collect_nursery());
         let item0 = unsafe { *((frame_ptr as *const u8).add(FIRST_ITEM_OFFSET) as *const usize) };
         assert_ne!(item0, 0, "young home cleared after host pop");

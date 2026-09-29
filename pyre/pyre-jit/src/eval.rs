@@ -10633,28 +10633,6 @@ fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
     correct_resume_vsd(frame, ni as usize);
 }
 
-/// Pin a GC-managed deadframe on the jitframe shadow stack for one
-/// `handle_fail` / blackhole window.
-///
-/// `JitFrameDeadFrame` already holds an `OwnerRootGuard`, but that slot
-/// is walked with `drag_out_root`: a nursery frame is copied, an old
-/// frame is left alone. Compiled execution had interior-traced the same
-/// old frame through `walk_jf_roots` (`visit_jf_root` →
-/// `trace_and_update_object`). The epilogue pops that stack before
-/// `execute_token` returns, so a later minor during bridge tracing skips
-/// `jf_gcmap` slots. Guard failure saved young Refs there with no write
-/// barrier (`_push_all_regs_to_jitframe`), so the words go stale until a
-/// later frame barrier remembers the jitframe and `jitframe_trace` trips
-/// GC BUG.
-fn pin_deadframe_jf(
-    deadframe: &Option<majit_backend::DeadFrame>,
-) -> Option<majit_gc::shadow_stack::JitFramePin> {
-    let ptr = deadframe.as_ref()?.jitframe_ptr()?;
-    Some(majit_gc::shadow_stack::JitFramePin::enter(majit_ir::GcRef(
-        ptr as usize,
-    )))
-}
-
 /// compile.py handle_fail.
 ///
 /// Single function containing the complete guard failure handling:
@@ -11435,7 +11413,6 @@ fn execute_assembler(
             savedata,
             ref deadframe,
         } => {
-            let _jf_pin = pin_deadframe_jf(deadframe);
             match dispatch_handle_fail(
                 &mut frame_root,
                 green_key,
@@ -11922,7 +11899,6 @@ fn bound_reached(
             ref deadframe,
         } = outcome
         {
-            let _jf_pin = pin_deadframe_jf(deadframe);
             match dispatch_handle_fail(
                 &mut frame_root,
                 green_key,
@@ -12208,7 +12184,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             ref deadframe,
         } = outcome
         {
-            let _jf_pin = pin_deadframe_jf(deadframe);
             match dispatch_handle_fail(
                 &mut frame_root,
                 green_key,

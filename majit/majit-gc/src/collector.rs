@@ -1686,12 +1686,17 @@ impl MiniMarkGC {
             if self.maybe_collect_for_external_malloc(total_size) {
                 return GcRef(0);
             }
-            if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
-                return obj;
-            }
             // `external_malloc` (`incminimark.py`): `arena_malloc` returning
             // NULL is `MemoryError`, not a process abort. `rbigint.lshift`
-            // of `1 << 10**18` is the public edge that depends on it.
+            // of `1 << 10**18` is the public edge that depends on it. A young
+            // birth that fails is that NULL; it does not fall back to an old
+            // one, which callers that elide the barrier on a fresh result
+            // (`remember_write_barrier`) could not see.
+            if self.young_birth_allowed(type_id) {
+                return self
+                    .try_alloc_young_nonmoving_clear(type_id, total_size)
+                    .unwrap_or(GcRef(0));
+            }
             if let Some(obj) = self.try_alloc_in_oldgen(type_id, total_size) {
                 Self::raw_memclear(obj, total_size);
                 return obj;
@@ -1732,7 +1737,13 @@ impl MiniMarkGC {
             // Production incminimark keeps `nonlarge_max` below the
             // nursery size. Tiny backend tests can configure the two
             // independently; retain their external-allocation fallback
-            // only for an object that cannot physically fit anywhere.
+            // only for an object that cannot physically fit anywhere, born
+            // young as the large arm above births it.
+            if self.young_birth_allowed(type_id) {
+                return self
+                    .try_alloc_young_nonmoving_clear(type_id, total_size)
+                    .unwrap_or(GcRef(0));
+            }
             return self.alloc_in_oldgen_clear(type_id, total_size);
         }
         if ptr.is_null() {
@@ -1937,12 +1948,15 @@ impl MiniMarkGC {
             if oom {
                 return GcRef(0);
             }
-            if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
-                return obj;
-            }
             // `external_malloc` (`incminimark.py`): `arena_malloc` returning
             // NULL is `MemoryError`, not a process abort. `rbigint.lshift`
-            // of `1 << 10**18` is the public edge that depends on it.
+            // of `1 << 10**18` is the public edge that depends on it. A young
+            // birth that fails is that NULL, as in `alloc_with_type_slow`.
+            if self.young_birth_allowed(type_id) {
+                return self
+                    .try_alloc_young_nonmoving_clear(type_id, total_size)
+                    .unwrap_or(GcRef(0));
+            }
             if let Some(obj) = self.try_alloc_in_oldgen(type_id, total_size) {
                 Self::raw_memclear(obj, total_size);
                 return obj;
@@ -3036,6 +3050,14 @@ impl MiniMarkGC {
         GcRef(obj_addr)
     }
 
+    /// Whether [`try_alloc_young_nonmoving_clear`](Self::try_alloc_young_nonmoving_clear)
+    /// attempts a young birth for `type_id` at all: `external_malloc`'s
+    /// `alloc_young=True`, unless `MAJIT_GC_YOUNG_RAWMALLOC=0` or the type
+    /// refuses it.
+    fn young_birth_allowed(&self, type_id: u32) -> bool {
+        young_rawmalloc_enabled() && self.type_alloc_may_be_young(type_id)
+    }
+
     /// incminimark.py `external_malloc(typeid, length, alloc_young=True)`,
     /// the birth [`alloc_in_oldgen`](Self::alloc_in_oldgen) is the
     /// `alloc_young=False` sibling of.
@@ -3053,14 +3075,13 @@ impl MiniMarkGC {
     /// `MAJIT_GC_YOUNG_RAWMALLOC=0` (see [`young_rawmalloc_enabled`]). A
     /// destructor is *not* refused.
     ///
-    /// Returns `None` for either refusal and for an allocation failure; the
-    /// caller falls back to `alloc_in_oldgen_clear`.
+    /// Returns `None` for either refusal and for an allocation failure.
     fn try_alloc_young_nonmoving_clear(
         &mut self,
         type_id: u32,
         total_size: usize,
     ) -> Option<GcRef> {
-        if !young_rawmalloc_enabled() || !self.type_alloc_may_be_young(type_id) {
+        if !self.young_birth_allowed(type_id) {
             return None;
         }
         let ptr = self.oldgen.try_alloc_young(total_size, 0)?;

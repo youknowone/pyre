@@ -8,7 +8,9 @@
 //!
 //! The list is what `os.py`'s module body needs to run — `environ`,
 //! `_have_functions`, `stat` and `cpu_count` — plus `lstat`, `listdir`,
-//! `fspath`, `scandir` and `stat_result`, and the three calls the stdlib reaches for
+//! `fspath`, `scandir`, the structseq types `posix` publishes on every
+//! platform (`stat_result`, `statvfs_result`, `times_result`, `uname_result`,
+//! `terminal_size`), and the three calls the stdlib reaches for
 //! that the embedder can still answer: `getcwd`, `getcwdb` and `urandom`.
 //! On top of that sits a descriptor half — `open`, `close`, `read`, `lseek`,
 //! `fstat` — over a table this module keeps itself.  The seam answers a whole
@@ -250,15 +252,6 @@ fn make_stat_result(mode: i64, size: i64) -> PyObjectRef {
         .map(|(name, slot)| (name, pyre_object::gc_roots::shadow_stack_get(slot)))
         .collect();
     crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), fields.take(), extras)
-}
-
-/// `os.terminal_size` structseq — `(columns, lines)`.
-fn terminal_size_seq_type() -> PyObjectRef {
-    static TERMINAL_SIZE_SEQ_TYPE: pyre_object::gc_roots::RootedOnceRef =
-        pyre_object::gc_roots::RootedOnceRef::new();
-    TERMINAL_SIZE_SEQ_TYPE.get_or_init(|| {
-        crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"])
-    })
 }
 
 /// `posix.listdir(path=None)` — the entry names the seam reports, in its
@@ -1037,18 +1030,6 @@ fn unsetenv(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_none())
 }
 
-/// `os.uname_result` structseq — the five fields `uname` fills.
-fn uname_seq_type() -> PyObjectRef {
-    static UNAME_SEQ_TYPE: pyre_object::gc_roots::RootedOnceRef =
-        pyre_object::gc_roots::RootedOnceRef::new();
-    UNAME_SEQ_TYPE.get_or_init(|| {
-        crate::_structseq::make_struct_seq(
-            "os.uname_result",
-            &["sysname", "nodename", "release", "version", "machine"],
-        )
-    })
-}
-
 /// `posix.uname()` — the record wasi's own `uname` fills in, which names the
 /// guest rather than whatever machine the embedder happens to be.
 ///
@@ -1060,7 +1041,7 @@ fn uname(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     for field in fields {
         seq.push(pyre_object::w_str_new_managed(field));
     }
-    Ok(crate::_structseq::new_instance(uname_seq_type(), seq.take()))
+    Ok(crate::_structseq::new_instance(super::uname_result_seq_type(), seq.take()))
 }
 
 /// What one parameter of a refused entry point is, which decides the
@@ -1516,7 +1497,13 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // `get_terminal_size` that fills one is guarded: `shutil.get_terminal_size`
     // catches the AttributeError from the missing call and builds its fallback
     // out of the type, so a target with neither raises from the handler.
-    crate::module_ns_store(ns, "terminal_size", terminal_size_seq_type());
+    crate::module_ns_store(ns, "terminal_size", super::terminal_size_seq_type());
+    // `moduledef.py` lists these three as appleveldefs with no platform test,
+    // and `posixmodule_exec` creates them unconditionally too: the types exist
+    // wherever `posix` does, even where the call that fills one is absent.
+    crate::module_ns_store(ns, "statvfs_result", super::statvfs_result_seq_type());
+    crate::module_ns_store(ns, "times_result", super::times_result_seq_type());
+    crate::module_ns_store(ns, "uname_result", super::uname_result_seq_type());
     // `follow_symlinks` and `dir_fd` are keyword-only, so neither entry point
     // can take the fixed-arity carrier that rejects keywords.
     crate::module_ns_store(

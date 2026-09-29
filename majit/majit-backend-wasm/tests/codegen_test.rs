@@ -2889,9 +2889,9 @@ fn entry_prologue_does_not_null_unmarked_home_padding() {
 
 /// The CA pop footer must not bake the caller's `GUARD_NOT_FORCED_2`.
 /// After `redirect_call_assembler` the callee can differ, so the footer
-/// loads `WasmCaDispatchEntry.has_guard_not_forced_2` and keeps both the
-/// shadowstack `SUB` and the write-barrier helper. A leftover caller
-/// `GUARD_NOT_FORCED` must not change that shape. The flag lives on the
+/// loads `WasmCaDispatchEntry.has_guard_not_forced_2`, and the pop itself
+/// is the shadowstack `SUB` (`_call_footer_shadowstack`) with no helper
+/// call. A leftover caller `GUARD_NOT_FORCED` must not change that shape. The flag lives on the
 /// dispatch cell so an in-flight pop sees a GNF2 bridge attached after
 /// the pre-call snapshot was loaded.
 #[test]
@@ -3004,8 +3004,8 @@ fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
         "CA pop must load callee GUARD_NOT_FORCED_2 from the snapshot"
     );
     assert!(
-        mentions_pop_helper(&without),
-        "redirectable callee GNF2 keeps the write-barrier pop helper"
+        !mentions_pop_helper(&without),
+        "the inline CA pop is `_call_footer_shadowstack`'s SUB, not a helper call"
     );
 
     let with = build(true);
@@ -3015,8 +3015,8 @@ fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
         "caller GUARD_NOT_FORCED_2 must not replace the snapshot load"
     );
     assert!(
-        mentions_pop_helper(&with),
-        "caller GUARD_NOT_FORCED_2 must not change the pop helper shape"
+        !mentions_pop_helper(&with),
+        "caller GUARD_NOT_FORCED_2 must not add a pop helper call"
     );
 }
 

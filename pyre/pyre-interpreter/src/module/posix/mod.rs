@@ -191,3 +191,77 @@ pub(crate) fn fspath(
     drop(roots);
     Err(error)
 }
+
+/// `os.terminal_size` structseq — `(columns, lines)`.
+pub(crate) fn terminal_size_seq_type() -> PyObjectRef {
+    static T: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    T.get_or_init(|| crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"]))
+}
+
+/// `uname_result` structseq — `(sysname, nodename, release, version,
+/// machine)`.  `uname_result_desc` names the type after the module it is
+/// registered in, which is what pickle imports to resolve it: `posix` where
+/// this module is `posix`, `nt` on Windows, which has the type even though it
+/// has no `uname` to build one with.
+pub(crate) fn uname_result_seq_type() -> PyObjectRef {
+    static T: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    T.get_or_init(|| {
+        crate::_structseq::make_struct_seq(
+            if cfg!(windows) {
+                "nt.uname_result"
+            } else {
+                "posix.uname_result"
+            },
+            &["sysname", "nodename", "release", "version", "machine"],
+        )
+    })
+}
+
+/// `os.statvfs_result` structseq — 10 sequence slots with `f_fsid` as an
+/// extra named field (`n_sequence_fields=10`, `n_fields=11`).
+pub(crate) fn statvfs_result_seq_type() -> PyObjectRef {
+    static T: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    T.get_or_init(|| {
+        crate::_structseq::make_struct_seq_with_extra(
+            "os.statvfs_result",
+            &[
+                "f_bsize",
+                "f_frsize",
+                "f_blocks",
+                "f_bfree",
+                "f_bavail",
+                "f_files",
+                "f_ffree",
+                "f_favail",
+                "f_flag",
+                "f_namemax",
+            ],
+            &["f_fsid"],
+        )
+    })
+}
+
+/// `os.times_result` structseq — `(user, system, children_user,
+/// children_system, elapsed)`; repr renders "posix.times_result(...)", or
+/// "nt.times_result(...)" on the host whose module is spelled that way.  The
+/// name is the one `pickle` imports to resolve the type, so it has to be the
+/// module the host actually has.
+pub(crate) fn times_result_seq_type() -> PyObjectRef {
+    static T: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    T.get_or_init(|| {
+        crate::_structseq::make_struct_seq(
+            if cfg!(windows) {
+                "nt.times_result"
+            } else {
+                "posix.times_result"
+            },
+            &[
+                "user",
+                "system",
+                "children_user",
+                "children_system",
+                "elapsed",
+            ],
+        )
+    })
+}

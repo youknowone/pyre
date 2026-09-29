@@ -3307,7 +3307,12 @@ impl GcRewriterImpl {
         st.emitting_an_operation_that_can_collect();
         let malloc_op = mk_op(OpCode::CallMallocNurseryVarsizeFrame, &[size]);
         let frame = st.emit_result(malloc_op, OpRef::NONE);
-        st.remember_wb(&frame);
+        // A frame past the large-object threshold is born young and
+        // non-moving, as `gen_malloc_fixedsize` states; under
+        // `MAJIT_GC_YOUNG_RAWMALLOC=0` it is born old and keeps its barriers.
+        if crate::collector::young_rawmalloc_enabled() {
+            st.remember_wb(&frame);
+        }
 
         // rewrite.py — gen_initialize_tid(frame, descrs.arraydescr.tid)
         self.gen_initialize_tid(frame.clone(), descrs.jitframe_tid, st);

@@ -629,8 +629,8 @@ pub struct CallAssemblerTarget {
     pub home_slot_base: u32,
     pub home_slots: u32,
     /// Callee retains `_finish_gcmap` (`GUARD_NOT_FORCED_2`). The caller
-    /// pop footer must use the write-barrier helper when this is set,
-    /// even if the caller module itself has no GNF2.
+    /// pop footer keeps that map while the callee's force token is armed
+    /// when this is set, even if the caller module itself has no GNF2.
     pub has_guard_not_forced_2: u32,
     /// Homes `build_home_gcmap` marks: the used ordinary prefix, then the
     /// LABEL-capture tail. Reserved padding between them is unmarked.

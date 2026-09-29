@@ -1292,37 +1292,6 @@ pub fn jf_depth() -> usize {
     })
 }
 
-/// Keeps one jitframe on the jitframe shadow stack for a scope outside
-/// compiled code, the way `_call_header_shadowstack` /
-/// `_call_footer_shadowstack` bracket a compiled call.
-///
-/// A frame whose compiled code already returned (a guard-failure deadframe)
-/// or is suspended in a residual call (`llmodel.py force` returns the frame
-/// that pushed `jf_gcmap`, and `pop_gcmap` runs only after the residual
-/// returns) is otherwise walked only through an owner root, which copies a
-/// nursery frame but does not interior-trace an old one. Pinning it here
-/// lets `walk_jf_roots` trace its `jf_frame` slots through `jitframe_trace`.
-/// Dropping the pin restores the stack to its depth at entry.
-pub struct JitFramePin {
-    depth: usize,
-}
-
-impl JitFramePin {
-    pub fn enter(jf_ptr: GcRef) -> Self {
-        Self {
-            depth: push_jf(jf_ptr),
-        }
-    }
-}
-
-impl Drop for JitFramePin {
-    fn drop(&mut self) {
-        if jf_depth() > self.depth {
-            pop_jf_to(self.depth);
-        }
-    }
-}
-
 /// Walk jitframe shadow stack entries as GC roots.
 ///
 /// Each jf_ptr is exposed as `&mut GcRef`. The GC treats it like any

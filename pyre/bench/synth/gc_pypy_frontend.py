@@ -5,9 +5,7 @@
 # type change. The roots list differs by platform, so guard_failures is
 # deterministic per runner but spread by up to 8 across runners (470 windows,
 # 473 macos, 481 ubuntu, measured before the MutableCell roots were wrapped
-# as GcRef). wasm keeps its own baseline (`gc_pypy_frontend.wasm.jitstats`):
-# since interned strings stopped registering roots, its root list no longer
-# matches the native one. Only about 16k of the 22.5k roots are
+# as GcRef). Only about 16k of the 22.5k roots are
 # distinct objects: several off-GC side-table walkers report the same type,
 # str or descriptor, where pypy3 reaches those objects through the heap.
 import gc
