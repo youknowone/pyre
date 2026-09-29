@@ -47,6 +47,27 @@ pub fn gc_alloc_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
     crate::lltype::malloc_raw(value)
 }
 
+/// [`gc_alloc_storage_box`] born young: `malloc_fixed_or_varsize_nonmovable`
+/// (`external_malloc(..., alloc_young=True)`).
+///
+/// The box keeps the non-moving address the self-mutating rule needs, but a
+/// minor collection frees it once nothing reaches it, instead of the next
+/// major.  A young box needs no barrier on its payload stores.  The caller
+/// owes the box a root until it is stored into a traced object.
+#[inline]
+pub fn gc_alloc_young_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
+    if tid != 0 {
+        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_raw(tid, std::mem::size_of::<T>());
+        if !raw.is_null() {
+            unsafe {
+                std::ptr::write(raw as *mut T, value);
+            }
+            return raw as *mut T;
+        }
+    }
+    crate::lltype::malloc_raw(value)
+}
+
 /// GC-sweep destructor for a storage box built by
 /// [`gc_alloc_storage_box::<T>`].
 ///
