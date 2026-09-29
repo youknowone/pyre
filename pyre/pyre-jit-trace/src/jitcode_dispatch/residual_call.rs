@@ -9147,23 +9147,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
 
-    // LoadFastCheck fold: a bound local makes the helper the identity, so the
-    // call becomes the nullity guard.  The residual is
-    // `load_fast_check_fn(value, code, name_idx)`, so `r_args = [value, code]`.
-    if ctx.is_authoritative_executor
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadFastCheck
-    {
-        if let Some(&value_opref) = r_args.first() {
-            if spec_gate(SpecFold::LoadFastCheck, || {
-                try_walker_fold_load_fast_check(ctx, op.pc, value_opref, dst, dst_bank)
-            })?
-            .is_some()
-            {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-        }
-    }
-
     // LoadSpecial fold: replace the `__enter__` / `__exit__` type lookup with
     // the constant descriptor plus an inline `Method` construction the
     // following CALL virtualizes away.  The residual is

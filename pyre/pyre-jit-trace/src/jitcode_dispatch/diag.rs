@@ -432,7 +432,6 @@ spec_folds! {
     LoadSuperAttr        => ("load_super_attr",          "residual_call", "-"),
     SuperAttrUnwrap      => ("super_attr_unwrap",        "residual_call", "load_super_attr"),
     LoadSpecialMethod    => ("load_special_method",      "residual_call", "-"),
-    LoadFastCheck        => ("load_fast_check",          "residual_call", "-"),
     FormatWithSpecInt    => ("format_with_spec_int",     "residual_call", "-"),
     SubscrUserGetitem    => ("subscr_user_getitem",      "inline_call",   "subscr"),
     LenUserDunder        => ("len_user_dunder",          "inline_call",   "-"),

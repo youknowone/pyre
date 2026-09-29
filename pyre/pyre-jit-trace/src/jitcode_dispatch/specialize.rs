@@ -3478,41 +3478,6 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Fold `bh_load_fast_check_fn(value, code, name_idx)` to the nullity guard it
-/// really is.  The helper returns `value` unchanged whenever the local is
-/// bound, so on a bound local the whole call is `guard_nonnull(value)` — the
-/// shape `pyjitpl.py _establish_nullity` proves a nullity with, and the shape
-/// LOAD_FAST_CHECK has no reason to be anything else.
-///
-/// Two things follow from removing the call rather than merely cheapening it.
-/// A `guard_nonnull` on a virtual is statically true, so the optimizer drops it
-/// and the local stops escaping into a residual — an object built inside the
-/// loop can then virtualize away entirely.  And the guard costs nothing on a
-/// value some earlier guard already proved non-null, where the residual cost a
-/// call per iteration regardless.
-///
-/// Declines on an unbound local (concrete `PY_NULL`), where the residual is the
-/// path that raises `UnboundLocalError` with the variable's name.  A guard
-/// failure resumes at this opcode, so the interpreter re-runs LOAD_FAST_CHECK
-/// and raises the same error the residual would have.
-pub(crate) fn try_walker_fold_load_fast_check<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    value: OpRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' {
-        return Ok(None);
-    }
-    if walker_concrete_ref_object(ctx, value).is_none() {
-        return Ok(None);
-    }
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[value])?;
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
-    Ok(Some(()))
-}
-
 /// LOAD_SPECIAL's `__enter__` / `__exit__` lookup, folded to the shape PyPy's
 /// `BEFORE_WITH` has for free: `space.lookup` is ordinary RPython there, so a
 /// promoted type makes the descriptor constant and the bound method it builds
