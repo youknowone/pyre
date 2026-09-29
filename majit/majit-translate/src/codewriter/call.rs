@@ -6186,7 +6186,7 @@ impl CallControl {
     pub(crate) fn declared_non_void_arg_classes(&self, path: &CallPath) -> Option<String> {
         let graph = self.function_graphs.get(path)?;
         let mut classes = String::new();
-        for ty in graph_non_void_arg_types(graph) {
+        for ty in graph_non_void_arg_types(&graph) {
             let class = match ty {
                 Type::Int => 'i',
                 Type::Ref => 'r',

@@ -40,7 +40,7 @@ fn nursery_spec_folds_gc_type_size() {
     let mut sizes = Vec::new();
     for function in &program.functions {
         for op in function
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -61,7 +61,7 @@ fn nursery_spec_folds_gc_type_size() {
             continue;
         }
         let call = function
-            .graph
+            .graph()
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -81,7 +81,7 @@ fn nursery_spec_folds_gc_type_size() {
             .and_then(|arg| arg.as_variable())
             .cloned()
             .unwrap_or_else(|| panic!("{} size argument is not a value", function.name));
-        let size_op = function.graph.blocks.iter().find_map(|block| {
+        let size_op = function.graph().blocks.iter().find_map(|block| {
             block
                 .operations
                 .iter()

@@ -257,13 +257,13 @@ fn scalar_pointer_params_match_int_callers() {
         .collect();
     assert!(
         hash_of.iter().any(|function| {
-            let tys = input_types(&function.graph);
+            let tys = input_types(function.graph());
             tys.len() >= 2 && int_family(&tys[1]) && function.name.contains("i64")
         }),
         "RDict<i64, IntKeyHasher>::hash_of key must be int, got {}",
         hash_of
             .iter()
-            .map(|function| format!("{} {:?}", function.name, input_types(&function.graph)))
+            .map(|function| format!("{} {:?}", function.name, input_types(function.graph())))
             .collect::<Vec<_>>()
             .join("; ")
     );
@@ -274,13 +274,13 @@ fn scalar_pointer_params_match_int_callers() {
         .collect();
     assert!(
         lookup.iter().any(|function| {
-            let tys = input_types(&function.graph);
+            let tys = input_types(function.graph());
             tys.len() >= 3 && int_family(&tys[2]) && function.name.contains("i64")
         }),
         "RDict<i64>::lookup_for_store key must be int, got {}",
         lookup
             .iter()
-            .map(|function| format!("{} {:?}", function.name, input_types(&function.graph)))
+            .map(|function| format!("{} {:?}", function.name, input_types(function.graph())))
             .collect::<Vec<_>>()
             .join("; ")
     );
