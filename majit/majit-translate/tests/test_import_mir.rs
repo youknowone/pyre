@@ -20,9 +20,11 @@ const OBJECT_LLBC: &str = concat!(
 /// to it and carries neither call.
 #[test]
 fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    let interpreter_llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    // The tuple decl is owned by pyre-object.
+    let object_llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[llbc],
+        &[interpreter_llbc, object_llbc],
         HostStaticAddrs::default(),
         &["importing"],
         &["dunder_import_absolute_head"],
