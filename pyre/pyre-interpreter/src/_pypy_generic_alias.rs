@@ -295,9 +295,9 @@ fn ga_call(args: &[PyObjectRef]) -> crate::PyResult {
 
 /// `GenericAlias.__getattribute__` (`_pypy_generic_alias.py`).
 fn ga_getattribute(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_ = self_alias(args)?;
+    let mut self_ = self_alias(args)?;
     let name_obj = args.get(1).copied().unwrap_or_else(w_none);
-    let name = crate::baseobjspace::text_w(name_obj)?;
+    let name = pyre_object::with_roots!(self_ => crate::baseobjspace::text_w(name_obj))?;
     if !is_attr_exception(name) && !is_attr_blocked(name) {
         let origin = unsafe { w_generic_alias_get_origin(self_) };
         crate::baseobjspace::getattr_str(origin, name)
@@ -329,19 +329,19 @@ fn ga_dir(args: &[PyObjectRef]) -> crate::PyResult {
 
 /// `GenericAlias.__eq__` (`_pypy_generic_alias.py`).
 fn ga_eq(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_ = args.first().copied().unwrap_or_else(w_none);
-    let other = args.get(1).copied().unwrap_or_else(w_none);
+    let mut self_ = args.first().copied().unwrap_or_else(w_none);
+    let mut other = args.get(1).copied().unwrap_or_else(w_none);
     if !unsafe { is_generic_alias(self_) } || !unsafe { is_generic_alias(other) } {
         return Ok(w_not_implemented());
     }
     let eq = unsafe {
-        crate::baseobjspace::eq_w(
+        pyre_object::with_roots!(self_, other => crate::baseobjspace::eq_w(
             w_generic_alias_get_origin(self_),
             w_generic_alias_get_origin(other),
-        )? && crate::baseobjspace::eq_w(
+        ))? && pyre_object::with_roots!(self_, other => crate::baseobjspace::eq_w(
             w_generic_alias_get_args(self_),
             w_generic_alias_get_args(other),
-        )? && w_generic_alias_get_unpacked(self_) == w_generic_alias_get_unpacked(other)
+        ))? && w_generic_alias_get_unpacked(self_) == w_generic_alias_get_unpacked(other)
     };
     Ok(w_bool_from(eq))
 }
@@ -439,8 +439,8 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // indices rather than values — the same shape `push_newarg` uses above —
     // and `items` is read back before each element fetch.
     let _roots = pyre_object::gc_roots::push_roots();
-    let items_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(items);
+    let items_slot = pyre_object::gc_roots::pin_roots(&[items, pyre_object::PY_NULL]);
+    let subargs_slot = items_slot + 1;
     let items = || pyre_object::gc_roots::shadow_stack_get(items_slot);
     let n = unsafe { w_tuple_len(items()) };
     let mut newarg_slots: Vec<usize> = Vec::new();
@@ -465,8 +465,7 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         let do_unpack = if unsafe { pyre_object::is_none(subargs) } {
             false
         } else {
-            let subargs_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(subargs);
+            pyre_object::gc_roots::shadow_stack_set(subargs_slot, subargs);
             let ends_ellipsis = crate::baseobjspace::is_true(
                 pyre_object::gc_roots::shadow_stack_get(subargs_slot),
             )? && {
@@ -484,7 +483,9 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
             // `newargs.extend(subargs)` — any iterable, not just a tuple.
             // Publish the collected members in one go: `collect_iterable`'s own
             // scope has popped, so its Vec is untraced from here on.
-            let members = crate::builtins::collect_iterable(subargs)?;
+            let members = crate::builtins::collect_iterable(
+                pyre_object::gc_roots::shadow_stack_get(subargs_slot),
+            )?;
             let member_base = pyre_object::gc_roots::pin_roots(&members);
             for index in 0..members.len() {
                 newarg_slots.push(member_base + index);
@@ -805,11 +806,13 @@ pub(crate) fn subs_parameters(
 /// `subs_tvars(obj, params, argitems)` (`_pypy_generic_alias.py`) —
 /// substitute the parameters of a nested generic and re-subscript it.
 fn subs_tvars(
-    obj: PyObjectRef,
-    params: PyObjectRef,
-    argitems: PyObjectRef,
+    mut obj: PyObjectRef,
+    mut params: PyObjectRef,
+    mut argitems: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let subparams = match crate::baseobjspace::getattr_str(obj, "__parameters__") {
+    let subparams = match pyre_object::with_roots!(obj, params, argitems =>
+        crate::baseobjspace::getattr_str(obj, "__parameters__")
+    ) {
         Ok(sub) => sub,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(obj),
         Err(e) => return Err(e),
@@ -1412,13 +1415,14 @@ fn ga_new(args: &[PyObjectRef]) -> crate::PyResult {
             args.len().saturating_sub(1)
         )));
     }
-    let cls = args[0];
-    let generic_alias_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
+    let mut cls = args[0];
+    let mut generic_alias_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
     // `_pypy_generic_alias.py GenericAlias.__new__` allocates through
     // `super(GenericAlias, cls).__new__(cls)`, preserving a user subtype as
     // the new alias's class while retaining the GenericAlias payload layout.
     crate::typedef::check_user_subclass(generic_alias_type, cls)?;
-    let result = make_generic_alias(args[1], args[2])?;
+    let result =
+        pyre_object::with_roots!(cls, generic_alias_type => make_generic_alias(args[1], args[2]))?;
     if !std::ptr::eq(cls, generic_alias_type) {
         unsafe { (*result).w_class = cls };
         pyre_object::gc_hook::maybe_register_finalizer(result);
@@ -1619,11 +1623,13 @@ pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, 
         if n == 1 {
             crate::display::wtf8_format!("[], ", result_repr)
         } else {
-            let first = w_tuple_getitem(current_args(), 0).unwrap();
-            if is_ellipsis(first) {
+            let first_slot =
+                pyre_object::gc_roots::pin_roots(&[w_tuple_getitem(current_args(), 0).unwrap()]);
+            let first = || pyre_object::gc_roots::shadow_stack_get(first_slot);
+            if is_ellipsis(first()) {
                 crate::display::wtf8_format!("..., ", result_repr)
-            } else if n == 2 && (is_param_spec(first)? || is_typing_generic_alias(first)?) {
-                crate::display::wtf8_format!(repr_item(first)?, ", ", result_repr)
+            } else if n == 2 && (is_param_spec(first())? || is_typing_generic_alias(first())?) {
+                crate::display::wtf8_format!(repr_item(first())?, ", ", result_repr)
             } else {
                 let mut params = Vec::with_capacity(n - 1);
                 for i in 0..n - 1 {

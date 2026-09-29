@@ -409,41 +409,45 @@ mod imp {
             )));
         }
 
+        // `pos` is the gateway's native copy; the conversions below run
+        // Python and collect, so every argument is read from its slot.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let pos_base = _roots.pin_roots(pos);
         // Decode everything (and pre-allocate the argv/envp arrays) before
         // fork(): the child must not allocate before exec.
-        let args_list = collect_fsencoded_cstrings(pos[0], "args")?;
-        let exec_list = collect_cstrings(pos[1], "executable_list")?;
-        let close_fds = pyre_interpreter::baseobjspace::is_true(pos[2])?;
-        let fds_to_keep = collect_fds(pos[3])?;
-        let cwd = opt_fsencoded_cstring(pos[4], "cwd")?;
-        let env_list = if is_none_obj(pos[5]) {
+        let args_list = collect_fsencoded_cstrings(_roots.get(pos_base), "args")?;
+        let exec_list = collect_cstrings(_roots.get(pos_base + 1), "executable_list")?;
+        let close_fds = pyre_interpreter::baseobjspace::is_true(_roots.get(pos_base + 2))?;
+        let fds_to_keep = collect_fds(_roots.get(pos_base + 3))?;
+        let cwd = opt_fsencoded_cstring(_roots.get(pos_base + 4), "cwd")?;
+        let env_list = if is_none_obj(_roots.get(pos_base + 5)) {
             None
         } else {
-            Some(collect_cstrings(pos[5], "env_list")?)
+            Some(collect_cstrings(_roots.get(pos_base + 5), "env_list")?)
         };
-        let p2cread = fd_arg(pos[6]);
-        let p2cwrite = fd_arg(pos[7]);
-        let c2pread = fd_arg(pos[8]);
-        let c2pwrite = fd_arg(pos[9]);
-        let errread = fd_arg(pos[10]);
-        let errwrite = fd_arg(pos[11]);
-        let errpipe_read = fd_arg(pos[12]);
-        let errpipe_write = fd_arg(pos[13]);
-        let restore_signals = pyre_interpreter::baseobjspace::is_true(pos[14])?;
-        let call_setsid = pyre_interpreter::baseobjspace::is_true(pos[15])?;
-        let pgid_to_set = (unsafe { w_int_get_value(pos[16]) }) as libc::pid_t;
-        let gid = opt_id(pos[17], "gid")?;
-        let extra_groups = if is_none_obj(pos[18]) {
+        let p2cread = fd_arg(_roots.get(pos_base + 6));
+        let p2cwrite = fd_arg(_roots.get(pos_base + 7));
+        let c2pread = fd_arg(_roots.get(pos_base + 8));
+        let c2pwrite = fd_arg(_roots.get(pos_base + 9));
+        let errread = fd_arg(_roots.get(pos_base + 10));
+        let errwrite = fd_arg(_roots.get(pos_base + 11));
+        let errpipe_read = fd_arg(_roots.get(pos_base + 12));
+        let errpipe_write = fd_arg(_roots.get(pos_base + 13));
+        let restore_signals = pyre_interpreter::baseobjspace::is_true(_roots.get(pos_base + 14))?;
+        let call_setsid = pyre_interpreter::baseobjspace::is_true(_roots.get(pos_base + 15))?;
+        let pgid_to_set = (unsafe { w_int_get_value(_roots.get(pos_base + 16)) }) as libc::pid_t;
+        let gid = opt_id(_roots.get(pos_base + 17), "gid")?;
+        let extra_groups = if is_none_obj(_roots.get(pos_base + 18)) {
             None
         } else {
-            Some(collect_gids(pos[18])?)
+            Some(collect_gids(_roots.get(pos_base + 18))?)
         };
-        let uid = opt_id(pos[19], "uid")?;
-        let child_umask = (unsafe { w_int_get_value(pos[20]) }) as i32;
-        let preexec_fn = if is_none_obj(pos[21]) {
+        let uid = opt_id(_roots.get(pos_base + 19), "uid")?;
+        let child_umask = (unsafe { w_int_get_value(_roots.get(pos_base + 20)) }) as i32;
+        let preexec_fn = if is_none_obj(_roots.get(pos_base + 21)) {
             None
         } else {
-            Some(pos[21])
+            Some(_roots.get(pos_base + 21))
         };
 
         let argv = args_list.iter().collect::<CharPtrVec<'_>>();

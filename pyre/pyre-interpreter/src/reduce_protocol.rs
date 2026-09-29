@@ -116,8 +116,9 @@ fn typename(w_obj: PyObjectRef) -> String {
 }
 
 /// objectobject.py `get_slotvalues(obj)` — app-level handle.
-pub fn get_slotvalues(w_obj: PyObjectRef) -> PyResult {
-    crate::call::call_function_impl_result(handle(GET_SLOTVALUES)?, &[w_obj])
+pub fn get_slotvalues(mut w_obj: PyObjectRef) -> PyResult {
+    let w_func = pyre_object::with_roots!(w_obj => handle(GET_SLOTVALUES))?;
+    crate::call::call_function_impl_result(w_func, &[w_obj])
 }
 
 /// objectobject.py `object_getstate_default(space, w_obj, required)`.

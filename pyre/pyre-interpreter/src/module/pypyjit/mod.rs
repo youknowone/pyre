@@ -22,7 +22,7 @@
 fn set_param(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    let (pos, kwds) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    let (pos, mut kwds) = pyre_interpreter::builtins::split_builtin_kwargs(args);
 
     // interp_jit.py:147-148 — at most one non-keyword argument.
     if pos.len() > 1 {
@@ -34,7 +34,13 @@ fn set_param(
 
     // interp_jit.py:151-156 — positional string → set_user_param(None, text).
     if let Some(&text_obj) = pos.first() {
-        let text = pyre_interpreter::baseobjspace::text_w(text_obj)?;
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[kwds.unwrap_or(pyre_object::PY_NULL)]);
+        let text = pyre_interpreter::baseobjspace::text_w(text_obj);
+        let w = roots.get(base);
+        kwds = if w.is_null() { None } else { Some(w) };
+        drop(roots);
+        let text = text?;
         if pyre_interpreter::call::set_jit_param_string(text).is_err() {
             return Err(pyre_interpreter::PyError::new(
                 pyre_interpreter::PyErrorKind::ValueError,

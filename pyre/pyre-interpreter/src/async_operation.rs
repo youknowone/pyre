@@ -140,7 +140,10 @@ pub fn builtin_aiter(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     crate::gateway::check_declared_arity("aiter", 1, positional.len())?;
-    crate::call::call_function_impl_result(handle(AITER)?, positional)
+    // `positional` is the gateway's native copy; `handle` may allocate.
+    let mut w_obj = positional[0];
+    let w_aiter = pyre_object::with_roots!(w_obj => handle(AITER))?;
+    crate::call::call_function_impl_result(w_aiter, &[w_obj])
 }
 
 /// `anext(iterator[, default])` — delegates to the app-level `anext` after
@@ -165,5 +168,10 @@ pub fn builtin_anext(args: &[PyObjectRef]) -> PyResult {
             positional.len()
         )));
     }
-    crate::call::call_function_impl_result(handle(ANEXT)?, positional)
+    // `positional` is the gateway's native copy; `handle` may allocate.
+    let mut w_iterator = positional[0];
+    let mut w_default = positional.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let w_anext = pyre_object::with_roots!(w_iterator, w_default => handle(ANEXT))?;
+    let live = [w_iterator, w_default];
+    crate::call::call_function_impl_result(w_anext, &live[..positional.len()])
 }

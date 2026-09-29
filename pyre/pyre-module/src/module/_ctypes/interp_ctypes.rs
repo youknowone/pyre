@@ -27,7 +27,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
 // ──────────────────────────────────────────────────────────────────────
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
+fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
     use rustpython_host_env::ctypes as host_ctypes;
 
     // ── dlopen flags ──
@@ -93,11 +93,13 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     "dlopen() missing library name",
                 ));
             }
+            let w_name = args[0];
+            let mut w_mode = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
             let name = unsafe {
-                if pyre_object::is_none(args[0]) {
+                if pyre_object::is_none(w_name) {
                     // dlopen(None) → process handle
                     let load_flags = if args.len() >= 2 {
-                        Some(pyre_interpreter::baseobjspace::int_w(args[1])? as libc::c_int)
+                        Some(pyre_interpreter::baseobjspace::int_w(w_mode)? as libc::c_int)
                     } else {
                         None
                     };
@@ -111,14 +113,14 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 // A library name is a path, so it reaches `dlopen` in the
                 // filesystem's own units: a byte with no UTF-8 spelling names
                 // a real file and must not be replaced with U+FFFD.
-                if pyre_object::is_bytes(args[0]) {
+                if pyre_object::is_bytes(w_name) {
                     pyre_interpreter::gateway::os_string_from_fs_bytes(
-                        pyre_object::bytesobject::w_bytes_data(args[0]),
+                        pyre_object::bytesobject::w_bytes_data(w_name),
                     )
-                } else if pyre_object::is_str(args[0]) {
-                    pyre_interpreter::gateway::os_string_from_fs_bytes(
-                        &pyre_interpreter::gateway::fsencode(args[0])?,
-                    )
+                } else if pyre_object::is_str(w_name) {
+                    pyre_interpreter::gateway::os_string_from_fs_bytes(&pyre_object::with_roots!(
+                        w_mode => pyre_interpreter::gateway::fsencode(w_name)
+                    )?)
                 } else {
                     return Err(pyre_interpreter::PyError::type_error(
                         "dlopen: name must be a string, bytes or None",
@@ -126,7 +128,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 }
             };
             let load_flags = if args.len() >= 2 {
-                Some(pyre_interpreter::baseobjspace::int_w(args[1])? as i32)
+                Some(pyre_interpreter::baseobjspace::int_w(w_mode)? as i32)
             } else {
                 None
             };
@@ -155,14 +157,18 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                         "dlsym() needs 2 arguments",
                     ));
                 }
-                let h = pyre_interpreter::baseobjspace::int_w(args[0])? as usize;
+                let w_handle = args[0];
+                let mut w_name = args[1];
+                let h = pyre_object::with_roots!(w_name =>
+                    pyre_interpreter::baseobjspace::int_w(w_handle)
+                )? as usize;
                 let name = unsafe {
-                    if !pyre_object::is_str(args[1]) {
+                    if !pyre_object::is_str(w_name) {
                         return Err(pyre_interpreter::PyError::type_error(
                             "dlsym: name must be a string",
                         ));
                     }
-                    pyre_interpreter::baseobjspace::str_utf8_w(args[1])?.to_string()
+                    pyre_interpreter::baseobjspace::str_utf8_w(w_name)?.to_string()
                 };
                 let addr = lookup_symbol(h, name.as_bytes()).map_err(|e| {
                     use rustpython_host_env::ctypes::LookupSymbolError as L;
@@ -289,9 +295,13 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     "string_at() needs ptr",
                 ));
             }
-            let ptr = pyre_interpreter::baseobjspace::int_w(args[0])? as usize;
+            let w_ptr = args[0];
+            let mut w_size = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            let ptr = pyre_object::with_roots!(w_size =>
+                pyre_interpreter::baseobjspace::int_w(w_ptr)
+            )? as usize;
             let size = if args.len() >= 2 {
-                pyre_interpreter::baseobjspace::int_w(args[1])?
+                pyre_interpreter::baseobjspace::int_w(w_size)?
             } else {
                 -1
             };
@@ -397,11 +407,11 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     // ── ArgumentError — a real Exception subclass ──
     let w_exception = pyre_interpreter::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _ctypes init");
-    let argument_error = pyre_interpreter::builtins::new_exception_class(
+    let argument_error = pyre_object::with_roots!(ns => pyre_interpreter::builtins::new_exception_class(
         "ArgumentError",
         pyre_interpreter::builtins::exc_exception_new,
         w_exception,
-    );
+    ));
     // Both CPython's module exception and PyPy's app-level ArgumentError are
     // mutable heap classes, unlike the immutable native `_ctypes` types.
     let argument_error = super::finish_cpython_type(argument_error, "ctypes", false);
@@ -942,7 +952,7 @@ fn ctypes_byref(
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     use super::cdata;
     use rustpython_host_env::ctypes as host_ctypes;
-    let obj = *args
+    let mut obj = *args
         .first()
         .ok_or_else(|| pyre_interpreter::PyError::type_error("byref() missing argument"))?;
     if !cdata::is_cdata_instance(obj) {
@@ -951,11 +961,11 @@ fn ctypes_byref(
         ));
     }
     let offset = if args.len() >= 2 {
-        pyre_interpreter::baseobjspace::int_w(args[1])? as isize
+        pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::int_w(args[1]))? as isize
     } else {
         0
     };
-    let base = cdata::cdata_addr(obj)
+    let base = pyre_object::with_roots!(obj => cdata::cdata_addr(obj))
         .ok_or_else(|| pyre_interpreter::PyError::type_error("instance has no buffer"))?;
     let addr = host_ctypes::offset_address(base, offset);
     Ok(make_carg(addr, obj))
@@ -972,13 +982,13 @@ fn ctypes_resize(
             "resize() needs (obj, size)",
         ));
     }
-    let obj = args[0];
+    let mut obj = args[0];
     if !cdata::is_cdata_instance(obj) {
         return Err(pyre_interpreter::PyError::type_error(
             "excepted ctypes instance",
         ));
     }
-    if !cdata::owns_buffer(obj) {
+    if !pyre_object::with_roots!(obj => cdata::owns_buffer(obj)) {
         return Err(pyre_interpreter::PyError::value_error(
             "Memory cannot be resized because this object doesn't own it",
         ));
@@ -986,7 +996,8 @@ fn ctypes_resize(
     // The floor is the type's natural size, not the current buffer length, so a
     // previously enlarged object can be shrunk back down to it.  A negative
     // request would wrap to a huge `usize`, so reject the signed value first.
-    let requested = pyre_interpreter::baseobjspace::int_w(args[1])?;
+    let requested =
+        pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::int_w(args[1]))?;
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let min = stginfo::stginfo_of(cls)
         .map(stginfo::stginfo_size)
@@ -1041,9 +1052,13 @@ pub(super) fn carg_type() -> pyre_object::PyObjectRef {
 }
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-pub(super) fn make_carg(addr: usize, obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
-    let carg = pyre_object::w_instance_new(carg_type());
-    let d = pyre_interpreter::baseobjspace::getdict_native(carg);
+pub(super) fn make_carg(
+    addr: usize,
+    mut obj: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    let mut carg = pyre_object::w_instance_new(carg_type());
+    let d =
+        pyre_object::with_roots!(carg, obj => pyre_interpreter::baseobjspace::getdict_native(carg));
     if !d.is_null() {
         // The instance dictionary moves under a minor collection and both
         // stores allocate — the address value, the key string each store

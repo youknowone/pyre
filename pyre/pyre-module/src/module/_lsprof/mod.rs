@@ -752,7 +752,8 @@ mod profiler_methods {
                     Ok(Some(pyre_interpreter::baseobjspace::is_true(w)?))
                 }
             };
-            let subcalls = flag(w_subcalls)?;
+            let mut w_builtins = w_builtins;
+            let subcalls = pyre_object::with_roots!(w_builtins => flag(w_subcalls))?;
             let builtins = flag(w_builtins)?;
             // The tool id is claimed before any of the profiler's own state is
             // touched, so a second profiler's `enable` reports the conflict and

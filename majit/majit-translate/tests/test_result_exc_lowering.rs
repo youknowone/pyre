@@ -177,7 +177,6 @@ fn a_tail_forwarding_wrapper_retypes_its_calls_to_the_payload() {
 #[test]
 fn a_rewrapped_call_site_retypes_its_call_to_the_payload() {
     for name in [
-        "pyre_interpreter::baseobjspace::_check_len_result",
         "pyre_interpreter::baseobjspace::getindex_w_index",
         "pyre_interpreter::baseobjspace::index_int_w_preserve_negative",
     ] {

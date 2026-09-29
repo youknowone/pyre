@@ -93,7 +93,7 @@ fn collect_and_run_finalizers(ec_ptr: *const crate::executioncontext::PyExecutio
 /// The point is not that these values are cheap to collect — it is that the
 /// collection cannot reach a different answer, so every `__del__` still runs at
 /// exactly the same place in the loop.
-fn release_frees_nothing(value: pyre_object::PyObjectRef) -> bool {
+fn release_frees_nothing(mut value: pyre_object::PyObjectRef) -> bool {
     if value.is_null() {
         return true;
     }
@@ -121,7 +121,8 @@ fn release_frees_nothing(value: pyre_object::PyObjectRef) -> bool {
             let Ok(name) = pyre_object::w_str_get_wtf8(w_name).as_str() else {
                 return false;
             };
-            return crate::importing::get_sys_module(name).is_some_and(|m| m == value);
+            return pyre_object::with_roots!(value => crate::importing::get_sys_module(name))
+                .is_some_and(|m| m == value);
         }
     }
     false
@@ -157,8 +158,8 @@ fn release_frees_nothing(value: pyre_object::PyObjectRef) -> bool {
 /// 0.09s total, and `test.test_inspect` pays it four times over in
 /// subprocesses. PyPy itself neither clears `__main__` nor collects here
 /// (`baseobjspace.py finish`), so nothing upstream prices that case higher.
-fn release_delivers_no_finalizer(value: pyre_object::PyObjectRef) -> bool {
-    release_frees_nothing(value)
+fn release_delivers_no_finalizer(mut value: pyre_object::PyObjectRef) -> bool {
+    pyre_object::with_roots!(value => release_frees_nothing(value))
         || !majit_gc::gc_has_pending_finalizers()
         || !majit_gc::gc_object_finalizer_pending(value as usize)
 }
@@ -408,11 +409,11 @@ fn finalize_delete_special() {
 /// `finalize_modules` phase that follows detaches `sys.modules` and clears the
 /// remaining module dictionaries newest-first.
 pub fn finalize_runtime(
-    canonical: pyre_object::PyObjectRef,
+    mut canonical: pyre_object::PyObjectRef,
     ec_ptr: *const crate::executioncontext::PyExecutionContext,
 ) {
-    run_threading_shutdown();
-    run_atexit_callbacks(canonical, ec_ptr);
+    pyre_object::with_roots!(canonical => run_threading_shutdown());
+    pyre_object::with_roots!(canonical => run_atexit_callbacks(canonical, ec_ptr));
     // PyPy sets `sys.finalizing` only after atexit callbacks.  Those callbacks
     // may still start threads; reject new starts only when module/finalizer
     // teardown is actually about to begin.
@@ -426,12 +427,13 @@ pub fn finalize_runtime(
     // alive.  The per-global teardown below reaches only the ones `__main__`
     // itself holds, so without this a stream owned by any other module loses
     // its buffered writes.
-    crate::module::_io::flush_all_streams();
+    pyre_object::with_roots!(canonical => crate::module::_io::flush_all_streams());
     // `finalize_modules` opens with this and every release below is its module
     // teardown, so the clearing has to precede the whole walk rather than sit
     // beside `clear_shutdown_modules`.
     finalize_delete_special();
-    let mut swept_something_finalizable = collect_and_run_finalizers(ec_ptr);
+    let mut swept_something_finalizable =
+        pyre_object::with_roots!(canonical => collect_and_run_finalizers(ec_ptr));
     let (mut released, mut swept) = (0usize, 0usize);
     let mut entries = unsafe { pyre_object::w_dict_str_entries(canonical) };
     entries.reverse();
@@ -451,7 +453,8 @@ pub fn finalize_runtime(
             continue;
         }
         swept += 1;
-        swept_something_finalizable = collect_and_run_finalizers(ec_ptr);
+        swept_something_finalizable =
+            pyre_object::with_roots!(canonical => collect_and_run_finalizers(ec_ptr));
     }
     teardown_census(released, swept);
     // Close the loop on a swept heap and a drained queue. A release the loop

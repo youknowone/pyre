@@ -1141,15 +1141,18 @@ mod rlock_class {
     #[crate::pyre_methods(weakrefable)]
     impl W_RLock {
         #[staticmethod]
-        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        fn __new__(
+            mut cls: PyObjectRef,
+            args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, crate::PyError> {
             if args.len() > 1 && cls == type_object() {
                 // CPython 3.14 keeps accepting arguments to the exact native
                 // RLock for compatibility, but deprecates them.  PyPy's
                 // W_RLock allocator likewise ignores construction arguments;
                 // subclasses remain free to consume them in their own __init__.
-                crate::warn::warn_deprecation(
+                pyre_object::with_roots!(cls => crate::warn::warn_deprecation(
                     "Passing arguments to _thread.RLock() is deprecated",
-                )?;
+                ))?;
             }
             crate::typedef::check_user_subclass(type_object(), cls)?;
             let obj = Self::allocate_stable(Self::default());
@@ -1800,8 +1803,11 @@ mod local_class {
                 (*this).last_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
             }
             pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
-            drop(roots);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let obj = pyre_object::gc_roots::pin_root(obj);
             register_local_in_current_ec(obj);
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            drop(roots);
             Ok(obj)
         }
 
@@ -2239,8 +2245,9 @@ fn spawn_thread(
                 // ignored-exception traceback for it would report a normal
                 // exit as a fault.
                 let ends_the_thread = crate::builtins::lookup_exc_class("SystemExit").is_some_and(
-                    |system_exit| unsafe {
-                        crate::baseobjspace::isinstance_w(error.to_exc_object(), system_exit)
+                    |mut system_exit| unsafe {
+                        let w_exc = pyre_object::with_roots!(system_exit => error.to_exc_object());
+                        crate::baseobjspace::isinstance_w(w_exc, system_exit)
                     },
                 );
                 if !ends_the_thread {
@@ -2357,7 +2364,7 @@ fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         ));
     }
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let callable = pos
+    let mut callable = pos
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("missing function argument"))?;
@@ -2366,7 +2373,7 @@ fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     }
     let requested = crate::builtins::kwarg_get(kwargs, "handle");
     let daemon = match crate::builtins::kwarg_get(kwargs, "daemon") {
-        Some(value) => crate::baseobjspace::is_true(value)?,
+        Some(value) => pyre_object::with_roots!(callable => crate::baseobjspace::is_true(value))?,
         None => false,
     };
     let handle = match requested {

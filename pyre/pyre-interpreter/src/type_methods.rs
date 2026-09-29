@@ -591,8 +591,8 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// scan of `list((i, 3, 1))` does not inherit `args.first` / `format!`
 /// from `require_list_receiver`.
 pub(crate) fn list_extend_items(
-    list: PyObjectRef,
-    other: PyObjectRef,
+    mut list: PyObjectRef,
+    mut other: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     // listobject.py extend only takes the storage-copy path when a
     // list/tuple uses its inherited iterator.  An overridden subclass
@@ -612,7 +612,7 @@ pub(crate) fn list_extend_items(
         // `keys`, and `list(f_locals)` does not re-enter the interpreter.
         // `false` means the proxy had no key list; drain it as a generic
         // iterable.
-        if !extend_from_frame_locals_proxy(list, other) {
+        if !pyre_object::with_roots!(list, other => extend_from_frame_locals_proxy(list, other)) {
             extend_from_iterable(list, other)?;
         }
     } else {
@@ -855,7 +855,9 @@ pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // it after `__index__` has run are pre-move addresses.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
-    let index = unsafe { crate::baseobjspace::getindex_w_index(args[1])? };
+    let index = unsafe {
+        crate::baseobjspace::getindex_w_index(pyre_object::gc_roots::shadow_stack_get(base + 1))?
+    };
     unsafe {
         pyre_object::listobject::w_list_insert(
             pyre_object::gc_roots::shadow_stack_get(base),
@@ -881,7 +883,11 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     let index = if args.len() > 1 {
-        unsafe { crate::baseobjspace::getindex_w_index(args[1])? }
+        unsafe {
+            crate::baseobjspace::getindex_w_index(pyre_object::gc_roots::shadow_stack_get(
+                base + 1,
+            ))?
+        }
     } else {
         -1
     };
@@ -925,9 +931,11 @@ pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "copy", true)?;
     arity_no_args(args, "copy")?;
-    let list = args[0];
+    let mut list = args[0];
     unsafe {
-        if let Some(clone) = pyre_object::listobject::w_list_clone_if_shared_strategy(list) {
+        if let Some(clone) = pyre_object::with_roots!(list =>
+            pyre_object::listobject::w_list_clone_if_shared_strategy(list)
+        ) {
             return Ok(clone);
         }
         let n = w_list_len(list);
@@ -2455,7 +2463,7 @@ fn format_render(
             // into its own roots) and read `val` back once it returns.
             let inner = pyre_object::gc_roots::push_roots();
             let val_slot = inner.base();
-            let mut val = inner.pin_root(val);
+            let _ = inner.pin_root(val);
             let reloaded: Vec<PyObjectRef> = (0..positional.len())
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
                 .collect();
@@ -3956,7 +3964,7 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     ))
 }
 
-fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
+fn format_with_spec(mut val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     use rustpython_common::format::FormatSpec;
     unsafe {
         // `int` / `bool` / `long` share the integer formatter.  The `c`
@@ -4025,7 +4033,9 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
             }
             return format_finite_float(v, spec);
         }
-        if let Some((re, im)) = crate::objspace::descroperation::complex_val(val) {
+        if let Some((re, im)) =
+            pyre_object::with_roots!(val => crate::objspace::descroperation::complex_val(val))
+        {
             let p = parse_spec(spec)?;
             validate_python314_spec_shape(&p, spec, "complex", '\0')?;
             FormatSpec::parse(&p.engine_spec)
@@ -4142,7 +4152,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
         // Reached only for the rare builtin type whose `__format__` is the
         // inherited default yet still routes here with a non-empty spec;
         // format its `str()` through the shared string formatter.
-        let full = unsafe { crate::display::py_str_wtf8(val)? };
+        let full = pyre_object::with_roots!(val => unsafe { crate::display::py_str_wtf8(val) })?;
         if let Ok(s) = full.as_str() {
             let parsed = FormatSpec::parse(spec)
                 .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
@@ -4595,8 +4605,10 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             }
             Ok(p.or(kw))
         };
-    let encoding = str_arg(dual("encoding", pos.get(1).map(|_| reload(1)))?, "utf-8")?;
-    let errors = str_arg(dual("errors", pos.get(2).map(|_| reload(2)))?, "strict")?;
+    let w_encoding = if pos.len() > 1 { Some(reload(1)) } else { None };
+    let w_errors = if pos.len() > 2 { Some(reload(2)) } else { None };
+    let encoding = str_arg(dual("encoding", w_encoding)?, "utf-8")?;
+    let errors = str_arg(dual("errors", w_errors)?, "strict")?;
     Ok(pyre_object::w_bytes_from_bytes(&encode_object(
         reload(0),
         &encoding,
@@ -4611,7 +4623,7 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// handlers.  The whole path reads the surrogate-aware WTF-8 view, so a
 /// lone surrogate is routed to the error handler rather than crashing.
 pub fn encode_object(
-    w_object: PyObjectRef,
+    mut w_object: PyObjectRef,
     encoding: &str,
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
@@ -4649,7 +4661,9 @@ pub fn encode_object(
                 | "utf-32-be"
         )
     {
-        crate::module::_codecs::validate_error_handler(errors)?;
+        pyre_object::with_roots!(w_object =>
+            crate::module::_codecs::validate_error_handler(errors)
+        )?;
     }
     // Name the encoder before reading the string.  `encode_text` hands
     // `w_object` to the registry untouched, so a name the built-ins do not
@@ -5062,23 +5076,27 @@ pub enum EncodeReplacement {
 pub fn call_registered_encode_error_handler(
     err_mode: &str,
     codec: &str,
-    source: PyObjectRef,
+    mut source: PyObjectRef,
     char_len: usize,
     start: usize,
     end: usize,
     reason: &str,
     owner: EncodeErrorOwner,
 ) -> Result<(EncodeReplacement, usize), crate::PyError> {
-    let w_handler = crate::module::_codecs::lookup_registered_error(err_mode).ok_or_else(|| {
+    let mut w_handler = pyre_object::with_roots!(source =>
+        crate::module::_codecs::lookup_registered_error(err_mode)
+    )
+    .ok_or_else(|| {
         crate::PyError::new(
             crate::PyErrorKind::LookupError,
             format!("unknown error handler name '{err_mode}'"),
         )
     })?;
 
-    let w_exc =
+    let mut w_err = pyre_object::with_roots!(w_handler =>
         crate::typedef::unicode_encode_error(codec, source, start as i64, end as i64, reason)
-            .to_exc_object();
+    );
+    let w_exc = pyre_object::with_roots!(w_handler => w_err.to_exc_object());
     let w_res = crate::baseobjspace::call_function(w_handler, &[w_exc]);
     if w_res.is_null() {
         return Err(crate::call::take_call_error()
@@ -5439,8 +5457,12 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // `&str` views across that allocation.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
+    let mut w_args = Vec::with_capacity(args.len());
+    for i in 0..args.len() {
+        w_args.push(pyre_object::gc_roots::shadow_stack_get(base + i));
+    }
     let Some((byte_start, byte_end)) =
-        wtf8_idx_window(pyre_object::gc_roots::shadow_stack_get(base), args)?
+        wtf8_idx_window(pyre_object::gc_roots::shadow_stack_get(base), &w_args)?
     else {
         return Ok(w_int_new(0));
     };
@@ -5546,22 +5568,37 @@ fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::
     if args.len() <= 2 {
         return Ok(CodePoint::from_char(' '));
     }
+    let mut w_fill = args[2];
     let decoded;
-    let raw = if unsafe { pyre_object::is_str(args[2]) } {
-        unsafe { w_str_get_wtf8(args[2]) }
+    let raw = if unsafe { pyre_object::is_str(w_fill) } {
+        unsafe { w_str_get_wtf8(w_fill) }
     } else {
-        let type_name = arg_type_name(args[2]);
+        let type_name = arg_type_name(w_fill);
         if method == "center" {
             return Err(crate::PyError::type_error(format!(
                 "expected str, got {type_name} object"
             )));
-        } else if unsafe { pyre_object::is_bytes(args[2]) } {
+        } else if unsafe { pyre_object::is_bytes(w_fill) } {
             return Err(crate::PyError::type_error(format!(
                 "Can't convert '{type_name}' object to str implicitly"
             )));
         } else {
-            let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(args[2])? else {
-                let operand = if unsafe { pyre_object::is_none(args[2]) } {
+            // Decoded and released inside the bracket rooting `w_fill`, which
+            // the export's own bracket must not outlive.
+            let result = pyre_object::with_roots!(w_fill =>
+            crate::baseobjspace::simple_buffer_bytes(w_fill).map(|buffer| {
+                buffer.map(|buffer| {
+                    let result = crate::typedef::decode_bytes_to_wtf8(
+                        buffer.as_bytes(),
+                        "utf-8",
+                        "strict",
+                    );
+                    buffer.release();
+                    result
+                })
+            }))?;
+            let Some(result) = result else {
+                let operand = if unsafe { pyre_object::is_none(w_fill) } {
                     "None".to_string()
                 } else {
                     format!("'{type_name}'")
@@ -5570,8 +5607,6 @@ fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::
                     "decoding to str: a bytes-like object is required, not {operand}"
                 )));
             };
-            let result = crate::typedef::decode_bytes_to_wtf8(buffer.as_bytes(), "utf-8", "strict");
-            buffer.release();
             decoded = result?;
             decoded.as_ref()
         }
@@ -6409,12 +6444,14 @@ fn dict_lookup_checked(
 
 pub(crate) fn dict_store_checked(
     dict: PyObjectRef,
-    key: PyObjectRef,
+    mut key: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     unsafe {
-        pyre_object::dictmultiobject::w_dict_store_checked(dict, key, value)
-            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
+        pyre_object::with_roots!(key =>
+            pyre_object::dictmultiobject::w_dict_store_checked(dict, key, value)
+        )
+        .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
     }
 }
 
@@ -6996,6 +7033,8 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
     unsafe {
         let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         let dict = pyre_object::interp_exceptions::w_exception_getdict(exc);
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let dict = _roots.pin_root(dict);
         let notes = match w_dict_getitem_str(dict, "__notes__") {
             Some(notes) if crate::baseobjspace::isinstance_list_w(notes) => notes,
             Some(_) => {
@@ -7003,7 +7042,11 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
             }
             None => {
                 let notes = w_list_new(Vec::new());
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(dict, "__notes__", notes);
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                    "__notes__",
+                    notes,
+                );
                 notes
             }
         };
@@ -7030,10 +7073,7 @@ pub fn dict_init_or_update(
     // Keep the flat Rust ABI's equivalent slots live before inspecting the
     // trailing kwargs vehicle or passing an operand to `update1`.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    for &arg in args {
-        let _ = pyre_object::gc_roots::pin_root(arg);
-    }
+    let root_base = pyre_object::gc_roots::pin_roots(args);
     let rooted_args = (0..args.len())
         .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + i))
         .collect::<Vec<_>>();
@@ -7059,16 +7099,28 @@ pub fn dict_init_or_update(
         // slotted-dict-subclass support needs intrinsic dict backing.
         return Ok(w_none());
     }
+    let backing_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(backing);
     if kwargs_dict.is_some() {
         let kwargs = pyre_object::gc_roots::shadow_stack_get(root_base + args.len() - 1);
         unsafe {
-            for (k, v) in pyre_object::w_dict_items(kwargs) {
+            // Every pair stays rooted while an earlier store runs a key's
+            // `__hash__` / `__eq__`.
+            let items = pyre_object::w_dict_items(kwargs);
+            let flat: Vec<PyObjectRef> = items.iter().flat_map(|&(k, v)| [k, v]).collect();
+            let items_base = pyre_object::gc_roots::pin_roots(&flat);
+            for i in 0..items.len() {
+                let k = pyre_object::gc_roots::shadow_stack_get(items_base + 2 * i);
                 if pyre_object::is_str(k)
                     && pyre_object::w_str_get_wtf8(k).as_str() == Ok("__pyre_kw__")
                 {
                     continue;
                 }
-                dict_store_checked(backing, k, v)?;
+                dict_store_checked(
+                    pyre_object::gc_roots::shadow_stack_get(backing_slot),
+                    k,
+                    pyre_object::gc_roots::shadow_stack_get(items_base + 2 * i + 1),
+                )?;
             }
         }
     }

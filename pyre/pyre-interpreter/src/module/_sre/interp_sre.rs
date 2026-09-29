@@ -2440,10 +2440,13 @@ pub(crate) fn sre_pattern_repr_str(
     pat: PyObjectRef,
 ) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     let pp = pat as *const W_SRE_Pattern;
-    let w_pattern = unsafe { (*pp).w_pattern };
-    let u = truncate_code_points(unsafe { crate::display::py_repr_wtf8(w_pattern) }?, 200);
-
+    let mut w_pattern = unsafe { (*pp).w_pattern };
     let mut flags = unsafe { (*pp).flags };
+    let u = truncate_code_points(
+        pyre_object::with_roots!(w_pattern => unsafe { crate::display::py_repr_wtf8(w_pattern) })?,
+        200,
+    );
+
     let is_known_unicode = unsafe { is_str(w_pattern) };
     if is_known_unicode
         && (flags & (SRE_FLAG_LOCALE | SRE_FLAG_UNICODE | SRE_FLAG_ASCII)) == SRE_FLAG_UNICODE

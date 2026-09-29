@@ -254,7 +254,7 @@ fn c_locale_conv() -> LocaleConvData {
 /// This mirrors the `except ImportError` fallback in the stdlib's
 /// `locale` module, but routed through pyre's builtin-module registry
 /// so a single import succeeds.
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     // Locale category constants sourced from libc so the values match
     // the host (Linux: LC_CTYPE=0; macOS: LC_ALL=0, LC_CTYPE=2; ...).
     // Windows has a C runtime too, and its numbering is a third one again
@@ -404,11 +404,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `interp_locale.py W_Error = _new_exception('Error', W_Exception, 'locale error')`
     let exception_base = crate::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _locale init");
-    let w_error = crate::builtins::new_exception_class(
+    let w_error = pyre_object::with_roots!(ns => crate::builtins::new_exception_class(
         "locale.Error",
         crate::builtins::exc_exception_new,
         exception_base,
-    );
+    ));
     crate::module_ns_store(ns, "Error", w_error);
 
     // `_localemodule.c:_locale._getdefaultlocale` — this compatibility hook
@@ -529,6 +529,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     "setlocale: category must be an integer",
                 ));
             }
+            // `args` is the gateway's native copy; `str_utf8_w` can collect.
+            let mut w_category = args[0];
             let locale_str: Option<String> =
                 if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
                     if !unsafe { pyre_object::is_str(args[1]) } {
@@ -536,13 +538,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             "setlocale: locale must be a string or None",
                         ));
                     }
-                    Some(crate::baseobjspace::str_utf8_w(args[1])?.to_string())
+                    let text = pyre_object::with_roots!(
+                        w_category => crate::baseobjspace::str_utf8_w(args[1])
+                    )?;
+                    Some(text.to_string())
                 } else {
                     None
                 };
             #[cfg(all(any(unix, windows), feature = "host_env"))]
             {
-                let cat = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let cat = (unsafe { pyre_object::w_int_get_value(w_category) }) as i32;
                 // The MSVC runtime reports a category outside its own
                 // `LC_MIN..=LC_MAX` through the invalid parameter handler,
                 // whose default action ends the process before `setlocale`
@@ -578,7 +583,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             {
                 // No libc available — every valid call resolves to the
                 // POSIX "C" locale.  `locale_str` is dropped on purpose.
-                let _ = locale_str;
+                let _ = (locale_str, w_category);
                 Ok(pyre_object::w_str_new_managed("C"))
             }
         }),
@@ -659,8 +664,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         "strcoll: arguments must be strings",
                     ));
                 }
-                let c1 = collation_arg(args[0])?;
-                let c2 = collation_arg(args[1])?;
+                // `args` is the gateway's native copy; `collation_arg` can
+                // collect.
+                let mut w_s2 = args[1];
+                let c1 = pyre_object::with_roots!(w_s2 => collation_arg(args[0]))?;
+                let c2 = collation_arg(w_s2)?;
                 #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
                 {
                     #[cfg(windows)]

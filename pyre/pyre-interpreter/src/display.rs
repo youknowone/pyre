@@ -877,8 +877,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         // a static type, so it survives the moves the object itself makes.
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(obj);
-        let mut obj = obj;
+        let mut obj = pyre_object::gc_roots::pin_root(obj);
         // The formatting below is keyed on the payload layout, which a
         // `_getusercls` class shares with the builtin it was made from.
         let tp = pyre_object::pyobject::layout_base((*obj).ob_type);
@@ -1388,7 +1387,7 @@ pub use wtf8_format;
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
+pub unsafe fn py_str_wtf8(mut obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         // `str` of a tagged `int` immediate is its decimal value; format
         // it before `ob_type` deref. Gated on
@@ -1413,16 +1412,20 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
         let tp = pyre_object::pyobject::layout_base((*obj).ob_type);
         // For strings, return the value directly (no quotes).
         if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
-            if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__str__")? {
+            if let Some(r) =
+                pyre_object::with_roots!(obj => builtin_subclass_dunder_obj(obj, tp, "__str__"))?
+            {
                 return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
             }
             return Ok(pyre_object::w_str_get_wtf8(obj).to_wtf8_buf());
         }
         if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
-            if let Some(w) = try_call_dunder_wtf8(obj, "__str__")? {
+            if let Some(w) = pyre_object::with_roots!(obj => try_call_dunder_wtf8(obj, "__str__"))?
+            {
                 return Ok(w);
             }
-            if let Some(w) = try_call_dunder_wtf8(obj, "__repr__")? {
+            if let Some(w) = pyre_object::with_roots!(obj => try_call_dunder_wtf8(obj, "__repr__"))?
+            {
                 return Ok(w);
             }
         }
@@ -1453,7 +1456,9 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
         // override or builtin formatting from `py_repr`).  `str` itself
         // has its own `tp_str` and is handled by the `STR_TYPE` branch
         // above, so this fallthrough never reaches a bare-`str` subclass.
-        if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__str__")? {
+        if let Some(r) =
+            pyre_object::with_roots!(obj => builtin_subclass_dunder_obj(obj, tp, "__str__"))?
+        {
             return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
         }
         // A class object is an instance of its metaclass, so `space.str`
@@ -1463,13 +1468,16 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
         // here, leaving `py_repr_wtf8` below to produce the native text.  The
         // override may return a lone surrogate, so read it as WTF-8 rather
         // than folding to `&str`.
-        if let Some(result) = type_metaclass_dunder_obj(obj, "__str__")? {
+        if let Some(result) =
+            pyre_object::with_roots!(obj => type_metaclass_dunder_obj(obj, "__str__"))?
+        {
             return Ok(pyre_object::w_str_get_wtf8(result).to_wtf8_buf());
         }
         // A `types.ModuleType` subclass `__str__` override wins; without one,
         // `str` falls back to `__repr__` through `py_repr`.
         if pyre_object::is_module(obj)
-            && let Some(r) = module_user_dunder_obj(obj, "__str__")?
+            && let Some(r) =
+                pyre_object::with_roots!(obj => module_user_dunder_obj(obj, "__str__"))?
         {
             return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
         }
@@ -1868,12 +1876,14 @@ fn basename_start(path: &[u8]) -> usize {
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.
-unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, crate::PyError> {
+unsafe fn exception_descr_str_wtf8(
+    mut obj: PyObjectRef,
+) -> Result<Option<Wtf8Buf>, crate::PyError> {
     unsafe {
         // A user subclass that overrides `__str__` shadows the builtin
         // `W_BaseException.descr_str`; dispatch it (preserving WTF-8)
         // before the single-`str`-arg fast path below, matching `py_str`.
-        if let Some(r) = exc_user_dunder_obj(obj, "__str__")? {
+        if let Some(r) = pyre_object::with_roots!(obj => exc_user_dunder_obj(obj, "__str__"))? {
             return Ok(Some(pyre_object::w_str_get_wtf8(r).to_wtf8_buf()));
         }
         let kind = pyre_object::w_exception_get_kind(obj);
@@ -1914,7 +1924,9 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
             let w_lineno = crate::baseobjspace::syntax_error_attr(obj, "lineno");
             let lineno_str: Option<Wtf8Buf> =
                 if pyre_object::pyobject::is_exact_type(w_lineno, &INT_TYPE) {
-                    let lineno = crate::baseobjspace::int_w(w_lineno).unwrap_or(-1);
+                    let lineno =
+                        pyre_object::with_roots!(obj => crate::baseobjspace::int_w(w_lineno))
+                            .unwrap_or(-1);
                     Some(Wtf8Buf::from_string(format!("line {lineno}")))
                 } else {
                     None
@@ -1970,7 +1982,7 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
 /// (used for `end - 1` arithmetic and the `end == start + 1` shape
 /// check); `Err(String)` carries the pre-formatted str-coerced
 /// fallback for direct interpolation into the message.
-unsafe fn unicode_err_int_slot(stored: PyObjectRef) -> Result<i64, Wtf8Buf> {
+unsafe fn unicode_err_int_slot(mut stored: PyObjectRef) -> Result<i64, Wtf8Buf> {
     unsafe {
         if stored.is_null() || pyre_object::is_none(stored) {
             // Never set / explicit None — PyPy class-default `w_start
@@ -1984,7 +1996,7 @@ unsafe fn unicode_err_int_slot(stored: PyObjectRef) -> Result<i64, Wtf8Buf> {
         // `True`/`False`) and any object implementing __index__ all
         // resolve to the numeric value — matching PyPy's
         // `"%d" % value` semantics.
-        if let Ok(v) = crate::baseobjspace::int_w(stored) {
+        if let Ok(v) = pyre_object::with_roots!(stored => crate::baseobjspace::int_w(stored)) {
             return Ok(v);
         }
         // `descr_str` deliberately str-coerces rather than raising; a raising

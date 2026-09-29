@@ -598,13 +598,11 @@ fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
     .map_err(|error| {
         crate::builtins::compile_err_to_syntax_error(error, &source, crate::compile::Mode::Exec)
     })?;
-    let w_code = crate::box_code_object(code);
+    let mut w_code = crate::box_code_object(code);
     if let Some(key) = cache_key {
         // `frozen_cache_store` marshals `w_code`, which can allocate and collect;
         // keep the freshly boxed code reachable across that call.
-        let _root = pyre_object::gc_roots::push_roots();
-        let w_code = pyre_object::gc_roots::pin_root(w_code);
-        frozen_cache_store(key, &source, w_code);
+        pyre_object::with_roots!(w_code => frozen_cache_store(key, &source, w_code));
     }
     Ok(w_code)
 }
@@ -1212,9 +1210,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     any(target_os = "macos", target_os = "linux")
                 )))]
                 {
-                    crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(
-                        spec, "name",
-                    )?)?;
+                    let mut spec = spec;
+                    let w_name = pyre_object::with_roots!(spec => crate::baseobjspace::getattr_str(spec, "name"))?;
+                    crate::baseobjspace::text0_wtf8_w(w_name)?;
                     crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(
                         spec, "origin",
                     )?)?;
@@ -1281,8 +1279,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 // `interp_imp.py pathname='fsencode'`: preserve the raw
                 // filesystem spelling before storing it on the code object.
-                let newname = crate::gateway::fsencode_bytes_w(args[1])?;
-                unsafe { crate::pycode::fix_co_filename(args[0], &newname) };
+                // `args` is the gateway's native copy; `fsencode` can collect.
+                let mut w_code = args[0];
+                let newname =
+                    pyre_object::with_roots!(w_code => crate::gateway::fsencode_bytes_w(args[1]))?;
+                unsafe { crate::pycode::fix_co_filename(w_code, &newname) };
                 Ok(pyre_object::w_none())
             },
             2,
@@ -1349,10 +1350,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // carries the 3.14 magic number, so the digest has to agree
                 // with the one that format specifies.
                 use std::hash::Hasher;
-                let magic = crate::baseobjspace::int_w(args[0])? as u64;
-                let content = if unsafe { pyre_object::bytesobject::is_bytes_like(args[1]) } {
-                    unsafe { pyre_object::bytesobject::bytes_like_data(args[1]) }.to_vec()
-                } else if let Some(src) = crate::typedef::buffer_as_bytes_like(args[1])? {
+                // `args` is the gateway's native copy; `int_w` can collect.
+                let mut w_source = args[1];
+                let magic = pyre_object::with_roots!(w_source => crate::baseobjspace::int_w(args[0]))?
+                    as u64;
+                let content = if unsafe { pyre_object::bytesobject::is_bytes_like(w_source) } {
+                    unsafe { pyre_object::bytesobject::bytes_like_data(w_source) }.to_vec()
+                } else if let Some(src) = crate::typedef::buffer_as_bytes_like(w_source)? {
                     unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec()
                 } else {
                     return Err(crate::PyError::type_error(

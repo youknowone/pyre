@@ -267,11 +267,11 @@ fn add_pickle_object_note(
     role: &rustpython_wtf8::Wtf8,
 ) -> PyError {
     let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_exc = err.to_exc_object();
     let _ = pyre_object::gc_roots::pin_root(w_exc);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = pyre_object::gc_roots::pin_root(w_obj);
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     if let Ok(type_name) = pickle_type_name(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
         let w_note = pyre_object::w_str_from_wtf8_managed(crate::display::wtf8_format!(
@@ -482,6 +482,8 @@ impl W_Pickler {
         // catch-all so the ctor keyword parameters (protocol/fix_imports/
         // buffer_callback) do not trip an unknown-argument error in `__new__`.
         let _ = _args;
+        // Allocate the memo before the payload's other words are taken.
+        let w_memo = pyre_object::listobject::w_list_new_empty();
         W_Pickler::allocate_stable(W_Pickler {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
@@ -494,7 +496,7 @@ impl W_Pickler {
             framing: false,
             fix_imports: true,
             buffer_callback: pyre_object::w_none(),
-            w_memo: pyre_object::listobject::w_list_new_empty(),
+            w_memo,
             fast: 0,
             w_dispatch_table: pyre_object::PY_NULL,
             w_pers_func: pyre_object::PY_NULL,
@@ -1659,8 +1661,8 @@ fn save_bool(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<()
     Ok(())
 }
 
-fn save_long(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
-    let small = crate::baseobjspace::int_w(w_obj).ok();
+fn save_long(ctx: &PickleCtx, buf: &mut Framer, mut w_obj: PyObjectRef) -> Result<(), PyError> {
+    let small = pyre_object::with_roots!(w_obj => crate::baseobjspace::int_w(w_obj)).ok();
     let to_big = |v: Option<i64>| match v {
         Some(v) => BigInt::from(v),
         None => unsafe { crate::builtins::obj_to_bigint(w_obj) },
@@ -2942,14 +2944,14 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
 fn save_global(
     ctx: &mut PickleCtx,
     buf: &mut Framer,
-    w_obj: PyObjectRef,
+    mut w_obj: PyObjectRef,
     w_name_opt: Option<PyObjectRef>,
 ) -> Result<(), PyError> {
     let w_name = match w_name_opt {
         Some(n) => n,
-        None => match crate::baseobjspace::findattr_result(w_obj, "__qualname__")? {
+        None => match pyre_object::with_roots!(w_obj => crate::baseobjspace::findattr_result(w_obj, "__qualname__"))? {
             Some(n) => n,
-            None => crate::baseobjspace::findattr_result(w_obj, "__name__")?
+            None => pyre_object::with_roots!(w_obj => crate::baseobjspace::findattr_result(w_obj, "__name__"))?
                 .ok_or_else(|| pickling_error("Can't pickle object: no __qualname__ / __name__"))?,
         },
     };

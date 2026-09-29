@@ -255,8 +255,8 @@ pub(super) fn stginfo_is_final(info: PyObjectRef) -> bool {
     stginfo_flags(info) & DICTFLAG_FINAL != 0
 }
 
-pub(super) fn stginfo_mark_final(info: PyObjectRef) {
-    let f = stginfo_flags(info) | DICTFLAG_FINAL;
+pub(super) fn stginfo_mark_final(mut info: PyObjectRef) {
+    let f = pyre_object::with_roots!(info => stginfo_flags(info)) | DICTFLAG_FINAL;
     set_int(info, K_FLAGS, f);
 }
 
@@ -268,8 +268,9 @@ pub(super) fn stginfo_pointer_type(info: PyObjectRef) -> Option<PyObjectRef> {
     }
 }
 
-pub(super) fn stginfo_set_pointer_type(info: PyObjectRef, ty: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(dict_of(info), K_POINTER_TYPE, ty) };
+pub(super) fn stginfo_set_pointer_type(info: PyObjectRef, mut ty: PyObjectRef) {
+    let w_dict = pyre_object::with_roots!(ty => dict_of(info));
+    unsafe { pyre_object::w_dict_setitem_str(w_dict, K_POINTER_TYPE, ty) };
 }
 
 // ── field size/align with the `_type_` fallback ───────────────────────

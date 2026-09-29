@@ -323,11 +323,12 @@ macro_rules! py_module {
     ) => {
         #[allow(dead_code)]
         pub fn init(
-            ns: ::pyre_object::PyObjectRef,
+            mut ns: ::pyre_object::PyObjectRef,
         ) -> ::std::result::Result<(), $crate::PyError> {
             let _name = $name;
             $($(
-                $crate::module_ns_store(ns, $key, $value);
+                let __w_value = ::pyre_object::with_roots!(ns => $value);
+                $crate::module_ns_store(ns, $key, __w_value);
             )*)?
             // int_constants: integer module constants — PyPy MixedModule
             // `interpleveldefs = {'NAME': 'space.wrap(value)'}` for the
@@ -335,10 +336,9 @@ macro_rules! py_module {
             // is an `i64`-valued expression wrapped via `w_int_new`, saving
             // the per-entry `module_ns_store(ns, k, w_int_new(v))`.
             $($(
-                $crate::module_ns_store(
-                    ns, $int_key,
-                    ::pyre_object::w_int_new($int_value as i64),
-                );
+                let __w_value =
+                    ::pyre_object::with_roots!(ns => ::pyre_object::w_int_new($int_value as i64));
+                $crate::module_ns_store(ns, $int_key, __w_value);
             )*)?
             // exceptions: module-local exception classes — PyPy
             // `new_exception_class("<mod>.Name", base)` (error.py).
@@ -348,14 +348,14 @@ macro_rules! py_module {
             // stored in the module dict.  The RHS is the base class
             // expression, e.g. `lookup_exc_class("OSError").unwrap()`.
             $($(
-                $crate::module_ns_store(
-                    ns, $exc_key,
-                    $crate::builtins::new_exception_class(
+                {
+                    let w_exc = ::pyre_object::with_roots!(ns => $crate::builtins::new_exception_class(
                         ::std::concat!($name, ".", $exc_key),
                         $crate::builtins::exc_exception_new,
                         $exc_base,
-                    ),
-                );
+                    ));
+                    $crate::module_ns_store(ns, $exc_key, w_exc);
+                }
             )*)?
             // appleveldefs: bundle Python source via `include_str!` at
             // compile time, then resolve each name through
@@ -364,13 +364,13 @@ macro_rules! py_module {
             // .py file is statically linked into the binary rather than
             // read off the filesystem at module-init time.
             $($(
-                $crate::importing::appleveldef_install(
+                ::pyre_object::with_roots!(ns => $crate::importing::appleveldef_install(
                     ns,
                     include_str!($appfile),
                     $appfile,
                     $name,
                     &[ $( $appname ),* ],
-                )?;
+                ))?;
             )*)?
             // inline_app: PyPy `applevel(r'''…''')` (gateway.py) —
             // embed a Python snippet inline; the runtime executes it the
@@ -379,13 +379,13 @@ macro_rules! py_module {
             // file.  Names listed in the `=> [...]` brackets get copied
             // out of the app namespace into the module dict.
             $($(
-                $crate::importing::appleveldef_install(
+                ::pyre_object::with_roots!(ns => $crate::importing::appleveldef_install(
                     ns,
                     $inline_src,
                     "<inline>",
                     $name,
                     &[ $( $inline_name ),* ],
-                )?;
+                ))?;
             )*)?
             // inline_functions: `#[pyre_function]` typed defs whose name +
             // arity are derived from the signature.  Replaces the
@@ -394,38 +394,31 @@ macro_rules! py_module {
                 {
                     #[$crate::pyre_function]
                     fn $ifn_name ( $($ifn_args)* ) $(-> $ifn_ret)? $ifn_body
-                    $crate::module_ns_store(
-                        ns,
-                        stringify!($ifn_name),
-                        $crate::gateway::with_module(
-                            $name,
-                            $crate::make_module_builtin_function_with_arity_and_maybe_sig(
-                                stringify!($ifn_name),
-                                $ifn_name,
-                                ::paste::paste! { [<$ifn_name _pyre_arity>]() },
-                                ::paste::paste! { [<$ifn_name _pyre_sig>]() },
-                            ),
+                    let __w_value = ::pyre_object::with_roots!(ns => $crate::gateway::with_module(
+                        $name,
+                        $crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                            stringify!($ifn_name),
+                            $ifn_name,
+                            ::paste::paste! { [<$ifn_name _pyre_arity>]() },
+                            ::paste::paste! { [<$ifn_name _pyre_sig>]() },
                         ),
-                    );
+                    ));
+                    $crate::module_ns_store(ns, stringify!($ifn_name), __w_value);
                 }
             )*)?
             $($(
-                $crate::module_ns_store(
-                    ns, $fn_key,
-                    $crate::gateway::with_module(
-                        $name,
-                        $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
-                    ),
-                );
+                let __w_value = ::pyre_object::with_roots!(ns => $crate::gateway::with_module(
+                    $name,
+                    $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
+                ));
+                $crate::module_ns_store(ns, $fn_key, __w_value);
             )*)?
             $($(
-                $crate::module_ns_store(
-                    ns, $mfn_key,
-                    $crate::gateway::with_module(
-                        $name,
-                        $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
-                    ),
-                );
+                let __w_value = ::pyre_object::with_roots!(ns => $crate::gateway::with_module(
+                    $name,
+                    $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
+                ));
+                $crate::module_ns_store(ns, $mfn_key, __w_value);
             )*)?
             $(
                 {

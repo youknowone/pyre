@@ -22,8 +22,8 @@ pub struct W_CDataIter {
 }
 
 /// `W_CTypeArray.iter` — `W_CDataIter(space, self.ctitem, cdata)`.
-pub fn new_cdata_iter(w_cdata: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let cdata = cdataobj::cdata_arg(w_cdata)?;
+pub fn new_cdata_iter(mut w_cdata: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let cdata = pyre_object::with_roots!(w_cdata => cdataobj::cdata_arg(w_cdata))?;
     let ct = ctypeobj::ctype_at(cdata.ctype)
         .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
     let item = super::ctypeptr::item_of(ct)?;

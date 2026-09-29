@@ -91,6 +91,11 @@ pub struct Llbc {
     /// the set harvested across the linked artefacts. Not a path-keyed
     /// map: membership is a short ordered list.
     eval_hook_graphs: parking_lot::RwLock<Vec<String>>,
+    /// Root-stack effects of the linked artefacts analysed before this one:
+    /// the crates whose every body was analysed, and the sorted paths of
+    /// the bodies among them that can leave the shadow stack changed.
+    /// Empty until the translator publishes them.
+    root_stack_effects: parking_lot::RwLock<(Vec<String>, Vec<String>)>,
     /// Dedup id of `register_eval_override`'s first parameter, resolved
     /// once from every `FunDecl` this artefact carries (local and
     /// external). `None` once the scan has finished without a match.
@@ -278,6 +283,7 @@ impl Llbc {
             transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
             foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
             eval_hook_graphs: parking_lot::RwLock::new(Vec::new()),
+            root_stack_effects: parking_lot::RwLock::new((Vec::new(), Vec::new())),
             eval_fn_type_id: std::sync::OnceLock::new(),
             trait_assoc_index: std::sync::OnceLock::new(),
         })
@@ -328,6 +334,31 @@ impl Llbc {
     /// them. Empty before that publish.
     pub fn eval_hook_graphs(&self) -> Vec<String> {
         self.eval_hook_graphs.read().clone()
+    }
+
+    /// Publish the root-stack effects harvested from other artefacts of the
+    /// same translation input: `crates` names every crate whose bodies were
+    /// analysed, `touching` the paths of those that can change the stack.
+    pub fn set_root_stack_effects(&self, crates: Vec<String>, mut touching: Vec<String>) {
+        touching.sort();
+        touching.dedup();
+        *self.root_stack_effects.write() = (crates, touching);
+    }
+
+    /// Whether the body at `path` in crate `krate` can change the root
+    /// stack, as published by [`Self::set_root_stack_effects`].  `None` when
+    /// that crate was not analysed.
+    pub fn root_stack_effect(&self, krate: &str, path: &str) -> Option<bool> {
+        let effects = self.root_stack_effects.read();
+        if !effects.0.iter().any(|c| c == krate) {
+            return None;
+        }
+        Some(effects.1.binary_search_by(|p| p.as_str().cmp(path)).is_ok())
+    }
+
+    /// Whether any other artefact's root-stack effects were published here.
+    pub fn has_root_stack_effects(&self) -> bool {
+        !self.root_stack_effects.read().0.is_empty()
     }
 
     /// Dedup id of `register_eval_override`'s parameter type.

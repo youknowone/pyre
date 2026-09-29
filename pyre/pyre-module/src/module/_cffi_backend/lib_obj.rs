@@ -180,7 +180,8 @@ fn build_cpython_func(
 /// `elidable_promote` guards on.
 #[majit_macros::elidable_promote]
 fn get_attr_elidable(lib: &W_LibObject, w_attr: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let attr = pyre_interpreter::baseobjspace::text_w(w_attr)?;
+    let mut w_attr = w_attr;
+    let attr = pyre_object::with_roots!(w_attr => pyre_interpreter::baseobjspace::text_w(w_attr))?;
     match unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(lib.dict_w, attr) } {
         Some(w_value) => Ok(w_value),
         None => Err(PyError::key_error_with_key(w_attr)),
@@ -258,12 +259,14 @@ fn build_attr(w_lib: PyObjectRef, w_attr: PyObjectRef) -> Result<Option<PyObject
                         ct.size
                     )));
                 }
+                let ct_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = roots.pin_root(w_ct);
                 let ptr = if g.address.is_null() {
                     cdlopen_fetch(roots.get(lib_slot), attr)?
                 } else {
                     g.address.cast()
                 };
-                cglob::new_glob(attr, w_ct, ptr, std::ptr::null_mut())
+                cglob::new_glob(attr, roots.get(ct_slot), ptr, std::ptr::null_mut())
             }
             parse_c_type::OP_GLOBAL_VAR_F => {
                 let w_ct = realize_c_type::realize_c_type(

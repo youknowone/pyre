@@ -407,10 +407,23 @@ fn main() {
             movable_callees.len(),
             liveness::movable_callee_ids(&cg, liveness::MOVABLE_GC_MARKERS, movable_hops).len()
         );
-        let gc_tys = liveness::gc_ptr_type_ids(&llbc);
+        let mut gc_tys = liveness::gc_ptr_type_ids(&llbc);
         if gc_tys.is_empty() {
             println!("   (no PyObjectRef type id found — liveness scan skipped)");
             continue;
+        }
+        // `Option<PyObjectRef>` locals are the same word behind a tag.  Behind
+        // an env var because the gate parses this output and its baseline was
+        // recorded over bare `PyObjectRef` locals only.
+        if std::env::var("GC_OPTION_REFS").is_ok() {
+            let opt = liveness::gc_option_type_ids(&llbc, &gc_tys);
+            println!("   Option<PyObjectRef> type ids: {}", opt.len());
+            gc_tys.extend(opt);
+        }
+        if std::env::var("GC_SLICE_ARGS").is_ok() {
+            let slices = liveness::gc_slice_type_ids(&llbc, &gc_tys);
+            println!("   &[PyObjectRef] type ids: {}", slices.len());
+            gc_tys.extend(slices);
         }
         let push_root_ids: std::collections::HashSet<u64> = pin_ids.iter().copied().collect();
         let (found, stats) = liveness::scan(
@@ -569,6 +582,32 @@ fn main() {
                 Ok(()) => println!(
                     "       wrote {} stale-pin read(s) to {path}",
                     stats.stale_pin_reads.len()
+                ),
+                Err(e) => {
+                    println!("       FAILED to write {path}: {e}");
+                    write_failed = true;
+                }
+            }
+        }
+        // Why the unread brackets went unread.  Behind an env var for the same
+        // reason as the nested-scope census: the gate matches this output by
+        // regex.
+        if let Ok(path) = std::env::var("GC_OPAQUE_JSON") {
+            for (reason, n) in &stats.opaque_by_reason {
+                println!("           unread because {reason}: {n} call(s)");
+            }
+            let mut out = String::new();
+            for (func, file, reason, calls) in &stats.opaque_bodies {
+                let row = serde_json::json!({
+                    "func": func, "file": file, "reason": reason, "calls": calls,
+                });
+                out.push_str(&row.to_string());
+                out.push('\n');
+            }
+            match write_rows(&path, &out, &mut opened) {
+                Ok(()) => println!(
+                    "       wrote {} unread bracket body/bodies to {path}",
+                    stats.opaque_bodies.len()
                 ),
                 Err(e) => {
                     println!("       FAILED to write {path}: {e}");

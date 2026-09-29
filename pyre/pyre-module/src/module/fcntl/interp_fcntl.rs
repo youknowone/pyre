@@ -192,9 +192,9 @@ fn lockf(
                 ));
             }
         }
-        // `lockf(space, w_fd, op, length, start, whence)` unwraps its
+        // `@unwrap_spec(op=int, length=int, start=int, whence=int)` unwraps
+        // the integers before the body runs; the body then unwraps its
         // descriptor through `space.c_filedescriptor_w`.
-        let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
         let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
         let len = if args.len() >= 3 {
             unsafe { pyre_object::w_int_get_value(args[2]) }
@@ -211,6 +211,7 @@ fn lockf(
         } else {
             0
         };
+        let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
         // `_flock` fields: `l_type` from `op == LOCK_UN` / `op & LOCK_SH` /
         // `op & LOCK_EX`, then `F_SETLK` when `op & LOCK_NB` else `F_SETLKW`.
         let l_type = if cmd == libc::LOCK_UN {
@@ -293,14 +294,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // `fcntl(space, w_fd, op, w_arg)` takes its descriptor through
                 // `space.c_filedescriptor_w`, so an open file answers for the
                 // number it wraps.
-                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
-                let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                let w_fd = args[0];
+                let mut w_cmd = args[1];
+                let mut w_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = pyre_object::with_roots!(w_cmd, w_arg =>
+                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+                )?;
+                let cmd = (unsafe { pyre_object::w_int_get_value(w_cmd) }) as i32;
                 // `interp_fcntl.py fcntl` tries the string-buffer path before
                 // falling back to the integer one and returns exactly the
                 // original buffer's length; `fcntl_fcntl_impl` takes its
                 // integer arm first, on `PyIndex_Check`.
-                if args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) } {
-                    let data = arg_readbuf(args[2], "fcntl")?;
+                if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
+                    let data = arg_readbuf(w_arg, "fcntl")?;
                     let Some(mut buf) = stage_arg(data) else {
                         return Err(pyre_interpreter::PyError::value_error(
                             "fcntl argument 3 is too long",
@@ -325,7 +331,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     }
                 }
                 let arg = if args.len() >= 3 {
-                    unsafe { pyre_object::w_int_get_value(args[2]) as i32 }
+                    unsafe { pyre_object::w_int_get_value(w_arg) as i32 }
                 } else {
                     0
                 };
@@ -373,19 +379,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // `ioctl` reads its descriptor the same way the rest of the
                 // module does.  It alone raises through `_raise_error_always`,
                 // so an interrupted call surfaces rather than being re-issued.
-                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
-                let raw_req = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i64;
+                let w_fd = args[0];
+                let mut w_request = args[1];
+                let mut w_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+                let mut w_mutate = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = pyre_object::with_roots!(w_request, w_arg, w_mutate =>
+                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+                )?;
+                let raw_req = (unsafe { pyre_object::w_int_get_value(w_request) }) as i64;
                 // `normalize_ioctl_request`: the request is the low 32 bits.
                 let request = raw_req as u32;
                 // The integer arm comes first, before the argument is ever
                 // looked at as a buffer.
-                if args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) } {
-                    let arg = args[2];
+                if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
+                    let mut arg = w_arg;
                     // `mutate_arg` defaults true, and is consulted only for an
                     // exporter that is neither `bytes` nor `str` — those two
                     // always take the read-only form however it is set.
                     let mutate = if args.len() >= 4 {
-                        pyre_interpreter::baseobjspace::is_true(args[3])?
+                        pyre_object::with_roots!(arg =>
+                            pyre_interpreter::baseobjspace::is_true(w_mutate)
+                        )?
                     } else {
                         true
                     };
@@ -402,7 +416,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     return ioctl_readonly(fd, request, arg_readbuf(arg, "ioctl")?);
                 }
                 let arg = if args.len() >= 3 {
-                    unsafe { pyre_object::w_int_get_value(args[2]) as i32 }
+                    unsafe { pyre_object::w_int_get_value(w_arg) as i32 }
                 } else {
                     0
                 };

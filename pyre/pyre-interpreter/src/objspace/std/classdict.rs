@@ -257,7 +257,7 @@ fn type_namespace(w_type: PyObjectRef) -> PyObjectRef {
 /// cannot absorb the new one).  `None` skips `mutated()`, so `_version_tag`
 /// does not move.  A type with no tag stores the raw value and always mutates.
 pub(crate) unsafe fn type_setdictvalue_wtf8(
-    w_type: PyObjectRef,
+    mut w_type: PyObjectRef,
     name: &Wtf8,
     mut w_value: PyObjectRef,
 ) -> Result<(), PyError> {
@@ -284,7 +284,8 @@ pub(crate) unsafe fn type_setdictvalue_wtf8(
         let raw =
             crate::baseobjspace::_pure_getdictvalue_no_unwrapping(w_type, w_name, version_tag);
         let w_curr = if raw.is_null() { None } else { Some(raw) };
-        match pyre_object::celldict::write_cell(w_curr, w_value) {
+        match pyre_object::with_roots!(w_type => pyre_object::celldict::write_cell(w_curr, w_value))
+        {
             None => {
                 // The cell already holds `w_value`; the store is done.  What the
                 // early return skips is `mutated()`, and keeping `_version_tag`

@@ -2037,15 +2037,17 @@ pub fn validate_check_exc_match_class(exc_type: PyObjectRef) -> Result<(), PyErr
 
 /// `pyopcode.py check_except_star_type_valid` is `@jit.unroll_safe`.
 #[majit_macros::unroll_safe]
-fn validate_check_eg_match_class(exc_type: PyObjectRef) -> Result<(), PyError> {
+fn validate_check_eg_match_class(mut exc_type: PyObjectRef) -> Result<(), PyError> {
     validate_check_exc_match_class(exc_type)?;
-    let base_group = crate::builtins::lookup_exc_class("BaseExceptionGroup").unwrap();
+    let mut base_group = crate::builtins::lookup_exc_class("BaseExceptionGroup").unwrap();
     unsafe {
         if pyre_object::is_tuple(exc_type) {
             let n = pyre_object::w_tuple_len(exc_type) as i64;
             for i in 0..n {
                 if let Some(w_type) = pyre_object::w_tuple_getitem(exc_type, i)
-                    && crate::baseobjspace::issubclass(w_type, base_group)?
+                    && pyre_object::with_roots!(base_group, exc_type =>
+                        crate::baseobjspace::issubclass(w_type, base_group)
+                    )?
                 {
                     return Err(PyError::type_error(
                         "catching ExceptionGroup with except* is not allowed. Use except instead.",
@@ -2232,7 +2234,7 @@ pub fn handle_exception_with_context(
             let saved_trace = frame.get_w_f_trace();
             let _trace_roots = pyre_object::gc_roots::push_roots();
             let saved_trace_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(saved_trace);
+            let saved_trace = pyre_object::gc_roots::pin_root(saved_trace);
             if !saved_trace.is_null() {
                 frame.getorcreatedebug(-1).w_f_trace = pyre_object::PY_NULL;
             }
@@ -2571,7 +2573,7 @@ pub(crate) fn eval_frame_plain_with_resume(
     // enter() already executed).  Python finally semantics: a finally
     // block that raises replaces the prior exception (return_trace
     // overrides eval-body, leave overrides everything).
-    let outer_result = (|| -> PyResult {
+    let mut outer_result = (|| -> PyResult {
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
         // The sent `OperationError` is a GC object there (`error.py`). Pin
         // the native carrier across the hook and write the slot back before
@@ -2588,7 +2590,7 @@ pub(crate) fn eval_frame_plain_with_resume(
             err.reload_exc_object(roots, Some(*slot));
         }
         drop(operr_pin);
-        let inner_result = (|| -> PyResult {
+        let mut inner_result = (|| -> PyResult {
             let frame = unsafe { &mut *frame_anchor.live() };
             if let Some(value) = prepare_frame_resume_for_dispatch(frame, &mut resume)? {
                 w_exitvalue = value;
@@ -2599,7 +2601,23 @@ pub(crate) fn eval_frame_plain_with_resume(
             w_exitvalue = result;
             Ok(result)
         })();
-        let return_trace_result = execution_context.return_trace(frame_anchor.live(), w_exitvalue);
+        // `return_trace` runs application Python while the exit value and
+        // the pending exception are still owed to `leave`.
+        let return_trace_result = {
+            let roots = pyre_object::gc_roots::push_roots();
+            let exit_slot = roots.base();
+            let exit = roots.pin_root(w_exitvalue);
+            let err_slot = match &inner_result {
+                Err(err) => err.pin_exc_object(&roots),
+                Ok(_) => None,
+            };
+            let result = execution_context.return_trace(frame_anchor.live(), exit);
+            w_exitvalue = roots.get(exit_slot);
+            if let Err(err) = &mut inner_result {
+                err.reload_exc_object(&roots, err_slot);
+            }
+            result
+        };
         // Python finally: a finally-block exception replaces any
         // pending exception from the try-body. Only the all-OK path
         // advances to `got_exception = false`.
@@ -2618,7 +2636,18 @@ pub(crate) fn eval_frame_plain_with_resume(
         }
         combined
     })();
-    let leave_result = execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
+    let leave_result = {
+        let roots = pyre_object::gc_roots::push_roots();
+        let err_slot = match &outer_result {
+            Err(err) => err.pin_exc_object(&roots),
+            Ok(_) => None,
+        };
+        let result = execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
+        if let Err(err) = &mut outer_result {
+            err.reload_exc_object(&roots, err_slot);
+        }
+        result
+    };
     match leave_result {
         Err(leave_err) => Err(leave_err),
         Ok(live) => outer_result.map(|_| live),
@@ -3083,7 +3112,7 @@ impl NamespaceOpcodeHandler for PyFrame {
         // annotator off the bare-`!` hazard; `we_are_jitted()` folds to
         // `ConstBool(true)` so the cache arm and its `Arc<Mutex<GlobalCache>>`
         // chase are dead-code-eliminated on the lifted graph.
-        let w_globals = self.get_w_globals();
+        let mut w_globals = self.get_w_globals();
         let use_cache = if majit_metainterp::jit::we_are_jitted() {
             false
         } else {
@@ -3110,16 +3139,16 @@ impl NamespaceOpcodeHandler for PyFrame {
         {
             return Ok(value);
         }
-        let w_builtin = self.get_builtin();
+        let mut w_builtin = self.get_builtin();
         if use_cache {
             let cache_hit: Option<PyObjectRef> = unsafe {
-                load_global_via_cache(
+                pyre_object::with_roots!(w_builtin, w_globals => load_global_via_cache(
                     w_globals,
                     w_builtin,
                     name,
                     self.pycode as PyObjectRef,
                     nameindex,
-                )
+                ))
             }?;
             if let Some(value) = cache_hit {
                 return Ok(value);
@@ -3133,11 +3162,13 @@ impl NamespaceOpcodeHandler for PyFrame {
         // instead of being swallowed as a miss.  A cached miss lands here too
         // and finds nothing again before the `NameError`.
         if !w_globals.is_null()
-            && let Some(value) = crate::baseobjspace::finditem_str_named(
-                w_globals,
-                name,
-                self.pycode as PyObjectRef,
-                nameindex,
+            && let Some(value) = pyre_object::with_roots!(w_builtin =>
+                crate::baseobjspace::finditem_str_named(
+                    w_globals,
+                    name,
+                    self.pycode as PyObjectRef,
+                    nameindex,
+                )
             )?
         {
             return Ok(value);
@@ -3403,7 +3434,7 @@ unsafe fn load_global_via_cache(
     use pyre_object::dictmultiobject::{DictOperationGuard, W_ModuleDictObject};
     let module_guard = DictOperationGuard::new(w_module_dict, &[w_builtin, pycode]);
     let w_module_dict = module_guard.root(0);
-    let w_builtin = module_guard.root(1);
+    let mut w_builtin = module_guard.root(1);
     let pycode = module_guard.root(2);
     // Body is a chain of unsafe-fn / raw-ptr ops on caller-supplied
     // PyObjectRefs; SAFETY contract is on the `unsafe fn` signature
@@ -3464,7 +3495,9 @@ unsafe fn load_global_via_cache(
         // available.  Continue through the ordinary mapping lookup just as
         // `_load_global_fallback` does upstream.
         if pyre_object::dictmultiobject::w_module_dict_is_object_strategy(w_module_dict) {
-            if let Some(value) = crate::baseobjspace::finditem_str(w_module_dict, name)? {
+            if let Some(value) = pyre_object::with_roots!(w_builtin =>
+                crate::baseobjspace::finditem_str(w_module_dict, name)
+            )? {
                 return Ok(Some(value));
             }
             if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
@@ -3863,16 +3896,16 @@ impl IterOpcodeHandler for PyFrame {
 
     /// FOR_ITER: advance the iterator one step.
     /// PyPy: space.next() → StopIteration means exhausted.
-    fn iter_next(&mut self, iter: Self::Value) -> Result<Option<Self::Value>, PyError> {
+    fn iter_next(&mut self, mut iter: Self::Value) -> Result<Option<Self::Value>, PyError> {
         // baseobjspace::next walks the iterator protocol and raises
         // StopIteration for exhaustion.  All iterator kinds dispatch uniformly
         // through space.next here (pyopcode.py `w_nextitem =
         // self.space.next(w_iterator)`); the JIT specialises range/long-range/
         // seq by inlining this dispatch during tracing (trace_opcode.rs
         // iter_next), not by branching the interpreter opcode implementation.
-        match crate::baseobjspace::next(iter) {
+        match pyre_object::with_roots!(iter => crate::baseobjspace::next(iter)) {
             Ok(result) => Ok(Some(result)),
-            Err(mut e) if e.matches_stop_iteration() => {
+            Err(mut e) if pyre_object::with_roots!(iter => e.matches_stop_iteration()) => {
                 // iterator exhausted
                 self._report_stopiteration_sometimes(iter, &mut e)?;
                 Ok(None)
@@ -4286,7 +4319,7 @@ pub fn load_super_attr_value_w(
     self_obj: PyObjectRef,
     cls: PyObjectRef,
     frame: *mut PyFrame,
-    w_name: PyObjectRef,
+    mut w_name: PyObjectRef,
     is_two_arg: bool,
     self_is_cell: bool,
     class_slot: isize,
@@ -4299,11 +4332,17 @@ pub fn load_super_attr_value_w(
     let exact_builtin_zero_arg =
         !is_two_arg && crate::builtins::is_builtin_super_type(global_super);
     let proxy = if is_two_arg {
-        crate::call::call_function_impl_result(global_super, &[cls, self_obj])?
+        pyre_object::with_roots!(w_name =>
+            crate::call::call_function_impl_result(global_super, &[cls, self_obj])
+        )?
     } else if exact_builtin_zero_arg {
-        crate::builtins::builtin_super_from_frame_layout(frame, self_is_cell, class_slot)?
+        pyre_object::with_roots!(w_name =>
+            crate::builtins::builtin_super_from_frame_layout(frame, self_is_cell, class_slot)
+        )?
     } else {
-        crate::call::call_function_impl_result(global_super, &[])?
+        pyre_object::with_roots!(w_name =>
+            crate::call::call_function_impl_result(global_super, &[])
+        )?
     };
     if exact_builtin_zero_arg {
         // The selected slot is PyPy's `W_Super.getattribute`, so enter that
@@ -5753,17 +5792,25 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     fn get_aiter(&mut self) -> Result<(), PyError> {
-        let obj = self.pop();
+        let mut obj = self.pop();
         let anchor = FrameAnchor::new(self);
-        let method =
-            unsafe { crate::baseobjspace::lookup_special(obj, "__aiter__")? }.ok_or_else(|| {
-                crate::PyError::type_error(format!(
-                    "'async for' requires an object with __aiter__ method, got {}",
-                    crate::type_methods::arg_type_name(obj)
-                ))
-            })?;
-        let iter = crate::call::call_function_impl_result(method, &[])?;
-        if unsafe { crate::baseobjspace::lookup_special(iter, "__anext__")? }.is_none() {
+        let method = unsafe {
+            pyre_object::with_roots!(obj => crate::baseobjspace::lookup_special(obj, "__aiter__"))?
+        }
+        .ok_or_else(|| {
+            crate::PyError::type_error(format!(
+                "'async for' requires an object with __aiter__ method, got {}",
+                crate::type_methods::arg_type_name(obj)
+            ))
+        })?;
+        let mut iter = crate::call::call_function_impl_result(method, &[])?;
+        if unsafe {
+            pyre_object::with_roots!(iter =>
+                crate::baseobjspace::lookup_special(iter, "__anext__")
+            )?
+        }
+        .is_none()
+        {
             return Err(crate::PyError::type_error(format!(
                 "'async for' received an object from __aiter__ that does not implement __anext__: {}",
                 crate::type_methods::arg_type_name(iter)
@@ -5773,41 +5820,51 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     fn get_anext(&mut self) -> Result<(), PyError> {
-        let iter = self.peek();
+        let mut iter = self.peek();
         let anchor = FrameAnchor::new(self);
-        let method = unsafe { crate::baseobjspace::lookup_special(iter, "__anext__")? }
-            .ok_or_else(|| {
-                crate::PyError::type_error(format!(
-                    "'async for' requires an iterator with __anext__ method, got {}",
-                    crate::type_methods::arg_type_name(iter)
-                ))
-            })?;
-        let next = crate::call::call_function_impl_result(method, &[])?;
-        let awaitable = crate::baseobjspace::get_awaitable_iter(next, 0).map_err(|mut cause| {
-            // CPython 3.14 `_PyEval_GetANext` uses
-            // `_PyErr_FormatFromCause` for *every* failure produced while
-            // converting `__anext__`'s result to an awaitable.  In
-            // particular, an exception raised by `result.__await__()` is the
-            // explicit cause of this TypeError; only an exception raised by
-            // `__anext__` itself propagates unchanged above.
-            let message = format!(
-                "'async for' received an invalid object from __anext__: {}",
-                crate::type_methods::arg_type_name(next)
-            );
-            let cause_obj = cause.to_exc_object();
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(cause_obj);
-            let cause_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let mut error = crate::PyError::type_error(message);
-            let error_obj = error.to_exc_object();
-            let cause_obj = pyre_object::gc_roots::shadow_stack_get(cause_slot);
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_context(error_obj, cause_obj);
-                pyre_object::interp_exceptions::w_exception_set_cause(error_obj, cause_obj);
-                pyre_object::interp_exceptions::w_exception_set_suppress_context(error_obj, true);
-                crate::PyError::from_exc_object(error_obj)
-            }
+        let method = unsafe {
+            pyre_object::with_roots!(iter =>
+                crate::baseobjspace::lookup_special(iter, "__anext__")
+            )?
+        }
+        .ok_or_else(|| {
+            crate::PyError::type_error(format!(
+                "'async for' requires an iterator with __anext__ method, got {}",
+                crate::type_methods::arg_type_name(iter)
+            ))
         })?;
+        let mut next = crate::call::call_function_impl_result(method, &[])?;
+        let awaitable =
+            pyre_object::with_roots!(next => crate::baseobjspace::get_awaitable_iter(next, 0))
+                .map_err(|mut cause| {
+                    // CPython 3.14 `_PyEval_GetANext` uses
+                    // `_PyErr_FormatFromCause` for *every* failure produced while
+                    // converting `__anext__`'s result to an awaitable.  In
+                    // particular, an exception raised by `result.__await__()` is the
+                    // explicit cause of this TypeError; only an exception raised by
+                    // `__anext__` itself propagates unchanged above.
+                    let message = format!(
+                        "'async for' received an invalid object from __anext__: {}",
+                        crate::type_methods::arg_type_name(next)
+                    );
+                    let cause_obj = cause.to_exc_object();
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let _ = pyre_object::gc_roots::pin_root(cause_obj);
+                    let cause_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    let mut error = crate::PyError::type_error(message);
+                    let error_obj = error.to_exc_object();
+                    let cause_obj = pyre_object::gc_roots::shadow_stack_get(cause_slot);
+                    unsafe {
+                        pyre_object::interp_exceptions::w_exception_set_context(
+                            error_obj, cause_obj,
+                        );
+                        pyre_object::interp_exceptions::w_exception_set_cause(error_obj, cause_obj);
+                        pyre_object::interp_exceptions::w_exception_set_suppress_context(
+                            error_obj, true,
+                        );
+                        crate::PyError::from_exc_object(error_obj)
+                    }
+                })?;
         Self::push_anchored(&anchor, awaitable)
     }
 

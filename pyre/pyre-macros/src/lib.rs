@@ -73,6 +73,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     // parameter-name / required tables so the wrapper can resolve keyword
     // arguments by name (PyPy gateway `Signature` + `_match_signature`).
     let mut unwrap_stmts = Vec::<proc_macro2::TokenStream>::new();
+    let mut reread_stmts = Vec::<proc_macro2::TokenStream>::new();
     let mut call_args = Vec::<proc_macro2::TokenStream>::new();
     let mut param_names = Vec::<String>::new();
     let mut param_required = Vec::<bool>::new();
@@ -81,6 +82,15 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let mut has_kw_markers = false;
     let mut kwonly_tail = false;
     let user_name_str = user_name.to_string();
+    let reads: Vec<ArgRead> = user_sig
+        .inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            FnArg::Typed(pt) => Some(arg_read(&pt.ty)),
+            FnArg::Receiver(_) => None,
+        })
+        .collect();
+    let rooted = args_need_roots(&reads, false);
     for (idx, arg) in user_sig.inputs.iter().enumerate() {
         let pat_type = match arg {
             FnArg::Typed(pt) => pt,
@@ -107,8 +117,10 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         param_required
             .push(arg_default(pat_type)?.is_none() && option_inner(&pat_type.ty).is_none());
         param_positional.push(!kwonly_tail && !is_kwargs);
-        let (unwrap, ident) = unwrap_arg(idx, pat_type, Some((&user_name_str, idx + 1)))?;
+        let (unwrap, reread, ident) =
+            unwrap_arg(idx, pat_type, Some((&user_name_str, idx + 1)), rooted)?;
         unwrap_stmts.push(unwrap);
+        reread_stmts.extend(reread);
         call_args.push(quote! { #ident });
     }
 
@@ -235,6 +247,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         #stripped #user_body
     };
 
+    let (roots_open, roots_close) = arg_roots_bracket(rooted);
     let wrapper = quote! {
         #[allow(non_snake_case)]
         #vis fn #user_name(
@@ -242,7 +255,10 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         ) -> ::std::result::Result<::pyre_object::PyObjectRef, ::pyre_interpreter::PyError> {
             #kwargs_preamble
             #count_preamble
+            #roots_open
             #(#unwrap_stmts)*
+            #(#reread_stmts)*
+            #roots_close
             #body
         }
     };
@@ -345,24 +361,148 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     })
 }
 
+/// How a wrapper parameter consumes its `args` slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArgRead {
+    /// Binds the slot's object itself (`PyObjectRef`, `Option<PyObjectRef>`,
+    /// a type-checked passthrough alias such as `PyTuple`).
+    Ref,
+    /// Runs a gateway conversion (`int_w`, `text_w`, `fsencode_w`, ...),
+    /// which can call back into Python and collect.
+    Convert,
+    /// Takes the whole `args` slice.
+    WholeSlice,
+}
+
+fn is_passthrough_alias(name: &str) -> bool {
+    matches!(
+        name,
+        "PyTuple"
+            | "PyList"
+            | "PyDict"
+            | "PyStr"
+            | "PyBytes"
+            | "PyByteArray"
+            | "PyInt"
+            | "PyFloat"
+            | "PyBool"
+            | "PySet"
+            | "PyFrozenSet"
+    )
+}
+
+fn arg_read(ty: &Type) -> ArgRead {
+    let ty = unwrap_type_group(ty);
+    if is_varargs_param(ty) {
+        return ArgRead::WholeSlice;
+    }
+    if type_is_py_object_ref(ty) {
+        return ArgRead::Ref;
+    }
+    if let Some(inner) = option_inner(ty) {
+        return arg_read(inner);
+    }
+    if let Type::Path(p) = ty
+        && let Some(seg) = p.path.segments.last()
+        && is_passthrough_alias(&seg.ident.to_string())
+    {
+        return ArgRead::Ref;
+    }
+    ArgRead::Convert
+}
+
+/// Whether the wrapper must publish `args` on the shadow stack while it
+/// unwraps them: `interp2app`'s activation reads every argument out of
+/// `scope_w`, a GC-visible list, so a conversion that collects never leaves
+/// an earlier or later argument stale.  The `args` slice here is a native
+/// copy, so any conversion followed by another read of a slot, or preceded
+/// by a bound object (the receiver included), needs the slots rooted.
+fn args_need_roots(reads: &[ArgRead], leading_ref: bool) -> bool {
+    reads.iter().enumerate().any(|(p, r)| {
+        *r == ArgRead::Convert
+            && (leading_ref
+                || reads[..p].contains(&ArgRead::Ref)
+                || reads[p + 1..].iter().any(|q| *q != ArgRead::WholeSlice))
+    })
+}
+
+/// The shadow-stack bracket around a rooted wrapper's unwraps.  It closes
+/// before the call: the callee roots its own locals.
+fn arg_roots_bracket(rooted: bool) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    if rooted {
+        (
+            quote! {
+                let __pyre_arg_roots = ::pyre_object::gc_roots::push_roots();
+                let __pyre_arg_base = __pyre_arg_roots.pin_roots(args);
+            },
+            quote! { ::std::mem::drop(__pyre_arg_roots); },
+        )
+    } else {
+        (quote! {}, quote! {})
+    }
+}
+
+/// The value read of `args[idx]`: the shadow-stack slot when the wrapper
+/// rooted `args`, the native slice otherwise.
+fn arg_slot(idx: usize, rooted: bool) -> proc_macro2::TokenStream {
+    if rooted {
+        quote! { __pyre_arg_roots.get(__pyre_arg_base + #idx) }
+    } else {
+        quote! { args[#idx] }
+    }
+}
+
 /// Generate `let <ident>: <T> = <unwrap-from-args[idx]>;`.
 ///
 /// `#[default(expr)]` on an arg substitutes `expr` whenever
 /// `args.len() <= idx`.  Mirrors PyPy `@unwrap_spec(w_x=WrappedDefault(v))`
 /// — when the caller omits a positional, the wrapper synthesises a value
 /// in the user's typed coordinate space, not in `PyObjectRef` space.
+///
+/// With `rooted`, the second result re-reads a bound object from its slot
+/// once every conversion has run.
 fn unwrap_arg(
     idx: usize,
     pt: &PatType,
     missing_ctx: Option<(&str, usize)>,
-) -> syn::Result<(proc_macro2::TokenStream, syn::Ident)> {
+    rooted: bool,
+) -> syn::Result<(
+    proc_macro2::TokenStream,
+    Option<proc_macro2::TokenStream>,
+    syn::Ident,
+)> {
     let ident = match &*pt.pat {
         Pat::Ident(pi) => pi.ident.clone(),
         _ => format_ident!("__pyre_arg{}", idx),
     };
     let ty = &*pt.ty;
 
-    let unwrap = unwrap_expr(ty, idx)?;
+    let slot = arg_slot(idx, rooted);
+    let unwrap = unwrap_expr(ty, &slot, idx)?;
+    let reread = match arg_read(ty) {
+        ArgRead::Ref if rooted => {
+            let value = if option_inner(unwrap_type_group(ty)).is_some() {
+                quote! { ::std::option::Option::Some(#slot) }
+            } else {
+                quote! { #slot }
+            };
+            Some(quote! {
+                let #ident = if #idx < args.len() && !args[#idx].is_null() { #value } else { #ident };
+            })
+        }
+        // The whole slice is the native copy; rebuild it from the slots.
+        ArgRead::WholeSlice if rooted => Some(quote! {
+            let mut __pyre_live_args: ::std::vec::Vec<::pyre_object::PyObjectRef> =
+                ::std::vec::Vec::with_capacity(args.len());
+            let mut __pyre_live_i = 0usize;
+            while __pyre_live_i < args.len() {
+                __pyre_live_args.push(__pyre_arg_roots.get(__pyre_arg_base + __pyre_live_i));
+                __pyre_live_i += 1;
+            }
+            let #ident: &[::pyre_object::PyObjectRef] = &__pyre_live_args;
+        }),
+        _ => None,
+    };
     // A `&[PyObjectRef]` whole-slice parameter binds the entire `args`
     // slice — it has no per-slot index to bounds-check.  Other slice
     // element types (e.g. `&[u8]`) are positioned params indexing
@@ -429,7 +569,7 @@ fn unwrap_arg(
     } else {
         quote! { #ty }
     };
-    Ok((quote! { let #ident: #binding_ty = #expr; }, ident))
+    Ok((quote! { let #ident: #binding_ty = #expr; }, reread, ident))
 }
 
 /// Substitute typed-receiver aliases in a fn signature with the rust
@@ -488,6 +628,7 @@ fn arg_default(pt: &PatType) -> syn::Result<Option<proc_macro2::TokenStream>> {
 /// bind/refer to so the caller can splice the chosen index in.
 fn typed_alias(
     name: &str,
+    slot: &proc_macro2::TokenStream,
     idx: usize,
 ) -> Option<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
     let passthrough = |check: proc_macro2::TokenStream| {
@@ -495,7 +636,7 @@ fn typed_alias(
             quote! { ::pyre_object::PyObjectRef },
             quote! {
                 {
-                    let __a = args[#idx];
+                    let __a = #slot;
                     if !unsafe { #check(__a) } {
                         return ::std::result::Result::Err(
                             ::pyre_interpreter::PyError::type_error(format!(
@@ -522,7 +663,7 @@ fn typed_alias(
         "PyFrozenSet" => passthrough(quote! { ::pyre_object::is_frozenset }),
         "PyPath" => (
             quote! { ::std::vec::Vec<u8> },
-            quote! { ::pyre_interpreter::gateway::fsencode_bytes_w(args[#idx])? },
+            quote! { ::pyre_interpreter::gateway::fsencode_bytes_w(#slot)? },
         ),
         "PyIndex" => (
             // Mirrors PyPy `space.getindex_w(w_obj, None)`: consults
@@ -531,7 +672,7 @@ fn typed_alias(
             // TypeError when the object has no `__index__` and is not
             // already int-like.
             quote! { i64 },
-            quote! { ::pyre_interpreter::baseobjspace::getindex_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::getindex_w(#slot)? },
         ),
         "PyIndexInt" => (
             // CPython 3.14 Argument Clinic `int` parameters that accept the
@@ -540,7 +681,7 @@ fn typed_alias(
             // huge bigint to i64::{MIN,MAX}.
             quote! { i64 },
             quote! {
-                ::pyre_interpreter::baseobjspace::index_int_w_preserve_negative(args[#idx])?
+                ::pyre_interpreter::baseobjspace::index_int_w_preserve_negative(#slot)?
             },
         ),
         "PyIndexCInt" => (
@@ -549,56 +690,56 @@ fn typed_alias(
             // does not serve: its converter reaches the value through
             // `__int__` first, which the index protocol does not.
             quote! { i32 },
-            quote! { ::pyre_interpreter::baseobjspace::index_c_int_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::index_c_int_w(#slot)? },
         ),
         // Integer aliases — route through the `space.gateway_nonnegint_w`
         // / `space.c_*_w` converters in baseobjspace.rs so the range / sign
         // checks and their exception messages live in one place.
         "PyNonNegInt" => (
             quote! { i64 },
-            quote! { ::pyre_interpreter::baseobjspace::gateway_nonnegint_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::gateway_nonnegint_w(#slot)? },
         ),
         "PyCInt" => (
             quote! { i32 },
-            quote! { ::pyre_interpreter::baseobjspace::c_int_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_int_w(#slot)? },
         ),
         "PyCUInt" => (
             quote! { u32 },
-            quote! { ::pyre_interpreter::baseobjspace::c_uint_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_uint_w(#slot)? },
         ),
         "PyCShort" => (
             quote! { i16 },
-            quote! { ::pyre_interpreter::baseobjspace::c_short_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_short_w(#slot)? },
         ),
         "PyCUShort" => (
             quote! { u16 },
-            quote! { ::pyre_interpreter::baseobjspace::c_ushort_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_ushort_w(#slot)? },
         ),
         "PyCUidT" => (
             quote! { u32 },
-            quote! { ::pyre_interpreter::baseobjspace::c_uid_t_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_uid_t_w(#slot)? },
         ),
         "PyTruncatedInt" => (
             quote! { i64 },
-            quote! { ::pyre_interpreter::baseobjspace::truncatedint_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::truncatedint_w(#slot)? },
         ),
         "PyText0" => (
             quote! { &'static str },
-            quote! { ::pyre_interpreter::baseobjspace::text0_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::text0_w(#slot)? },
         ),
         "PyBytes0" => (
             // space.bytes0_w — bytes_w plus a rejection of embedded NUL.
             quote! { &'static [u8] },
             quote! {
                 {
-                    if !unsafe { ::pyre_object::bytesobject::is_bytes_like(args[#idx]) } {
+                    if !unsafe { ::pyre_object::bytesobject::is_bytes_like(#slot) } {
                         return ::std::result::Result::Err(
                             ::pyre_interpreter::PyError::type_error(
                                 format!("argument {} must be bytes-like", #idx)
                             )
                         );
                     }
-                    let __b = unsafe { ::pyre_object::bytesobject::bytes_like_data(args[#idx]) };
+                    let __b = unsafe { ::pyre_object::bytesobject::bytes_like_data(#slot) };
                     if __b.contains(&0) {
                         return ::std::result::Result::Err(
                             ::pyre_interpreter::PyError::value_error(
@@ -615,10 +756,10 @@ fn typed_alias(
             // fsencode_bytes_w (same conversion as the `PyPath` alias).
             quote! { ::std::option::Option<::std::vec::Vec<u8>> },
             quote! {
-                if unsafe { ::pyre_object::is_none(args[#idx]) } {
+                if unsafe { ::pyre_object::is_none(#slot) } {
                     ::std::option::Option::None
                 } else {
-                    ::std::option::Option::Some(::pyre_interpreter::gateway::fsencode_bytes_w(args[#idx])?)
+                    ::std::option::Option::Some(::pyre_interpreter::gateway::fsencode_bytes_w(#slot)?)
                 }
             },
         ),
@@ -627,20 +768,20 @@ fn typed_alias(
         // utf8 buffer, differing only in the TypeError message they raise.
         "PyUnicode" => (
             quote! { &'static str },
-            quote! { ::pyre_interpreter::baseobjspace::realunicode_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::realunicode_w(#slot)? },
         ),
         "PyUtf8" => (
             quote! { &'static str },
-            quote! { ::pyre_interpreter::baseobjspace::utf8_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::utf8_w(#slot)? },
         ),
         "PyTextOrNone" => (
             // space.text_or_none_w — None passes through, otherwise text_w.
             quote! { ::std::option::Option<&'static str> },
             quote! {
-                if args[#idx].is_null() || unsafe { ::pyre_object::is_none(args[#idx]) } {
+                if #slot.is_null() || unsafe { ::pyre_object::is_none(#slot) } {
                     ::std::option::Option::None
                 } else {
-                    ::std::option::Option::Some(::pyre_interpreter::baseobjspace::text_w(args[#idx])?)
+                    ::std::option::Option::Some(::pyre_interpreter::baseobjspace::text_w(#slot)?)
                 }
             },
         ),
@@ -648,20 +789,20 @@ fn typed_alias(
             // space.text0_or_none_w — None passes through, otherwise text0_w.
             quote! { ::std::option::Option<&'static str> },
             quote! {
-                if args[#idx].is_null() || unsafe { ::pyre_object::is_none(args[#idx]) } {
+                if #slot.is_null() || unsafe { ::pyre_object::is_none(#slot) } {
                     ::std::option::Option::None
                 } else {
-                    ::std::option::Option::Some(::pyre_interpreter::baseobjspace::text0_w(args[#idx])?)
+                    ::std::option::Option::Some(::pyre_interpreter::baseobjspace::text0_w(#slot)?)
                 }
             },
         ),
         "PyBufferStr" => (
             quote! { ::std::vec::Vec<u8> },
-            quote! { ::pyre_interpreter::baseobjspace::charbuf_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::charbuf_w(#slot)? },
         ),
         "PyCNonNegInt" => (
             quote! { i32 },
-            quote! { ::pyre_interpreter::baseobjspace::c_nonnegint_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_nonnegint_w(#slot)? },
         ),
         _ => return None,
     })
@@ -671,10 +812,14 @@ fn typed_alias(
 /// type produced by `typed_alias`.  The dummy idx `0` is fine because
 /// the returned binding type never references `idx`.
 fn typed_alias_binding_ty(name: &str) -> Option<proc_macro2::TokenStream> {
-    typed_alias(name, 0).map(|(ty, _)| ty)
+    typed_alias(name, &quote! { args[0] }, 0).map(|(ty, _)| ty)
 }
 
-fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
+fn unwrap_expr(
+    ty: &Type,
+    slot: &proc_macro2::TokenStream,
+    idx: usize,
+) -> syn::Result<proc_macro2::TokenStream> {
     let ty = unwrap_type_group(ty);
     // Typed-receiver aliases — `state: PyTuple` becomes a typecheck +
     // PyObjectRef binding; `path: PyPath` becomes an fsencode_bytes_w call +
@@ -683,7 +828,7 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
     // resolves to.
     if let Type::Path(p) = ty
         && let Some(seg) = p.path.segments.last()
-        && let Some((_, expr)) = typed_alias(&seg.ident.to_string(), idx)
+        && let Some((_, expr)) = typed_alias(&seg.ident.to_string(), slot, idx)
     {
         return Ok(expr);
     }
@@ -702,14 +847,14 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
             {
                 return Ok(quote! {
                     {
-                        if !unsafe { ::pyre_object::bytesobject::is_bytes_like(args[#idx]) } {
+                        if !unsafe { ::pyre_object::bytesobject::is_bytes_like(#slot) } {
                             return ::std::result::Result::Err(
                                 ::pyre_interpreter::PyError::type_error(
                                     format!("argument {} must be bytes-like", #idx)
                                 )
                             );
                         }
-                        unsafe { ::pyre_object::bytesobject::bytes_like_data(args[#idx]) }
+                        unsafe { ::pyre_object::bytesobject::bytes_like_data(#slot) }
                     }
                 });
             }
@@ -721,23 +866,23 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
             && path_is_ident(&p.path, "str")
         {
             return Ok(quote! {
-                ::pyre_interpreter::baseobjspace::str_utf8_w(args[#idx])?
+                ::pyre_interpreter::baseobjspace::str_utf8_w(#slot)?
             });
         }
     }
 
     if let Type::Path(p) = ty {
         if type_is_py_object_ref(ty) {
-            return Ok(quote! { args[#idx] });
+            return Ok(quote! { #slot });
         }
         // `Option<T>` — present when the slot is in range and not the
         // `PY_NULL` "argument omitted" marker `bind_builtin_kwargs` writes
         // for an absent optional after keyword resolution.  Mirrors PyPy
         // `@unwrap_spec(s=W_Root)` with `def f(self, space, s=None)`.
         if let Some(inner) = option_inner(ty) {
-            let inner_unwrap = unwrap_expr(inner, idx)?;
+            let inner_unwrap = unwrap_expr(inner, slot, idx)?;
             return Ok(quote! {
-                if #idx < args.len() && !args[#idx].is_null() { Some(#inner_unwrap) } else { None }
+                if #idx < args.len() && !#slot.is_null() { Some(#inner_unwrap) } else { None }
             });
         }
         if let Some(seg) = p.path.segments.last() {
@@ -753,7 +898,7 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
             match name.as_str() {
                 "i64" => {
                     return Ok(quote! {
-                        ::pyre_interpreter::baseobjspace::gateway_int_w(args[#idx])?
+                        ::pyre_interpreter::baseobjspace::gateway_int_w(#slot)?
                     });
                 }
                 "i32" | "u32" | "usize" | "isize" | "u16" | "i16" | "u8" | "i8" => {
@@ -768,17 +913,17 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
                     // own `OverflowError` names `PyCInt` / `PyCNonNegInt`
                     // instead.
                     return Ok(quote! {
-                        (::pyre_interpreter::baseobjspace::gateway_int_w(args[#idx])? as #ty)
+                        (::pyre_interpreter::baseobjspace::gateway_int_w(#slot)? as #ty)
                     });
                 }
                 "f64" => {
                     return Ok(quote! {
-                        ::pyre_interpreter::baseobjspace::float_w(args[#idx])?
+                        ::pyre_interpreter::baseobjspace::float_w(#slot)?
                     });
                 }
                 "bool" => {
                     return Ok(quote! {
-                        ::pyre_interpreter::baseobjspace::is_true(args[#idx])?
+                        ::pyre_interpreter::baseobjspace::is_true(#slot)?
                     });
                 }
                 _ => {}
@@ -1967,6 +2112,23 @@ fn expand_pyre_methods(
         // registration time, where instead of `dict_storage_store(...,
         // make_builtin_function(...))` they participate in a deferred
         // `w_getset_property_new(fget=, fset=)` build keyed by py_name.
+        let has_receiver = matches!(
+            kind,
+            MethodKind::Instance
+                | MethodKind::Getter(..)
+                | MethodKind::Setter(..)
+                | MethodKind::Deleter(..)
+        );
+        let reads: Vec<ArgRead> = m
+            .sig
+            .inputs
+            .iter()
+            .filter_map(|arg| match arg {
+                FnArg::Typed(pt) => Some(arg_read(&pt.ty)),
+                FnArg::Receiver(_) => None,
+            })
+            .collect();
+        let rooted = args_need_roots(&reads, has_receiver);
         let mut inputs = m.sig.inputs.iter().peekable();
         let (recv_check, preamble, call_target, first_arg_idx) = match &kind {
             MethodKind::Instance
@@ -2003,6 +2165,7 @@ fn expand_pyre_methods(
                     quote! { &*s }
                 };
                 let needed = self_idx + 1;
+                let recv_slot = arg_slot(self_idx, rooted);
                 // `descr_check` names the descriptor as Python sees it, and
                 // a `#[setter]` / `#[deleter]` reaches the type under the
                 // property's name rather than the `set_` / `del_` prefixed
@@ -2050,13 +2213,14 @@ fn expand_pyre_methods(
                             ::std::option::Option::None,
                         );
                     }
-                    let __pyre_self = match <#self_ty>::from_obj(args[#self_idx]) {
+                    let __pyre_recv = #recv_slot;
+                    let __pyre_self = match <#self_ty>::from_obj(__pyre_recv) {
                         ::std::option::Option::Some(s) => #bind_self,
                         ::std::option::Option::None => {
                             return ::pyre_interpreter::gateway::receiver_mismatch(
                                 <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                                 #descr_name,
-                                ::std::option::Option::Some(args[#self_idx]),
+                                ::std::option::Option::Some(__pyre_recv),
                             );
                         }
                     };
@@ -2090,6 +2254,7 @@ fn expand_pyre_methods(
         };
 
         let mut unwrap_stmts = Vec::<proc_macro2::TokenStream>::new();
+        let mut reread_stmts = Vec::<proc_macro2::TokenStream>::new();
         let mut call_args = Vec::<proc_macro2::TokenStream>::new();
         let mut param_names = Vec::<String>::new();
         let mut param_required = Vec::<bool>::new();
@@ -2142,8 +2307,9 @@ fn expand_pyre_methods(
             // Optional iff it has a `#[default(...)]` or is `Option<T>`.
             param_required.push(arg_default(pt)?.is_none() && option_inner(&pt.ty).is_none());
             param_positional.push(!kwonly_tail && !is_kwargs);
-            let (stmt, ident) = unwrap_arg(arg_idx, pt, None)?;
+            let (stmt, reread, ident) = unwrap_arg(arg_idx, pt, None, rooted)?;
             unwrap_stmts.push(stmt);
+            reread_stmts.extend(reread);
             call_args.push(quote! { #ident });
         }
 
@@ -2334,15 +2500,13 @@ fn expand_pyre_methods(
                 // argument slice is not itself a moving-GC root, so pin and
                 // reload it before stamping the result.
                 let __pyre_new_roots = ::pyre_object::gc_roots::push_roots();
-                let __pyre_cls_input = args.first().copied().unwrap_or(::pyre_object::PY_NULL);
-                let _ = ::pyre_object::gc_roots::pin_root(__pyre_cls_input);
-                let __pyre_cls_slot = ::pyre_object::gc_roots::shadow_stack_len() - 1;
+                let __pyre_cls_slot = __pyre_new_roots.pin_roots(&[__pyre_cls_input]);
                 let __pyre_obj: ::pyre_object::PyObjectRef = match { #body } {
                     ::std::result::Result::Ok(o) => o,
                     ::std::result::Result::Err(e) => return ::std::result::Result::Err(e),
                 };
                 if !__pyre_obj.is_null() {
-                    let __pyre_cls = ::pyre_object::gc_roots::shadow_stack_get(__pyre_cls_slot);
+                    let __pyre_cls = __pyre_new_roots.get(__pyre_cls_slot);
                     if !__pyre_cls.is_null() && unsafe { ::pyre_object::is_type(__pyre_cls) } {
                         let __pyre_static_tp = ::pyre_interpreter::typedef::gettypefor(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
@@ -2369,7 +2533,22 @@ fn expand_pyre_methods(
             body
         };
 
+        // `__new__` reads `cls` before the unwrap bracket closes: after the
+        // unwraps, `args` is stale wherever they could collect.
+        let cls_read = if is_new {
+            let cls_slot = arg_slot(0, rooted);
+            quote! {
+                let __pyre_cls_input = if args.is_empty() {
+                    ::pyre_object::PY_NULL
+                } else {
+                    #cls_slot
+                };
+            }
+        } else {
+            quote! {}
+        };
         let py_name = mname.to_string();
+        let (roots_open, roots_close) = arg_roots_bracket(rooted);
         wrappers.push(quote! {
             #[allow(non_snake_case)]
             pub fn #wrapper_name(
@@ -2378,12 +2557,16 @@ fn expand_pyre_methods(
                 #recv_check
                 #kwargs_preamble
                 #arity_preamble
+                #roots_open
                 #(#unwrap_stmts)*
+                #(#reread_stmts)*
                 // Gateway coercions may invoke Python (`__index__`, path
                 // conversion, etc.) and therefore collect.  Perform them
                 // before borrowing the typed receiver, matching interp2app's
                 // unwrap-before-call boundary.
                 #preamble
+                #cls_read
+                #roots_close
                 #body
             }
         });

@@ -310,10 +310,37 @@ cargo test -p pyre-jit --no-default-features --features dynasm,prepass
   `check.py`'s dynasm leg builds *with* `pyre-module`. `--build no --backend
   dynasm` after the script measures the core binary, and its import failures
   are not regressions.
-- The core loop replaces neither gate below: the full `cargo test` and a bare
-  `python3 pyre/check.py` still run before every commit.
+- The core loop does not replace the full gate below. When the full gate is
+  due (see "How much to verify"), it is the product `cargo test` and a bare
+  `python3 pyre/check.py`, not their core variants.
 
-## Before committing
+## How much to verify
+
+The full gate (`cargo test --all` plus a bare `pyre/check.py`) costs over an
+hour. It is not the default for every commit. Scale verification to what
+changed since the last green signal, local or CI:
+
+- **Rebase, cherry-pick or history rewrite of a tree that was green.** Do not
+  rerun the tests. Confirm the rewrite kept the work: the commit list, and the
+  patch-ids of the commits that did not conflict. Run `cargo check` on the
+  crates whose conflicts you resolved by hand. A conflict resolved by blending
+  logic from both sides also gets the tests that exercise that region. CI
+  judges the rest.
+- **New code.** Run the tests that exercise it: the touched crate's tests, the
+  relevant `check.py --synthetic-pattern` fixtures, and the regression test for
+  the bug. Widen to the full gate when the change is cross-cutting (translator
+  front end, codewriter, GC rooting protocol, backend ABI, a shared runtime
+  helper), and once before opening a PR.
+- **The last CI run on this branch was red.** Before the next push, run every
+  failed job's command locally and see it pass. Use `/apple-container` for an
+  ubuntu-only red. A push that only hopes the red is fixed spends another CI
+  run.
+- **Before every push**, which takes seconds: `cargo fmt --all -- --check` and
+  codespell. The `pre-commit` job gates every other CI job. Also make sure the
+  tip contains `origin/main` (`git merge-base --is-ancestor origin/main HEAD`).
+  A PR that is behind main gets no workflow run at all.
+
+## The full gate
 
 - `cargo test --all --no-default-features --features dynasm,pyre-module`. All
   three parts matter. `--features dynasm` selects a backend;

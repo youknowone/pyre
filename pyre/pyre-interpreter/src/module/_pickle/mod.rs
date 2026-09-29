@@ -434,7 +434,7 @@ pub(crate) fn getattribute_dotted(
             )));
         }
         parent = cur;
-        cur = crate::baseobjspace::getattr_str(cur, sub)?;
+        cur = pyre_object::with_roots!(parent => crate::baseobjspace::getattr_str(cur, sub))?;
     }
     Ok((cur, parent))
 }

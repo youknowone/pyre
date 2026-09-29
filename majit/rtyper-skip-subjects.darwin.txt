@@ -235,14 +235,20 @@ two-phase-never-a-subject	pyre_interpreter::call::call_callable_with_mode
 two-phase-never-a-subject	pyre_interpreter::call::call_function_carrier_with_mode
 two-phase-never-a-subject	pyre_interpreter::call::call_function_impl
 two-phase-never-a-subject	pyre_interpreter::call::call_function_impl_raw
+two-phase-never-a-subject	pyre_interpreter::call::call_non_function_callable_with_mode
 two-phase-never-a-subject	pyre_interpreter::call::call_user_function_plain_with_ctx
 two-phase-never-a-subject	pyre_interpreter::call::call_user_function_with_ctx
 two-phase-never-a-subject	pyre_interpreter::call::check_type_instantiable
+two-phase-never-a-subject	pyre_interpreter::call::classmethod_call_override
 two-phase-never-a-subject	pyre_interpreter::call::frame_into_generator_for_function
 two-phase-never-a-subject	pyre_interpreter::call::genentry_merge_point
 two-phase-never-a-subject	pyre_interpreter::call::make_user_call_frame
+two-phase-never-a-subject	pyre_interpreter::call::metaclass_call_override
 two-phase-never-a-subject	pyre_interpreter::call::prepare_user_call
+two-phase-never-a-subject	pyre_interpreter::call::set_orig_class
+two-phase-never-a-subject	pyre_interpreter::call::staticmethod_call_override
 two-phase-never-a-subject	pyre_interpreter::call::unpack_portal_runner
+two-phase-never-a-subject	pyre_interpreter::call::user_call_slot
 two-phase-never-a-subject	pyre_interpreter::codec_engine::<Impl>::new
 two-phase-never-a-subject	pyre_interpreter::codec_engine::<Impl>::pinned
 two-phase-never-a-subject	pyre_interpreter::codec_engine::adjust_consumed
@@ -1860,3 +1866,5 @@ two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_ObjectKey
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_StrKey_PyObject_0002512fcef93ae1
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_i64_PyObject_aaa40259a54842f8
 two-phase-never-a-subject	setobject::callback_free_set_op__spec_bool_closure_ee601150793776bc
+two-phase-rtype-skipped	pyre_interpreter::module::__pypy__::interp_buffer::__majit_wrap___release_buffer__
+two-phase-rtype-skipped	pyre_interpreter::module::_pickle::pickler::__majit_wrap___persistent_id_default

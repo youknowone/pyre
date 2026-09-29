@@ -59,6 +59,8 @@ impl TypeCache {
             .expect("layout-only TypeDef has no declarations");
         let w_type = w_type_alloc_builtin();
         let _roots = gc_roots::push_roots();
+        let w_type_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_type);
         let bases_start = gc_roots::shadow_stack_len();
         if definition.bases.is_empty() {
             // The root object's declaration still belongs to the legacy
@@ -94,9 +96,9 @@ impl TypeCache {
         };
         let override_def = unsafe { &*overridetypedef };
         let w_override_doc = newtext_or_none(override_def.doc.as_deref());
-        let _ = gc_roots::pin_root(w_override_doc);
+        let w_override_doc = gc_roots::pin_root(w_override_doc);
         unsafe {
-            w_type_set_w_doc(w_type, w_override_doc);
+            w_type_set_w_doc(gc_roots::shadow_stack_get(w_type_slot), w_override_doc);
         }
         for (name, value) in &definition.rawdict {
             let value = match value {
@@ -105,7 +107,10 @@ impl TypeCache {
                 TypeDefValue::Root(slot) => {
                     let value = unsafe { *slot.get() };
                     if unsafe { pyre_object::typedef::is_getset_property(value) } {
-                        crate::typedef::copy_for_type(value, w_type)
+                        crate::typedef::copy_for_type(
+                            value,
+                            gc_roots::shadow_stack_get(w_type_slot),
+                        )
                     } else if unsafe { pyre_object::gateway::is_interp2app(value) } {
                         crate::gateway::interp2app_spacebind(value, &space)
                     } else {
@@ -123,7 +128,7 @@ impl TypeCache {
             };
         }
         crate::typedef::init_builtin_typeobject(
-            w_type,
+            gc_roots::shadow_stack_get(w_type_slot),
             name,
             gc_roots::shadow_stack_get(bases_slot),
             gc_roots::shadow_stack_get(ns_slot),
@@ -132,20 +137,36 @@ impl TypeCache {
         unsafe {
             // setup_builtin_type reads hasdict/weakrefable/heaptype off
             // instancetypedef (the override), not the derived declaration.
-            w_type_set_hasdict(w_type, override_def.hasdict);
-            w_type_set_weakrefable(w_type, override_def.weakrefable);
-            w_type_set_flag_sequence_bug_compat(w_type, definition.flag_sequence_bug_compat);
-            w_type_set_heaptype(w_type, override_def.heaptype);
+            w_type_set_hasdict(
+                gc_roots::shadow_stack_get(w_type_slot),
+                override_def.hasdict,
+            );
+            w_type_set_weakrefable(
+                gc_roots::shadow_stack_get(w_type_slot),
+                override_def.weakrefable,
+            );
+            w_type_set_flag_sequence_bug_compat(
+                gc_roots::shadow_stack_get(w_type_slot),
+                definition.flag_sequence_bug_compat,
+            );
+            w_type_set_heaptype(
+                gc_roots::shadow_stack_get(w_type_slot),
+                override_def.heaptype,
+            );
             if let Some(signature) = &override_def.text_signature {
                 // setup_builtin_type: `w_self.text_signature =
                 // instancetypedef.text_signature`.
-                w_type_set_text_signature(w_type, signature);
+                w_type_set_text_signature(gc_roots::shadow_stack_get(w_type_slot), signature);
             }
             // `W_TypeObject.acceptable_as_base_class` reads
             // `self.layout.typedef.acceptable_as_base_class` — the override
             // declaration, not the derived one.
-            w_type_set_acceptable_as_base_class(w_type, override_def.acceptable_as_base_class());
-            crate::baseobjspace::compute_and_set_mro(w_type).map_err(CacheError::Build)?;
+            w_type_set_acceptable_as_base_class(
+                gc_roots::shadow_stack_get(w_type_slot),
+                override_def.acceptable_as_base_class(),
+            );
+            crate::baseobjspace::compute_and_set_mro(gc_roots::shadow_stack_get(w_type_slot))
+                .map_err(CacheError::Build)?;
             let best = crate::call::find_best_base(gc_roots::shadow_stack_get(bases_slot))
                 .map_err(CacheError::Build)?;
             let parent_layout = if best.is_null() {
@@ -166,10 +187,13 @@ impl TypeCache {
                     dict_data_slot: typeobject::DICT_DATA_SLOT_UNRESOLVED,
                 })
             };
-            w_type_set_layout(w_type, layout);
+            w_type_set_layout(gc_roots::shadow_stack_get(w_type_slot), layout);
             if std::ptr::eq(definition as *const TypeDef, overridetypedef) {
                 // TypeCache.build's else arm: qualify member functions.
-                crate::typedef::stamp_new_descr_self(gc_roots::shadow_stack_get(ns_slot), w_type);
+                crate::typedef::stamp_new_descr_self(
+                    gc_roots::shadow_stack_get(ns_slot),
+                    gc_roots::shadow_stack_get(w_type_slot),
+                );
             } else {
                 // `typedef is not overridetypedef`: skip the
                 // qualname/objclass pass.  `setup_builtin_type` already
@@ -177,12 +201,15 @@ impl TypeCache {
                 // from the override; overwrite only the type-level slot
                 // (`typeobject.py TypeCache.build`).
                 let w_derived_doc = newtext_or_none(definition.doc.as_deref());
-                let _ = gc_roots::pin_root(w_derived_doc);
-                w_type_set_w_doc(w_type, w_derived_doc);
-                crate::typedef::ensure_static_new(gc_roots::shadow_stack_get(ns_slot), w_type);
+                let w_derived_doc = gc_roots::pin_root(w_derived_doc);
+                w_type_set_w_doc(gc_roots::shadow_stack_get(w_type_slot), w_derived_doc);
+                crate::typedef::ensure_static_new(
+                    gc_roots::shadow_stack_get(ns_slot),
+                    gc_roots::shadow_stack_get(w_type_slot),
+                );
             }
         }
-        Ok(w_type)
+        Ok(gc_roots::shadow_stack_get(w_type_slot))
     }
 }
 

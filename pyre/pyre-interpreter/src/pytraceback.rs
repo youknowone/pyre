@@ -462,7 +462,7 @@ pub unsafe fn record_application_traceback(
         // `w_pytraceback_new`, which collects; the local is not rewritten, so
         // re-read the pin after that constructor — the same address the
         // walker writes back into the in-flight cell.
-        crate::eval::set_in_flight_exception(w_exc_object);
+        crate::eval::set_in_flight_exception(roots.get(exc_slot));
         // `pytraceback.py record_application_traceback` builds
         // `PyTraceback(space, frame, last_instruction, tb)` and leaves
         // `lineno` at `LINENO_NOT_COMPUTED`; `get_lineno` resolves it from

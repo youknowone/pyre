@@ -52,8 +52,8 @@ fn skips_inplace_special(a: PyObjectRef, b: PyObjectRef, op: BinaryOperator) -> 
 }
 
 pub fn binary_value(
-    a: PyObjectRef,
-    b: PyObjectRef,
+    mut a: PyObjectRef,
+    mut b: PyObjectRef,
     op: BinaryOperator,
 ) -> Result<PyObjectRef, PyError> {
     // descroperation.py `inplace_impl` — consult the in-place
@@ -74,13 +74,13 @@ pub fn binary_value(
             BinaryOperator::InplaceMultiply => (Some("__rmul__"), true),
             _ => (None, false),
         };
-        if let Some(result) = crate::objspace::descroperation::try_inplace_special(
+        if let Some(result) = pyre_object::with_roots!(a, b => crate::objspace::descroperation::try_inplace_special(
             a,
             b,
             idunder,
             rdunder,
             seq_bug_compat,
-        )? {
+        ))? {
             return Ok(result);
         }
     }
@@ -709,12 +709,13 @@ pub fn load_common_constant_value(cc: crate::bytecode::CommonConstant) -> PyObje
 /// `bh_list_extend_fn`.  Mirrors `list.extend`: fast paths for list/tuple
 /// sources, generic iterator-protocol fallback otherwise (which surfaces
 /// "Value after * must be an iterable, not <T>" when not iterable).
-pub fn list_extend_value(list: PyObjectRef, iterable: PyObjectRef) -> Result<(), PyError> {
+pub fn list_extend_value(list: PyObjectRef, mut iterable: PyObjectRef) -> Result<(), PyError> {
     // pyopcode.py LIST_EXTEND calls the target list's `extend` method.  The
     // builtin body preserves exact-list/tuple storage fast paths while list
     // and tuple subclasses go through `iter()` so an overridden `__iter__`
     // is observed.
-    match crate::type_methods::list_method_extend(&[list, iterable]) {
+    match pyre_object::with_roots!(iterable => crate::type_methods::list_method_extend(&[list, iterable]))
+    {
         Ok(_) => Ok(()),
         Err(error) if crate::baseobjspace::is_iterable(iterable) => Err(error),
         Err(_) => {

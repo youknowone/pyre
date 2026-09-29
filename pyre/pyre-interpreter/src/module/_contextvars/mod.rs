@@ -167,8 +167,15 @@ fn call_method_result(
     name: &str,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    // `args` is a native copy; the attribute lookup can collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(args);
     let method = pyre_interpreter::baseobjspace::getattr_str(obj, name)?;
-    pyre_interpreter::call::call_function_impl_result(method, args)
+    let mut live_args = Vec::with_capacity(args.len());
+    for i in 0..args.len() {
+        live_args.push(_roots.get(base + i));
+    }
+    pyre_interpreter::call::call_function_impl_result(method, &live_args)
 }
 
 fn current_context(create: bool) -> Result<Option<PyObjectRef>, pyre_interpreter::PyError> {
@@ -522,8 +529,10 @@ fn token_enter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::Py
 }
 
 fn token_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let var = pyre_interpreter::baseobjspace::getattr_str(args[0], "_var")?;
-    context_var_reset(&[var, args[0]])?;
+    // `args` is the gateway's native copy; the lookup can collect.
+    let mut w_token = args[0];
+    let var = pyre_object::with_roots!(w_token => pyre_interpreter::baseobjspace::getattr_str(w_token, "_var"))?;
+    context_var_reset(&[var, w_token])?;
     Ok(w_bool_from(false))
 }
 
@@ -543,16 +552,17 @@ pyre_interpreter::py_module! {
         },
     },
     extra_init: |ns| {
-        let context_var = pyre_interpreter::module_ns_get(ns, "ContextVar")
+        let mut ns = ns;
+        let mut context_var = pyre_interpreter::module_ns_get(ns, "ContextVar")
             .expect("_contextvars.ContextVar must be installed first");
-        pyre_interpreter::importing::appleveldef_install_seeded(
+        pyre_object::with_roots!(context_var, ns => pyre_interpreter::importing::appleveldef_install_seeded(
             ns,
             include_str!("_contextvars_app.py"),
             "_contextvars_app.py",
             "_contextvars",
             &["Context"],
             &[("ContextVar", context_var)],
-        )?;
+        ))?;
         let context = pyre_interpreter::module_ns_get(ns, "Context")
             .expect("_contextvars.Context must be installed by appleveldefs");
         // [3.14-spec] PyPy keeps Context as the ordinary app-level class in

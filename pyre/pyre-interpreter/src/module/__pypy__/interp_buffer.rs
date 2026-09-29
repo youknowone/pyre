@@ -245,7 +245,7 @@ pub mod bufferable_impl {
 
         /// PyPy `W_Bufferable.descr_buffer`: subclasses provide the actual
         /// exporter and return a memoryview; the base class itself is abstract.
-        fn __buffer__(&self, w_flags: PyObjectRef) -> Result<PyObjectRef, PyError> {
+        fn __buffer__(&self, mut w_flags: PyObjectRef) -> Result<PyObjectRef, PyError> {
             let self_obj = self as *const W_Bufferable as PyObjectRef;
             let self_type = crate::typedef::r#type(self_obj)
                 .map(|p| p.as_ptr())
@@ -253,7 +253,7 @@ pub mod bufferable_impl {
             if std::ptr::eq(self_type, type_object()) {
                 return Err(PyError::value_error("override __buffer__ in a subclass"));
             }
-            let method = crate::baseobjspace::getattr_str(self_obj, "__buffer__")?;
+            let method = pyre_object::with_roots!(w_flags => crate::baseobjspace::getattr_str(self_obj, "__buffer__"))?;
             let result = crate::baseobjspace::call_function(method, &[w_flags]);
             if result.is_null() {
                 Err(crate::call::take_call_error()
@@ -343,9 +343,10 @@ impl W_PickleBuffer {
         }
         let mv_type = memoryview_type()
             .ok_or_else(|| PyError::runtime_error("memoryview type unavailable"))?;
-        let mv = crate::module::_pickle::call_fn(mv_type, &[w_obj])?;
-        let w_contig = crate::baseobjspace::getattr_str(mv, "contiguous")?;
-        if !crate::baseobjspace::is_true(w_contig)? {
+        let mut mv = crate::module::_pickle::call_fn(mv_type, &[w_obj])?;
+        let w_contig =
+            pyre_object::with_roots!(mv => crate::baseobjspace::getattr_str(mv, "contiguous"))?;
+        if !pyre_object::with_roots!(mv => crate::baseobjspace::is_true(w_contig))? {
             return Err(PyError::new(
                 crate::PyErrorKind::BufferError,
                 "cannot extract raw buffer from non-contiguous buffer",
@@ -539,7 +540,7 @@ fn is_memoryview(obj: PyObjectRef) -> bool {
 ///
 /// The contents are the bytes in physical order, which is what the buffer a
 /// `PickleBuffer` saves is defined to be.
-pub(crate) fn buffer_view(obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> {
+pub(crate) fn buffer_view(mut obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> {
     unsafe {
         if pyre_object::is_bytes(obj) {
             return Ok((pyre_object::bytesobject::w_bytes_data(obj).to_vec(), true));
@@ -564,7 +565,7 @@ pub(crate) fn buffer_view(obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> 
         // 1-D reinterpretation is what goes into the stream.  The only caller
         // has already refused a buffer contiguous in neither order.
         let raw = crate::builtins::memoryview_raw_bytes(obj);
-        let w_data = crate::module::_pickle::call_meth(raw, "tobytes", &[])?;
+        let w_data = pyre_object::with_roots!(obj => crate::module::_pickle::call_meth(raw, "tobytes", &[]))?;
         let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_data) }.to_vec();
         let w_ro = crate::baseobjspace::getattr_str(obj, "readonly")?;
         return Ok((data, crate::baseobjspace::is_true(w_ro)?));

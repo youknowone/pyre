@@ -101,7 +101,7 @@ pub extern "C" fn jit_load_name_from_namespace(
     name_ptr: i64,
     name_len: i64,
 ) -> i64 {
-    let w_globals = namespace_ptr as PyObjectRef;
+    let mut w_globals = namespace_ptr as PyObjectRef;
     let Some(name) = decode_name(name_ptr, name_len) else {
         return 0;
     };
@@ -111,7 +111,9 @@ pub extern "C" fn jit_load_name_from_namespace(
     // object, so a raising key `__eq__` propagates through the traced path
     // instead of being swallowed as a miss.
     if !w_globals.is_null() {
-        let value = match crate::baseobjspace::finditem_str(w_globals, name) {
+        let value = match pyre_object::with_roots!(w_globals =>
+            crate::baseobjspace::finditem_str(w_globals, name)
+        ) {
             Ok(value) => value,
             Err(mut error) => {
                 jit_publish_exception(error.to_exc_object());
@@ -1448,7 +1450,7 @@ pub fn type_dict_delete_wtf8(cls: PyObjectRef, name: &Wtf8) -> bool {
     unsafe { pyre_object::w_dict_delitem_wtf8_no_proxy(dict as PyObjectRef, name) }
 }
 
-pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
+pub fn sequence_len(mut seq: PyObjectRef) -> Result<usize, PyError> {
     unsafe {
         if is_tuple(seq) {
             return Ok(w_tuple_len(seq));
@@ -1462,7 +1464,7 @@ pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
         }
         // Try __len__ on instances
         if is_instance(seq)
-            && let Ok(len_val) = crate::baseobjspace::len(seq)
+            && let Ok(len_val) = pyre_object::with_roots!(seq => crate::baseobjspace::len(seq))
         {
             return Ok(w_int_get_value(len_val) as usize);
         }
@@ -1524,7 +1526,10 @@ pub extern "C" fn jit_sequence_getitem(seq: i64, index: i64) -> i64 {
     }
 }
 
-pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObjectRef>, PyError> {
+pub fn unpack_sequence_exact(
+    mut seq: PyObjectRef,
+    count: usize,
+) -> Result<Vec<PyObjectRef>, PyError> {
     // Fast path only for exact built-in sequence types. Subclasses and other
     // instances may define custom `__iter__` that must be honored.
     // CPython 3.14 `ceval.c:_PyEval_UnpackIterableStackRef` reports the total
@@ -1580,13 +1585,14 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
     // baseobjspace.py _unpackiterable_known_length_jitlook.  pyopcode.py STORE_NAME
     // UNPACK_SEQUENCE wraps the whole `fixedview_unroll` (iter + known-length
     // loop) in a TypeError → "cannot unpack non-iterable %T object" remap.
+    let iter_result = pyre_object::with_roots!(seq => crate::baseobjspace::iter(seq));
     let non_iterable = || {
         PyError::type_error(format!(
             "cannot unpack non-iterable {} object",
             crate::baseobjspace::object_functionstr_type_name(seq)
         ))
     };
-    let iter = match crate::baseobjspace::iter(seq) {
+    let iter = match iter_result {
         Ok(it) => it,
         Err(e) if e.kind == PyErrorKind::TypeError => return Err(non_iterable()),
         Err(e) => return Err(e),

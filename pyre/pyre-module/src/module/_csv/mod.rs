@@ -257,9 +257,9 @@ fn build_dialect_config(
     if !w_dialect.is_null() {
         let mut w_dialect = w_dialect;
         if unsafe { pyre_object::is_str(w_dialect) } {
-            w_dialect = lookup_registered_dialect(w_dialect)?;
+            w_dialect = pyre_object::with_roots!(w_delimiter, w_doublequote, w_escapechar, w_lineterminator, w_quotechar, w_quoting, w_skipinitialspace, w_strict => lookup_registered_dialect(w_dialect))?;
         }
-        if is_csv_dialect(w_dialect)?
+        if pyre_object::with_roots!(w_delimiter, w_dialect, w_doublequote, w_escapechar, w_lineterminator, w_quotechar, w_quoting, w_skipinitialspace, w_strict => is_csv_dialect(w_dialect))?
             && w_delimiter.is_null()
             && w_doublequote.is_null()
             && w_escapechar.is_null()
@@ -272,35 +272,35 @@ fn build_dialect_config(
             return Ok(BuildOutcome::Existing(w_dialect));
         }
         if w_delimiter.is_null() {
-            w_delimiter = fetch(w_dialect, "delimiter")?;
+            w_delimiter = pyre_object::with_roots!(w_dialect, w_doublequote, w_escapechar, w_lineterminator, w_quotechar, w_quoting, w_skipinitialspace, w_strict => fetch(w_dialect, "delimiter"))?;
         }
         if w_doublequote.is_null() {
-            w_doublequote = fetch(w_dialect, "doublequote")?;
+            w_doublequote = pyre_object::with_roots!(w_delimiter, w_dialect, w_escapechar, w_lineterminator, w_quotechar, w_quoting, w_skipinitialspace, w_strict => fetch(w_dialect, "doublequote"))?;
         }
         if w_escapechar.is_null() {
-            w_escapechar = fetch(w_dialect, "escapechar")?;
+            w_escapechar = pyre_object::with_roots!(w_delimiter, w_dialect, w_doublequote, w_lineterminator, w_quotechar, w_quoting, w_skipinitialspace, w_strict => fetch(w_dialect, "escapechar"))?;
         }
         if w_lineterminator.is_null() {
-            w_lineterminator = fetch(w_dialect, "lineterminator")?;
+            w_lineterminator = pyre_object::with_roots!(w_delimiter, w_dialect, w_doublequote, w_escapechar, w_quotechar, w_quoting, w_skipinitialspace, w_strict => fetch(w_dialect, "lineterminator"))?;
         }
         if w_quotechar.is_null() {
-            w_quotechar = fetch(w_dialect, "quotechar")?;
+            w_quotechar = pyre_object::with_roots!(w_delimiter, w_dialect, w_doublequote, w_escapechar, w_lineterminator, w_quoting, w_skipinitialspace, w_strict => fetch(w_dialect, "quotechar"))?;
         }
         if w_quoting.is_null() {
-            w_quoting = fetch(w_dialect, "quoting")?;
+            w_quoting = pyre_object::with_roots!(w_delimiter, w_dialect, w_doublequote, w_escapechar, w_lineterminator, w_quotechar, w_skipinitialspace, w_strict => fetch(w_dialect, "quoting"))?;
         }
         if w_skipinitialspace.is_null() {
-            w_skipinitialspace = fetch(w_dialect, "skipinitialspace")?;
+            w_skipinitialspace = pyre_object::with_roots!(w_delimiter, w_dialect, w_doublequote, w_escapechar, w_lineterminator, w_quotechar, w_quoting, w_strict => fetch(w_dialect, "skipinitialspace"))?;
         }
         if w_strict.is_null() {
-            w_strict = fetch(w_dialect, "strict")?;
+            w_strict = pyre_object::with_roots!(w_delimiter, w_doublequote, w_escapechar, w_lineterminator, w_quotechar, w_quoting, w_skipinitialspace => fetch(w_dialect, "strict"))?;
         }
     }
 
     let delimiter = get_codepoint(w_delimiter, Some(',' as u32), "delimiter", false)?;
-    let doublequote = get_bool(w_doublequote, true)?;
+    let doublequote = pyre_object::with_roots!(w_escapechar, w_lineterminator, w_quotechar, w_quoting, w_skipinitialspace, w_strict => get_bool(w_doublequote, true))?;
     let escapechar = get_codepoint(w_escapechar, None, "escapechar", true)?;
-    let lineterminator = get_str(w_lineterminator, "\r\n", "lineterminator")?;
+    let lineterminator = pyre_object::with_roots!(w_quotechar, w_quoting, w_skipinitialspace, w_strict => get_str(w_lineterminator, "\r\n", "lineterminator"))?;
     let mut quoting = get_int(w_quoting, QUOTE_MINIMAL, "quoting")?;
     if !valid_quoting(quoting) {
         return Err(PyError::type_error("bad \"quoting\" value"));
@@ -311,7 +311,8 @@ fn build_dialect_config(
         quoting = QUOTE_NONE;
     }
     let quotechar = get_codepoint(w_quotechar, Some('"' as u32), "quotechar", true)?;
-    let skipinitialspace = get_bool(w_skipinitialspace, false)?;
+    let skipinitialspace =
+        pyre_object::with_roots!(w_strict => get_bool(w_skipinitialspace, false))?;
     let strict = get_bool(w_strict, false)?;
 
     let delimiter = delimiter
@@ -403,21 +404,21 @@ fn read_char_field(d: PyObjectRef, name: &str) -> Result<Option<u32>, PyError> {
 
 /// Recover the internal `DialectConfig` from a `_csv.Dialect` instance's
 /// private slots — used by the reader/writer hot paths.
-fn derive_config(d: PyObjectRef) -> Result<DialectConfig, PyError> {
-    let delimiter = read_char_field(d, "_csv_delimiter")?.unwrap_or(',' as u32);
-    let quotechar = read_char_field(d, "_csv_quotechar")?;
-    let escapechar = read_char_field(d, "_csv_escapechar")?;
-    let doublequote = pyre_interpreter::baseobjspace::is_true(
-        pyre_interpreter::baseobjspace::getattr_str(d, "_csv_doublequote")?,
-    )?;
-    let skipinitialspace = pyre_interpreter::baseobjspace::is_true(
-        pyre_interpreter::baseobjspace::getattr_str(d, "_csv_skipinitialspace")?,
-    )?;
-    let strict = pyre_interpreter::baseobjspace::is_true(
-        pyre_interpreter::baseobjspace::getattr_str(d, "_csv_strict")?,
-    )?;
+fn derive_config(mut d: PyObjectRef) -> Result<DialectConfig, PyError> {
+    let delimiter =
+        pyre_object::with_roots!(d => read_char_field(d, "_csv_delimiter"))?.unwrap_or(',' as u32);
+    let quotechar = pyre_object::with_roots!(d => read_char_field(d, "_csv_quotechar"))?;
+    let escapechar = pyre_object::with_roots!(d => read_char_field(d, "_csv_escapechar"))?;
+    let w_doublequote = pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::getattr_str(d, "_csv_doublequote"))?;
+    let doublequote =
+        pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::is_true(w_doublequote))?;
+    let w_skipinitialspace = pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::getattr_str(d, "_csv_skipinitialspace"))?;
+    let skipinitialspace =
+        pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::is_true(w_skipinitialspace))?;
+    let w_strict = pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::getattr_str(d, "_csv_strict"))?;
+    let strict = pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::is_true(w_strict))?;
     let quoting = {
-        let v = pyre_interpreter::baseobjspace::getattr_str(d, "_csv_quoting")?;
+        let v = pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::getattr_str(d, "_csv_quoting"))?;
         if unsafe { pyre_object::is_int(v) } {
             unsafe { pyre_object::w_int_get_value(v) }
         } else {
@@ -679,11 +680,11 @@ fn to_float(w_str: PyObjectRef) -> Result<PyObjectRef, PyError> {
 /// `W_Reader.next_w` — parse the next CSV record from the underlying line
 /// iterator. Re-entering the reader from its own line iterator (gh-145105) is
 /// rejected with a `_csv.Error`.
-fn reader_next_impl(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let reading = pyre_interpreter::baseobjspace::getattr_str(self_obj, "_reading")
+fn reader_next_impl(mut self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let reading = pyre_object::with_roots!(self_obj => pyre_interpreter::baseobjspace::getattr_str(self_obj, "_reading")
         .ok()
         .map(|v| pyre_interpreter::baseobjspace::is_true(v).unwrap_or(false))
-        .unwrap_or(false);
+        .unwrap_or(false));
     if reading {
         return Err(csv_error("reader is already iterating".to_string()));
     }
@@ -707,12 +708,12 @@ fn reader_next_impl(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     result
 }
 
-fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let dialect_obj = pyre_interpreter::baseobjspace::getattr_str(self_obj, "dialect")?;
-    let cfg = derive_config(dialect_obj)?;
+fn reader_next_inner(mut self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let dialect_obj = pyre_object::with_roots!(self_obj => pyre_interpreter::baseobjspace::getattr_str(self_obj, "dialect"))?;
+    let cfg = pyre_object::with_roots!(self_obj => derive_config(dialect_obj))?;
     let limit = FIELD_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
     let mut line_num = {
-        let v = pyre_interpreter::baseobjspace::getattr_str(self_obj, "line_num")?;
+        let v = pyre_object::with_roots!(self_obj => pyre_interpreter::baseobjspace::getattr_str(self_obj, "line_num"))?;
         if unsafe { pyre_object::is_int(v) } {
             unsafe { pyre_object::w_int_get_value(v) }
         } else {
@@ -951,14 +952,15 @@ fn special_chars(cfg: &DialectConfig) -> Vec<u32> {
 
 /// `W_Writer.writerow` — serialize one record.
 fn writer_writerow_impl(
-    self_obj: PyObjectRef,
-    w_fields: PyObjectRef,
+    mut self_obj: PyObjectRef,
+    mut w_fields: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
-    let dialect_obj = pyre_interpreter::baseobjspace::getattr_str(self_obj, "dialect")?;
-    let cfg = derive_config(dialect_obj)?;
-    let w_filewrite = pyre_interpreter::baseobjspace::getattr_str(self_obj, "_write")?;
+    let dialect_obj = pyre_object::with_roots!(self_obj, w_fields => pyre_interpreter::baseobjspace::getattr_str(self_obj, "dialect"))?;
+    let cfg = pyre_object::with_roots!(self_obj, w_fields => derive_config(dialect_obj))?;
+    let mut w_filewrite = pyre_object::with_roots!(w_fields => pyre_interpreter::baseobjspace::getattr_str(self_obj, "_write"))?;
 
-    let row = match pyre_interpreter::builtins::collect_iterable(w_fields) {
+    let row = match pyre_object::with_roots!(w_fields, w_filewrite => pyre_interpreter::builtins::collect_iterable(w_fields))
+    {
         Ok(r) => r,
         Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {
             let r =
@@ -1109,10 +1111,10 @@ fn writer_writerow_impl(
 
 /// `W_Writer.writerows` — serialize a sequence of records.
 fn writer_writerows_impl(
-    self_obj: PyObjectRef,
+    mut self_obj: PyObjectRef,
     w_seqseq: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
-    let it = pyre_interpreter::baseobjspace::iter(w_seqseq)?;
+    let it = pyre_object::with_roots!(self_obj => pyre_interpreter::baseobjspace::iter(w_seqseq))?;
     let _roots = gc_roots::push_roots();
     let it_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(it);
@@ -1231,21 +1233,21 @@ pyre_interpreter::py_module! {
         // `csv_reader` — build the reader over an iterable of lines.
         fn reader(
             iterable: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] dialect: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] delimiter: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] doublequote: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] escapechar: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] lineterminator: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] quotechar: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] quoting: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] skipinitialspace: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] strict: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut dialect: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut delimiter: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut doublequote: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut escapechar: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut lineterminator: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut quotechar: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut quoting: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut skipinitialspace: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut strict: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let w_iter = pyre_interpreter::baseobjspace::iter(iterable)?;
-            let dialect_obj = resolve_dialect(
+            let mut w_iter = pyre_object::with_roots!(delimiter, dialect, doublequote, escapechar, lineterminator, quotechar, quoting, skipinitialspace, strict => pyre_interpreter::baseobjspace::iter(iterable))?;
+            let dialect_obj = pyre_object::with_roots!(w_iter => resolve_dialect(
                 dialect, delimiter, doublequote, escapechar, lineterminator,
                 quotechar, quoting, skipinitialspace, strict,
-            )?;
+            ))?;
             let r = pyre_object::w_instance_new(reader_class::type_object());
             let _roots = gc_roots::push_roots();
             let slot = gc_roots::shadow_stack_len();
@@ -1261,7 +1263,7 @@ pyre_interpreter::py_module! {
 
         // `csv_writer` — build the writer over a file-like object's `write`.
         fn writer(
-            fileobj: PyObjectRef,
+            mut fileobj: PyObjectRef,
             #[default(pyre_object::PY_NULL)] dialect: PyObjectRef,
             #[default(pyre_object::PY_NULL)] delimiter: PyObjectRef,
             #[default(pyre_object::PY_NULL)] doublequote: PyObjectRef,
@@ -1272,14 +1274,14 @@ pyre_interpreter::py_module! {
             #[default(pyre_object::PY_NULL)] skipinitialspace: PyObjectRef,
             #[default(pyre_object::PY_NULL)] strict: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let dialect_obj = resolve_dialect(
+            let mut dialect_obj = pyre_object::with_roots!(fileobj => resolve_dialect(
                 dialect, delimiter, doublequote, escapechar, lineterminator,
                 quotechar, quoting, skipinitialspace, strict,
-            )?;
+            ))?;
             // A missing `write` attribute is a TypeError ("argument 1 must
             // have a write method"); a `write` whose access itself raises
             // (e.g. a property) propagates that error unchanged.
-            let w_write = match pyre_interpreter::baseobjspace::getattr_str(fileobj, "write") {
+            let w_write = match pyre_object::with_roots!(dialect_obj => pyre_interpreter::baseobjspace::getattr_str(fileobj, "write")) {
                 Ok(w) => w,
                 Err(e) if e.kind == pyre_interpreter::PyErrorKind::AttributeError => {
                     return Err(PyError::type_error("argument 1 must have a write method"));
@@ -1299,7 +1301,7 @@ pyre_interpreter::py_module! {
 
         // `app_csv.register_dialect` — validate + register under `name`.
         fn register_dialect(
-            name: PyObjectRef,
+            mut name: PyObjectRef,
             #[default(pyre_object::PY_NULL)] dialect: PyObjectRef,
             #[default(pyre_object::PY_NULL)] delimiter: PyObjectRef,
             #[default(pyre_object::PY_NULL)] doublequote: PyObjectRef,
@@ -1313,10 +1315,10 @@ pyre_interpreter::py_module! {
             if !unsafe { pyre_object::is_str(name) } {
                 return Err(PyError::type_error("dialect name must be a string"));
             }
-            let dialect_obj = resolve_dialect(
+            let dialect_obj = pyre_object::with_roots!(name => resolve_dialect(
                 dialect, delimiter, doublequote, escapechar, lineterminator,
                 quotechar, quoting, skipinitialspace, strict,
-            )?;
+            ))?;
             let dialects = csv_dialects()?;
             unsafe { pyre_object::dictmultiobject::w_dict_store(dialects, name, dialect_obj) };
             Ok(pyre_object::w_none())
@@ -1350,16 +1352,14 @@ pyre_interpreter::py_module! {
         // own `basicsize`, and a spec that does gets no managed weakref.  It
         // is therefore the one module exception class that is not
         // weak-referenceable, together with `ssl.SSLError`.
-        pyre_interpreter::module_ns_store(
-            ns,
-            "Error",
-            pyre_interpreter::builtins::make_exc_type(
-                "_csv.Error",
-                pyre_interpreter::builtins::exc_exception_new,
-                pyre_interpreter::builtins::lookup_exc_class("Exception")
-                    .expect("Exception must be installed before _csv init"),
-            ),
-        );
+        let mut ns = ns;
+        let w_error = pyre_object::with_roots!(ns => pyre_interpreter::builtins::make_exc_type(
+            "_csv.Error",
+            pyre_interpreter::builtins::exc_exception_new,
+            pyre_interpreter::builtins::lookup_exc_class("Exception")
+                .expect("Exception must be installed before _csv init"),
+        ));
+        pyre_interpreter::module_ns_store(ns, "Error", w_error);
         // `app_csv._dialects = {}` — the registry mapping.  It is stored in
         // the module namespace under the name PyPy gives it and published to
         // the state the accelerator reads, which is what keeps it reachable

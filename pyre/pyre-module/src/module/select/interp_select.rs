@@ -80,7 +80,7 @@ impl Poll {
     /// `POLLIN | POLLOUT | POLLPRI`.
     fn register(
         &mut self,
-        w_fd: PyObjectRef,
+        mut w_fd: PyObjectRef,
         #[default(pyre_object::w_none())] w_events: PyObjectRef,
     ) -> Result<(), pyre_interpreter::PyError> {
         // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.  The
@@ -88,7 +88,8 @@ impl Poll {
         let events = if unsafe { pyre_object::is_none(w_events) } {
             default_poll_events()
         } else {
-            pyre_interpreter::baseobjspace::c_ushort_w(w_events)? as i16
+            pyre_object::with_roots!(w_fd => pyre_interpreter::baseobjspace::c_ushort_w(w_events))?
+                as i16
         };
         let fd = filedescriptor_w(w_fd)?;
         self.fddict.insert(fd, events);
@@ -99,12 +100,13 @@ impl Poll {
     /// a descriptor that was never registered.
     fn modify(
         &mut self,
-        w_fd: PyObjectRef,
+        mut w_fd: PyObjectRef,
         w_events: PyObjectRef,
     ) -> Result<(), pyre_interpreter::PyError> {
         // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.  The
         // gateway converts it before the body resolves the descriptor.
-        let events = pyre_interpreter::baseobjspace::c_ushort_w(w_events)? as i16;
+        let events = pyre_object::with_roots!(w_fd => pyre_interpreter::baseobjspace::c_ushort_w(w_events))?
+            as i16;
         let fd = filedescriptor_w(w_fd)?;
         let known = self.fddict.contains_key(&fd);
         if known {
@@ -351,7 +353,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // the caller's root bracket and named by its slot.
                 fn collect_fds(
                     seq: pyre_object::PyObjectRef,
-                ) -> Result<Vec<(usize, host_select::RawFd)>, pyre_interpreter::PyError> {
+                ) -> Result<Vec<(usize, host_select::RawFd)>, pyre_interpreter::PyError>
+                {
                     let items = pyre_interpreter::baseobjspace::unpackiterable(seq, -1)?;
                     let base = pyre_object::gc_roots::pin_roots(&items);
                     let mut out = Vec::with_capacity(items.len());
@@ -372,13 +375,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // are usually lists, whose header moves, so reading the second
                 // and third out of the slice after the first was collected
                 // hands `unpackiterable` a pre-move address.  Pin them here and
-                // read each back at its own call.
+                // read each back at its own call.  All four are published
+                // before the first forwarding query.
                 let arg_roots = pyre_object::gc_roots::push_roots();
-                let args_base = arg_roots.base();
-                let _ = arg_roots.pin_root(args[0]);
-                let _ = arg_roots.pin_root(args[1]);
-                let _ = arg_roots.pin_root(args[2]);
-                let _ = arg_roots.pin_root(args.get(3).copied().unwrap_or(pyre_object::PY_NULL));
+                let args_base = arg_roots.pin_roots(&[
+                    args[0],
+                    args[1],
+                    args[2],
+                    args.get(3).copied().unwrap_or(pyre_object::PY_NULL),
+                ]);
                 let rfds = collect_fds(arg_roots.get(args_base))?;
                 let wfds = collect_fds(arg_roots.get(args_base + 1))?;
                 let xfds = collect_fds(arg_roots.get(args_base + 2))?;

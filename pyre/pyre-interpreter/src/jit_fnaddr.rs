@@ -1056,6 +1056,10 @@ pub fn is_rewindable_root_bracket_residual(addr: usize) -> bool {
             .into_iter()
             .filter(|(path, _)| {
                 path.ends_with("::RootScope::pin_root")
+                    || path.ends_with("::RootScope::pin_roots")
+                    || path.ends_with("::RootScope::publish")
+                    || path.ends_with("::RootScope::normalize")
+                    || path.ends_with("::RootScope::set")
                     || path.ends_with("::RootScope::get")
                     || path.ends_with("::RootScope::base")
                     || path.ends_with("::gc_roots::shadow_stack_cell")
@@ -1072,6 +1076,10 @@ pub fn is_rewindable_root_bracket_residual(addr: usize) -> bool {
                     || *path == "pyre_object::shadow_stack_get"
                     || path.ends_with("::gc_roots::pin_root")
                     || *path == "pyre_object::pin_root"
+                    || path.ends_with("::gc_roots::pin_roots")
+                    || *path == "pyre_object::pin_roots"
+                    || path.ends_with("::gc_roots::publish_roots")
+                    || *path == "pyre_object::publish_roots"
                     || path.ends_with("::gc_roots::push_roots")
                     || *path == "pyre_object::push_roots"
             })
@@ -1648,6 +1656,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::publish_roots",
         pyre_object::gc_roots::publish_roots_jit_abi,
     );
+    cpa1(
+        &mut entries,
+        "pyre_object::gc_roots::pin_roots",
+        "pyre_object::pin_roots",
+        pyre_object::gc_roots::pin_roots_jit_abi,
+    );
     // The scope-local pair a bracket body spells as `roots.pin_root(w)` /
     // `roots.get(slot)`: the same pin through the cached cell, and its
     // read-back half.  The codewriter names an inherent method by its
@@ -1669,6 +1683,41 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::gc_roots::RootScope::get",
         "gc_roots::RootScope::get",
         scope_get,
+    );
+    // The rest of the scope-local API a bracket body calls on its guard: the
+    // slice-taking pair through the one-word array ABI `publish_roots` uses,
+    // and the run normalize and slot write, whose arguments are words.
+    let scope_publish: extern "C" fn(&pyre_object::gc_roots::RootScope, i64) -> i64 =
+        pyre_object::gc_roots::RootScope::publish_jit_abi;
+    cpa2(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::publish",
+        "gc_roots::RootScope::publish",
+        scope_publish,
+    );
+    let scope_pin_roots: extern "C" fn(&pyre_object::gc_roots::RootScope, i64) -> i64 =
+        pyre_object::gc_roots::RootScope::pin_roots_jit_abi;
+    cpa2(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::pin_roots",
+        "gc_roots::RootScope::pin_roots",
+        scope_pin_roots,
+    );
+    let scope_normalize: fn(&pyre_object::gc_roots::RootScope, usize, usize) =
+        pyre_object::gc_roots::RootScope::normalize;
+    pa3(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::normalize",
+        "gc_roots::RootScope::normalize",
+        scope_normalize,
+    );
+    let scope_set: fn(&pyre_object::gc_roots::RootScope, usize, pyre_object::PyObjectRef) =
+        pyre_object::gc_roots::RootScope::set;
+    pa3(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::set",
+        "gc_roots::RootScope::set",
+        scope_set,
     );
     // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY` bit,
     // and `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — both through

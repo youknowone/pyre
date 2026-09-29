@@ -1547,6 +1547,11 @@ pub unsafe fn w_long_range_iter_has_next(obj: PyObjectRef) -> bool {
 /// `obj` must point to a valid `W_LongRangeIterator`.
 pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
     unsafe {
+        // The iterator is rewritten after the rbigint arithmetic below, and
+        // every step of it allocates digits.
+        let _roots = crate::gc_roots::push_roots();
+        let iter_slot = crate::gc_roots::shadow_stack_len();
+        let obj = crate::gc_roots::pin_root(obj);
         let it = obj as *mut W_LongRangeIterator;
         let index = RBigIntGcRoot::new(range_obj_to_bigint((*it).index));
         let len = RBigIntGcRoot::new(range_obj_to_bigint((*it).len));
@@ -1562,9 +1567,6 @@ pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         // RPython's GC transform roots this local automatically.
         let product = RBigIntGcRoot::new(index.mul(&*step));
         let value = RBigIntGcRoot::new(start.add(&*product));
-        let _roots = crate::gc_roots::push_roots();
-        let _ = crate::gc_roots::pin_root(obj);
-        let iter_slot = crate::gc_roots::shadow_stack_len() - 1;
         let next_index = range_bigint_to_obj(index.int_add(1));
         let next_index = crate::gc_roots::pin_root(next_index);
         let it = crate::gc_roots::shadow_stack_get(iter_slot) as *mut W_LongRangeIterator;

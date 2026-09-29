@@ -58,9 +58,10 @@ impl W_BytesIO {
         // and `close` run after they store into the old stream. An unchanged
         // address — the whole `exports == 0` path, which returns before it
         // collects — skips both.
-        let current = self.buffer;
-        let live = unsafe { crate::builtins::bytearray_check_exports(current)? };
-        if !std::ptr::eq(live, current) {
+        // Only the pre-call address is kept: it is compared, never read.
+        let current_addr = self.buffer as usize;
+        let live = unsafe { crate::builtins::bytearray_check_exports(self.buffer)? };
+        if live as usize != current_addr {
             self.buffer = live;
             pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
         }
@@ -226,15 +227,16 @@ impl W_BytesIO {
 
     /// `space.buffer_w(w_data, space.BUF_CONTIG_RO)` — the contiguous
     /// read-only bytes `descr_init` and `write_w` both copy from.
-    fn contiguous_bytes(w_data: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-        let Some(input) = crate::baseobjspace::simple_buffer_bytes(w_data)? else {
+    fn contiguous_bytes(mut w_data: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+        let Some(data) = pyre_object::with_roots!(w_data =>
+            crate::baseobjspace::simple_buffer_bytes(w_data)
+                .map(|input| input.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)))?
+        else {
             return Err(crate::PyError::type_error(format!(
                 "a bytes-like object is required, not '{}'",
                 crate::type_methods::arg_type_name(w_data)
             )));
         };
-        let data = input.as_bytes().to_vec();
-        input.release();
         Ok(data)
     }
 
@@ -536,10 +538,10 @@ impl W_BytesIO {
         ]))
     }
 
-    fn __setstate__(&mut self, w_state: PyObjectRef) -> Result<(), crate::PyError> {
+    fn __setstate__(&mut self, mut w_state: PyObjectRef) -> Result<(), crate::PyError> {
         // interp_bytesio.py:212-227.
         self.check_closed()?;
-        let length = crate::baseobjspace::len_w(w_state)?;
+        let length = pyre_object::with_roots!(w_state => crate::baseobjspace::len_w(w_state))?;
         if length != 3 {
             return Err(crate::PyError::type_error(format!(
                 "{}.__setstate__ argument should be 3-tuple, got {}",

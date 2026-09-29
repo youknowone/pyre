@@ -258,8 +258,8 @@ fn weak_cache_contains(
 /// frame it replaces is most of what the check costs: the body is three
 /// operations, and entering Python to run them is the rest.
 fn simple_weak_set_contains(
-    cache: PyObjectRef,
-    item: PyObjectRef,
+    mut cache: PyObjectRef,
+    mut item: PyObjectRef,
 ) -> Result<Option<bool>, pyre_interpreter::PyError> {
     if !pyre_interpreter::typedef::r#type(cache)
         .is_some_and(|actual| std::ptr::eq(actual.as_ptr(), simple_weak_set_type()))
@@ -271,7 +271,8 @@ fn simple_weak_set_contains(
     // rebinding either global its body resolves — the `ref` it calls, the
     // `TypeError` it catches — each leaves every instance an exact
     // `SimpleWeakSet` while changing what a membership test answers.
-    let Some(installed) = installed_contains_identity() else {
+    let Some(installed) = pyre_object::with_roots!(cache, item => installed_contains_identity())
+    else {
         return Ok(None);
     };
     if simple_weak_set_contains_identity() != installed {
@@ -422,20 +423,24 @@ fn negative_cache_version_compare(
 /// `app_abc.py _abc_init` — install the three collections and the
 /// negative-cache generation, then compute `__abstractmethods__`.
 fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    if let Some(&cls) = args.first() {
+    if let Some(mut cls) = args.first().copied() {
         // `app_abc.py:74-77` — registry and both caches are per-class for the
         // same reason: resolved up the MRO, one base's would answer for every
         // descendant ABC, and a hit on `Rational` would satisfy `Integral`.
         // Each value is built before the call that stores it, so that no
         // allocation happens between reading `cls` and using it.
         for name in ["_abc_registry", "_abc_cache", "_abc_negative_cache"] {
-            let fresh = new_simple_weak_set()?;
-            pyre_interpreter::baseobjspace::setattr_str(cls, name, fresh)?;
+            let fresh = pyre_object::with_roots!(cls => new_simple_weak_set())?;
+            pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::setattr_str(cls, name, fresh))?;
         }
         let version = w_int_new(INVALIDATION_COUNTER.load(Ordering::Relaxed) as i64);
-        pyre_interpreter::baseobjspace::setattr_str(cls, "_abc_negative_cache_version", version)?;
+        pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::setattr_str(
+            cls,
+            "_abc_negative_cache_version",
+            version
+        ))?;
         let mut abstract_names = Vec::new();
-        let bases = unsafe { w_type_get_bases(cls) };
+        let mut bases = unsafe { w_type_get_bases(cls) };
         if !bases.is_null() && unsafe { is_tuple(bases) } {
             for i in 0..unsafe { w_tuple_len(bases) } {
                 let Some(base) = (unsafe { w_tuple_getitem(bases, i as i64) }) else {
@@ -444,29 +449,32 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
                 // app_abc.py:67-71 — `getattr(..., set())` defaults only a
                 // missing attribute.  A descriptor failure is observable and
                 // any iterable, not just a set/frozenset, supplies names.
-                let names = match pyre_interpreter::baseobjspace::getattr_str(
+                let names = match pyre_object::with_roots!(bases, cls => pyre_interpreter::baseobjspace::getattr_str(
                     base,
                     "__abstractmethods__",
-                ) {
+                )) {
                     Ok(names) => names,
                     Err(err) if err.kind == pyre_interpreter::PyErrorKind::AttributeError => {
                         w_set_new()
                     }
                     Err(err) => return Err(err),
                 };
-                for name in pyre_interpreter::builtins::collect_iterable(names)? {
+                for mut name in pyre_object::with_roots!(bases, cls => pyre_interpreter::builtins::collect_iterable(names))?
+                {
                     // `_py_abc.py:69` — object-level getattr validates that
                     // every supplied abstract-method name is a string, then
                     // lets descriptors and metaclass attributes provide an
                     // implementation.  Only a missing attribute defaults.
-                    let value = match pyre_interpreter::baseobjspace::getattr(cls, name) {
+                    let value = match pyre_object::with_roots!(bases, cls, name => pyre_interpreter::baseobjspace::getattr(cls, name))
+                    {
                         Ok(value) => value,
                         Err(err) if err.kind == pyre_interpreter::PyErrorKind::AttributeError => {
                             w_none()
                         }
                         Err(err) => return Err(err),
                     };
-                    if pyre_interpreter::baseobjspace::isabstractmethod_w(value)? {
+                    if pyre_object::with_roots!(bases, cls, name => pyre_interpreter::baseobjspace::isabstractmethod_w(value))?
+                    {
                         abstract_names.push(name);
                     }
                 }
@@ -474,15 +482,16 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
         }
         let namespace = unsafe { w_type_get_dict_ptr(cls) as PyObjectRef };
         if !namespace.is_null() {
-            for (name, value) in unsafe { w_dict_items(namespace) } {
+            for (mut name, value) in unsafe { w_dict_items(namespace) } {
                 let value = unsafe { pyre_object::celldict::unwrap_cell(value) };
-                if pyre_interpreter::baseobjspace::isabstractmethod_w(value)? {
+                if pyre_object::with_roots!(cls, name => pyre_interpreter::baseobjspace::isabstractmethod_w(value))?
+                {
                     abstract_names.push(name);
                 }
             }
         }
         let methods = w_frozenset_from_items(&abstract_names);
-        pyre_interpreter::baseobjspace::setattr_str(cls, "__abstractmethods__", methods)?;
+        pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::setattr_str(cls, "__abstractmethods__", methods))?;
 
         // `app_abc.py _abc_init` — fold a `__abc_tpflags__` in the class body
         // into the structural-match marker, then drop the attribute.
@@ -541,8 +550,8 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
             "_abc_register() requires (cls, subclass)",
         ));
     }
-    let cls = args[0];
-    let subclass = args[1];
+    let mut cls = args[0];
+    let mut subclass = args[1];
     // `_abc_register`: `if not isinstance(subclass, type): raise TypeError(
     // "Can only register classes")`.  Everything downstream reads a registry
     // entry as a class, so the rejection is what makes that sound.
@@ -554,18 +563,20 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     // Already a subclass (`issubclass(subclass, cls)`) — nothing to register.
     // This also dedups: a previously registered `subclass` resolves through
     // `__subclasscheck__`'s registry walk.
-    if pyre_interpreter::baseobjspace::issubclass(subclass, cls)? {
+    if pyre_object::with_roots!(cls, subclass => pyre_interpreter::baseobjspace::issubclass(subclass, cls))?
+    {
         return Ok(subclass);
     }
     // Registering `subclass` would also make `cls` its subclass.  Tested after
     // the arm above, so `X.register(X)` stays a no-op rather than a cycle.
-    if pyre_interpreter::baseobjspace::issubclass(cls, subclass)? {
+    if pyre_object::with_roots!(cls, subclass => pyre_interpreter::baseobjspace::issubclass(cls, subclass))?
+    {
         return Err(pyre_interpreter::PyError::runtime_error(
             "Refusing to create an inheritance cycle",
         ));
     }
     // `app_abc.py cls._abc_registry.add(subclass)`.
-    weak_cache_add(cls, "_abc_registry", subclass)?;
+    pyre_object::with_roots!(cls, subclass => weak_cache_add(cls, "_abc_registry", subclass))?;
     // `app_abc.py:100-101` — invalidate every negative cache.  A class this
     // registration now makes a subclass may already be recorded as a non-match
     // somewhere, and only the counter can reach those entries: they live on
@@ -637,7 +648,9 @@ fn internal_set_collection_flag(
             "_internal_set_collection_flag() requires (cls, flag)",
         ));
     };
-    set_collection_flag_of(*w_type, pyre_interpreter::baseobjspace::int_w(*w_flag)?)?;
+    let mut w_type = *w_type;
+    let flag = pyre_object::with_roots!(w_type => pyre_interpreter::baseobjspace::int_w(*w_flag))?;
+    set_collection_flag_of(w_type, flag)?;
     Ok(w_none())
 }
 
@@ -650,16 +663,14 @@ fn internal_set_collection_flag_recursive(
             "_internal_set_collection_flag_recursive() requires (cls, flag)",
         ));
     };
-    let marker = collection_marker(
-        *w_type,
-        pyre_interpreter::baseobjspace::int_w(*w_flag)?,
-        "_internal_set_collection_flag_recursive",
-    )?;
+    let mut w_type = *w_type;
+    let flag = pyre_object::with_roots!(w_type => pyre_interpreter::baseobjspace::int_w(*w_flag))?;
+    let marker = collection_marker(w_type, flag, "_internal_set_collection_flag_recursive")?;
     // `_PyType_SetFlagsRecursive` starts the guarded walk at the argument
     // itself, not at its children: `set_collection_flag` stamps whatever it is
     // handed, so entering through that one would let this primitive mark an
     // immutable type -- `str` among them.
-    set_collection_flag_recursive(*w_type, marker);
+    set_collection_flag_recursive(w_type, marker);
     Ok(w_none())
 }
 
@@ -976,9 +987,9 @@ fn reset_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter:
 /// Cleared in place rather than rebound, so anything already holding the set
 /// sees the clear.
 fn reset_caches(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    if let Some(&cls) = args.first() {
+    if let Some(mut cls) = args.first().copied() {
         for name in ["_abc_cache", "_abc_negative_cache"] {
-            weak_cache_clear(cls, name)?;
+            pyre_object::with_roots!(cls => weak_cache_clear(cls, name))?;
         }
     }
     Ok(w_none())
@@ -1031,14 +1042,15 @@ pyre_interpreter::py_module! {
         "_internal_set_collection_flag_recursive" / 2 = internal_set_collection_flag_recursive,
     },
     extra_init: |ns| {
-        pyre_interpreter::importing::appleveldef_install_seeded(
+        let mut ns = ns;
+        pyre_object::with_roots!(ns => pyre_interpreter::importing::appleveldef_install_seeded(
             ns,
             include_str!("app_abc.py"),
             "app_abc.py",
             "_abc",
             &["SimpleWeakSet"],
             &[],
-        )?;
+        ))?;
         let simple_weak_set = pyre_interpreter::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
         SIMPLE_WEAK_SET_TYPE.set(simple_weak_set);

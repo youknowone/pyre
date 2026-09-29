@@ -22,8 +22,8 @@
 use std::collections::{HashMap, HashSet};
 
 use majit_charon_reader::ullbc::{
-    CallFunc, CallKind, FunId, Operand, Place, PlaceKind, Rvalue, StmtKind, SwitchTargets,
-    TermKind, TyRef,
+    CallFunc, CallKind, FunId, Operand, Place, PlaceKind, ProjectionElem, Rvalue, StmtKind,
+    SwitchTargets, TermKind, TyRef,
 };
 
 /// One call that can collect, with GC pointers live across it and no bracket.
@@ -123,6 +123,12 @@ pub struct ScanStats {
     /// Locals summed over [`Self::bodies_with_movable_args`], so a body that
     /// contributes one argument is told apart from one that contributes twenty.
     pub movable_arg_locals: usize,
+    /// [`Self::withheld_contents_opaque`] split by the first reason the body's
+    /// pinned set went unread.
+    pub opaque_by_reason: std::collections::BTreeMap<&'static str, usize>,
+    /// One entry per body with unread contents: function, file, first
+    /// reason, and how many withheld calls it cost.
+    pub opaque_bodies: Vec<(String, String, &'static str, usize)>,
 }
 
 /// A pin whose argument the body goes on to read.
@@ -305,6 +311,85 @@ pub fn gc_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
     out
 }
 
+/// The type ids of `&[PyObjectRef]` in *this* artefact.
+///
+/// A builtin receives its arguments as a native slice: a copy the collector
+/// does not rewrite, so an element read after a collecting call is the same
+/// stale word a bare local would be.  Each borrow region is its own type id,
+/// so the spellings are read off every body's locals, as for `Option`.
+pub fn gc_slice_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64>) -> HashSet<u64> {
+    let id_of = |v: &serde_json::Value| {
+        v.get("Deduplicated")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| v.pointer("/Value/0").and_then(serde_json::Value::as_u64))
+    };
+    let body_of = |v: &serde_json::Value| {
+        v.pointer("/Value/1")
+            .cloned()
+            .or_else(|| id_of(v).and_then(|id| llbc.dedup_body(id).cloned()))
+    };
+    let mut seen = HashSet::new();
+    let mut out = HashSet::new();
+    for fd in llbc.iter_local_fns() {
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
+        for l in &body.locals.locals {
+            let Some(t) = ty_id(&l.ty) else { continue };
+            if gc_tys.contains(&t) || !seen.insert(t) {
+                continue;
+            }
+            let elem = llbc
+                .dedup_body(t)
+                .and_then(|b| b.pointer("/Ref/1").cloned())
+                .and_then(|inner| body_of(&inner))
+                .and_then(|inner| inner.pointer("/Slice/0").and_then(id_of));
+            if elem.is_some_and(|e| gc_tys.contains(&e)) {
+                out.insert(t);
+            }
+        }
+    }
+    out
+}
+
+/// The type ids of `Option<PyObjectRef>` in *this* artefact.
+///
+/// A GC pointer held as `Option<PyObjectRef>` goes stale across a collecting
+/// call exactly like a bare one: the payload is the same word, and nothing
+/// publishes it.  Read off every body's locals, so the answer covers only
+/// the spellings a body actually holds.
+pub fn gc_option_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64>) -> HashSet<u64> {
+    let mut seen = HashSet::new();
+    let mut out = HashSet::new();
+    for fd in llbc.iter_local_fns() {
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
+        for l in &body.locals.locals {
+            let Some(t) = ty_id(&l.ty) else { continue };
+            if gc_tys.contains(&t) || !seen.insert(t) {
+                continue;
+            }
+            let is_option = llbc
+                .dedup_to_adt_def_id(t)
+                .and_then(|def| llbc.type_by_id(def))
+                .is_some_and(|td| td.item_meta.name_path() == "core::option::Option");
+            if !is_option {
+                continue;
+            }
+            let arg = llbc
+                .dedup_body(t)
+                .and_then(|v| v.pointer("/Adt/generics/types/0"))
+                .and_then(|v| serde_json::from_value::<TyRef>(v.clone()).ok())
+                .and_then(|r| ty_id(&r));
+            if arg.is_some_and(|a| gc_tys.contains(&a)) {
+                out.insert(t);
+            }
+        }
+    }
+    out
+}
+
 /// The type ids a `PyFrame` pointer is spelled with in *this* artefact.
 ///
 /// The frame is the second thing a minor collection can leave a body holding a
@@ -360,8 +445,14 @@ fn bare_local(p: &Place) -> Option<u64> {
     }
 }
 
+/// `x.PtrMetadata` -- a fat pointer's length, not the words behind it.
+fn is_metadata_place(p: &Place) -> bool {
+    matches!(&p.kind, PlaceKind::Projection(_, ProjectionElem::Atom(e)) if e == "PtrMetadata")
+}
+
 fn use_operand(o: &Operand, out: &mut HashSet<u64>) {
     match o {
+        Operand::Copy(p) | Operand::Move(p) if is_metadata_place(p) => {}
         Operand::Copy(p) | Operand::Move(p) => {
             if let Some(l) = place_local(p) {
                 out.insert(l);
@@ -373,6 +464,9 @@ fn use_operand(o: &Operand, out: &mut HashSet<u64>) {
 
 fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
     match r {
+        // A slice's length lives in the fat pointer, not in the elements the
+        // collector would have to forward.
+        Rvalue::Len(_) => {}
         Rvalue::Use(o, _) | Rvalue::UnaryOp(_, o) => use_operand(o, out),
         Rvalue::BinaryOp(_, a, b) => {
             use_operand(a, out);
@@ -388,7 +482,7 @@ fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
                 use_operand(o, out);
             }
         }
-        Rvalue::Discriminant(p) | Rvalue::Len(p) => {
+        Rvalue::Discriminant(p) => {
             if let Some(l) = place_local(p) {
                 out.insert(l);
             }
@@ -543,6 +637,22 @@ pub fn scan(
 ) -> (Vec<Finding>, ScanStats) {
     let mut findings = Vec::new();
     let mut stats = ScanStats::default();
+    // Calls that read a slice's length or test a word against null.  A moved
+    // object's stale address is still non-null, so neither answer changes.
+    let metadata_fns: HashSet<u64> = cg
+        .names
+        .iter()
+        .filter(|(_, n)| {
+            matches!(
+                n.as_str(),
+                "core::slice::<Impl>::len"
+                    | "core::slice::<Impl>::is_empty"
+                    | "core::ptr::mut_ptr::<Impl>::is_null"
+                    | "core::ptr::const_ptr::<Impl>::is_null"
+            )
+        })
+        .map(|(id, _)| *id)
+        .collect();
     for fd in llbc.iter_local_fns() {
         let id = fd.def_id;
         if !reach.contains(&id) {
@@ -762,6 +872,10 @@ pub fn scan(
         // `pin_roots(&[..])` lowers through.
         let mut defs: HashMap<u64, PinSrc> = HashMap::new();
         let mut defined: HashSet<u64> = HashSet::new();
+        // `_t = &mut _l`: a callee handed `_t` owns keeping `_l` current, the
+        // way `try_dispatch_binary_special` pins both operands and writes the
+        // live words back through its `&mut` parameters.
+        let mut mut_borrow_of: HashMap<u64, u64> = HashMap::new();
         for (b, blk) in body.body.iter().enumerate() {
             for st in &blk.statements {
                 let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
@@ -772,7 +886,24 @@ pub fn scan(
                 };
                 if !defined.insert(d) {
                     defs.remove(&d);
+                    mut_borrow_of.remove(&d);
                     continue;
+                }
+                // A two-phase call argument reborrows: `_t = &mut _l;
+                // _u = &TwoPhaseMut (*_t)`, so a deref of a recorded borrow
+                // names the same local.
+                if let Rvalue::Ref { place, kind, .. } = &rv
+                    && matches!(kind.as_str(), Some("Mut" | "TwoPhaseMut"))
+                    && let Some(l) = bare_local(place).or_else(|| match &place.kind {
+                        PlaceKind::Projection(base, ProjectionElem::Atom(elem))
+                            if elem == "Deref" =>
+                        {
+                            bare_local(base).and_then(|t| mut_borrow_of.get(&t).copied())
+                        }
+                        _ => None,
+                    })
+                {
+                    mut_borrow_of.insert(d, l);
                 }
                 if let Some(src) = pin_src(&rv) {
                     defs.insert(d, src);
@@ -798,7 +929,13 @@ pub fn scan(
         if has_nested_scopes {
             stats.bodies_with_nested_scopes += 1;
         }
-        let mut opaque_contents = unparsed_terms || unparsed_stmts;
+        let mut opaque_reason: Option<&'static str> = if unparsed_terms {
+            Some("unparsed-terminator")
+        } else if unparsed_stmts {
+            Some("unparsed-statement")
+        } else {
+            None
+        };
         let mut saw_pin_call = false;
         let mut term_pins: Vec<HashSet<u64>> = vec![HashSet::new(); n];
         // The locals a pin was *handed*, as distinct from the word it hands
@@ -825,7 +962,7 @@ pub fn scan(
                 // These overwrite an existing coloured slot.  Without a
                 // slot→root map, retaining the old root or replacing the
                 // wrong one could both claim false coverage.
-                opaque_contents = true;
+                opaque_reason.get_or_insert("slot-set");
                 continue;
             }
             // Reading a slot back yields the word the slot holds now, which
@@ -866,7 +1003,7 @@ pub fn scan(
             if pinned.is_empty() {
                 // A pin that named nothing we could resolve is a pin we do not
                 // understand, not one that pinned nothing.
-                opaque_contents = true;
+                opaque_reason.get_or_insert("pin-names-nothing");
             }
             term_pins[b] = pinned;
         }
@@ -878,13 +1015,13 @@ pub fn scan(
             (term_closes_root_scope[b] && (closed_scope[b].is_none() || stack_at[b].is_none()))
                 || (!term_pins[b].is_empty() && owner_at[b].is_none())
         }) {
-            opaque_contents = true;
+            opaque_reason.get_or_insert("scope-owner-ambiguous");
         }
         if !bracket_blocks.is_empty() && !saw_pin_call {
             // A scope is open and nothing in this body names what went into
             // it: the pins run behind a helper that holds the scope itself,
             // as `RootedItems` does.  An unread set, not an empty one.
-            opaque_contents = true;
+            opaque_reason.get_or_insert("no-pin-in-body");
         }
 
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -1118,10 +1255,10 @@ pub fn scan(
                         live.extend(sl.iter().copied());
                     }
                 }
-                transfer_term(t, &mut live);
+                transfer_term(t, &mut live, &metadata_fns);
                 for st in body.body[b].statements.iter().rev() {
                     if let Ok(k) = st.stmt_kind() {
-                        transfer_stmt(&k, &mut live);
+                        transfer_stmt(&k, &mut live, &gc_locals);
                     }
                 }
                 live.retain(|l| gc_locals.contains_key(l));
@@ -1251,6 +1388,15 @@ pub fn scan(
             if let Some(d) = bare_local(&call.dest) {
                 after.remove(&d);
             }
+            for a in &call.args {
+                let mut used: HashSet<u64> = HashSet::new();
+                use_operand(a, &mut used);
+                for t in used {
+                    if let Some(l) = mut_borrow_of.get(&t) {
+                        after.remove(l);
+                    }
+                }
+            }
             after.retain(|l| gc_locals.contains_key(l));
             // One span answers every column below, and it is the
             // terminator's own: the call being reported *is* the terminator,
@@ -1264,8 +1410,20 @@ pub fn scan(
                 // questions, and only the first was ever asked.  Grade the
                 // second here so a bracket that pins the wrong set stops
                 // reading as coverage.
-                if opaque_contents || !reachable.contains(&b) {
+                if opaque_reason.is_some() || !reachable.contains(&b) {
                     stats.withheld_contents_opaque += 1;
+                    let reason = opaque_reason.unwrap_or("unreachable-block");
+                    *stats.opaque_by_reason.entry(reason).or_default() += 1;
+                    let fname = fd.item_meta.name_path();
+                    match stats.opaque_bodies.last_mut() {
+                        Some(last) if last.0 == fname => last.3 += 1,
+                        _ => stats.opaque_bodies.push((
+                            fname,
+                            llbc.file_path(at.file_id).unwrap_or_default().to_string(),
+                            reason,
+                            1,
+                        )),
+                    }
                     if has_nested_scopes {
                         stats.withheld_opaque_from_nested += 1;
                     }
@@ -1388,11 +1546,20 @@ pub fn scan(
     (findings, stats)
 }
 
-fn transfer_stmt(k: &StmtKind, live: &mut HashSet<u64>) {
+fn transfer_stmt(k: &StmtKind, live: &mut HashSet<u64>, tracked: &HashMap<u64, String>) {
     match k {
         StmtKind::Assign(p, r) => {
             if let Some(d) = bare_local(p) {
-                live.remove(&d);
+                // `_t = &*args` / `_t = copy x` into a tracked local reads `x`
+                // only if `_t` is read later: the reborrow a `args.len()` call
+                // takes is dead once the length is out.  Only for a tracked
+                // destination -- an untracked one is never in `live`, so its
+                // later reads are invisible here.
+                let pure = matches!(r, Rvalue::Use(..) | Rvalue::Ref { .. } | Rvalue::Cast(..));
+                let was_live = live.remove(&d);
+                if pure && tracked.contains_key(&d) && !was_live {
+                    return;
+                }
             } else if let Some(l) = place_local(p) {
                 live.insert(l);
             }
@@ -1424,13 +1591,21 @@ fn term_span<'a>(
         .expect("span id is not in the artefact span table")
 }
 
-fn transfer_term(t: &TermKind, live: &mut HashSet<u64>) {
+fn transfer_term(t: &TermKind, live: &mut HashSet<u64>, metadata_fns: &HashSet<u64>) {
     match t {
         TermKind::Call { call, .. } => {
             if let Some(d) = bare_local(&call.dest) {
                 live.remove(&d);
             } else if let Some(l) = place_local(&call.dest) {
                 live.insert(l);
+            }
+            let metadata_only = matches!(
+                &call.func,
+                CallFunc::Regular(reg)
+                    if matches!(&reg.kind, CallKind::Fun(FunId::Regular { id }) if metadata_fns.contains(id))
+            );
+            if metadata_only {
+                return;
             }
             for a in &call.args {
                 use_operand(a, live);

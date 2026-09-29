@@ -325,12 +325,12 @@ fn encode_impl(
 }
 
 pub(crate) fn getcodec(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
-    let Some(w_name) = args.first().copied() else {
+    let Some(mut w_name) = args.first().copied() else {
         return Err(pyre_interpreter::PyError::type_error(
             "getcodec() missing codec name",
         ));
     };
-    let name = pyre_interpreter::baseobjspace::text_w(w_name)?;
+    let name = pyre_object::with_roots!(w_name => pyre_interpreter::baseobjspace::text_w(w_name))?;
     if !codec_supported(name) {
         return Err(pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::LookupError,
@@ -340,17 +340,18 @@ pub(crate) fn getcodec(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     // `_codecs_jp` reaches this through `from _multibytecodec import
     // __getcodec`, i.e. an import — so resolve the module the same way rather
     // than requiring some earlier importer to have populated `sys.modules`.
-    let module = match pyre_interpreter::importing::get_sys_module("_multibytecodec") {
+    let module = match pyre_object::with_roots!(w_name => pyre_interpreter::importing::get_sys_module("_multibytecodec"))
+    {
         Some(module) => module,
-        None => pyre_interpreter::importing::importhook(
+        None => pyre_object::with_roots!(w_name => pyre_interpreter::importing::importhook(
             rustpython_wtf8::Wtf8::new("_multibytecodec"),
             pyre_object::PY_NULL,
             pyre_object::w_tuple_new(vec![pyre_object::w_str_new("MultibyteCodec")]),
             0,
             pyre_interpreter::call::getexecutioncontext(),
-        )?,
+        ))?,
     };
-    let cls = pyre_interpreter::baseobjspace::getattr_str(module, "MultibyteCodec")?;
+    let cls = pyre_object::with_roots!(w_name => pyre_interpreter::baseobjspace::getattr_str(module, "MultibyteCodec"))?;
     pyre_interpreter::call::call_function_impl_result(cls, &[w_name])
 }
 
@@ -379,17 +380,15 @@ fn publish_codec_args(
 /// Acquire the decoder input and copy it out.  `SimpleBufferBytes` has no
 /// `Drop`, so the export stays active until `release`, and a `bytearray` that
 /// is decoded twice would refuse to resize.
-fn codec_input_bytes(w_input: PyObjectRef) -> Result<Vec<u8>, pyre_interpreter::PyError> {
-    let buffer =
-        pyre_interpreter::baseobjspace::simple_buffer_bytes(w_input)?.ok_or_else(|| {
-            pyre_interpreter::PyError::type_error(format!(
-                "a bytes-like object is required, not '{}'",
-                pyre_interpreter::type_methods::arg_type_name(w_input)
-            ))
-        })?;
-    let input = buffer.as_bytes().to_vec();
-    buffer.release();
-    Ok(input)
+fn codec_input_bytes(mut w_input: PyObjectRef) -> Result<Vec<u8>, pyre_interpreter::PyError> {
+    pyre_object::with_roots!(w_input => pyre_interpreter::baseobjspace::simple_buffer_bytes(w_input)
+        .map(|buffer| buffer.map(pyre_interpreter::baseobjspace::SimpleBufferBytes::into_bytes)))?
+    .ok_or_else(|| {
+        pyre_interpreter::PyError::type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            pyre_interpreter::type_methods::arg_type_name(w_input)
+        ))
+    })
 }
 
 /// `errors: str(accept={str, NoneType})` -- the conversion the two
@@ -520,8 +519,11 @@ fn raw_initial_state(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
             "_initial_state() requires 2 arguments",
         ));
     }
-    let name = pyre_interpreter::baseobjspace::text_w(positional[0])?;
-    let decoder = pyre_interpreter::baseobjspace::is_true(positional[1])?;
+    let w_name = positional[0];
+    let mut w_decoder = positional[1];
+    let name =
+        pyre_object::with_roots!(w_decoder => pyre_interpreter::baseobjspace::text_w(w_name))?;
+    let decoder = pyre_interpreter::baseobjspace::is_true(w_decoder)?;
     let codec = cjkcodecs::Codec::from_name(name).ok_or_else(|| {
         pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::LookupError,

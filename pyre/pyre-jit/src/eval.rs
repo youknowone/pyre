@@ -9129,7 +9129,25 @@ fn portal_activation_bracketed(
             if let Ok(value) = &result {
                 w_exitvalue = *value;
             }
-            match unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, w_exitvalue) } {
+            let mut result = result;
+            // `return_trace` runs application Python while the exit value and
+            // the pending exception are still owed to `leave`.
+            let return_trace_result = {
+                let roots = pyre_object::gc_roots::push_roots();
+                let exit_slot = roots.base();
+                let exit = roots.pin_root(w_exitvalue);
+                let err_slot = match &result {
+                    Err(err) => err.pin_exc_object(&roots),
+                    Ok(_) => None,
+                };
+                let trace = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, exit) };
+                w_exitvalue = roots.get(exit_slot);
+                if let Err(err) = &mut result {
+                    err.reload_exc_object(&roots, err_slot);
+                }
+                trace
+            };
+            match return_trace_result {
                 Err(err) => Err(err),
                 Ok(live) => {
                     w_exitvalue = live;
@@ -9145,17 +9163,29 @@ fn portal_activation_bracketed(
     // one exception: its trace records enter/leave around CALL_ASSEMBLER, so
     // this helper supplies the otherwise-skipped hook only and must not close
     // the trace-owned chain a second time.
-    let leave_result = match leave_owner {
-        PortalLeaveOwner::ExecutionContext => unsafe {
-            (*ec).leave(
-                frame_root.frame() as *mut PyFrame,
-                w_exitvalue,
-                outer_result.is_err(),
-            )
-        },
-        PortalLeaveOwner::CompiledTrace => unsafe {
-            (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)
-        },
+    let mut outer_result = outer_result;
+    let leave_result = {
+        let roots = pyre_object::gc_roots::push_roots();
+        let err_slot = match &outer_result {
+            Err(err) => err.pin_exc_object(&roots),
+            Ok(_) => None,
+        };
+        let left = match leave_owner {
+            PortalLeaveOwner::ExecutionContext => unsafe {
+                (*ec).leave(
+                    frame_root.frame() as *mut PyFrame,
+                    w_exitvalue,
+                    outer_result.is_err(),
+                )
+            },
+            PortalLeaveOwner::CompiledTrace => unsafe {
+                (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)
+            },
+        };
+        if let Err(err) = &mut outer_result {
+            err.reload_exc_object(&roots, err_slot);
+        }
+        left
     };
     // The compiled trace owns only the raw `topframeref` restore.  Preserve
     // `ExecutionContext.leave`'s separate escape-propagation arm even when the
@@ -9305,9 +9335,9 @@ pub extern "C" fn ll_unpackiterable_portal_runner_shim(
 
 /// `warmspot.py ll_portal_runner` for `generatorentry_driver`.
 fn generatorentry_ll_portal_runner(
-    pycode: pyre_object::PyObjectRef,
-    w_gen: pyre_object::PyObjectRef,
-    w_arg: pyre_object::PyObjectRef,
+    mut pycode: pyre_object::PyObjectRef,
+    mut w_gen: pyre_object::PyObjectRef,
+    mut w_arg: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError> {
     // `ll_portal_runner` calls `maybe_compile_and_run` before `portal_ptr`.
     // `send_ex` only reaches its own merge-point hook when `we_are_jitted`
@@ -9317,7 +9347,12 @@ fn generatorentry_ll_portal_runner(
         let (driver, _) = driver_pair();
         driver.meta_interp().is_tracing()
     };
-    if !tracing && let Some(result) = genentry_merge_point_jit(w_gen, w_arg, pycode) {
+    // The portal's reds and green stay live across `maybe_compile_and_run`,
+    // which can trace, compile or run the loop.
+    if !tracing
+        && let Some(result) = pyre_object::with_roots!(pycode, w_gen, w_arg =>
+            genentry_merge_point_jit(w_gen, w_arg, pycode))
+    {
         return result;
     }
     pyre_interpreter::generatorentry_portal(pycode, w_gen, w_arg)

@@ -29,10 +29,10 @@ pub fn mini_buffer_params(w_obj: PyObjectRef) -> Option<(*mut u8, usize)> {
 
 /// `cbuffer.py MiniBuffer___new__`.
 fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_cdata = *args
+    let mut w_cdata = *args
         .get(1)
         .ok_or_else(|| PyError::type_error("buffer() missing cdata argument"))?;
-    let cdata = cdataobj::cdata_arg(w_cdata)?;
+    let cdata = pyre_object::with_roots!(w_cdata => cdataobj::cdata_arg(w_cdata))?;
     let ct = ctypeobj::ctype_at(cdata.ctype)
         .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
     // The signature binder pads an omitted optional argument with `PY_NULL`.
@@ -40,7 +40,9 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // app-level argument to `MiniBuffer___new__`.
     let explicit_size = args.get(2).is_some_and(|value| !value.is_null());
     let mut size = match args.get(2) {
-        Some(&w_size) if !w_size.is_null() => pyre_interpreter::baseobjspace::int_w(w_size)?,
+        Some(&w_size) if !w_size.is_null() => {
+            pyre_object::with_roots!(w_cdata => pyre_interpreter::baseobjspace::int_w(w_size))?
+        }
         None => -1,
         Some(_) => -1,
     };
@@ -51,7 +53,7 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
                     && ctypeobj::ctype_at(structobj.ctype)
                         .is_some_and(|item| item.is_struct_or_union())
                 {
-                    size = cdataobj::cdata_sizeof(structobj as *mut _ as PyObjectRef)?;
+                    size = pyre_object::with_roots!(w_cdata => cdataobj::cdata_sizeof(structobj as *mut _ as PyObjectRef))?;
                 }
                 if size < 0 {
                     size = super::ctypeptr::item_of(ct)?.size;
@@ -60,7 +62,7 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         }
         ctypeobj::KIND_ARRAY => {
             if size < 0 {
-                size = cdataobj::cdata_sizeof(w_cdata)?;
+                size = pyre_object::with_roots!(w_cdata => cdataobj::cdata_sizeof(w_cdata))?;
             }
         }
         _ => {
@@ -77,15 +79,15 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         )));
     }
     if explicit_size {
-        let max_size = cdataobj::maximum_buffer_size(w_cdata)?;
+        let max_size = pyre_object::with_roots!(w_cdata => cdataobj::maximum_buffer_size(w_cdata))?;
         if max_size >= 0 && size > max_size {
-            pyre_interpreter::warn::warn_category(
+            pyre_object::with_roots!(w_cdata => pyre_interpreter::warn::warn_category(
                 &format!(
                     "ffi.buffer(cdata, bytes): creating a buffer of {size} bytes over a cdata that owns only {max_size} bytes.  This will crash if you access the extra memory"
                 ),
                 "UserWarning",
                 1,
-            )?;
+            ))?;
         }
     }
     let roots = pyre_object::gc_roots::push_roots();
@@ -154,17 +156,20 @@ fn mini_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// `MiniBuffer.descr_setitem`.
 fn mini_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
-    let value_slot = roots.base();
-    let _ = roots.pin_root(args[2]);
-    let (start, size) = if unsafe { pyre_object::sliceobject::is_slice(args[1]) } {
+    let args_base = roots.pin_roots(&[args[0], args[1], args[2]]);
+    let self_slot = args_base;
+    let index_slot = args_base + 1;
+    let value_slot = args_base + 2;
+    let w_index = roots.get(index_slot);
+    let (start, size) = if unsafe { pyre_object::sliceobject::is_slice(w_index) } {
         let (raw_start, raw_stop, step) = unsafe {
             pyre_interpreter::sliceobject::slice_unpack(
-                pyre_object::sliceobject::w_slice_get_start(args[1]),
-                pyre_object::sliceobject::w_slice_get_stop(args[1]),
-                pyre_object::sliceobject::w_slice_get_step(args[1]),
+                pyre_object::sliceobject::w_slice_get_start(w_index),
+                pyre_object::sliceobject::w_slice_get_stop(w_index),
+                pyre_object::sliceobject::w_slice_get_step(w_index),
             )?
         };
-        let length = buffer_arg(args[0])?.size;
+        let length = buffer_arg(roots.get(self_slot))?.size;
         let (start, _, step, size) =
             pyre_interpreter::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, length);
         if step != 1 {
@@ -172,7 +177,8 @@ fn mini_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         }
         (start, size)
     } else {
-        let index = adjusted_index(args[1], buffer_arg(args[0])?.size)?;
+        let length = buffer_arg(roots.get(self_slot))?.size;
+        let index = adjusted_index(roots.get(index_slot), length)?;
         (index, 1)
     };
     let Some(value) = pyre_interpreter::baseobjspace::simple_buffer_bytes(roots.get(value_slot))?
@@ -185,7 +191,7 @@ fn mini_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             "cannot modify size of memoryview object",
         ));
     }
-    let buffer = buffer_arg(args[0])?;
+    let buffer = buffer_arg(roots.get(self_slot))?;
     unsafe {
         std::ptr::copy_nonoverlapping(
             value.as_bytes().as_ptr(),
@@ -201,10 +207,18 @@ fn comparison(args: &[PyObjectRef], mode: fn(Ordering) -> bool) -> Result<PyObje
     if unsafe { pyre_object::unicodeobject::is_str(args[1]) } {
         return Ok(pyre_object::special::w_not_implemented());
     }
-    let Some(other) = pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1])? else {
+    let mut w_self = args[0];
+    let w_other = args[1];
+    // The view owns a bracket of its own, above this one; this one stays
+    // open until the view is released.
+    let self_roots = pyre_object::gc_roots::push_roots();
+    let self_base = self_roots.pin_roots(&[w_self]);
+    let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(w_other);
+    w_self = self_roots.get(self_base);
+    let Some(other) = acquired? else {
         return Ok(pyre_object::special::w_not_implemented());
     };
-    let buffer = buffer_arg(args[0])?;
+    let buffer = buffer_arg(w_self)?;
     // A buffer over a NULL cdata is empty, and no slice may be built from a
     // null address even at length zero.  `_comparison_helper` reads zero bytes.
     let mine = if buffer.ptr.is_null() {

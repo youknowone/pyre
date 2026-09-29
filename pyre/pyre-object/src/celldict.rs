@@ -307,18 +307,27 @@ pub fn object_mutable_cell_write_barrier(cell: *mut u8) {
 /// # Safety
 /// `w_cell` must be either `None` or a valid PyObjectRef.  `w_value`
 /// must be a valid non-null PyObjectRef.
-pub unsafe fn write_cell(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> Option<PyObjectRef> {
+pub unsafe fn write_cell(
+    w_cell: Option<PyObjectRef>,
+    mut w_value: PyObjectRef,
+) -> Option<PyObjectRef> {
     debug_assert!(!w_value.is_null(), "write_cell: null value");
-    match classify_cell_write(w_cell, w_value) {
-        CellWrite::InPlaceObject(cell) => {
+    // `space.is_w` of a long and a machine int builds an rbigint, so the
+    // value stored below and the cell rewritten in place stay rooted
+    // across the classification.
+    let mut w_cell_word = w_cell.unwrap_or(std::ptr::null_mut());
+    let write = crate::with_roots!(w_cell_word, w_value => classify_cell_write(w_cell, w_value));
+    match write {
+        CellWrite::InPlaceObject(_) => {
+            let cell = w_cell_word;
             // Barrier before the store, the `remember_young_pointer` order.
             // An in-place int store writes no `PyObjectRef` and needs none.
             object_mutable_cell_write_barrier(cell as *mut u8);
             (*(cell as *mut ObjectMutableCell)).w_value = w_value;
             None
         }
-        CellWrite::InPlaceInt(cell, intvalue) => {
-            (*(cell as *mut IntMutableCell)).intvalue = intvalue;
+        CellWrite::InPlaceInt(_, intvalue) => {
+            (*(w_cell_word as *mut IntMutableCell)).intvalue = intvalue;
             None
         }
         CellWrite::Unchanged => None,
@@ -1158,11 +1167,12 @@ impl ModuleDictStrategy {
     pub fn _setitem_str_cell_known(
         &mut self,
         cell: Option<PyObjectRef>,
-        w_dict: PyObjectRef,
+        mut w_dict: PyObjectRef,
         key: &str,
         w_value: PyObjectRef,
     ) {
-        let Some(w_to_store) = (unsafe { write_cell(cell, w_value) }) else {
+        let Some(w_to_store) = crate::with_roots!(w_dict => unsafe { write_cell(cell, w_value) })
+        else {
             // In-place cell mutation: storage slot unchanged, version
             // stays valid (matches the JIT-cache-stable fast path).
             return;

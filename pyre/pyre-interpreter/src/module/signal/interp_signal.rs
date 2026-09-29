@@ -295,9 +295,9 @@ fn windows_handles_signal(signum: i32) -> bool {
 /// interp_signal.py `signal(signum, handler) -> previous`.
 fn signal_signal(
     w_signum: PyObjectRef,
-    w_handler: PyObjectRef,
+    mut w_handler: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let signum = signum_arg(w_signum)?;
+    let signum = pyre_object::with_roots!(w_handler => signum_arg(w_signum))?;
     // interp_signal.py — only the main/signal-enabled execution
     // context may install process signal handlers.
     let ec = crate::call::getexecutioncontext() as *const ExecutionContext;
@@ -765,7 +765,9 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
 /// from `libc::*` so they match the host's POSIX numbering (the previous
 /// macOS-flavoured hard-coded list disagreed with Linux for
 /// SIGUSR1/SIGUSR2/SIGCHLD).
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+pub fn register_module(
+    #[cfg_attr(not(unix), allow(unused_mut))] mut ns: pyre_object::PyObjectRef,
+) -> Result<(), crate::PyError> {
     // interp_signal.py `signal(signum, handler) -> previous`.
     crate::module_ns_store(
         ns,
@@ -1106,15 +1108,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // itimers it reports on, so a platform without them does not carry it.
         let w_os_error = crate::builtins::lookup_exc_class("OSError")
             .expect("OSError must be installed before _signal init");
-        crate::module_ns_store(
-            ns,
-            "ItimerError",
-            crate::builtins::new_exception_class(
-                "signal.ItimerError",
-                crate::builtins::exc_os_error_new,
-                w_os_error,
-            ),
-        );
+        let itimer_error = pyre_object::with_roots!(ns => crate::builtins::new_exception_class(
+            "signal.ItimerError",
+            crate::builtins::exc_os_error_new,
+            w_os_error,
+        ));
+        crate::module_ns_store(ns, "ItimerError", itimer_error);
         crate::module_ns_store(
             ns,
             "alarm",

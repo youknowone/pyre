@@ -23,10 +23,16 @@ fn import_module(name: &str) -> Result<PyObjectRef, PyError> {
     if let Some(module) = crate::importing::get_sys_module(name) {
         return Ok(module);
     }
+    // The fresh `"*"` has to be rooted across the list's own allocation.
+    let w_fromlist = {
+        let mut items = pyre_object::gc_roots::RootedItems::new();
+        items.push(w_str_new("*"));
+        w_list_new(items.take())
+    };
     crate::importing::importhook(
         rustpython_wtf8::Wtf8::new(name),
         w_none(),
-        w_list_new(vec![w_str_new("*")]),
+        w_fromlist,
         0,
         crate::call::getexecutioncontext(),
     )?;
@@ -141,7 +147,7 @@ fn get_category(message: PyObjectRef, category: PyObjectRef) -> Result<PyObjectR
             .map(|p| p.as_ptr())
             .ok_or_else(|| PyError::type_error("warning instance has no type"));
     }
-    let category = if category.is_null() || unsafe { is_none(category) } {
+    let mut category = if category.is_null() || unsafe { is_none(category) } {
         warning_class("UserWarning")
     } else {
         category
@@ -150,7 +156,7 @@ fn get_category(message: PyObjectRef, category: PyObjectRef) -> Result<PyObjectR
     // from inside its own `try`, so the enclosing `except OperationError` catches
     // that raise and re-reports it in the `'%T'` form.  A plain False and a
     // subclass check that itself fails therefore reach the caller identically.
-    match crate::baseobjspace::issubclass(category, warning) {
+    match pyre_object::with_roots!(category => crate::baseobjspace::issubclass(category, warning)) {
         Ok(true) => Ok(category),
         Ok(false) | Err(_) => Err(PyError::type_error(format!(
             "category must be a Warning subclass, not '{}'",
@@ -440,16 +446,18 @@ pub(crate) fn show_warning(
     let source_line_slot = pin_root_slot(source_line);
     let source_slot = pin_root_slot(source);
     if let Some(show) = warnings_attr("_showwarnmsg") {
-        if !crate::baseobjspace::callable_w(show) {
+        let show_slot = pin_root_slot(show);
+        if !crate::baseobjspace::callable_w(pyre_object::gc_roots::shadow_stack_get(show_slot)) {
             return Err(PyError::type_error(
                 "warnings._showwarnmsg() must be set to a callable",
             ));
         }
         let cls = warnings_attr("WarningMessage")
             .ok_or_else(|| PyError::runtime_error("unable to get warnings.WarningMessage"))?;
+        let cls_slot = pin_root_slot(cls);
         let lineno_slot = pin_root_slot(w_int_new(lineno));
         let warning_message = crate::call::call_function_impl_result(
-            cls,
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
             &[
                 pyre_object::gc_roots::shadow_stack_get(message_slot),
                 pyre_object::gc_roots::shadow_stack_get(category_slot),
@@ -457,7 +465,7 @@ pub(crate) fn show_warning(
                 pyre_object::gc_roots::shadow_stack_get(lineno_slot),
                 w_none(),
                 w_none(),
-                if source.is_null() {
+                if pyre_object::gc_roots::shadow_stack_get(source_slot).is_null() {
                     w_none()
                 } else {
                     pyre_object::gc_roots::shadow_stack_get(source_slot)
@@ -466,7 +474,7 @@ pub(crate) fn show_warning(
         )?;
         let warning_message_slot = pin_root_slot(warning_message);
         crate::call::call_function_impl_result(
-            show,
+            pyre_object::gc_roots::shadow_stack_get(show_slot),
             &[pyre_object::gc_roots::shadow_stack_get(
                 warning_message_slot,
             )],
@@ -780,6 +788,7 @@ pub(crate) fn do_warn_explicit(
         lineno,
         pyre_object::gc_roots::shadow_stack_get(module_slot),
     )?;
+    let item_slot = pin_root_slot(item);
     if action == "error" {
         return Err(unsafe {
             PyError::from_exc_object(pyre_object::gc_roots::shadow_stack_get(message_slot))
@@ -819,7 +828,11 @@ pub(crate) fn do_warn_explicit(
         } else if action != "default" {
             return Err(PyError::runtime_error(format!(
                 "Unrecognized action ({action}) in warnings.filters: {}",
-                if item.is_null() { "???" } else { "filter item" }
+                if pyre_object::gc_roots::shadow_stack_get(item_slot).is_null() {
+                    "???"
+                } else {
+                    "filter item"
+                }
             )));
         }
     }
@@ -953,12 +966,12 @@ crate::py_module! {
         }
 
         fn warn(
-            message: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] category: PyObjectRef,
+            mut message: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut category: PyObjectRef,
             #[default(1i64)] stacklevel: i64,
             // `source` is positional-or-keyword; only `skip_file_prefixes`
             // sits behind the clinic's `*`.
-            #[default(pyre_object::PY_NULL)] source: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut source: PyObjectRef,
             #[kwonly] #[default(pyre_object::PY_NULL)] skip_file_prefixes: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
             // CPython 3.14 `_warnings.warn`: `skip_file_prefixes` is a
@@ -975,14 +988,14 @@ crate::py_module! {
                     )));
                 }
                 let mut prefixes = Vec::new();
-                for prefix in crate::baseobjspace::fixedview(skip_file_prefixes, -1)? {
+                for prefix in pyre_object::with_roots!(category, message, source => crate::baseobjspace::fixedview(skip_file_prefixes, -1))? {
                     if unsafe { !pyre_object::is_str(prefix) } {
                         return Err(PyError::type_error(format!(
                             "Found non-str '{}' in skip_file_prefixes.",
                             crate::baseobjspace::object_functionstr_type_name(prefix),
                         )));
                     }
-                    prefixes.push(crate::baseobjspace::text_w(prefix)?.to_string());
+                    prefixes.push(pyre_object::with_roots!(category, message, source => crate::baseobjspace::text_w(prefix))?.to_string());
                 }
                 prefixes
             };
@@ -1009,16 +1022,16 @@ crate::py_module! {
         }
 
         fn warn_explicit(
-            message: PyObjectRef,
-            category: PyObjectRef,
-            filename: PyObjectRef,
+            mut message: PyObjectRef,
+            mut category: PyObjectRef,
+            mut filename: PyObjectRef,
             lineno: i64,
-            #[default(pyre_object::PY_NULL)] module: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] registry: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut module: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut registry: PyObjectRef,
             #[default(pyre_object::PY_NULL)] module_globals: PyObjectRef,
-            #[default(pyre_object::PY_NULL)] source: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] mut source: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let source_line = get_source_line(module_globals, lineno)?;
+            let source_line = pyre_object::with_roots!(category, filename, message, module, registry, source => get_source_line(module_globals, lineno))?;
             let _roots = pyre_object::gc_roots::push_roots();
             let source_line_slot = pin_root_slot(source_line);
             let category = get_category(message, category)?;

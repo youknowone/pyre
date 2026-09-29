@@ -944,6 +944,13 @@ impl BasicBlock {
         }
     }
 
+    /// Replace the raw terminator kind, forgetting the projection of the
+    /// old one so the next [`term`](Self::term) reads the new kind.
+    pub fn set_terminator_kind(&mut self, kind: Value) {
+        self.terminator.kind = kind;
+        self.term_cache = OnceLock::new();
+    }
+
     fn term_cached(&self, llbc: &crate::Llbc) -> &Result<TermKind, String> {
         self.term_cache
             .get_or_init(|| decode_term_kind(&self.terminator.kind, llbc))

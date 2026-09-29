@@ -608,11 +608,11 @@ impl W_BufferedRandom {
 
     fn readinto_impl(
         &mut self,
-        w_buffer: PyObjectRef,
+        mut w_buffer: PyObjectRef,
         read_once: bool,
     ) -> Result<i64, crate::PyError> {
         self.check_init()?;
-        self.check_closed("readinto of closed file")?;
+        pyre_object::with_roots!(w_buffer => self.check_closed("readinto of closed file"))?;
         let mut target = unsafe { crate::builtins::WritableBuffer::acquire(w_buffer) }?;
         let requested = unsafe { target.as_mut_slice() }.len();
         if requested == 0 {
@@ -797,9 +797,9 @@ impl W_BufferedRandom {
 
     fn readline(
         &mut self,
-        #[default(pyre_object::w_none())] w_limit: PyObjectRef,
+        #[default(pyre_object::w_none())] mut w_limit: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        self.check_closed("readline of closed file")?;
+        pyre_object::with_roots!(w_limit => self.check_closed("readline of closed file"))?;
         let mut limit = super::iobase_convert_size(w_limit)?;
         let mut have = self.readahead();
         if limit >= 0 {
@@ -935,11 +935,11 @@ impl W_BufferedRandom {
 
     fn seek(
         &mut self,
-        w_pos: PyObjectRef,
-        #[default(pyre_object::w_int_new(0))] w_whence: PyObjectRef,
+        mut w_pos: PyObjectRef,
+        #[default(pyre_object::w_int_new(0))] mut w_whence: PyObjectRef,
     ) -> Result<i64, crate::PyError> {
-        self.check_closed("seek of closed file")?;
-        let pos = crate::builtins::space_index_w(w_pos)?;
+        pyre_object::with_roots!(w_pos, w_whence => self.check_closed("seek of closed file"))?;
+        let pos = pyre_object::with_roots!(w_whence => crate::builtins::space_index_w(w_pos))?;
         let whence = crate::builtins::space_index_w(w_whence)?;
         if !(0..=2).contains(&whence) {
             return Err(crate::PyError::value_error(format!(
@@ -1030,9 +1030,9 @@ impl W_BufferedRandom {
 
     fn truncate(
         &mut self,
-        #[default(pyre_object::w_none())] w_size: PyObjectRef,
+        #[default(pyre_object::w_none())] mut w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        self.check_closed("truncate of closed file")?;
+        pyre_object::with_roots!(w_size => self.check_closed("truncate of closed file"))?;
         self.with_lock(|this| {
             if this.writable {
                 this.flush_and_rewind_unlocked()?;

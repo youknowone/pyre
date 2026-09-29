@@ -550,7 +550,7 @@ struct FieldDescr {
 
 /// `newtype.py complete_struct_or_union`.
 pub fn complete_struct_or_union(
-    w_ctype: PyObjectRef,
+    mut w_ctype: PyObjectRef,
     w_fields: PyObjectRef,
     totalsize: i64,
     totalalignment: i64,
@@ -575,7 +575,7 @@ pub fn complete_struct_or_union(
 
     // The field descriptors are read out first: each one is a tuple whose
     // unpacking allocates, and nothing below may hold a stale reference.
-    let descrs = read_field_descrs(ct, w_fields)?;
+    let descrs = pyre_object::with_roots!(w_ctype => read_field_descrs(ct, w_fields))?;
 
     let roots = pyre_object::gc_roots::push_roots();
     let list_slot = roots.base();
@@ -929,14 +929,14 @@ pub fn new_enum_type(
     w_basectype: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
-    let base_slot = roots.base();
-    let _ = roots.pin_root(w_basectype);
+    let base_slot = roots.pin_roots(&[w_basectype, w_enumvalues]);
+    let enumvalues_slot = base_slot + 1;
     let enumerators_w = pyre_interpreter::baseobjspace::fixedview(w_enumerators, -1)?;
     let names_slot = pyre_object::gc_roots::shadow_stack_len();
     for &w in &enumerators_w {
         let _ = roots.pin_root(w);
     }
-    let enumvalues_w = pyre_interpreter::baseobjspace::fixedview(w_enumvalues, -1)?;
+    let enumvalues_w = pyre_interpreter::baseobjspace::fixedview(roots.get(enumvalues_slot), -1)?;
     let values_slot = pyre_object::gc_roots::shadow_stack_len();
     for &w in &enumvalues_w {
         let _ = roots.pin_root(w);
@@ -1143,9 +1143,9 @@ pub fn build_function_type(
         },
     );
     let roots = pyre_object::gc_roots::push_roots();
-    let ctype_slot = roots.base();
-    let _ = roots.pin_root(w_ctype);
-    let fargs_slot = ctype_slot + 1;
+    let ctype_slot = roots.pin_roots(&[w_ctype, w_fresult]);
+    let fresult_slot = ctype_slot + 1;
+    let fargs_slot = ctype_slot + 2;
     let _ = roots.pin_root(pyre_object::w_tuple_new(fargs.to_vec()));
     let ct = ctypeobj::ctype_arg(roots.get(ctype_slot))?;
     ct.fargs = roots.get(fargs_slot);
@@ -1156,13 +1156,15 @@ pub fn build_function_type(
         // computed per call from the types actually passed.  For every other
         // one it is computed once, here.  A NotImplementedError is eaten; the
         // call itself raises it if one is ever made.
-        match super::ctypefunc::build_cif_descr(fargs, w_fresult, abi, None) {
+        match super::ctypefunc::build_cif_descr(fargs, roots.get(fresult_slot), abi, None) {
             Ok(cif) => ct.cif_descr = cif,
             Err(e) if e.kind == pyre_interpreter::PyErrorKind::NotImplementedError => {}
             Err(e) => return Err(e),
         }
     }
     let weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(roots.get(ctype_slot));
+    let weak_slot = fargs_slot + 1;
+    let _ = roots.pin_root(weak);
     let mut cache = function_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1175,7 +1177,7 @@ pub fn build_function_type(
                     existing_root_slot,
                 ))
             };
-            if function_type_matches(existing, fargs, w_fresult, ellipsis, abi) {
+            if function_type_matches(existing, fargs, roots.get(fresult_slot), ellipsis, abi) {
                 return Ok(existing);
             }
         }
@@ -1183,7 +1185,7 @@ pub fn build_function_type(
     for weakdict in cache.iter_mut() {
         match weakdict.get(&func_hash).copied() {
             None => {
-                let root_slot = ctypeobj::root_forever_slot(weak) as usize;
+                let root_slot = ctypeobj::root_forever_slot(roots.get(weak_slot)) as usize;
                 weakdict.insert(func_hash, root_slot);
                 return Ok(roots.get(ctype_slot));
             }
@@ -1201,14 +1203,14 @@ pub fn build_function_type(
                     } {
                         return Ok(roots.get(ctype_slot));
                     }
-                    let root_slot = ctypeobj::root_forever_slot(weak) as usize;
+                    let root_slot = ctypeobj::root_forever_slot(roots.get(weak_slot)) as usize;
                     weakdict.insert(func_hash, root_slot);
                     return Ok(roots.get(ctype_slot));
                 }
             }
         }
     }
-    let root_slot = ctypeobj::root_forever_slot(weak) as usize;
+    let root_slot = ctypeobj::root_forever_slot(roots.get(weak_slot)) as usize;
     cache.push(HashMap::from([(func_hash, root_slot)]));
     Ok(roots.get(ctype_slot))
 }

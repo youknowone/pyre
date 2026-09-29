@@ -1322,7 +1322,7 @@ unsafe fn long_int_divmod(a: PyObjectRef, other: i64) -> PyResult {
 /// PyPy longobject.py `_divmod` / `_int_divmod`: compute both halves with one
 /// rbigint division and only then box the pair.  Calling `floordiv` and `mod`
 /// separately would run `_divmod` twice.
-unsafe fn integer_divmod_pair(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+unsafe fn integer_divmod_pair(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     if is_int_like(a) && is_int_like(b) {
         let va = int_value(a);
         let vb = int_value(b);
@@ -1369,18 +1369,19 @@ unsafe fn integer_divmod_pair(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         RBigIntGcRoot::new(BigInt::from(int_value(a)))
     };
     let vb = live_long_num(b);
-    let (q, r) = va.divmod(&vb).expect("divisor was checked nonzero");
+    let (q, r) =
+        pyre_object::with_roots!(a, b => va.divmod(&vb)).expect("divisor was checked nonzero");
     // `_divmod` produces two live rbigints before either wrapper is
     // allocated. RPython's GC transform roots both across those collecting
     // allocations.
     let q = RBigIntGcRoot::new(q);
     let r = RBigIntGcRoot::new(r);
     if is_long(a) || is_long(b) {
-        let w_q = w_long_new(q.translated_alias());
+        let mut w_q = pyre_object::with_roots!(a => w_long_new(q.translated_alias()));
         let w_r = if remainder_aliases_a {
             pyre_object::longobject::w_long_from_raw(w_long_get_raw_value(a))
         } else {
-            w_long_new(r.translated_alias())
+            pyre_object::with_roots!(w_q => w_long_new(r.translated_alias()))
         };
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(w_q);
@@ -2445,13 +2446,13 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     })
 }
 
-pub(crate) unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     let len_a = w_list_len(a);
     let len_b = w_list_len(b);
     // W_ListObject.descr_add: when the left operand is empty, clone the right
     // operand. A SizeListStrategy clone retains that exact strategy instance.
     if len_a == 0
-        && let Some(clone) = pyre_object::listobject::w_list_clone_if_shared_strategy(b)
+        && let Some(clone) = pyre_object::with_roots!(a, b => pyre_object::listobject::w_list_clone_if_shared_strategy(b))
     {
         return Ok(clone);
     }
@@ -2513,9 +2514,11 @@ pub(crate) unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 /// listobject.py descr_mul
-pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyResult {
     let count = repeat_count(n)?;
-    if let Some(clone) = pyre_object::listobject::w_list_clone_if_size(list) {
+    if let Some(clone) =
+        pyre_object::with_roots!(list => pyre_object::listobject::w_list_clone_if_size(list))
+    {
         return Ok(clone);
     }
     let len = w_list_len(list);
@@ -3469,7 +3472,7 @@ unsafe fn complex_richcompare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> 
         // `complexobject.py descr_eq`: compare a real-only complex through
         // float/int equality.  Do not round an arbitrary-size integer to f64;
         // convert the integral float lane to BigInt and compare exactly.
-        let (z, other) = if is_complex(a) { (a, b) } else { (b, a) };
+        let (z, mut other) = if is_complex(a) { (a, b) } else { (b, a) };
         let real = w_complex_get_real(z);
         if w_complex_get_imag(z) != 0.0 {
             false
@@ -3478,7 +3481,7 @@ unsafe fn complex_richcompare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> 
         } else if is_int(other) || is_long(other) || is_bool(other) {
             real.is_finite()
                 && real.fract() == 0.0
-                && BigInt::from_f64(real).is_some_and(|value| {
+                && pyre_object::with_roots!(other => BigInt::from_f64(real)).is_some_and(|value| {
                     if is_long(other) {
                         value.eq(w_long_get_value(other))
                     } else {
@@ -3603,10 +3606,10 @@ unsafe fn try_compare_override(
 /// `AttributeError` raised by that binding step means that this comparison
 /// implementation is absent (notably `__eq__ = property(...)`).
 unsafe fn invoke_comparison(
-    w_descr: PyObjectRef,
+    mut w_descr: PyObjectRef,
     w_obj: PyObjectRef,
     w_type: PyObjectRef,
-    w_other: PyObjectRef,
+    mut w_other: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, PyError> {
     let direct_function = std::ptr::eq(
         unsafe { (*w_descr).ob_type },
@@ -3618,7 +3621,9 @@ unsafe fn invoke_comparison(
     let result = if direct_function {
         crate::call::call_function_impl_result(w_descr, &[w_obj, w_other])?
     } else {
-        let w_impl = match unsafe { crate::baseobjspace::get(w_descr, w_obj, w_type) } {
+        let w_impl = match pyre_object::with_roots!(w_descr, w_other => unsafe {
+            crate::baseobjspace::get(w_descr, w_obj, w_type)
+        }) {
             Ok(Some(w_impl)) => w_impl,
             Ok(None) => w_descr,
             Err(err) if err.kind == PyErrorKind::AttributeError => return Ok(None),
@@ -4388,12 +4393,12 @@ unsafe fn shortcut_xor(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObject
     Ok(None)
 }
 
-pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     // `_make_binop_impl`: `type(w1) is type(w2) and not user_overridden_class`
     // then the `use_special_method_shortcut` body.
     unsafe {
         if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = shortcut_add(a, b)?
+            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_add(a, b))?
                 && !is_not_implemented(w_res)
             {
                 return Ok(w_res);
@@ -4513,13 +4518,12 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // memoryview included), and the result type follows the left operand:
         // `bytes + <buffer>` is bytes, `bytearray + <buffer>` is bytearray.
         if pyre_object::bytesobject::is_bytes_like(a) {
-            if let Some(b_src) = crate::typedef::buffer_as_bytes_like(b)? {
+            if let Some(mut b_src) = crate::typedef::buffer_as_bytes_like(b)? {
                 // Only a real bytes-like rhs can carry a subclass `__radd__`;
                 // a memoryview cannot, so dispatch only when both are bytes-like.
                 if pyre_object::bytesobject::is_bytes_like(b)
                     && needs_bytes_binop_dispatch_unless_exact(a, b, BinopDunder::Add)
-                    && let Some(result) =
-                        try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
+                    && let Some(result) = pyre_object::with_roots!(b_src => try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__"))?
                 {
                     return Ok(result);
                 }
@@ -4566,10 +4570,10 @@ pub(crate) fn matmul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
     }
 }
 
-pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn sub(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = shortcut_sub(a, b)?
+            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_sub(a, b))?
                 && !is_not_implemented(w_res)
             {
                 return Ok(w_res);
@@ -4629,10 +4633,10 @@ pub(crate) fn sub_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
     }
 }
 
-pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = shortcut_mul(a, b)?
+            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_mul(a, b))?
                 && !is_not_implemented(w_res)
             {
                 return Ok(w_res);
@@ -4775,10 +4779,10 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
     }
 }
 
-pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn floordiv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = shortcut_floordiv(a, b)?
+            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_floordiv(a, b))?
                 && !is_not_implemented(w_res)
             {
                 return Ok(w_res);
@@ -4847,10 +4851,10 @@ unsafe fn try_subclass_binop_override(
     Ok((!is_not_implemented(result)).then_some(result))
 }
 
-pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = shortcut_mod(a, b)?
+            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_mod(a, b))?
                 && !is_not_implemented(w_res)
             {
                 return Ok(w_res);
@@ -5051,7 +5055,9 @@ pub fn pow(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
 /// `descroperation.py inplace_pow` — unlike the generated in-place
 /// binary operations, power has its own fallback error spelling.
 pub fn inplace_pow(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
-    if let Some(result) = try_inplace_special(a, b, "__ipow__", None, false)? {
+    if let Some(result) =
+        pyre_object::with_roots!(a, b => try_inplace_special(a, b, "__ipow__", None, false))?
+    {
         return Ok(result);
     }
     if let Some(result) = pow_binary(&mut a, &mut b)? {
@@ -5217,7 +5223,7 @@ pub(crate) fn pow_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-pub(crate) fn divmod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub(crate) fn divmod_builtin(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let lhs_num = is_int(a) || is_long(a) || is_float(a);
         let rhs_num = is_int(b) || is_long(b) || is_float(b);
@@ -5225,7 +5231,7 @@ pub(crate) fn divmod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             // Python 3.14 reports the builtin operation's uniform spelling for
             // every numeric zero divisor.  This intentionally differs from
             // PyPy 3.11's int/float-specific divmod and modulo messages.
-            if !is_true(b)? {
+            if !pyre_object::with_roots!(a, b => is_true(b))? {
                 return Err(PyError::zero_division(ZERO_DIVISION_MSG));
             }
             if is_float_pair(a, b) {
@@ -5801,7 +5807,7 @@ pub fn divmod(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         if !numeric_override && lhs_num && rhs_num {
             // Python 3.14 target-version spelling; see `divmod_builtin` above
             // for the PyPy 3.11 difference.
-            if !is_true(b)? {
+            if !pyre_object::with_roots!(a, b => is_true(b))? {
                 return Err(PyError::zero_division(ZERO_DIVISION_MSG));
             }
             if is_float_pair(a, b) {
@@ -5987,10 +5993,10 @@ pub fn float_pow_would_raise(x: f64, y: f64) -> bool {
 
 /// Left shift dispatch (`<<` operator).
 
-pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn lshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = shortcut_lshift(a, b)?
+            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_lshift(a, b))?
                 && !is_not_implemented(w_res)
             {
                 return Ok(w_res);
@@ -6358,7 +6364,7 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
         if matches!(op, CompareOp::Eq | CompareOp::Ne) && same_unoverridden_rpy_type(a, b) {
             // `_check_notimplemented`: a `NotImplemented` answer from the
             // shortcut falls through to the full lookup below.
-            let w_res = compare_slot(a, b, op)?;
+            let w_res = pyre_object::with_roots!(a, b => compare_slot(a, b, op))?;
             if !pyre_object::is_not_implemented(w_res) {
                 return Ok(w_res);
             }
@@ -6550,7 +6556,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
 /// [`compare_slot`] for layouts whose comparison iterates (containers) or
 /// is not the loop-free long/int/str arm.
 #[inline(never)]
-fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResult {
     // RPython inserts a stack check on this recursive object-space call.
     // Container comparisons recurse through [`compare`] without pushing a
     // Python frame (for example two distinct self-referential lists), so keep
@@ -6875,7 +6881,7 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
         {
             // A raised exception (not NotImplemented) propagates; only
             // NotImplemented falls through to the reflected comparison.
-            let result = crate::call::call_function_impl_result(method, &[a, b])?;
+            let result = pyre_object::with_roots!(a, b => crate::call::call_function_impl_result(method, &[a, b]))?;
             if !is_not_implemented(result) {
                 return Ok(result);
             }
@@ -6885,7 +6891,7 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             && let Some(b_type) = crate::typedef::r#type(b)
             && let Some(method) = lookup_in_type_where(b_type.as_ptr(), rdunder)
         {
-            let result = crate::call::call_function_impl_result(method, &[b, a])?;
+            let result = pyre_object::with_roots!(a, b => crate::call::call_function_impl_result(method, &[b, a]))?;
             if !is_not_implemented(result) {
                 return Ok(result);
             }
@@ -6996,9 +7002,11 @@ impl CompareOp {
 /// one-call wrapper and the codewriter never mints the graph named by
 /// `flatten.rs build_orthodox_inline_call_r_r`.
 #[inline(never)]
-pub fn pos(a: PyObjectRef) -> PyResult {
+pub fn pos(mut a: PyObjectRef) -> PyResult {
     unsafe {
-        if let Some(result) = try_numeric_unaryop_override(a, UnaryDunder::Pos)? {
+        if let Some(result) =
+            pyre_object::with_roots!(a => try_numeric_unaryop_override(a, UnaryDunder::Pos))?
+        {
             return Ok(result);
         }
         pos_inner(a)
@@ -7027,7 +7035,7 @@ pub fn pos(a: PyObjectRef) -> PyResult {
 /// never mints a graph the walker can descend.  Same knob as
 /// `w_list_append_inner`.
 #[inline(never)]
-pub fn pos_inner(a: PyObjectRef) -> PyResult {
+pub fn pos_inner(mut a: PyObjectRef) -> PyResult {
     unsafe {
         if is_int(a) && !is_bool(a) && pyre_object::is_exact_builtin_instance(a) {
             // `_self_unaryop('pos')` delegates to `W_IntObject.int`, which
@@ -7060,7 +7068,7 @@ pub fn pos_inner(a: PyObjectRef) -> PyResult {
             let (ar, ai) = complex_val(a).unwrap();
             return Ok(w_complex_new(ar, ai));
         }
-        if let Some(result) = try_lookup_unaryop(a, "__pos__")? {
+        if let Some(result) = pyre_object::with_roots!(a => try_lookup_unaryop(a, "__pos__"))? {
             return Ok(result);
         }
         Err(bad_operand_type("unary +", a))
@@ -7489,9 +7497,11 @@ pub(crate) fn _float_neg(x: f64) -> PyResult {
 /// one-call wrapper and the codewriter never mints the graph named by
 /// `flatten.rs build_orthodox_inline_call_r_r`.
 #[inline(never)]
-pub fn neg(a: PyObjectRef) -> PyResult {
+pub fn neg(mut a: PyObjectRef) -> PyResult {
     unsafe {
-        if let Some(result) = try_numeric_unaryop_override(a, UnaryDunder::Neg)? {
+        if let Some(result) =
+            pyre_object::with_roots!(a => try_numeric_unaryop_override(a, UnaryDunder::Neg))?
+        {
             return Ok(result);
         }
         neg_inner(a)
@@ -7513,7 +7523,7 @@ pub fn neg(a: PyObjectRef) -> PyResult {
 /// Unlike [`invert_inner`] this keeps the `bool` operand: `neg` has no separate
 /// bool slot to leave behind, and the integer arm below already answers `True`
 /// and `False` through [`int_value`].
-pub fn neg_inner(a: PyObjectRef) -> PyResult {
+pub fn neg_inner(mut a: PyObjectRef) -> PyResult {
     unsafe {
         if is_int(a) || is_bool(a) {
             let v = int_value(a);
@@ -7536,7 +7546,7 @@ pub fn neg_inner(a: PyObjectRef) -> PyResult {
             return complex_neg(a);
         }
         // Instance __neg__
-        if let Some(result) = try_lookup_unaryop(a, "__neg__")? {
+        if let Some(result) = pyre_object::with_roots!(a => try_lookup_unaryop(a, "__neg__"))? {
             return Ok(result);
         }
         Err(bad_operand_type("unary -", a))
@@ -7573,16 +7583,22 @@ pub(crate) fn bool_invert_deprecation_text() -> PyObjectRef {
 /// one-call wrapper and the codewriter never mints the graph named by
 /// `flatten.rs build_orthodox_inline_call_r_r`.
 #[inline(never)]
-pub fn invert(a: PyObjectRef) -> PyResult {
+pub fn invert(mut a: PyObjectRef) -> PyResult {
     unsafe {
-        if let Some(result) = try_numeric_unaryop_override(a, UnaryDunder::Invert)? {
+        if let Some(result) =
+            pyre_object::with_roots!(a => try_numeric_unaryop_override(a, UnaryDunder::Invert))?
+        {
             return Ok(result);
         }
         if is_bool(a) {
             // CPython 3.14 `Objects/boolobject.c:bool_invert`.  The bundled
             // PyPy source inherits `W_IntObject.descr_invert`; 3.14 inserts
             // this warning-bearing bool slot before the integer inversion.
-            crate::warn::warn_category_w(bool_invert_deprecation_text(), "DeprecationWarning", 2)?;
+            pyre_object::with_roots!(a => crate::warn::warn_category_w(
+                bool_invert_deprecation_text(),
+                "DeprecationWarning",
+                2
+            ))?;
             return Ok(w_int_new(!int_value(a)));
         }
         invert_inner(a)
@@ -7612,7 +7628,7 @@ pub(crate) fn _int_invert(x: i64) -> PyResult {
     }) as PyObjectRef)
 }
 
-pub fn invert_inner(a: PyObjectRef) -> PyResult {
+pub fn invert_inner(mut a: PyObjectRef) -> PyResult {
     unsafe {
         if is_int(a) {
             return _int_invert(int_value(a));
@@ -7620,7 +7636,7 @@ pub fn invert_inner(a: PyObjectRef) -> PyResult {
         if is_long(a) {
             return Ok(w_long_new(bigint_invert(w_long_get_value(a))));
         }
-        if let Some(result) = try_lookup_unaryop(a, "__invert__")? {
+        if let Some(result) = pyre_object::with_roots!(a => try_lookup_unaryop(a, "__invert__"))? {
             return Ok(result);
         }
         Err(bad_operand_type("unary ~", a))

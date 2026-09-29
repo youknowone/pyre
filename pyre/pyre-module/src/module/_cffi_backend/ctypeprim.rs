@@ -223,7 +223,7 @@ pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyEr
 }
 
 /// `W_CTypePrimitive.cast` — everything that ends up in an integer slot.
-fn cast_integer(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyError> {
+fn cast_integer(mut w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     let value = if let Some(source) = W_CData::from_obj(w_ob)
         && ctypeobj::ctype_at(source.ctype).is_some_and(|it| it.is_ptr_or_array())
@@ -235,9 +235,9 @@ fn cast_integer(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, 
         cast_result(ct, u64::from(cast_unicode(ct, w_ob)?))
     } else if ct.kind == ctypeobj::KIND_PRIM_BOOL {
         // `W_CTypePrimitiveBool._cast_generic`.
-        u64::from(misc::object_as_bool(w_ob)?)
+        u64::from(pyre_object::with_roots!(w_ctype => misc::object_as_bool(w_ob))?)
     } else {
-        misc::as_unsigned_long_long(w_ob, false)?
+        pyre_object::with_roots!(w_ctype => misc::as_unsigned_long_long(w_ob, false))?
     };
     let w_cdata = cdataobj::new_cdata_mem(w_ctype)?;
     let cdata = W_CData::from_obj(w_cdata).expect("new_cdata_mem returns a cdata");
@@ -273,7 +273,9 @@ fn cast_float(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, Py
     // `unwrap_primitive_cdata` boxes a cdata source, so what it hands back is
     // a fresh object nothing else roots while `float_w` dispatches.
     let roots = pyre_object::gc_roots::push_roots();
-    let ob_slot = roots.base();
+    let ctype_slot = roots.base();
+    let _ = roots.pin_root(w_ctype);
+    let ob_slot = ctype_slot + 1;
     let _ = roots.pin_root(unwrap_primitive_cdata(ct, w_ob)?);
     let w_ob = roots.get(ob_slot);
     let value = if unsafe { pyre_object::bytesobject::is_bytes(w_ob) } {
@@ -283,7 +285,7 @@ fn cast_float(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, Py
     } else {
         pyre_interpreter::baseobjspace::float_w(w_ob)?
     };
-    let w_cdata = cdataobj::new_cdata_mem(w_ctype)?;
+    let w_cdata = cdataobj::new_cdata_mem(roots.get(ctype_slot))?;
     let cdata = W_CData::from_obj(w_cdata).expect("new_cdata_mem returns a cdata");
     let ct = ctypeobj::ctype_arg(cdata.ctype)?;
     unsafe {
@@ -300,7 +302,9 @@ fn cast_float(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, Py
 fn cast_complex(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     let roots = pyre_object::gc_roots::push_roots();
-    let ob_slot = roots.base();
+    let ctype_slot = roots.base();
+    let _ = roots.pin_root(w_ctype);
+    let ob_slot = ctype_slot + 1;
     let _ = roots.pin_root(unwrap_primitive_cdata(ct, w_ob)?);
     let w_ob = roots.get(ob_slot);
     let (real, imag) = if unsafe { pyre_object::bytesobject::is_bytes(w_ob) } {
@@ -310,7 +314,7 @@ fn cast_complex(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, 
     } else {
         unpack_complex(w_ob)?
     };
-    let w_cdata = cdataobj::new_cdata_mem(w_ctype)?;
+    let w_cdata = cdataobj::new_cdata_mem(roots.get(ctype_slot))?;
     let cdata = W_CData::from_obj(w_cdata).expect("new_cdata_mem returns a cdata");
     let ct = ctypeobj::ctype_arg(cdata.ctype)?;
     let half = ct.size >> 1;
