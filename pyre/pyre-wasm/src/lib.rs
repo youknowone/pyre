@@ -815,6 +815,10 @@ fn install_wasm_print_hook() {
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 fn run_python_impl(source: &str) -> String {
     install_panic_hook();
+    // The descr class list is not the callee's wasm type. The host reads the
+    // function table and performs the call.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+    majit_backend_wasm::install_residual_host_call();
     // Optional-module rclass aliases must be installed before the collector
     // is built: `init_jit_hooks` / `build_gc` snapshots the alias census.
     pyre_module::register();
