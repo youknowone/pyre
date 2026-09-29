@@ -10056,6 +10056,51 @@ fn cond_call_n_emits_predicate_and_direct_call() {
     assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
 }
 
+/// A COND_CALL whose table type uses an i32 pointer lowers with that type.
+#[test]
+fn cond_call_n_i32_arg_lowers_with_the_table_signature() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let encoded = majit_backend_wasm::encode_func_sig(&[majit_backend_wasm::FuncSigVal::I32], None);
+    with_table_sig(0x100, Some(encoded), || {
+        let inputargs = vec![
+            InputArg::from_type_rc(Type::Int, 0),
+            InputArg::from_type_rc(Type::Ref, 1),
+        ];
+        let call = make_op(
+            OpCode::CondCallN,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::const_int(0x100),
+                OpRef::input_arg_ref(1),
+            ],
+            OpRef::NONE,
+        );
+        call.setdescr(Arc::new(SimpleCallDescr::new(
+            0,
+            vec![Type::Ref],
+            Type::Void,
+            false,
+            0,
+            EffectInfo::default(),
+        )));
+        let ops = vec![
+            call,
+            Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+        ];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+        let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+        assert_eq!(indirect_calls.len(), 1);
+        assert_eq!(
+            function_type(&bytes, indirect_calls[0].0 as usize),
+            (vec![wasmparser::ValType::I32], vec![])
+        );
+    });
+}
+
 #[test]
 fn cond_call_without_call_descr_is_unsupported() {
     let inputargs = vec![
