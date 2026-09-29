@@ -5628,6 +5628,7 @@ mod tests {
             StructLayout {
                 size: 6 * word,
                 align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![
                     StructFieldLayout {
                         name: "bytes".into(),
@@ -6012,6 +6013,7 @@ mod tests {
             StructLayout {
                 size: 16,
                 align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![
                     StructFieldLayout {
                         name: "visible_zero".to_string(),
@@ -6099,6 +6101,7 @@ mod tests {
             StructLayout {
                 size: 8,
                 align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![StructFieldLayout {
                     name: "visible_zero".to_string(),
                     offset: 0,

@@ -179,6 +179,35 @@ pub unsafe fn header_of(obj_addr: usize) -> *mut GcHeader {
     (obj_addr - GcHeader::SIZE) as *mut GcHeader
 }
 
+/// Per-type GC metadata, mirroring the compile-time constants that
+/// `gct_fv_gc_malloc` closes over:
+///
+/// ```python
+/// type_id = self.get_type_id(TYPE)
+/// c_type_id = rmodel.inputconst(TYPE_ID, type_id)
+/// info = self.layoutbuilder.get_info(type_id)
+/// c_size = rmodel.inputconst(lltype.Signed, info.fixedsize)
+/// ```
+///
+/// In RPython these are inputconsts woven into the `direct_call` to
+/// the malloc helper. Here they are associated items on the payload
+/// type, surfaced through `malloc_typed` so the allocator can read
+/// them without a runtime dispatch.
+///
+/// `TYPE_ID` must match the id returned by `gc.register_type` during
+/// JitDriver init; a `debug_assert_eq!` there guards against drift.
+pub trait GcType {
+    /// Backend-registered GC type id, equal to `c_type_id` closed over
+    /// by `gct_fv_gc_malloc`. Read at runtime so the value can be
+    /// assigned by the JIT driver after `gc.register_type` returns —
+    /// auto-id mode delivers the result through this accessor. Explicit
+    /// `type_id = N` cells return `N` unchanged.
+    fn type_id() -> u32;
+    /// Fixed payload size in bytes, equal to `info.fixedsize` from
+    /// `layoutbuilder.get_info`.
+    const SIZE: usize;
+}
+
 /// Allocate a value of type `T` behind a leading [`GcHeader`] and return the
 /// payload pointer (`block + SIZE`).
 ///
