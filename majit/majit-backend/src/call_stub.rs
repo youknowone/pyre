@@ -1008,15 +1008,7 @@ call_sig_table!(define_call_sig_stubs);
 /// that type: published targets are widening `i64` shims, raw pointers are
 /// `i32`. The host reads the table signature. Native keeps the stub.
 fn wasm_residual_host_call(func: usize, args: &[i64]) -> Option<i64> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        return residual_host_call().map(|hook| hook(func, args));
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (func, args);
-        None
-    }
+    residual_host_call().map(|hook| hook(func, args))
 }
 
 pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
@@ -1025,6 +1017,9 @@ pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
         args.len(),
         "bh_call dispatch: class sequence and positional arg list length differ"
     );
+    if let Some(result) = wasm_residual_host_call(func, args) {
+        return result;
+    }
     unsafe { (lookup_stub_i(classes))(func, args) }
 }
 
@@ -1042,6 +1037,9 @@ pub unsafe fn bh_call_r_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
     );
     #[cfg(target_arch = "wasm32")]
     {
+        if let Some(result) = wasm_residual_host_call(func, args) {
+            return result;
+        }
         unsafe { (lookup_stub_ptr(classes))(func, args) }
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -1066,6 +1064,9 @@ pub unsafe fn bh_call_v_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
         args.len(),
         "bh_call dispatch: class sequence and positional arg list length differ"
     );
+    if wasm_residual_host_call(func, args).is_some() {
+        return;
+    }
     unsafe { (lookup_stub_v(classes))(func, args) }
 }
 
@@ -1085,6 +1086,9 @@ pub unsafe fn bh_call_f_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
         args.len(),
         "bh_call dispatch: class sequence and positional arg list length differ"
     );
+    if let Some(bits) = wasm_residual_host_call(func, args) {
+        return f64::from_bits(bits as u64);
+    }
     unsafe { (lookup_stub_f(classes))(func, args) }
 }
 
@@ -1284,6 +1288,12 @@ pub unsafe fn bh_call_i_with_descr(
     args_f: Option<&[i64]>,
     calldescr: &BhCallDescr,
 ) -> i64 {
+    if residual_host_call().is_some() {
+        let collected = collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
+        if let Some(result) = wasm_residual_host_call(func, collected.args()) {
+            return result;
+        }
+    }
     unsafe { call_stub_for(calldescr).call_i(func, args_i, args_r, args_f) }
 }
 
@@ -1298,6 +1308,12 @@ pub unsafe fn bh_call_f_with_descr(
     args_f: Option<&[i64]>,
     calldescr: &BhCallDescr,
 ) -> f64 {
+    if residual_host_call().is_some() {
+        let collected = collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
+        if let Some(bits) = wasm_residual_host_call(func, collected.args()) {
+            return f64::from_bits(bits as u64);
+        }
+    }
     unsafe { call_stub_for(calldescr).call_f(func, args_i, args_r, args_f) }
 }
 
@@ -1312,6 +1328,12 @@ pub unsafe fn bh_call_v_with_descr(
     args_f: Option<&[i64]>,
     calldescr: &BhCallDescr,
 ) {
+    if residual_host_call().is_some() {
+        let collected = collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
+        if wasm_residual_host_call(func, collected.args()).is_some() {
+            return;
+        }
+    }
     unsafe { call_stub_for(calldescr).call_v(func, args_i, args_r, args_f) }
 }
 
@@ -1725,6 +1747,33 @@ mod tests {
     #[should_panic(expected = "is not one of \"r\"")]
     fn verify_result_type_rejects_the_default_descr_s_null_result_type() {
         verify_result_type('\0', "r");
+    }
+
+    /// Mixed `i`/`r` past arity 7 has no stub-table arm. The host hook must run
+    /// before that lookup.
+    #[test]
+    fn host_hook_dispatches_a_wide_mixed_signature_without_a_stub_arm() {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                set_residual_host_call(None);
+            }
+        }
+        let _clear = Clear;
+        set_residual_host_call(Some(|func, args| {
+            assert_eq!(func, 7);
+            assert_eq!(args, &[1, 5, 2, 6, 3, 7, 4, 8]);
+            42
+        }));
+        let descr = BhCallDescr::from_arg_classes(
+            "iriririr".to_string(),
+            'i',
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let result = unsafe {
+            bh_call_i_with_descr(7, Some(&[1, 2, 3, 4]), Some(&[5, 6, 7, 8]), None, &descr)
+        };
+        assert_eq!(result, 42);
     }
 
     /// `descr.py CallDescr.create_call_stub` + `llmodel.py AbstractLLCPU.bh_call_f`
