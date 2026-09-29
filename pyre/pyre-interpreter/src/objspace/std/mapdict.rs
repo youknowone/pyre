@@ -6376,16 +6376,11 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
     // dict subclasses. Pyre's composed dict-subclass representation is
     // resolved by the getdict backing helpers at each raw dict operation,
     // while the SPECIAL slot retains the supplied object's identity.
-    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-    if !unsafe { crate::baseobjspace::isinstance_w(w_dict, w_dict_type) } {
-        return Err(PyError::type_error(
-            "setting dictionary to a non-dict".to_string(),
-        ));
-    }
+    crate::baseobjspace::require_dict_for_setdict(w_dict)?;
+    // A dict subclass passes the type test, so the composed representation is
+    // asked for its backing too.
     if crate::type_methods::resolve_dict_backing(w_dict).is_null() {
-        return Err(PyError::type_error(
-            "setting dictionary to a non-dict".to_string(),
-        ));
+        return Err(crate::baseobjspace::setdict_not_a_dict(w_dict));
     }
     if unsafe { has_mapdict_storage(self_ref) } {
         // mapdict.py:892-900: the old dict has `self` as its dstorage, so

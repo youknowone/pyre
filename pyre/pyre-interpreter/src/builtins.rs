@@ -5575,18 +5575,37 @@ pub fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
 /// marker.  The clinic-style "takes at most N arguments (M given)" builtins
 /// (`sum`, `round`, `pow`) count positionals plus this against their limit.
 ///
-/// Read through the surrogate-preserving iterator, the same one
-/// [`call_forwarding_args`] rebuilds the keywords with: `w_dict_str_entries`
-/// drops a `**{'\udc80': v}` key outright, which would make this report a
-/// keyword-free call and let the keyword be silently discarded.
+/// The marker occupies exactly one entry, so the answer is the dict's length
+/// less that entry.  `__pyre_kw__` is one key, so it holds one slot whichever
+/// order the writes happen in, and [`split_builtin_kwargs`] hands back a dict
+/// only when that slot still holds the sentinel.  `w_dict_len` reads the count
+/// off the strategy; enumerating the entries to filter one name out would build
+/// a `Vec<(Wtf8Buf, PyObjectRef)>` per arity check.
+///
+/// A caller keyword spelled `__pyre_kw__` lands in the same slot and
+/// `call_with_kwargs` writes the sentinel over it, so that keyword is lost
+/// before any arity check sees it: `sum([1, 2], **{'__pyre_kw__': 0})` answers
+/// 3 where 3.14.6 and pypy3 both raise, and `dict(**{'__pyre_kw__': 7})`
+/// answers `{}` where both give `{'__pyre_kw__': 7}`.  That is the marker
+/// scheme's own collision, not this count's: filtering the name out of the
+/// entry list reported the same 0.
+///
+/// The length also needs no key decode, which the entry list does: a key
+/// carrying a lone surrogate has no `&str` view, so counting through
+/// `w_dict_str_entries` would drop `**{'\udc80': v}` outright and report a
+/// keyword-free call.  A non-str key cannot reach here at all —
+/// `call_with_kwargs` raises `TypeError("keywords must be strings")` first.
+///
+/// Not building that `Vec` is also what lets a builtin body be descended.
+/// `w_dict_str_entries_wtf8` is un-lowered, and every hand-written
+/// `__majit_wrap_*` reaches it through an arity helper into
+/// `type_methods::reject_kwargs_of`, so while it was called here the descent
+/// declined for `set.add`, `list.append`, `dict.keys` and their siblings.
 pub fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
     let Some(dict) = kwargs else {
         return 0;
     };
-    unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
-        .iter()
-        .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
-        .count()
+    unsafe { pyre_object::w_dict_len(dict) }.saturating_sub(1)
 }
 
 /// The real keyword `(name, value)` pairs in the kwargs dict from
@@ -10900,6 +10919,15 @@ pub(crate) fn exception_group_fields(
     Ok((message, exceptions))
 }
 
+/// `interp_group.py descr_new`, whose validation upstream is one applevel
+/// helper, `app_group.py check_new_args`, ending `return cls, tuple(exceptions)`.
+///
+/// It stays inline here because the constructor-time `exceptions` repr
+/// (gh-141732) has to be taken between two of that helper's own steps: after
+/// the sequence check, so a non-sequence still raises `TypeError` first, and
+/// before `tuple(exceptions)`, so the repr is the source sequence's and not the
+/// converted tuple's.  Extracting the helper puts the capture on one side or
+/// the other and loses one of those two orderings.
 fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `descr_new(space, w_subtype, w_message, w_exceptions)` counts only the
     // positional arguments it was bound to. Keywords ride the same flat slice
@@ -11111,7 +11139,7 @@ fn exception_group_list_contains_ptr(w_list: PyObjectRef, item: PyObjectRef) -> 
     })
 }
 
-fn exception_group_condition(
+fn exception_group_get_condition_filter(
     mut w_condition: PyObjectRef,
 ) -> Result<ExceptionGroupCondition, crate::PyError> {
     let mut base_exc = lookup_exc_class("BaseException").unwrap();
@@ -11146,32 +11174,7 @@ fn exception_group_condition(
     ))
 }
 
-fn exception_group_copy_attrs(
-    mut source: PyObjectRef,
-    mut target: PyObjectRef,
-) -> Result<(), crate::PyError> {
-    if let Ok(notes) = pyre_object::with_roots!(source, target =>
-        crate::baseobjspace::getattr_str(source, "__notes__")
-    ) && let Ok(items) =
-        pyre_object::with_roots!(source, target => crate::baseobjspace::fixedview(notes, -1))
-    {
-        let notes_list = pyre_object::with_roots!(source, target => pyre_object::w_list_new(items));
-        pyre_object::with_roots!(source, target =>
-            crate::baseobjspace::setattr_str(target, "__notes__", notes_list)
-        )?;
-    }
-    for name in ["__cause__", "__context__", "__traceback__"] {
-        let value = pyre_object::with_roots!(source, target =>
-            crate::baseobjspace::getattr_str(source, name)
-        )?;
-        pyre_object::with_roots!(source, target =>
-            crate::baseobjspace::setattr_str(target, name, value)
-        )?;
-    }
-    Ok(())
-}
-
-fn exception_group_derive_and_copy(
+fn exception_group_derive_and_copy_attrs(
     w_self: PyObjectRef,
     exceptions: Vec<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -11214,10 +11217,51 @@ fn exception_group_derive_and_copy(
             "derive must return an instance of BaseExceptionGroup",
         ));
     }
-    exception_group_copy_attrs(
+    // `__notes__` is supposed to be a list, and `split()` is not a good place
+    // to report earlier user errors. `findattr` (`PyObject_GetOptionalAttr`)
+    // propagates anything but a missing attribute. Present and `issequence_w`
+    // (`PySequence_Check`): copy through `fixedview` and `w_list_new`.
+    // Present and not a sequence: skip.
+    let notes = crate::baseobjspace::findattr(
         pyre_object::gc_roots::shadow_stack_get(self_slot),
-        pyre_object::gc_roots::shadow_stack_get(group_slot),
+        "__notes__",
     )?;
+    if let Some(notes) = notes {
+        let notes_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(notes);
+        if crate::baseobjspace::issequence_w(pyre_object::gc_roots::shadow_stack_get(notes_slot)) {
+            let items = crate::baseobjspace::fixedview(
+                pyre_object::gc_roots::shadow_stack_get(notes_slot),
+                -1,
+            )?;
+            // `fixedview` returns an untraced Vec and `w_list_new` allocates,
+            // so publish every element and build the list from those slots.
+            let items_base = pyre_object::gc_roots::pin_roots(&items);
+            let items: Vec<_> = (0..items.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(items_base + i))
+                .collect();
+            let notes_list_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(items));
+            crate::baseobjspace::setattr_str(
+                pyre_object::gc_roots::shadow_stack_get(group_slot),
+                "__notes__",
+                pyre_object::gc_roots::shadow_stack_get(notes_list_slot),
+            )?;
+        }
+    }
+    for name in ["__cause__", "__context__", "__traceback__"] {
+        let value = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            name,
+        )?;
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        crate::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(group_slot),
+            name,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        )?;
+    }
     Ok(pyre_object::gc_roots::shadow_stack_get(group_slot))
 }
 
@@ -11268,6 +11312,16 @@ fn live_exception_group_condition(
     }
 }
 
+/// `app_group.py subgroup`.
+///
+/// Upstream returns `self` twice: once when the condition matches the group
+/// itself, and once at the end when no child was filtered out — the arm its own
+/// comment marks as "this is the difference to split!".  3.14's
+/// `exceptiongroup_subgroup` keeps only the first: an unfiltered subgroup is
+/// still rebuilt through `derive`, so `eg.subgroup(cond) is eg` is False and a
+/// `BaseExceptionGroup` subclass answers `ExceptionGroup` rather than itself.
+/// Identity is observable, so the second arm is not taken here.  `split` never
+/// had it on either side.
 fn exception_group_subgroup_inner(
     w_self: PyObjectRef,
     condition: &ExceptionGroupCondition,
@@ -11288,7 +11342,6 @@ fn exception_group_subgroup_inner(
     let (children_base, n_children) = pin_exception_group_children(exceptions);
     let child = |i| pyre_object::gc_roots::shadow_stack_get(children_base + i);
     let mut selected = pyre_object::gc_roots::RootedItems::new();
-    let mut modified = false;
     for i in 0..n_children {
         let exc = child(i);
         if crate::baseobjspace::isinstance(exc, base_group)? {
@@ -11297,21 +11350,18 @@ fn exception_group_subgroup_inner(
             if !unsafe { pyre_object::is_none(subgroup) } {
                 selected.push(subgroup);
             }
-            if !std::ptr::eq(subgroup, child(i)) {
-                modified = true;
-            }
         } else if live_condition().matches(child(i))? {
             selected.push(child(i));
-        } else {
-            modified = true;
         }
     }
-    if !modified {
-        Ok(w_self())
-    } else if selected.is_empty() {
+    // Upstream tracks whether the walk dropped anything and hands back `self`
+    // when it did not.  `exceptiongroup_subgroup` derives either way, which is
+    // what the identity and the answered class are measured against, so the
+    // `modified` flag has no reader here.
+    if selected.is_empty() {
         Ok(pyre_object::w_none())
     } else {
-        exception_group_derive_and_copy(w_self(), selected.take())
+        exception_group_derive_and_copy_attrs(w_self(), selected.take())
     }
 }
 
@@ -11371,14 +11421,14 @@ fn exception_group_split_inner(
         pyre_object::w_none()
     } else {
         let items: Vec<PyObjectRef> = matching_at.iter().map(|&i| kept.get(i)).collect();
-        exception_group_derive_and_copy(w_self(), items)?
+        exception_group_derive_and_copy_attrs(w_self(), items)?
     };
     derived.push(yes);
     let no = if nonmatching_at.is_empty() {
         pyre_object::w_none()
     } else {
         let items: Vec<PyObjectRef> = nonmatching_at.iter().map(|&i| kept.get(i)).collect();
-        exception_group_derive_and_copy(w_self(), items)?
+        exception_group_derive_and_copy_attrs(w_self(), items)?
     };
     derived.push(no);
     Ok((derived.get(0), derived.get(1)))
@@ -11482,7 +11532,7 @@ fn exception_group_meta_ref_eq(w_left: PyObjectRef, w_right: PyObjectRef) -> boo
     }
 }
 
-fn exception_group_same_metadata(
+fn exception_group_is_same_exception_metadata(
     w_left: PyObjectRef,
     w_right: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
@@ -11526,7 +11576,7 @@ fn exception_group_same_metadata(
     })
 }
 
-fn exception_group_collect_leaves(
+fn exception_group_collect_eg_leafs(
     w_exc: PyObjectRef,
     w_leaves: PyObjectRef,
 ) -> Result<(), crate::PyError> {
@@ -11543,7 +11593,7 @@ fn exception_group_collect_leaves(
         let children = unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) };
         let kids = pyre_object::gc_roots::pin_roots(&children);
         for i in 0..children.len() {
-            exception_group_collect_leaves(
+            exception_group_collect_eg_leafs(
                 pyre_object::gc_roots::shadow_stack_get(kids + i),
                 w_leaves(),
             )?;
@@ -11575,7 +11625,7 @@ fn exception_group_projection(
     let leaves_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(Vec::new()));
     for i in 0..keep.len() {
-        exception_group_collect_leaves(
+        exception_group_collect_eg_leafs(
             pyre_object::gc_roots::shadow_stack_get(keep_base + i),
             pyre_object::gc_roots::shadow_stack_get(leaves_slot),
         )?;
@@ -11623,7 +11673,7 @@ pub(crate) fn exception_group_prep_reraise_star(
     for i in 0..n {
         let w_exc = exc_at(i);
         if !unsafe { pyre_object::is_none(w_exc) } {
-            if exception_group_same_metadata(
+            if exception_group_is_same_exception_metadata(
                 w_exc,
                 pyre_object::gc_roots::shadow_stack_get(orig_slot),
             )? {
@@ -11689,7 +11739,8 @@ fn exception_group_subgroup(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         ));
     }
     let mut w_self = args[0];
-    let condition = pyre_object::with_roots!(w_self => exception_group_condition(args[1]))?;
+    let condition =
+        pyre_object::with_roots!(w_self => exception_group_get_condition_filter(args[1]))?;
     exception_group_subgroup_inner(w_self, &condition)
 }
 
@@ -11700,7 +11751,8 @@ fn exception_group_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         ));
     }
     let mut w_self = args[0];
-    let condition = pyre_object::with_roots!(w_self => exception_group_condition(args[1]))?;
+    let condition =
+        pyre_object::with_roots!(w_self => exception_group_get_condition_filter(args[1]))?;
     let (yes, no) = exception_group_split_inner(w_self, &condition)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[yes, no]);

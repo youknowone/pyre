@@ -12897,7 +12897,12 @@ impl<'a> Lowering<'a> {
         // `call.func`.  This is the same two-source type test used for
         // `SliceIndex::index` below and keeps Range* implementations on the
         // separate getslice lowering.
-        let (slice_get_index_is_scalar, slice_get_element, slice_first_element) = match &call.func {
+        let (
+            slice_get_index_is_scalar,
+            slice_get_element,
+            slice_first_element,
+            slice_object_array_type_id,
+        ) = match &call.func {
             CallFunc::Regular(reg) => {
                 let scalar = self.is_slice_get_scalar_call(reg, second_arg_ty.as_ref());
                 let is_get_mut = self.is_slice_get_mut_call(reg);
@@ -12918,9 +12923,14 @@ impl<'a> Lowering<'a> {
                     .is_slice_first_or_last_call(reg)
                     .then(|| self.slice_get_element(reg))
                     .flatten();
-                (scalar, element, first_element)
+                // `arraylen_gc` only for an object-pointer receiver. The
+                // element-read identity above is a different value: a
+                // `[u8]` slice is length-prefixed and still not the GC
+                // array object `bh_arraylen_gc` reads.
+                let object_array_type_id = self.slice_object_array_type_id(reg);
+                (scalar, element, first_element, object_array_type_id)
             }
-            _ => (false, None, None),
+            _ => (false, None, None, None),
         };
         // A void ZST stays in `Call.args`. The callee's `Input` still
         // lists that parameter, and the annotator counts it. The
@@ -17891,6 +17901,7 @@ impl<'a> Lowering<'a> {
             && let Some(mut site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
         {
             self.annotate_slice_first_site(&mut site, &arg_locals, slice_first_element.clone());
+            site.object_array_type_id = slice_object_array_type_id.clone();
             self.slice_first_sites.push(site);
         }
         // `<[T]>::last(slice)` is `first` with index `len-1` and the
@@ -17906,6 +17917,7 @@ impl<'a> Lowering<'a> {
         {
             site.access = crate::front::slice_first::SliceAccess::Last;
             self.annotate_slice_first_site(&mut site, &arg_locals, slice_first_element.clone());
+            site.object_array_type_id = slice_object_array_type_id.clone();
             self.slice_first_sites.push(site);
         }
         // Capture `<[T]>::get(slice, i)` / `get_mut` sites for the
@@ -17928,10 +17940,16 @@ impl<'a> Lowering<'a> {
             && args.len() == 2
             && crate::front::slice_get::is_slice_get_segments(segments)
             && slice_get_index_is_scalar
+            // `first`/`last` carry the mark onto the site and answer a byte
+            // view with `__strlen` plus `__string_byte_getitem`; the scalar
+            // `get` rewriter has neither, so its diamond would read the string
+            // object as a GC array.  Leave the residual call.
+            && !self.slice_receiver_is_string_byte_view(&arg_locals)
             && let Some((item_ty, array_type_id)) = slice_get_element.clone()
-            && let Some(site) =
+            && let Some(mut site) =
                 self.recognize_slice_get_site(&call.dest.ty, &result_var, item_ty, array_type_id)
         {
+            site.object_array_type_id = slice_object_array_type_id.clone();
             self.slice_get_sites.push(site);
         }
         // `<[T]>::get(slice, start..)` returns an Option subslice.  Preserve
@@ -17958,6 +17976,7 @@ impl<'a> Lowering<'a> {
                 range: range_site.range_result,
                 start: range_site.start,
             };
+            site.object_array_type_id = slice_object_array_type_id.clone();
             self.slice_first_sites.push(site);
         }
         // Capture `{uN}::saturating_sub(a, b)` sites for the unsigned clamp
@@ -22870,8 +22889,20 @@ impl<'a> Lowering<'a> {
             niche,
             payload_narrow_root,
             array_type_id: None,
+            object_array_type_id: None,
             string_byte_view: false,
         })
+    }
+
+    /// Whether the receiver of a recognized slice call is an `as_bytes()` view
+    /// of a string rather than a GC array, i.e. carries a `StringRepr` length
+    /// and a `__string_byte_getitem` element read.
+    fn slice_receiver_is_string_byte_view(&self, arg_locals: &[Option<usize>]) -> bool {
+        arg_locals
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|local| self.string_byte_view_locals.contains(&local))
     }
 
     /// Stamp byte-view / ARRAY identity onto a `first` / `last` site.
@@ -22885,11 +22916,7 @@ impl<'a> Lowering<'a> {
         arg_locals: &[Option<usize>],
         element: Option<(ValueType, Option<String>)>,
     ) {
-        let string_byte_view = arg_locals
-            .first()
-            .copied()
-            .flatten()
-            .is_some_and(|local| self.string_byte_view_locals.contains(&local));
+        let string_byte_view = self.slice_receiver_is_string_byte_view(arg_locals);
         if string_byte_view {
             site.string_byte_view = true;
             site.array_type_id = None;
@@ -22942,6 +22969,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty: item_ty,
             array_type_id,
+            object_array_type_id: None,
             niche,
             payload_narrow_root,
         })

@@ -597,6 +597,49 @@ pub(crate) fn close_goto_mixed(
     graph.set_control_flow_metadata(block, None, vec![link]);
 }
 
+/// The length read a slice bounds guard branches on.
+///
+/// `ArrayLen` is `arraylen_gc` (`bh_arraylen_gc`). It reads
+/// `ArrayDescr.lendescr` from a GC array object, and
+/// `AbstractBaseListRepr.rtype_len` reaches that op for a `SomeList` of
+/// objects. The only receiver with that shape is an object-pointer slice:
+/// `slice_object_array_type_id` — the same answer `is_slice_is_empty` uses —
+/// is `Some` only when the element type is `*mut PyObject`, naming the object
+/// gcarray. Pass that identity here. The element read's identity describes
+/// the array the index addresses, which for `&[u8]` is a borrowed view, and
+/// reading `arraylen_gc` from those bytes takes the length from the wrong
+/// offset.
+///
+/// Every other receiver keeps a marker. A string byte view is a
+/// `StringRepr`, so `StringRepr.rtype_len` is `ll_strlen` and the guard emits
+/// `__strlen`. A `[u8]` / `[i64]` / `[f64]` / `[str]` view, and any slice
+/// whose element is not an object pointer, keeps `__len`.
+pub(crate) fn slice_len_op(
+    base: Variable,
+    object_array_type_id: Option<&str>,
+    string_byte_view: bool,
+) -> OpKind {
+    let marker = if string_byte_view {
+        "__strlen"
+    } else if let Some(id) = object_array_type_id {
+        return OpKind::ArrayLen {
+            base,
+            array_type_id: Some(id.to_owned()),
+            nolength: false,
+        };
+    } else {
+        "__len"
+    };
+    OpKind::Call {
+        target: CallTarget::FunctionPath {
+            segments: vec![marker.to_string()],
+            fun_decl_id: None,
+        },
+        args: crate::model::call_args(vec![base]),
+        result_ty: ValueType::Int,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

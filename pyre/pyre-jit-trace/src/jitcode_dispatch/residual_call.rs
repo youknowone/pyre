@@ -3070,8 +3070,11 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
 ///   A nested function's `LOAD_GLOBAL` folds it to the NULL constant.
 /// * `RaiseVarargs` trailing arg — `cause`: `normalize_raise_varargs` carries it
 ///   as the `raise X` (no `from`) sentinel, never dereferenced when null.
+/// * a registered leaf the effect info gives no kind for — see
+///   [`null_ref_sentinel_of_registered_leaf`].
 pub(crate) fn mayforce_null_ref_arg_is_checked_sentinel(
     helper: majit_ir::RuntimeHelperKind,
+    target: i64,
     arg_index: usize,
     nargs: usize,
 ) -> bool {
@@ -3081,8 +3084,50 @@ pub(crate) fn mayforce_null_ref_arg_is_checked_sentinel(
         K::CallFunctionEx => arg_index == 1 || arg_index == 3,
         K::LoadGlobal => arg_index == 0,
         K::RaiseVarargs => arg_index + 1 == nargs,
-        _ => false,
+        _ => null_ref_sentinel_of_registered_leaf(target, arg_index, nargs),
     }
+}
+
+/// Whether Ref argument `arg_index` of the registered leaf at `target` is a
+/// checked `PY_NULL` sentinel.
+///
+/// A plain `dont_look_inside*` body has no `RuntimeHelperKind`, so the table
+/// above cannot name it and the funcptr is the only coordinate the call
+/// carries; resolve it against the published registry the way
+/// `records_inside_transparent_helper` does.
+fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: usize) -> bool {
+    if target <= 0 {
+        return false;
+    }
+    pyre_interpreter::jit_trace_fnaddrs()
+        .iter()
+        .any(|(path, registered)| {
+            *registered == target
+                && path.rsplit("::").next().is_some_and(|leaf| {
+                    let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
+                    match leaf {
+                        // `dict_get_plain_applies(dict, key, tail)` — `tail` is
+                        // `PY_NULL` for the two-word `d.get(k)` that
+                        // `__majit_wrap_dict_descr_get` pads to three words, and
+                        // `tail.is_null()` is the first thing the body reads it
+                        // with.  Declining it leaves the `bool` result unbound,
+                        // and the wrapper's own `goto_if_not` on that result
+                        // then aborts the walk with no complete image.
+                        "dict_get_plain_applies" => arg_index == 2 && nargs == 3,
+                        // `dict_get_slow(dict, key, default, nargs)` — the same
+                        // padding reaches `default`, and a concrete NULL there
+                        // is itself the proof the word is unread: the wrapper
+                        // leaves it `PY_NULL` only for a call of one or two
+                        // words and passes that same length as `nargs`, while
+                        // every arm that moves `default` on is guarded by
+                        // `nargs >= 3`.  Nothing dereferences it even then —
+                        // it is copied into the slice `dict_method_get`
+                        // rejects on arity.
+                        "dict_get_slow" => arg_index == 2 && nargs == 4,
+                        _ => false,
+                    }
+                })
+        })
 }
 
 /// Abort the walk when a result-bearing may-force CALL is recorded with a
@@ -3116,41 +3161,47 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
         if ty != majit_ir::Type::Ref {
             continue;
         }
-        // The checked-sentinel table, shared with
-        // `try_execute_residual_call_via_executor` so the two cannot drift.
-        if mayforce_null_ref_arg_is_checked_sentinel(helper, i, nargs) {
+        let Some(&b) = allboxes.get(1 + i) else {
+            continue;
+        };
+        if !matches!(
+            ctx.trace_ctx.box_value(b),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
+        ) {
             continue;
         }
-        if let Some(&b) = allboxes.get(1 + i) {
-            if matches!(
-                ctx.trace_ctx.box_value(b),
-                Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
-            ) {
-                // Phase-1 diagnostic (gh#343 depth-2): pinpoint which Ref arg
-                // folded to concrete NULL and its provenance.  Gated on
-                // `PYRE_P2_DIAG` (the depth-2 framestack-walk diag flag) and
-                // computed only on the abort path, so the default trace path
-                // pays nothing.
-                if p2_diag_enabled() {
-                    eprintln!(
-                        "[p2-mayforce] NULL Ref arg: pc={pc} call_opcode={call_opcode:?} \
-                         helper={:?} arg_index={i} nargs={} funcbox={:?}(={:?})",
-                        call_descr.get_extra_info().runtime_helper,
-                        call_descr.arg_types().len(),
-                        allboxes.first(),
-                        allboxes.first().and_then(|&f| ctx.trace_ctx.box_value(f)),
-                    );
-                    for (j, &aty) in call_descr.arg_types().iter().enumerate() {
-                        let ab = allboxes.get(1 + j).copied();
-                        eprintln!(
-                            "[p2-mayforce]   arg[{j}] ty={aty:?} opref={ab:?} val={:?}",
-                            ab.and_then(|b| ctx.trace_ctx.box_value(b)),
-                        );
-                    }
-                }
-                return Err(DispatchError::MayForceNullRefArgUnsupported { pc });
+        // The checked-sentinel table, shared with
+        // `try_execute_residual_call_via_executor` so the two cannot drift.
+        // Its funcbox coordinate names a leaf the effect info gives no
+        // `RuntimeHelperKind` for, and is resolved on this arm alone.
+        let target = match allboxes.first().and_then(|&f| ctx.trace_ctx.box_value(f)) {
+            Some(majit_ir::Value::Int(addr)) => addr,
+            _ => 0,
+        };
+        if mayforce_null_ref_arg_is_checked_sentinel(helper, target, i, nargs) {
+            continue;
+        }
+        // Phase-1 diagnostic (gh#343 depth-2): pinpoint which Ref arg
+        // folded to concrete NULL and its provenance.  Gated on
+        // `PYRE_P2_DIAG` (the depth-2 framestack-walk diag flag) and
+        // computed only on the abort path, so the default trace path
+        // pays nothing.
+        if p2_diag_enabled() {
+            eprintln!(
+                "[p2-mayforce] NULL Ref arg: pc={pc} call_opcode={call_opcode:?} \
+                 helper={helper:?} arg_index={i} nargs={nargs} funcbox={:?}(={:?})",
+                allboxes.first(),
+                allboxes.first().and_then(|&f| ctx.trace_ctx.box_value(f)),
+            );
+            for (j, &aty) in call_descr.arg_types().iter().enumerate() {
+                let ab = allboxes.get(1 + j).copied();
+                eprintln!(
+                    "[p2-mayforce]   arg[{j}] ty={aty:?} opref={ab:?} val={:?}",
+                    ab.and_then(|b| ctx.trace_ctx.box_value(b)),
+                );
             }
         }
+        return Err(DispatchError::MayForceNullRefArgUnsupported { pc });
     }
     Ok(())
 }
@@ -3837,33 +3888,35 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // summed to n-1, callee ran n-1 times).
     let helper = call_descr.get_extra_info().runtime_helper;
     for (i, &arg) in args.iter().enumerate() {
-        if mayforce_null_ref_arg_is_checked_sentinel(helper, i, args.len()) {
+        if arg != 0 || !matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) {
             continue;
         }
-        if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
-            // The refusal names the helper and slot it fired on, because the
-            // repair for a helper that does check its NULL is a row in
-            // `mayforce_null_ref_arg_is_checked_sentinel` and the row needs
-            // both coordinates.  A call the effect info gives no
-            // `RuntimeHelperKind` for has only the funcbox to name it by, so
-            // resolve that against the published registry too.
-            if fbw_debug_abort_enabled() {
-                let target = match allboxes.first().and_then(|&b| ctx.trace_ctx.box_value(b)) {
-                    Some(majit_ir::Value::Int(addr)) => addr,
-                    _ => 0,
-                };
-                let name = pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .find(|&(_, addr)| addr == target)
-                    .map_or("-", |(name, _)| name);
-                eprintln!(
-                    "[nullref-refusal] helper={helper:?} target={name}/{target:#x} \
-                     arg_index={i} nargs={} pc={op_pc} opcode={call_opcode:?}",
-                    args.len()
-                );
-            }
-            return Ok(declined_symbolic(call_opcode));
+        // The funcbox coordinate the sentinel table needs to name a leaf the
+        // effect info gives no `RuntimeHelperKind` for, resolved on this arm
+        // alone so the ordinary residual path never reads the registry.
+        let target = match allboxes.first().and_then(|&b| ctx.trace_ctx.box_value(b)) {
+            Some(majit_ir::Value::Int(addr)) => addr,
+            _ => 0,
+        };
+        if mayforce_null_ref_arg_is_checked_sentinel(helper, target, i, args.len()) {
+            continue;
         }
+        // The refusal names the helper and slot it fired on, because the
+        // repair for a helper that does check its NULL is a row in
+        // `mayforce_null_ref_arg_is_checked_sentinel` and the row needs
+        // both coordinates.
+        if fbw_debug_abort_enabled() {
+            let name = pyre_interpreter::jit_trace_fnaddrs()
+                .into_iter()
+                .find(|&(_, addr)| addr == target)
+                .map_or("-", |(name, _)| name);
+            eprintln!(
+                "[nullref-refusal] helper={helper:?} target={name}/{target:#x} \
+                 arg_index={i} nargs={} pc={op_pc} opcode={call_opcode:?}",
+                args.len()
+            );
+        }
+        return Ok(declined_symbolic(call_opcode));
     }
     // #57 (Finding #1, in-place container mutation): an in-flight FOR_ITER
     // body's `acc += delta` is a bare `NB_INPLACE_*` `BinaryOp` residual (args

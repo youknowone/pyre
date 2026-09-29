@@ -1995,12 +1995,7 @@ pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn function_setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
-    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-    if !unsafe { crate::baseobjspace::isinstance_w(value, w_dict_type) } {
-        return Err(crate::PyError::type_error(
-            "setting function's dictionary to a non-dict",
-        ));
-    }
+    crate::baseobjspace::require_dict_for_setdict(value)?;
     unsafe {
         function_write_barrier(obj);
         (*(obj as *mut Function)).w_func_dict = value;
