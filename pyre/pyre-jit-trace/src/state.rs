@@ -1330,12 +1330,9 @@ pub fn jitcode_source_has_exception_handler(jitcode_index: i32) -> Option<bool> 
 /// The pool's VALUES are immutable after build; their ADDRESSES are not.  A
 /// `residual_call` whose ref argument is a constant bakes whatever object the
 /// tracer read, and that object is non-moving only when it happens to be an
-/// old-generation number or a `malloc_typed`-immortal build-time constant.
-/// `MAKE_FUNCTION` bakes the frame's globals dict
-/// (`jit_make_function_from_globals(globals, code)`), and a frame running
-/// under `exec(code, {...})` carries an ordinary collectable one.  So this
-/// walk writes the visitor's answer back into the slot instead of marking a
-/// copy of it. Major collections walk every pool; minor collections consume
+/// old-generation number or a `malloc_typed`-immortal build-time constant, so
+/// this walk writes the visitor's answer back into the slot instead of marking
+/// a copy of it. Major collections walk every pool; minor collections consume
 /// only [`MetaInterpStaticData::jitcodes_with_young_constants`], the off-GC
 /// counterpart of incminimark's `old_objects_pointing_to_young`.
 pub fn walk_jitcode_constants_refs(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {

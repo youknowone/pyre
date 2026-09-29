@@ -6366,7 +6366,7 @@ where
 /// Lower the MAKE_FUNCTION pyre HLOp `make_function_value(globals, code)` →
 /// `result: Ref` to `residual_call_r_r(ConstInt(make_function_fn_idx),
 /// ListR([globals, code]), Descr) → reg`, the two-Ref shape.  `globals` is the
-/// code's `w_globals` object baked as a `Signed(ptr) + Kind::Ref` constant;
+/// frame's `get_w_globals()` result (the `load_import_globals` helper's Ref);
 /// `code` is the popped code object.  The result is the function the
 /// codewriter pushes back onto the stack.  `jit_make_function_from_globals`
 /// allocates a function but runs no user code and never raises → `Plain`.

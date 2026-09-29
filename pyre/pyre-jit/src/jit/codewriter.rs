@@ -11241,43 +11241,30 @@ impl CodeWriter {
                             // object on the shadow stack so a following
                             // SET_FUNCTION_ATTRIBUTE / STORE_FAST sees the function.
                             //
-                            // `globals` is the code's `w_globals` object as a
-                            // post-rtype `Signed(ptr) + Kind::Ref` constant, the same
-                            // shape the StoreAttr arm bakes `w_code` with.
-                            // `pyframe.py:49 self.w_globals = w_globals` stamps a
-                            // `malloc_typed`-immortal wrapper at frame construction,
-                            // so its pointer is fixed and GC-stable at jitcode build
-                            // time (see the LOAD_GLOBAL namespace fold above).
-                            //
-                            // Reading the live frame's `w_globals` here instead —
-                            // the shape `pyopcode.py` has, and the one that
-                            // would honour an `exec(code, ns)` override — needs the
-                            // vable read to be trustworthy off a NONSTANDARD
-                            // virtualizable.  It is not: that path answers from a
-                            // heapcache keyed by `fielddescr.index()`, which is
-                            // `u32::MAX` for every descriptor that was never
-                            // assigned one, so a Ref field read can return another
-                            // field's Int.  `jit_make_function_from_globals`
-                            // dereferences whatever it gets
-                            // (`synth/raise_reg_unbound_jitstress` faulted on 0x1).
-                            // The constant stays until that keying is fixed.
+                            // The globals operand is the live frame's
+                            // `get_w_globals()` (`pyopcode.py MAKE_FUNCTION` /
+                            // `pyframe.py get_w_globals`), read through the same
+                            // frame-only `load_import_globals` helper IMPORT_NAME
+                            // uses. `PyCode.w_globals` is first-store-wins and
+                            // stays NULL until the code object's first frame is
+                            // created, so a jitcode built before that would
+                            // otherwise capture NULL.
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let code_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let globals_obj = unsafe {
-                                pyre_interpreter::w_code_get_w_globals(
-                                    w_code as pyre_object::PyObjectRef,
+                            let globals_value: super::flow::FlowValue =
+                                emit_frontend_frame_only_ref(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "load_import_globals",
+                                    frame_var.into(),
+                                    py_pc as i64,
                                 )
-                            };
-                            let globals_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(globals_obj as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
+                                .into();
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
                                 "make_function_value",
-                                vec![globals_const.into(), code_value.into()],
+                                vec![globals_value.into(), code_value.into()],
                                 Kind::Ref,
                                 py_pc as i64,
                             );
@@ -16877,6 +16864,30 @@ mod tests {
                     .any(|i| code.get(i).copied() == Some(pyjit.metadata.portal_frame_reg as u8))
             }),
             "the residual must name this callee's frame register"
+        );
+    }
+
+    #[test]
+    fn make_function_reads_globals_from_this_graph_frame() {
+        let code =
+            first_nested_function_code("def f():\n    def g():\n        pass\n    return g\n");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code) as *const CodeObject) };
+        let writer = CodeWriter::new();
+        let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
+        assert!(pyjit.jitcode.jitdriver_sd().is_none());
+        assert!(!pyjit.has_abort);
+        assert_ne!(pyjit.metadata.portal_frame_reg, u16::MAX);
+        let calls: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .filter(|op| op.key.contains("residual_call"))
+            .collect();
+        assert!(
+            calls.iter().any(|op| {
+                let code = &pyjit.jitcode.code;
+                (op.pc + 3..op.pc + 8)
+                    .any(|i| code.get(i).copied() == Some(pyjit.metadata.portal_frame_reg as u8))
+            }),
+            "MAKE_FUNCTION must read globals from this frame, not a build-time constant"
         );
     }
 

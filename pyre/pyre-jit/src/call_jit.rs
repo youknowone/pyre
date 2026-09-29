@@ -6937,7 +6937,8 @@ pub extern "C" fn bh_load_import_locals_fn(frame_ptr: *mut PyFrame) -> PyObjectR
     pyre_interpreter::importing::import_locals(frame)
 }
 
-/// IMPORT_NAME's globals argument — `pyopcode.py`'s `self.get_w_globals()`.
+/// IMPORT_NAME and MAKE_FUNCTION's globals argument — `pyopcode.py`'s
+/// `self.get_w_globals()`.
 ///
 /// `w_globals` stopped being a `PyFrame` field, so the namespace is no longer
 /// readable as a virtualizable slot: `get_w_globals` answers from
@@ -6948,7 +6949,7 @@ pub extern "C" fn bh_load_import_globals_fn(frame_ptr: *mut PyFrame) -> PyObject
     assert!(
         !frame_ptr.is_null(),
         "bh_load_import_globals_fn requires a non-null PyFrame; every IMPORT_NAME \
-         emit site must thread portal_frame_reg as its ref operand"
+         and MAKE_FUNCTION emit site must thread portal_frame_reg as its ref operand"
     );
     let frame = unsafe { &*frame_ptr };
     frame.get_w_globals()
