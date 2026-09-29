@@ -7092,14 +7092,14 @@ fn pygraph_initial_block(
         // resolved to `Int` above regardless of its own zero-sized
         // layout — never reaches this arm.
         //
-        // A reference or raw pointer to a primitive is the same case
-        // in the other bank. `lltype.Ptr.__new__` refuses a
-        // non-container pointee, so `&i64` / `*mut i64` are not GC
-        // refs: `Rvalue::Ref` and `Rvalue::RawPtr` alias the scalar,
-        // and `history.py` `getkind` banks a raw pointer as `int`.
-        // Recording `Ref(None)` makes `FUNC.ARGS` disagree with that
-        // caller. A GC `*mut PyObject` is not a primitive pointee and
-        // stays `Ref`.
+        // A reference to a primitive is the same case in the other
+        // bank. `lltype.Ptr.__new__` refuses a non-container pointee,
+        // so `&i64` is not a GC ref: `Rvalue::Ref` aliases the scalar
+        // and `history.py` `getkind` banks it as `int`. Recording
+        // `Ref(None)` makes `FUNC.ARGS` disagree with that caller.
+        // A raw pointer to a wider scalar is `int` (`getkind` of a raw
+        // `Ptr`). A byte pointer stays `Ref`: pyre erases a GC
+        // reference to `*mut u8`. See [`tyref_scalar_pointee_value_type`].
         let mut ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc) {
             ValueType::Void
         } else if matches!(ty, ValueType::Ref(None))
@@ -34383,12 +34383,15 @@ fn tyref_is_raw_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
 /// `ty` is one `&` / `&mut` / `*const` / `*mut` whose pointee is a
 /// primitive (`i64`, `usize`, `bool`, `f64`, …).
 ///
-/// `history.py` `getkind` banks a reference's scalar as `int` or
-/// `float` and a raw pointer as `int`. `lltype.Ptr` cannot point at a
-/// primitive, so neither is a GC ref. Returns `None` for
-/// a pointer to an ADT (`*mut PyObject`), a pointer to a pointer, and
-/// every non-pointer type. 128-bit primitives stay `None`: `getkind`
-/// rejects them.
+/// `lltype.Ptr` cannot point at a primitive. `Rvalue::Ref` of a primitive
+/// aliases the scalar, so a reference's flow value is that word and
+/// `history.py` `getkind` banks it as `int` or `float`. A raw pointer is
+/// the address: `getkind` banks every raw `Ptr` as `int`, including
+/// `*mut f64`. A byte pointer stays `None` (the caller keeps `Ref`):
+/// pyre erases a GC reference to `*mut u8` (`gc_hook::try_gc_write_barrier`,
+/// frame and dict storage). Returns `None` for a pointer to an ADT
+/// (`*mut PyObject`), a pointer to a pointer, and every non-pointer type.
+/// 128-bit primitives stay `None`: `getkind` rejects them.
 fn tyref_scalar_pointee_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let obj = node.as_object()?;
@@ -34404,27 +34407,30 @@ fn tyref_scalar_pointee_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType>
     let prim = tyref_primitive_node(pointee, llbc)?;
     let scalar = prim.as_object()?.get("Scalar")?;
     let pointee_vt = scalar_value_type(scalar)?;
-    // A raw pointer is the address itself: `getkind` of a raw `Ptr` is
-    // `int` whatever the pointee, so `*mut f64` is not a float.
+    let supported = matches!(
+        pointee_vt,
+        ValueType::Int
+            | ValueType::Unsigned
+            | ValueType::Bool
+            | ValueType::Float
+            | ValueType::SingleFloat
+    );
+    if !supported {
+        return None;
+    }
     if is_raw {
-        return matches!(
-            pointee_vt,
-            ValueType::Int
-                | ValueType::Unsigned
-                | ValueType::Bool
-                | ValueType::Float
-                | ValueType::SingleFloat
-        )
-        .then_some(ValueType::Int);
+        let tag = scalar
+            .as_object()
+            .and_then(|obj| obj.get("Integer"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|int| int.get("Signed").or_else(|| int.get("Unsigned")))
+            .and_then(serde_json::Value::as_str);
+        if matches!(tag, Some("I8" | "U8")) {
+            return None;
+        }
+        return Some(ValueType::Int);
     }
-    match pointee_vt {
-        vt @ (ValueType::Int
-        | ValueType::Unsigned
-        | ValueType::Bool
-        | ValueType::Float
-        | ValueType::SingleFloat) => Some(vt),
-        _ => None,
-    }
+    Some(pointee_vt)
 }
 
 /// `ty` itself is a Charon primitive scalar, not a pointer to one.
