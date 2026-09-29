@@ -1058,8 +1058,8 @@ fn sparse_value_ids_declare_only_addressable_value_locals() {
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
-        inputargs.len() as u32 + 3 + 6 + 2,
-        "two input values and three sparse ids, plus fixed i64 and i32 locals"
+        inputargs.len() as u32 + 1 + 6 + 2,
+        "sparse ids allocate no hole, and a dead input local is reused by a later result"
     );
 }
 
@@ -1111,8 +1111,8 @@ fn same_as_does_not_alias_a_mutable_label_local() {
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
-        inputargs.len() as u32 + 2 + 6 + 2,
-        "SameAs must not share the phi local that JUMP rebinds"
+        inputargs.len() as u32 + 1 + 6 + 2,
+        "SameAs must not share the phi local that JUMP rebinds; its dead result may share with the later IntAdd"
     );
 }
 
@@ -7069,7 +7069,7 @@ fn host_oversized_loop_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) ->
     // `host_loop_ops` is [label, advance, guard, jump]. The chain replaces
     // the guard and the JUMP so both read the last add.
     ops.truncate(2);
-    const EXTRA: u32 = 700;
+    const EXTRA: u32 = 1000;
     for i in 0..EXTRA {
         let next = Op::new(
             OpCode::IntAdd,
