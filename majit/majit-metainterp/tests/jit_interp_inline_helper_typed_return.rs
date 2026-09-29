@@ -904,19 +904,12 @@ fn a_discarded_inline_int_result_still_pops_on_the_concrete_path() {
 /// bhimpl_inline_call_*` runs — `cpu.bh_call_X(adr2int(jitcode.fnaddr),
 /// args_i, args_r, args_f, jitcode.calldescr)` — so `arg_classes` and the
 /// result class must name the ABI of `fnaddr` itself. The `extern "C"`
-/// trampoline the macro emits is a WIDENING shim: every parameter is `i64`
+/// trampoline the macro emits is a widening shim: every parameter is `i64`
 /// and an `f64` one is rebuilt in the body from its bits. The class string is
-/// built from the SOURCE kinds, so for a float it would say `'f'` while the
-/// ABI is an integer register, and the two readers of `fnaddr` disagree in
-/// opposite directions — `collect_call_args` puts the value in the float
-/// register file, `collect_call_args_positional` passes raw bits and then
-/// reads a float result out of an `i64` return.
-///
-/// Upstream has no such split: `call.py get_jitcode_calldescr` derives
-/// `fnaddr` and the calldescr from the same `FUNC`. Until the two come from
-/// one signature here, the entry is refused and the blackhole interprets the
-/// bytes, which is what every one of these helpers did before an entry was
-/// staged at all.
+/// built from the source kinds, so for a float it says `'f'` while the ABI is
+/// an integer register. `collect_call_args` would pass a real `f64`, and a
+/// float result would be read from an integer return of a target that returns
+/// `f64`. The entry stays at 0 and the blackhole interprets the bytes.
 ///
 /// The int/ref helper below is the control: without it a `0` here would also
 /// be produced by an expansion that had stopped staging entries entirely.

@@ -368,21 +368,6 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
         )
         .map_err(estr)?;
 
-    // Residual-call trampoline for the recording / blackhole path; see the
-    // wasmtime path's `jit_call_host` for the full rationale.
-    linker
-        .func_wrap(
-            "majit_host",
-            "jit_call_host",
-            |mut caller: Caller<'_, Host>, frame_ptr: u32| {
-                if let Err(e) = jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32)
-                {
-                    eprintln!("[jit_call_host] {e}");
-                }
-            },
-        )
-        .map_err(estr)?;
-
     linker
         .func_wrap(
             "env",
