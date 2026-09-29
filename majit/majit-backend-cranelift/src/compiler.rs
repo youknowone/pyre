@@ -7784,10 +7784,13 @@ struct MergedBridgePiece {
 }
 
 /// A loop pulled into the anchor's function because some JUMP in the family
-/// targets one of its LABELs.
+/// targets one of its LABELs. `ops` starts at the loop's first LABEL: the ops
+/// before it run only on the loop's own entry, which the merged function does
+/// not replace, so a family JUMP never reaches them. `entry_args` are that
+/// LABEL's arguments.
 struct FamilyMember {
     token: Arc<JitCellToken>,
-    inputargs: Vec<InputArgRc>,
+    entry_args: Vec<OpRef>,
     ops: Vec<Op>,
     bridges: Vec<MergedBridgePiece>,
     invalidation_flag_ptr: usize,
@@ -8662,15 +8665,16 @@ fn renumber_bridge_ops(
     Some(renumber_ops(bridge_ops, &input_map, next_raw))
 }
 
-/// Fresh op-result positions, one per input, int/ref/float matching the
-/// `InputArg` type. The member loop is not a second entry of the function,
-/// so its inputargs cannot keep their old raws.
-fn member_input_map(inputargs: &[InputArgRc], next_raw: &mut u32) -> Vec<(OpRef, OpRef)> {
-    inputargs
+/// Fresh op-result positions, one per argument of the member's first LABEL,
+/// int/ref/float matching the argument. Those arguments were defined by ops
+/// the merge does not copy (or were the loop's inputargs), so they cannot
+/// keep their old raws.
+fn member_input_map(entry_args: &[OpRef], next_raw: &mut u32) -> Vec<(OpRef, OpRef)> {
+    entry_args
         .iter()
-        .map(|ia| {
-            let old = OpRef::input_arg_typed(ia.index, ia.tp.get());
-            let new = OpRef::op_typed(*next_raw, ia.tp.get());
+        .map(|&old| {
+            let tp = old.ty().expect("member entry argument is a typed value");
+            let new = OpRef::op_typed(*next_raw, tp);
             *next_raw = next_raw.saturating_add(1);
             (old, new)
         })
@@ -8825,14 +8829,39 @@ fn push_jump_descrs(ops: &[Op], work: &mut Vec<DescrRef>) {
     }
 }
 
-fn label_args_are_inputargs(op: &Op, inputargs: &[InputArgRc]) -> bool {
-    if op.num_args() != inputargs.len() {
-        return false;
+/// The arguments of `ops[0]`, a LABEL, when they are distinct typed values
+/// and every value the rest of `ops` reads is one of them or a result of an
+/// op in `ops`. `None` when a read reaches past the LABEL into ops the merge
+/// does not copy.
+fn member_entry_args(ops: &[Op]) -> Option<Vec<OpRef>> {
+    let label = ops.first()?;
+    if label.opcode != OpCode::Label {
+        return None;
     }
-    (0..op.num_args()).all(|i| {
-        let ia = &inputargs[i];
-        op.arg(i).to_opref() == OpRef::input_arg_typed(ia.index, ia.tp.get())
-    })
+    let mut known: Vec<u32> = Vec::new();
+    let mut entry_args = Vec::with_capacity(label.num_args());
+    for i in 0..label.num_args() {
+        let arg = label.arg(i).to_opref();
+        if !is_value_position(arg) || arg.ty().is_none() || known.contains(&arg.raw()) {
+            return None;
+        }
+        known.push(arg.raw());
+        entry_args.push(arg);
+    }
+    for op in ops {
+        let pos = op.pos().get();
+        if is_value_position(pos) && !known.contains(&pos.raw()) {
+            known.push(pos.raw());
+        }
+    }
+    let read_is_known = |opref: OpRef| !is_value_position(opref) || known.contains(&opref.raw());
+    let all_known = ops.iter().all(|op| {
+        (0..op.num_args()).all(|i| read_is_known(op.arg(i).to_opref()))
+            && op
+                .getfailargs()
+                .is_none_or(|fail_args| fail_args.iter().all(|arg| read_is_known(arg.to_opref())))
+    });
+    all_known.then_some(entry_args)
 }
 
 /// Bridges attached to guards of `owner_ops`, same skips as the anchor:
@@ -8909,7 +8938,7 @@ fn try_accept_family_member(
     if owner.is_invalidated() {
         return None;
     }
-    let inputargs;
+    let entry_args;
     let ops;
     {
         let compiled = owner
@@ -8926,18 +8955,13 @@ fn try_accept_family_member(
         if !label_in_ops {
             return None;
         }
-        let Some(first) = src.ops.first() else {
-            return None;
-        };
-        if first.opcode != OpCode::Label || !label_args_are_inputargs(first, &src.inputargs) {
-            return None;
-        }
-        ops = snapshot_ops(&src.ops);
+        let first_label = src.ops.iter().position(|op| op.opcode == OpCode::Label)?;
+        ops = snapshot_ops(&src.ops[first_label..]);
+        entry_args = member_entry_args(&ops)?;
         refresh_retained_constptrs(&ops, compiled.gc_table.as_deref())?;
         if ops_refuse_merge(&ops) {
             return None;
         }
-        inputargs = snapshot_inputargs(&src.inputargs);
     }
     // `compiled` borrowed `owner`. Bridge collection needs `&owner` again.
     let invalidation_flag_ptr = token_invalidation_flag_ptr(&owner);
@@ -8950,7 +8974,7 @@ fn try_accept_family_member(
     }
     Some(FamilyMember {
         token: owner,
-        inputargs,
+        entry_args,
         ops,
         bridges,
         invalidation_flag_ptr,
@@ -9080,7 +9104,7 @@ fn prepare_merged_recompile(
         )?;
     }
     for member in &members {
-        let input_map = member_input_map(&member.inputargs, &mut next_raw);
+        let input_map = member_input_map(&member.entry_args, &mut next_raw);
         let (renumbered, next) = renumber_ops(&member.ops, &input_map, next_raw);
         next_raw = next;
         let member_base = combined.len();
@@ -24342,6 +24366,165 @@ mod tests {
 
         let frame = backend.execute_token(&token_a, &[Value::Int(0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 47);
+    }
+
+    /// Same crossings as `family_merge_makes_cross_token_jumps_local`, but C
+    /// runs a preamble before its LABEL, the shape an unrolled loop has. The
+    /// family JUMP enters C at the LABEL, so C still joins the family and
+    /// the result is 47, not the 40 of staying inside A.
+    #[test]
+    fn family_member_with_a_preamble_joins_at_its_label() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let n = OpRef::input_arg_int(0);
+
+        let label_a = make_label_descr(1_500_430);
+        let exit_a = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let odd_a = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        stamp_one_loc(&exit_a);
+        stamp_one_loc(&odd_a);
+        let ops_a = vec![
+            mk_op_with_descr(OpCode::Label, &[n], OpRef::NONE.raw(), label_a.clone()),
+            mk_op(OpCode::IntAdd, &[n, OpRef::const_int(1)], 1),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(40)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_a,
+            ),
+            mk_op(OpCode::IntAnd, &[OpRef::int_op(1), OpRef::const_int(1)], 3),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(3),
+                OpRef::int_op(1),
+                11,
+                odd_a.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label_a.clone(),
+            ),
+        ];
+        let token_a = Arc::new(JitCellToken::new(1_500_430));
+        bind_target_owner(&label_a, &token_a);
+        backend.compile_loop(&inputargs, &ops_a, &token_a).unwrap();
+
+        let label_c = make_label_descr(1_500_431);
+        let exit_c = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let odd_c = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        stamp_one_loc(&exit_c);
+        stamp_one_loc(&odd_c);
+        let ops_c = vec![
+            mk_op(OpCode::IntAdd, &[n, OpRef::const_int(0)], 5),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::int_op(5)],
+                OpRef::NONE.raw(),
+                label_c.clone(),
+            ),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(5), OpRef::const_int(10)], 1),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(40)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_c,
+            ),
+            mk_op(OpCode::IntAnd, &[OpRef::int_op(1), OpRef::const_int(1)], 3),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(3),
+                OpRef::int_op(1),
+                11,
+                odd_c.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label_c.clone(),
+            ),
+        ];
+        let token_c = Arc::new(JitCellToken::new(1_500_431));
+        bind_target_owner(&label_c, &token_c);
+        backend.compile_loop(&inputargs, &ops_c, &token_c).unwrap();
+
+        let bridge_to_c = vec![mk_op_with_descr(
+            OpCode::Jump,
+            &[n],
+            OpRef::NONE.raw(),
+            label_c.clone(),
+        )];
+        backend
+            .compile_bridge(as_fd(&odd_a), &inputargs, &bridge_to_c, &token_a, &[], None)
+            .unwrap();
+        let bridge_to_a = vec![mk_op_with_descr(
+            OpCode::Jump,
+            &[n],
+            OpRef::NONE.raw(),
+            label_a.clone(),
+        )];
+        backend
+            .compile_bridge(as_fd(&odd_c), &inputargs, &bridge_to_a, &token_c, &[], None)
+            .unwrap();
+
+        let family_body = token_c
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_body_ptr
+            .load(Ordering::Acquire);
+        assert_eq!(
+            label_a.as_loop_target_descr().unwrap().ll_loop_code(),
+            family_body,
+            "A's LABEL points into the function that merged C"
+        );
+        let frame = backend.execute_token(&token_a, &[Value::Int(0)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 47);
+    }
+
+    /// A read after the member's first LABEL of a value only its preamble
+    /// defines cannot be carried into the merged function.
+    #[test]
+    fn member_entry_args_refuse_a_read_of_a_preamble_value() {
+        let n = OpRef::input_arg_int(0);
+        let label = make_label_descr(1_500_440);
+        let closed = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::int_op(5)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(5), OpRef::const_int(1)], 1),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let closed: Vec<Op> = closed.iter().map(|op| snapshot_op(op)).collect();
+        assert_eq!(member_entry_args(&closed), Some(vec![OpRef::int_op(5)]));
+        let leaking = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::int_op(5)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(5), OpRef::int_op(6)], 1),
+            mk_op_with_descr(OpCode::Jump, &[n], OpRef::NONE.raw(), label),
+        ];
+        let leaking: Vec<Op> = leaking.iter().map(|op| snapshot_op(op)).collect();
+        assert_eq!(member_entry_args(&leaking), None);
     }
 
     /// C's `GuardNotInvalidated` must load C's flag. Invalidating C exits a
