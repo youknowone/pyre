@@ -2004,8 +2004,8 @@ impl AbstractShortPreambleBuilderState {
         &mut self,
         preamble_op: &majit_ir::OpRc,
         already_in_short: &FxIndexSet<OpRef>,
-        arg_guards: &[Op],
-        result_guards: &[Op],
+        arg_guards: &[OpRc],
+        result_guards: &[OpRc],
     ) -> Op {
         let canonical_result = preamble_op.pos().get();
         if self.short_results.contains(&canonical_result)
@@ -2045,7 +2045,7 @@ impl AbstractShortPreambleBuilderState {
             }
         }
         // shortpreamble.py:389,396: info.make_guards(arg, self.short, optimizer)
-        self.short.extend(arg_guards.iter().cloned().map(OpRc::new));
+        self.short.extend(arg_guards.iter().cloned());
         // shortpreamble.py:398: self.short.append(preamble_op)
         self.short_results.insert(canonical_result);
         self.short.push(preamble_op.clone());
@@ -2058,8 +2058,7 @@ impl AbstractShortPreambleBuilderState {
         // later consumer's arg walk doesn't re-append this op.
         *preamble_op.forwarded().borrow_mut() = majit_ir::forwarding::Forwarded::None;
         // shortpreamble.py:405-406: info.make_guards(preamble_op, self.short, optimizer)
-        self.short
-            .extend(result_guards.iter().cloned().map(OpRc::new));
+        self.short.extend(result_guards.iter().cloned());
         (**preamble_op).clone()
     }
 }
@@ -2257,8 +2256,8 @@ impl ShortPreambleBuilder {
         &mut self,
         source: OpRef,
         preamble_op: &majit_ir::OpRc,
-        arg_guards: &[Op],
-        result_guards: &[Op],
+        arg_guards: &[OpRc],
+        result_guards: &[OpRc],
     ) {
         // shortpreamble.py `use_box(box, preamble_op)`: `preamble_op` is the
         // replay op created by `add_op_to_short`. Its args are already
@@ -2985,8 +2984,8 @@ impl ExtendedShortPreambleBuilder {
         &mut self,
         source: OpRef,
         preamble_op: &majit_ir::OpRc,
-        arg_guards: &[Op],
-        result_guards: &[Op],
+        arg_guards: &[OpRc],
+        result_guards: &[OpRc],
     ) {
         #[cfg(debug_assertions)]
         if let Some(produced) = self.produced_short_boxes.get(&source) {
@@ -3028,13 +3027,15 @@ impl ExtendedShortPreambleBuilder {
                     }
                 }
             }
-            self.short.extend_from_slice(arg_guards);
+            self.short
+                .extend(arg_guards.iter().map(|op| (**op).clone()));
             self.short_results.insert(canonical);
             self.short.push(preamble_op.clone());
             if preamble_op.opcode.is_ovf() {
                 self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
             }
-            self.short.extend_from_slice(result_guards);
+            self.short
+                .extend(result_guards.iter().map(|op| (**op).clone()));
         }
         // shortpreamble.py:481: self.short.append(jump_op)
         if let Some(jump) = jump_op {

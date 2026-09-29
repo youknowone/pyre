@@ -4347,7 +4347,10 @@ impl OptContext {
     /// returns whatever is stored — PtrInfo *or* IntBound — and calls
     /// `info.make_guards(...)` uniformly. None declines reconstruction when a
     /// required pointer-layout guard cannot name its runtime tid.
-    fn collect_use_box_guards(&mut self, preamble_op: &Op) -> Option<(Vec<Op>, Vec<Op>)> {
+    fn collect_use_box_guards(
+        &mut self,
+        preamble_op: &Op,
+    ) -> Option<(Vec<majit_ir::OpRc>, Vec<majit_ir::OpRc>)> {
         // shortpreamble.py:383-401 line-by-line:
         //
         //   for arg in preamble_op.getarglist():
@@ -4485,47 +4488,47 @@ impl OptContext {
         // info.py FloatConstInfo.make_guards / ConstPtrInfo path —
         // single-value info classes emit a GUARD_VALUE that pins `op` to
         // the recorded constant.
-        let emit_const_guard = |arg: OpRef, value: &Value, guards: &mut Vec<Op>, ctx: &mut Self| {
-            // history.py/268/314 Const{Int,Float,Ptr}.value inline —
-            // GUARD_VALUE second operand is the inline-Const directly.
-            let c = match value {
-                Value::Int(v) => OpRef::const_int(*v),
-                Value::Float(v) => OpRef::const_float(*v),
-                Value::Ref(v) => OpRef::const_ptr(*v),
-                Value::Void => panic!("emit_const_guard: ConstVoid not allowed"),
-            };
-            // ConstInt/Float/Ptr value rides inline on `c` (history.py/
-            // 268/314); no `seed_constant` step (its const arm is a no-op).
-            let arg_b = ctx.materialize_operand_at(arg);
-            let c_b = ctx.materialize_operand_at(c);
-            guards.push(Op::new(OpCode::GuardValue, &[arg_b, c_b]));
+        let emit_const_guard = |arg: &Operand, value: &Value, guards: &mut Vec<majit_ir::OpRc>| {
+            // history.py Const{Int,Float,Ptr}.value inline — GUARD_VALUE
+            // second operand is the inline-Const directly.
+            assert!(
+                !matches!(value, Value::Void),
+                "emit_const_guard: ConstVoid not allowed"
+            );
+            let c = Operand::const_from_value(value.clone());
+            guards.push(majit_ir::OpRc::new(Op::new(
+                OpCode::GuardValue,
+                &[arg.clone(), c],
+            )));
         };
         for entry in &arg_entries {
+            let arg = self.materialize_operand_at(entry.arg);
             match &entry.info {
                 ForwardedInfo::Empty => {}
                 ForwardedInfo::Ptr(p) => {
-                    if !p.make_guards(entry.arg, &mut arg_guards, self) {
+                    if !p.make_guards(&arg, &mut arg_guards, self) {
                         return None;
                     }
                 }
-                ForwardedInfo::Int(b) => b.make_guards(entry.arg, &mut arg_guards, self),
+                ForwardedInfo::Int(b) => b.make_guards(&arg, &mut arg_guards, self),
                 ForwardedInfo::FloatConst(f) => {
-                    emit_const_guard(entry.arg, &Value::Float(*f), &mut arg_guards, self)
+                    emit_const_guard(&arg, &Value::Float(*f), &mut arg_guards)
                 }
             }
         }
         let mut result_guards = Vec::new();
         if let Some((result_ref, info)) = &result_info {
+            let result = self.materialize_operand_at(*result_ref);
             match info {
                 ForwardedInfo::Empty => {}
                 ForwardedInfo::Ptr(p) => {
-                    if !p.make_guards(*result_ref, &mut result_guards, self) {
+                    if !p.make_guards(&result, &mut result_guards, self) {
                         return None;
                     }
                 }
-                ForwardedInfo::Int(b) => b.make_guards(*result_ref, &mut result_guards, self),
+                ForwardedInfo::Int(b) => b.make_guards(&result, &mut result_guards, self),
                 ForwardedInfo::FloatConst(f) => {
-                    emit_const_guard(*result_ref, &Value::Float(*f), &mut result_guards, self)
+                    emit_const_guard(&result, &Value::Float(*f), &mut result_guards)
                 }
             }
         }

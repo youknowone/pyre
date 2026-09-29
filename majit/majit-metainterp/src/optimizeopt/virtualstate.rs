@@ -2412,7 +2412,7 @@ impl GuardRequirement {
     /// matching unroll.py `if isinstance(guard, GuardResOp)`. The
     /// interleaved INT_GE / INT_LE / INT_AND producers in this stream
     /// are NOT GuardResOp and therefore skip the resume stamp.
-    pub fn to_ops(&self, args: &[OpRef], ctx: &mut OptContext) -> Vec<Op> {
+    pub fn to_ops(&self, args: &[OpRef], ctx: &mut OptContext) -> Vec<majit_ir::OpRc> {
         match self {
             GuardRequirement::GuardClass {
                 arg_index,
@@ -2437,7 +2437,7 @@ impl GuardRequirement {
                 let class_b = ctx.materialize_operand_at(class_const);
                 let mut op = Op::new(OpCode::GuardClass, &[arg_b.clone(), class_b.clone()]);
                 op.setfailargs(Default::default());
-                vec![op]
+                vec![majit_ir::OpRc::new(op)]
             }
             GuardRequirement::GuardNonnullClass {
                 arg_index,
@@ -2460,7 +2460,7 @@ impl GuardRequirement {
                 let class_b = ctx.materialize_operand_at(class_const);
                 let mut op = Op::new(OpCode::GuardNonnullClass, &[arg_b.clone(), class_b.clone()]);
                 op.setfailargs(Default::default());
-                vec![op]
+                vec![majit_ir::OpRc::new(op)]
             }
             GuardRequirement::GuardNonnull {
                 arg_index,
@@ -2476,7 +2476,7 @@ impl GuardRequirement {
                 };
                 let mut op = Op::new(OpCode::GuardNonnull, &[ctx.materialize_operand_at(arg)]);
                 op.setfailargs(Default::default());
-                vec![op]
+                vec![majit_ir::OpRc::new(op)]
             }
             GuardRequirement::GuardValue {
                 arg_index,
@@ -2507,7 +2507,7 @@ impl GuardRequirement {
                 let val_b = ctx.materialize_operand_at(val_const);
                 let mut op = Op::new(OpCode::GuardValue, &[arg_b.clone(), val_b.clone()]);
                 op.setfailargs(Default::default());
-                vec![op]
+                vec![majit_ir::OpRc::new(op)]
             }
             GuardRequirement::GuardBounds {
                 arg_index,
@@ -2531,14 +2531,15 @@ impl GuardRequirement {
                 // OpRef is installed on the producer's `pos` before the
                 // consumer guard captures the args.
                 let mut emitted = Vec::new();
-                bounds.make_guards(arg, &mut emitted, ctx);
+                let arg = ctx.materialize_operand_at(arg);
+                bounds.make_guards(&arg, &mut emitted, ctx);
                 // Tag GUARD_TRUE / GUARD_VALUE with empty fail_args; the
                 // non-guard INT_GE / INT_LE / INT_AND producers keep the
                 // default. The caller (`unroll.rs`'s
                 // `jump_to_existing_trace_impl`) gates the
                 // rd_resume_position / descr stamp on `is_guard()` per
                 // unroll.py `isinstance(guard, GuardResOp)`.
-                for op in &mut emitted {
+                for op in &emitted {
                     if matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardValue) {
                         op.setfailargs(Default::default());
                     }

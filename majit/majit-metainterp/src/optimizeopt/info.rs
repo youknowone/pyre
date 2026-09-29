@@ -448,8 +448,8 @@ pub trait PtrInfoExt {
     /// required runtime layout guard cannot be expressed.
     fn make_guards(
         &self,
-        op: OpRef,
-        short: &mut Vec<Op>,
+        op: &Operand,
+        short: &mut Vec<majit_ir::OpRc>,
         ctx: &mut crate::optimizeopt::OptContext,
     ) -> bool;
 
@@ -566,37 +566,28 @@ impl PtrInfoExt for PtrInfo {
     /// Append guard operations to `short` that check this PtrInfo's
     /// properties hold for `op`. Used by use_box (shortpreamble.py).
     /// `ctx` plays the role of `optimizer` in the upstream signature:
-    /// constant-pool allocation goes through `reserve_const_ref` +
-    /// `seed_constant`, and producer-result identity through
-    /// `alloc_op_position_typed`.
+    /// constants ride inline on their operand, and a producer pushed into
+    /// `short` (lenop / eq_op below) takes a fresh position from
+    /// `alloc_op_position_typed`; its consumer guard binds the producer's
+    /// `OpRc` itself.
     fn make_guards(
         &self,
-        op: OpRef,
-        short: &mut Vec<Op>,
+        op: &Operand,
+        short: &mut Vec<majit_ir::OpRc>,
         ctx: &mut crate::optimizeopt::OptContext,
     ) -> bool {
-        let mut alloc_const = |ctx: &mut crate::optimizeopt::OptContext, value: Value| {
-            // history.py/268/314 Const{Int,Float,Ptr}.value inline.
-            let pos = match value {
-                Value::Int(v) => OpRef::const_int(v),
-                Value::Float(v) => OpRef::const_float(v),
-                Value::Ref(v) => OpRef::const_ptr(v),
-                Value::Void => panic!("alloc_const: ConstVoid not allowed"),
-            };
-            // ConstInt/Float/Ptr value rides inline on `pos`
-            // (history.py:227/268/314); no `seed_constant` (const arm no-op).
-            ctx.materialize_operand_at(pos)
-        };
-        // info.py make_guards receives `op` as a Box object; bind the
-        // caller-resolved producer once. Guard args referencing ops pushed
-        // into `short` itself (lenop / eq_op below) stay position-only —
-        // their producer lives in `short`, not in ctx's registries.
-        let op_b = ctx.materialize_operand_at(op);
+        use majit_ir::OpRc;
+        // history.py Const{Int,Float,Ptr}.value inline.
+        let alloc_const = |value: Value| Operand::const_from_value(value);
+        let op_b = op.clone();
         match self {
             // info.py: PtrInfo base — no-op
             PtrInfo::NonNull { .. } => {
                 // info.py: NonNullPtrInfo.make_guards
-                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
+                short.push(OpRc::new(Op::new(
+                    OpCode::GuardNonnull,
+                    std::slice::from_ref(&op_b),
+                )));
             }
             PtrInfo::Instance(info) => {
                 // info.py InstancePtrInfo.make_guards line-by-line.
@@ -635,19 +626,25 @@ impl PtrInfoExt for PtrInfo {
                     // the emitted guard operand is the same ConstInt vtable
                     // address produced by backend/model.py cls_of_box
                     // `cls_of_box()`.
-                    let class_ref = alloc_const(ctx, Value::Int(cls));
+                    let class_ref = alloc_const(Value::Int(cls));
                     if !ctx.remove_gctypeptr {
-                        short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
-                        short.push(Op::new(OpCode::GuardIsObject, std::slice::from_ref(&op_b)));
-                        short.push(Op::new(
+                        short.push(OpRc::new(Op::new(
+                            OpCode::GuardNonnull,
+                            std::slice::from_ref(&op_b),
+                        )));
+                        short.push(OpRc::new(Op::new(
+                            OpCode::GuardIsObject,
+                            std::slice::from_ref(&op_b),
+                        )));
+                        short.push(OpRc::new(Op::new(
                             OpCode::GuardClass,
                             &[op_b.clone(), class_ref.clone()],
-                        ));
+                        )));
                     } else {
-                        short.push(Op::new(
+                        short.push(OpRc::new(Op::new(
                             OpCode::GuardNonnullClass,
                             &[op_b.clone(), class_ref.clone()],
-                        ));
+                        )));
                     }
                 } else if let Some(descr) = &info.descr {
                     // info.py reads `self.descr.get_vtable()`
@@ -671,19 +668,28 @@ impl PtrInfoExt for PtrInfo {
                              (optimizer.py:480-481 InstancePtrInfo(parent_descr))",
                         )
                         .vtable() as i64;
-                    let vtable_const = alloc_const(ctx, Value::Int(vtable));
-                    short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
+                    let vtable_const = alloc_const(Value::Int(vtable));
+                    short.push(OpRc::new(Op::new(
+                        OpCode::GuardNonnull,
+                        std::slice::from_ref(&op_b),
+                    )));
                     if !ctx.remove_gctypeptr {
-                        short.push(Op::new(OpCode::GuardIsObject, std::slice::from_ref(&op_b)));
+                        short.push(OpRc::new(Op::new(
+                            OpCode::GuardIsObject,
+                            std::slice::from_ref(&op_b),
+                        )));
                     }
-                    short.push(Op::new(
+                    short.push(OpRc::new(Op::new(
                         OpCode::GuardSubclass,
                         &[op_b.clone(), vtable_const.clone()],
-                    ));
+                    )));
                 } else {
                     // info.py:353 fall-through with neither class nor
                     // descr — base NonNullPtrInfo.make_guards.
-                    short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
+                    short.push(OpRc::new(Op::new(
+                        OpCode::GuardNonnull,
+                        std::slice::from_ref(&op_b),
+                    )));
                 }
             }
             PtrInfo::Struct(info) => {
@@ -729,20 +735,26 @@ impl PtrInfoExt for PtrInfo {
                 } else {
                     None
                 };
-                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
+                short.push(OpRc::new(Op::new(
+                    OpCode::GuardNonnull,
+                    std::slice::from_ref(&op_b),
+                )));
                 if let Some(type_id) = type_id {
                     let type_id = type_id as i64;
-                    let type_id_const = alloc_const(ctx, Value::Int(type_id));
-                    short.push(Op::new(
+                    let type_id_const = alloc_const(Value::Int(type_id));
+                    short.push(OpRc::new(Op::new(
                         OpCode::GuardGcType,
                         &[op_b.clone(), type_id_const.clone()],
-                    ));
+                    )));
                 }
             }
             PtrInfo::Constant(gcref) => {
                 // info.py: ConstPtrInfo.make_guards
-                let c = alloc_const(ctx, Value::Ref(*gcref));
-                short.push(Op::new(OpCode::GuardValue, &[op_b.clone(), c.clone()]));
+                let c = alloc_const(Value::Ref(*gcref));
+                short.push(OpRc::new(Op::new(
+                    OpCode::GuardValue,
+                    &[op_b.clone(), c.clone()],
+                )));
             }
             PtrInfo::Array(info) => {
                 // info.py: ArrayPtrInfo.make_guards.
@@ -785,14 +797,17 @@ impl PtrInfoExt for PtrInfo {
                 } else {
                     None
                 };
-                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
+                short.push(OpRc::new(Op::new(
+                    OpCode::GuardNonnull,
+                    std::slice::from_ref(&op_b),
+                )));
                 if let Some(type_id) = type_id {
                     let type_id = type_id as i64;
-                    let type_id_const = alloc_const(ctx, Value::Int(type_id));
-                    short.push(Op::new(
+                    let type_id_const = alloc_const(Value::Int(type_id));
+                    short.push(OpRc::new(Op::new(
                         OpCode::GuardGcType,
                         &[op_b.clone(), type_id_const.clone()],
-                    ));
+                    )));
                 }
                 // Emit ARRAYLEN_GC + bound guards: pyre's ArrayPtrInfo.lenbound
                 // is a plain `IntBound`, not an `Option`, so the parity check
@@ -816,21 +831,19 @@ impl PtrInfoExt for PtrInfo {
                 // in memory there is no length any guard could establish.
                 let has_length = ad.len_descr().is_some();
                 if has_length && !info.lenbound.is_unbounded() {
-                    let mut lenop = Op::with_descr(
+                    let lenop = OpRc::new(Op::with_descr(
                         OpCode::ArraylenGc,
                         std::slice::from_ref(&op_b),
                         info.descr.clone(),
-                    );
-                    // info.py:637 `lenop = ResOperation(ARRAYLEN_GC, [op])`
-                    // followed by `lenbound.make_guards(lenop, ...)` — the
-                    // `lenop` object is the consumer's box arg via Python
-                    // identity. Allocate a fresh Int OpRef on `lenop.pos`
-                    // so the chained INT_GE/INT_LE/INT_AND check against
-                    // the producer result, not the sentinel `OpRef::NONE`.
+                    ));
+                    // ArrayPtrInfo.make_guards `lenop = ResOperation(
+                    // ARRAYLEN_GC, [op])` followed by
+                    // `lenbound.make_guards(lenop, ...)`: the `lenop` object
+                    // is the chained guards' box arg.
                     lenop.pos().set(ctx.alloc_op_position_typed(Type::Int));
-                    let lenop_pos = lenop.pos().get();
-                    short.push(lenop);
-                    info.lenbound.make_guards(lenop_pos, short, ctx);
+                    short.push(lenop.clone());
+                    info.lenbound
+                        .make_guards(&Operand::from_bound_op(&lenop), short, ctx);
                 }
             }
             // info.py `AbstractRawPtrInfo.make_guards`:
@@ -849,25 +862,23 @@ impl PtrInfoExt for PtrInfo {
             // Both `RawBufferPtrInfo` (info.py) and
             // `RawSlicePtrInfo` (info.py) inherit this override.
             PtrInfo::VirtualRawBuffer(_) | PtrInfo::VirtualRawSlice(_) => {
-                let zero = alloc_const(ctx, Value::Int(0));
-                let mut eq_op = Op::new(OpCode::IntEq, &[op_b.clone(), zero.clone()]);
-                // info.py:381 `op = ResOperation(INT_EQ, [...])` then
-                // `[op]` — INT_EQ result identity for GUARD_FALSE.
+                let zero = alloc_const(Value::Int(0));
+                // `op = ResOperation(INT_EQ, [op, CONST_0])` is then the
+                // GUARD_FALSE arg itself.
+                let eq_op = OpRc::new(Op::new(OpCode::IntEq, &[op_b.clone(), zero]));
                 eq_op.pos().set(ctx.alloc_op_position_typed(Type::Int));
-                let eq_pos = eq_op.pos().get();
-                short.push(eq_op);
-                // info.py:381 reuses the INT_EQ ResOperation object as the
-                // GUARD_FALSE arg by identity. The producer lives in `short`,
-                // not in ctx's registries, so bind the position to its
-                // canonical stand-in (resolved at replay) the same way the
-                // sibling array/str/IntBound arms do, rather than minting a
-                // position-only operand that has no producer to bind.
-                let arg_eq = ctx.materialize_operand_at(eq_pos);
-                short.push(Op::new(OpCode::GuardFalse, &[arg_eq]));
+                short.push(eq_op.clone());
+                short.push(OpRc::new(Op::new(
+                    OpCode::GuardFalse,
+                    &[Operand::from_bound_op(&eq_op)],
+                )));
             }
             PtrInfo::Str(sinfo) => {
                 // vstring.py: StrPtrInfo.make_guards
-                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
+                short.push(OpRc::new(Op::new(
+                    OpCode::GuardNonnull,
+                    std::slice::from_ref(&op_b),
+                )));
                 if let Some(ref bound) = sinfo.lenbound
                     && bound.lower >= 1
                 {
@@ -876,17 +887,14 @@ impl PtrInfoExt for PtrInfo {
                     } else {
                         OpCode::Unicodelen
                     };
-                    let mut lenop = Op::new(lenop_code, std::slice::from_ref(&op_b));
-                    // vstring.py:124 `lenop = ResOperation(STRLEN, [op])`
-                    // is consumed by `bound.make_guards(lenop, ...)`.
-                    // Materialize the producer result before the chain.
+                    // StrPtrInfo.make_guards `lenop = ResOperation(STRLEN,
+                    // [op])` is the box of `bound.make_guards(lenop, ...)`,
+                    // which chains INT_GE/INT_LE/INT_AND →
+                    // GUARD_TRUE/GUARD_VALUE pairs against it.
+                    let lenop = OpRc::new(Op::new(lenop_code, std::slice::from_ref(&op_b)));
                     lenop.pos().set(ctx.alloc_op_position_typed(Type::Int));
-                    let lenop_pos = lenop.pos().get();
-                    short.push(lenop);
-                    // intutils.py IntBound.make_guards: emits the
-                    // chained INT_GE/INT_LE/INT_AND → GUARD_TRUE/GUARD_VALUE
-                    // pairs against `lenop_pos`.
-                    bound.make_guards(lenop_pos, short, ctx);
+                    short.push(lenop.clone());
+                    bound.make_guards(&Operand::from_bound_op(&lenop), short, ctx);
                 }
             }
             // Virtuals/Virtualizable: no guards needed in short preamble
@@ -1978,7 +1986,7 @@ mod tests {
         let mut ctx = OptContext::new(8);
         let array_box = field_op(Type::Ref, 3);
         let mut short = Vec::new();
-        info.make_guards(array_box.to_opref(), &mut short, &mut ctx);
+        info.make_guards(&array_box, &mut short, &mut ctx);
         short.iter().map(|op| op.opcode).collect()
     }
 
@@ -2071,12 +2079,14 @@ mod tests {
 
         let mut ctx = OptContext::new(8);
         let mut struct_guards = Vec::new();
-        assert!(struct_info.make_guards(OpRef::ref_op(1), &mut struct_guards, &mut ctx));
+        let struct_box = ctx.materialize_operand_at(OpRef::ref_op(1));
+        assert!(struct_info.make_guards(&struct_box, &mut struct_guards, &mut ctx));
         assert_eq!(struct_guards[1].opcode, OpCode::GuardGcType);
         assert_eq!(struct_guards[1].arg(1).const_value(), Some(Value::Int(71)));
 
         let mut array_guards = Vec::new();
-        assert!(array_info.make_guards(OpRef::ref_op(2), &mut array_guards, &mut ctx));
+        let array_box = ctx.materialize_operand_at(OpRef::ref_op(2));
+        assert!(array_info.make_guards(&array_box, &mut array_guards, &mut ctx));
         assert_eq!(array_guards[1].opcode, OpCode::GuardGcType);
         assert_eq!(array_guards[1].arg(1).const_value(), Some(Value::Int(72)));
         assert_eq!(
@@ -2097,7 +2107,8 @@ mod tests {
         let mut guards = Vec::new();
         let mut ctx = OptContext::new(4);
 
-        assert!(!info.make_guards(OpRef::ref_op(1), &mut guards, &mut ctx));
+        let op = ctx.materialize_operand_at(OpRef::ref_op(1));
+        assert!(!info.make_guards(&op, &mut guards, &mut ctx));
         assert!(guards.is_empty());
     }
 
