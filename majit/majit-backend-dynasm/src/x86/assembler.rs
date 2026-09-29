@@ -3629,6 +3629,8 @@ impl<'a> Assembler386<'a> {
                             rx86::movsx32_rm(&mut self.mc, dst.value, (base.value, ofs));
                         }
                         _ => {
+                            // Word `mov`. For a `load_is_acquire` descr this
+                            // aligned mov is the acquire load.
                             rx86::mov_rm(&mut self.mc, dst.value, (base.value, ofs));
                         }
                     }

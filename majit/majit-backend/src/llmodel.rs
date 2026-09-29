@@ -346,6 +346,25 @@ pub unsafe fn write_ref_at_mem(base: usize, ofs: usize, newvalue: usize) {
     unsafe { (base.wrapping_add(ofs) as *mut usize).write_unaligned(newvalue) }
 }
 
+/// Pointer-width load at an aligned address.
+///
+/// `acquire` selects `AtomicPtr::load(Acquire)` for a slot published with
+/// `AtomicPtr::store(Release)`. The plain arm is `llmodel.py read_ref_at_mem`.
+///
+/// # Safety
+/// `addr` must be a readable, naturally aligned pointer-width field. When
+/// `acquire` is true, every write of that field is an atomic pointer store.
+pub unsafe fn read_ref_at_mem(addr: usize, acquire: bool) -> usize {
+    unsafe {
+        if acquire {
+            std::sync::atomic::AtomicPtr::<()>::from_ptr(addr as *mut *mut ())
+                .load(std::sync::atomic::Ordering::Acquire) as usize
+        } else {
+            *(addr as *const usize)
+        }
+    }
+}
+
 /// llmodel.py — `write_float_at_mem(gcref, ofs, newvalue)`.
 ///
 /// `FLOATSTORAGE`-width store. Like the ref store this takes no `size`:

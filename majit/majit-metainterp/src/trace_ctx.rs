@@ -44,8 +44,9 @@ use crate::virtualizable::VirtualizableInfo;
 /// (`cpu.bh_getfield_gc_*`) read offset/size off the same descr.
 /// Pyre's two-tier descr model splits the runtime trace-level
 /// `Arc<dyn FieldDescr>` from the build-time `BhDescr::Field` enum,
-/// so the bridge has to fish out the offset/size/type/flags and
+/// so the bridge has to fish out the offset/size/type/flag/name and
 /// reassemble a `BhDescr::Field` on the stack at the call site.
+/// `bh_getfield_gc_r` reads that name for `load_is_acquire`.
 ///
 /// Returns `None` for non-field descrs (the sanity check is then
 /// skipped at the caller — same behavior as `cpu == None`).
@@ -55,12 +56,10 @@ fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::B
         offset: f.offset(),
         field_size: f.field_size(),
         field_type: f.field_type(),
-        // `bh_getfield_gc_*` uses only (offset, field_size,
-        // is_field_signed) via `unpack_fielddescr_size`; the remaining
-        // fields are placeholder defaults that the load path never
-        // reads.  Setting them to neutral values preserves parity at
-        // the consumed-surface level without faking a richer descr.
-        field_flag: majit_ir::ArrayFlag::Signed,
+        // `bh_getfield_gc_r` reads `load_is_acquire`, which needs the
+        // pointer flag, the quasi bit, and the field name. The signedness
+        // the integer load uses is `is_field_signed`, not this flag.
+        field_flag: bh_field_flag(f),
         is_field_signed: f.is_field_signed(),
         is_immutable: f.is_immutable(),
         is_quasi_immutable: descr.is_quasi_immutable(),
@@ -68,9 +67,25 @@ fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::B
         // is the parent's arbitrated answer, not an unresolved claim.
         index_in_parent: Some(f.index_in_parent()),
         parent: None,
-        name: String::new(),
+        name: f.field_name().to_string(),
         owner: String::new(),
     })
+}
+
+/// `BhFieldSpec::from_field_descr`'s flag: a pointer field stays
+/// `FLAG_POINTER` so `load_is_acquire` can see it.
+fn bh_field_flag(f: &dyn majit_ir::descr::FieldDescr) -> majit_ir::ArrayFlag {
+    if f.is_pointer_field() {
+        majit_ir::ArrayFlag::Pointer
+    } else if f.is_float_field() {
+        majit_ir::ArrayFlag::Float
+    } else if f.field_type() == Type::Void {
+        majit_ir::ArrayFlag::Void
+    } else if f.is_field_signed() {
+        majit_ir::ArrayFlag::Signed
+    } else {
+        majit_ir::ArrayFlag::Unsigned
+    }
 }
 
 /// Project a tracer-side `DescrRef` to a backend `BhDescr::Array` for

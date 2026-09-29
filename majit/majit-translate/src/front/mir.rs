@@ -15020,16 +15020,18 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // Only two loads alias the receiver. A Relaxed load is the
-                // existing scalar fold. An Acquire load aliases only when that
-                // receiver is already a `FieldRead` of a field this crate's
-                // `_immutable_fields_` marker ranks quasi-immutable: the
-                // codewriter then emits `record_quasiimmut_field` plus the
-                // pure getfield, and the pure read is the guarded value.
-                // SeqCst, Release, an unknown ordering, and an Acquire load of
-                // any other field stay unsupported. `&self` may already alias
-                // the loaded value, NOT its address, so those cannot fall
-                // through to an ordinary `Atomic::load` call.
+                // A Relaxed load is the scalar field value.
+                //
+                // An Acquire load of quasi-immutable `w_globals` is also that
+                // field value, so the codewriter still emits
+                // `record_quasiimmut_field` and the pure getfield. The
+                // executable read is Acquire (`FieldDescr::load_is_acquire`):
+                // the watcher invalidates the compiled pointer and does not
+                // order the load. SeqCst, Release, an unknown ordering, and
+                // an Acquire load of any other field stay unsupported.
+                // `&self` may already alias the loaded value, NOT its
+                // address, so those cannot fall through to an ordinary
+                // `Atomic::load` call.
                 // FlowContext.record_block in flowcontext.py propagates an
                 // unsupported operation rather than publishing a wrong graph.
                 // This rejects the body, not the whole translation: the
@@ -15042,19 +15044,30 @@ impl<'a> Lowering<'a> {
                         .flatten()
                         .and_then(|local| self.atomic_ordering_locals.get(&local))
                         .map(String::as_str);
-                    let quasi_acquire = ordering == Some("Acquire")
-                        && self.atomic_load_receiver_is_quasi_field(&args[0]);
-                    if ordering != Some("Relaxed") && !quasi_acquire {
-                        return Err(LowerError::Unsupported(format!(
-                            "atomic load ordering {} requires address-preserving ordered lowering",
-                            ordering.unwrap_or("unknown")
-                        )));
+                    if ordering == Some("Relaxed") {
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
                     }
-                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    // Quasi-immutable `w_globals`. The field read stays so
+                    // `record_quasiimmut_field` still guards it. Execution of
+                    // the getfield and of `bh_getfield_gc_r` is the Acquire
+                    // load, not the Relaxed scalar fold above.
+                    if ordering == Some("Acquire")
+                        && self.atomic_load_receiver_is_quasi_w_globals(&args[0])
+                    {
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                    return Err(LowerError::Unsupported(format!(
+                        "atomic load ordering {} requires address-preserving ordered lowering",
+                        ordering.unwrap_or("unknown")
+                    )));
                 }
                 // `<Atomic*>::store(&self, value, ordering)` — the write twin
                 // of the load fold above.  A read needs no place, so the load
@@ -20472,8 +20485,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// The receiver variable is a `FieldRead`, or a fresh block input
-    /// copied from one, whose `(owner_root, field)` this crate's
-    /// `_immutable_fields_` marker ranks quasi-immutable.
+    /// copied from one, of quasi-immutable `w_globals`.
     ///
     /// `w_code_get_w_globals` computes `&raw (*code).w_globals` in one
     /// block and calls `AtomicPtr::load` in the successor. `FrameState.copy`
@@ -20482,10 +20494,10 @@ impl<'a> Lowering<'a> {
     ///
     /// The marker is read from `self.llbc` here because
     /// `SemanticProgram::immutable_fields` is published only after lowering.
-    /// A missing owner, a missing marker, a merge phi, or a rank that is
-    /// not quasi fails closed and the load keeps the unsupported-ordering
-    /// error.
-    fn atomic_load_receiver_is_quasi_field(&self, recv: &Variable) -> bool {
+    /// A missing owner, a missing marker, a field other than `w_globals`,
+    /// a merge phi, or a rank that is not quasi fails closed and the load
+    /// keeps the unsupported-ordering error.
+    fn atomic_load_receiver_is_quasi_w_globals(&self, recv: &Variable) -> bool {
         let mut var_id = recv.id();
         let mut seen = std::collections::HashSet::new();
         let (owner, name) = loop {
@@ -20516,6 +20528,9 @@ impl<'a> Lowering<'a> {
         let Some(owner) = owner else {
             return false;
         };
+        if !majit_ir::descr::is_w_globals_field_name(&name) {
+            return false;
+        }
         let ranks = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(self.llbc),
         );

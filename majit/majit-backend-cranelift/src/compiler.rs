@@ -16531,14 +16531,26 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                     );
                     let addr = builder.ins().iadd_imm_s(base, fd.offset() as i64);
-                    let r = emit_load_from_addr(
-                        &mut builder,
-                        addr,
-                        fd.field_type(),
-                        fd.field_size(),
-                        fd.is_field_signed(),
-                        op.opcode,
-                    )?;
+                    let acquire = fd.load_is_acquire()
+                        && fd.field_size() == 8
+                        && matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR);
+                    let r = if acquire {
+                        // Sequentially consistent load. It acquires the
+                        // Release publication of this pointer. Non-trusted
+                        // flags keep the load from moving ahead of a guard.
+                        builder
+                            .ins()
+                            .atomic_load(cl_types::I64, MemFlagsData::new(), addr)
+                    } else {
+                        emit_load_from_addr(
+                            &mut builder,
+                            addr,
+                            fd.field_type(),
+                            fd.field_size(),
+                            fd.is_field_signed(),
+                            op.opcode,
+                        )?
+                    };
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
 
@@ -21784,8 +21796,14 @@ impl majit_backend::Backend for CraneliftBackend {
         let offset = fielddescr.as_offset();
         // `llmodel.py bh_getfield_gc_r` loads a value, including a by-value
         // transparent newtype. Address projections are lowered separately by
-        // `jtransform.py rewrite_op_getsubstruct`.
-        majit_ir::GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
+        // `jtransform.py rewrite_op_getsubstruct`. `load_is_acquire` reads
+        // the same slot with Acquire.
+        // SAFETY: `struct_ptr + offset` is a naturally aligned pointer field
+        // the trace recorder handed to this blackhole load.
+        let addr = (struct_ptr as usize).wrapping_add(offset);
+        majit_ir::GcRef(unsafe {
+            majit_backend::llmodel::read_ref_at_mem(addr, fielddescr.load_is_acquire())
+        })
     }
 
     fn bh_setfield_gc_i(

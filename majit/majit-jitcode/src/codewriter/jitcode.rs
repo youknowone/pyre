@@ -2351,6 +2351,26 @@ static EMPTY_DESCRS: [BhDescr; 0] = [];
 pub static EMPTY_DESCR_TABLE: &(dyn DescrTable + 'static) = &EMPTY_DESCRS;
 
 impl BhDescr {
+    /// Acquire load of quasi-immutable `w_globals`. See
+    /// [`majit_ir::descr::ref_field_load_is_acquire`].
+    pub fn load_is_acquire(&self) -> bool {
+        match self {
+            BhDescr::Field {
+                name,
+                is_quasi_immutable,
+                field_type,
+                field_flag,
+                ..
+            } => majit_ir::descr::ref_field_load_is_acquire(
+                *is_quasi_immutable,
+                *field_type == majit_ir::value::Type::Ref
+                    || *field_flag == majit_ir::descr::ArrayFlag::Pointer,
+                name,
+            ),
+            _ => false,
+        }
+    }
+
     /// Extract byte offset for field/array operations (FieldDescr/ArrayDescr).
     /// Panics on VableField/VableArray — those must use `as_vable_field_index`.
     pub fn as_offset(&self) -> usize {
@@ -3063,6 +3083,38 @@ mod tests {
         };
         assert!(header.same_descr_layout(&undeclared));
         assert!(!payload.same_descr_layout(&undeclared));
+    }
+
+    #[test]
+    fn quasi_w_globals_bh_field_loads_with_acquire() {
+        let descr = BhDescr::Field {
+            offset: 56,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: true,
+            index_in_parent: Some(5),
+            parent: None,
+            name: "PyCode.w_globals".into(),
+            owner: "PyCode".into(),
+        };
+        assert!(descr.load_is_acquire());
+        let mutate = BhDescr::Field {
+            offset: 0,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: None,
+            parent: None,
+            name: "mutate_w_globals".into(),
+            owner: "PyCode".into(),
+        };
+        assert!(!mutate.load_is_acquire());
     }
 
     #[test]

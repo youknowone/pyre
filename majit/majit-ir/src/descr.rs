@@ -5172,6 +5172,20 @@ pub trait FieldDescr: Descr {
         self.field_name()
     }
 
+    /// This field's executable read is `AtomicPtr::load(Acquire)`.
+    ///
+    /// `PyCode.w_globals` is published with `AtomicPtr::store(Release)`.
+    /// The quasi-immutable watcher invalidates a compiled assumption of the
+    /// pointer; the load itself still has to acquire that publication.
+    /// Every other field stays a plain load.
+    fn load_is_acquire(&self) -> bool {
+        ref_field_load_is_acquire(
+            self.is_quasi_immutable(),
+            self.is_pointer_field(),
+            self.field_name(),
+        )
+    }
+
     /// The class pointer is the object-header field at offset 0
     /// (`rpython/rtyper/rclass.py`, `OBJECT.typeptr`). Its
     /// descriptors use two field spellings, each bare or struct-qualified:
@@ -5244,6 +5258,22 @@ pub trait FieldDescr: Descr {
     fn sort_key(&self) -> usize {
         self.offset()
     }
+}
+
+/// `PyCode.w_globals`, bare or `STRUCT.w_globals`. `mutate_w_globals` does
+/// not match: the hidden mutate slot is not the published pointer.
+pub fn is_w_globals_field_name(name: &str) -> bool {
+    name == "w_globals" || name.ends_with(".w_globals")
+}
+
+/// Acquire load of the quasi-immutable `w_globals` pointer. Other quasi
+/// fields stay plain loads; their slots are not `AtomicPtr`.
+pub fn ref_field_load_is_acquire(
+    is_quasi_immutable: bool,
+    is_pointer: bool,
+    field_name: &str,
+) -> bool {
+    is_quasi_immutable && is_pointer && is_w_globals_field_name(field_name)
 }
 
 /// RPython: descr.py FLAG_* constants for array element type classification.
@@ -7764,6 +7794,46 @@ impl FailDescr for SimpleFailDescr {
     }
     fn vector_info(&self) -> Vec<AccumInfo> {
         flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
+    }
+}
+
+#[cfg(test)]
+mod acquire_load_tests {
+    use super::*;
+
+    fn pointer_field(quasi: bool, name: &str, field_key: &str) -> SimpleFieldDescr {
+        SimpleFieldDescr::new_with_name(
+            0,
+            56,
+            8,
+            Type::Ref,
+            false,
+            ArrayFlag::Pointer,
+            name.into(),
+            field_key.into(),
+        )
+        .with_quasi_immutable(quasi)
+    }
+
+    #[test]
+    fn only_quasi_w_globals_loads_with_acquire() {
+        assert!(pointer_field(true, "PyCode.w_globals", "w_globals").load_is_acquire());
+        assert!(pointer_field(true, "w_globals", "w_globals").load_is_acquire());
+        assert!(!pointer_field(false, "PyCode.w_globals", "w_globals").load_is_acquire());
+        assert!(!pointer_field(true, "mutate_w_globals", "mutate_w_globals").load_is_acquire());
+        assert!(!pointer_field(true, "w_func_globals", "w_func_globals").load_is_acquire());
+        let version = SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Int,
+            false,
+            ArrayFlag::Unsigned,
+            "W_TypeObject.version_tag".into(),
+            "version_tag".into(),
+        )
+        .with_quasi_immutable(true);
+        assert!(!version.load_is_acquire());
     }
 }
 
