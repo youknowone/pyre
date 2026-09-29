@@ -251,8 +251,8 @@ const MAJIT_ONLY: &[&str] = &[
 const PYRE_ONLY: &[&str] = &[
     // The float array reads. `getarrayitem_gc_r_pure/rid>r` left this list
     // when majit's tracer gained the pure array-read arms.
-    "getarrayitem_gc_f/rid>f",
-    "getarrayitem_gc_f_pure/rid>f",
+    // `getarrayitem_gc_f/rid>f` and `getarrayitem_gc_f_pure/rid>f` left this
+    // list when majit's tracer gained the float getarrayitem arms.
     // Constant-length form. The register-length `new_array_clear/id>r`
     // is decoded by both tracers.
     "new_array_clear/cd>r",
