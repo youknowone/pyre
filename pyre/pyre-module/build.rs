@@ -460,7 +460,8 @@ fn accept(candidate: &Candidate) -> bool {
     // what a dependent binary passes to its own link.
     for (index, extra) in candidate.link_extra.iter().enumerate() {
         println!("cargo:rustc-link-arg={extra}");
-        println!("cargo:metadata=LINK_ARG_{index}={extra}");
+        // `cargo::metadata=KEY=VALUE` is `DEP_PYRE_MINIMAL_CURSES_KEY`.
+        println!("cargo::metadata=LINK_ARG_{index}={extra}");
     }
     println!("cargo:rustc-cfg=pyre_minimal_curses");
     let _ = fs::remove_file(out_dir().join("curses_probe_last_stderr.txt"));
