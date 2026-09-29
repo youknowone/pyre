@@ -14220,13 +14220,16 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // CleanupThrow: pops 3, pushes 1. Net: -2.
+                        // CleanupThrow: `(sub_iter, last_sent_val, exc_value --
+                        // none, value)`. Net: -1.
                         Instruction::CleanupThrow => {
                             for _ in 0..3 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
+                            for _ in 0..2 {
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_depth += 1;
+                            }
                             // Genuine trace boundary: CLEANUP_THROW runs on the
                             // throw() path of a suspended generator, which a trace
                             // never records — the resume happens elsewhere.

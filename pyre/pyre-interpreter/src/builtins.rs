@@ -9195,7 +9195,9 @@ fn os_error_family_new(
         }
     }
     let exc = ctor(cls, &live_positional)?;
-    let exc = pyre_object::gc_roots::pin_root(exc);
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let positional: Vec<PyObjectRef> = (0..positional.len())
         .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
         .collect();
@@ -9210,14 +9212,14 @@ fn os_error_family_new(
         cls
     };
     if let Some(w_target) = w_target {
-        crate::typedef::tag_subclass_instance(exc, w_target);
+        crate::typedef::tag_subclass_instance(exc(), w_target);
     }
     // Fill the slots after the retag so `os_error_fill_slots` can see the
     // resolved class (the `BlockingIOError` numeric-filename special-case).
     if !use_init {
-        os_error_fill_slots(exc, &positional)?;
+        os_error_fill_slots(exc(), &positional)?;
     }
-    Ok(exc)
+    Ok(exc())
 }
 
 pub fn exc_os_error_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -16691,6 +16693,24 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     if generator_span.is_some() {
         msg = "invalid syntax".to_owned();
     }
+    // An unparenthesized `yield` where the grammar has no expression
+    // alternative for it (`return yield 42`) matches no rule, so the parser's
+    // generic error names the `yield` token itself.
+    let yield_span = match &e {
+        crate::compile::CompileError::Parse(parse_error)
+            if msg == "Yield expression cannot be used here" =>
+        {
+            let start = parse_error.raw_location.start().to_usize();
+            source
+                .get(start..)
+                .is_some_and(|rest| rest.starts_with("yield"))
+                .then_some((start, start + "yield".len()))
+        }
+        _ => None,
+    };
+    if yield_span.is_some() {
+        msg = "invalid syntax".to_owned();
+    }
     // `invalid_assignment` is a grammar alternative, reached only by a
     // statement whose tokens lexed and parsed.  A literal whose own content is
     // wrong -- a bad escape, a byte outside ASCII, a replacement field that
@@ -16798,6 +16818,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         .or(lambda_span)
         .or(late_dollar_span)
         .or(generator_span)
+        .or(yield_span)
         .or(delimiter_span);
     let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
         (

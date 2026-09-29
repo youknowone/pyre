@@ -899,8 +899,8 @@ pub(crate) fn stack_effects(
         Instruction::FormatWithSpec => (d - 1, d - 1),
         // EndAsyncFor's async-stub shape pops iterator+exception and pushes nothing.
         Instruction::EndAsyncFor => (d - 2, d - 2),
-        // CleanupThrow's async-stub shape pops three exception items and pushes one result.
-        Instruction::CleanupThrow => (d - 2, d - 2),
+        // CleanupThrow: `(sub_iter, last_sent_val, exc_value -- none, value)`.
+        Instruction::CleanupThrow => (d - 1, d - 1),
         // MATCH_CLASS: pops subject, type, names (−3) and pushes the attrs
         // tuple or None (+1). Net −2.
         Instruction::MatchClass { .. } => (d - 2, d - 2),

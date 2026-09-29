@@ -13036,6 +13036,36 @@ fn descend_generatorentry<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(w_arg as usize)),
     );
 
+    // `space.next` dispatches on the iterator's type, and `send_ex` reads
+    // the immutable `self.pycode` that `generatorentry_driver.jit_merge_point`
+    // takes as its green: `promote_greens` guards it to the constant the
+    // token was chosen for.
+    if !iter_op.is_constant() {
+        let type_const = ctx
+            .trace_ctx
+            .const_int(unsafe { (*iter_obj).ob_type } as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        let pycode_descr = crate::descr::make_immutable_field_descr(
+            std::mem::offset_of!(pyre_object::generator::GeneratorIterator, pycode),
+            std::mem::size_of::<pyre_object::PyObjectRef>(),
+            majit_ir::Type::Ref,
+            false,
+        );
+        let pycode_op =
+            ctx.trace_ctx
+                .record_op_with_descr(OpCode::GetfieldGcR, &[iter_op], pycode_descr);
+        ctx.trace_ctx.set_opref_concrete(
+            pycode_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(pycode as usize)),
+        );
+        let pycode_const = ctx.trace_ctx.const_ref(pycode as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[pycode_op, pycode_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+
     // `pyjitpl.py` `vable_and_vrefs_before_residual_call`, before the call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     // `direct_assembler_call` executes the call, then rewrites the recorded

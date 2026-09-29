@@ -603,11 +603,18 @@ fn scan_replacement_field(
 }
 
 /// Skip an interpolated literal, scanning each replacement field on the way.
-/// Returns the index just past the closing quote.
+/// Returns the index just past the closing quote, or `limit` when the literal
+/// does not close inside the range being scanned.
+///
+/// `limit` is the end of the enclosing range.  A literal inside a replacement
+/// field's expression is scanned only up to that expression's end: past it the
+/// bytes belong to the enclosing field, which scans them itself, so an
+/// unterminated nested literal cannot make every level rescan the tail.
 fn scan_interpolated_string(
     source: &str,
     filename: &Wtf8,
     quote_index: usize,
+    limit: usize,
     _raw: bool,
 ) -> Result<usize, PyError> {
     let bytes = source.as_bytes();
@@ -615,13 +622,13 @@ fn scan_interpolated_string(
     let triple =
         bytes.get(quote_index + 1) == Some(&quote) && bytes.get(quote_index + 2) == Some(&quote);
     let mut index = quote_index + if triple { 3 } else { 1 };
-    while index < bytes.len() {
+    while index < limit {
         // A backslash is not an escape for an f-string field delimiter,
         // including in a non-raw literal (`f'\\{expr}'`).  It can still
         // protect a quote or any other following literal character while we
         // locate the end of the interpolated string.
         if bytes[index] == b'\\' && !matches!(bytes.get(index + 1), Some(b'{' | b'}')) {
-            index = (index + 2).min(bytes.len());
+            index = (index + 2).min(limit);
         } else if triple && bytes[index..].starts_with(&[quote, quote, quote]) {
             return Ok(index + 3);
         } else if !triple && bytes[index] == quote {
@@ -631,14 +638,14 @@ fn scan_interpolated_string(
         } else if bytes[index] == b'}' && bytes.get(index + 1) == Some(&b'}') {
             index += 2;
         } else if bytes[index] == b'{' {
-            let field_end = replacement_field_end(bytes, index + 1, bytes.len());
+            let field_end = replacement_field_end(bytes, index + 1, limit);
             scan_replacement_field(source, filename, index + 1, field_end)?;
             index = field_end + 1;
         } else {
             index += 1;
         }
     }
-    Ok(index)
+    Ok(index.min(limit))
 }
 
 /// Emit tokenizer-level numeric-literal warnings before parsing.
@@ -688,7 +695,7 @@ fn scan_tokenizer_warnings(
                     let raw = bytes[name_start..index]
                         .iter()
                         .any(|byte| byte.to_ascii_lowercase() == b'r');
-                    index = scan_interpolated_string(source, filename, index, raw)?;
+                    index = scan_interpolated_string(source, filename, index, end, raw)?;
                 }
             }
             b'.' | b'0'..=b'9' => {
@@ -1006,6 +1013,14 @@ mod tests {
             },
             offset,
         ))
+    }
+
+    #[test]
+    fn unterminated_nested_fstring_fields_scan_each_range_once() {
+        // Every level used to rescan the unterminated tail twice (2**n); 200
+        // levels finish only when each range is scanned once.
+        let source = format!("f\"{{1 1:{}", "{f\"1:".repeat(200));
+        assert!(emit_tokenizer_syntax_warnings(&source, Wtf8::new("<s>")).is_ok());
     }
 
     #[test]

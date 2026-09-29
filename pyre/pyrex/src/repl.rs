@@ -25,7 +25,7 @@ enum ShellCompileAction {
     Ignore,
     ContinueBlock,
     ContinueLine,
-    CompileErr(String),
+    CompileErr(CompileError),
 }
 
 enum ShellExecResult {
@@ -33,7 +33,7 @@ enum ShellExecResult {
     ContinueBlock,
     ContinueLine,
     RuntimeErr(PyError),
-    CompileErr(String),
+    CompileErr(PyError),
 }
 
 struct ReplRuntime {
@@ -187,8 +187,18 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
         };
         continuing_line = false;
 
+        let mut at_eof = false;
         let line = match repl.readline(&prompt) {
             ReadlineResult::Line(line) => line,
+            ReadlineResult::Partial(line) => {
+                // End of input inside a line: the tokenizer asks for the
+                // rest of it under `ps2`, meets the end there, and only then
+                // runs what it has.
+                full_input.push_str(&line);
+                full_input.push('\n');
+                continuing_line = true;
+                continue;
+            }
             ReadlineResult::Interrupt => {
                 eprintln!("KeyboardInterrupt");
                 full_input.clear();
@@ -197,8 +207,15 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
                 continue;
             }
             ReadlineResult::Eof => {
-                println!();
-                break;
+                // The line the prompt left open ends on the prompt's stream.
+                eprintln!();
+                if full_input.is_empty() {
+                    break;
+                }
+                // End of input ends the pending statement, block included, and
+                // it runs before the prompt comes back for the next read.
+                at_eof = true;
+                String::new()
             }
             ReadlineResult::Io(err) => {
                 eprintln!("pyre: REPL I/O error: {err}");
@@ -210,7 +227,7 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
             }
         };
 
-        if let Err(err) = repl.add_history_entry(line.trim_end()) {
+        if !at_eof && let Err(err) = repl.add_history_entry(line.trim_end()) {
             eprintln!("pyre: could not record REPL history: {err}");
         }
 
@@ -240,7 +257,7 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
                 continuing_block = true;
             }
             ShellExecResult::CompileErr(err) => {
-                eprintln!("{err}");
+                print_syntax_error(err);
                 full_input.clear();
                 continuing_block = false;
                 continuing_line = false;
@@ -258,6 +275,12 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
                 continuing_block = false;
                 continuing_line = false;
             }
+        }
+        if at_eof {
+            // Whatever the statement left pending, there is no more input for it.
+            full_input.clear();
+            continuing_block = false;
+            continuing_line = false;
         }
     }
 
@@ -619,7 +642,22 @@ fn shell_exec(
         ShellCompileAction::Ignore => ShellExecResult::Ok,
         ShellCompileAction::ContinueBlock => ShellExecResult::ContinueBlock,
         ShellCompileAction::ContinueLine => ShellExecResult::ContinueLine,
-        ShellCompileAction::CompileErr(err) => ShellExecResult::CompileErr(err),
+        ShellCompileAction::CompileErr(err) => {
+            let source = pyre_interpreter::universal_newline(source);
+            ShellExecResult::CompileErr(pyre_interpreter::compile_err_to_syntax_error(
+                err,
+                &source,
+                Mode::Single,
+            ))
+        }
+    }
+}
+
+/// A statement that does not compile is reported the way `PyErr_Print`
+/// reports any other error at the prompt: through `sys.excepthook`.
+fn print_syntax_error(mut err: PyError) {
+    if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
+        pyre_interpreter::eprint_syntax_error(&err);
     }
 }
 
@@ -633,6 +671,10 @@ fn compile_repl_input(
     // compiler the same shape a script would rather than a windows-only
     // `\r\n` rewrite.
     let source = &*pyre_interpreter::universal_newline(source);
+
+    if !empty_line_given && !continuing_block && starts_compound_statement(source) {
+        return ShellCompileAction::ContinueBlock;
+    }
 
     match pyre_interpreter::rp_compile(source, Mode::Single, "<stdin>", Default::default()) {
         Ok(code) => {
@@ -691,12 +733,36 @@ fn compile_repl_input(
             };
 
             if empty_line_given || bad_error {
-                ShellCompileAction::CompileErr(format!("compile error: {err}"))
+                ShellCompileAction::CompileErr(err)
             } else {
                 ShellCompileAction::ContinueBlock
             }
         }
     }
+}
+
+/// The interactive grammar closes a compound statement only at a blank line,
+/// so one written on a single line is still incomplete
+/// (`codeop.compile_command("if 1: pass")` answers `None`) and waits under
+/// `ps2` however it would compile.
+fn starts_compound_statement(source: &str) -> bool {
+    use rustpython_compiler::ast::Stmt;
+    let Ok(parsed) = rustpython_compiler::parser::parse_module(source) else {
+        return false;
+    };
+    parsed.syntax().body.first().is_some_and(|stmt| {
+        matches!(
+            stmt,
+            Stmt::FunctionDef(_)
+                | Stmt::ClassDef(_)
+                | Stmt::If(_)
+                | Stmt::For(_)
+                | Stmt::While(_)
+                | Stmt::With(_)
+                | Stmt::Try(_)
+                | Stmt::Match(_)
+        )
+    })
 }
 
 fn repl_history_path() -> PathBuf {
@@ -724,6 +790,14 @@ mod tests {
     fn incomplete_line_continues() {
         let result = compile_repl_input("x = (\n", false, false);
         assert!(matches!(result, ShellCompileAction::ContinueLine));
+    }
+
+    #[test]
+    fn one_line_compound_statement_waits_for_blank_line() {
+        let result = compile_repl_input("def f(x, x): ...\n", false, false);
+        assert!(matches!(result, ShellCompileAction::ContinueBlock));
+        let result = compile_repl_input("def f(x, x): ...\n\n", true, true);
+        assert!(matches!(result, ShellCompileAction::CompileErr(_)));
     }
 
     #[test]

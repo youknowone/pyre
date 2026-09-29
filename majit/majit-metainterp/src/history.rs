@@ -87,6 +87,10 @@ pub struct TargetToken {
     /// contract is `vable_label_arg_recipes` in
     /// `OptUnroll::jump_to_existing_trace`.
     pub vable_label_arg_recipes: Vec<(majit_ir::OpCode, majit_ir::DescrRef)>,
+    /// The assembled LABEL carries an appended arg with no recipe, so no
+    /// close can deliver every LABEL slot.  `jump_to_existing_trace` skips
+    /// such a target, and the bridge falls back to `jump_to_preamble`.
+    pub label_tail_unrebuildable: bool,
     jump_target_descr: Arc<LoopTargetDescr>,
     /// `IncrementalMiniMarkGC.old_objects_pointing_to_young` state for the
     /// off-GC `TargetToken.virtual_state` / `short_preamble` graph.  Upstream
@@ -110,6 +114,7 @@ impl TargetToken {
             virtual_state: None,
             short_preamble: None,
             vable_label_arg_recipes: Vec::new(),
+            label_tail_unrebuildable: false,
             jump_target_descr: Arc::new(LoopTargetDescr::new(0, false)),
             minor_scan_pending: true,
         }

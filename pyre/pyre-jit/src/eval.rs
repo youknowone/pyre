@@ -9164,7 +9164,7 @@ fn portal_activation_bracketed(
     // this helper supplies the otherwise-skipped hook only and must not close
     // the trace-owned chain a second time.
     let mut outer_result = outer_result;
-    let leave_result = {
+    let mut leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
         let err_slot = match &outer_result {
             Err(err) => err.pin_exc_object(&roots),
@@ -9191,10 +9191,20 @@ fn portal_activation_bracketed(
     // `ExecutionContext.leave`'s separate escape-propagation arm even when the
     // profile hook above raised: upstream puts both in the same `finally`.
     if matches!(leave_owner, PortalLeaveOwner::CompiledTrace) {
+        // The escape propagation forces the caller frame, so both pending
+        // results ride a collecting call here too.
+        let pinned_leave = pyre_interpreter::executioncontext::PinnedResult::pin(&leave_result);
+        let pinned_outer = outer_result
+            .is_err()
+            .then(|| pyre_interpreter::executioncontext::PinnedResult::pin(&outer_result));
         crate::call_jit::propagate_portal_frame_escape(
             frame_root.frame() as *mut PyFrame,
             outer_result.is_err(),
         );
+        if let Some(pinned) = &pinned_outer {
+            pinned.reload(&mut outer_result);
+        }
+        pinned_leave.reload(&mut leave_result);
     }
     let live = leave_result?;
     outer_result.map(|_| live)

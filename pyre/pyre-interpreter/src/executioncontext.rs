@@ -252,6 +252,41 @@ pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
     }
 }
 
+/// An activation's pending result held in root slots across a call that can
+/// collect: the exit value, or the three object references a `PyError`
+/// carries.
+///
+/// `execute_frame`'s `finally` and `ExecutionContext.leave` keep the exit value
+/// and the propagating `OperationError` in RPython locals, which the GC
+/// transform roots across every collecting call.  Here they are Rust copies,
+/// so the forcing half of `leave` would hand back a pre-collection address.
+pub struct PinnedResult {
+    roots: pyre_object::gc_roots::RootScope,
+    base: usize,
+}
+
+impl PinnedResult {
+    pub fn pin(result: &crate::PyResult) -> Self {
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = match result {
+            Ok(w_value) => roots.pin_roots(&[*w_value]),
+            Err(err) => roots.pin_roots(&[err.exc_object, err.w_name_context, err.w_obj_context]),
+        };
+        Self { roots, base }
+    }
+
+    pub fn reload(&self, result: &mut crate::PyResult) {
+        match result {
+            Ok(w_value) => *w_value = self.roots.get(self.base),
+            Err(err) => {
+                err.exc_object = self.roots.get(self.base);
+                err.w_name_context = self.roots.get(self.base + 1);
+                err.w_obj_context = self.roots.get(self.base + 2);
+            }
+        }
+    }
+}
+
 /// Force a vref stored in the frame chain (`topframeref` / `f_backref`).
 /// `virtualref.py force_virtual_if_necessary`: `if inst.typeptr !=
 /// jit_virtual_ref_vtable: return inst` (the pointer already *is* the frame)
@@ -1120,7 +1155,7 @@ impl ExecutionContext {
         // `_trace` runs the profile callback, which is application-level
         // Python; the chain surgery below reads the frame's own fields.
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-        let trace_result = self.leaveframe_trace(frame, w_exitvalue);
+        let mut trace_result = self.leaveframe_trace(frame, w_exitvalue);
         let frame = anchor.live();
         let frame_vref = self.topframeref;
         // At interp level a vref in the chain *is* the frame pointer, so the
@@ -1132,6 +1167,10 @@ impl ExecutionContext {
             // caller vref back, do not force it).
             self.topframeref = (*frame).f_backref;
             if (*frame).escaped() || got_exception {
+                // Both forces below can materialize frames, so they can
+                // collect, and the traced exit value is a local of this
+                // `finally` across them.
+                let pinned = PinnedResult::pin(&trace_result);
                 // `f_back = frame.f_backref()` — forced (get_f_back forces).
                 let f_back = (*frame).get_f_back();
                 if !f_back.is_null() {
@@ -1141,6 +1180,7 @@ impl ExecutionContext {
                 // stays reachable after the JIT frame is gone (identity at
                 // interp level).
                 force_vref(vref_anchor.live());
+                pinned.reload(&mut trace_result);
             }
         }
         // `jit.virtual_ref_finish(frame_vref, frame)` — keepalives only at
