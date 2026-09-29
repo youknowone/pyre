@@ -610,45 +610,32 @@ pub unsafe fn pyerror_value_error_to_exc_object(
 }
 
 impl PyError {
-    /// Pin `exc_object` on `roots` and return that slot.
+    /// Publish the three GC references this carrier holds on `roots` without
+    /// normalizing them, and return the base of their three slots.
     ///
     /// `OperationError` (`pypy/interpreter/error.py`) is a GC object, so a
-    /// collecting call updates `w_value` in place. This carrier is a native
-    /// copy of that pointer. A null `exc_object` has not been materialised
-    /// and is not pinned. [`PyError::reload_exc_object`] writes the forwarded
-    /// instance back into the copy. The caller owns the bracket: other live
-    /// pointers pinned on the same `roots` stay beside this slot.
-    pub fn pin_exc_object(&self, roots: &pyre_object::gc_roots::RootScope) -> Option<usize> {
-        if self.exc_object.is_null() {
-            None
-        } else {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = roots.pin_root(self.exc_object);
-            Some(slot)
-        }
+    /// collecting call keeps every field it holds alive and updates it in
+    /// place. This carrier is a native copy of those fields: the cached
+    /// exception and the lazy name/obj context, the set
+    /// [`PyError::walk_gc_refs`] visits. A null field takes a null slot, so the
+    /// layout does not depend on which fields are set. For a caller that
+    /// publishes its whole livevar set first and then normalizes the range
+    /// once (`gc_roots::pin_roots`). The caller owns the bracket;
+    /// [`PyError::reload_gc_refs`] writes the live words back.
+    pub fn publish_gc_refs(&self, roots: &pyre_object::gc_roots::RootScope) -> usize {
+        roots.publish(&[self.exc_object, self.w_name_context, self.w_obj_context])
     }
 
-    /// Publish `exc_object` on `roots` without normalizing it and return that
-    /// slot, for a caller that publishes its whole livevar set first and
-    /// then normalizes the range once (`gc_roots::pin_roots`). A null
-    /// `exc_object` is not published.
-    pub fn publish_exc_object(&self, roots: &pyre_object::gc_roots::RootScope) -> Option<usize> {
-        if self.exc_object.is_null() {
-            None
-        } else {
-            Some(roots.publish(&[self.exc_object]))
-        }
+    /// [`PyError::publish_gc_refs`], normalizing the three slots.
+    pub fn pin_gc_refs(&self, roots: &pyre_object::gc_roots::RootScope) -> usize {
+        roots.pin_roots(&[self.exc_object, self.w_name_context, self.w_obj_context])
     }
 
-    /// Write the live `exc_object` out of `slot` into this carrier.
-    pub fn reload_exc_object(
-        &mut self,
-        roots: &pyre_object::gc_roots::RootScope,
-        slot: Option<usize>,
-    ) {
-        if let Some(slot) = slot {
-            self.exc_object = roots.get(slot);
-        }
+    /// Write the live words out of the three slots at `base` into this carrier.
+    pub fn reload_gc_refs(&mut self, roots: &pyre_object::gc_roots::RootScope, base: usize) {
+        self.exc_object = roots.get(base);
+        self.w_name_context = roots.get(base + 1);
+        self.w_obj_context = roots.get(base + 2);
     }
 
     /// Forward the up-to-three GC-managed references a `PyError` holds — the
@@ -5586,5 +5573,27 @@ mod tests {
         assert!(!stored.is_null());
         let name = unsafe { pyre_object::interp_exceptions::w_exception_get_name(exc) };
         assert!(!name.is_null());
+    }
+
+    /// A collection between the pin and the reload rewrites every slot it
+    /// walks. All three GC fields of the carrier have to come back through
+    /// those slots, the lazy context included, or a forwarded context would
+    /// be stamped onto the exception later.
+    #[test]
+    fn pinned_carrier_reloads_every_gc_field_a_walk_rewrites() {
+        let dummy = |addr: usize| addr as pyre_object::PyObjectRef;
+        let mut err = PyError::attribute_error("missing");
+        err.exc_object = dummy(0x1000);
+        err.w_name_context = dummy(0x2000);
+        err.w_obj_context = dummy(0x3000);
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = err.pin_gc_refs(&roots);
+        pyre_object::gc_roots::walk_shadow_stack(|slot| {
+            *slot = dummy(*slot as usize + 0x10);
+        });
+        err.reload_gc_refs(&roots, base);
+        assert_eq!(err.exc_object as usize, 0x1010);
+        assert_eq!(err.w_name_context as usize, 0x2010);
+        assert_eq!(err.w_obj_context as usize, 0x3010);
     }
 }

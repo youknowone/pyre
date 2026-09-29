@@ -12,39 +12,6 @@ use rustpython_wtf8::Wtf8;
 
 use pyre_interpreter::error::{PyError, PyResult};
 
-/// Shadow-stack slots holding the three GC references a `PyError` carries.
-/// The precise collector does not scan a Rust `PyError`, so a site that runs
-/// Python while holding one pins the payload here and reads it back after.
-type PyErrorRootSlots = [Option<usize>; 3];
-
-fn pin_pyerror_payload(err: &PyError) -> PyErrorRootSlots {
-    let mut slots = [None; 3];
-    for (slot, value) in
-        slots
-            .iter_mut()
-            .zip([err.exc_object, err.w_name_context, err.w_obj_context])
-    {
-        if !value.is_null() {
-            *slot = Some(gc_roots::shadow_stack_len());
-            let _ = gc_roots::pin_root(value);
-        }
-    }
-    slots
-}
-
-fn reload_pyerror_payload(mut err: PyError, slots: PyErrorRootSlots) -> PyError {
-    if let Some(slot) = slots[0] {
-        err.exc_object = gc_roots::shadow_stack_get(slot);
-    }
-    if let Some(slot) = slots[1] {
-        err.w_name_context = gc_roots::shadow_stack_get(slot);
-    }
-    if let Some(slot) = slots[2] {
-        err.w_obj_context = gc_roots::shadow_stack_get(slot);
-    }
-    err
-}
-
 fn require_string(obj: PyObjectRef) -> Result<&'static Wtf8, PyError> {
     if !unsafe { pyre_object::is_str(obj) } {
         return Err(PyError::type_error("first argument must be a string"));
@@ -836,13 +803,13 @@ fn encode_float(
 /// `json.encoder._make_iterencode`.  The original exception remains
 /// authoritative if a pathological `add_note` override itself fails.
 fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
-    let _roots = gc_roots::push_roots();
+    let roots = gc_roots::push_roots();
     // Materialise the carrier first so the pin below covers the finished
     // payload: `to_exc_object` stamps the deferred name/obj context onto the
     // instance and memoises the carrier.
     err.to_exc_object();
-    let slots = pin_pyerror_payload(&err);
-    let exc_slot = slots[0].expect("to_exc_object leaves a non-null carrier");
+    let err_base = err.pin_gc_refs(&roots);
+    let exc_slot = err_base;
     // Both calls below run Python, and `err` lives only in this Rust local
     // while they do; the name/obj context can be a young list or dict, which a
     // collection there relocates. `walk_gc_refs` forwards those fields for as
@@ -862,7 +829,8 @@ fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) ->
             &[gc_roots::shadow_stack_get(note_slot)],
         );
     }
-    reload_pyerror_payload(err, slots)
+    err.reload_gc_refs(&roots, err_base);
+    err
 }
 
 fn short_type_name(obj: PyObjectRef) -> String {

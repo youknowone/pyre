@@ -8224,22 +8224,9 @@ unsafe fn instance_getattr_hook_or_err(
     mut e: crate::PyError,
 ) -> PyResult {
     unsafe {
-        let _roots = pyre_object::gc_roots::push_roots();
+        let roots = pyre_object::gc_roots::push_roots();
         let live = pyre_object::gc_roots::pin_roots(&[w_type, obj]);
-        let name_ctx_slot = if !e.w_name_context.is_null() {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(e.w_name_context);
-            Some(slot)
-        } else {
-            None
-        };
-        let obj_ctx_slot = if !e.w_obj_context.is_null() {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(e.w_obj_context);
-            Some(slot)
-        } else {
-            None
-        };
+        let err_base = e.pin_gc_refs(&roots);
         if let Some(getattr_fn) =
             lookup_in_type_where(pyre_object::gc_roots::shadow_stack_get(live), "__getattr__")
         {
@@ -8260,12 +8247,7 @@ unsafe fn instance_getattr_hook_or_err(
                 &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
             );
         }
-        if let Some(slot) = name_ctx_slot {
-            e.w_name_context = pyre_object::gc_roots::shadow_stack_get(slot);
-        }
-        if let Some(slot) = obj_ctx_slot {
-            e.w_obj_context = pyre_object::gc_roots::shadow_stack_get(slot);
-        }
+        e.reload_gc_refs(&roots, err_base);
     }
     Err(e)
 }
@@ -8283,25 +8265,12 @@ unsafe fn type_getattr_hook_or_err(
     mut e: crate::PyError,
     call_getattr: bool,
 ) -> PyResult {
-    let _roots = pyre_object::gc_roots::push_roots();
+    let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     let mc_vals: Vec<PyObjectRef> = w_metaclasses.iter().copied().flatten().collect();
     let mc_base = pyre_object::gc_roots::pin_roots(&mc_vals);
-    let name_ctx_slot = if !e.w_name_context.is_null() {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(e.w_name_context);
-        Some(slot)
-    } else {
-        None
-    };
-    let obj_ctx_slot = if !e.w_obj_context.is_null() {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(e.w_obj_context);
-        Some(slot)
-    } else {
-        None
-    };
+    let err_base = e.pin_gc_refs(&roots);
     if call_getattr && e.kind == PyErrorKind::AttributeError {
         for i in 0..mc_vals.len() {
             let w_metaclass = pyre_object::gc_roots::shadow_stack_get(mc_base + i);
@@ -8326,12 +8295,7 @@ unsafe fn type_getattr_hook_or_err(
             }
         }
     }
-    if let Some(slot) = name_ctx_slot {
-        e.w_name_context = pyre_object::gc_roots::shadow_stack_get(slot);
-    }
-    if let Some(slot) = obj_ctx_slot {
-        e.w_obj_context = pyre_object::gc_roots::shadow_stack_get(slot);
-    }
+    e.reload_gc_refs(&roots, err_base);
     Err(e)
 }
 
@@ -15735,7 +15699,7 @@ pub fn call_args_and_c_profile_args(
     // slice and the `Arguments` vectors are native storage no root walker
     // updates.  Root them all, dispatch from the roots, and refresh the
     // `Arguments` vectors before the return hook reads them again.
-    let _roots = pyre_object::gc_roots::push_roots();
+    let roots = pyre_object::gc_roots::push_roots();
     let callable_slot = pyre_object::gc_roots::publish_roots(&[callable]);
     let flat_base = pyre_object::gc_roots::publish_roots(flat_args);
     let positional_base = pyre_object::gc_roots::publish_roots(&arguments.arguments_w);
@@ -15794,15 +15758,7 @@ pub fn call_args_and_c_profile_args(
             // the call and written back with `set_call_error`. A tracer error
             // replaces it, matching `except` replacing the in-flight error.
             let mut parked = crate::call::take_call_error();
-            let parked_base = parked.as_ref().map(|err| {
-                let base = pyre_object::gc_roots::publish_roots(&[
-                    err.exc_object,
-                    err.w_name_context,
-                    err.w_obj_context,
-                ]);
-                pyre_object::gc_roots::normalize_roots(base, 3);
-                base
-            });
+            let parked_base = parked.as_ref().map(|err| err.pin_gc_refs(&roots));
             let exc_children = parked
                 .as_ref()
                 .and_then(|err| pin_unmanaged_exception_children(err.exc_object));
@@ -15811,9 +15767,7 @@ pub fn call_args_and_c_profile_args(
             };
             if let Some(mut err) = parked.take() {
                 if let Some(base) = parked_base {
-                    err.exc_object = pyre_object::gc_roots::shadow_stack_get(base);
-                    err.w_name_context = pyre_object::gc_roots::shadow_stack_get(base + 1);
-                    err.w_obj_context = pyre_object::gc_roots::shadow_stack_get(base + 2);
+                    err.reload_gc_refs(&roots, base);
                 }
                 if let Some((child_base, offsets)) = exc_children {
                     write_unmanaged_exception_children(err.exc_object, child_base, offsets);
@@ -21435,21 +21389,23 @@ pub(crate) fn resume_yield_from(
     let roots = pyre_object::gc_roots::push_roots();
     let yf_slot = roots.publish(&[w_yf, w_arg]);
     let arg_slot = yf_slot + 1;
-    let exc_slot = operr
-        .as_ref()
-        .and_then(|err| err.publish_exc_object(&roots));
+    let exc_slot = operr.as_ref().map(|err| err.publish_gc_refs(&roots));
     let throw_slot = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
     roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
 
     let result = match operr {
         Some(mut err) if err.kind == PyErrorKind::GeneratorExit => {
             close_yield_from(roots.get(yf_slot))?;
-            err.reload_exc_object(&roots, exc_slot);
+            if let Some(base) = exc_slot {
+                err.reload_gc_refs(&roots, base);
+            }
             unsafe { (*anchor.live()).w_yielding_from = pyre_object::PY_NULL };
             return Err(err);
         }
         Some(mut err) => {
-            err.reload_exc_object(&roots, exc_slot);
+            if let Some(base) = exc_slot {
+                err.reload_gc_refs(&roots, base);
+            }
             let throw_args = throw_slot.map(|(base, argc)| {
                 (
                     [roots.get(base), roots.get(base + 1), roots.get(base + 2)],
@@ -21518,18 +21474,18 @@ fn throw_yield_from(
     // the range once, before `getattr`.
     let roots = pyre_object::gc_roots::push_roots();
     let yf_slot = roots.publish(&[w_yf]);
-    let mut exc_slot = err.publish_exc_object(&roots);
+    let mut exc_slot = err.publish_gc_refs(&roots);
     let pinned_args = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
     roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
     let throw = match getattr_str(roots.get(yf_slot), "throw") {
         Ok(method) => method,
         Err(attr_err) if attr_err.kind == PyErrorKind::AttributeError => {
-            err.reload_exc_object(&roots, exc_slot);
+            err.reload_gc_refs(&roots, exc_slot);
             return Err(err);
         }
         Err(attr_err) => return Err(attr_err),
     };
-    err.reload_exc_object(&roots, exc_slot);
+    err.reload_gc_refs(&roots, exc_slot);
     let throw_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(throw);
     if let Some((args_base, argc)) = pinned_args {
@@ -21548,17 +21504,17 @@ fn throw_yield_from(
             _ => crate::call::call_function_impl_result(throw, &[arg0, arg1, arg2]),
         };
     }
-    if exc_slot.is_none() {
+    if err.exc_object.is_null() {
         let w_exc = err.to_exc_object();
         err.exc_object = w_exc;
-        exc_slot = err.pin_exc_object(&roots);
+        exc_slot = err.pin_gc_refs(&roots);
     }
-    err.reload_exc_object(&roots, exc_slot);
+    err.reload_gc_refs(&roots, exc_slot);
     let w_type =
         crate::typedef::r#type(err.exc_object).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_type);
-    err.reload_exc_object(&roots, exc_slot);
+    err.reload_gc_refs(&roots, exc_slot);
     crate::call::call_function_impl_result(
         roots.get(throw_slot),
         &[roots.get(type_slot), err.exc_object],

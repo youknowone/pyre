@@ -9084,13 +9084,13 @@ fn portal_activation_bracketed(
     let mut w_exitvalue = w_none();
     // `call_trace` runs before `resume_execute_frame`. A thrown
     // `OperationError` (`error.py`) is a GC object on that path; pin the
-    // native carrier and write the slot back before the resume reads
-    // `exc_object`.
+    // native carrier and write the slots back before the resume reads
+    // them.
     let operr_pin = resume.as_ref().and_then(|resume| {
-        resume.operr.as_ref().and_then(|err| {
+        resume.operr.as_ref().map(|err| {
             let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin_exc_object(&roots)?;
-            Some((roots, slot))
+            let slot = err.pin_gc_refs(&roots);
+            (roots, slot)
         })
     });
     let mut resume = resume;
@@ -9104,7 +9104,7 @@ fn portal_activation_bracketed(
                 && let Some(resume) = resume.as_mut()
                 && let Some(err) = resume.operr.as_mut()
             {
-                err.reload_exc_object(roots, Some(*slot));
+                err.reload_gc_refs(roots, *slot);
             }
             drop(operr_pin);
             // `self.resume_execute_frame(w_arg_or_err)` and its
@@ -9137,13 +9137,13 @@ fn portal_activation_bracketed(
                 let exit_slot = roots.base();
                 let exit = roots.pin_root(w_exitvalue);
                 let err_slot = match &result {
-                    Err(err) => err.pin_exc_object(&roots),
+                    Err(err) => Some(err.pin_gc_refs(&roots)),
                     Ok(_) => None,
                 };
                 let trace = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, exit) };
                 w_exitvalue = roots.get(exit_slot);
-                if let Err(err) = &mut result {
-                    err.reload_exc_object(&roots, err_slot);
+                if let (Err(err), Some(base)) = (&mut result, err_slot) {
+                    err.reload_gc_refs(&roots, base);
                 }
                 trace
             };
@@ -9167,7 +9167,7 @@ fn portal_activation_bracketed(
     let mut leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
         let err_slot = match &outer_result {
-            Err(err) => err.pin_exc_object(&roots),
+            Err(err) => Some(err.pin_gc_refs(&roots)),
             Ok(_) => None,
         };
         let left = match leave_owner {
@@ -9182,8 +9182,8 @@ fn portal_activation_bracketed(
                 (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)
             },
         };
-        if let Err(err) = &mut outer_result {
-            err.reload_exc_object(&roots, err_slot);
+        if let (Err(err), Some(base)) = (&mut outer_result, err_slot) {
+            err.reload_gc_refs(&roots, base);
         }
         left
     };
