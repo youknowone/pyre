@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=3822e0404b24d9ce platform=linux
+# corpus=bad8c4dbd5a5e523 platform=linux
 direct-skip (never reaches unported_category)	pyre_interpreter::module::_random::<Impl>::new_instance
 two-phase-never-a-subject	argument::raise_type_error__spec_String_f3a4935218b38edd
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
@@ -258,7 +258,6 @@ two-phase-never-a-subject	pyre_interpreter::codec_engine::encode_utf32
 two-phase-never-a-subject	pyre_interpreter::codec_engine::encode_utf8
 two-phase-never-a-subject	pyre_interpreter::display::<Impl>::enter
 two-phase-never-a-subject	pyre_interpreter::display::base_exception_str_wtf8
-two-phase-never-a-subject	pyre_interpreter::display::builtin_subclass_dunder_obj
 two-phase-never-a-subject	pyre_interpreter::display::exc_user_dunder_obj
 two-phase-never-a-subject	pyre_interpreter::display::exception_descr_str_wtf8
 two-phase-never-a-subject	pyre_interpreter::display::exception_descr_str_wtf8::<Impl>::call
@@ -1014,10 +1013,8 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_dispat
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_dispatch_binary_special::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_inplace_special
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_lookup_unaryop
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_numeric_unaryop_override
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_reflected_binary_special
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_reflected_binary_special::<Impl>::call
-two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_subclass_binop_override
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::tuple_concat_type_error
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor_impl
@@ -1564,7 +1561,6 @@ two-phase-never-a-subject	pyre_object::celldict::_orig_module_dict_entries_get
 two-phase-never-a-subject	pyre_object::celldict::_orig_module_dict_entries_insert
 two-phase-never-a-subject	pyre_object::celldict::module_dict_entries_get
 two-phase-never-a-subject	pyre_object::celldict::module_dict_entries_insert
-two-phase-never-a-subject	pyre_object::complexobject::w_complex_slot_get
 two-phase-never-a-subject	pyre_object::dict_eq_hook::try_hash_str
 two-phase-never-a-subject	pyre_object::dictmultiobject::<Impl>::copy
 two-phase-never-a-subject	pyre_object::dictmultiobject::<Impl>::delitem
@@ -1648,7 +1644,6 @@ two-phase-never-a-subject	pyre_object::dictmultiobject::w_module_dict_store_inne
 two-phase-never-a-subject	pyre_object::float_array::<Impl>::pop
 two-phase-never-a-subject	pyre_object::float_array::<Impl>::remove
 two-phase-never-a-subject	pyre_object::float_array::<Impl>::with_capacity
-two-phase-never-a-subject	pyre_object::floatobject::w_float_slot_get
 two-phase-never-a-subject	pyre_object::gc_hook::gc_identity_hash
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc_collecting_rooted

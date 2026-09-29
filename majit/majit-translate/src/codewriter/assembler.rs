@@ -186,6 +186,115 @@ use crate::regalloc::RegAllocator;
 
 pub use majit_jitcode::codewriter::assembler::*;
 
+fn compact_exc_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Address of the `interp_exceptions` row whose name derives from `class_name`.
+///
+/// `StopIteration` matches `EXC_STOP_ITERATION_TYPE` by dropping underscores.
+/// `BaseException` is the one static spelled `EXCEPTION_TYPE`.
+fn lookup_exc_static_row(rows: &[(String, i64)], class_name: &str, suffix: &str) -> Option<i64> {
+    let compact = compact_exc_name(class_name);
+    let mut found: Option<i64> = None;
+    for (key, addr) in rows {
+        if !key.contains("interp_exceptions::") {
+            continue;
+        }
+        let leaf = key.rsplit("::").next().unwrap_or(key.as_str());
+        let matched = if suffix == "_TYPE" && leaf == "EXCEPTION_TYPE" {
+            compact == "BASEEXCEPTION"
+        } else if let Some(rest) = leaf.strip_prefix("EXC_") {
+            let Some(body) = rest.strip_suffix(suffix) else {
+                continue;
+            };
+            let row_compact: String = body.chars().filter(|c| *c != '_').collect();
+            row_compact == compact
+        } else {
+            false
+        };
+        if !matched {
+            continue;
+        }
+        if found.is_some() {
+            panic!("exception class {class_name} matches more than one {suffix} static row");
+        }
+        found = Some(*addr);
+    }
+    found
+}
+
+fn exception_class_of(obj: &crate::flowspace::model::HostObject) -> Option<String> {
+    if !obj.is_class() {
+        return None;
+    }
+    let base = crate::flowspace::model::HOST_ENV.lookup_builtin("BaseException")?;
+    obj.is_subclass_of(&base)
+        .then(|| obj.simple_name().to_string())
+}
+
+/// Class name and message of a builtin exception instance.
+///
+/// `Ok(None)` message is the empty prebuilt instance. Any other argument
+/// shape panics with the class name.
+fn exception_instance_spec(
+    obj: &crate::flowspace::model::HostObject,
+) -> Option<(String, Option<Vec<u8>>)> {
+    let class = obj.instance_class()?;
+    let base = crate::flowspace::model::HOST_ENV.lookup_builtin("BaseException")?;
+    if !class.is_subclass_of(&base) {
+        return None;
+    }
+    let name = class.simple_name().to_string();
+    let args = obj.instance_args().unwrap_or(&[]);
+    let message = match args {
+        [] => None,
+        [crate::flowspace::model::ConstValue::UniStr(text)] => Some(text.as_bytes().to_vec()),
+        [crate::flowspace::model::ConstValue::ByteStr(bytes)] => Some(bytes.clone()),
+        other => panic!("raise/r: unsupported prebuilt {name} instance arguments {other:?}"),
+    };
+    Some((name, message))
+}
+
+/// Pytype address for a builtin exception class. `None` when `obj` is not
+/// one, so other host objects keep their existing pool bits. A class with
+/// no row panics: the constant must not fall back to `identity_id`.
+fn exception_class_addr(
+    obj: &crate::flowspace::model::HostObject,
+    callcontrol: Option<&CallControl>,
+    site: &str,
+) -> Option<i64> {
+    let name = exception_class_of(obj)?;
+    let pytypes = callcontrol.map_or(&[][..], CallControl::exc_pytype_rows);
+    Some(
+        lookup_exc_static_row(pytypes, &name, "_TYPE").unwrap_or_else(|| {
+            panic!("{site}: no interp_exceptions pytype row for exception class {name}")
+        }),
+    )
+}
+
+fn host_object_ref_bits(
+    obj: &crate::flowspace::model::HostObject,
+    callcontrol: Option<&CallControl>,
+) -> i64 {
+    if exception_instance_spec(obj).is_some() {
+        let name = obj
+            .instance_class()
+            .map(|class| class.simple_name().to_string())
+            .unwrap_or_default();
+        panic!(
+            "raise/r: exception instance {name} must be a load-time descriptor, not identity_id"
+        );
+    }
+    if let Some(addr) = exception_class_addr(obj, callcontrol, "raise/r") {
+        return addr;
+    }
+    obj.identity_id() as i64
+}
+
 /// The graph-reading half of `assembler.py` `Assembler`.
 ///
 /// The state it writes into lives in `majit-jitcode` so the runtime can keep
@@ -297,9 +406,19 @@ trait AssemblerEncode {
         state: &mut AssemblyState,
     ) -> (u8, char);
 
-    fn emit_llexitcase(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8;
+    fn emit_llexitcase(
+        &mut self,
+        value: &ConstValue,
+        state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
+    ) -> u8;
 
-    fn emit_const_r(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8;
+    fn emit_const_r(
+        &mut self,
+        value: &ConstValue,
+        state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
+    ) -> u8;
 
     fn emit_str_const_r(
         &mut self,
@@ -312,6 +431,13 @@ trait AssemblerEncode {
         &mut self,
         qualname: String,
         tag: i64,
+        state: &mut AssemblyState,
+    ) -> u8;
+
+    fn emit_exc_instance_const_r(
+        &mut self,
+        class_name: String,
+        message: Option<Vec<u8>>,
         state: &mut AssemblyState,
     ) -> u8;
 
@@ -394,6 +520,7 @@ impl AssemblerExt for Assembler {
             constants_f: Vec::new(),
             str_consts: Vec::new(),
             unit_variant_consts: Vec::new(),
+            exc_instance_consts: Vec::new(),
             num_regs_i,
             num_regs_r,
             num_regs_f,
@@ -515,6 +642,7 @@ impl AssemblerExt for Assembler {
             constants_f: state.constants_f,
             str_consts: state.str_consts,
             unit_variant_consts: state.unit_variant_consts,
+            exc_instance_consts: state.exc_instance_consts,
             c_num_regs_i: num_regs_i as u8,
             c_num_regs_r: num_regs_r as u8,
             c_num_regs_f: num_regs_f as u8,
@@ -643,7 +771,7 @@ impl AssemblerEncode for Assembler {
                 let opnum = self.get_opnum("goto_if_exception_mismatch/iL");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
-                let encoded_llexitcase = self.emit_llexitcase(llexitcase, state);
+                let encoded_llexitcase = self.emit_llexitcase(llexitcase, state, callcontrol);
                 state.code.push(encoded_llexitcase);
                 state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*target, state.code.len()));
@@ -1351,7 +1479,7 @@ impl AssemblerEncode for Assembler {
             // `rtyper/rpbc.py::SingleFrozenPBCRepr` parity).
             OpKind::ConstRef(obj) => {
                 let const_value = crate::flowspace::model::ConstValue::HostObject(obj.clone());
-                let idx = self.emit_const_r(&const_value, state);
+                let idx = self.emit_const_r(&const_value, state, callcontrol);
                 state.code.push(idx);
                 argcodes.push('r');
                 if let Some(result) = op.result.as_ref() {
@@ -1368,7 +1496,7 @@ impl AssemblerEncode for Assembler {
                 let p = crate::translator::rtyper::lltypesystem::rstr::const_str_cache_llstr(bytes)
                     .expect("prebuilt STR constant must materialize");
                 let const_value = crate::flowspace::model::ConstValue::LLPtr(Box::new(p));
-                let idx = self.emit_const_r(&const_value, state);
+                let idx = self.emit_const_r(&const_value, state, callcontrol);
                 state.code.push(idx);
                 argcodes.push('r');
                 if let Some(result) = op.result.as_ref() {
@@ -1385,7 +1513,7 @@ impl AssemblerEncode for Assembler {
                 let const_value = crate::flowspace::model::ConstValue::LLAddress(
                     crate::translator::rtyper::lltypesystem::lltype::_address::Null,
                 );
-                let idx = self.emit_const_r(&const_value, state);
+                let idx = self.emit_const_r(&const_value, state, callcontrol);
                 state.code.push(idx);
                 argcodes.push('r');
                 if let Some(result) = op.result.as_ref() {
@@ -3234,7 +3362,7 @@ impl AssemblerEncode for Assembler {
     ) -> u8 {
         match kind {
             'i' => self.emit_const_i_from_const(value, state, callcontrol),
-            'r' => self.emit_const_r(value, state),
+            'r' => self.emit_const_r(value, state, callcontrol),
             'f' => self.emit_const_f(value, state),
             other => std::panic::panic_any(AssemblerError::message(format!(
                 "unknown constant kind {other:?} for {value:?}"
@@ -3340,17 +3468,33 @@ impl AssemblerEncode for Assembler {
         }
     }
 
-    fn emit_llexitcase(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
+    fn emit_llexitcase(
+        &mut self,
+        value: &ConstValue,
+        state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
+    ) -> u8 {
         match value {
             ConstValue::Int(value) => self.emit_const_i(*value, state),
-            ConstValue::HostObject(obj) => self.emit_const_i(obj.identity_id() as i64, state),
+            ConstValue::HostObject(obj) => {
+                let bits = exception_class_addr(obj, callcontrol, "goto_if_exception_mismatch")
+                    .unwrap_or_else(|| {
+                        panic!("goto_if_exception_mismatch: llexitcase {obj:?} is not an exception class")
+                    });
+                self.emit_const_i(bits, state)
+            }
             other => {
                 panic!("goto_if_exception_mismatch: unsupported llexitcase constant {other:?}")
             }
         }
     }
 
-    fn emit_const_r(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
+    fn emit_const_r(
+        &mut self,
+        value: &ConstValue,
+        state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
+    ) -> u8 {
         // A prebuilt `Ptr(STR)` constant cannot be baked as a runtime
         // address: the translator runs in a separate build-script process,
         // so the `_ptr` target is process-local garbage at runtime.  Record
@@ -3376,6 +3520,11 @@ impl AssemblerEncode for Assembler {
         {
             return self.emit_unit_variant_const_r(qualname, tag, state);
         }
+        if let ConstValue::HostObject(obj) = value
+            && let Some((class_name, message)) = exception_instance_spec(obj)
+        {
+            return self.emit_exc_instance_const_r(class_name, message, state);
+        }
         let bits = match value {
             // assembler.py::Assembler.emit_const casts ref constants to
             // GCREF and gives every typed nullptr the same None pool key.
@@ -3387,7 +3536,7 @@ impl AssemblerEncode for Assembler {
                 );
                 0
             }
-            ConstValue::HostObject(obj) => obj.identity_id() as i64,
+            ConstValue::HostObject(obj) => host_object_ref_bits(obj, callcontrol),
             ConstValue::LLAddress(
                 crate::translator::rtyper::lltypesystem::lltype::_address::Null,
             ) => 0,
@@ -3459,6 +3608,39 @@ impl AssemblerEncode for Assembler {
                 constants_r_index,
                 qualname,
                 tag,
+            });
+        reg
+    }
+
+    /// Record a prebuilt exception instance and pool its sentinel.
+    /// Identical `(class, message)` pairs share one descriptor.
+    fn emit_exc_instance_const_r(
+        &mut self,
+        class_name: String,
+        message: Option<Vec<u8>>,
+        state: &mut AssemblyState,
+    ) -> u8 {
+        if let Some(ordinal) = state
+            .exc_instance_consts
+            .iter()
+            .position(|d| d.class_name == class_name && d.message == message)
+        {
+            return self.emit_const_r_bits(exc_instance_const_sentinel(ordinal), state);
+        }
+        let ordinal = state.exc_instance_consts.len();
+        let constants_r_index = state.constants_r.len();
+        let reg = self.emit_const_r_bits(exc_instance_const_sentinel(ordinal), state);
+        debug_assert_eq!(
+            state.constants_r.len(),
+            constants_r_index + 1,
+            "a fresh exception-instance sentinel must push a new constants_r slot"
+        );
+        state
+            .exc_instance_consts
+            .push(super::jitcode::ExcInstanceConstDescriptor {
+                constants_r_index,
+                class_name,
+                message,
             });
         reg
     }
@@ -3575,6 +3757,14 @@ fn unit_variant_const_sentinel(ordinal: usize) -> i64 {
     UNIT_VARIANT_CONST_SENTINEL_BASE | ordinal as i64
 }
 
+fn exc_instance_const_sentinel(ordinal: usize) -> i64 {
+    debug_assert!(
+        (ordinal as u64) < (1u64 << 48),
+        "too many prebuilt exception instances in one jitcode"
+    );
+    EXC_INSTANCE_CONST_SENTINEL_BASE | ordinal as i64
+}
+
 /// Per-assembly state (RPython: Assembler.setup() fields).
 struct AssemblyState {
     code: Vec<u8>,
@@ -3589,6 +3779,7 @@ struct AssemblyState {
     /// committed to [`JitCodeBody::unit_variant_consts`]; same ownership
     /// contract as `str_consts`.
     unit_variant_consts: Vec<super::jitcode::UnitVariantConstDescriptor>,
+    exc_instance_consts: Vec<super::jitcode::ExcInstanceConstDescriptor>,
     num_regs_i: usize,
     num_regs_r: usize,
     num_regs_f: usize,
@@ -6270,6 +6461,7 @@ mod tests {
             constants_f: Vec::new(),
             str_consts: Vec::new(),
             unit_variant_consts: Vec::new(),
+            exc_instance_consts: Vec::new(),
             num_regs_i: 4,
             num_regs_r: 0,
             num_regs_f: 0,
@@ -6841,6 +7033,127 @@ mod tests {
         assert!(asm.insns.contains_key("ref_return/r"));
     }
 
+    fn cc_with_exc_rows(pytypes: &[(&str, i64)]) -> crate::call::CallControl {
+        let mut cc = crate::call::CallControl::new();
+        cc.set_exc_pytype_rows(
+            pytypes
+                .iter()
+                .map(|(key, addr)| ((*key).to_string(), *addr))
+                .collect(),
+        );
+        cc
+    }
+
+    #[test]
+    fn exception_class_llexitcase_emits_pytype_row_not_identity() {
+        use crate::flatten::{FlatOp, Label, SSARepr};
+        use crate::flowspace::model::HOST_ENV;
+
+        let stop = HOST_ENV
+            .lookup_exception_class("StopIteration")
+            .expect("StopIteration");
+        let base = HOST_ENV
+            .lookup_exception_class("BaseException")
+            .expect("BaseException");
+        let exc = HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        let cc = cc_with_exc_rows(&[
+            ("interp_exceptions::EXCEPTION_TYPE", 0x10),
+            ("interp_exceptions::EXC_EXCEPTION_TYPE", 0x20),
+            ("interp_exceptions::EXC_STOP_ITERATION_TYPE", 0x30),
+        ]);
+        let mut flat = SSARepr {
+            name: "mismatch".into(),
+            insns: vec![
+                FlatOp::GotoIfExceptionMismatch {
+                    llexitcase: ConstValue::HostObject(stop.clone()),
+                    target: Label(0),
+                },
+                FlatOp::GotoIfExceptionMismatch {
+                    llexitcase: ConstValue::HostObject(base.clone()),
+                    target: Label(0),
+                },
+                FlatOp::GotoIfExceptionMismatch {
+                    llexitcase: ConstValue::HostObject(exc.clone()),
+                    target: Label(0),
+                },
+                FlatOp::Label(Label(0)),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        assert_eq!(body.constants_i, vec![0x30, 0x10, 0x20]);
+        for class in [&stop, &base, &exc] {
+            assert!(!body.constants_i.contains(&(class.identity_id() as i64)));
+        }
+    }
+
+    #[test]
+    fn assertion_error_message_instance_emits_sentinel_not_identity() {
+        use crate::flatten::{FlatOp, RegOrConst, SSARepr};
+        use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, HostObject};
+
+        let class = HOST_ENV
+            .lookup_exception_class("AssertionError")
+            .expect("AssertionError");
+        let message = "implicit AssertionError shouldn't occur";
+        let inst = HostObject::new_instance(class, vec![ConstValue::UniStr(message.to_string())]);
+        let mut flat = SSARepr {
+            name: "raise_assert".into(),
+            insns: vec![FlatOp::Raise(RegOrConst::Const(Constant::new(
+                ConstValue::HostObject(inst.clone()),
+            )))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &empty_regallocs());
+        assert_eq!(
+            body.constants_r,
+            vec![crate::assembler::EXC_INSTANCE_CONST_SENTINEL_BASE]
+        );
+        assert_ne!(
+            crate::assembler::EXC_INSTANCE_CONST_SENTINEL_BASE,
+            inst.identity_id() as i64
+        );
+        assert_eq!(body.exc_instance_consts.len(), 1);
+        assert_eq!(body.exc_instance_consts[0].class_name, "AssertionError");
+        assert_eq!(
+            body.exc_instance_consts[0].message.as_deref(),
+            Some(message.as_bytes())
+        );
+        assert_eq!(body.exc_instance_consts[0].constants_r_index, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "no interp_exceptions pytype row for exception class ValueError")]
+    fn exception_class_without_pytype_row_panics() {
+        use crate::flatten::{FlatOp, Label, SSARepr};
+        use crate::flowspace::model::HOST_ENV;
+
+        let value = HOST_ENV
+            .lookup_exception_class("ValueError")
+            .expect("ValueError");
+        let cc = cc_with_exc_rows(&[("interp_exceptions::EXC_STOP_ITERATION_TYPE", 0x30)]);
+        let mut flat = SSARepr {
+            name: "missing".into(),
+            insns: vec![
+                FlatOp::GotoIfExceptionMismatch {
+                    llexitcase: ConstValue::HostObject(value),
+                    target: Label(0),
+                },
+                FlatOp::Label(Label(0)),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+    }
+
     #[test]
     #[should_panic(expected = "integer pointer constants must be raw")]
     fn integer_constants_reject_null_gc_pointer() {
@@ -6858,7 +7171,7 @@ mod tests {
             crate::translator::rtyper::rclass::OBJECT_VTABLE.clone(),
         )
         .unwrap();
-        Assembler::new().emit_const_r(&ConstValue::LLPtr(Box::new(null)), &mut empty_state());
+        Assembler::new().emit_const_r(&ConstValue::LLPtr(Box::new(null)), &mut empty_state(), None);
     }
 
     #[test]
@@ -6910,7 +7223,7 @@ mod tests {
             rstr::STR.clone(),
         ] {
             let null = lltype::nullptr(container).expect("null GC pointer");
-            let slot = asm.emit_const_r(&ConstValue::LLPtr(Box::new(null)), &mut state);
+            let slot = asm.emit_const_r(&ConstValue::LLPtr(Box::new(null)), &mut state, None);
             assert_eq!(
                 slot, 3,
                 "typed nulls share one slot after the Ref registers"
@@ -7033,7 +7346,7 @@ mod tests {
 
         // A prebuilt `Ptr(STR)` no longer panics: it records a descriptor
         // and pools a sentinel slot for runtime materialization.
-        let reg_a = asm.emit_const_r(&str_const(b"hello"), &mut state);
+        let reg_a = asm.emit_const_r(&str_const(b"hello"), &mut state, None);
         assert_eq!(state.str_consts.len(), 1);
         assert_eq!(state.str_consts[0].bytes, b"hello".to_vec());
         assert_eq!(
@@ -7044,13 +7357,13 @@ mod tests {
         assert_eq!(state.constants_r, vec![str_const_sentinel(0)]);
 
         // The same literal dedups to the same descriptor + pool slot.
-        let reg_a2 = asm.emit_const_r(&str_const(b"hello"), &mut state);
+        let reg_a2 = asm.emit_const_r(&str_const(b"hello"), &mut state, None);
         assert_eq!(reg_a2, reg_a);
         assert_eq!(state.str_consts.len(), 1);
         assert_eq!(state.constants_r.len(), 1);
 
         // A distinct literal gets a distinct descriptor + sentinel slot.
-        let reg_b = asm.emit_const_r(&str_const(b"world"), &mut state);
+        let reg_b = asm.emit_const_r(&str_const(b"world"), &mut state, None);
         assert_ne!(reg_b, reg_a);
         assert_eq!(state.str_consts.len(), 2);
         assert_eq!(state.str_consts[1].bytes, b"world".to_vec());

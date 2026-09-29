@@ -2198,6 +2198,11 @@ pub fn for_each_immortal_exception_singleton(mut visit: impl FnMut(PyObjectRef))
             visit(raw as PyObjectRef);
         }
     }
+    if let Ok(table) = PREBUILT_EXC_WITH_MESSAGE.lock() {
+        for (_, _, raw) in table.iter() {
+            visit(*raw as PyObjectRef);
+        }
+    }
 }
 
 /// `rpython/rtyper/exceptiondata.py get_standard_ll_exc_instance`
@@ -2215,6 +2220,41 @@ pub fn for_each_immortal_exception_singleton(mut visit: impl FnMut(PyObjectRef))
 pub fn standard_exc_instance(kind: ExcKind) -> PyObjectRef {
     let slot = &STANDARD_EXC_INSTANCES[kind as u8 as usize];
     *slot.get_or_init(|| w_exception_new_empty_immortal(kind) as usize) as PyObjectRef
+}
+
+static PREBUILT_EXC_WITH_MESSAGE: std::sync::Mutex<Vec<(u8, String, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Immortal exception instance with one text argument.
+///
+/// Empty `message` is [`standard_exc_instance`]. A repeated `(kind, message)`
+/// returns the same object. The instance is visited by
+/// [`for_each_immortal_exception_singleton`] so its argument list stays
+/// reachable across collections.
+pub fn prebuilt_exception_with_message(kind: ExcKind, message: &str) -> PyObjectRef {
+    if message.is_empty() {
+        return standard_exc_instance(kind);
+    }
+    if let Some((_, _, raw)) = PREBUILT_EXC_WITH_MESSAGE
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(k, text, _)| *k == kind as u8 && text == message)
+    {
+        return *raw as PyObjectRef;
+    }
+    let exc = w_exception_new_empty_immortal(kind);
+    let text = crate::unicodeobject::box_str_constant(
+        rustpython_wtf8::Wtf8::from_bytes(message.as_bytes())
+            .expect("prebuilt exception message is UTF-8"),
+    );
+    let args = w_exception_args_new(vec![text]);
+    unsafe { w_exception_set_args(exc, args) };
+    PREBUILT_EXC_WITH_MESSAGE
+        .lock()
+        .unwrap()
+        .push((kind as u8, message.to_string(), exc as usize));
+    exc
 }
 
 /// Check if an object is an exception instance.

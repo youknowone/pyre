@@ -2538,6 +2538,13 @@ fn analyze_pipeline_from_module_paths(
     };
 
     mark_phase!("call_control + canonical_trait_impls + register graphs");
+    call_control.set_exc_pytype_rows(
+        static_addrs
+            .pytypes
+            .iter()
+            .map(|(key, addr)| ((*key).to_string(), *addr))
+            .collect(),
+    );
     let (jitcodes, indirectcalltarget_indices, insns, descrs, all_liveness) =
         make_jitcodes(&config.pipeline, &mut call_control, &mut prof);
     mark_phase!("make_jitcodes");

@@ -27,6 +27,11 @@ pub const STR_CONST_SENTINEL_BASE: i64 = 0x7E57_0000_0000_0000u64 as i64;
 /// [`super::jitcode::UnitVariantConstDescriptor`] ordinal.
 pub const UNIT_VARIANT_CONST_SENTINEL_BASE: i64 = 0x7E58_0000_0000_0000u64 as i64;
 
+/// Non-canonical tag marking a deferred prebuilt exception-instance slot
+/// in `constants_r`, disjoint from the string and unit-variant sentinels.
+/// The low 48 bits carry the descriptor ordinal.
+pub const EXC_INSTANCE_CONST_SENTINEL_BASE: i64 = 0x7E59_0000_0000_0000u64 as i64;
+
 /// RPython `class AssemblerError(Exception)` (assembler.py).
 ///
 /// Upstream raises this for unsupported constant kinds while assembling

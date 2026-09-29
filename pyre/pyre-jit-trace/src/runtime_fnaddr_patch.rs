@@ -639,6 +639,52 @@ pub fn materialize_unit_variant_consts(jitcodes: &mut [Arc<JitCode>]) {
     }
 }
 
+/// Materialize every deferred prebuilt exception instance.
+///
+/// Each descriptor names a class and an optional message. The load pass
+/// allocates one immortal instance and overwrites the sentinel. Identical
+/// `(class, message)` pairs share one object.
+pub fn materialize_exc_instance_consts(jitcodes: &mut [Arc<JitCode>]) {
+    for arc in jitcodes.iter_mut() {
+        if arc
+            .try_body()
+            .is_none_or(|b| b.exc_instance_consts.is_empty())
+        {
+            continue;
+        }
+        let jc = Arc::get_mut(arc).expect(
+            "materialize_exc_instance_consts: Arc<JitCode> already shared before patch — \
+             every caller must run this before publishing the table to consumers",
+        );
+        let body = jc.body_mut();
+        for i in 0..body.exc_instance_consts.len() {
+            let idx = body.exc_instance_consts[i].constants_r_index;
+            let class_name = body.exc_instance_consts[i].class_name.clone();
+            let message = body.exc_instance_consts[i].message.clone();
+            let kind = pyre_object::interp_exceptions::exc_kind_from_name(&class_name)
+                .unwrap_or_else(|| {
+                    panic!("prebuilt exception instance has no ExcKind for class {class_name}")
+                });
+            let addr = match &message {
+                None => pyre_object::interp_exceptions::standard_exc_instance(kind) as usize as i64,
+                Some(bytes) => {
+                    let text = std::str::from_utf8(bytes)
+                        .unwrap_or_else(|_| panic!("prebuilt {class_name} message is not UTF-8"));
+                    pyre_object::interp_exceptions::prebuilt_exception_with_message(kind, text)
+                        as usize as i64
+                }
+            };
+            assert_eq!(
+                (body.constants_r[idx].get() as u64) & SENTINEL_HIGH_MASK,
+                (majit_jitcode::codewriter::assembler::EXC_INSTANCE_CONST_SENTINEL_BASE as u64)
+                    & SENTINEL_HIGH_MASK,
+                "constants_r[{idx}] did not hold an exception-instance sentinel",
+            );
+            body.constants_r[idx] = addr.into();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +918,41 @@ mod tests {
         let addr = jcs[0].body().constants_r[0].get();
         let cpu = crate::pyre_cpu::PyreCpu::new();
         assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(0));
+    }
+
+    #[test]
+    fn materialize_exc_instance_consts_overwrites_sentinel_with_assertion_error() {
+        use majit_jitcode::codewriter::assembler::EXC_INSTANCE_CONST_SENTINEL_BASE;
+        use majit_jitcode::jitcode::ExcInstanceConstDescriptor;
+
+        let desc = ExcInstanceConstDescriptor {
+            constants_r_index: 0,
+            class_name: "AssertionError".into(),
+            message: Some(b"implicit AssertionError shouldn't occur".to_vec()),
+        };
+        let jc = JitCode::new("raise_assert");
+        jc.set_body(JitCodeBody {
+            exc_instance_consts: vec![desc],
+            constants_r: vec![EXC_INSTANCE_CONST_SENTINEL_BASE.into()],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        materialize_exc_instance_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_ne!(addr, EXC_INSTANCE_CONST_SENTINEL_BASE);
+        assert_eq!((addr as u64) & SENTINEL_HIGH_MASK, 0);
+        let kind = unsafe {
+            pyre_object::interp_exceptions::w_exception_get_kind(addr as pyre_object::PyObjectRef)
+        };
+        assert_eq!(
+            kind,
+            pyre_object::interp_exceptions::ExcKind::AssertionError
+        );
+        let again = pyre_object::interp_exceptions::prebuilt_exception_with_message(
+            pyre_object::interp_exceptions::ExcKind::AssertionError,
+            "implicit AssertionError shouldn't occur",
+        );
+        assert_eq!(addr, again as usize as i64);
     }
 
     /// Walker folds that recognise a residual by callee compare against this
