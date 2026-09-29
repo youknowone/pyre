@@ -220,6 +220,8 @@ pub(crate) struct SliceGetSite {
     /// RPython carries this as the payload annotation with `can_be_None=True`,
     /// not as an Option object with discriminant and payload fields.
     pub niche: bool,
+    /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
+    pub niche_null_cast: Option<(String, ValueType)>,
     /// Concrete payload class for a niche reference.  In particular,
     /// `<[*mut PyObject]>::get` returns `Option<&PyObjectRef>`: the successful
     /// list item and the null arm must both retain the `PyObject` ClassDef.
@@ -418,7 +420,7 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
 
     // `else_bb`: opt = None.
     let else_result = if site.niche {
-        let null = graph.push_null_mut_ptr(else_bb);
+        let null = graph.push_niche_null(else_bb, site.niche_null_cast.as_ref());
         emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
     } else {
         let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
@@ -488,6 +490,7 @@ mod tests {
             array_type_id: None,
             object_array_type_id: None,
             niche: false,
+            niche_null_cast: None,
             payload_narrow_root: None,
         }
     }

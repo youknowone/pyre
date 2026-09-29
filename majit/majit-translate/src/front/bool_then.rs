@@ -88,6 +88,8 @@ pub(crate) struct BoolThenSite {
     /// `x` itself and `None` is null.  The consumer folds use this same flag,
     /// so the producer must choose the identical representation.
     pub niche: bool,
+    /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
+    pub niche_null_cast: Option<(String, ValueType)>,
     /// Concrete pointee class carried by a niche pointer payload.  Rust's raw
     /// pointer spelling otherwise erases to a classless `Ref`; RPython keeps
     /// the corresponding `SomeInstance(W_Root-subclass)` across the closure
@@ -266,7 +268,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
 
     // `else_bb`: opt = None.
     let none_var = if site.niche {
-        let null = graph.push_null_mut_ptr(else_bb);
+        let null = graph.push_niche_null(else_bb, site.niche_null_cast.as_ref());
         crate::front::option_map_or::emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
     } else {
         emit_option_variant(graph, else_bb, &site.option_owner, 0, None)

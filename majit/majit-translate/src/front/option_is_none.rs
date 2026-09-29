@@ -93,33 +93,37 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
 
     // Structural validation passed; mutate the graph.
     let new_ops = if site.niche {
-        let null = graph.alloc_value_var();
-        let (null_path, null_ty) = if site.fn_ptr {
-            (["core", "ptr", "null_fn"], ValueType::Int)
-        } else {
-            (["core", "ptr", "null_mut"], ValueType::Ref(None))
-        };
-        let mut ops = vec![SpaceOperation {
-            result: Some(null.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::function_path(null_path),
-                args: crate::model::call_args(vec![]),
-                result_ty: null_ty,
-            },
-        }];
-        let rhs = if let Some((root, result_ty)) = &site.niche_null_cast {
-            let narrowed = graph.alloc_value_var();
+        let mut ops = Vec::new();
+        let rhs = if site.fn_ptr {
+            let null = graph.alloc_value_var();
             ops.push(SpaceOperation {
-                result: Some(narrowed.clone()),
-                kind: crate::model::cast_instance_call_result(
-                    root.clone(),
-                    null,
-                    result_ty.clone(),
-                ),
+                result: Some(null.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["core", "ptr", "null_fn"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
             });
-            narrowed
+            if let Some((root, result_ty)) = &site.niche_null_cast {
+                let narrowed = graph.alloc_value_var();
+                ops.push(SpaceOperation {
+                    result: Some(narrowed.clone()),
+                    kind: crate::model::cast_instance_call_result(
+                        root.clone(),
+                        null,
+                        result_ty.clone(),
+                    ),
+                });
+                narrowed
+            } else {
+                null
+            }
         } else {
-            null
+            let block_id = graph.blocks[a].id;
+            let before = graph.block(block_id).operations.len();
+            let rhs = graph.push_niche_null(block_id, site.niche_null_cast.as_ref());
+            ops.extend(graph.block_mut(block_id).operations.split_off(before));
+            rhs
         };
         let is_none = if site.is_some {
             graph.alloc_value_var()

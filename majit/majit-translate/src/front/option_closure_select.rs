@@ -96,6 +96,10 @@ pub(crate) struct ClosureSelectSite {
     /// The built niche is `Option<fn>`. `None` is `null_fn` (int bank),
     /// not `null_mut` (ref bank). Set from `tyref_option_payload_is_fn_ptr`.
     pub result_fn_ptr: bool,
+    /// Repr projection of the built result's niche null; see
+    /// `FunctionGraph::push_niche_null`. `map`/`and_then` take it from the
+    /// destination `Option`; the other combinators reuse the receiver's cast.
+    pub result_niche_null_cast: Option<(String, ValueType)>,
     /// `None` tag when the built result is `Option<E>` over a densely
     /// numbered fieldless enum.  `Some(e)` is the scalar `e` itself.
     pub result_fieldless_none_tag: Option<i64>,
@@ -136,6 +140,8 @@ pub(crate) struct ClosureSelectSite {
     /// itself (identity), not a `__pos_0` field read.  (The closure `Args`
     /// tuple `__pos_0` write is unaffected — that is a real `Tuple` field.)
     pub niche: bool,
+    /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
+    pub niche_null_cast: Option<(String, ValueType)>,
     /// Receiver-side counterpart of `result_fieldless_none_tag`.
     pub fieldless_none_tag: Option<i64>,
     /// A closure whose declared result is `Result<T, PyError>` is translated
@@ -385,7 +391,7 @@ fn rewire_one_closure_select_site(
                 let null = if site.result_fn_ptr {
                     graph.push_null_fn_ptr(else_bb)
                 } else {
-                    graph.push_null_mut_ptr(else_bb)
+                    graph.push_niche_null(else_bb, site.result_niche_null_cast.as_ref())
                 };
                 (null, else_bb, else_inputs.clone())
             } else if let Some(none_tag) = site.result_fieldless_none_tag {
@@ -467,7 +473,7 @@ fn rewire_one_closure_select_site(
         // `ptr_ne` with an `Int` result matching the aggregate read.  The null
         // is a repr-adaptive `null_mut()` call, not a fixed-GCREF
         // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
-        let nullc = graph.push_null_mut_ptr(a_id);
+        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
@@ -753,11 +759,13 @@ mod tests {
             call_result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
             niche: false,
+            niche_null_cast: None,
             fieldless_none_tag: None,
             result_option_owner: RESULT_OPTION.into(),
             result_some_owner: RESULT_SOME.into(),
             result_niche,
             result_fn_ptr: false,
+            result_niche_null_cast: None,
             result_fieldless_none_tag: None,
             call_once_result_exc: None,
         }
@@ -1478,6 +1486,133 @@ mod tests {
             narrowed,
             "function-item map must narrow the payload to its class before the call"
         );
+    }
+
+    /// `null_mut` narrowed by `__cast_instance_intrinsic` to `ValueType::Str`.
+    fn str_niche_null_cast(g: &FunctionGraph) -> (Variable, Variable) {
+        let null = g
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. }
+                    if args.is_empty() && target.to_string() == "core::ptr::null_mut" =>
+                {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("null_mut");
+        let cast_result = g
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| {
+                crate::model::cast_instance_of(&op.kind, &null) == Some("&str")
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call { result_ty, .. } if result_ty == &ValueType::Str
+                    )
+            })
+            .and_then(|op| op.result.clone())
+            .expect("str cast of the niche null");
+        (null, cast_result)
+    }
+
+    #[test]
+    fn map_niche_result_str_cast_flows_to_the_merge() {
+        let mut g = FunctionGraph::new("test_closure_select_result_str_cast");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let env = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map", Some(RECV_OPTION.into())),
+                    args: crate::model::call_args(vec![opt, env]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (merge, _) = g.create_block_with_arg_vars(1);
+        g.set_return(merge, None);
+        g.set_goto(a, merge, vec![result.clone()]);
+        let mut site = site_with_result_niche(ClosureCombinator::Map, result, true);
+        site.result_niche_null_cast = Some(("&str".into(), ValueType::Str));
+        assert_eq!(
+            rewire_closure_select_call_sites(&mut g, &[site]).rewritten,
+            1
+        );
+        let (raw_null, cast_result) = str_niche_null_cast(&g);
+        let none_arm = g
+            .blocks
+            .iter()
+            .find(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| op.result.as_ref() == Some(&raw_null))
+            })
+            .expect("None arm");
+        assert!(
+            none_arm.exits.iter().any(|link| {
+                link.target == merge
+                    && link
+                        .args
+                        .iter()
+                        .any(|arg| arg.as_variable() == Some(&cast_result))
+                    && link
+                        .args
+                        .iter()
+                        .all(|arg| arg.as_variable() != Some(&raw_null))
+            }),
+            "the merge receives the cast result, not the raw null"
+        );
+    }
+
+    #[test]
+    fn niche_receiver_str_cast_is_ne_rhs() {
+        let mut g = FunctionGraph::new("test_closure_select_recv_str_cast");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let env = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map", Some(RECV_OPTION.into())),
+                    args: crate::model::call_args(vec![opt.clone(), env]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+        let mut site = site(ClosureCombinator::Map, result);
+        site.niche = true;
+        site.niche_null_cast = Some(("&str".into(), ValueType::Str));
+        assert_eq!(
+            rewire_closure_select_call_sites(&mut g, &[site]).rewritten,
+            1
+        );
+        let (raw_null, cast_result) = str_niche_null_cast(&g);
+        let ne = g.blocks[a.0]
+            .operations
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne"))
+            .expect("ne discriminant");
+        match &ne.kind {
+            OpKind::BinOp { lhs, rhs, .. } => {
+                assert_eq!(lhs, &opt);
+                assert_eq!(rhs, &cast_result);
+                assert_ne!(rhs, &raw_null);
+            }
+            other => panic!("expected ne, got {other:?}"),
+        }
     }
 
     #[test]

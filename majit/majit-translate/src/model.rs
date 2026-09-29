@@ -7568,6 +7568,28 @@ impl FunctionGraph {
         res
     }
 
+    /// One repr-adaptive source for every niche-Option null.
+    ///
+    /// Emits `core::ptr::null_mut()`, then, when `cast` is set, narrows that
+    /// null in the same block onto the payload repr and returns the narrowed
+    /// value.
+    pub fn push_niche_null(
+        &mut self,
+        block: BlockId,
+        cast: Option<&(String, ValueType)>,
+    ) -> crate::flowspace::model::Variable {
+        let null = self.push_null_mut_ptr(block);
+        let Some((root, ty)) = cast else {
+            return null;
+        };
+        let narrowed = self.alloc_value_var_with_type(ConcreteType::Unknown);
+        self.block_mut(block).operations.push(SpaceOperation {
+            result: Some(narrowed.clone()),
+            kind: cast_instance_call_result(root.clone(), null, ty.clone()),
+        });
+        narrowed
+    }
+
     /// Null function pointer for `Option<fn>`'s `None` arm. Annotates as
     /// `SomePtr(FuncType)` (`fn_null_constant`), the same `ll_ptrtype` as a
     /// `fn` field read, so the two arms union. A `null_mut()` null is a
@@ -14183,5 +14205,31 @@ mod tests {
         );
         let round_trip: CallTarget = serde_json::from_str(&json).expect("decode");
         assert_eq!(round_trip.resolved_path(), None);
+    }
+
+    #[test]
+    fn push_niche_null_without_cast_emits_only_null_mut() {
+        let mut graph = FunctionGraph::new("push_niche_null");
+        let block = graph.startblock;
+        let var = graph.push_niche_null(block, None);
+        let ops = &graph.block(block).operations;
+        assert_eq!(ops.len(), 1, "a cast-less niche null is only null_mut");
+        match &ops[0] {
+            SpaceOperation {
+                result: Some(result),
+                kind:
+                    OpKind::Call {
+                        target,
+                        args,
+                        result_ty,
+                    },
+            } => {
+                assert_eq!(result, &var);
+                assert_eq!(target.to_string(), "core::ptr::null_mut");
+                assert!(args.is_empty());
+                assert_eq!(result_ty, &ValueType::Ref(None));
+            }
+            other => panic!("expected null_mut call, got {other:?}"),
+        }
     }
 }

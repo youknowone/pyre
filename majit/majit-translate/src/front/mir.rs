@@ -4275,12 +4275,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             let return_owner = lo.resolve_option_return_owner(&fd.signature.output);
             let return_niche = lo.tyref_is_niche_option_ptr(&fd.signature.output);
             let return_narrow_root = lo.option_niche_payload_class_root(&fd.signature.output);
+            let return_niche_null_cast = lo.option_niche_null_cast(&fd.signature.output);
             crate::front::option_try::rewire_option_try_call_sites(
                 &mut lo.graph,
                 &lo.option_try_sites,
                 return_owner.as_deref(),
                 return_niche,
                 return_narrow_root.as_deref(),
+                return_niche_null_cast.as_ref(),
             )
         };
         // Non-carrier `Result` `?` is the same ControlFlow diamond as
@@ -23035,6 +23037,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
+            niche_null_cast: self.option_niche_null_cast(dest_ty),
             payload_narrow_root,
         })
     }
@@ -23062,6 +23065,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
+            niche_null_cast: self.option_niche_null_cast(dest_ty),
             payload_narrow_root,
         })
     }
@@ -23094,6 +23098,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
+            niche_null_cast: self.option_niche_null_cast(dest_ty),
             payload_narrow_root,
             array_type_id: None,
             object_array_type_id: None,
@@ -23178,6 +23183,7 @@ impl<'a> Lowering<'a> {
             array_type_id,
             object_array_type_id: None,
             niche,
+            niche_null_cast: self.option_niche_null_cast(dest_ty),
             payload_narrow_root,
         })
     }
@@ -23261,6 +23267,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             payload_on_disc_true,
             niche,
+            niche_null_cast: self.option_niche_null_cast(recv_ty),
             fieldless_none_tag,
         })
     }
@@ -23351,6 +23358,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             payload_on_disc_true,
             niche,
+            niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
     }
 
@@ -23381,6 +23389,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
+            niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
     }
 
@@ -23538,6 +23547,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
+            niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
     }
 
@@ -24047,6 +24057,7 @@ impl<'a> Lowering<'a> {
             result_ty,
             args_tuple_suffix,
             niche,
+            niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
     }
 
@@ -24414,6 +24425,13 @@ impl<'a> Lowering<'a> {
             }
             _ => fieldless_none_tag,
         };
+        let niche_null_cast = self.option_niche_null_cast(&recv_ty);
+        let result_niche_null_cast = match kind {
+            ClosureCombinator::Map | ClosureCombinator::AndThen => {
+                self.option_niche_null_cast(dest_ty)
+            }
+            _ => niche_null_cast.clone(),
+        };
         Some(crate::front::option_closure_select::ClosureSelectSite {
             kind,
             result_var: result_var.clone(),
@@ -24424,6 +24442,7 @@ impl<'a> Lowering<'a> {
             result_niche,
             result_fn_ptr: matches!(kind, ClosureCombinator::Map | ClosureCombinator::AndThen)
                 && tyref_option_payload_is_fn_ptr(dest_ty, self.llbc),
+            result_niche_null_cast,
             result_fieldless_none_tag,
             call_once_owner,
             fn_item_segments,
@@ -24433,6 +24452,7 @@ impl<'a> Lowering<'a> {
             call_result_ty,
             args_tuple_suffix,
             niche,
+            niche_null_cast,
             fieldless_none_tag,
             call_once_result_exc,
         })
@@ -24725,18 +24745,8 @@ impl<'a> Lowering<'a> {
         if self.option_payload_is_fn_ptr(option_ty) {
             return self.graph.push_null_fn_ptr(bb_id);
         }
-        let null = self.graph.push_null_mut_ptr(bb_id);
-        let Some((root, result_ty)) = self.option_niche_null_cast(option_ty) else {
-            return null;
-        };
-        let narrowed = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(narrowed.clone()),
-            kind: crate::model::cast_instance_call_result(root, null, result_ty),
-        });
-        narrowed
+        self.graph
+            .push_niche_null(bb_id, self.option_niche_null_cast(option_ty).as_ref())
     }
 
     /// Lower `i64::checked_neg()` (`core::num::<Impl>::checked_neg` —

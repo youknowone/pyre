@@ -63,6 +63,8 @@ pub(crate) struct OptionTrySite {
     /// tag switch is then a pointer null-test (`opt != null`) and the `Some`-arm
     /// payload is the base pointer itself (identity).
     pub niche: bool,
+    /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
+    pub niche_null_cast: Option<(String, ValueType)>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -73,16 +75,20 @@ pub(crate) struct OptionTryStats {
 
 /// Rewrite every recorded `Option` `Try::branch` site.  `return_option_owner`
 /// is the enclosing function's declared `Option<U>` root; `None` means the
-/// function is not Option-returning, so all sites decline. `return_niche` and
-/// `return_narrow_root` describe the enclosing return Option independently of
-/// the branched Option: a niche return builds a narrowed null instead of an
-/// enum `Option::None` aggregate.
+/// function is not Option-returning, so all sites decline. `return_niche`,
+/// `return_narrow_root`, and `return_niche_null_cast` describe the enclosing
+/// return Option independently of the branched Option: a niche return builds
+/// a narrowed null instead of an enum `Option::None` aggregate. The receiver
+/// null-test uses [`OptionTrySite::niche_null_cast`]; the returned `None`
+/// uses `return_niche_null_cast`, because recording only has the branched
+/// `Option` and the return `Option` is the function signature's output.
 pub(crate) fn rewire_option_try_call_sites(
     graph: &mut FunctionGraph,
     sites: &[OptionTrySite],
     return_option_owner: Option<&str>,
     return_niche: bool,
     return_narrow_root: Option<&str>,
+    return_niche_null_cast: Option<&(String, ValueType)>,
 ) -> OptionTryStats {
     let mut stats = OptionTryStats::default();
     for site in sites {
@@ -92,6 +98,7 @@ pub(crate) fn rewire_option_try_call_sites(
             return_option_owner,
             return_niche,
             return_narrow_root,
+            return_niche_null_cast,
         ) {
             Ok(()) => stats.rewritten += 1,
             Err(decline) => {
@@ -114,6 +121,7 @@ fn rewire_one_option_try_site(
     return_option_owner: Option<&str>,
     return_niche: bool,
     return_narrow_root: Option<&str>,
+    return_niche_null_cast: Option<&(String, ValueType)>,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     let Some(return_option_owner) = return_option_owner else {
@@ -323,7 +331,7 @@ fn rewire_one_option_try_site(
     // `None`.  Building an `Option::None` aggregate here made the returnblock
     // try to union that enum variant with the `PyObject` success value.
     let none = if return_niche {
-        let null = graph.push_null_mut_ptr(none_bb);
+        let null = graph.push_niche_null(none_bb, return_niche_null_cast);
         let narrow_root = return_narrow_root.map(str::to_owned);
         crate::front::option_map_or::emit_narrow(graph, none_bb, null, &narrow_root)
     } else {
@@ -348,7 +356,7 @@ fn rewire_one_option_try_site(
         // the `{1 => Some, 0 => None}` switch exactly as the aggregate read.
         // The null is a repr-adaptive `null_mut()` call, not a fixed-GCREF
         // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
-        let nullc = graph.push_null_mut_ptr(a_id);
+        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(opt_disc.clone()),
             kind: OpKind::BinOp {
