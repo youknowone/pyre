@@ -2604,11 +2604,7 @@ fn rewire_one_option_ok_or_else_try_site(
 
     // One recorded result: a merged `ok_or_else` continue has to fail in
     // planning, before this splice mutates, and the matcher reads the list.
-    let recorded = [(
-        site.result_var.clone(),
-        None,
-        site.payload_ty.clone(),
-    )];
+    let recorded = [(site.result_var.clone(), None, site.payload_ty.clone())];
     let result_shape = rewire_one_call_site(
         graph,
         &site.result_var,
@@ -2923,13 +2919,7 @@ fn rewire_one_call_site(
         }
         let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
         replace_exit_value(graph, a, r, &payload);
-        separate_payload_from_shell(
-            graph,
-            a,
-            &payload,
-            &pending_result_vars(results),
-            true,
-        )?;
+        separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
         return Ok(SiteOutcome::TailForward);
     }
     let (b, r_b) =
@@ -5380,11 +5370,7 @@ fn predecessor_exits(graph: &FunctionGraph, block: usize) -> Vec<(usize, usize)>
 /// `forwards_to_returnblock` allows the chain; the shared phi is the
 /// merged continuation `guessexception` would not build out of several
 /// shells.
-fn merged_forward_target(
-    graph: &FunctionGraph,
-    block: usize,
-    var: &Variable,
-) -> Option<BlockId> {
+fn merged_forward_target(graph: &FunctionGraph, block: usize, var: &Variable) -> Option<BlockId> {
     let mut current = block;
     let mut tracked = var.clone();
     for _ in 0..graph.blocks.len() {
@@ -5486,14 +5472,17 @@ fn shell_field_write(
     block: usize,
     shell: &Variable,
 ) -> Option<(crate::model::FieldDescriptor, ValueType)> {
-    graph.blocks[block].operations.iter().find_map(|op| match &op.kind {
-        OpKind::FieldWrite { base, field, ty, .. }
-            if base == shell && field.name == "__pos_0" && projects_exc_shell(field) =>
-        {
-            Some((field.clone(), ty.clone()))
-        }
-        _ => None,
-    })
+    graph.blocks[block]
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::FieldWrite {
+                base, field, ty, ..
+            } if base == shell && field.name == "__pos_0" && projects_exc_shell(field) => {
+                Some((field.clone(), ty.clone()))
+            }
+            _ => None,
+        })
 }
 
 fn inputarg_used_outside_pos0(graph: &FunctionGraph, block: usize, var: &Variable) -> bool {
@@ -5536,21 +5525,25 @@ fn pos0_read_field(
     block: usize,
     var: &Variable,
 ) -> Option<(crate::model::FieldDescriptor, ValueType)> {
-    graph.blocks[block].operations.iter().find_map(|op| match &op.kind {
-        OpKind::FieldRead { base, field, ty, .. }
-            if base == var && field.name == "__pos_0" && projects_exc_shell(field) =>
-        {
-            Some((field.clone(), ty.clone()))
-        }
-        _ => None,
-    })
+    graph.blocks[block]
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::FieldRead {
+                base, field, ty, ..
+            } if base == var && field.name == "__pos_0" && projects_exc_shell(field) => {
+                Some((field.clone(), ty.clone()))
+            }
+            _ => None,
+        })
 }
 
 /// Slots whose only use in `block` is a shell `__pos_0` projection.
 fn projection_slots(graph: &FunctionGraph, block: usize) -> Vec<usize> {
     let mut slots = Vec::new();
     for (pos, var) in graph.blocks[block].inputargs.iter().enumerate() {
-        if pos0_read_field(graph, block, var).is_some() && !inputarg_used_outside_pos0(graph, block, var)
+        if pos0_read_field(graph, block, var).is_some()
+            && !inputarg_used_outside_pos0(graph, block, var)
         {
             slots.push(pos);
         }
@@ -5563,9 +5556,9 @@ fn is_identity_forward_block(graph: &FunctionGraph, block: usize) -> bool {
     if !body.operations.is_empty() || body.exitswitch.is_some() || body.exits.len() != 1 {
         return false;
     }
-    body.exits[0].args.iter().enumerate().all(|(pos, arg)| {
-        matches!(arg, LinkArg::Value(value) if body.inputargs.get(pos) == Some(value))
-    })
+    body.exits[0].args.iter().enumerate().all(
+        |(pos, arg)| matches!(arg, LinkArg::Value(value) if body.inputargs.get(pos) == Some(value)),
+    )
 }
 
 /// `source` itself when it is the discriminant switch, otherwise the
@@ -5655,11 +5648,15 @@ fn classify_slot_value(
                 payload_ty: payload_ty.clone(),
             });
         }
-        let forwarded = graph.blocks[source].inputargs.iter().any(|input| input == var)
-            && !graph.blocks[source]
-                .operations
-                .iter()
-                .any(|op| op_operand_vars(&op.kind).iter().any(|operand| operand == var));
+        let forwarded = graph.blocks[source]
+            .inputargs
+            .iter()
+            .any(|input| input == var)
+            && !graph.blocks[source].operations.iter().any(|op| {
+                op_operand_vars(&op.kind)
+                    .iter()
+                    .any(|operand| operand == var)
+            });
         if forwarded {
             return Ok(SlotAction::Remint {
                 call_block,
@@ -5685,10 +5682,7 @@ fn classify_slot_value(
                     return Ok(SlotAction::LeaveCtor);
                 }
                 let field = shell_field_write(graph, source, var);
-                return Ok(SlotAction::Project(SlotProjection {
-                    pos: 0,
-                    field,
-                }));
+                return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
             }
         }
         if is_branch_result(graph, var) {
@@ -5704,7 +5698,10 @@ fn classify_slot_value(
         ));
     }
     if graph.blocks[source].operations.is_empty()
-        && graph.blocks[source].inputargs.iter().any(|input| input == var)
+        && graph.blocks[source]
+            .inputargs
+            .iter()
+            .any(|input| input == var)
         && predecessor_exits(graph, source).len() == 1
     {
         let (pred, pred_exit) = predecessor_exits(graph, source)[0];
@@ -5742,8 +5739,7 @@ fn plan_question_diamond(
     results: &[(Variable, Option<String>, ValueType)],
     name: &str,
 ) -> Result<DiamondPlan, String> {
-    let (continue_link, break_link) =
-        split_diamond_exits(&graph.blocks[disc_block].exits, name)?;
+    let (continue_link, break_link) = split_diamond_exits(&graph.blocks[disc_block].exits, name)?;
     let this = &graph.blocks[disc_block].exits[exit_index];
     if this.target != continue_link.target || this.exitcase != continue_link.exitcase {
         return Err(format!(
@@ -5845,9 +5841,7 @@ fn plan_question_diamond(
         .iter()
         .find(|(result, _, _)| *result == r)
         .map(|(_, _, ty)| ty.clone())
-        .ok_or_else(|| {
-            format!("{name}: merged continue call result is not a scoped Result")
-        })?;
+        .ok_or_else(|| format!("{name}: merged continue call result is not a scoped Result"))?;
     let (disc_target, cf_c) = follow_single_exit(graph, branch_block, &cf)
         .map_err(|err| format!("{name}: branch block exit: {err}"))?;
     if disc_target != disc_block {
@@ -5925,10 +5919,7 @@ fn apply_diamond(graph: &mut FunctionGraph, plan: &DiamondPlan, target: BlockId)
     exc_link.last_exc_value = Some(LinkArg::Value(vb));
     let call = &mut graph.blocks[plan.call_block];
     call.exitswitch = Some(ExitSwitch::LastException);
-    call.exits = vec![
-        Link::new_mixed(normal_args, target, None),
-        exc_link,
-    ];
+    call.exits = vec![Link::new_mixed(normal_args, target, None), exc_link];
     payload
 }
 
@@ -5961,13 +5952,19 @@ fn split_link_project(
         vars.push(value.clone());
     }
     let (new_id, new_inputs) = graph.create_block_with_arg_vars(vars.len());
-    graph.blocks[block].exits[exit_index] =
-        Link::new_mixed(vars.iter().cloned().map(LinkArg::Value).collect(), new_id, link.exitcase.clone());
+    graph.blocks[block].exits[exit_index] = Link::new_mixed(
+        vars.iter().cloned().map(LinkArg::Value).collect(),
+        new_id,
+        link.exitcase.clone(),
+    );
 
     let mut projected: Vec<(usize, Variable)> = Vec::new();
     for projection in projections {
         let arg = link.args.get(projection.pos).ok_or_else(|| {
-            format!("{name}: projection slot {} is past the link arity", projection.pos)
+            format!(
+                "{name}: projection slot {} is past the link arity",
+                projection.pos
+            )
         })?;
         let result = graph.alloc_value_var();
         let kind = if let Some((field, ty)) = &projection.field {
@@ -5977,9 +5974,10 @@ fn split_link_project(
                     projection.pos
                 ));
             };
-            let index = vars.iter().position(|value| value == shell).ok_or_else(|| {
-                format!("{name}: projection shell is not on the link")
-            })?;
+            let index = vars
+                .iter()
+                .position(|value| value == shell)
+                .ok_or_else(|| format!("{name}: projection shell is not on the link"))?;
             OpKind::FieldRead {
                 base: new_inputs[index].clone(),
                 field: field.clone(),
@@ -5998,7 +5996,9 @@ fn split_link_project(
 
     let mut exit_args = Vec::with_capacity(link.args.len());
     for (pos, arg) in link.args.iter().enumerate() {
-        if let Some((_, value)) = projected.iter().find(|(projected_pos, _)| *projected_pos == pos)
+        if let Some((_, value)) = projected
+            .iter()
+            .find(|(projected_pos, _)| *projected_pos == pos)
         {
             exit_args.push(LinkArg::Value(value.clone()));
             continue;
@@ -6006,9 +6006,10 @@ fn split_link_project(
         match arg {
             LinkArg::Const(constant) => exit_args.push(LinkArg::Const(constant.clone())),
             LinkArg::Value(value) => {
-                let index = vars.iter().position(|defined| defined == value).ok_or_else(|| {
-                    format!("{name}: forwarded value is not on the split link")
-                })?;
+                let index = vars
+                    .iter()
+                    .position(|defined| defined == value)
+                    .ok_or_else(|| format!("{name}: forwarded value is not on the split link"))?;
                 exit_args.push(LinkArg::Value(new_inputs[index].clone()));
             }
         }
@@ -6158,7 +6159,10 @@ fn rewire_merged_target(
             let plan = plan_question_diamond(graph, disc_block, disc_exit, results, name)?;
             for pos in &plan.shell_positions {
                 let carrier = graph.blocks[target.0].inputargs.get(*pos).ok_or_else(|| {
-                    format!("{name}: merged continue block {} lacks inputarg {pos}", target.0)
+                    format!(
+                        "{name}: merged continue block {} lacks inputarg {pos}",
+                        target.0
+                    )
                 })?;
                 if inputarg_used_outside_pos0(graph, target.0, carrier) {
                     return Err(format!(
@@ -6230,9 +6234,7 @@ fn rewire_merged_target(
         let mut projections = Vec::new();
         for pos in &normalize {
             let arg = link.args.get(*pos).ok_or_else(|| {
-                format!(
-                    "{name}: merged continue block {source} link is shorter than slot {pos}"
-                )
+                format!("{name}: merged continue block {source} link is shorter than slot {pos}")
             })?;
             match arg {
                 LinkArg::Const(_) => {
@@ -6268,9 +6270,11 @@ fn rewire_merged_target(
                         SlotAction::Project(mut projection) => {
                             projection.pos = *pos;
                             if projection.field.is_none() {
-                                if let Some((field, ty)) =
-                                    pos0_read_field(graph, target.0, &graph.blocks[target.0].inputargs[*pos])
-                                {
+                                if let Some((field, ty)) = pos0_read_field(
+                                    graph,
+                                    target.0,
+                                    &graph.blocks[target.0].inputargs[*pos],
+                                ) {
                                     projection.field = Some((field, ty));
                                 }
                             }
@@ -9190,5 +9194,415 @@ mod break_arm_copy_tests {
         })
         .expect_err("a call beside the reraise is a side effect");
         assert!(err.contains("side-effecting"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod merged_continue_tests {
+    use super::*;
+    use crate::flowspace::model::ConstValue;
+    use crate::model::{ExitCase, FieldDescriptor, SpaceOperation};
+
+    /// Two `?` diamonds and one literal `Ok` share one continue block.
+    ///
+    /// The start switch keeps every arm reachable. Each `?` is
+    /// `call → Result::branch → ControlFlow discriminant`, and both
+    /// break arms share one `from_residual` tail.
+    fn merged_question_mark() -> (FunctionGraph, Vec<(Variable, Option<String>, ValueType)>) {
+        let mut graph = FunctionGraph::new("merged_question_mark");
+        let (cont, cont_args) = graph.create_block_with_arg_vars(2);
+        let payload = graph
+            .push_op_var(
+                cont,
+                OpKind::FieldRead {
+                    base: cont_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Continue".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("continue payload");
+        let carried = cont_args[1].clone();
+        graph.blocks[cont.0].operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: carried.clone(),
+                field: FieldDescriptor::new("value", Some("test::Slot".into())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+        });
+        graph.set_return(cont, Some(carried));
+
+        let (brk, brk_args) = graph.create_block_with_arg_vars(1);
+        let err_payload = graph
+            .push_op_var(
+                brk,
+                OpKind::FieldRead {
+                    base: brk_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Break".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("break payload");
+        let residual = graph
+            .push_op_var(
+                brk,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "from_residual",
+                        Some("core::ops::FromResidual".into()),
+                    ),
+                    args: crate::model::call_args(vec![err_payload]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(brk, Some(residual));
+
+        let r1 = add_question(&mut graph, cont, brk);
+        let r2 = add_question(&mut graph, cont, brk);
+        let literal = add_literal_ok(&mut graph, cont);
+
+        let start = graph.startblock;
+        let live = graph
+            .push_op_var(start, OpKind::ConstStr(b"live".to_vec()), true)
+            .expect("live");
+        let cond = graph
+            .push_op_var(start, OpKind::ConstInt(0), true)
+            .expect("cond");
+        let call1 = producer_block_index(&graph, &r1).expect("call 1");
+        let call2 = producer_block_index(&graph, &r2).expect("call 2");
+        graph.block_mut(start).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.block_mut(start).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(live.clone())],
+                BlockId(call1),
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(live.clone())],
+                BlockId(call2),
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(live)],
+                literal,
+                Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
+            ),
+        ];
+        (
+            graph,
+            vec![(r1, None, ValueType::Int), (r2, None, ValueType::Int)],
+        )
+    }
+
+    fn add_question(graph: &mut FunctionGraph, cont: BlockId, brk: BlockId) -> Variable {
+        let (call, call_args) = graph.create_block_with_arg_vars(1);
+        let extra = call_args[0].clone();
+        let result = graph
+            .push_op_var(
+                call,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        let (branch, branch_args) = graph.create_block_with_arg_vars(2);
+        let cf = graph
+            .push_op_var(
+                branch,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("core::result::Result".into())),
+                    args: crate::model::call_args(vec![branch_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("branch");
+        graph.set_goto(call, branch, vec![result.clone(), extra]);
+
+        let (disc, disc_args) = graph.create_block_with_arg_vars(2);
+        let cf_c = disc_args[0].clone();
+        let extra_c = disc_args[1].clone();
+        let disc_var = graph
+            .push_op_var(
+                disc,
+                OpKind::FieldRead {
+                    base: cf_c.clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::ops::control_flow::ControlFlow".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("discriminant");
+        graph.block_mut(disc).exitswitch = Some(ExitSwitch::Value(disc_var));
+        graph.block_mut(disc).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(cf_c.clone()), LinkArg::Value(extra_c)],
+                cont,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(cf_c)],
+                brk,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        graph.set_goto(branch, disc, vec![cf, branch_args[1].clone()]);
+        result
+    }
+
+    fn add_literal_ok(graph: &mut FunctionGraph, cont: BlockId) -> BlockId {
+        let (lit, lit_args) = graph.create_block_with_arg_vars(1);
+        let payload = graph
+            .push_op_var(lit, OpKind::ConstInt(7), true)
+            .expect("ok payload");
+        let shell = graph
+            .push_op_var(
+                lit,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<i64,PyError>".into()],
+                        "Ok",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("ok ctor");
+        graph.push_op_var(
+            lit,
+            OpKind::FieldWrite {
+                base: shell.clone(),
+                field: FieldDescriptor::new(
+                    "__pos_0",
+                    Some("core::result::Result<i64,PyError>::Ok".into()),
+                ),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_goto(lit, cont, vec![shell, lit_args[0].clone()]);
+        lit
+    }
+
+    fn assert_model_links(graph: &FunctionGraph) {
+        for block in &graph.blocks {
+            for (ei, link) in block.exits.iter().enumerate() {
+                assert_eq!(
+                    link.args.len(),
+                    graph.blocks[link.target.0].inputargs.len(),
+                    "block {} exit {ei} -> block {} arity",
+                    block.id.0,
+                    link.target.0
+                );
+                let exception = link.exitcase == Some(crate::model::exception_exitcase());
+                if !exception {
+                    assert!(
+                        link.last_exception.is_none() && link.last_exc_value.is_none(),
+                        "block {} exit {ei} is not an exception link",
+                        block.id.0
+                    );
+                }
+                for (ai, arg) in link.args.iter().enumerate() {
+                    let LinkArg::Value(value) = arg else {
+                        continue;
+                    };
+                    if exception
+                        && (link.last_exception.as_ref() == Some(arg)
+                            || link.last_exc_value.as_ref() == Some(arg))
+                    {
+                        continue;
+                    }
+                    let defined = block.inputargs.iter().any(|input| input == value)
+                        || block
+                            .operations
+                            .iter()
+                            .any(|op| op.result.as_ref() == Some(value));
+                    assert!(
+                        defined,
+                        "block {} exit {ei} args[{ai}] -> block {} is undefined in its source",
+                        block.id.0, link.target.0
+                    );
+                }
+            }
+        }
+    }
+
+    fn is_callee(op: &SpaceOperation) -> bool {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["callee"]
+        )
+    }
+
+    fn ok_ctor_var(graph: &FunctionGraph) -> Variable {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if name == "Ok" => op.result.clone(),
+                _ => None,
+            })
+            .expect("Ok ctor")
+    }
+
+    #[test]
+    fn merged_continue_projects_literal_ok_and_rewrites_both_questions() {
+        let (mut graph, results) = merged_question_mark();
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &results,
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("merged continue rewires");
+        assert_eq!(outcome.diamonds, 1);
+        assert_eq!(outcome.tail_forwards, 0);
+        assert_eq!(outcome.rewrapped, 0);
+        assert_model_links(&graph);
+
+        let mut calls = 0;
+        for block in &graph.blocks {
+            if !block.operations.iter().any(is_callee) {
+                continue;
+            }
+            calls += 1;
+            assert!(
+                matches!(block.exitswitch, Some(ExitSwitch::LastException)),
+                "call block {} is not LastException",
+                block.id.0
+            );
+            assert!(
+                block.exits.iter().any(|link| {
+                    link.target == graph.exceptblock
+                        && link.exitcase == Some(crate::model::exception_exitcase())
+                        && link.last_exception.is_some()
+                        && link.last_exc_value.is_some()
+                }),
+                "call block {} has no exception link",
+                block.id.0
+            );
+        }
+        assert_eq!(calls, 2);
+
+        let shell_ops = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "branch" || name == "from_residual"
+                )
+            });
+        assert!(!shell_ops, "branch / from_residual survived");
+
+        let cont_index = graph
+            .blocks
+            .iter()
+            .position(|block| {
+                block
+                    .inputargs
+                    .first()
+                    .is_some_and(|var| var.name_prefix() == "exc_payload_")
+            })
+            .expect("payload phi");
+        let cont_inputs = graph.blocks[cont_index].inputargs.clone();
+        let cont_exit = graph.blocks[cont_index].exits.clone();
+        let cont_projects_pos0 = graph.blocks[cont_index].operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. }
+                    if field.name == "__pos_0"
+            )
+        });
+        assert_eq!(cont_inputs.len(), 2);
+        assert_ne!(cont_inputs[1].name_prefix(), "exc_payload_");
+        assert!(!cont_projects_pos0, "continue block still projects __pos_0");
+        let returned = cont_inputs[1].clone();
+        assert!(
+            matches!(
+                cont_exit.as_slice(),
+                [link] if link.target == graph.returnblock
+                    && matches!(link.args.as_slice(), [LinkArg::Value(value)] if value == &returned)
+            ),
+            "pass-through value is not the return"
+        );
+
+        let ctor = ok_ctor_var(&graph);
+        let split = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if field.name == "__pos_0"
+                                && field.owner_root.as_deref().is_some_and(|owner| {
+                                    owner.contains("Result")
+                                })
+                    )
+                })
+            })
+            .expect("literal Ok projection");
+        assert!(
+            split.exits.iter().all(|link| {
+                link.args.iter().all(|arg| match arg {
+                    LinkArg::Value(value) => value != &ctor,
+                    LinkArg::Const(_) => true,
+                })
+            }),
+            "Ok shell flows past the projection block"
+        );
+        assert!(
+            graph.blocks.iter().any(|block| {
+                block.exits.iter().any(|link| {
+                    link.target == split.id
+                        && link
+                            .args
+                            .iter()
+                            .any(|arg| matches!(arg, LinkArg::Value(value) if value == &ctor))
+                })
+            }),
+            "projection block is not fed by the Ok ctor"
+        );
+        assert!(cont_inputs.iter().all(|var| var != &ctor));
+        assert!(cont_exit.iter().all(|link| {
+            link.args
+                .iter()
+                .all(|arg| !matches!(arg, LinkArg::Value(value) if value == &ctor))
+        }));
     }
 }

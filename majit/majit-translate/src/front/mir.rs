@@ -11357,15 +11357,19 @@ impl<'a> Lowering<'a> {
         tyref_class_root_with(&field.ty, self.llbc, self.tombstoned_leaves)
     }
 
-    /// `PyError(ptr)` is one pointer word, but the handle's class is not
-    /// `PyObject`. Leaving the aggregate as the inner value merges
-    /// `pyobject::PyObject` with `error::PyError` at every call.
+    /// `PyError(ptr)` is one pointer word. The class is the handle's
+    /// `Deref::Target` (`OperationError` carries `w_type` and `_w_value`),
+    /// so the word is not merged with `PyObject`. A configured carrier the
+    /// structural rule does not classify still uses its own leaf.
     fn retag_error_carrier(
         &mut self,
         wrapper_ty: &TyRef,
         value: Variable,
     ) -> (Option<OpKind>, Variable) {
-        let Some(root) = self.error_carrier_class_root(wrapper_ty) else {
+        let Some(root) =
+            transparent_deref_target_class(wrapper_ty, self.llbc, self.tombstoned_leaves)
+                .or_else(|| self.error_carrier_class_root(wrapper_ty))
+        else {
             return (None, value);
         };
         let res = self
@@ -43614,15 +43618,12 @@ fn tyref_to_value_type_with(
     if tyref_is_string_builder(ty, llbc) {
         return ValueType::StringBuilder;
     }
-    // `PyError` is `repr(transparent)` over `PyObjectRef`, one pointer word.
-    // Peeling it would paint the handle as `pyobject::PyObject` and merge the
-    // carrier with every object. The class is the handle's own leaf.
-    if let Some(path) = adt_path_of_tyref(ty, llbc) {
-        if path == "pyre_interpreter::error::PyError"
-            || strip_crate_prefix(&path) == "error::PyError"
-        {
-            return ValueType::Ref(Some("PyError".into()));
-        }
+    // A `repr(transparent)` GC handle whose `Deref::Target` is a struct
+    // is that struct's class. `OperationError` (`pypy/interpreter/error.py`)
+    // carries `w_type` and `_w_value`; it is not a `W_Root`. A wrapper
+    // with no such impl keeps the transparent peel below.
+    if let Some(root) = transparent_deref_target_class(ty, llbc, tombstoned) {
+        return ValueType::Ref(Some(root));
     }
     // A transparent one-field struct has the same low-level value shape as
     // its field. Charon records the representation in `TypeDecl.layout`, so
@@ -44968,6 +44969,150 @@ fn tyref_is_borrowed_transparent_scalar(
                 | ValueType::UInt128
         )
     )
+}
+
+/// ADT id of a type expression: inline `Value`, `Deduplicated`, or a bare `Adt`.
+fn tyexpr_to_adt_def_id(llbc: &Llbc, ty: &serde_json::Value) -> Option<u64> {
+    resolve_tyexpr_to_adt_def_id_free(llbc, ty).or_else(|| adt_node_def_id(ty))
+}
+
+fn deref_trait_decl_id(llbc: &Llbc) -> Option<u64> {
+    let mut found = None;
+    for decl in llbc.iter_trait_decls() {
+        if decl.item_meta.name_path() != "core::ops::deref::Deref" {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(decl.def_id);
+    }
+    found
+}
+
+enum DerefTargetBind<'a> {
+    Absent,
+    Value(&'a serde_json::Value),
+    Ambiguous,
+}
+
+/// The one `TraitType` of `trait_id` on this impl row.
+///
+/// Two bindings for the same trait are not a guess: the caller peels.
+fn deref_impl_target_bind(row: &serde_json::Value, trait_id: u64) -> DerefTargetBind<'_> {
+    let Some(entries) = row.get("types").and_then(|types| types.as_array()) else {
+        return DerefTargetBind::Absent;
+    };
+    let mut count = 0usize;
+    let mut value = None;
+    for entry in entries {
+        let Some(kind) = entry
+            .get("kind")
+            .and_then(|kind| kind.get("TraitType"))
+            .and_then(|kind| kind.as_array())
+        else {
+            continue;
+        };
+        if kind.first().and_then(|id| id.as_u64()) != Some(trait_id) {
+            continue;
+        }
+        count += 1;
+        if count > 1 {
+            return DerefTargetBind::Ambiguous;
+        }
+        value = entry
+            .get("skip_binder")
+            .and_then(|binder| binder.get("value"));
+    }
+    match value {
+        Some(value) if count == 1 => DerefTargetBind::Value(value),
+        _ => DerefTargetBind::Absent,
+    }
+}
+
+/// Class of a `repr(transparent)` one-field GC handle's `Deref::Target`.
+///
+/// The field must already be a `Ref` (including `Ref(None)`). `Target`
+/// must be one struct decl; its class is [`tyref_class_root_with`], so a
+/// tombstoned leaf stays disambiguated. No impl, a non-struct `Target`,
+/// or two struct targets with different classes keep the transparent peel.
+/// A struct `Target` with no class root does not apply. Two impls that
+/// name the same class do.
+fn transparent_deref_target_class(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let wrapper_id = adt_node_def_id(node)?;
+    let decl = llbc.type_by_id(wrapper_id)?;
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let (index, _) = transparent_nonzst_field(decl, llbc)?;
+    let field_ty = &fields.get(index)?.ty;
+    // The field is this wrapper. Typing it would re-enter the rule.
+    // `*mut T` is not an ADT, so a pointer field does not trip this.
+    if let Some(field_node) =
+        tyref_node(field_ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))
+        && adt_node_def_id(field_node) == Some(wrapper_id)
+    {
+        return None;
+    }
+    if !matches!(
+        tyref_to_value_type_with(field_ty, llbc, tombstoned),
+        ValueType::Ref(_)
+    ) {
+        return None;
+    }
+    let trait_id = deref_trait_decl_id(llbc)?;
+    let mut class = None;
+    for row in llbc.trait_impls_raw() {
+        if row.is_null() {
+            continue;
+        }
+        let Some(impl_trait) = row.get("impl_trait") else {
+            continue;
+        };
+        if impl_trait.get("id").and_then(|id| id.as_u64()) != Some(trait_id) {
+            continue;
+        }
+        let Some(self_ty) = impl_trait.pointer("/generics/types/0") else {
+            continue;
+        };
+        let Some(self_id) = tyexpr_to_adt_def_id(llbc, self_ty) else {
+            continue;
+        };
+        if !same_nominal_adt(llbc, self_id, wrapper_id) {
+            continue;
+        }
+        let target_ty = match deref_impl_target_bind(row, trait_id) {
+            DerefTargetBind::Ambiguous => return None,
+            DerefTargetBind::Absent => continue,
+            DerefTargetBind::Value(target_ty) => target_ty,
+        };
+        let Some(target_id) = tyexpr_to_adt_def_id(llbc, target_ty) else {
+            continue;
+        };
+        let Some(target_decl) = llbc.type_by_id(target_id) else {
+            continue;
+        };
+        if !matches!(target_decl.kind, TypeDeclKind::Struct(_)) {
+            continue;
+        }
+        // A struct whose class root is `None` (core/std/alloc with type
+        // arguments, via `adt_node_class_root_with`) does not apply.
+        let Some(root) = tyref_class_root_with(&TyRef::Other(target_ty.clone()), llbc, tombstoned)
+        else {
+            return None;
+        };
+        match &class {
+            None => class = Some(root),
+            Some(previous) if previous != &root => return None,
+            Some(_) => {}
+        }
+    }
+    class
 }
 
 fn tyref_transparent_inner_value_type(
@@ -63536,6 +63681,370 @@ mod tests {
         assert_eq!(
             super::tyref_to_value_type(&word_ty, &llbc),
             crate::model::ValueType::Int
+        );
+    }
+
+    fn fixture_span() -> serde_json::Value {
+        serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }})
+    }
+
+    fn fixture_item_meta(name: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "span": fixture_span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": true
+        })
+    }
+
+    fn ident_path(path: &[&str]) -> serde_json::Value {
+        serde_json::Value::Array(
+            path.iter()
+                .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                .collect(),
+        )
+    }
+
+    fn indexed_rows(rows: Vec<(u64, serde_json::Value)>) -> serde_json::Value {
+        let max = rows.iter().map(|(id, _)| *id).max().unwrap_or(0) as usize;
+        let mut slots = vec![serde_json::Value::Null; max + 1];
+        for (id, row) in rows {
+            slots[id as usize] = row;
+        }
+        serde_json::Value::Array(slots)
+    }
+
+    fn transparent_layout() -> serde_json::Value {
+        serde_json::json!([{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "Rust", "transparent": true}
+            }
+        }])
+    }
+
+    fn struct_decl(
+        def_id: u64,
+        name: serde_json::Value,
+        fields: serde_json::Value,
+        transparent: bool,
+    ) -> serde_json::Value {
+        let mut decl = serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(name),
+            "kind": {"Struct": fields}
+        });
+        if transparent {
+            decl["layout"] = transparent_layout();
+        }
+        decl
+    }
+
+    fn empty_fields() -> serde_json::Value {
+        serde_json::json!([])
+    }
+
+    fn raw_ptr_field(pointee: u64) -> serde_json::Value {
+        serde_json::json!([{
+            "name": null,
+            "ty": {"RawPtr": [
+                {"Adt": {"id": pointee, "generics": {"types": []}}},
+                "Mut"
+            ]},
+            "attr_info": null
+        }])
+    }
+
+    fn i64_field() -> serde_json::Value {
+        serde_json::json!([{
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+            "attr_info": null
+        }])
+    }
+
+    fn adt_body(def_id: u64) -> serde_json::Value {
+        serde_json::json!({"Adt": {"id": def_id, "generics": {"types": []}}})
+    }
+
+    fn deref_impl(
+        trait_id: u64,
+        self_ty: serde_json::Value,
+        targets: Vec<serde_json::Value>,
+        witnesses: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let types = targets
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| {
+                serde_json::json!({
+                    "kind": {"TraitType": [trait_id, index]},
+                    "skip_binder": {"value": target}
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "impl_trait": {
+                "id": trait_id,
+                "generics": {
+                    "regions": [],
+                    "types": [self_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            },
+            "types": types,
+            "witnesses": witnesses
+        })
+    }
+
+    fn paint_handle(
+        type_decls: Vec<(u64, serde_json::Value)>,
+        trait_impls: serde_json::Value,
+        query: u64,
+    ) -> ValueType {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": indexed_rows(type_decls),
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": indexed_rows(vec![(
+                    1,
+                    serde_json::json!({
+                        "def_id": 1,
+                        "item_meta": fixture_item_meta(ident_path(&[
+                            "core", "ops", "deref", "Deref"
+                        ])),
+                        "methods": []
+                    })
+                )]),
+                "trait_impls": trait_impls
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let ty = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [9000 + query, adt_body(query)]
+        }))
+        .expect("query TyRef parses");
+        super::tyref_to_value_type(&ty, &llbc)
+    }
+
+    fn pointer_handle_decls() -> Vec<(u64, serde_json::Value)> {
+        vec![
+            (
+                1,
+                struct_decl(
+                    1,
+                    ident_path(&["fixture", "PyObject"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (
+                2,
+                struct_decl(
+                    2,
+                    ident_path(&["fixture", "PyErrorObject"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (
+                3,
+                struct_decl(
+                    3,
+                    ident_path(&["fixture", "PyError"]),
+                    raw_ptr_field(1),
+                    true,
+                ),
+            ),
+            (
+                4,
+                struct_decl(
+                    4,
+                    ident_path(&["fixture", "OtherClass"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (
+                5,
+                struct_decl(
+                    5,
+                    ident_path(&["alloc", "vec", "Vec"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+        ]
+    }
+
+    fn pyerror_deref_impl(target_dedup: u64, target_adt: u64) -> serde_json::Value {
+        deref_impl(
+            1,
+            serde_json::json!({"Deduplicated": 22}),
+            vec![serde_json::json!({"Deduplicated": target_dedup})],
+            vec![
+                serde_json::json!({"Value": [22, adt_body(3)]}),
+                serde_json::json!({"Value": [target_dedup, adt_body(target_adt)]}),
+            ],
+        )
+    }
+
+    /// `Deref::Target` of a transparent GC-ref wrapper is that struct's class.
+    #[test]
+    fn transparent_gc_handle_class_follows_deref_target() {
+        let decls = pointer_handle_decls();
+        let blanket = serde_json::json!({
+            "impl_trait": {
+                "id": 1,
+                "generics": {"types": [{"TypeVar": {"Bound": [0, 0]}}]}
+            },
+            "types": [{
+                "kind": {"TraitType": [1, 0]},
+                "skip_binder": {"value": adt_body(4)}
+            }]
+        });
+        let painted = paint_handle(
+            decls.clone(),
+            serde_json::json!([null, blanket, pyerror_deref_impl(23, 2)]),
+            3,
+        );
+        assert_eq!(painted, ValueType::Ref(Some("PyErrorObject".into())));
+
+        let same_class = paint_handle(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2), pyerror_deref_impl(25, 2)]),
+            3,
+        );
+        assert_eq!(same_class, ValueType::Ref(Some("PyErrorObject".into())));
+
+        let peeled = paint_handle(decls.clone(), serde_json::json!([null]), 3);
+        assert_eq!(peeled, ValueType::Ref(None));
+
+        let mut scalar_decls = decls.clone();
+        scalar_decls[2] = (
+            3,
+            struct_decl(3, ident_path(&["fixture", "Word"]), i64_field(), true),
+        );
+        let scalar = paint_handle(
+            scalar_decls,
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+        );
+        assert_eq!(scalar, ValueType::Int);
+
+        let split = paint_handle(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2), pyerror_deref_impl(24, 4)]),
+            3,
+        );
+        assert_eq!(split, ValueType::Ref(None));
+
+        let ambiguous = deref_impl(
+            1,
+            serde_json::json!({"Deduplicated": 22}),
+            vec![
+                serde_json::json!({"Deduplicated": 23}),
+                serde_json::json!({"Deduplicated": 24}),
+            ],
+            vec![
+                serde_json::json!({"Value": [22, adt_body(3)]}),
+                serde_json::json!({"Value": [23, adt_body(2)]}),
+                serde_json::json!({"Value": [24, adt_body(4)]}),
+            ],
+        );
+        assert_eq!(
+            paint_handle(decls.clone(), serde_json::json!([ambiguous]), 3),
+            ValueType::Ref(None)
+        );
+
+        let vec_target = serde_json::json!({
+            "Adt": {
+                "id": 5,
+                "generics": {"types": [{"Scalar": {"Integer": {"Signed": "I64"}}}]}
+            }
+        });
+        let no_class = deref_impl(
+            1,
+            serde_json::json!({"Deduplicated": 22}),
+            vec![serde_json::json!({"Deduplicated": 26})],
+            vec![
+                serde_json::json!({"Value": [22, adt_body(3)]}),
+                serde_json::json!({"Value": [26, vec_target]}),
+            ],
+        );
+        assert_eq!(
+            paint_handle(decls, serde_json::json!([no_class]), 3),
+            ValueType::Ref(None)
+        );
+
+        let mut copy_name = ident_path(&["fixture", "Handle"]);
+        copy_name
+            .as_array_mut()
+            .expect("path")
+            .push(serde_json::json!({
+                "Instantiated": {"skip_binder": {"types": [{"Scalar": "Bool"}]}}
+            }));
+        let mut other_copy = ident_path(&["fixture", "Handle"]);
+        other_copy
+            .as_array_mut()
+            .expect("path")
+            .push(serde_json::json!({
+                "Instantiated": {"skip_binder": {"types": [
+                    {"Scalar": {"Integer": {"Signed": "I64"}}}
+                ]}}
+            }));
+        let copies = vec![
+            (
+                1,
+                struct_decl(
+                    1,
+                    ident_path(&["fixture", "PyObject"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (
+                2,
+                struct_decl(
+                    2,
+                    ident_path(&["fixture", "PyErrorObject"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (6, struct_decl(6, copy_name, raw_ptr_field(1), true)),
+            (7, struct_decl(7, other_copy, raw_ptr_field(1), true)),
+        ];
+        let copy_impl = deref_impl(
+            1,
+            serde_json::json!({"Deduplicated": 22}),
+            vec![serde_json::json!({"Deduplicated": 23})],
+            vec![
+                serde_json::json!({"Value": [22, adt_body(6)]}),
+                serde_json::json!({"Value": [23, adt_body(2)]}),
+            ],
+        );
+        assert_eq!(
+            paint_handle(copies, serde_json::json!([copy_impl]), 7),
+            ValueType::Ref(Some("PyErrorObject".into()))
         );
     }
 
