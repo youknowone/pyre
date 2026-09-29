@@ -375,7 +375,6 @@ spec_folds! {
     // variant                    label                       site             parent
     TruthInt             => ("truth_int",                "residual_call", "-"),
     TruthBool            => ("truth_bool",               "residual_call", "-"),
-    NewboolCall          => ("newbool_call",             "residual_call", "-"),
     BinaryOpDescent      => ("binary_op_descent",        "residual_call,inline_call", "-"),
     CompareOpDescent     => ("compare_op_descent",       "residual_call", "-"),
     StoreSubscr          => ("store_subscr",             "residual_call", "-"),

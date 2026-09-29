@@ -103,40 +103,29 @@ pub static SPECIALISED_TUPLE_II_TYPE: PyType = new_pytype("tuple");
 pub static SPECIALISED_TUPLE_FF_TYPE: PyType = new_pytype("tuple");
 pub static SPECIALISED_TUPLE_OO_TYPE: PyType = new_pytype("tuple");
 
-/// Allocate an arity-2 specialised int tuple via the same nursery bump
-/// `w_tuple_new` uses (`malloc_fixedsize` / `try_gc_alloc_nursery_raw`).
-/// The variant carries no GC-pointer fields (`gc_ptr_offsets = []`,
-/// `eval.rs`). Falls back to `Box::into_raw` when the host hook is
-/// absent (unit tests outside `JitDriver` init).
-pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
-    let header = PyObject {
-        ob_type: &SPECIALISED_TUPLE_II_TYPE as *const PyType,
-        w_class: get_instantiate(&TUPLE_TYPE),
-    };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
-        SPECIALISED_TUPLE_II_GC_TYPE_ID,
-        SPECIALISED_TUPLE_II_OBJECT_SIZE,
-    );
-    if !raw.is_null() {
-        unsafe {
-            std::ptr::write(
-                raw as *mut W_SpecialisedTupleObject_ii,
-                W_SpecialisedTupleObject_ii {
-                    ob_header: header,
-                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
-                    value0,
-                    value1,
-                },
-            );
-        }
-        return raw as PyObjectRef;
+impl crate::lltype::GcType for W_SpecialisedTupleObject_ii {
+    fn type_id() -> u32 {
+        SPECIALISED_TUPLE_II_GC_TYPE_ID
     }
-    Box::into_raw(Box::new(W_SpecialisedTupleObject_ii {
-        ob_header: header,
+    const SIZE: usize = SPECIALISED_TUPLE_II_OBJECT_SIZE;
+}
+
+/// `Cls_ii(space, w_arg1, w_arg2)` (`specialisedtupleobject.py`) over the two
+/// already-unwrapped machine ints.  The variant carries no GC-pointer fields
+/// (`gc_ptr_offsets = []`, `eval.rs`).  Own graph so `fuse_boxing_alloc`
+/// rewrites the `malloc_typed_managed` cluster to `new_with_vtable` + field
+/// stores, which keeps a traced pair virtual.
+#[inline(never)]
+pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
+    crate::lltype::malloc_typed_managed(W_SpecialisedTupleObject_ii {
+        ob_header: PyObject {
+            ob_type: &SPECIALISED_TUPLE_II_TYPE as *const PyType,
+            w_class: get_instantiate(&TUPLE_TYPE),
+        },
         hash: AtomicI64::new(TUPLE_HASH_UNSET),
         value0,
         value1,
-    })) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Allocate an arity-2 specialised float tuple. Same shape as

@@ -10185,9 +10185,6 @@ const FLOAT_NEW_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["jit_w_float_new"]),
 ];
 
-const BOOL_FROM_TARGETS: &[CallTargetPattern] =
-    &[CallTargetPattern::FunctionPath(&["w_bool_from"])];
-
 const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
     // ── Pure arithmetic (elidable, cannot raise) ──
     CallDescriptorEntry {
@@ -10292,12 +10289,6 @@ const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
     CallDescriptorEntry {
         targets: FLOAT_NEW_TARGETS,
         extraeffect: ExtraEffect::CannotRaise,
-        oopspecindex: OopSpecIndex::None,
-    },
-    // w_bool_from returns singletons (True/False) — safe to CSE.
-    CallDescriptorEntry {
-        targets: BOOL_FROM_TARGETS,
-        extraeffect: ExtraEffect::ElidableCannotRaise,
         oopspecindex: OopSpecIndex::None,
     },
 ];

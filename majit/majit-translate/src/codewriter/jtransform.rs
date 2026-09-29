@@ -171,6 +171,13 @@ pub struct GraphTransformConfig {
     /// `rstr.py ll_int2dec` via `rint.py rtype_str`.
     #[serde(default = "default_int_str_helper")]
     pub int_str_helper: String,
+    /// The host's own `s1 == s2` helper, called for an `eq` / `ne` over two
+    /// Ref operands one of which is an rstr `STR`.
+    ///
+    /// Same contract as [`Self::str_concat_helper`]; upstream's counterpart
+    /// is `rstr.py ll_streq` via `AbstractStringRepr.rtype_eq`.
+    #[serde(default = "default_str_eq_helper")]
+    pub str_eq_helper: String,
 }
 
 /// The [`GraphTransformConfig::jitdriver_receiver_roots`] default: pyre's own
@@ -195,6 +202,12 @@ fn default_int_str_helper() -> String {
     "jit_int_str".to_string()
 }
 
+/// The [`GraphTransformConfig::str_eq_helper`] default, on the same terms:
+/// the `ll_streq` port over `rstr.STR` payloads.
+fn default_str_eq_helper() -> String {
+    "jit_ll_streq".to_string()
+}
+
 impl Default for GraphTransformConfig {
     fn default() -> Self {
         Self {
@@ -207,6 +220,7 @@ impl Default for GraphTransformConfig {
             jitdriver_receiver_roots: default_jitdriver_receiver_roots(),
             str_concat_helper: default_str_concat_helper(),
             int_str_helper: default_int_str_helper(),
+            str_eq_helper: default_str_eq_helper(),
         }
     }
 }
@@ -2791,6 +2805,14 @@ impl<'a> Transformer<'a> {
             {
                 Some(self.config.str_concat_helper.as_str())
             }
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if self.is_string_equality(binop_name, lhs, rhs) => {
+                Some(self.config.str_eq_helper.as_str())
+            }
             _ => None,
         };
         if configured_helper.is_some_and(str::is_empty) {
@@ -3356,7 +3378,7 @@ impl<'a> Transformer<'a> {
                 lhs,
                 rhs,
                 result_ty,
-            } if matches!(binop_name.as_str(), "eq" | "ne")
+            } if matches!(binop_name.as_str(), "eq" | "ne" | "is_")
                 && self.get_value_kind_var(lhs) == 'r'
                 && self.get_value_kind_var(rhs) == 'r'
                 && (is_falsy_source_constant(graph, lhs)
@@ -3367,10 +3389,10 @@ impl<'a> Transformer<'a> {
                 } else {
                     lhs
                 };
-                let unop = if binop_name == "eq" {
-                    "ptr_iszero"
-                } else {
+                let unop = if binop_name == "ne" {
                     "ptr_nonzero"
+                } else {
+                    "ptr_iszero"
                 };
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -3380,6 +3402,66 @@ impl<'a> Transformer<'a> {
                         result_ty: result_ty.clone(),
                     },
                 }])
+            }
+            // `pairtype(AbstractStringRepr, AbstractStringRepr).rtype_eq`
+            // (`rstr.py`): `hop.gendirectcall(ll_streq, v_str1, v_str2)`;
+            // `rtype_ne` is the same call followed by `bool_not`.  The
+            // front-end keeps value `==` on strings as `eq` / `ne` and spells
+            // pointer identity `is_`, so an `eq` / `ne` over two Ref operands
+            // one of which is an rstr `STR` is the string comparison, not
+            // `ptr_eq`.  It lowers to the registered `jit_ll_streq` host extern
+            // (`pyre_object::lowlevel_string`, address in `jit_fnaddr.rs`),
+            // whose operands are `STR` payloads like a `ConstStr`.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if self.is_string_equality(binop_name, lhs, rhs) => {
+                let target = CallTarget::function_path([self.config.str_eq_helper.as_str()]);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+                let streq = if binop_name == "eq" {
+                    op.result.clone()
+                } else {
+                    Some(self.fresh_synthetic_variable_typed(
+                        graph,
+                        crate::codewriter::type_state::ConcreteType::Signed,
+                    ))
+                };
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::Signed,
+                );
+                let mut ops = vec![funcptr_op];
+                ops.push(SpaceOperation {
+                    result: streq.clone(),
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Ref, majit_ir::value::Type::Ref],
+                            majit_ir::value::Type::Int,
+                            EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
+                        ),
+                        args_i: vec![],
+                        args_r: vec![lhs.clone(), rhs.clone()],
+                        args_f: vec![],
+                        result_kind: 'i',
+                        indirect_targets: None,
+                    },
+                });
+                if binop_name == "ne" {
+                    let streq = streq.expect("ne allocates its ll_streq result");
+                    ops.push(SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::UnaryOp {
+                            op: "int_is_zero".into(),
+                            operand: streq,
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                }
+                RewriteResult::Replace(ops)
             }
             // RPython `jtransform.py` `rewrite_op_ptr_eq`/`rewrite_op_ptr_ne`
             // + `_is_rclass_instance` → `instance_ptr_eq`/`instance_ptr_ne`.
@@ -3397,13 +3479,14 @@ impl<'a> Transformer<'a> {
                 lhs,
                 rhs,
                 result_ty,
-            } if (binop_name == "eq" || binop_name == "ne")
+            } if matches!(binop_name.as_str(), "eq" | "ne" | "is_")
                 && self.get_value_kind_var(lhs) == 'r'
                 && self.get_value_kind_var(rhs) == 'r' =>
             {
                 // jtransform.py `rewrite_op_ptr_eq`: `_rewrite_equality`
                 // (NULL → `ptr_iszero`) then the rclass-instance promotion.
-                if let Some(rewritten) = null_test_rewrite(graph, &op, binop_name == "eq", lhs, rhs)
+                // `is_` is `rptr.py` `rtype_is_` → `ptr_eq`.
+                if let Some(rewritten) = null_test_rewrite(graph, &op, binop_name != "ne", lhs, rhs)
                 {
                     return rewritten;
                 }
@@ -3416,7 +3499,11 @@ impl<'a> Transformer<'a> {
                     op.result.clone(),
                     crate::codewriter::type_state::ConcreteType::Signed,
                 );
-                let new_op = self.ptr_equality_opname(binop_name, lhs, rhs);
+                let new_op = self.ptr_equality_opname(
+                    if binop_name == "ne" { "ne" } else { "eq" },
+                    lhs,
+                    rhs,
+                );
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
                     kind: OpKind::BinOp {
@@ -4357,6 +4444,22 @@ impl<'a> Transformer<'a> {
             return false;
         };
         crate::translator::rtyper::lltypesystem::lltype::_castdepth(outside, object) >= 0
+    }
+
+    /// Whether `eq` / `ne` over `lhs` / `rhs` is the string comparison
+    /// `AbstractStringRepr.rtype_eq` / `rtype_ne` lowers to `ll_streq`:
+    /// both operands are Ref and one of them is an rstr `STR`.
+    fn is_string_equality(
+        &self,
+        binop_name: &str,
+        lhs: &crate::flowspace::model::Variable,
+        rhs: &crate::flowspace::model::Variable,
+    ) -> bool {
+        matches!(binop_name, "eq" | "ne")
+            && self.get_value_kind_var(lhs) == 'r'
+            && self.get_value_kind_var(rhs) == 'r'
+            && (matches!(stroruni_first_arg_kind(lhs), StrOrUniKind::Str)
+                || matches!(stroruni_first_arg_kind(rhs), StrOrUniKind::Str))
     }
 
     /// `rewrite_op_ptr_eq` / `rewrite_op_ptr_ne` opname after the
@@ -6577,11 +6680,12 @@ impl<'a> Transformer<'a> {
         // `core::ptr::eq(a, b)` — raw-pointer identity comparison.  Like
         // `is_null` above, `front::mir` leaves it as a `FunctionPath` residual
         // because the charon front-end skips the rtyper lowering that turns a
-        // pointer `eq` into `ptr_eq` (`jtransform.py rewrite_op_ptr_eq` routes `eq`
-        // over two Ref operands to `ptr_eq`).  Finish that lowering here: emit
-        // a `BinOp("eq")` over the two pointer operands — the assembler maps
-        // the `rr` operand shape to `ptr_eq` — instead of residualising the
-        // call to a symbolic helper fnaddr the executor cannot run.
+        // pointer identity into `ptr_eq`.  Finish that lowering here: emit
+        // the flowspace identity `BinOp("is_")` over the two pointer operands
+        // (`rptr.py` `rtype_is_` → `ptr_eq`) instead of residualising the
+        // call to a symbolic helper fnaddr the executor cannot run.  It is
+        // `is_`, not `eq`: two rstr `STR` operands compared by `eq` would be
+        // the `ll_streq` value comparison.
         if let CallTarget::FunctionPath { segments, .. } = target
             && segments.len() == 3
             && segments[0] == "core"
@@ -6601,7 +6705,7 @@ impl<'a> Transformer<'a> {
             let lowered = SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::BinOp {
-                    op: "eq".into(),
+                    op: "is_".into(),
                     lhs: args[0].clone(),
                     rhs: args[1].clone(),
                     result_ty: ValueType::Int,
@@ -13899,6 +14003,147 @@ mod tests {
         assert!(
             matches!(&ops[3].kind, OpKind::BinOp { op: name, .. } if name == "add"),
             "the original op stays residual after the abort: {ops:?}",
+        );
+    }
+
+    fn str_compare_graph(opname: &str) -> FunctionGraph {
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        let mut graph = FunctionGraph::new(format!("str_compare_{opname}"));
+        let input = |name: &str, graph: &mut FunctionGraph| {
+            graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: name.into(),
+                        ty: ValueType::Str,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap()
+        };
+        let lhs = input("lhs", &mut graph);
+        let rhs = input("rhs", &mut graph);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: opname.into(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        lhs.set_concretetype(Some(STRPTR.clone()));
+        rhs.set_concretetype(Some(STRPTR.clone()));
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::Signed);
+        graph
+    }
+
+    fn streq_fnaddr() -> i64 {
+        crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_ll_streq"]))
+    }
+
+    /// `AbstractStringRepr.rtype_eq`: `==` on two rstr `STR` values is the
+    /// `ll_streq` call.  Lowered to `ptr_eq` it answered False for two equal
+    /// strings at different addresses.
+    #[test]
+    fn string_eq_calls_the_streq_helper_instead_of_ptr_eq() {
+        let graph = str_compare_graph("eq");
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstInt(f) if *f == streq_fnaddr())),
+            "the fnptr is the ll_streq helper: {ops:?}",
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::CallResidual { args_r, result_kind: 'i', .. } if args_r.len() == 2
+            )),
+            "string == is a residual ll_streq call: {ops:?}",
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { .. })),
+            "no pointer comparison survives: {ops:?}",
+        );
+    }
+
+    /// `AbstractStringRepr.rtype_ne`: `ll_streq` followed by `bool_not`.
+    #[test]
+    fn string_ne_is_the_negated_streq_call() {
+        let graph = str_compare_graph("ne");
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let call = ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::CallResidual { .. }))
+            .unwrap_or_else(|| panic!("string != calls ll_streq: {ops:?}"));
+        let streq = call.result.clone().expect("ll_streq has a result");
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op: name, operand, .. } if name == "int_is_zero" && *operand == streq
+            )),
+            "the ll_streq result is negated: {ops:?}",
+        );
+    }
+
+    /// `rptr.py` `rtype_is_`: pointer identity over two `STR` values stays
+    /// `ptr_eq`; only value `eq` is `ll_streq`.
+    #[test]
+    fn string_identity_stays_ptr_eq() {
+        let graph = str_compare_graph("is_");
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op: name, .. } if name == "ptr_eq")),
+            "is_ over two STR values is ptr_eq: {ops:?}",
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "identity never calls ll_streq: {ops:?}",
+        );
+    }
+
+    /// `core::ptr::eq` is address identity, `rptr.py` `rtype_is_`: over two
+    /// `STR` values it is `ptr_eq`, not the `ll_streq` call value `eq` takes.
+    #[test]
+    fn core_ptr_eq_over_strings_is_ptr_eq() {
+        let mut graph = str_compare_graph("eq");
+        let block = graph.startblock;
+        let compare = graph
+            .block_mut(block)
+            .operations
+            .iter_mut()
+            .find(|op| matches!(op.kind, OpKind::BinOp { .. }))
+            .expect("the compare op");
+        let OpKind::BinOp { lhs, rhs, .. } = compare.kind.clone() else {
+            unreachable!()
+        };
+        compare.kind = OpKind::Call {
+            target: CallTarget::function_path(["core", "ptr", "eq"]),
+            args: crate::model::call_args(vec![lhs, rhs]),
+            result_ty: ValueType::Int,
+        };
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let ops = &transformed.graph.block(block).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op: name, .. } if name == "ptr_eq")),
+            "core::ptr::eq over two STR values is ptr_eq: {ops:?}",
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "identity never calls ll_streq: {ops:?}",
         );
     }
 

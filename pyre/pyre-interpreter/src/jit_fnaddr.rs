@@ -3653,16 +3653,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::ll_issubclass",
         ll_issubclass,
     );
-    // `elidable_cannot_raise` bool singleton lookup; the trampoline widens the
-    // returned pointer to one word.
-    let w_bool_from: extern "C" fn(i64) -> i64 =
-        pyre_object::boolobject::__majit_call_target_w_bool_from;
-    cpa1(
-        &mut entries,
-        "pyre_object::boolobject::w_bool_from",
-        "pyre_object::w_bool_from",
-        w_bool_from,
-    );
     cpa1(
         &mut entries,
         "pyre_object::gc_hook::try_gc_write_barrier",

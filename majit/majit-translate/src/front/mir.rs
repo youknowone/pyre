@@ -5987,6 +5987,11 @@ struct Lowering<'a> {
     /// Restored per block from [`Lowering::block_entry_string_byte_view_locals`],
     /// same shape as [`Lowering::positional_aggregate_locals`].
     string_byte_view_locals: Vec<usize>,
+    /// MIR locals bound by [`Lowering::is_prebuilt_once_lock_get_or_init`].
+    /// Each holds the `&usize` a `OnceLock<usize>` singleton hands back, and
+    /// its word is the registered GC object, so a later `*local as *mut T`
+    /// is that reference unchanged rather than a `cast_int_to_ptr`.
+    prebuilt_once_value_locals: Vec<usize>,
     /// MIR locals holding the `ll_items(l)` view returned by the string-list
     /// slice adapters, each paired with the list's LOGICAL length.  Rust
     /// spells the element as a concrete raw pointer, but both byte and
@@ -6479,6 +6484,7 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
             string_byte_view_locals: Vec::new(),
+            prebuilt_once_value_locals: Vec::new(),
             string_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
             option_ok_or_else_try_sites: Vec::new(),
@@ -7474,6 +7480,17 @@ impl<'a> Lowering<'a> {
                     self.string_byte_view_locals
                         .retain(|&local| local != dest_local);
                 }
+                // `_j = copy (*_i)` reads the singleton word out of the
+                // `get_or_init` borrow; `_j` carries the same object.
+                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                    && !self.multi_assigned_locals.contains(&dest_local)
+                    && self
+                        .prebuilt_once_value_locals
+                        .iter()
+                        .any(|&local| place_references_local(src, local))
+                {
+                    self.prebuilt_once_value_locals.push(dest_local);
+                }
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
@@ -8295,6 +8312,16 @@ impl<'a> Lowering<'a> {
                 // rtype_cast_ptr_to_int`); `rptr.py` has only eq/ne.
                 let lhs_kind = self.operand_value_kind(&lhs);
                 let rhs_kind = self.operand_value_kind(&rhs);
+                // Rust `==` / `!=` on raw pointers compares addresses: the
+                // flowspace `is_` (`rptr.py` `rtype_is_` → `ptr_eq`), not the
+                // value `eq` a string operand would dispatch to `ll_streq`.
+                let raw_ref_pointer = |op: &Operand, kind: &Option<ValueType>| {
+                    matches!(op, Operand::Copy(place) | Operand::Move(place)
+                        if tyref_is_raw_pointer(&place.ty, self.llbc))
+                        && kind.as_ref().is_some_and(|k| value_type_bank(k) == 1)
+                };
+                let pointer_identity =
+                    raw_ref_pointer(&lhs, &lhs_kind) && raw_ref_pointer(&rhs, &rhs_kind);
                 let lhs_v = self.resolve_operand(mir_bb, lhs)?;
                 let rhs_v = self.resolve_operand(mir_bb, rhs)?;
                 let mut op_label = binop_label(&op_json)?;
@@ -8374,6 +8401,43 @@ impl<'a> Lowering<'a> {
                 } else {
                     (lhs_v, rhs_v)
                 };
+                if pointer_identity && matches!(op_label.as_str(), "eq" | "ne") {
+                    // `a is not b` has no operation of its own; it is
+                    // `is_(a, b) == False`, the shape `Option::is_some`
+                    // lowers to.
+                    if op_label == "ne" {
+                        let bb_id = self.block_id[mir_bb];
+                        let is_res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        let false_var = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(is_res.clone()),
+                            kind: OpKind::BinOp {
+                                op: "is_".to_string(),
+                                lhs: lhs_v,
+                                rhs: rhs_v,
+                                result_ty: ValueType::Int,
+                            },
+                        });
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(false_var.clone()),
+                            kind: OpKind::ConstBool(false),
+                        });
+                        return Ok((
+                            Some(OpKind::BinOp {
+                                op: "eq".to_string(),
+                                lhs: is_res,
+                                rhs: false_var,
+                                result_ty: ValueType::Int,
+                            }),
+                            res,
+                        ));
+                    }
+                    op_label = "is_".to_string();
+                }
                 Ok((
                     Some(OpKind::BinOp {
                         op: op_label,
@@ -8451,6 +8515,13 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.operand_class_root(&operand)
                     };
+                    let src_is_prebuilt_once_value = match &operand {
+                        Operand::Copy(p) | Operand::Move(p) => self
+                            .prebuilt_once_value_locals
+                            .iter()
+                            .any(|&local| place_references_local(p, local)),
+                        Operand::Const(_) => false,
+                    };
                     let dst_kind =
                         tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
                     // The Rust-only current-address adapter is erased as a
@@ -8460,6 +8531,13 @@ impl<'a> Lowering<'a> {
                     // retaining either bank crossing would manufacture an
                     // address integer absent from the upstream graph.
                     if self.is_gc_current_object_address_adapter_graph() {
+                        return Ok((None, arg));
+                    }
+                    // A prebuilt singleton kept in a `OnceLock<usize>` reads
+                    // back as the registered object itself
+                    // ([`Lowering::prebuilt_once_value_locals`]); the word it
+                    // is stored as is already that GC reference.
+                    if src_is_prebuilt_once_value && matches!(dst_kind, ValueType::Ref(_)) {
                         return Ok((None, arg));
                     }
                     // Signedness-flipping int cast (`w_tuple_len(obj) as i64`)
@@ -8670,7 +8748,11 @@ impl<'a> Lowering<'a> {
             // itself. Aliasing the dest local to the referent Variable
             // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, .. } => {
-                let projection = Self::place_ref_is_address_of(&place);
+                // A `StringBuilder` is a GC reference (`STRINGBUILDERPTR`):
+                // `&mut self._s` is the `getfield` of that reference, not the
+                // address of an inline substructure.
+                let projection = Self::place_ref_is_address_of(&place)
+                    && !tyref_is_string_builder(&place.ty, self.llbc);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
@@ -12676,32 +12758,19 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `w_str_get_wtf8(obj)` is `_utf8`.  The receiver is a
-                // `PyObjectRef`, so aliasing dest to args[0] would paint
-                // dest `SomeInstance(pyobject::PyObject)` and every later
-                // string op would union `String ∪ Instance` or dispatch
-                // `InstanceRepr` (no `rtype_len` / `rtype_eq`).  Project
-                // dest as `ValueType::Str` through the existing
-                // `__cast_instance_intrinsic` string-root seam
-                // (`project_struct_field_type("Wtf8")` → `SomeString`;
-                // `cast_instance_call_result` result_ty `Str`).  The
-                // marker is jitcode-identity (`cast_pointer` /
-                // `cast_opaque_ptr` → `same_as`; Skip folds it to the
-                // operand), so the machine value stays the receiver.
-                // Mark dest a byte view so `as_bytes()[i]` / `len` still
-                // plant `strgetitem` / `strlen`.
+                // `w_str_get_wtf8(obj)` is `w_obj._utf8`: a getfield of the
+                // rstr `STR` payload off the `W_UnicodeObject`
+                // (`unicodeobject.py` `_immutable_fields_ = ['_utf8', ...]`).
+                // The receiver is a `PyObjectRef`, so narrow it to
+                // `W_UnicodeObject` before reading `value`; the read is
+                // typed `ValueType::Str`, so dest is the same `SomeString`
+                // payload a `ConstStr` materializes, and `strlen` /
+                // `strgetitem` / string equality all read one
+                // representation.  Mark dest a byte view so
+                // `as_bytes()[i]` / `len` still plant `strgetitem` /
+                // `strlen`.
                 if args.len() == 1 && self.is_w_str_get_wtf8_identity(&reg) {
-                    let dest = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(dest.clone()),
-                        kind: crate::model::cast_instance_call_result(
-                            "Wtf8",
-                            args[0].clone(),
-                            ValueType::Str,
-                        ),
-                    });
+                    let dest = self.emit_w_str_utf8_read(bb_id, args[0].clone());
                     self.local_var[dest_local] = Some(dest);
                     if !self.string_byte_view_locals.contains(&dest_local) {
                         self.string_byte_view_locals.push(dest_local);
@@ -13765,6 +13834,51 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `rstring.py` `StringBuilder(size)`, `.append(s)` and
+                // `.build()` are `SomeStringBuilder` operations
+                // (`rtyper/rbuilder.py` `AbstractStringBuilderRepr`), wherever
+                // the builder lives: a local or an instance attribute such as
+                // `rutf8.py` `Utf8StringBuilder._s`.
+                if let Some(method) = string_builder_method_leaf(self.llbc, &reg) {
+                    let (marker, result_ty, concrete) = match method {
+                        "new" => (
+                            crate::runtime_names::shims::STRINGBUILDER_NEW,
+                            ValueType::Ref(None),
+                            crate::model::ConcreteType::Unknown,
+                        ),
+                        "append" => (
+                            crate::runtime_names::shims::STRINGBUILDER_APPEND,
+                            ValueType::Void,
+                            crate::model::ConcreteType::Void,
+                        ),
+                        _ => (
+                            crate::runtime_names::shims::STRINGBUILDER_BUILD,
+                            ValueType::Ref(None),
+                            crate::model::ConcreteType::Unknown,
+                        ),
+                    };
+                    let res = self.graph.alloc_value_var_with_type(concrete);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![marker.to_string()],
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(args.clone()),
+                            result_ty,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(if method == "append" {
+                        self.emit_unit(bb_id)
+                    } else {
+                        res
+                    });
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Builder-mode ctor. In the canonical builder-form lowering, the
                 // single `Wtf8Buf`/`String` `new`/`with_capacity`/`from_string`
                 // def of a
@@ -13985,6 +14099,31 @@ impl<'a> Lowering<'a> {
                 // unicode `hash`, `rstr.py:1238`), so alias the view to the
                 // field pointer exactly like the raw-pointer casts above.
                 if args.len() == 1 && self.is_atomic_from_ptr_identity(&reg) {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `ONCE.get_or_init(f)` on a lazily-built prebuilt whose refs
+                // row carries the built object is `Bookkeeper.immutablevalue`
+                // of that object: the host initialized it before the row was
+                // captured, so the call is the constant and `f` never runs.
+                if args.len() == 2
+                    && !self.multi_assigned_locals.contains(&dest_local)
+                    && self.is_prebuilt_once_lock_get_or_init(&reg, &args[0])
+                {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    self.prebuilt_once_value_locals.push(dest_local);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `Atomic*::new(v)` builds the layout-transparent wrapper over
+                // its inner scalar; the translated field is that scalar, so
+                // the constructor is the value itself.
+                if args.len() == 1 && self.is_atomic_new_identity(&reg) {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -17961,6 +18100,36 @@ impl<'a> Lowering<'a> {
     /// MIR projections.  Keep the collision-free layout identity alongside
     /// the bare `Constants` annotation owner, exactly as
     /// [`Self::resolve_adt_field`] does for a source-level `.0` read.
+    /// `w_obj._utf8` — narrow the `PyObjectRef` receiver to
+    /// `W_UnicodeObject` and read its `value` field, the rstr `STR`
+    /// payload.
+    fn emit_w_str_utf8_read(&mut self, bb_id: BlockId, base: Variable) -> Variable {
+        let narrowed = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(narrowed.clone()),
+            kind: crate::model::cast_instance_call("W_UnicodeObject", base),
+        });
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::FieldRead {
+                base: narrowed,
+                field: FieldDescriptor::new("value", Some("W_UnicodeObject".to_string()))
+                    .with_owner_id(Some(majit_ir::descr::StructId::from_canonical(
+                        "unicodeobject::W_UnicodeObject",
+                    )))
+                    .with_base_is_deref(true),
+                ty: ValueType::Str,
+                pure: false,
+            },
+        });
+        result
+    }
+
     fn emit_constants_items_read(&mut self, bb_id: BlockId, base: Variable) -> Variable {
         // `CodeObject<C>` is generic, so its `constants: Constants<C>` field
         // arrives at a dependent trait-default graph as classdef-less `Ref`.
@@ -19375,6 +19544,45 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// `std::sync::OnceLock::get_or_init` whose receiver is a
+    /// [`OpKind::ConstRefAddr`] taken from a `refs` row. Those rows register
+    /// the initialized object, not the `OnceLock` container, so the only
+    /// receivers that qualify are statics the host already initialized.
+    fn is_prebuilt_once_lock_get_or_init(&self, reg: &RegularCall, recv: &Variable) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let is_get_or_init = self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            let name = fd.item_meta.name_path();
+            name.contains("::once_lock::") && name.rsplit("::").next() == Some("get_or_init")
+        });
+        is_get_or_init
+            && self
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    op.result.as_ref() == Some(recv)
+                        && matches!(op.kind, OpKind::ConstRefAddr(addr)
+                            if self.static_addrs.refs.iter().any(|(_, a)| *a == addr))
+                })
+    }
+
+    /// `core::sync::atomic::Atomic*::new(v)` — the wrapper constructor over
+    /// the inner scalar the field translates as.  Keyed on the exact core
+    /// associated function and an atomic output wrapper, like
+    /// [`Self::is_atomic_from_ptr_identity`].
+    fn is_atomic_new_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path() == "core::sync::atomic::<Impl>::new"
+                && tyref_atomic_inner_value_type(&fd.signature.output, self.llbc).is_some()
+        })
+    }
+
     /// `<*mut T>::add` / `<*const T>::add` inside an `ItemsBlock` or
     /// `TypedItemsBlock` items-base accessor (`items_block_items_base` /
     /// `items_block_items_ptr` / `typed_items_block_items_base`), whose
@@ -19787,9 +19995,9 @@ impl<'a> Lowering<'a> {
         tyref_strips_to_str(dest_ty, self.llbc)
     }
 
-    /// `w_str_get_wtf8(obj)` — `_utf8`.  Dest is the receiver's
-    /// machine value projected as `ValueType::Str` (`Wtf8` string-root
-    /// `__cast_instance_intrinsic`), not a residual call and not an
+    /// `w_str_get_wtf8(obj)` — `_utf8`.  Dest is the `value` getfield
+    /// of the receiver narrowed to `W_UnicodeObject`
+    /// ([`Self::emit_w_str_utf8_read`]), not a residual call and not an
     /// alias that keeps the `PyObject` instance type.
     fn is_w_str_get_wtf8_identity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
@@ -26409,6 +26617,22 @@ fn str_builder_ctor_leaf(llbc: &Llbc, reg: &RegularCall) -> Option<&'static str>
     owner_accepted(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some(leaf)
 }
 
+/// The `rstring.py` `StringBuilder` method a call resolves to — `new`,
+/// `append` or `build` on [`STRING_BUILDER_PATH`] — or `None`.
+fn string_builder_method_leaf(llbc: &Llbc, reg: &RegularCall) -> Option<&'static str> {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let fd = llbc.fn_by_id(*id)?;
+    let leaf = match fd.item_meta.name_path().rsplit("::").next()? {
+        "new" => "new",
+        "append" => "append",
+        "build" => "build",
+        _ => return None,
+    };
+    (impl_owner_path(llbc, fd)? == STRING_BUILDER_PATH).then_some(leaf)
+}
+
 /// If `reg` is a functional-concat string append, its `(accumulator, piece)`
 /// argument positions.  `push` / `push_str` / `push_wtf8` (on `String` /
 /// `Wtf8Buf`) take the accumulator as `&mut self` (arg 0) and the appended
@@ -30864,6 +31088,12 @@ fn fundecl_fn_item_segments(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
 /// Returns `None` when the owner cannot be resolved, in which case the
 /// caller keeps the ordinary thin-pointer treatment.
 fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+    let path = impl_owner_path(llbc, fd)?;
+    Some(path.rsplit("::").next().unwrap_or(&path).to_string())
+}
+
+/// The full `name_path` of the ADT whose inherent or trait impl owns `fd`.
+fn impl_owner_path(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     let segs = &fd.item_meta.name;
     let last_idx = segs
         .iter()
@@ -30876,9 +31106,7 @@ fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
         _ => return None,
     };
     let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
-    let td = llbc.type_by_id(adt_def_id)?;
-    let path = td.item_meta.name_path();
-    Some(path.rsplit("::").next().unwrap_or(&path).to_string())
+    Some(llbc.type_by_id(adt_def_id)?.item_meta.name_path())
 }
 
 /// Collect, from the lowered MIR,
@@ -31079,8 +31307,10 @@ fn collect_fn_stubs_from_llbc_if(
         // residual-call ABI has only a one-word return and no `sret` path,
         // so a multiword return cannot be published at all. Admit `ref` only
         // for returns that genuinely are one word.
-        if token.as_deref() == Some("ref")
-            && !ref_return_is_single_word(&tyref_to_ast_string(&fd.signature.output, llbc))
+        if matches!(
+            token.as_deref(),
+            Some("ref" | crate::translator::rtyper::cutover::STR_RETURN_TYPE)
+        ) && !ref_return_is_single_word(&tyref_to_ast_string(&fd.signature.output, llbc))
         {
             continue;
         }
@@ -32483,6 +32713,11 @@ fn tyref_to_value_type_with(
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
         return inner;
     }
+    // `rstring.py` `StringBuilder` is `SomeStringBuilder`, not the word its
+    // one-field Rust struct wraps; checked before the transparent peel.
+    if tyref_is_string_builder(ty, llbc) {
+        return ValueType::StringBuilder;
+    }
     // A transparent one-field struct has the same low-level value shape as
     // its field. Charon records the representation in `TypeDecl.layout`, so
     // preserve the field's register bank instead of treating the wrapper as
@@ -33176,7 +33411,10 @@ fn dont_look_inside_return_token(
         ValueType::Ref(_) if output_type_is_objectptr(output, llbc) => {
             return Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
         }
-        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => "ref",
+        // An rstr `STR` result is the `SomeString` its body produces, not
+        // the classdef-less instance behind `ref`.
+        ValueType::Str => crate::translator::rtyper::cutover::STR_RETURN_TYPE,
+        ValueType::Ref(_) | ValueType::StringBuilder => "ref",
         ValueType::Void | ValueType::State | ValueType::Unknown => return None,
     };
     Some(token.to_string())
@@ -33297,6 +33535,11 @@ fn tyref_to_attr_value_type_with(
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
         return inner;
     }
+    // `rutf8.py` `Utf8StringBuilder._s` is a `StringBuilder` instance
+    // attribute: seed it `SomeStringBuilder`, matching the value site.
+    if tyref_is_string_builder(ty, llbc) {
+        return ValueType::StringBuilder;
+    }
     if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc, tombstoned) {
         return inner;
     }
@@ -33413,6 +33656,21 @@ fn tyref_is_string_adt(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
 }
+
+/// Whether a `TyRef` resolves (behind the usual wrappers) to `rstring.py`'s
+/// `StringBuilder`, spelled `pyre_object::rstring::StringBuilder`: a
+/// `SomeStringBuilder` value (`STRINGBUILDERPTR`), whatever word the Rust
+/// struct holds. A borrow of it is the same builder.
+fn tyref_is_string_builder(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| td.item_meta.name_path() == STRING_BUILDER_PATH)
+}
+
+/// The `name_path` of `rstring.py`'s `StringBuilder` in pyre-object.
+const STRING_BUILDER_PATH: &str = "pyre_object::rstring::StringBuilder";
 
 /// Whether a `TyRef` resolves (behind `Ref`/dedup/hash-cons wrappers) to
 /// the `str` builtin — the unsized string slice (`{"Builtin": "Str"}`).
@@ -57021,6 +57279,243 @@ mod tests {
         );
     }
 
+    /// Every variable carrying the result of a `FunctionPath` call whose
+    /// last segment is `name`, followed through identity casts and through
+    /// the links into later blocks.
+    fn call_results_named(graph: &FunctionGraph, name: &str) -> std::collections::HashSet<u64> {
+        let mut ids: std::collections::HashSet<u64> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some(name) => {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect();
+        loop {
+            let mut grew = false;
+            for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+                if let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } = &op.kind
+                    && segments.last().map(String::as_str) == Some("__cast_instance_intrinsic")
+                    && let Some(LinkArg::Value(v)) = args.first()
+                    && ids.contains(&v.id())
+                    && let Some(result) = &op.result
+                {
+                    grew |= ids.insert(result.id());
+                }
+            }
+            for link in graph.blocks.iter().flat_map(|b| b.exits.iter()) {
+                let target = graph.block(link.target);
+                for (arg, input) in link.args.iter().zip(&target.inputargs) {
+                    if let LinkArg::Value(v) = arg
+                        && ids.contains(&v.id())
+                    {
+                        grew |= ids.insert(input.id());
+                    }
+                }
+            }
+            if !grew {
+                return ids;
+            }
+        }
+    }
+
+    /// Rust `==` on two raw pointers compares addresses: the flowspace `is_`
+    /// (`rptr.py` `rtype_is_` → `ptr_eq`), not the value `eq` that an rstr
+    /// operand dispatches to `ll_streq`. `is_w`'s bytes arm compares two
+    /// `w_bytes_block` pointers that way. Ignored by default (loads the real
+    /// LLBC).
+    #[test]
+    #[ignore]
+    fn raw_pointer_eq_lowers_to_is() {
+        let path = format!(
+            "{}/../../build/llbc/pyre-object.ullbc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph =
+            super::lower_function(&llbc, "pyre_object::pyobject::is_w").expect("lower is_w");
+        let blocks = call_results_named(&graph, "w_bytes_block");
+        let compares: Vec<&str> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::BinOp { op, lhs, rhs, .. }
+                    if blocks.contains(&lhs.id()) && blocks.contains(&rhs.id()) =>
+                {
+                    Some(op.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(compares, ["is_"], "w_bytes_block(a) == w_bytes_block(b)");
+    }
+
+    /// Rust `!=` on two raw pointers is `is_(a, b) == False`: flowspace has
+    /// no `is not` operation. `w_exception_base_defaults` tests
+    /// `w_class != PY_NULL`. Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn raw_pointer_ne_lowers_to_negated_is() {
+        let path = format!(
+            "{}/../../build/llbc/pyre-object.ullbc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_object::interp_exceptions::w_exception_base_defaults",
+        )
+        .expect("lower w_exception_base_defaults");
+        let classes = call_results_named(&graph, "lookup_exc_class_for_kind");
+        let ops: Vec<&SpaceOperation> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .collect();
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, lhs, .. }
+                if op == "ne" && classes.contains(&lhs.id()))),
+            "w_class != PY_NULL must not stay a value `ne`"
+        );
+        let is_results: std::collections::HashSet<u64> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::BinOp { op: name, lhs, .. }
+                    if name == "is_" && classes.contains(&lhs.id()) =>
+                {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(is_results.len(), 1, "w_class != PY_NULL starts with is_");
+        let false_consts: std::collections::HashSet<u64> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::ConstBool(false) => op.result.as_ref().map(|v| v.id()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, lhs, rhs, .. }
+                if op == "eq" && is_results.contains(&lhs.id())
+                    && false_consts.contains(&rhs.id()))),
+            "w_class != PY_NULL is eq(is_(w_class, NULL), False)"
+        );
+    }
+
+    /// `jit_ll_int2dec` (`ll_str.py` `ll_int2dec`, elidable) returns an rstr
+    /// `STR`.  Its residual FUNC.RESULT token is `str`, so the stub callers
+    /// annotate against is `SomeString` — the value `StringBuilder.build()`
+    /// passes to the same `space.newutf8` — not the classdef-less instance of
+    /// `ref`.  Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn string_residual_result_token_is_str() {
+        use crate::translator::rtyper::cutover::{STR_RETURN_TYPE, residual_return_shell};
+        let path = format!(
+            "{}/../../build/llbc/pyre-object.ullbc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let program = super::build_semantic_program_from_llbc(&llbc)
+            .expect("build semantic pyre-object program");
+        let int2dec = program
+            .functions
+            .iter()
+            .find(|f| f.name == "jit_ll_int2dec")
+            .expect("jit_ll_int2dec is lowered");
+        assert_eq!(int2dec.return_type.as_deref(), Some(STR_RETURN_TYPE));
+        assert!(
+            matches!(
+                residual_return_shell(int2dec.return_type.as_deref()),
+                Some(crate::annotator::model::SomeValue::String(_))
+            ),
+            "the `str` residual result is SomeString"
+        );
+    }
+
+    /// `rutf8.py` `Utf8StringBuilder` keeps an `rstring.py` `StringBuilder`
+    /// in `_s`.  `new` / `append_utf8` / `build` are the `SomeStringBuilder`
+    /// operations (`__majit_stringbuilder_*`) on that attribute, and the
+    /// receiver `self._s` is the `getfield` of the builder reference, not the
+    /// address of an inline substructure.  Ignored by default (loads the real
+    /// LLBC).
+    #[test]
+    #[ignore]
+    fn utf8_string_builder_methods_lower_to_string_builder_markers() {
+        use crate::runtime_names::shims::{
+            STRINGBUILDER_APPEND, STRINGBUILDER_BUILD, STRINGBUILDER_NEW,
+        };
+        let path = format!(
+            "{}/../../build/llbc/pyre-object.ullbc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        for (method, marker) in [
+            ("new", STRINGBUILDER_NEW),
+            ("append_utf8", STRINGBUILDER_APPEND),
+            ("build", STRINGBUILDER_BUILD),
+        ] {
+            let name = format!("pyre_object::rutf8::<Impl>::{method}");
+            let graph = super::lower_function(&llbc, &name).expect("lower Utf8StringBuilder");
+            let ops: Vec<&SpaceOperation> = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .collect();
+            let marker_args: Vec<&Vec<LinkArg>> = ops
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } if segments.len() == 1 && segments[0] == marker => Some(args),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(marker_args.len(), 1, "{name} calls {marker} once");
+            let s_reads: Vec<&SpaceOperation> = ops
+                .iter()
+                .copied()
+                .filter(
+                    |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "_s"),
+                )
+                .collect();
+            assert!(
+                s_reads.iter().all(|op| !matches!(&op.kind,
+                    OpKind::FieldRead { field, .. } if field.taken_by_address)),
+                "{name}: `self._s` is not taken by address"
+            );
+            if method != "new" {
+                let receiver = match marker_args[0].first() {
+                    Some(LinkArg::Value(v)) => v.id(),
+                    other => panic!("{name}: {marker} receiver {other:?}"),
+                };
+                assert!(
+                    s_reads
+                        .iter()
+                        .any(|op| op.result.as_ref().map(|v| v.id()) == Some(receiver)),
+                    "{name}: the {marker} receiver is the `self._s` getfield"
+                );
+            }
+        }
+    }
+
     /// `get_w_locals` is `getdebug_data().map_or(PY_NULL, |data| data.w_locals)`
     /// over `Option<&FrameDebugData>` — a SHARED-reference niche Option. Its
     /// `Some` payload must alias the base pointer (no aggregate `__pos_0`
@@ -57970,6 +58465,27 @@ mod tests {
                 matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "hash")
             }),
             "the identity view must retain its underlying unicode hash-field read"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn atomic_new_lowers_to_its_inner_value() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "w_specialised_tuple_ii_new")
+            .expect("lower w_specialised_tuple_ii_new");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("new")
+                        && segments.iter().any(|s| s.starts_with("Atomic")))
+            }),
+            "AtomicI64::new must not survive as a graph-less core call"
         );
     }
 
@@ -59825,6 +60341,47 @@ mod tests {
                 OpKind::Call { result_ty: ValueType::Ref(Some(owner)), .. }
                     if owner.contains("OnceLock")))
         );
+    }
+
+    /// `baseobjspace.py newbool` is a branch on the value and a prebuilt
+    /// constant per arm. Each arm's `get_or_init` on a registered singleton
+    /// is that constant, so no `get_or_init` call survives the lowering.
+    #[test]
+    #[ignore = "requires the extracted pyre-object LLBC"]
+    fn bool_singleton_accessor_lowers_to_prebuilt_constants() {
+        let llbc = Llbc::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        ))
+        .expect("load object LLBC");
+        let (w_true, w_false) = (0x1234_5678, 0x1234_9abc);
+        let refs = [
+            ("boolobject::TRUE_SINGLETON", w_true),
+            ("boolobject::FALSE_SINGLETON", w_false),
+        ];
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "pyre_object::boolobject::w_bool_from",
+            crate::HostStaticAddrs {
+                refs: &refs,
+                ..Default::default()
+            },
+        )
+        .expect("lower w_bool_from");
+        let ops = || graph.blocks.iter().flat_map(|block| &block.operations);
+        for addr in [w_true, w_false] {
+            assert!(
+                ops().any(|op| matches!(&op.kind, OpKind::ConstRefAddr(value) if *value == addr))
+            );
+        }
+        // The `OnceLock<usize>` word is read back as the GC reference it
+        // stores, with no `cast_int_to_ptr` of the prebuilt constant.
+        assert!(!ops().any(|op| matches!(&op.kind,
+        OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+            if matches!(
+                segments.last().map(String::as_str),
+                Some("get_or_init" | "cast_int_to_ptr")
+            ))));
     }
 
     /// `policy.py look_inside_graph` reads `_jit_look_inside_` first and

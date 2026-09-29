@@ -1064,7 +1064,8 @@ pub(crate) fn ll_int_py_div(x: i64, y: i64) -> i64 {
     } else {
         x.wrapping_sub(p)
     };
-    r.wrapping_add(u >> (i64::BITS - 1))
+    // INT_BITS_1 (rarithmetic)
+    r.wrapping_add(u >> 63)
 }
 
 /// rint.py `ll_int_py_mod`, the remainder companion of [`ll_int_py_div`].
@@ -1072,7 +1073,8 @@ pub(crate) fn ll_int_py_div(x: i64, y: i64) -> i64 {
 pub(crate) fn ll_int_py_mod(x: i64, y: i64) -> i64 {
     let r = x.wrapping_rem(y);
     let u = if y < 0 { r.wrapping_neg() } else { r };
-    r.wrapping_add(y & (u >> (i64::BITS - 1)))
+    // INT_BITS_1 (rarithmetic)
+    r.wrapping_add(y & (u >> 63))
 }
 
 // ── Long (BigInt) arithmetic operations ─────────────────────────────
@@ -1325,7 +1327,9 @@ unsafe fn integer_divmod_pair(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let va = int_value(a);
         let vb = int_value(b);
         debug_assert_ne!(vb, 0, "numeric_divmod checks the divisor");
-        if va == i64::MIN && vb == -1 {
+        // rint.py `ll_int_py_div_ovf`: the overflow test is not
+        // short-circuited, so a known divisor removes it entirely.
+        if (va == i64::MIN) & (vb == -1) {
             let (q, r) = BigInt::from(va)
                 .int_divmod(vb)
                 .expect("divisor was checked nonzero");

@@ -52,44 +52,43 @@ pub unsafe fn w_bool_get_value(obj: PyObjectRef) -> bool {
 
 // ── Bool singletons ──────────────────────────────────────────────────
 //
-// pypy/objspace/std/objspace.py:61 installs `space.w_True` /
-// `space.w_False` as singletons; every PyPy `space.newbool(value)`
-// call (pypy/interpreter/baseobjspace.py `newbool`) returns one of
-// the two pre-allocated objects. pyre mirrors the singleton model with
-// two process-global prebuilt objects and routes all callers through
+// `boolobject.py` builds `W_BoolObject.w_False` / `W_BoolObject.w_True` at
+// import time and `StdObjSpace.initialize` (`objspace.py`) installs them as
+// `space.w_False` / `space.w_True`; every `space.newbool(value)`
+// (`baseobjspace.py`) returns one of the two prebuilt objects. pyre keeps
+// the two as process-global prebuilt objects and routes all callers through
 // [`w_bool_from`]. Their host allocations carry the same GC header as an
 // RPython translated prebuilt object.
+//
+// Translation freezes upstream's two objects into the binary. pyre builds
+// each on first use instead, so the slot is a `OnceLock`: concurrent first
+// callers without a GIL must all observe the one object, since `is` on
+// bools is pointer identity. The JIT never sees the lazy path — the
+// registered prebuilt address stands in for the initialized static.
 
 static TRUE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static FALSE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-#[majit_macros::dont_look_inside]
-fn bool_singleton(slot: &'static std::sync::OnceLock<usize>, intval: i64) -> PyObjectRef {
-    *slot.get_or_init(|| {
-        crate::lltype::malloc_typed_immortal(W_BoolObject {
-            ob_header: PyObject {
-                ob_type: &BOOL_TYPE as *const PyType,
-                w_class: std::ptr::null_mut(),
-            },
-            intval,
-        }) as usize
-    }) as PyObjectRef
+fn new_bool_singleton(intval: i64) -> usize {
+    crate::lltype::malloc_typed_immortal(W_BoolObject {
+        ob_header: PyObject {
+            ob_type: &BOOL_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
+        },
+        intval,
+    }) as usize
 }
 
-/// Get a boolean PyObjectRef from a bool value.
-///
-/// Returns a pointer to a pre-allocated static singleton,
-/// avoiding heap allocation on every comparison/branch.
-/// Both singletons are immortal and their addresses never change after the
-/// first materialisation, so the result depends only on `value` and the
-/// call cannot raise.
-#[majit_macros::elidable_cannot_raise]
+/// baseobjspace.py `newbool`: `w_True` if `value` else `w_False`, the two
+/// prebuilt singletons.  Each arm reads its singleton's static, which the
+/// translator resolves to the registered prebuilt address, so a traced call
+/// is the branch on `value` and a constant.
 #[inline]
 pub fn w_bool_from(value: bool) -> *mut PyObject {
     if value {
-        bool_singleton(&TRUE_SINGLETON, 1)
+        *TRUE_SINGLETON.get_or_init(|| new_bool_singleton(1)) as PyObjectRef
     } else {
-        bool_singleton(&FALSE_SINGLETON, 0)
+        *FALSE_SINGLETON.get_or_init(|| new_bool_singleton(0)) as PyObjectRef
     }
 }
 

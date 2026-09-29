@@ -9615,16 +9615,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // (BoxInt exec, generic residual below) requires every box bound.
     ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
-    // `w_bool_from(truth)` inside a descended body: guard the truth and take
-    // the singleton, as `space.newbool` traces.
-    if spec_gate(SpecFold::NewboolCall, || {
-        try_walker_fold_newbool_call(ctx, op.pc, &allboxes, &i_args, dst, dst_bank)
-    })?
-    .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // BoxInt fold (#62): `box_int_fn(raw)` allocates a fresh `PyLong`.  The
     // opaque CanRaise residual the generic leg would record blocks the
     // optimizer (no DCE of an unused/round-tripped box).  Emit the

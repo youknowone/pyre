@@ -82,6 +82,10 @@ pub(crate) const OBJECTPTR_RETURN_TYPE: &str = "*mut PyObject";
 /// `cast_opaque_ptr` back to StringRepr / InstanceRepr.
 pub(crate) const GCREF_RETURN_TYPE: &str = "gcref";
 
+/// Residual FUNC.RESULT token for an rstr `STR` result (`ValueType::Str`):
+/// ref-kind, annotated `SomeString` and lowered `Ptr(STR)`.
+pub(crate) const STR_RETURN_TYPE: &str = "str";
+
 /// Project a post-`specialize` `LowLevelType` back to the legacy
 /// `ConcreteType` bucket the codewriter consumes (Signed / Float /
 /// GcRef / Void).
@@ -2732,6 +2736,12 @@ pub(crate) fn default_someshell_for_lltype(
 /// GcRef`, so the emitted `residual_call_*_r` opcode and C ABI are
 /// byte-identical.
 ///
+/// The `str` token (`STR_RETURN_TYPE`) is an rstr `STR` result — `ll_int2dec`,
+/// a `W_UnicodeObject._utf8` accessor — and carries the `SomeString` shell
+/// (`valuetype_to_someshell(Str)`), the annotation the callee body produces.
+/// Projected through `ref`, it met the `SomeString` of a `StringBuilder.build()`
+/// at the same `space.newutf8` argument as a `String ∪ Instance` UnionError.
+///
 /// The object-pointer marker (`OBJECTPTR_RETURN_TYPE`, stamped by
 /// `merge_hints_from_llbcs` for a `*mut PyObject`-returning opaque callee the
 /// front-end left untokened) keeps the typed `OBJECTPTR` lltype so a caller
@@ -2756,6 +2766,11 @@ pub(crate) fn residual_return_shell(
                 &crate::model::ValueType::Ref(None),
             )
             .expect("Ref(None) shells to a definite SomeInstance"),
+        );
+    }
+    if token == Some(STR_RETURN_TYPE) {
+        return crate::codewriter::annotation_state::valuetype_to_someshell(
+            &crate::model::ValueType::Str,
         );
     }
     return_token_to_lltype(token).and_then(|ll| default_someshell_for_lltype(&ll))
@@ -2792,6 +2807,9 @@ fn return_token_to_lltype(token: Option<&str>) -> Option<LowLevelType> {
         Some("ref") => Some(crate::translator::rtyper::rclass::OBJECTPTR.clone()),
         Some(s) if s == GCREF_RETURN_TYPE => {
             Some(crate::translator::rtyper::lltypesystem::lltype::GCREF.clone())
+        }
+        Some(s) if s == STR_RETURN_TYPE => {
+            Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone())
         }
         Some("bool") => Some(LowLevelType::Bool),
         Some("i64") => Some(LowLevelType::Signed),

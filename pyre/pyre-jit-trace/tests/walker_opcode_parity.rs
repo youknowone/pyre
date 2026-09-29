@@ -369,10 +369,16 @@ fn the_two_tracers_opcode_coverage_matches_its_snapshot() {
 
 /// Keys pyre's walker answers that the encoding does not name.
 ///
-/// An arm here is unreachable from any assembled jitcode. Both entries are
-/// deliberate and say so at their own definition — `abort/>i` shares its arm
+/// `abort/>i` and `int_same_as/i>i` are unreachable from any assembled
+/// jitcode and say so at their own definition — `abort/>i` shares its arm
 /// with `abort/>r`, and `int_same_as/i>i` is documented as dormant because
 /// `jtransform.py rewrite_op_same_as` removes `same_as` before assembly.
+///
+/// `newstr`, `strsetitem` and `copystrcontent` are translator-only keys: the
+/// codewriter numbers them through the `assembler.py setdefault` dynamic
+/// allocator (`insn_byte_opt` answers `None`), as the `StringBuilderRepr`
+/// helper graphs (`rbuilder.py ll_append` / `ll_grow_by` / `ll_build`) emit
+/// them.  No walked body builds through those graphs yet.
 #[test]
 fn the_walker_answers_no_key_the_encoding_cannot_name() {
     let root = repo_root();
@@ -382,9 +388,30 @@ fn the_walker_answers_no_key_the_encoding_cannot_name() {
         .filter(|key| !named.contains(key))
         .collect();
     unnamed.sort();
+    let mut expected: Vec<String> = [
+        "abort/>i",
+        "int_same_as/i>i",
+        "newstr/i>r",
+        "newstr/c>r",
+        "strsetitem/rii",
+        "strsetitem/rci",
+        "strsetitem/ric",
+        "strsetitem/rcc",
+        "copystrcontent/rriii",
+        "copystrcontent/rrcii",
+        "copystrcontent/rrici",
+        "copystrcontent/rriic",
+        "copystrcontent/rrcci",
+        "copystrcontent/rrcic",
+        "copystrcontent/rricc",
+        "copystrcontent/rrccc",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    expected.sort();
     assert_eq!(
-        unnamed,
-        vec!["abort/>i".to_string(), "int_same_as/i>i".to_string()],
+        unnamed, expected,
         "the walker's set of arms with no `insns` entry drifted; a new one is \
          either dead or an entry the table is missing",
     );

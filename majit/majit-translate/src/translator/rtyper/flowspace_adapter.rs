@@ -5734,8 +5734,8 @@ mod tests {
     fn strlen_on_w_str_get_wtf8_identity_alias_receiver_is_instance_not_string() {
         // This fixture is the OLD identity-alias graph: `__strlen` on a
         // PyObject Input.  Real `w_str_get_wtf8` sites no longer produce
-        // it — dest is a Wtf8/`ValueType::Str` cast (see
-        // `strlen_arg_at_real_w_str_get_wtf8_sites_annotates_as_somestring`).
+        // it — dest is the `W_UnicodeObject.value` read (see
+        // `strlen_arg_at_real_w_str_get_wtf8_sites_is_the_utf8_field`).
         // Pin the annotation / repr at this argument: it is still
         // SomeInstance / InstanceRepr, which has no `rtype_len` and whose
         // annotator `len_SomeInstance` is `getattr(__len__)`.
@@ -5904,10 +5904,9 @@ mod tests {
 
     #[test]
     fn w_str_get_wtf8_cast_projects_dest_as_somestring() {
-        // `w_str_get_wtf8(obj)` emits
-        // `cast_instance_call_result("Wtf8", obj, ValueType::Str)`
-        // (`front/mir.rs`), not `alias_dest_to_arg0`.  Dest is a new
-        // Variable whose annotation is SomeString; obj stays
+        // The `Wtf8` string-root cast
+        // `cast_instance_call_result("Wtf8", obj, ValueType::Str)`: dest
+        // is a new Variable whose annotation is SomeString; obj stays
         // SomeInstance(PyObject).  StringRepr.rtype_len → ll_strlen is
         // then the honest length of that dest.
         use crate::annotator::annrpython::RPythonAnnotator;
@@ -5926,7 +5925,7 @@ mod tests {
         assert_eq!(
             crate::model::cast_instance_root(&cast),
             Some("Wtf8"),
-            "the producer root is the Wtf8 return of w_str_get_wtf8"
+            "the producer root is the Wtf8 string root"
         );
         let OpKind::Call { result_ty, .. } = &cast else {
             panic!("cast_instance_call_result must be a Call");
@@ -6426,6 +6425,13 @@ mod tests {
         if let OpKind::Input { ty, class_root, .. } = kind {
             return format!("Input ty={ty:?} class_root={class_root:?}");
         }
+        if let OpKind::FieldRead { field, ty, .. } = kind {
+            return format!(
+                "FieldRead {}.{} ty={ty:?}",
+                field.owner_root.as_deref().unwrap_or("?"),
+                field.name
+            );
+        }
         if let Some(root) = crate::model::cast_instance_root(kind) {
             let result_ty = match kind {
                 OpKind::Call { result_ty, .. } => format!("{result_ty:?}"),
@@ -6508,29 +6514,24 @@ mod tests {
                     continue;
                 };
                 let desc = describe_strlen_arg_producer(graph, arg);
-                let is_wtf8_str_cast =
-                    desc.starts_with("cast_instance root=Wtf8") && desc.contains("result_ty=Str");
+                let is_utf8_read = desc == "FieldRead W_UnicodeObject.value ty=Str";
                 let is_instance_input =
                     desc.starts_with("Input ") && desc.contains("class_root=Some");
-                sites.push((desc, is_wtf8_str_cast, is_instance_input));
+                sites.push((desc, is_utf8_read, is_instance_input));
             }
         }
         sites
     }
 
-    /// Real-site measurement: `w_str_get_wtf8` dest paint vs `__strlen`
-    /// argument.  The identity-alias fixture
+    /// Real-site measurement: the `__strlen` argument at a
+    /// `w_str_get_wtf8` byte view.  The identity-alias fixture
     /// (`strlen_on_w_str_get_wtf8_identity_alias_receiver_is_instance_not_string`)
     /// does not exercise the frontend, so this lowers the object LLBC.
+    /// The view is `w_obj._utf8`: the `value` getfield of the receiver
+    /// narrowed to `W_UnicodeObject`, typed `Str`, so `strlen` reads the
+    /// rstr `STR` payload and not the wrapper.
     #[test]
-    fn strlen_arg_at_real_w_str_get_wtf8_sites_annotates_as_somestring() {
-        use crate::annotator::annrpython::RPythonAnnotator;
-        use crate::annotator::classdesc::ClassDef;
-        use crate::annotator::model::SomeInstance;
-        use crate::flowspace::model::ConstValue;
-        use crate::translator::rtyper::pairtype::ReprClassId;
-        use crate::translator::rtyper::rmodel::Repr;
-        use crate::translator::rtyper::rtyper::RPythonTyper;
+    fn strlen_arg_at_real_w_str_get_wtf8_sites_is_the_utf8_field() {
         use majit_charon_reader::Llbc;
 
         let path = concat!(
@@ -6547,8 +6548,8 @@ mod tests {
                 !sites.is_empty(),
                 "{name} must plant at least one __strlen (w_str_get_wtf8 dest is a byte view)"
             );
-            for (desc, is_wtf8_str, is_instance) in &sites {
-                all_sites.push((name, desc.clone(), *is_wtf8_str, *is_instance));
+            for (desc, is_utf8_read, is_instance) in &sites {
+                all_sites.push((name, desc.clone(), *is_utf8_read, *is_instance));
             }
         }
 
@@ -6560,44 +6561,14 @@ mod tests {
             instance_sites.is_empty(),
             "__strlen still sees an Instance Input at real sites: {instance_sites:?}"
         );
-        let non_string: Vec<_> = all_sites
+        let not_utf8: Vec<_> = all_sites
             .iter()
-            .filter(|(_, _, is_wtf8_str, _)| !*is_wtf8_str)
+            .filter(|(_, _, is_utf8_read, _)| !*is_utf8_read)
             .collect();
         assert!(
-            non_string.is_empty(),
-            "__strlen argument is not the Wtf8/Str dest at: {non_string:?}"
+            not_utf8.is_empty(),
+            "__strlen argument is not the W_UnicodeObject.value read at: {not_utf8:?}"
         );
-
-        let bk = Rc::new(Bookkeeper::new());
-        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
-        let s_obj =
-            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
-        let s_root = bk
-            .immutablevalue(&ConstValue::byte_str("Wtf8"))
-            .expect("Wtf8 root constant");
-        let s_dest = crate::annotator::builtin::call_builtin(
-            &bk,
-            crate::runtime_names::shims::CAST_INSTANCE,
-            &[Some(s_obj), Some(s_root)],
-            &std::collections::HashMap::new(),
-        )
-        .expect("string-root cast must accept a PyObject instance");
-        assert!(
-            matches!(s_dest, SomeValue::String(_)),
-            "Wtf8 dest of the real-site producer annotates SomeString, got {s_dest:?}"
-        );
-
-        let ann = RPythonAnnotator::new(None, None, Some(bk.clone()), false);
-        let rtyper = Rc::new(RPythonTyper::new(&ann));
-        rtyper
-            .initialize_exceptiondata()
-            .expect("exceptiondata for getrepr");
-        let repr = rtyper
-            .getrepr(&s_dest)
-            .expect("SomeString must make StringRepr");
-        assert_eq!(Repr::class_name(repr.as_ref()), "StringRepr");
-        assert_eq!(Repr::repr_class_id(repr.as_ref()), ReprClassId::StringRepr);
     }
 
     #[test]

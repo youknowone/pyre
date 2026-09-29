@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=4
 # Negative and invert are emitted as canonical codewriter `inline_call`s and
 # carry no residual-call fold gate.
 # Unary operations must observe the current loop-carried integer. Exercise

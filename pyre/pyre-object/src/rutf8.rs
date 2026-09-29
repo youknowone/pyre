@@ -467,13 +467,13 @@ pub fn codepoint_index_at_byte_position(
 
 /// `rutf8.Utf8StringBuilder` (`rutf8.py`).
 ///
-/// `@always_inline` methods wrap a rbuilder `StringBuilder` (`_s`) and a
-/// code-point counter (`_lgt`).  `pyopcode.py BUILD_STRING` is
+/// `@always_inline` methods wrap a [`crate::rstring::StringBuilder`] (`_s`)
+/// and a code-point counter (`_lgt`).  `pyopcode.py BUILD_STRING` is
 /// `append_utf8` + `space.newutf8(builder.build(), builder.getlength())`.
 /// The rbuilder helpers residualise when jitted (`rbuilder.py ll_append`
 /// / `ll_build`); these wrappers stay look-inside like upstream.
 pub struct Utf8StringBuilder {
-    _s: i64,
+    _s: crate::rstring::StringBuilder,
     _lgt: i64,
 }
 
@@ -482,10 +482,7 @@ impl Utf8StringBuilder {
     #[inline]
     pub fn new(size: i64) -> Self {
         Self {
-            _s: crate::rbuilder::rbuilder_runtime::ll_new(
-                size,
-                crate::rbuilder::rbuilder_runtime::STR_ITEM_SIZE,
-            ),
+            _s: crate::rstring::StringBuilder::new(size),
             _lgt: 0,
         }
     }
@@ -497,17 +494,14 @@ impl Utf8StringBuilder {
         utf8: *mut crate::unicodeobject::UnicodeValueStorage,
         length: i64,
     ) {
-        crate::rbuilder::rbuilder_runtime::ll_append(self._s, utf8 as i64);
+        self._s.append(utf8);
         self._lgt += length;
     }
 
     /// `Utf8StringBuilder.build(self)` — the rstr `STR` payload.
     #[inline]
     pub fn build(&mut self) -> *mut crate::unicodeobject::UnicodeValueStorage {
-        crate::rbuilder::rbuilder_runtime::ll_build(
-            self._s,
-            crate::rbuilder::rbuilder_runtime::STR_ITEM_SIZE,
-        ) as *mut crate::unicodeobject::UnicodeValueStorage
+        self._s.build()
     }
 
     /// `Utf8StringBuilder.getlength(self)` — code-point count.
