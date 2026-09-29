@@ -23,6 +23,8 @@ pub mod nonconst;
 pub mod rbigint;
 pub mod rffi;
 pub mod rposix;
+#[cfg(unix)]
+pub mod rtermios;
 pub mod rthread;
 pub mod rvmprof;
 #[cfg(target_os = "windows")]
