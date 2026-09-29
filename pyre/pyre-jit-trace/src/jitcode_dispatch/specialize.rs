@@ -6319,10 +6319,11 @@ fn walker_write_const_bool_result<Sym: WalkSym>(
 /// performs, so a `def` in a loop body virtualizes away instead of allocating a
 /// `Function` per iteration.
 ///
-/// Everything the constructor stores is loop-invariant here: `globals` and
-/// `code` arrive as baked constants (`codewriter.rs` MakeFunction arm bakes the
-/// frame's globals object, and the code object comes from a `LOAD_CONST`), and
-/// the remaining slots are derived from them:
+/// Everything the constructor stores is loop-invariant when the operands are
+/// constants. `globals` is the frame's `get_w_globals()` result (the
+/// `LoadImportGlobals` lowering) and the specialization applies only when that
+/// operand is a constant; otherwise it declines to the residual. `code` comes
+/// from a `LOAD_CONST`, and the remaining slots are derived from them:
 ///
 /// * `name` — `function.py:51 self.name = code.co_name`, a pointer into the
 ///   `Box::into_raw`'d `CodeObject`, which is never rewritten in place nor
