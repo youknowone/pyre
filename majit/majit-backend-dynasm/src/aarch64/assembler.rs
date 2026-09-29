@@ -630,10 +630,44 @@ pub struct AssemblerARM64<'a> {
     /// which the `LoadFromGcTable` genop reads PC-relative. Empty when the
     /// trace references no reference constants.
     gcref_table: Vec<dynasmrt::DynamicLabel>,
+    /// Float immediates loaded with a PC-relative `ldr Dt, =bits`.
+    /// `VFPRegisterManager.convert_to_imm` parks the bits in the data block
+    /// and `AssemblerARM64.load` reads them; the literal sits after the
+    /// recovery stubs so the hot loop does not rebuild the bits with
+    /// `movz`/`movk`/`fmov`.
+    float_pool: Vec<(DynamicLabel, u64)>,
     /// `AssemblerARM64.malloc_slowpath`: per-CPU shared slowpath built by
     /// `_build_malloc_slowpath('fixed')` and used by both fixed-size and
     /// varsize-frame nursery probes.
     malloc_slowpath_fixed: usize,
+}
+
+/// How many `movz`/`movk` words `codebuilder.py gen_load_int` emits.
+fn imm_mov_count(val: i64) -> u32 {
+    if val < 0 {
+        if val >= -65536 {
+            return 1;
+        }
+        let mut value = (val as u64) >> 16;
+        let mut n = 1u32;
+        let mut shift = 16;
+        while shift < 64 {
+            if (value & 0xFFFF) != 0xFFFF {
+                n += 1;
+            }
+            shift += 16;
+            value >>= 16;
+        }
+        return n;
+    }
+    let mut value = val as u64;
+    let mut n = 1u32;
+    value >>= 16;
+    while value != 0 {
+        n += 1;
+        value >>= 16;
+    }
+    n
 }
 
 /// `NOP` (`HINT #0`), the placeholder `_emit_guard` leaves at a
@@ -832,6 +866,7 @@ impl<'a> AssemblerARM64<'a> {
             attached_descrs,
             cpu_handle,
             gcref_table: Vec::new(),
+            float_pool: Vec::new(),
             malloc_slowpath_fixed,
         }
     }
@@ -855,6 +890,33 @@ impl<'a> AssemblerARM64<'a> {
         }
         if n % 2 == 1 {
             dynasm!(self.mc ; .u64 0);
+        }
+    }
+
+    /// PC-relative load of a float immediate. The pool is emitted after the
+    /// recovery stubs (`emit_float_literal_pool`).
+    fn emit_ldr_float_literal(&mut self, dst: u8, bits: u64) {
+        let slot = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch aarch64 ; ldr D(dst), =>slot);
+        self.float_pool.push((slot, bits));
+    }
+
+    fn emit_ldr_int_literal(&mut self, dst: u8, bits: u64) {
+        let slot = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch aarch64 ; ldr X(dst), =>slot);
+        self.float_pool.push((slot, bits));
+    }
+
+    fn emit_float_literal_pool(&mut self) {
+        if self.float_pool.is_empty() {
+            return;
+        }
+        let pool = std::mem::take(&mut self.float_pool);
+        while self.mc.offset().0 % 8 != 0 {
+            dynasm!(self.mc ; .arch aarch64 ; nop);
+        }
+        for (slot, bits) in pool {
+            dynasm!(self.mc ; .arch aarch64 ; =>slot ; .u64 bits);
         }
     }
 
@@ -1895,6 +1957,7 @@ impl<'a> AssemblerARM64<'a> {
         // assembler.py:553 write_pending_failure_recoveries
         let stub_offsets = self.write_pending_failure_recoveries();
         self.check_guard_reach()?;
+        self.emit_float_literal_pool();
 
         // assembler.py:556 materialize_loop — finalize to executable memory
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
@@ -2037,6 +2100,7 @@ impl<'a> AssemblerARM64<'a> {
         self.check_unrelocated_jump_target()?;
         let stub_offsets = self.write_pending_failure_recoveries();
         self.check_guard_reach()?;
+        self.emit_float_literal_pool();
 
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
         let frame_depth = self.frame_depth;
@@ -3087,7 +3151,11 @@ impl<'a> AssemblerARM64<'a> {
                             self.emit_op_gcload_regalloc(base, ofs_loc, dst, nsize);
                         }
                         Some(Loc::Immed(base_i) | Loc::ImmedFloat(base_i)) => {
-                            self.emit_mov_imm64(16, base_i.value);
+                            if imm_mov_count(base_i.value) >= 3 {
+                                self.emit_ldr_int_literal(16, base_i.value as u64);
+                            } else {
+                                self.emit_mov_imm64(16, base_i.value);
+                            }
                             let base = RegLoc {
                                 value: 16,
                                 is_xmm: false,
@@ -8277,10 +8345,18 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                     self.emit_ldr_fp(d.value, ofs);
                 }
             }
+            (Loc::ImmedFloat(i), Loc::Reg(d)) if d.is_xmm => {
+                self.emit_ldr_float_literal(d.value, i.value as u64);
+            }
             (Loc::Immed(i) | Loc::ImmedFloat(i), Loc::Reg(d)) => {
                 if d.is_xmm {
                     self.emit_mov_imm64(16, i.value); // x16 = scratch
                     dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), X(16));
+                } else if imm_mov_count(i.value) >= 3 {
+                    // `gen_load_int` would be three or four `movz`/`movk`.
+                    // A PC-relative literal is one load; the signal-word
+                    // address in a traced loop is that case.
+                    self.emit_ldr_int_literal(d.value, i.value as u64);
                 } else {
                     self.emit_mov_imm64(d.value as u32, i.value);
                 }
