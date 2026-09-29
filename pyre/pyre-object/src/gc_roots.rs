@@ -533,7 +533,10 @@ impl RootScope {
     /// One-word residual ABI for [`Self::publish`], the
     /// [`publish_roots_jit_abi`] twin.
     #[majit_macros::dont_look_inside_cannot_raise]
-    pub extern "C" fn publish_jit_abi(&self, array: i64) -> i64 {
+    pub extern "C" fn publish_jit_abi(
+        &self,
+        array: *const crate::object_array::GcTypedArray,
+    ) -> i64 {
         let items = gcarray_ref_items(array);
         self.publish(&items) as i64
     }
@@ -541,7 +544,10 @@ impl RootScope {
     /// One-word residual ABI for [`Self::pin_roots`], the
     /// [`publish_roots_jit_abi`] twin.
     #[majit_macros::dont_look_inside_cannot_raise]
-    pub extern "C" fn pin_roots_jit_abi(&self, array: i64) -> i64 {
+    pub extern "C" fn pin_roots_jit_abi(
+        &self,
+        array: *const crate::object_array::GcTypedArray,
+    ) -> i64 {
         let items = gcarray_ref_items(array);
         self.pin_roots(&items) as i64
     }
@@ -906,15 +912,11 @@ pub fn reload_top_root(root: PyObjectRef) -> PyObjectRef {
     majit_gc::shadow_stack::top_ref().0 as PyObjectRef
 }
 
-/// One-word residual-call ABI for [`reload_top_root`].
-///
-/// A residual with a `Ref` result lowers to a direct `call_indirect` typed
-/// `(i64) -> i64`; `PyObjectRef` is `i32` on wasm32, where the call
-/// type-checks its callee. Same exception effect as [`reload_top_root`]:
-/// the body only reads the shadow-stack top.
+/// `extern "C"` residual entry for [`reload_top_root`], with the same
+/// exception effect: the body only reads the shadow-stack top.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub extern "C" fn reload_top_root_jit_abi(root: PyObjectRef) -> i64 {
-    reload_top_root(root) as i64
+pub extern "C" fn reload_top_root_jit_abi(root: PyObjectRef) -> PyObjectRef {
+    reload_top_root(root)
 }
 
 /// Publish a complete translated livevar set before performing any
@@ -974,7 +976,7 @@ pub extern "C" fn publish_roots_jit_abi(array: *const crate::object_array::GcTyp
 /// One-word residual ABI for [`pin_roots`], the [`publish_roots_jit_abi`]
 /// twin.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub extern "C" fn pin_roots_jit_abi(array: i64) -> i64 {
+pub extern "C" fn pin_roots_jit_abi(array: *const crate::object_array::GcTypedArray) -> i64 {
     let items = gcarray_ref_items(array);
     pin_roots(&items) as i64
 }

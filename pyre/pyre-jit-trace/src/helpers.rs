@@ -309,14 +309,16 @@ pub fn emit_trace_call_ref_typed_elidable_cannot_raise(
 /// `GetfieldGcR`.  Null on a non-module dict, missing slot, or after
 /// `switch_to_object_strategy`.
 #[allow(dead_code)]
-pub(crate) extern "C" fn jit_namespace_cell_lookup(namespace_ptr: i64, slot: i64) -> i64 {
-    let w_globals = namespace_ptr as pyre_object::PyObjectRef;
+pub(crate) extern "C" fn jit_namespace_cell_lookup(
+    w_globals: PyObjectRef,
+    slot: i64,
+) -> PyObjectRef {
     if w_globals.is_null() || slot < 0 {
-        return PY_NULL as i64;
+        return PY_NULL;
     }
     let cell =
         unsafe { pyre_object::dictmultiobject::module_dict_cell_at(w_globals, slot as usize) };
-    cell.unwrap_or(PY_NULL) as i64
+    cell.unwrap_or(PY_NULL)
 }
 
 #[allow(dead_code)]

@@ -207,7 +207,7 @@ pub struct Cpu {
     ) -> i64,
     /// `bhimpl_load_global` — namespace/code from getfield_vable_r plus live frame.
     pub load_global_fn: extern "C" fn(
-        i64,
+        pyre_object::PyObjectRef,
         pyre_object::PyObjectRef,
         *mut pyre_interpreter::PyFrame,
         i64,

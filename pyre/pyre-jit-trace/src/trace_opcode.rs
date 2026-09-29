@@ -153,14 +153,10 @@ pub(crate) extern "C" fn raise_exception_jit(exc_obj: i64) {
 /// following `GUARD_EXCEPTION` sees it.
 #[allow(dead_code)]
 pub(crate) extern "C" fn normalize_raise_varargs_jit(
-    frame_ptr: i64,
-    exc_obj: i64,
-    cause_obj: i64,
-) -> i64 {
-    let _frame_ptr = frame_ptr as *const pyre_interpreter::pyframe::PyFrame;
-    let exc = exc_obj as pyre_object::PyObjectRef;
-    let raw_cause = cause_obj as pyre_object::PyObjectRef;
-
+    _frame_ptr: *const pyre_interpreter::pyframe::PyFrame,
+    exc: pyre_object::PyObjectRef,
+    raw_cause: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
     // pyopcode.py:704-722 — cause and exc normalization both run against
     // `self.space.getexecutioncontext()`: execution context belongs to the
     // current activation/thread, independently of the frame object.
@@ -187,7 +183,7 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
                 pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
                 let exc = err.to_exc_object();
                 raise_exception_jit(exc as i64);
-                return exc as i64;
+                return exc;
             }
         }
     };
@@ -201,7 +197,7 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
                 let err =
                     PyError::runtime_error("raise helper missing current frame").to_exc_object();
                 raise_exception_jit(err as i64);
-                return err as i64;
+                return err;
             }
             let result = {
                 let _plain_guard = pyre_interpreter::call::force_plain_eval();
@@ -224,7 +220,7 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
         final_exc = err.to_exc_object();
     }
     raise_exception_jit(final_exc as i64);
-    final_exc as i64
+    final_exc
 }
 
 /// Runtime helper for traced `PUSH_EXC_INFO`: read the per-thread
@@ -3489,9 +3485,9 @@ mod tests {
         }
         .expect("builtins should contain ValueError");
 
-        let result = normalize_raise_varargs_jit(0, exc_class as i64, pyre_object::PY_NULL as i64);
+        let result = normalize_raise_varargs_jit(std::ptr::null(), exc_class, pyre_object::PY_NULL);
 
-        assert_eq!(result, pending_jit_exception_raw());
+        assert_eq!(result as i64, pending_jit_exception_raw());
         let err = unsafe { pyre_interpreter::PyError::from_exc_object(result as PyObjectRef) };
         assert_eq!(err.kind, pyre_interpreter::PyErrorKind::RuntimeError);
         assert_eq!(err.message_text(), "raise helper missing current frame");

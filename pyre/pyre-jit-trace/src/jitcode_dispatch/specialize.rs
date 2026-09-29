@@ -932,8 +932,10 @@ fn traceback_walk_field(
 /// Runtime half of the optimized-frame `f_locals` getter.  The proxy owns the
 /// exact frame passed to it; reading or mutating the proxy later goes through
 /// that frame's existing synchronization path.
-extern "C" fn jit_inline_frame_locals_proxy_new(frame: i64) -> i64 {
-    pyre_interpreter::pyframe::frame_locals_proxy::new(frame as pyre_object::PyObjectRef) as i64
+extern "C" fn jit_inline_frame_locals_proxy_new(
+    frame: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    pyre_interpreter::pyframe::frame_locals_proxy::new(frame)
 }
 
 /// Prove the receiving code object still owns its host `CodeObject`, the
@@ -1565,9 +1567,11 @@ fn try_walker_specialize_frame_lasti<Sym: WalkSym>(
 /// Runtime half of the owned-frame `f_lineno` getter: `pyframe.py
 /// fget_f_lineno` with the executing `last_instr` supplied by its caller
 /// instead of read back off the frame.
-extern "C" fn jit_frame_f_lineno_at(frame: i64, last_instr: i64) -> i64 {
-    let frame = frame as usize as *const pyre_interpreter::PyFrame;
-    unsafe { &*frame }.f_lineno_at(last_instr as isize) as i64
+extern "C" fn jit_frame_f_lineno_at(
+    frame: *const pyre_interpreter::PyFrame,
+    last_instr: i64,
+) -> pyre_object::PyObjectRef {
+    unsafe { &*frame }.f_lineno_at(last_instr as isize)
 }
 
 /// `pyframe.py fget_f_lineno` — the line the frame is currently executing.

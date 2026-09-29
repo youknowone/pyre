@@ -5994,7 +5994,7 @@ pub extern "C" fn bh_call_function_ex_fn(
 /// well as blackhole.  namei is the raw oparg from LOAD_GLOBAL:
 /// name_idx = namei >> 1.
 pub extern "C" fn bh_load_global_fn(
-    namespace_ptr: i64,
+    namespace_ptr: PyObjectRef,
     w_code_ptr: PyObjectRef,
     frame_ptr: *mut PyFrame,
     namei: i64,
