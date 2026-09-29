@@ -8276,14 +8276,22 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // callable -- `set.add` bound method against the `super` type -- so the
     // order between them is free; `set_add` is asked first only because it is
     // the cheaper recognition.
+    //
+    // An integer-strategy hit is not this tail.  The contains check does not
+    // insert and does not run `__hash__`, so it is not tagged `SetAddMethod`
+    // and must not be concrete-executed as `jit_set_add_method`.  `spec_gate`
+    // still counts that `Some` as the same row.
     let direct_subst = if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
         match spec_gate(SpecFold::SetAddMethod, || {
-            try_walker_specialize_set_add_method(ctx, code, op, &r_args)
+            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
         })? {
-            Some(subst) => Some(subst),
+            Some(SetAddMethodSpec::Elided) => {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            Some(SetAddMethodSpec::Subst(subst)) => Some(subst),
             None => spec_gate(SpecFold::BareSuperCall, || {
                 try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
             })?,

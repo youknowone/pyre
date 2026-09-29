@@ -2095,6 +2095,15 @@ pub extern "C" fn jit_set_add_method(set: PyObjectRef, value: PyObjectRef) -> Py
     }
 }
 
+/// `1` when [`pyre_object::plain_int_already_in_int_set`] is true.
+///
+/// Recorded as a cannot-collect call when the traced `set.add` is that hit.
+/// It does not insert, so a user `__hash__` never runs here. `0` fails the
+/// guard and the interpreter performs the real add.
+pub extern "C" fn jit_int_set_add_already_present(set: i64, value: i64) -> i64 {
+    pyre_object::plain_int_already_in_int_set(set as PyObjectRef, value as PyObjectRef) as i64
+}
+
 /// `pyopcode.py` FOR_ITER exception discrimination:
 /// `e.match(space, space.w_StopIteration)`. The caught object and match class
 /// are Python-level objects, so use the same MRO-aware helper as

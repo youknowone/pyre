@@ -14859,6 +14859,16 @@ pub(crate) struct DirectResidualSubst {
     pub(crate) allboxes: Vec<OpRef>,
 }
 
+/// What [`try_walker_specialize_set_add_method`] recorded.
+pub(crate) enum SetAddMethodSpec {
+    /// MayForce [`pyre_interpreter::runtime_ops::jit_set_add_method`]. The
+    /// generic tail still executes it.
+    Subst(DirectResidualSubst),
+    /// The traced element is already in an integer-strategy set. The contains
+    /// check and `GuardTrue` stand in for the insert.
+    Elided,
+}
+
 /// `s.add(x)`: record the direct `set_add` residual the SET_ADD accumulator
 /// opcode records, in place of the generic `bh_call_fn` dispatch the
 /// bound-method spelling otherwise leaves behind.
@@ -14876,10 +14886,20 @@ pub(crate) struct DirectResidualSubst {
 /// form and the comprehension: 0.220s -> 0.130s against `list.append`'s
 /// 0.040s.
 ///
-/// The insert stays a MayForce residual, and deliberately so: `set_add_value`
+/// A miss stays a MayForce residual, and deliberately so: `set_add_value`
 /// hashes the element, which can run a user `__hash__`.  That is the other
 /// half of the gap against `list.append` (`GuardNotForced`, which even the
 /// dispatch-free comprehension carries), and this arm does not claim it.
+///
+/// A hit does not hash.  When the traced value is a plain int
+/// [`pyre_object::plain_int_already_in_int_set`] already finds in an
+/// [`pyre_object::setobject::IntegerSetStrategy`] set, the arm records
+/// [`pyre_interpreter::runtime_ops::jit_int_set_add_already_present`] as a
+/// cannot-collect call plus `GuardTrue`, and writes `None`.  The helper does
+/// not insert.  A later miss fails the guard and resumes at this call, so the
+/// interpreter performs the real add.  The traced iteration itself must be a
+/// hit: recording the guard around a concrete miss would compile a loop that
+/// side-exits every time.
 ///
 /// Recognition declines before emitting IR, and what it admits is deliberately
 /// the builtin's own predicate: `require_set_receiver` is `is_set`, an
@@ -14897,7 +14917,8 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
-) -> Result<Option<DirectResidualSubst>, DispatchError> {
+    dst: usize,
+) -> Result<Option<SetAddMethodSpec>, DispatchError> {
     if r_args.len() != 3 {
         return Ok(None);
     }
@@ -14916,7 +14937,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     // verbatim, and the class guard below is emitted in the same spelling, so
     // recognition and guard admit the same set of receivers.  It excludes a
     // frozenset, which `set_add_value` would otherwise mutate.
-    let inner_func = unsafe {
+    let (inner_func, inner_self) = unsafe {
         if !pyre_object::function::is_method(callable) {
             return Ok(None);
         }
@@ -14929,8 +14950,11 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
         if pyre_interpreter::lookup_in_type(set_type, "add") != Some(inner_func) {
             return Ok(None);
         }
-        inner_func
+        (inner_func, inner_self)
     };
+    // Before any IR. A concrete miss keeps today's MayForce substitution;
+    // guarding a contains check that just returned 0 would side-exit forever.
+    let already = pyre_object::plain_int_already_in_int_set(inner_self, value);
 
     // ── tentative commit ──
     // Pin the callable to `set.add`: guard_class METHOD + guard_value on the
@@ -14977,14 +15001,33 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
         .heap_cache_mut()
         .class_now_known(self_ref, set_type_addr);
 
+    if already {
+        let mut effect = majit_metainterp::cannot_raise_effect_info();
+        effect.can_collect = false;
+        let present = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallI,
+            pyre_interpreter::runtime_ops::jit_int_set_add_already_present as *const (),
+            &[self_ref, r_args[2]],
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::Type::Int,
+            effect,
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(present, majit_ir::Value::Int(1));
+        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[present])?;
+        let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
+        return Ok(Some(SetAddMethodSpec::Elided));
+    }
+
     let funcptr = ctx
         .trace_ctx
         .const_int(pyre_interpreter::runtime_ops::jit_set_add_method as *const () as i64);
-    Ok(Some(DirectResidualSubst {
+    Ok(Some(SetAddMethodSpec::Subst(DirectResidualSubst {
         funcptr,
         descr: set_add_method_descr(),
         allboxes: vec![funcptr, self_ref, r_args[2]],
-    }))
+    })))
 }
 
 /// The descr the `s.add(x)` substitution installs: `(Ref, Ref) -> Ref`,
