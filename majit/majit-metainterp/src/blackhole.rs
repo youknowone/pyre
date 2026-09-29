@@ -7200,32 +7200,12 @@ pub fn cast_float_to_uint(f: f64) -> i64 {
     wrapped as i64
 }
 
-// RPython `rstr.LLHelpers.ll_streq_nonnull(s1, s2)`
-// (`rpython/jit/codewriter/support.py _ll_2_str_eq_nonnull`)
-// is the helper canonically registered by `jtransform.py:620-624 /
-// :637-641 _register_extra_helper(OS_STREQ_NONNULL / OS_UNIEQ_NONNULL,
-// "str.eq_nonnull", ...)`.  Its body indexes `s1.chars[i]` against
-// `s2.chars[i]` on the `{hash, chars: Array(Char)}` GC struct at
-// `rpython/rtyper/lltypesystem/rstr.py STR.become(...)`.
-//
-// Pyre has no equivalent `rstr.STR`-shaped GC layout yet (byte
-// buffers lower to fat-slice `(ptr, len)` or to `W_BytesObject`),
-// so the helper would have no correct body to port.  Registering a
-// panic-stub instead would promise the codewriter a production
-// helper that fails at runtime — a parity violation worse than
-// not registering at all.
-//
-// Convergence path: once pyre-object grows a GC struct mirroring
-// `rstr.STR`'s `{hash, chars[]}` layout, port the function body
-// line-by-line from `support.py` and add the registration
-// here together with the `jit_fnaddr.rs::jit_trace_fnaddrs` entry
-// publishing the host address.  Until then, pyre's type state has no
-// `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)` channel: the elidable-promote
-// dual hint (`PromoteOrString`) falls through to the plain
-// `<kind>_guard_value` arm, and direct `hint_promote_string` /
-// `hint_promote_unicode` calls fail loud in
-// `codewriter/jtransform.rs`, mirroring upstream's
-// `jit.py/636` concretetype assertions.
+// `support.py _ll_2_str_eq_nonnull` and the other `_ll_*_str_eq_*`
+// helpers `jtransform.py _handle_stroruni_call` registers beside
+// `stroruni.equal` live in `pyre_object::lowlevel_string` over the rstr
+// `STR` payload, and `jit_fnaddr.rs` publishes their addresses.
+// `promote_string` / `promote_unicode` (`str_guard_value`) are not ported:
+// the dual `PromoteOrString` hint takes the plain `<kind>_guard_value` arm.
 
 /// blackhole.py `bhimpl_int_and(a, b): return a & b`.
 fn bhimpl_int_and(a: i64, b: i64) -> i64 {

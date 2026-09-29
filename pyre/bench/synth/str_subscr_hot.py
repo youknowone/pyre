@@ -1,23 +1,18 @@
-# pyre-check: spec-folds=subscr_str
+# pyre-check: spec-folds=subscr
 # Hot-loop `s[i]` on an exact `str`. The subscript reaches the walker as the
-# `BinaryOp` helper's `Subscr` tag, and `try_walker_specialize_subscr` only
-# recognized dict, tuple, specialised-pair and list receivers -- a `str` fell
-# through to the generic `CallMayForce`, which forces virtualizables and
-# clears the heap cache across itself. Measured with the identical loop body
-# over a `list` receiver, whose storage arm already folds, the str form cost
-# an order of magnitude more per iteration than the one code point it boxes.
+# `BinaryOp` helper's `Subscr` tag; an exact `str` receiver with an exact
+# `int` index descends `baseobjspace::getitem_str` (`descr_getitem`'s scalar
+# arm) instead of the generic `CallMayForce`, which forces virtualizables and
+# clears the heap cache across itself.
 #
-# NO throughput ceiling, deliberately. The fold removes the may-force
-# residual and nothing else: 51.1 -> 45.5 ns/iter on dynasm, against pypy's
-# 0.7. The remaining 45 is the boxed code point itself, which this loop
-# discards immediately and pypy never allocates at all -- `len(s[0])` reads
-# 44.3 and `ord(s[0])` 45.0, i.e. the cost does not depend on the consumer.
-# Virtualizing that allocation is a different lever, so the two arms here sit
-# at 73x and 64x pypy and no ratio between them would be a stable gate. The
-# `spec-folds` line above is the gate; a ratio would only measure the
-# allocation.
+# NO throughput ceiling, deliberately. The remaining cost is the boxed code
+# point itself, which this loop discards immediately and pypy never
+# allocates at all -- `len(s[0])` and `ord(s[0])` cost the same, i.e. the
+# cost does not depend on the consumer. Virtualizing that allocation is a
+# different lever, so no ratio here would be a stable gate. The `spec-folds`
+# line above is the gate; a ratio would only measure the allocation.
 #
-# The other legs are correctness legs for the shapes the fold must REFUSE,
+# The other legs are correctness legs for the shapes the descent must REFUSE,
 # each written so a wrongly-admitted shape is a wrong value and not a silent
 # pass:
 #
@@ -27,12 +22,11 @@
 #   * a NON-ASCII receiver indexes code points, not bytes; a fixed-stride read
 #     would return a fragment of a multi-byte sequence.
 #   * a NEGATIVE index counts from the end, and an out-of-range one raises
-#     `IndexError` -- both belong to the interpreter, so the helper declines
-#     them with `PY_NULL` and the non-null guard carries that back.
+#     `IndexError`; the descended body keeps its own length test, so the
+#     trace must guard it rather than bake this receiver's length in.
 #   * an index past `usize::MAX` is out of range on the 32-bit wasm guest for
 #     a reason the other backends never see: the machine int is 64-bit
-#     everywhere, so `2**32` reaches the helper as a valid operand and only
-#     the width conversion refuses it.
+#     everywhere, so `2**32` must still raise rather than wrap to `0`.
 #   * a `bool` index shares `int`'s `intval` but carries its own type, and a
 #     `__index__` object is not an int at all.
 class Prefixed(str):

@@ -6476,10 +6476,11 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // `int_lt` through here.  Exact float/float is the same shape
     // (`_float_lt` after `_to_float`).  Long/long (`rbigint.lt`), mixed
     // long/int (`rbigint.int_lt` via [`long_int_compare`]), and str/str
-    // (`jit_str_compare`, the `ll_unicode_cmp` ordering `W_UnicodeObject.descr_lt`
-    // takes over `_utf8`) are loop-free too and must live here, or the leaf
-    // is only reachable from [`compare_slot_rest`] and never becomes a
-    // jitcode.  Every layout that iterates stays in [`compare_slot_rest`].
+    // (`W_UnicodeObject.descr_eq` / `descr_lt`: `ll_streq` / `ll_strcmp`
+    // over the two `_utf8` payloads) are loop-free too and must live here,
+    // or the leaf is only reachable from [`compare_slot_rest`] and never
+    // becomes a jitcode.  Every layout that iterates stays in
+    // [`compare_slot_rest`].
     // Tuple comparison stays there: the container cycle's stack check is the
     // first thing `compare_slot_rest` does, and a tuple arm ahead of that
     // check would recurse through `compare_tuples` with no guard.  Short
@@ -6554,17 +6555,19 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             }));
         }
         if is_str(a) && is_str(b) {
-            // `W_UnicodeObject.descr_lt` answers from one `_utf8` ordering
-            // (`ll_unicode_cmp`). `jit_str_compare` is that ordering on WTF-8
-            // bytes, which matches code-point order including lone surrogates.
-            let diff = pyre_object::unicodeobject::jit_str_compare(a, b);
+            // `W_UnicodeObject.descr_eq` / `descr_lt` and their siblings
+            // compare the two `_utf8` payloads, which `rtype_eq` /
+            // `rtype_lt` turn into `ll_streq` / `ll_strcmp` calls. WTF-8
+            // byte order matches code-point order, lone surrogates included.
+            let s1 = pyre_object::unicodeobject::w_str_storage(a);
+            let s2 = pyre_object::unicodeobject::w_str_storage(b);
             return Ok(w_bool_from(match op {
-                CompareOp::Lt => diff < 0,
-                CompareOp::Le => diff <= 0,
-                CompareOp::Gt => diff > 0,
-                CompareOp::Ge => diff >= 0,
-                CompareOp::Eq => diff == 0,
-                CompareOp::Ne => diff != 0,
+                CompareOp::Lt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) < 0,
+                CompareOp::Le => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) <= 0,
+                CompareOp::Gt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) > 0,
+                CompareOp::Ge => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) >= 0,
+                CompareOp::Eq => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0,
+                CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
             }));
         }
     }

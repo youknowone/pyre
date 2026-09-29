@@ -3439,6 +3439,26 @@ impl<'a> Transformer<'a> {
                 ..
             } if self.is_string_equality(binop_name, lhs, rhs) => {
                 let target = CallTarget::function_path([self.config.str_eq_helper.as_str()]);
+                // `ll_streq` is `@jit.oopspec('stroruni.equal(s1, s2)')`, so
+                // the direct call goes through `_handle_stroruni_call`: the
+                // `OS_STREQ_*` extra helpers, then `_handle_oopspec_call`'s
+                // `callinfocollection.add(OS_STR_EQUAL, ...)`.
+                self.register_stroruni_equal_extra_helpers(&StrOrUniKind::Str);
+                let descriptor = CallDescriptor::from_signature(
+                    &[majit_ir::value::Type::Ref, majit_ir::value::Type::Ref],
+                    majit_ir::value::Type::Int,
+                    EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::StrEqual),
+                );
+                if let Some(cc) = self.callcontrol.as_mut() {
+                    let func_as_int = cc.fnaddr_for_target(&target) as u64;
+                    cc.callinfocollection.add(
+                        OopSpecIndex::StrEqual,
+                        descriptor.to_descr_ref(),
+                        func_as_int,
+                    );
+                    cc.callinfocollection
+                        .register_func_name(func_as_int, format!("{target}"));
+                }
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 let streq = if binop_name == "eq" {
                     op.result.clone()
@@ -3458,11 +3478,7 @@ impl<'a> Transformer<'a> {
                     result: streq.clone(),
                     kind: OpKind::CallResidual {
                         funcptr: CallFuncPtr::Value(funcptr),
-                        descriptor: CallDescriptor::from_signature(
-                            &[majit_ir::value::Type::Ref, majit_ir::value::Type::Ref],
-                            majit_ir::value::Type::Int,
-                            EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
-                        ),
+                        descriptor,
                         args_i: vec![],
                         args_r: vec![lhs.clone(), rhs.clone()],
                         args_f: vec![],
@@ -7343,10 +7359,8 @@ impl<'a> Transformer<'a> {
     ///   raise `MemoryError` (`EF_ELIDABLE_OR_MEMORYERROR`), `cmp` /
     ///   `copy_string_to_raw` cannot (`EF_ELIDABLE_CANNOT_RAISE`).
     /// - `equal` (jtransform.py) additionally registers the
-    ///   `OS_STREQ_*` / `OS_UNIEQ_*` slice-comparison helper variants via
-    ///   `_register_extra_helper`, which pyre has not ported; that spelling
-    ///   returns `None` and falls through to the residual-call path until the
-    ///   helper-registration machinery lands.
+    ///   `OS_STREQ_*` / `OS_UNIEQ_*` helper variants via
+    ///   [`Self::_register_extra_helper`].
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -7390,24 +7404,14 @@ impl<'a> Transformer<'a> {
             }]));
         }
 
-        // jtransform.py:2087-2122 — before falling through to the common
-        // residual-call tail, stroruni.equal registers seven OS_STREQ_* /
-        // OS_UNIEQ_* slice-comparison side-helpers (str.eq_slice_checknull /
-        // eq_slice_nonnull / eq_slice_char / eq_nonnull / eq_nonnull_char /
-        // eq_checknull_char / eq_lengthok, each shifted by _OS_offset_uni for
-        // UNICODE) via _register_extra_helper. That registration is blocked:
-        // _register_extra_helper → support::builtin_func_for_spec →
-        // setup_extra_builtin resolves each helper's host fnaddr and panics on
-        // a miss, and pyre deliberately does not host-bind the str.eq_*
-        // helpers — Python strings are W_UnicodeObject (native WTF-8), not the
-        // rstr.STR `{hash, chars}` GcStruct these helpers index (see
-        // jit_fnaddr.rs `jit_trace_fnaddrs` and blackhole.rs next to
-        // `bhimpl_int_and`). The side-registrations are consumed only by the
-        // string-optimization pass; their absence does not affect the main
-        // OS_STR_EQUAL / OS_UNI_EQUAL residual call emitted by the tail below,
-        // which resolves the primary helper through fnaddr_for_target like
-        // concat/slice/cmp. Wire the extra-helper loop once the rstr.STR
-        // runtime layout and str.eq_* host bodies land.
+        // jtransform.py _handle_stroruni_call: stroruni.equal also registers
+        // the OS_STREQ_* / OS_UNIEQ_* helpers vstring substitutes for it.
+        // Upstream reaches the loop only past the STR / UNICODE dispatch.
+        if oopspec_name == "stroruni.equal"
+            && matches!(kind, StrOrUniKind::Str | StrOrUniKind::Unicode)
+        {
+            self.register_stroruni_equal_extra_helpers(&kind);
+        }
 
         // jtransform.py:2059-2072 — the OS_STR_* / OS_UNI_* index selected by
         // the STR vs UNICODE operand. BYTEARRAY → NotSupported (None); any
@@ -7453,6 +7457,166 @@ impl<'a> Transformer<'a> {
             Some(extra),
             None,
         ))
+    }
+
+    /// The `stroruni.equal` loop of `jtransform.py _handle_stroruni_call`:
+    ///
+    /// ```python
+    /// for otherindex, othername, argtypes, resulttype in [...]:
+    ///     if args[0].concretetype.TO == rstr.UNICODE:
+    ///         otherindex += EffectInfo._OS_offset_uni
+    ///     self._register_extra_helper(otherindex, othername,
+    ///                                 argtypes, resulttype,
+    ///                                 EffectInfo.EF_ELIDABLE_CANNOT_RAISE)
+    /// ```
+    ///
+    /// `OopSpecIndex` is an enum, so each row names both the `OS_STREQ_*`
+    /// index and its `_OS_offset_uni` twin.
+    fn register_stroruni_equal_extra_helpers(&mut self, kind: &StrOrUniKind) {
+        use majit_ir::value::Type::{Int, Ref};
+        // SoU and CHR are Ref and Int on the pyre side.
+        let rows: [(OopSpecIndex, OopSpecIndex, &str, &[majit_ir::value::Type]); 7] = [
+            (
+                OopSpecIndex::StreqSliceChecknull,
+                OopSpecIndex::UnieqSliceChecknull,
+                "str.eq_slice_checknull",
+                &[Ref, Int, Int, Ref],
+            ),
+            (
+                OopSpecIndex::StreqSliceNonnull,
+                OopSpecIndex::UnieqSliceNonnull,
+                "str.eq_slice_nonnull",
+                &[Ref, Int, Int, Ref],
+            ),
+            (
+                OopSpecIndex::StreqSliceChar,
+                OopSpecIndex::UnieqSliceChar,
+                "str.eq_slice_char",
+                &[Ref, Int, Int, Int],
+            ),
+            (
+                OopSpecIndex::StreqNonnull,
+                OopSpecIndex::UnieqNonnull,
+                "str.eq_nonnull",
+                &[Ref, Ref],
+            ),
+            (
+                OopSpecIndex::StreqNonnullChar,
+                OopSpecIndex::UnieqNonnullChar,
+                "str.eq_nonnull_char",
+                &[Ref, Int],
+            ),
+            (
+                OopSpecIndex::StreqChecknullChar,
+                OopSpecIndex::UnieqChecknullChar,
+                "str.eq_checknull_char",
+                &[Ref, Int],
+            ),
+            (
+                OopSpecIndex::StreqLengthok,
+                OopSpecIndex::UnieqLengthok,
+                "str.eq_lengthok",
+                &[Ref, Ref],
+            ),
+        ];
+        for (str_index, uni_index, othername, argtypes) in rows {
+            let otherindex = if matches!(kind, StrOrUniKind::Unicode) {
+                uni_index
+            } else {
+                str_index
+            };
+            self._register_extra_helper(
+                otherindex,
+                othername,
+                argtypes,
+                Int,
+                ExtraEffect::ElidableCannotRaise,
+            );
+        }
+    }
+
+    /// Port of `jtransform.py _register_extra_helper`:
+    ///
+    /// ```python
+    /// def _register_extra_helper(self, oopspecindex, oopspec_name,
+    ///                            argtypes, resulttype, effectinfo):
+    ///     # a bit hackish
+    ///     if self.callcontrol.callinfocollection.has_oopspec(oopspecindex):
+    ///         return
+    ///     c_func, TP = support.builtin_func_for_spec(self.cpu.rtyper,
+    ///                                                oopspec_name, argtypes,
+    ///                                                resulttype)
+    ///     op = SpaceOperation('pseudo_call_cannot_raise',
+    ///                         [c_func] + [varoftype(T) for T in argtypes],
+    ///                         varoftype(resulttype))
+    ///     calldescr = self.callcontrol.getcalldescr(op, oopspecindex,
+    ///                                               effectinfo,
+    ///                                               calling_graph=self.graph)
+    ///     func = ptr2int(c_func.value)
+    ///     self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
+    /// ```
+    fn _register_extra_helper(
+        &mut self,
+        oopspecindex: OopSpecIndex,
+        oopspec_name: &str,
+        argtypes: &[majit_ir::value::Type],
+        resulttype: majit_ir::value::Type,
+        effectinfo: ExtraEffect,
+    ) {
+        let Some(cc) = self.callcontrol.as_deref_mut() else {
+            return;
+        };
+        if cc.callinfocollection.has_oopspec(oopspecindex) {
+            return;
+        }
+        // A codewriter run without the host's helper table (the build-time
+        // LLBC pipeline) has no `_ll_*` binding to hand
+        // `setup_extra_builtin`; skip the row the way `find_all_graphs`'s
+        // `inline_calls_to` seed loop does. The runtime seeds the same rows
+        // from the bound helpers.
+        let canonical = crate::parse::CallPath::from_segments([format!(
+            "_ll_{}_{}",
+            argtypes.len(),
+            oopspec_name.replace('.', "_"),
+        )]);
+        if cc.lookup_function_fnaddr(&canonical).is_none() {
+            return;
+        }
+        let spec = crate::support::builtin_func_for_spec(
+            Some(cc),
+            oopspec_name,
+            argtypes,
+            resulttype,
+            None,
+            None,
+        );
+        // `pseudo_call_cannot_raise` is a direct call to `c_func` for
+        // `getcalldescr`; only its arity and target are read.
+        let op = SpaceOperation {
+            result: Some(crate::flowspace::model::Variable::default()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path([spec.impl_name.as_str()]),
+                args: argtypes
+                    .iter()
+                    .map(|_| LinkArg::from(crate::flowspace::model::Variable::default()))
+                    .collect(),
+                result_ty: ValueType::Int,
+            },
+        };
+        let calldescr = cc.getcalldescr(
+            &op,
+            argtypes.to_vec(),
+            resulttype,
+            oopspecindex,
+            Some(effectinfo),
+            &mut self.analysis_cache,
+            None,
+        );
+        let func = spec.fnaddr as u64;
+        cc.callinfocollection
+            .add(oopspecindex, calldescr.to_descr_ref(), func);
+        cc.callinfocollection
+            .register_func_name(func, spec.impl_name);
     }
 
     /// Port of `jtransform.py _handle_rgc_call`, `ll_shrink_array` arm:
@@ -21376,16 +21540,51 @@ mod tests {
         );
     }
 
-    /// jtransform.py:2087-2128 — `stroruni.equal` emits the main OS_STR_EQUAL
-    /// residual call (via the common tail) even though the seven
-    /// OS_STREQ_*/OS_UNIEQ_* extra-helper side-registrations remain blocked on
-    /// the unported str.eq_* host bodies.
+    /// `jtransform.py _handle_stroruni_call` — `stroruni.equal` emits the
+    /// OS_STR_EQUAL residual call and registers the seven OS_STREQ_* helpers
+    /// through `_register_extra_helper`.
     #[test]
     fn stroruni_equal_lowers_to_str_equal_residual_call() {
+        stroruni_equal_lowering_case(true);
+    }
+
+    /// A codewriter without the host's `_ll_*` table (the build-time LLBC
+    /// pipeline) still lowers `stroruni.equal` and leaves the extra-helper
+    /// rows out instead of failing `setup_extra_builtin`.
+    #[test]
+    fn stroruni_equal_skips_extra_helpers_the_host_has_not_bound() {
+        stroruni_equal_lowering_case(false);
+    }
+
+    fn stroruni_equal_lowering_case(bind_helpers: bool) {
         use crate::call::CallControl;
+        use crate::parse::CallPath;
         use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
 
+        let extras = [
+            (
+                OopSpecIndex::StreqSliceChecknull,
+                "_ll_4_str_eq_slice_checknull",
+            ),
+            (
+                OopSpecIndex::StreqSliceNonnull,
+                "_ll_4_str_eq_slice_nonnull",
+            ),
+            (OopSpecIndex::StreqSliceChar, "_ll_4_str_eq_slice_char"),
+            (OopSpecIndex::StreqNonnull, "_ll_2_str_eq_nonnull"),
+            (OopSpecIndex::StreqNonnullChar, "_ll_2_str_eq_nonnull_char"),
+            (
+                OopSpecIndex::StreqChecknullChar,
+                "_ll_2_str_eq_checknull_char",
+            ),
+            (OopSpecIndex::StreqLengthok, "_ll_2_str_eq_lengthok"),
+        ];
         let mut cc = CallControl::new();
+        if bind_helpers {
+            for (i, (_, name)) in extras.iter().enumerate() {
+                cc.register_function_fnaddr(CallPath::from_segments([*name]), 0x1000 + i as i64);
+            }
+        }
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
 
@@ -21439,6 +21638,26 @@ mod tests {
             "expected an oopspec StrEqual note, got {:?}",
             transformer.notes
         );
+        drop(transformer);
+        for (i, (oopspec, name)) in extras.iter().enumerate() {
+            if !bind_helpers {
+                assert!(!cc.callinfocollection.has_oopspec(*oopspec), "{name}");
+                continue;
+            }
+            let (calldescr, func) = cc.callinfocollection.callinfo_for_oopspec(*oopspec);
+            assert_eq!(func, 0x1000 + i as u64, "{name}");
+            let calldescr = calldescr.unwrap_or_else(|| panic!("{name} has no calldescr"));
+            let effect = calldescr
+                .as_call_descr()
+                .map(|cd| cd.get_extra_info().clone())
+                .unwrap_or_else(|| panic!("{name} calldescr is not a call descr"));
+            assert_eq!(
+                effect.extraeffect,
+                ExtraEffect::ElidableCannotRaise,
+                "{name}"
+            );
+            assert_eq!(effect.oopspecindex, *oopspec, "{name}");
+        }
     }
 
     /// jtransform.py — `rgc.ll_shrink_array` lowers to a residual

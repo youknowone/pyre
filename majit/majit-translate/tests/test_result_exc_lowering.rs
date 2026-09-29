@@ -248,6 +248,36 @@ fn check_len_result_match_does_not_rebuild_a_result_shell() {
 }
 
 #[test]
+fn payload_less_intermediate_result_does_not_decline_the_callee() {
+    // `getitem_str` matches on `i64::try_from(&rbigint)`, whose `Err` wraps a
+    // zero-sized error and so writes no `__pos_0`.  That shell is consumed in
+    // the graph and never reaches `returnblock`; the callee's own
+    // `Result<_, PyError>` returns must still lower.
+    let graph = lower_function(interp(), "pyre_interpreter::baseobjspace::getitem_str")
+        .expect("lower getitem_str");
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { owner_path, .. },
+                ..
+            } = &op.kind
+            {
+                let owner = owner_path.join("::");
+                assert!(
+                    !owner.contains("PyError"),
+                    "PyError Result shell ctor still built: {owner}"
+                );
+            }
+        }
+    }
+    // Its literal-message `IndexError` must fuse: a `PyError` aggregate left
+    // in the graph hands the materialiser a `STR` word read as a `Wtf8Buf`.
+    let (fused, _materialise, _ctors) =
+        raise_path_calls("pyre_interpreter::baseobjspace::getitem_str");
+    assert!(fused > 0, "getitem_str's literal IndexError must fuse");
+}
+
+#[test]
 fn list_append_underflow_lowers_to_raise_links() {
     let llbc = interp();
     // `opcode_list_append`'s `depth == 0` arm returns
@@ -632,7 +662,8 @@ fn raise_path_calls(name: &str) -> (usize, usize, usize) {
             match segments.last().map(String::as_str) {
                 Some("pyerror_type_error_to_exc_object")
                 | Some("pyerror_zero_division_to_exc_object")
-                | Some("pyerror_value_error_to_exc_object") => fused += 1,
+                | Some("pyerror_value_error_to_exc_object")
+                | Some("pyerror_index_error_to_exc_object") => fused += 1,
                 Some("pyerror_to_exc_object") => materialise += 1,
                 Some(_) if segments.len() >= 2 && segments[segments.len() - 2] == "PyError" => {
                     ctors += 1

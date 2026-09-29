@@ -1361,17 +1361,6 @@ pub extern "C" fn jit_str_repeat(s: PyObjectRef, n: i64) -> PyObjectRef {
 }
 
 #[majit_macros::elidable]
-pub extern "C" fn jit_str_compare(a: PyObjectRef, b: PyObjectRef) -> i64 {
-    unsafe {
-        // WTF-8 byte order matches code point order, so the byte
-        // comparison yields the same result as comparing code points.
-        let sa = w_str_get_wtf8(a).as_bytes();
-        let sb = w_str_get_wtf8(b).as_bytes();
-        crate::object_array::ll_chars_strcmp(sa, sb) as i64
-    }
-}
-
-#[majit_macros::elidable]
 pub extern "C" fn jit_str_is_true(s: PyObjectRef) -> i64 {
     unsafe { (w_str_len(s) != 0) as i64 }
 }
@@ -1538,7 +1527,8 @@ pub extern "C" fn jit_str_contains(haystack: PyObjectRef, needle: PyObjectRef) -
 /// `unicodeobject.py _unwrap_and_search` / `descr_find` with default
 /// bounds.  The search is `_utf8.find` after `_index_to_byte`; the
 /// result comes back through `_byte_to_index`.  Index-table memoization
-/// is the same write `jit_str_getitem` already admits as elidable.
+/// stores exactly what the next call would recompute, so the call stays
+/// elidable.
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_str_find(s: PyObjectRef, sub: PyObjectRef) -> i64 {
     jit_str_search_bounds(s, sub, 0, i64::MAX, true)
@@ -1571,28 +1561,6 @@ pub extern "C" fn jit_str_rfind_bounds(
     end: i64,
 ) -> i64 {
     jit_str_search_bounds(s, sub, start, end, false)
-}
-
-/// `_unicode_sliced` (`unicodeobject.py`) with already-unboxed
-/// code-point bounds and step 1.  The payload cut is `_utf8[start_byte:
-/// end_byte]` after `_index_to_byte`.  The wrap is `w_str_cut`:
-/// `ll_stringslice_startstop` returns the source STR when the window is
-/// the whole string (`start == 0 and stop >= len`), and `is_w` then
-/// reports `s[:] is s` via `_utf8` identity.  Not elidable: two
-/// `s[1:4]` sites allocate two wrappers / payloads (`is_w` of `_len() > 1`).
-pub extern "C" fn jit_str_slice(s: PyObjectRef, start: i64, end: i64) -> PyObjectRef {
-    unsafe {
-        let Some((lo, hi)) = str_byte_window(s, start, end) else {
-            // `_empty()`.  `w_str_new` is the immortal constructor: from a
-            // residual call it would leave one unreclaimable header and
-            // payload behind per `s[5:2]`.
-            return w_str_new_managed("");
-        };
-        let hay = w_str_get_wtf8(s);
-        let part = rustpython_wtf8::Wtf8::from_bytes(&hay.as_bytes()[lo..hi])
-            .expect("code-point-aligned slice is WTF-8");
-        w_str_cut(s, part)
-    }
 }
 
 /// `descr_count` / `ll_count`. The search is `ll_search` ->
@@ -1731,9 +1699,9 @@ pub unsafe fn w_str_next_codepoint_pos_dont_look_inside(obj: PyObjectRef, pos: u
 /// `ll_stringslice_startstop` (`@jit.oopspec('stroruni.slice')`); the
 /// wrap is `space.newutf8`.
 ///
-/// Residual: the walker folds exact-str getitem.  Looking inside this
-/// body currently hits `stroruni.slice` with a first argument whose
-/// concretetype is not `rpy_string`.  Unseal with the wrap helper.
+/// Residual (through the one-word `w_str_getitem_word` bridge): looking
+/// inside this body currently hits `stroruni.slice` with a first argument
+/// whose concretetype is not `rpy_string`.  Unseal with the wrap helper.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
@@ -1751,47 +1719,6 @@ pub unsafe fn w_str_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef>
     let utf8 = unsafe { w_str_storage(obj) };
     let sliced = crate::lowlevel_string::ll_stringslice_startstop(utf8, start as i64, end as i64);
     Some(w_str_from_storage_and_length(sliced, 1))
-}
-
-/// `s[i]` on an exact `str` with a non-negative machine-int index: the scalar
-/// arm of `descr_getitem` (`unicodeobject.py`), restricted to what it answers
-/// without running Python.
-///
-/// The receiver crosses as a boxed reference and the index as a raw machine
-/// integer.  A `PY_NULL` declines and resumes the subscript in the
-/// interpreter, which is where negative indices, `IndexError`, `__index__`
-/// coercion and every non-exact receiver belong.
-///
-/// Elidable despite `w_str_get_index_storage`: a non-ASCII payload memoizes
-/// its code-point index table on first read, and that write stores exactly
-/// what the next call would recompute — the same shape as the string hash
-/// `try_hash_value` memoizes, which `EffectInfo.__new__` already admits for
-/// an `EF_ELIDABLE_*` call.  A `str` is immutable, so the code point at an
-/// index is fixed for the life of the object.  Its only failure is the
-/// allocation, so `call.py getcalldescr` picks its `cr == "mem"` branch
-/// rather than the conservative can-raise one.
-#[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_str_getitem(obj: PyObjectRef, index: i64) -> PyObjectRef {
-    // The index is a machine int, 64-bit on every target, while `usize` is
-    // 32 bits on the wasm guest.  Converting is what declines a negative
-    // index and one past `usize::MAX` alike: an `as` cast would truncate
-    // `2**32` to `0` and answer `s[0]` where the interpreter raises
-    // `IndexError`.
-    let Ok(index) = usize::try_from(index) else {
-        return PY_NULL;
-    };
-    if obj.is_null() {
-        return PY_NULL;
-    }
-    unsafe {
-        if !crate::pyobject::is_exact_type(obj, &crate::pyobject::STR_TYPE) {
-            return PY_NULL;
-        }
-        match w_str_codepoint_at(obj, index) {
-            Some(code_point) => w_str_from_codepoint(code_point.to_u32()),
-            None => PY_NULL,
-        }
-    }
 }
 
 /// The text [`jit_int_str`] wraps.  Split out so a caller can check what the
@@ -1944,15 +1871,6 @@ mod tests {
         assert_eq!(jit_str_count_bounds(hay, needle, 0, i64::MAX), 2);
         assert_eq!(jit_str_count_bounds(hay, needle, 2, 6), 1);
         assert_eq!(jit_str_find_bounds(hay, needle, 2, 6), 5);
-        let sliced = jit_str_slice(hay, 1, 4);
-        unsafe {
-            assert_eq!(w_str_get_wtf8(sliced), "二三四");
-        }
-        let full = jit_str_slice(hay, 0, unsafe { w_str_len(hay) } as i64);
-        assert!(
-            std::ptr::eq(full, hay),
-            "full-window slice must reuse the receiver (`ll_stringslice_startstop` / `is_w`)"
-        );
     }
 
     #[test]
@@ -2052,9 +1970,6 @@ mod tests {
         unsafe {
             assert_eq!(w_str_get_wtf8(cat), "abcd");
             assert_eq!(w_str_get_wtf8(rep), "ababab");
-            assert!(jit_str_compare(a, b) < 0);
-            assert_eq!(jit_str_compare(a, a), 0);
-            assert!(jit_str_compare(b, a) > 0);
             assert_eq!(jit_str_is_true(a), 1);
             assert_eq!(jit_str_is_true(w_str_new("")), 0);
         }
