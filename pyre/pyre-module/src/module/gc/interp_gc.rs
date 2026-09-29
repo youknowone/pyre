@@ -140,13 +140,13 @@ pub(super) fn _run_finalizers() -> Result<(), pyre_interpreter::PyError> {
     };
     let temp_reenable = !uda.enabled_at_app_level;
     if temp_reenable {
-        enable_finalizers()?;
+        __enable_finalizers_impl()?;
     }
     if let Some(uda) = user_del_action() {
         uda._run_finalizers();
     }
     if temp_reenable {
-        disable_finalizers();
+        __disable_finalizers_impl();
     }
     Ok(())
 }
@@ -169,7 +169,10 @@ pub(crate) fn run_finalizers_now() {
 }
 
 /// `interp_gc.py collect`.
-pub(super) fn collect(generation: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+#[pyre_interpreter::pyre_function]
+pub(super) fn collect(
+    #[default(w_int_new(NUM_GENERATIONS - 1))] generation: PyObjectRef,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // `interp_gc.py collect` unwraps the optional generation as an int
     // and then ignores it, because the frontend it belongs to has no
     // generations to select between.  This one does: `NUM_GENERATIONS`
@@ -200,6 +203,7 @@ pub(super) fn collect(generation: PyObjectRef) -> Result<PyObjectRef, pyre_inter
 }
 
 /// `interp_gc.py collect_step`, running `StepCollector.do`.
+#[pyre_interpreter::pyre_function]
 pub(super) fn collect_step() -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // interp_gc.py StepCollector: the app-level finalizer drain
     // is a virtual fifth state after the collector has returned to
@@ -226,7 +230,7 @@ pub(super) fn enable(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpre
         && !uda.enabled_at_app_level
     {
         uda.enabled_at_app_level = true;
-        enable_finalizers()?;
+        __enable_finalizers_impl()?;
     }
     Ok(w_none())
 }
@@ -239,7 +243,7 @@ pub(super) fn disable(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpr
         && uda.enabled_at_app_level
     {
         uda.enabled_at_app_level = false;
-        disable_finalizers();
+        __disable_finalizers_impl();
     }
     Ok(w_none())
 }
@@ -254,6 +258,7 @@ pub(super) fn isenabled(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_inter
 }
 
 /// `interp_gc.py enable_finalizers`.
+#[pyre_interpreter::pyre_function]
 pub(super) fn enable_finalizers() -> Result<(), pyre_interpreter::PyError> {
     // Unlike gc.enable(), an unmatched enable is an error rather than a
     // no-op. Before UserDelAction is installed there cannot have been a
@@ -284,6 +289,7 @@ pub(super) fn enable_finalizers() -> Result<(), pyre_interpreter::PyError> {
 }
 
 /// `interp_gc.py disable_finalizers`.
+#[pyre_interpreter::pyre_function]
 pub(super) fn disable_finalizers() {
     // The lock is recursive and deliberately independent of gc.isenabled().
     if let Some(uda) = user_del_action() {

@@ -540,6 +540,24 @@ pub fn set_jit_param_string(text: &str) -> Result<(), ()> {
     }
 }
 
+// `jit.set_param(None, 'enable_opts', text)`. The value is one string,
+// not a comma-separated parameter list.
+type SetJitParamEnableOptsFn = fn(value: &str);
+static SET_JIT_PARAM_ENABLE_OPTS_HOOK: OnceLock<SetJitParamEnableOptsFn> = OnceLock::new();
+
+/// Register the hook that forwards `enable_opts` into
+/// `WarmState::set_param_enable_opts`. Called by pyre-jit at startup.
+pub fn register_set_jit_param_enable_opts_hook(f: SetJitParamEnableOptsFn) {
+    let _ = SET_JIT_PARAM_ENABLE_OPTS_HOOK.set(f);
+}
+
+/// `jit.set_param(None, 'enable_opts', text)`. No-op when the hook is absent.
+pub fn set_jit_param_enable_opts(value: &str) {
+    if let Some(hook) = SET_JIT_PARAM_ENABLE_OPTS_HOOK.get() {
+        hook(value);
+    }
+}
+
 /// jd1 (`unpackiterable_driver`) merge-point hook. pyre-interpreter cannot
 /// import pyre-jit (its upper crate), so the JIT registers this at boot and the
 /// `unpackiterable_driver.jit_merge_point` marker calls through it. Mirrors the

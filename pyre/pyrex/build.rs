@@ -1,6 +1,7 @@
 use std::path::Path;
 
 fn main() {
+    forward_minimal_curses_link_args();
     let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     // INTERPRETER_THREAD_STACK_SIZE in lib.rs is 256 MiB (0x10000000). The
     // linker, not setrlimit, is what sizes the origin thread's stack on
@@ -38,6 +39,28 @@ fn main() {
         }
     }
     embed_windows_manifest(&target);
+}
+
+/// `ExternalCompilationInfo.link_extra`, carried as
+/// `DEP_PYRE_MINIMAL_CURSES_LINK_ARG_<n>`.
+fn forward_minimal_curses_link_args() {
+    let mut args: Vec<(u32, String)> = Vec::new();
+    for (key, value) in std::env::vars() {
+        let Some(suffix) = key.strip_prefix("DEP_PYRE_MINIMAL_CURSES_LINK_ARG_") else {
+            continue;
+        };
+        let Ok(index) = suffix.parse::<u32>() else {
+            continue;
+        };
+        args.push((index, value));
+    }
+    args.sort_by_key(|(index, _)| *index);
+    for (_, arg) in args {
+        println!("cargo::rustc-link-arg-bins={arg}");
+        println!("cargo::rustc-link-arg-tests={arg}");
+        println!("cargo::rustc-link-arg-examples={arg}");
+        println!("cargo::rustc-link-arg-benches={arg}");
+    }
 }
 
 /// Embed `python.manifest` in the Windows executables, the way

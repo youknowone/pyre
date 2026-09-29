@@ -46,50 +46,6 @@ pyre_interpreter::py_module! {
         "GcRef"               => gcref::type_object(),
         "hooks"               => hook::hooks_object(),
     },
-    inline_functions: {
-        fn collect(
-            #[default(w_int_new(interp_gc::NUM_GENERATIONS - 1))] generation: PyObjectRef,
-        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            interp_gc::collect(generation)
-        }
-
-        fn collect_step() -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            interp_gc::collect_step()
-        }
-
-        fn enable_finalizers() -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            interp_gc::enable_finalizers()?;
-            Ok(w_none())
-        }
-
-        fn disable_finalizers() -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            interp_gc::disable_finalizers();
-            Ok(w_none())
-        }
-
-        fn get_objects(
-            #[default(w_none())] generation: PyObjectRef,
-        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            referents::get_objects(generation)
-        }
-
-        fn _get_stats(
-            #[default(w_bool_from(false))] memory_pressure: PyObjectRef,
-        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            // referents.py `@unwrap_spec(memory_pressure=bool)`.
-            Ok(stats::new(pyre_interpreter::baseobjspace::is_true(memory_pressure)?))
-        }
-
-        fn get_stats(
-            #[default(w_bool_from(false))] memory_pressure: PyObjectRef,
-        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            app_referents::new_public_gc_stats(pyre_interpreter::baseobjspace::is_true(memory_pressure)?)
-        }
-
-        fn dump_rpy_heap(file: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            app_referents::dump_rpy_heap_public(file)
-        }
-    },
     functions: {
         "disable"              / 0 = interp_gc::disable,
         "enable"               / 0 = interp_gc::enable,
@@ -113,6 +69,85 @@ pyre_interpreter::py_module! {
         "freeze"               / 0 = interp_gc::freeze,
         "unfreeze"             / 0 = interp_gc::unfreeze,
         "get_freeze_count"     / 0 = interp_gc::get_freeze_count,
+    },
+    // moduledef.py binds these by submodule path (`interp_gc.collect`,
+    // `referents.get_stats`, `app_referents.dump_rpy_heap`). The function
+    // pointer is that submodule function; this table only stores it.
+    extra_init: |ns| {
+        let mut ns = ns;
+        fn install(
+            mut ns: PyObjectRef,
+            name: &'static str,
+            func: pyre_interpreter::BuiltinCodeFn,
+            arity: u16,
+            sig: Option<pyre_interpreter::Signature>,
+        ) -> PyObjectRef {
+            let value = pyre_object::with_roots!(ns => pyre_interpreter::gateway::with_module(
+                "gc",
+                pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
+                    name, func, arity, sig,
+                ),
+            ));
+            pyre_interpreter::module_ns_store(ns, name, value);
+            ns
+        }
+        ns = install(
+            ns,
+            "collect",
+            interp_gc::collect,
+            interp_gc::collect_pyre_arity(),
+            interp_gc::collect_pyre_sig(),
+        );
+        ns = install(
+            ns,
+            "collect_step",
+            interp_gc::collect_step,
+            interp_gc::collect_step_pyre_arity(),
+            interp_gc::collect_step_pyre_sig(),
+        );
+        ns = install(
+            ns,
+            "enable_finalizers",
+            interp_gc::enable_finalizers,
+            interp_gc::enable_finalizers_pyre_arity(),
+            interp_gc::enable_finalizers_pyre_sig(),
+        );
+        ns = install(
+            ns,
+            "disable_finalizers",
+            interp_gc::disable_finalizers,
+            interp_gc::disable_finalizers_pyre_arity(),
+            interp_gc::disable_finalizers_pyre_sig(),
+        );
+        ns = install(
+            ns,
+            "get_objects",
+            referents::get_objects,
+            referents::get_objects_pyre_arity(),
+            referents::get_objects_pyre_sig(),
+        );
+        ns = install(
+            ns,
+            "_get_stats",
+            referents::get_stats,
+            referents::get_stats_pyre_arity(),
+            referents::get_stats_pyre_sig(),
+        );
+        ns = install(
+            ns,
+            "get_stats",
+            app_referents::get_stats,
+            app_referents::get_stats_pyre_arity(),
+            app_referents::get_stats_pyre_sig(),
+        );
+        ns = install(
+            ns,
+            "dump_rpy_heap",
+            app_referents::dump_rpy_heap,
+            app_referents::dump_rpy_heap_pyre_arity(),
+            app_referents::dump_rpy_heap_pyre_sig(),
+        );
+        let _ = ns;
     },
 }
 
