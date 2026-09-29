@@ -37015,6 +37015,29 @@ fn type_node_fn_def_fun_id<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) 
     None
 }
 
+/// Direct-call `FunctionPath` segments of a `FnDef` type, or `None` when
+/// `ty` is not a named function item.
+fn tyref_fn_def_call_segments(ty: &TyRef, llbc: &Llbc) -> Option<Vec<String>> {
+    let fun_id = type_node_fn_def_fun_id(tyref_node(ty, llbc)?, llbc)?;
+    let fd = llbc.fn_by_id(fun_id)?;
+    let segments = fundecl_fn_item_segments(llbc, fd);
+    (!segments.is_empty()).then_some(segments)
+}
+
+/// Callable named by a combinator's second argument when that argument is a
+/// function item: a `FnDef` constant, or a Copy/Move of a `FnDef`-typed
+/// local.  `None` for a closure ADT (handled via `call_once`) and for any
+/// unproven shape.
+fn operand_fn_item_segments(llbc: &Llbc, op: Option<&Operand>) -> Option<Vec<String>> {
+    match op? {
+        Operand::Const(value) => match decode_constant(llbc, value) {
+            Ok(DecodedConst::FnPath(segments)) if !segments.is_empty() => Some(segments),
+            _ => None,
+        },
+        Operand::Copy(p) | Operand::Move(p) => tyref_fn_def_call_segments(&p.ty, llbc),
+    }
+}
+
 /// The `FunDecl` a combinator's function-item argument names — the operand
 /// shapes [`operand_fn_item_segments`] accepts.
 fn operand_fn_item_decl<'l>(llbc: &'l Llbc, op: Option<&Operand>) -> Option<&'l FunDecl> {
@@ -42418,6 +42441,7 @@ fn rewire_disc_combinator_diamond(
     if site.kind == DiscCombinator::OptionFilter {
         return rewire_option_filter_diamond(graph, site, a, ci, recv, extra, flow_result, &name);
     }
+    let exception_lowered = matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException));
     let [exit] = graph.blocks[a].exits.as_slice() else {
         if exception_lowered && graph.blocks[a].exits.len() == 2 {
             return rewire_result_map_last_exception(
@@ -42978,13 +43002,10 @@ fn build_disc_arm(
     }
 }
 
-/// Run a Result combinator's callable on `payload` in `block`: a function
-/// item directly, a closure as `call_once(env, (payload,))` with the env
-/// threaded in as `extra`.
+/// Rewrite a Result combinator whose call `result_exc` already made can-raise.
 #[allow(clippy::too_many_arguments)]
-fn emit_disc_callable(
+fn rewire_result_map_last_exception(
     graph: &mut FunctionGraph,
-    block: BlockId,
     site: &DiscCombinatorSite,
     spec: crate::ErrorCarrierSpec<'_>,
     (a, ci): (usize, usize),

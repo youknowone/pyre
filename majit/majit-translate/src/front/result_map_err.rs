@@ -362,10 +362,9 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
 }
 
 /// Close `block` by raising the error carrier `carrier` along `exceptional`,
-/// the exception edge of a call `result_exc` made can-raise: the carrier is
-/// materialised as the trace-level exception object and fills the edge's
-/// `last_exception` / `last_exc_value` slots; every other value is remapped
-/// through `sources` → `inputs`.
+/// the exception edge of a call `result_exc` made can-raise. The edge's
+/// `last_exception` / `last_exc_value` slots carry `carrier`; every other
+/// value is remapped through `sources` → `inputs`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn raise_carrier_on_exception_edge(
     graph: &mut FunctionGraph,
@@ -387,8 +386,10 @@ pub(crate) fn raise_carrier_on_exception_edge(
         .as_ref()
         .and_then(LinkArg::as_variable)
         .ok_or_else(|| format!("{name}: exceptional edge lacks last_exc_value"))?;
-    let exc =
-        crate::front::result_exc::materialize_error_to_exc_object(graph, block, carrier, spec);
+    // The edge carries the carrier. `codewriter::error_carrier_edges` turns
+    // it into the runtime exception value.
+    let _ = spec;
+    let exc = carrier;
     let args = exceptional
         .args
         .iter()
