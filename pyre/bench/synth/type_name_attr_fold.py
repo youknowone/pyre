@@ -3,14 +3,10 @@ N = 120000
 M = 4000
 
 # `cls.__name__` read from inside a method the enclosing `for` loop inlines.
-# The read folds to the class's name slot under two guards -- the receiver is a
-# type, and its metaclass is `type` -- so what this pins is the ways that can
-# be wrong: a rename must be seen, because the slot is read live rather than
-# baked, and its object identity must survive; two classes sharing the trace
-# must each report their own name, since the fold deliberately does not pin
-# which class arrived; a class dict entry of the same name must lose, because
-# the metatype descriptor is consulted first; and any metaclass other than
-# `type` must not be folded past at all.
+# A rename must be seen and the name object's identity must survive. Two
+# classes sharing the trace must each report their own name. A class-dict
+# entry of the same name loses, because the metatype descriptor is consulted
+# first. A metaclass other than `type` must not take that path.
 
 
 class Base:

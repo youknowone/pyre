@@ -6348,8 +6348,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // reads the slot off its raw address: the allocator hands the next
         // incarnation the same address, so the peeled body's load disagrees
         // with what the heap cache holds for that address and trips
-        // `_opimpl_getfield_gc_any_pureornot`'s sanity check.  Same test the
-        // `set_function_attribute` fold uses to tell the two apart.
+        // `_opimpl_getfield_gc_any_pureornot`'s sanity check.
         if ctx.trace_ctx.heap_cache().is_unescaped(callable_guard_op) {
             return resolved_inline_decline(op.pc, line!());
         }
@@ -6898,15 +6897,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // body reads `self.attr` — was admitted here only once the
                 // receiver was proven not to be a type object, because a type
                 // receiver's read went through `type.__getattribute__` and
-                // reached the deferred abort path.  That read folds now
-                // ([`try_walker_specialize_load_type_name_attr`]), so a type
-                // receiver reaches no residual to abort on either and the proof
-                // is no longer what admits it: a classmethod body reading
-                // `cls.__name__` measured 1082 ns/iter on the decline against
-                // 1.6 once admitted.  A body whose attribute read does NOT fold
-                // — any metaclass other than `type` — still aborts once and is
-                // denied, which is what this arm's promise has always rested
-                // on.
+                // reached the deferred abort path.  `cls.__name__` on a class
+                // whose metaclass is `type` is traced through the metatype
+                // data descriptor, so that receiver leaves no residual to
+                // abort on.  Any other metaclass still aborts once and is
+                // denied.
                 //
                 // A callee with its own exception handler has protected-region
                 // state that must be restored at the callee's precise resume

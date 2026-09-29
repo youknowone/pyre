@@ -7467,18 +7467,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // BUILD_STRING of already-str fragments: left-fold `descr_add`
-    // (`jit_str_concat`) off the backing-array heap-cache, the same
-    // channel as `BINARY_OP ADD` of two exact `str`s.
-    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BuildStringFromArray
-        && spec_gate(SpecFold::BuildString, || {
-            try_walker_specialize_build_string(ctx, op.pc, &r_args, dst, dst_bank)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // FORMAT_WITH_SPEC: an exact `int` plus a constant decimal spec
     // (`:d` / `:05d`) is `ll_int2dec` + pad, the same split
     // `format_int_or_long` records.  Tried before the Python `__format__`
@@ -8761,25 +8749,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
-    // Emit SET_FUNCTION_ATTRIBUTE's single-slot arms as the `SetfieldGc` they
-    // name on the allocation MAKE_FUNCTION just made, and pass that allocation
-    // through as the result, so the definition sequence stays one virtual
-    // instead of escaping through a call whose opaque result the inline-call
-    // path has to re-read and re-guard.  Falls through to the residual for
-    // every shape it cannot reproduce (SAFE — never declined).
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && runtime_helper_kind == majit_ir::RuntimeHelperKind::SetFunctionAttribute
-        && spec_gate(SpecFold::SetFunctionAttribute, || {
-            try_walker_specialize_set_function_attribute(
-                ctx, op.pc, &i_args, &r_args, dst, dst_bank,
-            )
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // LOAD_DEREF on a constant cell whose binding was only ever filled once:
     // fold to the contents under a `QUASIIMMUT_FIELD(family, ever_mutated)`
     // instead of the opaque read residual, the shape upstream gets for free
@@ -9178,23 +9147,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
 
-    // LoadFastCheck fold: a bound local makes the helper the identity, so the
-    // call becomes the nullity guard.  The residual is
-    // `load_fast_check_fn(value, code, name_idx)`, so `r_args = [value, code]`.
-    if ctx.is_authoritative_executor
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadFastCheck
-    {
-        if let Some(&value_opref) = r_args.first() {
-            if spec_gate(SpecFold::LoadFastCheck, || {
-                try_walker_fold_load_fast_check(ctx, op.pc, value_opref, dst, dst_bank)
-            })?
-            .is_some()
-            {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-        }
-    }
-
     // LoadSpecial fold: replace the `__enter__` / `__exit__` type lookup with
     // the constant descriptor plus an inline `Method` construction the
     // following CALL virtualizes away.  The residual is
@@ -9303,24 +9255,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         )
                     })?
                     .is_some()
-                {
-                    return Ok((DispatchOutcome::Continue, op.next_pc));
-                }
-                // The plain-slot fold wants a mapdict instance and declines a
-                // class; `Cls.__name__` reads the slot the metatype getset
-                // returns instead.
-                if spec_gate(SpecFold::LoadTypeNameAttr, || {
-                    try_walker_specialize_load_type_name_attr(
-                        ctx,
-                        op.pc,
-                        obj_opref,
-                        w_code_ptr,
-                        namei as usize,
-                        dst,
-                        dst_bank,
-                    )
-                })?
-                .is_some()
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
