@@ -1492,6 +1492,7 @@ pub use majit_backend::{JittedGuard, set_jitted, we_are_jitted};
 // harness, and `majit-backend` is not one of its dependencies — every embedder
 // reaches the backends through this crate.
 pub use majit_backend::deadframe::{jitframe_pool_counts, set_jitframe_pool};
+pub use majit_backend::jitframe::malloc_host_jitframe;
 
 // ── rstack criticalcode hooks ──
 // rpython/translator/c/src/stack.h:42-43 LL_stack_criticalcode_start/stop.
