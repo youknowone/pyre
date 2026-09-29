@@ -5171,8 +5171,9 @@ pub fn is_builtin_hasattr_function(callable: PyObjectRef) -> bool {
 /// The JIT walker uses this to recognize the `locals()` residual it can
 /// lower to modelled fastlocals reads; a name rebound to anything else
 /// carries a different builtin code and answers `false`.
+/// The check must name the registered entry.
 pub fn is_builtin_locals_function(callable: PyObjectRef) -> bool {
-    is_builtin_code_function(callable, builtin_locals)
+    is_builtin_code_function(callable, __majit_wrap_builtin_locals)
 }
 
 /// True iff `callable` is the builtin `vars` function object.
@@ -26424,6 +26425,26 @@ crate::builtin_wrapper_descriptor!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The identity helpers must match the function objects installed in the
+    /// builtins namespace. A helper that names an inner body instead of the
+    /// registered entry answers false for the real builtin and the walker
+    /// fold never fires.
+    #[test]
+    fn builtin_namespace_entries_match_identity_helpers() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let ns = pyre_object::gc_roots::pin_root(new_builtin_module_dict());
+        let lookup = |name: &str| {
+            unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+                .unwrap_or_else(|| panic!("builtins namespace has no {name}"))
+        };
+        assert!(is_builtin_locals_function(lookup("locals")));
+        assert!(is_builtin_vars_function(lookup("vars")));
+        assert!(is_builtin_dir_function(lookup("dir")));
+        assert!(is_builtin_getattr_function(lookup("getattr")));
+        assert!(is_builtin_hasattr_function(lookup("hasattr")));
+        assert!(is_builtin_issubclass_function(lookup("issubclass")));
+    }
 
     #[test]
     fn check_surrogate_reports_codepoint_position_like_cpython_314() {
