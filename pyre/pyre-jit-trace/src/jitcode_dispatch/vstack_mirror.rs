@@ -47,6 +47,11 @@ pub(crate) fn classify_vstack_opcode(
         // Single value lands on the new TOS = the last Ref written.
         Instruction::LoadConst { .. }
         | Instruction::LoadSmallInt { .. }
+        // `return_generator` pushes the `None` the following `POP_TOP`
+        // discards (`liveness.rs` net +1). Leaving it unmodeled dropped the
+        // mirror, so the later `YIELD_VALUE` finished with that `None`
+        // instead of the value `LOAD_SMALL_INT` pushed.
+        | Instruction::ReturnGenerator
         | Instruction::LoadFast { .. }
         | Instruction::LoadFastBorrow { .. }
         | Instruction::LoadFastCheck { .. }
@@ -630,13 +635,21 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 // leave an intentional hole so the capture overlay around
                 // stack_sync omits the slot and resume rematerializes it.
                 let mut top = ctx.frame_state.borrow().vstack_last_ref;
-                if top == OpRef::NONE {
-                    // A value `LOAD_CONST` (large int / float) routes its
-                    // result through the unboxed int/float bank, so
-                    // `write_ref_reg` never stamps `vstack_last_ref`.
-                    // Only fill a NONE hole, from `getconstant_w` /
-                    // `w_small_int_const`.
-                    top = loadconst_operand_ref(ctx, code, &instr, op_arg);
+                // `LOAD_CONST` / `LOAD_SMALL_INT` push that constant. A
+                // `ref_copy` renaming does not stamp `vstack_last_ref`, so
+                // the previous opcode's ref (the `None` a generator send
+                // pushed) would otherwise become this TOS and the yield
+                // would finish with it.
+                let const_result = matches!(
+                    instr,
+                    pyre_interpreter::bytecode::Instruction::LoadSmallInt { .. }
+                        | pyre_interpreter::bytecode::Instruction::LoadConst { .. }
+                );
+                if top == OpRef::NONE || const_result {
+                    let from_const = loadconst_operand_ref(ctx, code, &instr, op_arg);
+                    if !from_const.is_none() {
+                        top = from_const;
+                    }
                 }
                 ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = top;
             }
