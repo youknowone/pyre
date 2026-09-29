@@ -57,9 +57,20 @@ fn nursery_spec_folds_gc_type_size() {
                 function.name
             );
         }
+        if function.name == "alloc_exception_nursery" {
+            assert!(
+                function.hints.iter().any(|hint| hint == "dont_look_inside"),
+                "the unspecialized template still carries a Clause TraitConst"
+            );
+        }
         if !function.name.contains("alloc_exception_nursery__spec_") {
             continue;
         }
+        assert!(
+            !function.hints.iter().any(|hint| hint == "dont_look_inside"),
+            "{} folded the const and stays look-inside",
+            function.name
+        );
         let call = function
             .graph()
             .blocks
@@ -109,5 +120,107 @@ fn nursery_spec_folds_gc_type_size() {
     assert!(
         distinct.len() >= 2,
         "base and extended layouts must not share one size: {sizes:?}"
+    );
+}
+
+fn is_trait_const_sentinel(target: &CallTarget) -> bool {
+    call_segments(target).is_some_and(|segments| {
+        segments.len() == 2 && segments[0] == "__str_const" && segments[1] == "__trait_const"
+    })
+}
+
+#[test]
+fn malloc_templates_with_a_clause_size_are_not_look_inside() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(&llbc),
+        HostStaticAddrs::default(),
+        &[],
+        &[
+            "malloc_typed",
+            "malloc_typed_immortal",
+            "malloc_typed_managed",
+            "malloc_typed_stable",
+            "w_module_new_managed",
+        ],
+    )
+    .expect("malloc graphs lower");
+    let names: Vec<_> = program
+        .functions
+        .iter()
+        .map(|function| function.name.as_str())
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.contains("__spec_")),
+        "host builtins are not specialized: {names:?}"
+    );
+    for name in [
+        "malloc_typed",
+        "malloc_typed_immortal",
+        "malloc_typed_managed",
+        "malloc_typed_stable",
+    ] {
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("missing {name} in {names:?}"));
+        let has_sentinel = function.graph().blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(&op.kind, OpKind::Call { target, .. } if is_trait_const_sentinel(target))
+            })
+        });
+        // `malloc_typed` mentions `T::SIZE` only inside `debug_assert`, and
+        // that operand does not survive lowering. The stable and managed
+        // allocators pass it to the hook, so the sentinel stays live.
+        if matches!(name, "malloc_typed_managed" | "malloc_typed_stable") {
+            assert!(has_sentinel, "{name} dropped the unresolved TraitConst");
+        }
+        if !has_sentinel {
+            continue;
+        }
+        assert!(
+            function.hints.iter().any(|hint| hint == "dont_look_inside"),
+            "{name} hints {:?}",
+            function.hints
+        );
+        assert!(
+            function
+                .graph()
+                .hints
+                .iter()
+                .any(|hint| hint == "dont_look_inside"),
+            "{name} graph hints {:?}",
+            function.graph().hints
+        );
+        assert_eq!(
+            function.return_type, None,
+            "{name} FUNC.RESULT must stay unstamped"
+        );
+    }
+    let caller = program
+        .functions
+        .iter()
+        .find(|function| function.name == "w_module_new_managed")
+        .expect("w_module_new_managed");
+    assert!(
+        !caller.hints.iter().any(|hint| hint == "dont_look_inside"),
+        "the caller has no Clause TraitConst: {:?}",
+        caller.hints
+    );
+    let calls_template = caller.graph().blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target, .. } if call_segments(target).is_some_and(|segments| {
+                    segments.last().map(String::as_str) == Some("malloc_typed_stable")
+                        && !segments.iter().any(|segment| segment.contains("__spec_"))
+                })
+            )
+        })
+    });
+    assert!(
+        calls_template,
+        "w_module_new_managed must keep calling malloc_typed_stable"
     );
 }

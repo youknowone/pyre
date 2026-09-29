@@ -3,9 +3,10 @@
 //!
 //! `history.py` `getkind`: a primitive and a raw pointer are `int`; a GC
 //! pointer is `ref`. These graphs used to lie about that — a `*const i64`
-//! deref aliased the pointer (`ref`) out of an `i64` function, `GcType::SIZE`
-//! arrived as `Ref`, and `&i64` / `*mut i64` parameters were `Ref(None)`
-//! while their callers passed the scalar.
+//! deref aliased the pointer (`ref`) out of an `i64` function, and `&i64` /
+//! `*mut i64` parameters were `Ref(None)` while their callers passed the
+//! scalar. An unspecialized `GcType::SIZE` is still a `Clause`, so it stays
+//! the `__trait_const` ref sentinel. That template is `dont_look_inside`.
 
 use majit_charon_reader::Llbc;
 use majit_translate::{
@@ -154,7 +155,7 @@ fn sizehint_deref_loads_an_int_word() {
 }
 
 #[test]
-fn gc_type_size_argument_is_an_int() {
+fn unresolved_gc_type_size_stays_a_ref_sentinel() {
     let llbc = load_object();
     let graph =
         lower_function(&llbc, "lltype::malloc_typed_stable").expect("lower malloc_typed_stable");
@@ -171,9 +172,14 @@ fn gc_type_size_argument_is_an_int() {
     assert_eq!(call.len(), 2, "try_gc_alloc_stable_raw(type_id, T::SIZE)");
     let size = call[1].as_variable().expect("T::SIZE is a value").clone();
     match defining_op(&graph, &size) {
-        Some(OpKind::ConstInt(_) | OpKind::ConstUInt(_)) => {}
-        Some(OpKind::Call { result_ty, .. }) if int_family(result_ty) => {}
-        other => panic!("T::SIZE must be int-kind, got {other:?}"),
+        Some(OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty: ValueType::Ref(_),
+            ..
+        }) if segments.len() == 2
+            && segments[0] == "__str_const"
+            && segments[1] == "__trait_const" => {}
+        other => panic!("unresolved T::SIZE stays the ref sentinel, got {other:?}"),
     }
 }
 

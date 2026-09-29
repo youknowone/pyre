@@ -1366,8 +1366,11 @@ impl<'l> CrateLowering<'l> {
         &self,
         fd: &'l FunDecl,
     ) -> Result<crate::front::semantic::SemanticFunction, DeclBuildError> {
-        let header = self.decl_header(fd);
+        let mut header = self.decl_header(fd);
         let graph = self.build_decl_body(fd)?;
+        // After `FUNC.RESULT` is chosen. Adding the path to the harvested
+        // `dont_look_inside` set would restamp that token.
+        header.residualize_unresolved_trait_const(&graph);
         Ok(header.into_function(graph))
     }
 
@@ -1528,8 +1531,9 @@ impl<'l> CrateLowering<'l> {
         &self,
         req: crate::front::clause_spec::SpecRequest,
     ) -> Option<crate::front::semantic::SemanticFunction> {
-        let spec = self.declare_spec(req)?;
+        let mut spec = self.declare_spec(req)?;
         let graph = self.build_spec_body(&spec.body)?;
+        spec.header.residualize_unresolved_trait_const(&graph);
         let graph = spec.header.graph_stamp().apply(graph);
         Some(spec.into_semantic(crate::model::LazyGraph::built(graph)))
     }
@@ -2030,6 +2034,27 @@ impl SemanticFunctionHeader {
         }
     }
 
+    /// A `Clause` has no single `TraitConst` value.
+    ///
+    /// `resolved_trait_const_op` folds a selected impl's const to the
+    /// literal `history.getkind` banks as `int`. A clause stays the
+    /// `__trait_const` string, and `emit_constant` types that call `ref`.
+    /// `CallControl.getcalldescr` raises when the word is passed for a
+    /// `usize` parameter. Stamp `dont_look_inside` (`rlib/jit.py`
+    /// `dont_look_inside` sets `_jit_look_inside_ = False`) so
+    /// `policy.py` `look_inside_graph` keeps the template out of the
+    /// jitcode closure. A copy that folded the const has no sentinel and
+    /// stays look-inside. An explicit `jit_look_inside` wins.
+    fn residualize_unresolved_trait_const(&mut self, graph: &crate::model::FunctionGraph) {
+        if !graph_calls_unresolved_trait_const(graph) {
+            return;
+        }
+        if self.hints.iter().any(|hint| look_inside_hint_is_set(hint)) {
+            return;
+        }
+        self.hints.push("dont_look_inside".to_string());
+    }
+
     /// Stamp the header onto the lowered body and assemble the
     /// `SemanticFunction`.
     fn into_function(
@@ -2070,6 +2095,30 @@ impl SemanticFunctionHeader {
             returns_objectptr: self.returns_objectptr,
         }
     }
+}
+
+/// `policy.py` `look_inside_graph` reads `_jit_look_inside_` first, so an
+/// explicit hint already decides and a later `dont_look_inside` must not
+/// override it.
+fn look_inside_hint_is_set(hint: &str) -> bool {
+    hint == "dont_look_inside" || hint.starts_with("jit_look_inside")
+}
+
+/// The body still passes the unresolved `TraitConst` sentinel
+/// (`emit_constant`'s `Call(["__str_const", "__trait_const"])`).
+fn graph_calls_unresolved_trait_const(graph: &FunctionGraph) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } = &op.kind
+            else {
+                return false;
+            };
+            segments.len() == 2 && segments[0] == "__str_const" && segments[1] == "__trait_const"
+        })
+    })
 }
 
 /// The header facts a funcobj's lowered body carries: `graph.func` and the
