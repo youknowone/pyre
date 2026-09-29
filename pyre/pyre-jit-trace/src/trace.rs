@@ -481,11 +481,6 @@ thread_local! {
     /// exhaustion is converted by the caller opcode.
     static INSTANCE_NEXT_FORITER_BRIDGE_DEMOTED: std::cell::RefCell<std::collections::HashSet<u64>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
-    /// The current bridge trace's full-body walk hit a deterministic
-    /// structural decline.  The walker only knows `(w_code, start_pc)`; the
-    /// bridge launcher still has the originating guard descr and consumes this
-    /// bit so the bridge launcher marks the originating guard descriptor.
-    static FBW_BRIDGE_DECLINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn fbw_declined(key: u64) -> bool {
@@ -496,12 +491,6 @@ pub(crate) fn fbw_decline(key: u64) {
     FBW_DECLINED_KEYS.with(|s| {
         s.borrow_mut().insert(key);
     });
-}
-
-fn fbw_bridge_decline(ctx: &TraceCtx) {
-    if ctx.is_bridge_trace {
-        FBW_BRIDGE_DECLINED.with(|c| c.set(true));
-    }
 }
 
 fn p2_drain_abort() -> TraceAction {
@@ -518,19 +507,6 @@ fn abort_too_long_action() -> TraceAction {
         reason: majit_metainterp::counters::ABORT_TOO_LONG,
         raising_exception: false,
     })
-}
-
-pub fn take_fbw_bridge_declined() -> bool {
-    FBW_BRIDGE_DECLINED.with(|c| c.replace(false))
-}
-
-/// Start one bridge-tracing attempt with no decline inherited from a prior
-/// attempt.  A single RPython `MetaInterp.interpret()` can cross several merge
-/// points; pyre re-enters `trace_bytecode` for those segments, so clearing the
-/// bit inside `trace_bytecode` would erase a decline recorded by an earlier
-/// segment of the *same* attempt.
-pub fn reset_fbw_bridge_declined() {
-    FBW_BRIDGE_DECLINED.with(|c| c.set(false));
 }
 
 pub(crate) fn range_foriter_demoted(key: u64) -> bool {
@@ -1133,111 +1109,6 @@ fn try_commit_midbody_abort_inner(
             Ok(())
         }
     }
-}
-
-/// Whether a backward jump is reachable from `start_pc` — the loop a
-/// reconstructed frame resumed there can still reach.
-///
-/// `drive_bridge_carrier_walk` keeps its sub-walk only on a clean
-/// `SubReturn`; every other outcome falls through to the journal-rollback tail,
-/// which hands the guard back to a resume from `rd_numb`.  By then the sub-walk
-/// has concrete-executed the callee's residual calls — a `STORE_ATTR` runs
-/// through a residual helper, outside the store journal's reach — so the
-/// replayed region reads fields it has already written.  A callee that reaches
-/// its own loop header while a compiled token exists for it surfaces
-/// `SubLoopCalleeCallAssembler`, one such outcome, and that is only decidable
-/// after the prologue has run.  Walk the code instead and decline before
-/// driving anything: the effect odometer has not moved at that point, so the
-/// rollback the decline falls into is sound.
-///
-/// The walk starts where the drain resumes the frame, not at the top of the
-/// code, because a frame resumed past its loops cannot re-enter them.  Reading
-/// the whole code object instead declined `inline_subwalk_user_iterator`'s
-/// `step`, resumed at py 37 with only the `return` tail ahead of it and its one
-/// header behind at py 20, and that decline cost 402 -> 5988 guard failures and
-/// a `loops_aborted` of 1.
-///
-/// Successors are the codewriter's: fall-through unless the opcode is an
-/// unconditional jump, the branch operand's target, and the handler any
-/// covering exception-table entry names.  The test remains a superset of the
-/// outcome it stands for — a header whose token is not compiled would have
-/// walked through — so it still costs bridges rather than answers, and a seed
-/// that lands outside the code declines rather than admits.
-///
-/// Deciding early rather than repairing the tail is what the tail itself
-/// reports.  On `chunked_read_keeps_its_buffered_tail.py` without this arm,
-/// `PYRE_FBW_DEBUG_ABORT` reads:
-///
-/// ```text
-/// [fbw-effect] pc=1886 helper=StoreAttr extraeffect=RandomEffects writes_live=true
-/// [fbw-effect-bump] site=residual count=1
-/// [fbw-effect] pc=1960 helper=StoreAttr extraeffect=CannotRaise writes_live=true
-/// [fbw-effect-bump] site=residual count=2
-/// [s2-adopt-decline] no latched multi-frame image; single-frame adopt follows
-/// [p2-drain-abort] effects=2 adopted=false
-/// ```
-///
-/// The odometer does see both stores; they bump it as `residual`, not as
-/// `store_journal`, which is the same thing as saying no journal carries them.
-/// So the tail's two exits are the adopt — which declined for want of a latched
-/// multi-frame image — and the rollback, which restores only what a journal
-/// holds and then replays the region over stores that already stand.  Repairing
-/// that means making the adopt succeed for this shape, not making the rollback
-/// reach further; until it does, not entering is the only sound road.
-fn backward_jump_reachable_from(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
-    use pyre_interpreter::Instruction as I;
-    let n = code.instructions.len();
-    // An entry the projection cannot place inside this code object leaves the
-    // walk with nothing to explore, and an empty walk answers "no loop" -- the
-    // admitting answer. Refuse instead: not knowing where the frame resumes is
-    // not evidence that it resumes outside every loop.
-    if start_pc >= n {
-        return true;
-    }
-    // On a raise the unwinder transfers to the covering handler, which is a
-    // control-flow successor the branch operand does not carry.
-    let handlers: Vec<(usize, usize, usize)> =
-        pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
-            .map(|e| {
-                (
-                    e.start as usize / 2,
-                    e.end as usize / 2,
-                    e.target as usize / 2,
-                )
-            })
-            .collect();
-    let mut seen = vec![false; n];
-    let mut work = vec![start_pc];
-    while let Some(pc) = work.pop() {
-        if pc >= n || seen[pc] {
-            continue;
-        }
-        seen[pc] = true;
-        let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
-            // An opcode this build cannot decode says nothing about where it
-            // goes, so keep walking past it rather than pruning the successor.
-            work.push(pc + 1);
-            continue;
-        };
-        if matches!(
-            instr,
-            I::JumpBackward { .. } | I::JumpBackwardNoInterrupt { .. }
-        ) {
-            return true;
-        }
-        if !crate::liveness::is_unconditional_jump(&instr) {
-            work.push(pc + 1);
-        }
-        if let Some(target) = crate::liveness::target_pc(code, &instr, pc, op_arg) {
-            work.push(target);
-        }
-        for (start, end, target) in &handlers {
-            if pc >= *start && pc < *end {
-                work.push(*target);
-            }
-        }
-    }
-    false
 }
 
 fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
@@ -2055,11 +1926,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
-        // Churn guard: making this class transient retried the same
-        // guard 500 times in inline_chain_depth_typeflip.py and
-        // p2_local_result_bridge.py (loops_aborted 6 -> 505), so keep only
-        // this measured P2 class permanently declined.
-        fbw_bridge_decline(ctx);
         discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
         return p2_drain_abort();
     };
@@ -2101,81 +1967,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeCode");
         return p2_drain_abort();
     }
-    // Before anything runs in the callee: a frame that can reach a loop header
-    // from where the drain resumes it can stop the sub-walk at an outcome this
-    // drain does not keep, and the rollback that follows does not reach what
-    // the sub-walk has already executed by then.
-    // See `backward_jump_reachable_from`.
-    //
-    // Every recipe is tested, not the deepest alone.  A middle frame is driven
-    // by the same `drive_bridge_frame_subwalk`, so it surfaces the same outcome
-    // from its own header -- and it is driven only after the deepest callee has
-    // executed, which is exactly the position this arm exists to avoid.  For a
-    // self-recursive carrier every recipe shares one code object, so the
-    // whole-code test this replaces covered the middles by accident; reading
-    // each recipe's own resume point is what keeps that cover once the test
-    // stops reading the whole code.
-    for carried in carrier.recipes.iter() {
-        if carried.len_tail {
-            continue;
-        }
-        let raw_code = carried.code_ptr as *const pyre_interpreter::CodeObject;
-        let seed = (!raw_code.is_null())
-            .then(|| crate::state::pyjitcode_for_code(carried.code_ptr))
-            .flatten()
-            .and_then(|carried_pjc| {
-                let carried_entry = select_recipe_entry(
-                    carried.jitcode_index,
-                    carried_pjc.jitcode.index() as i32,
-                    carried.jitcode_pc,
-                )?;
-                Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
-                    &carried_pjc.metadata,
-                    carried_entry,
-                ) as usize)
-            });
-        // A recipe the drain cannot project has no resume point to test, and
-        // admitting it would drive a frame this arm never read.
-        let Some(seed) = seed else {
-            fbw_bridge_decline(ctx);
-            discard_bridge_carrier_walk(
-                ctx,
-                sym,
-                entry_depth,
-                pre_pos,
-                &pre_virtualref_boxes,
-                true,
-            );
-            crate::jitcode_dispatch::census_record("P2Drain::RecipeNotProjectable");
-            return p2_drain_abort();
-        };
-        // `for` reached from the resume is the double-advance this drain
-        // cannot roll back. A `while` (`JUMP_BACKWARD` only — `heapq._siftdown`)
-        // is a bridge back to its header; refusing it aborts every guard
-        // inside the inlined body. An unprojectable resume stays declined.
-        let code = unsafe { &*raw_code };
-        let unprojectable = seed >= pyre_interpreter::code_instructions_len(code);
-        let loop_bearing = unprojectable
-            || (backward_jump_reachable_from(code, seed)
-                && pyre_interpreter::code_has_for_iter(code));
-        if loop_bearing {
-            // Kept permanently declined, as the whole-code test was: the churn
-            // the `NoRecipes` arm measures is what a retryable decline of this
-            // class costs, and narrowing which carriers reach here does not
-            // change what happens to the ones that do.
-            fbw_bridge_decline(ctx);
-            discard_bridge_carrier_walk(
-                ctx,
-                sym,
-                entry_depth,
-                pre_pos,
-                &pre_virtualref_boxes,
-                true,
-            );
-            crate::jitcode_dispatch::census_record("P2Drain::LoopBearingCallee");
-            return p2_drain_abort();
-        }
-    }
+
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
     // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
@@ -2210,6 +2002,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         resumed_stack_oprefs,
         resumed_stack_concretes,
         pending.sym.concrete_vable_ptr as usize,
+        pending.sym.frame(),
+        pending.sym.execution_context(),
         // Depth-N: tell the deepest sub-walk that all shallower frames are
         // paused so its in-callee guard snapshots encode the full
         // [root, ..middles.., deepest] chain (else the blackhole rebuilds a
@@ -2817,6 +2611,8 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
         middle_stack_oprefs,
         middle_stack_concretes,
         pending.sym.concrete_vable_ptr as usize,
+        pending.sym.frame(),
+        pending.sym.execution_context(),
         paused_parents,
         exc,
         exc_concrete,
@@ -2893,6 +2689,8 @@ fn walk_len_operator_tail<Sym: WalkSym>(
         &[],
         &[],
         0,
+        majit_ir::OpRef::NONE,
+        majit_ir::OpRef::NONE,
         paused_parents,
         child_result,
     );
@@ -3041,6 +2839,8 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         middle_stack_oprefs,
         middle_stack_concretes,
         pending.sym.concrete_vable_ptr as usize,
+        pending.sym.frame(),
+        pending.sym.execution_context(),
         paused_parents,
         child_result,
     );
@@ -4567,7 +4367,6 @@ fn run_perfn_walk<Sym: WalkSym>(
                 pjc.metadata.n_py_instrs as usize
             );
         }
-        fbw_bridge_decline(ctx);
         fbw_decline(crate::driver::make_green_key(
             w_code,
             start_pc,
@@ -4604,7 +4403,6 @@ fn run_perfn_walk<Sym: WalkSym>(
                      entry_depth={entry_depth} marker_py={marker_py}; declining marker-entry walk"
                 );
             }
-            fbw_bridge_decline(ctx);
             fbw_decline(crate::driver::make_green_key(
                 w_code,
                 start_pc,
@@ -4627,7 +4425,6 @@ fn run_perfn_walk<Sym: WalkSym>(
                  (built_as_portal=false); declining walk"
             );
         }
-        fbw_bridge_decline(ctx);
         fbw_decline(crate::driver::make_green_key(
             w_code,
             start_pc,
@@ -5017,8 +4814,9 @@ fn run_perfn_walk<Sym: WalkSym>(
     // resume.py:1049-1056 constructs a frame and consumes its register stream
     // against that frame's JitCode body. Do not interpret a carried offset in
     // another installed body for the same code object: its register colors are
-    // a foreign coordinate space. This is a runtime decline, not a green-key
-    // disable, because a later bridge may carry a matching body identity.
+    // a foreign coordinate space. Returning None aborts this attempt rather
+    // than green-key disabling the location, because a later bridge may carry
+    // a matching body identity.
     if is_bridge_trace
         && sym.bridge_walk_entry_pc().is_some()
         && pjc.jitcode.index() as i32 != sym.bridge_walk_entry_jitcode_index()
@@ -5033,7 +4831,6 @@ fn run_perfn_walk<Sym: WalkSym>(
                 entry,
             );
         }
-        fbw_bridge_decline(ctx);
         return None;
     }
 
@@ -5108,7 +4905,6 @@ fn run_perfn_walk<Sym: WalkSym>(
                     entry,
                 );
             }
-            fbw_bridge_decline(ctx);
             return None;
         }
     }
@@ -7348,37 +7144,23 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // re-walk executes the body's residual calls before failing) —
                 // an unbounded slowdown. Decline it so the location interprets
                 // instead.
-                // A bridge entry is keyed on the guard descr, which the
-                // green-key cell never gates, so the green-key decline alone
-                // leaves `must_compile_with_values` re-firing this
-                // structurally-undecidable bridge every
-                // `DEFAULT_TRACE_EAGERNESS` failures forever — each retry
-                // re-walking the whole body and executing its residual calls
-                // concretely. Record the bridge-guard decline too, the way
-                // `ExcEdgeNoInFrameCatch` below does.
+                // The green-key decline retires the portal location. A bridge
+                // entry is keyed on the guard descr, which that cell does not
+                // gate, so this attempt aborts and `jitcounter.tick` leaves
+                // the guard to be traced again.
                 DE::GotoIfNotValueNotConcrete { .. } => {
                     fbw_decline(crate::driver::make_green_key(
                         w_code,
                         start_pc,
                         is_being_profiled,
                     ));
-                    fbw_bridge_decline(ctx);
                     TraceAction::Abort
                 }
-                // The exc-edge routing decision is `find_catch_for_exc_resume`
-                // over `(jitcode_code, position)` alone, so the same guard
-                // reaches it on every retrace — the premise the `AbortPermanent`
-                // decline below is written for.  It cannot take that mapping:
-                // the abort is raised before any recording precisely so the
-                // guard resumes via the blackhole, which is the correct
-                // handling, not a location to retire.  Record only the
-                // bridge-guard decline, so the guard stops re-walking the whole
-                // body (executing its residual calls concretely) to re-derive a
-                // static answer.
-                DE::ExcEdgeNoInFrameCatch { .. } => {
-                    fbw_bridge_decline(ctx);
-                    TraceAction::Abort
-                }
+                // `find_catch_for_exc_resume` over `(jitcode, position)` is the
+                // same answer on every retrace, but the abort is raised before
+                // any recording so the guard resumes via the blackhole. That
+                // is the handling, not a location to retire.
+                DE::ExcEdgeNoInFrameCatch { .. } => TraceAction::Abort,
                 _ => TraceAction::Abort,
             }
         }
@@ -7391,26 +7173,13 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 w_code,
                 start_pc,
                 is_being_profiled,
-            )) || (ctx.is_bridge_trace && FBW_BRIDGE_DECLINED.with(|c| c.get()))
-            {
+            )) {
                 TraceAction::Decline
             } else {
                 TraceAction::Abort
             }
         }
     };
-    // A permanent abort is a property of the walked jitcode body, not of the
-    // guard's runtime values: the same `(jitcode, resume_pc)` reaches the same
-    // marker on every retrace.  The loop-header entry stops re-entering because
-    // `abort_trace(true)` flips its cell to `DONT_TRACE_HERE`, but a bridge
-    // entry is keyed on the guard descr, which that cell never gates — so
-    // without this the guard keeps re-firing `must_compile` every
-    // `trace_eagerness` failures and each retry walks the whole body, executing
-    // its residual calls concretely, before failing again.  Record the decline
-    // through the same channel the pre-walk structural declines use.
-    if matches!(action, TraceAction::AbortPermanent) {
-        fbw_bridge_decline(ctx);
-    }
     action
 }
 

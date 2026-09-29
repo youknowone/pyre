@@ -2474,9 +2474,14 @@ pub enum DispatchOutcome {
     /// via `setarrayitem_vable` during the prologue walk; the caller sets
     /// `last_instr = target_pc - 1` on it and passes it as the
     /// CALL_ASSEMBLER `[frame, ec]` red arg (forcing the virtual
-    /// materializes the locals); surfaced only from an inlined sub-walk.
+    /// materializes the locals). `token` is `Some` when
+    /// `get_or_make_portal_assembler_token_arc` already has a loop token
+    /// (`direct_assembler_call`). A bridge carrier whose lookup returns
+    /// none surfaces `None` so the drain records the portal runner via
+    /// `direct_call_may_force` instead of walking the callee's loop body
+    /// (`do_recursive_call`, `assembler_call=False`).
     SubLoopCalleeCallAssembler {
-        token: std::sync::Arc<majit_backend::JitCellToken>,
+        token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
         target_pc: usize,
     },
     /// `jit_merge_point` was crossed by a trace that already carries
@@ -2693,10 +2698,30 @@ impl PartialEq for DispatchOutcome {
                     token: b_token,
                     target_pc: b_pc,
                 },
-            ) => a_token.number == b_token.number && a_pc == b_pc,
+            ) => {
+                a_token.as_ref().map(|token| token.number)
+                    == b_token.as_ref().map(|token| token.number)
+                    && a_pc == b_pc
+            }
             _ => false,
         }
     }
+}
+
+/// `opimpl_jit_merge_point`'s non-zero `portal_call_depth` arm surfaces the
+/// recursive portal call. A carrier resume (`rebuild_from_resumedata`) has no
+/// caller `op.next_pc`; the guard pc is the merge point itself (`op.pc`).
+fn surface_carrier_or_inline_subloop(
+    token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
+    target_pc: usize,
+    carrier_resume: bool,
+    op_pc: usize,
+    op_next_pc: usize,
+) -> (DispatchOutcome, usize) {
+    (
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
+        if carrier_resume { op_pc } else { op_next_pc },
+    )
 }
 
 fn trace_too_long_blackhole_snapshot_safe(outcome: &DispatchOutcome) -> bool {
@@ -15180,32 +15205,30 @@ fn handle<Sym: WalkSym>(
                         .map(|frame| frame.w_code),
                 );
             }
-            // A carrier resume has no return site to hand a
-            // `SubLoopCalleeCallAssembler` to: `drive_bridge_frame_subwalk` is
-            // the reconstructed frame's own walk, so the outcome surfaces out of
-            // it and reaches the drain, which threads only `SubReturn` and
-            // `SubRaise` and sends everything else to its journal-rollback abort
-            // epilogue.  That epilogue hands the guard back to a blackhole resume
-            // from `rd_numb`, re-entering this frame at the coordinate the walk
-            // started from, and the journal does not reach a residual call that
-            // already wrote the live heap.  `ZipExtFile.read` is the witness: its
-            // slow path clears `_readbuffer` and zeroes `_offset` before reaching
-            // the `while n > 0` header, so the re-entry recomputes `n` and `buf`
-            // from the cleared buffer and the member loses one buffer's worth of
-            // bytes.  `carrier_resume` is set on the reconstructed frame's own
-            // context and nowhere else, so a nested inline inside that frame
-            // still folds its own recursive call to a CALL_ASSEMBLER.
+            // `opimpl_jit_merge_point` (`pyjitpl.py`), the `else` taken when
+            // `metainterp.portal_call_depth` is non-zero: this header is not
+            // the traced loop's own close. Finish the callee and
+            // `do_recursive_call(..., assembler_call=True)`. A frame rebuilt
+            // by `rebuild_from_resumedata` is an ordinary MIFrame, so a bridge
+            // that resumes inside a callee and later reaches that callee's
+            // header takes the same arm. `drive_bridge_frame_subwalk` consumes
+            // the outcome: a token records CALL_ASSEMBLER
+            // (`direct_assembler_call`); no token records the portal runner
+            // (`direct_call_may_force`) instead of walking the loop body.
+            // Nested inlines inherit `carrier_resume` and are consumed by
+            // `try_walker_inline_resolved_user_call`. A missing token there
+            // residualizes the original CALL.
+            let carrier_resume = ctx.fbw_mode.carrier_resume;
             let callee_code = (!ctx.is_top_level
-                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none()
-                && !ctx.fbw_mode.carrier_resume)
-                .then(|| {
-                    ctx.session
-                        .borrow()
-                        .framestack
-                        .last()
-                        .map(|frame| frame.w_code)
-                })
-                .flatten();
+                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
+            .then(|| {
+                ctx.session
+                    .borrow()
+                    .framestack
+                    .last()
+                    .map(|frame| frame.w_code)
+            })
+            .flatten();
             if let Some(callee_code) = callee_code {
                 let callee_key = crate::driver::make_green_key_typed(
                     callee_code as *const (),
@@ -15219,16 +15242,17 @@ fn handle<Sym: WalkSym>(
                     Value::Ref(majit_ir::GcRef(callee_code)),
                 ];
                 let red_types = [Type::Ref, Type::Ref];
-                if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
+                let token = driver.get_or_make_portal_assembler_token_arc(
                     &callee_key,
                     &greenboxes,
                     &red_types,
-                ) {
-                    return Ok((
-                        DispatchOutcome::SubLoopCalleeCallAssembler {
-                            token,
-                            target_pc: next_instr,
-                        },
+                );
+                if token.is_some() || carrier_resume {
+                    return Ok(surface_carrier_or_inline_subloop(
+                        token,
+                        next_instr,
+                        carrier_resume,
+                        op.pc,
                         op.next_pc,
                     ));
                 }
@@ -15245,17 +15269,15 @@ fn handle<Sym: WalkSym>(
                     // surface a recursive CALL_ASSEMBLER request to the caller's
                     // inline return site (mirror `opimpl_recursive_call_
                     // assembler`, metainterp.rs).
-                    // Same carrier-resume exclusion as the arm above, for
-                    // the same reason.
-                    let callee_code = (!ctx.fbw_mode.carrier_resume)
-                        .then(|| {
-                            ctx.session
-                                .borrow()
-                                .framestack
-                                .last()
-                                .map(|frame| frame.w_code)
-                        })
-                        .flatten();
+                    // Same carrier rule as the arm above: a resume with no
+                    // token still leaves the loop body via `direct_call_may_force`.
+                    let carrier_resume = ctx.fbw_mode.carrier_resume;
+                    let callee_code = ctx
+                        .session
+                        .borrow()
+                        .framestack
+                        .last()
+                        .map(|frame| frame.w_code);
                     if let Some(callee_code) = callee_code {
                         let callee_key = crate::driver::make_green_key_typed(
                             callee_code as *const (),
@@ -15269,16 +15291,22 @@ fn handle<Sym: WalkSym>(
                             Value::Ref(majit_ir::GcRef(callee_code)),
                         ];
                         let red_types = [Type::Ref, Type::Ref];
+<<<<<<< HEAD
                         if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
                             &callee_key,
+=======
+                        let token = driver.get_or_make_portal_assembler_token_arc(
+                            callee_key,
+>>>>>>> e36c7cbc9a4 (metainterp: no sticky bridge decline, jitcounter.tick decides; walker: a bridge resumed inside a loop-bearing callee reaches the callee's loop header)
                             &greenboxes,
                             &red_types,
-                        ) {
-                            return Ok((
-                                DispatchOutcome::SubLoopCalleeCallAssembler {
-                                    token,
-                                    target_pc: next_instr,
-                                },
+                        );
+                        if token.is_some() || carrier_resume {
+                            return Ok(surface_carrier_or_inline_subloop(
+                                token,
+                                next_instr,
+                                carrier_resume,
+                                op.pc,
                                 op.next_pc,
                             ));
                         }

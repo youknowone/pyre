@@ -1321,6 +1321,128 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     })
 }
 
+/// `opimpl_jit_merge_point` when `portal_call_depth` is non-zero, for a
+/// frame `rebuild_from_resumedata` rebuilt. Finish this callee
+/// (`finishframe(..., leave_portal_frame=False)` records nothing: the
+/// result box is `None`), record `do_recursive_call(assembler_call=True)`
+/// (`direct_assembler_call` when a token exists, `direct_call_may_force`
+/// of the same portal reds `[frame, ec]` otherwise), then
+/// `leave_portal_frame`. The drain threads the resulting `SubReturn` /
+/// `SubRaise` as the caller continuation. A recorder decline leaves the
+/// original outcome so the drain's abort still runs.
+fn consume_reconstructed_loop_header<Sym: WalkSym>(
+    outcome: Result<(DispatchOutcome, usize), DispatchError>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    portal_frame_box: OpRef,
+    portal_ec_box: OpRef,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let Ok((DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc }, cont_pc)) = outcome
+    else {
+        return outcome;
+    };
+    // A `len` tail has no portal frame. Leave the outcome for the drain.
+    if portal_frame_box.is_none() || portal_ec_box.is_none() {
+        return Ok((
+            DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
+            cont_pc,
+        ));
+    }
+    publish_carrier_header_vsd(ctx, portal_frame_box, target_pc);
+    let is_being_profiled = ctx.session.borrow().is_being_profiled;
+    let w_code = ctx.inline_w_code() as *const ();
+    let token_for_rebuild = token.clone();
+    match super::inline_call::record_walker_loop_callee_portal_call(
+        ctx,
+        cont_pc,
+        None,
+        portal_frame_box,
+        portal_ec_box,
+        token,
+        target_pc,
+        w_code,
+        is_being_profiled,
+    ) {
+        Ok(Some(recorded)) => {
+            record_carrier_leave_portal_frame(ctx);
+            if let Some((exc, exc_concrete)) = recorded.raised {
+                Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, cont_pc))
+            } else {
+                Ok((
+                    DispatchOutcome::SubReturn {
+                        result: Some(recorded.result),
+                    },
+                    cont_pc,
+                ))
+            }
+        }
+        Ok(None) => Ok((
+            DispatchOutcome::SubLoopCalleeCallAssembler {
+                token: token_for_rebuild,
+                target_pc,
+            },
+            cont_pc,
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+/// The bridge walk does not install `InlineConcreteFrameGuard`, so
+/// `setfield_vable` records the virtualizable write without mirroring
+/// `valuestackdepth` onto the concrete frame. The portal-call recorder
+/// then declines a header whose operand stack is non-empty. Publish the
+/// walk's operand depth when it matches `depth_based_vsd_for_wcode`.
+fn publish_carrier_header_vsd<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    portal_frame_box: OpRef,
+    target_pc: usize,
+) {
+    if !ctx.vstack_valid {
+        return;
+    }
+    let w_code = ctx.inline_w_code();
+    let Some(depth_vsd) = crate::state::depth_based_vsd_for_wcode(w_code, target_pc) else {
+        return;
+    };
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw_code.is_null() {
+        return;
+    }
+    let stack_base = {
+        let code = unsafe { &*raw_code };
+        code.varnames.len() + pyre_interpreter::pyframe::ncells(code)
+    };
+    let published = stack_base.saturating_add(ctx.vstack_depth);
+    if published != depth_vsd {
+        return;
+    }
+    let Some(majit_ir::Value::Ref(gcref)) = ctx.trace_ctx.concrete_of_opref(portal_frame_box)
+    else {
+        return;
+    };
+    if gcref.0 == 0 {
+        return;
+    }
+    // Field 2 is `valuestackdepth` (`store_live_frame_static_int`).
+    crate::state::store_live_frame_static_int(gcref.0, 2, published as i64);
+}
+
+/// `MetaInterp.leave_portal_frame` after `do_recursive_call`. Record the
+/// op only: this bridge never took `newframe`, so the depth counter that
+/// function decrements was never incremented.
+fn record_carrier_leave_portal_frame<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    let Some(jitcode) = crate::jitcode_runtime::portal_metainterp_jitcode() else {
+        return;
+    };
+    let Some(jd_no) = jitcode.jitdriver_sd() else {
+        return;
+    };
+    let jd_box = ctx.trace_ctx.const_int(jd_no as i64);
+    ctx.trace_ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
@@ -1339,6 +1461,8 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     resumed_stack_oprefs: &[OpRef],
     resumed_stack_concretes: &[majit_ir::Value],
     concrete_callee_frame: usize,
+    portal_frame_box: OpRef,
+    portal_ec_box: OpRef,
     child_result: Option<OpRef>,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
     // `finishframe_exception` ChangeFrame: enter this reconstructed frame at
@@ -1803,6 +1927,18 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             walk_entry = pc;
         }
         let outcome = walk(callee_code, walk_entry, &mut sub_wc);
+        // `opimpl_jit_merge_point` when `portal_call_depth` is non-zero:
+        // finish this callee (`leave_portal_frame=False`), record
+        // `do_recursive_call(assembler_call=True)` on its portal reds, then
+        // `leave_portal_frame`. The caller continuation is the `SubReturn` /
+        // `SubRaise` the drain already threads. A recorder decline leaves the
+        // original outcome so the drain's abort still runs.
+        let outcome = consume_reconstructed_loop_header(
+            outcome,
+            &mut sub_wc,
+            portal_frame_box,
+            portal_ec_box,
+        );
         drop(bank_guard);
         // `pyjitpl.py handle_guard_failure` wraps `_handle_guard_failure`
         // in `except SwitchToBlackhole as stb:
@@ -1880,6 +2016,8 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
     resumed_stack_oprefs: &[OpRef],
     resumed_stack_concretes: &[majit_ir::Value],
     concrete_callee_frame: usize,
+    portal_frame_box: OpRef,
+    portal_ec_box: OpRef,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     drive_bridge_frame_subwalk(
@@ -1899,6 +2037,8 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
         resumed_stack_oprefs,
         resumed_stack_concretes,
         concrete_callee_frame,
+        portal_frame_box,
+        portal_ec_box,
         None,
         paused_parent_recipes,
         None,
@@ -1923,6 +2063,8 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
     resumed_stack_oprefs: &[OpRef],
     resumed_stack_concretes: &[majit_ir::Value],
     concrete_callee_frame: usize,
+    portal_frame_box: OpRef,
+    portal_ec_box: OpRef,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
     child_result: OpRef,
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
@@ -1943,6 +2085,8 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
         resumed_stack_oprefs,
         resumed_stack_concretes,
         concrete_callee_frame,
+        portal_frame_box,
+        portal_ec_box,
         Some(child_result),
         paused_parent_recipes,
         None,
@@ -1967,6 +2111,8 @@ pub(crate) fn drive_bridge_middle_frame_from_handler<Sym: WalkSym>(
     resumed_stack_oprefs: &[OpRef],
     resumed_stack_concretes: &[majit_ir::Value],
     concrete_callee_frame: usize,
+    portal_frame_box: OpRef,
+    portal_ec_box: OpRef,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
     exc: OpRef,
     exc_concrete: ConcreteValue,
@@ -1989,6 +2135,8 @@ pub(crate) fn drive_bridge_middle_frame_from_handler<Sym: WalkSym>(
         resumed_stack_oprefs,
         resumed_stack_concretes,
         concrete_callee_frame,
+        portal_frame_box,
+        portal_ec_box,
         None,
         paused_parent_recipes,
         Some((exc, exc_concrete, catch_target)),

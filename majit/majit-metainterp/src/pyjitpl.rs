@@ -11281,15 +11281,10 @@ impl<M: Clone> MetaInterp<M> {
                 true
             }
             Err(e) => {
-                // Same decline handling as `compile_bridge`: a structural
-                // `Unsupported` reproduces on every retrace of this guard, so
-                // backends that report it as terminal get the guard recorded
-                // and it resolves through blackhole resume from then on.
-                if matches!(e, majit_backend::BackendError::Unsupported(_))
-                    && self.backend.bridge_decline_is_terminal()
-                {
-                    fail_descr.set_bridge_declined_terminally();
-                }
+                // `AbstractResumeGuardDescr.done_compiling`: a bridge that
+                // did not compile already had its jitcounter reset by
+                // `jitcounter.tick`. The caller's `done_compiling` clears
+                // `ST_BUSY_FLAG`, and the next failure ticks again.
                 self.stats.loops_aborted += 1;
                 let msg = format!("Retrace bridge compilation failed: {e}");
                 crate::debug::log_one("jit-summary", &msg);
@@ -14972,16 +14967,6 @@ impl<M: Clone> MetaInterp<M> {
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
-        // A guard whose bridge was refused by a terminal-declining backend
-        // (`bridge_decline_is_terminal()`, currently wasm) or by a structural
-        // full-body-walk decline must not re-fire: re-tracing rebuilds the same
-        // unsupported bridge forever. Transient backend and walker aborts do
-        // not populate this set. Fall back to the blackhole resume the dormant
-        // path always used for this guard.
-        if descr_fd.bridge_declined_terminally() {
-            crate::mc_diag_bump(1); // guard-descr terminal-decline short-circuit
-            return (false, owning_key);
-        }
         if descr_addr == 0 {
             crate::mc_diag_bump(2); // descr_addr==0 skip
             crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");
@@ -15010,6 +14995,22 @@ impl<M: Clone> MetaInterp<M> {
         // round-trip go away.
         if descr_arc.is_guard_forced() {
             crate::mc_diag_bump(60); // forced_never_compiled
+            return (false, owning_key);
+        }
+        // `CompileLoopVersionDescr.handle_fail` is
+        // `assert 0, "this guard must never fail"` and never reaches
+        // `must_compile`. Pyre has no descr-keyed `handle_fail`, so every
+        // guard exit arrives here: refuse before `jitcounter.tick`. Debug
+        // builds assert; release logs and declines.
+        if descr_fd.loop_version() {
+            crate::debug::log_one(
+                "jit-summary",
+                "CompileLoopVersionDescr.handle_fail: this guard must never fail",
+            );
+            debug_assert!(
+                false,
+                "CompileLoopVersionDescr.handle_fail: this guard must never fail"
+            );
             return (false, owning_key);
         }
         // `compile.py:741` `status = self.status` — direct field read on
@@ -15067,35 +15068,6 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         (fired, owning_key)
-    }
-
-    /// Whether this exact guard's bridge was terminally declined by the
-    /// backend.  The wasm CALL_ASSEMBLER host-deopt path queries the same
-    /// descriptor bit that normal guard failures populate, so it cannot
-    /// re-trace a structural decline through a detached identity table.
-    pub fn bridge_declined_terminally(
-        &self,
-        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
-    ) -> bool {
-        let descr = descr_arc
-            .as_fail_descr()
-            .expect("bridge_declined_terminally: descr_arc must be a FailDescr");
-        descr.bridge_declined_terminally()
-    }
-
-    /// Record that this exact source guard's bridge hit a deterministic
-    /// structural decline before backend compilation.  Subsequent guard
-    /// failures use the existing `must_compile_with_values` short-circuit and
-    /// resume through the blackhole instead of rebuilding the same declined
-    /// bridge every trace-eagerness cycle.
-    pub fn record_declined_bridge_guard(
-        &mut self,
-        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
-    ) {
-        let descr = descr_arc
-            .as_fail_descr()
-            .expect("record_declined_bridge_guard: descr_arc must be a FailDescr");
-        descr.set_bridge_declined_terminally();
     }
 
     /// `memmgr.py` `MemoryManager.keep_loop_alive`, which
@@ -16835,25 +16807,10 @@ impl<M: Clone> MetaInterp<M> {
                 true
             }
             Err(e) => {
-                // RPython compile.py:701-717: a transient bridge compilation
-                // failure is not permanent — the counter resets and may fire
-                // again (RPython uses ST_BUSY_FLAG only, cleared by
-                // done_compiling). A structural `Unsupported` decline is the
-                // exception: it is deterministic in the source guard, so
-                // re-tracing rebuilds the identical unsupported bridge forever.
-                // Only backends that report `bridge_decline_is_terminal()` (the
-                // wasm backend, whose every decline is a structural shape
-                // mismatch) record it; native backends keep the transient-retry
-                // semantics above, since their `Unsupported` (cranelift
-                // op-lowering gaps) may be resolved on a differently-shaped
-                // retrace. Record the source guard so `must_compile_with_values`
-                // stops firing for it; the guard then resolves through blackhole
-                // resume (the always-correct fallback).
-                if matches!(e, majit_backend::BackendError::Unsupported(_))
-                    && self.backend.bridge_decline_is_terminal()
-                {
-                    fail_descr.set_bridge_declined_terminally();
-                }
+                // `AbstractResumeGuardDescr.done_compiling`: a bridge that
+                // did not compile already had its jitcounter reset by
+                // `jitcounter.tick`. The caller's `done_compiling` clears
+                // `ST_BUSY_FLAG`, and the next failure ticks again.
                 let msg = format!("Bridge compilation failed: {e}");
                 crate::debug::log_one("jit-summary", &msg);
                 if let Some(ref cb) = self.hooks.on_compile_error {
@@ -20240,13 +20197,6 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         };
-        // A backend that cannot compile a CALL_ASSEMBLER entering this token
-        // declines every trace carrying the edge. Fall back to the residual
-        // emission the caller keeps running for a `(None, None)` answer, the
-        // same shape the tmp-callback refusal above takes.
-        if target_token.call_assembler_refused() {
-            return (None, None);
-        }
         let vable_index = target_token.virtualizable_arg_index();
         // pyjitpl.py:3601 opnum = OpHelpers.call_assembler_for_descr(calldescr)
         let opnum = match descr_view.result_type() {
@@ -30373,6 +30323,43 @@ mod tests {
             meta.warm_state.ensure_cell_key(&key),
             green_key,
             "a typed writer of the same greens must land on that cell"
+        );
+    }
+
+    #[test]
+    fn failed_bridge_compile_is_ticked_again() {
+        // `AbstractResumeGuardDescr.done_compiling`: `jitcounter.tick` resets
+        // the counter when `must_compile` fires. A bridge that does not
+        // compile clears `ST_BUSY_FLAG` and the next failures tick again
+        // until the threshold.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.set_trace_eagerness(2);
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        let fd = descr.as_fail_descr().expect("resume guard");
+        let hash = meta.warm_state.fetch_next_hash();
+        fd.store_hash(hash);
+
+        assert!(!meta.must_compile_with_values(&descr, &[], None, 1).0);
+        assert!(
+            meta.must_compile_with_values(&descr, &[], None, 1).0,
+            "trace_eagerness 2 fires on the second failure"
+        );
+
+        fd.start_compiling();
+        assert!(
+            !meta.must_compile_with_values(&descr, &[], None, 1).0,
+            "ST_BUSY_FLAG set by start_compiling skips the tick"
+        );
+        fd.done_compiling();
+
+        assert!(
+            !meta.must_compile_with_values(&descr, &[], None, 1).0,
+            "the firing tick reset the counter"
+        );
+        assert!(
+            meta.must_compile_with_values(&descr, &[], None, 1).0,
+            "later failures tick until the threshold again"
         );
     }
 

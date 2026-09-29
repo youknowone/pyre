@@ -1843,11 +1843,6 @@ pub struct JitDriver<S: JitState> {
     /// traces from an exception guard (GUARD_EXCEPTION / GUARD_NO_EXCEPTION).
     /// The caller should emit SAVE_EXC_CLASS + SAVE_EXCEPTION at trace start.
     pub last_bridge_is_exception_guard: bool,
-    /// `(current, monotonic)` recorded-op counts after bridge setup prologue
-    /// materialization and before the bridge body walk starts. Used to
-    /// distinguish deterministic setup aborts from transient mid-trace aborts
-    /// even when `history.cut` rewinds the current count to the setup position.
-    bridge_body_start_op_counts: Option<(usize, usize)>,
     /// Whether this session's bridge attempt was declined, or had no target to
     /// close against -- the session PHASE, as distinct from the resumekey CLASS
     /// that `MetaInterp::bridge_info` carries.
@@ -2216,7 +2211,6 @@ impl<S: JitState> JitDriver<S> {
             bridge_entered_at_guard_resume: false,
             resume_data_result: None,
             last_bridge_is_exception_guard: false,
-            bridge_body_start_op_counts: None,
             bridge_attempt_declined: false,
             entry_points: Vec::new(),
             is_recursive: false,
@@ -5132,7 +5126,6 @@ impl<S: JitState> JitDriver<S> {
                     // unrelated declines trip pyre's local abort ceiling.
                     self.meta.decline_trace_live();
                     self.sym = None;
-                    self.bridge_body_start_op_counts = None;
                     self.bridge_attempt_declined = false;
                     self.meta.clear_trace_session();
                 }
@@ -5149,67 +5142,15 @@ impl<S: JitState> JitDriver<S> {
                     if self.bridge_attempt_declined {
                         crate::mc_diag_bump(52); // abort_after_declined
                     }
-                    let setup_aborted_bridge_descr = if matches!(action, TraceAction::Abort)
-                    && self.meta.bridge_info().is_some()
-                    && !self.bridge_attempt_declined
-                    // `bridge_info` survives `RetraceNeeded` and declined
-                    // attempts now that it stands for the `self.resumekey`
-                    // CLASS rather than "still building the bridge", so it
-                    // alone no longer says which PHASE the session is in. The
-                    // contract below is about the bridge's own setup shape, so
-                    // exclude both phases in which `bridge_info` is alive but
-                    // the setup is not: the retrace phase, by requiring
-                    // `partial_trace().is_none()`, and the declined-attempt
-                    // phase, by requiring `!bridge_attempt_declined`. Reaching
-                    // `record_declined_bridge_guard` from either would
-                    // permanently decline the source guard.
-                    && self.meta.partial_trace().is_none()
-                    && self.meta.tracing.as_ref().is_some_and(|ctx| {
-                        let Some((start_ops, start_total)) = self.bridge_body_start_op_counts else {
-                            return false;
-                        };
-                        let current_ops = ctx.num_ops();
-                        let current_total = ctx.recorded_ops_total();
-                        (current_ops == start_ops && current_total == start_total)
-                            || (current_ops == start_ops + 1
-                                && current_total == start_total + 1
-                                && matches!(
-                                    ctx.opcode_at(start_ops),
-                                    Some(
-                                        majit_ir::OpCode::GetfieldGcR
-                                            | majit_ir::OpCode::GetfieldRawI
-                                    )
-                                ))
-                    }) {
-                        self.meta
-                            .bridge_info_cloned()
-                            .map(|bridge| bridge.source_descr)
-                    } else {
-                        None
-                    };
+                    // `AbstractResumeGuardDescr.done_compiling` does not stick
+                    // a failed bridge. A setup abort or a deterministic bridge
+                    // abort leaves the guard's jitcounter where `jitcounter.tick`
+                    // reset it, and the next failure ticks again.
                     let det_bridge_abort = self
                         .meta
                         .tracing
                         .as_ref()
                         .is_some_and(|ctx| ctx.deterministic_bridge_abort);
-                    if let Some(source_descr) = setup_aborted_bridge_descr {
-                        // Setup died before any body op: the reachable
-                        // set of the first callee still names an unbound
-                        // residual. Retrying rebuilds the same refuse.
-                        if !self.source_guard_already_bridged(&source_descr) {
-                            self.meta.record_declined_bridge_guard(&source_descr);
-                        }
-                    } else if det_bridge_abort {
-                        // `BC_ABORT` / walk-local refuse: the reconstructed
-                        // arm is not a compilable bridge. Decline so we do
-                        // not rebuild it every eagerness cycle. Do not
-                        // stamp a guard that already has a compiled bridge.
-                        if let Some(bridge) = self.meta.bridge_info_cloned() {
-                            if !self.source_guard_already_bridged(&bridge.source_descr) {
-                                self.meta.record_declined_bridge_guard(&bridge.source_descr);
-                            }
-                        }
-                    }
                     // pyjitpl.py `run_blackhole_interp_to_cancel_tracing(stb)`
                     // consumes both the reason and raising_exception from the
                     // same signal. The Python worker returns it with the action;
@@ -5372,7 +5313,6 @@ impl<S: JitState> JitDriver<S> {
                     // greenkey is None.
                     self.meta.aborted_tracing(reason_int);
                     self.sym = None;
-                    self.bridge_body_start_op_counts = None;
                     self.bridge_attempt_declined = false;
                     self.meta.clear_trace_session();
                 }
@@ -5412,11 +5352,9 @@ impl<S: JitState> JitDriver<S> {
                     }
                     self.meta.abort_trace(!is_bridge);
                     self.sym = None;
-                    // The session ends here, so the latch must not outlive it. The
-                    // sibling `bridge_body_start_op_counts` is cleared on the
-                    // Abort/Decline arm and in `clear_tracing_session_state` but
-                    // not here, which is why this arm needs its own reset rather
-                    // than a shared teardown.
+                    // The session ends here, so the latch must not outlive it.
+                    // This arm does not share the Abort/Decline teardown, so it
+                    // clears the latch itself.
                     self.bridge_attempt_declined = false;
                     self.meta.clear_trace_session();
                 }
@@ -5507,7 +5445,6 @@ impl<S: JitState> JitDriver<S> {
     #[inline(never)]
     fn clear_tracing_session_state(&mut self) {
         self.sym = None;
-        self.bridge_body_start_op_counts = None;
         self.bridge_attempt_declined = false;
         self.meta.clear_trace_session();
     }
@@ -10371,32 +10308,6 @@ impl<S: JitState> JitDriver<S> {
             .opimpl_arraylen_vable(pc, vable_opref, vable_struct_ptr, fdescr, adescr)
     }
 
-    /// Whether `source_descr` already has a compiled bridge attached.
-    ///
-    /// Used to keep a working patch when a later FIRED re-enters setup
-    /// and aborts: `record_declined_bridge_guard` would otherwise make
-    /// every later fail skip that patch.
-    fn source_guard_already_bridged(
-        &self,
-        source_descr: &std::sync::Arc<dyn majit_ir::Descr>,
-    ) -> bool {
-        let Some(fd) = source_descr.as_fail_descr() else {
-            return false;
-        };
-        // Prefer the descr-side mark (`assembler.py patch_jump_for_descr`
-        // zeroes `adr_jump_offset` once the guard jumps into a bridge).
-        // `bridge_attached` returns `Some(false)` while the guard still
-        // owns its recovery stub; `None` falls back to the token map.
-        match self.meta.backend.bridge_attached(fd) {
-            Some(attached) => attached,
-            None => {
-                let green_key = self.meta.bridge_info().map(|b| b.green_key).unwrap_or(0);
-                self.meta
-                    .bridge_was_compiled(green_key, fd.trace_id(), fd.fail_index_per_trace())
-            }
-        }
-    }
-
     /// Start bridge tracing from a guard failure point.
     ///
     /// Uses the compiled loop's stored meta so that the sym's
@@ -10429,7 +10340,6 @@ impl<S: JitState> JitDriver<S> {
         // Same reason as the primary trace entry: the bridge compile decodes
         // frame value counts through the per-thread store, so aim it here.
         self.republish_state_field_fvc();
-        self.bridge_body_start_op_counts = None;
         self.bridge_attempt_declined = false;
         // compile.py `_trace_and_compile_from_bridge` raises
         // `compile.giveup()` when the descr's owning JitCellToken weakref
@@ -10870,11 +10780,6 @@ impl<S: JitState> JitDriver<S> {
                 ctx.synchronize_virtualizable_after_guard_failure();
             }
         }
-        self.bridge_body_start_op_counts = self
-            .meta
-            .tracing
-            .as_ref()
-            .map(|ctx| (ctx.num_ops(), ctx.recorded_ops_total()));
         self.meta.begin_trace_session(trace_meta);
         // resume.py:1047-1055 parity:
         //   ResumeDataBoxReader.consume_boxes() rebuilds the frame state,

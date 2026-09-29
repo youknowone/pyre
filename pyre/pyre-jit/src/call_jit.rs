@@ -4113,10 +4113,10 @@ pub fn trace_and_compile_from_bridge(
     if pending_exc && !route_exc_edge && !exception_resume_prepared {
         // Uncaught: `finishframe_exception` would
         // `compile_exit_frame_with_exception`.  That Finish(exc) close is
-        // not wired on this walk yet, so this failure blackholes —
-        // `compile.py` `must_compile` retries via the jitcounter, and
-        // `bridge_declined_terminally` is only for a backend that cannot
-        // attach (`bridge_decline_is_terminal`).
+        // not wired on this walk yet, so this failure blackholes.
+        // `AbstractResumeGuardDescr.done_compiling` clears `ST_BUSY_FLAG`;
+        // `jitcounter.tick` already reset the counter, so the next failure
+        // ticks again.
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][bridge-trace] uncaught pending exc → blackhole key={} trace={} fail={} resume_pc={}",
@@ -4209,10 +4209,6 @@ pub fn trace_and_compile_from_bridge(
     // walk's live frame IS the frame whose guard failed — so it takes the same
     // any-frame-count arming.  Only the guard-state blackhole fallback below it
     // rebuilds frames, and a kept stash never reaches that path.
-    // One upstream `MetaInterp.interpret()` owns the whole resumed bridge.
-    // `jit_merge_point_keyed` may re-enter `trace_bytecode` for later merge
-    // points, so reset the per-attempt decline latch here, not per segment.
-    pyre_jit_trace::trace::reset_fbw_bridge_declined();
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(true);
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
@@ -4268,12 +4264,6 @@ pub fn trace_and_compile_from_bridge(
     // Disarm so the flag cannot leak into a later (non-bridge) walk on this
     // thread; the epilogue has already consumed it.
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(false);
-    if pyre_jit_trace::trace::take_fbw_bridge_declined() {
-        let (driver, _) = crate::eval::driver_pair();
-        driver
-            .meta_interp_mut()
-            .record_declined_bridge_guard(descr_arc);
-    }
 
     // #177 bridge `Terminate` no-replay: consume any finish-concrete the walk
     // kept.  A stash survives the epilogue only when `bridge_noreplay_armed`
@@ -4684,11 +4674,11 @@ fn jit_ca_handle_guard_failure(
 /// The caller has already recovered the live descriptor and exit values; the
 /// rest is the same must-compile/bridge attachment sequence used by the native
 /// CALL_ASSEMBLER guard callback above.
-#[allow(dead_code)]
-struct CaBridgeAttempt {
-    terminal_declined: bool,
-}
-
+///
+/// A bridge that does not compile takes the same resume as a guard whose
+/// counter has not fired (`AbstractResumeGuardDescr.handle_fail`'s blackhole
+/// arm). `done_compiling` clears `ST_BUSY_FLAG` and `jitcounter.tick` already
+/// reset the counter, so a later failure ticks again.
 #[allow(dead_code)]
 fn try_compile_ca_bridge(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
@@ -4701,18 +4691,14 @@ fn try_compile_ca_bridge(
     // `handle_possible_exception`, so the bridge enters the handler with the
     // exception live. `0` is the no-exception resume.
     guard_exc: i64,
-) -> CaBridgeAttempt {
+) {
     if raw_values.is_empty() {
-        return CaBridgeAttempt {
-            terminal_declined: false,
-        };
+        return;
     }
     let Some((source_green_key, source_trace_id, source_fail_index)) =
         bridge_source_identity_from_descr(descr_arc)
     else {
-        return CaBridgeAttempt {
-            terminal_declined: false,
-        };
+        return;
     };
     let (must_compile, owning_key) = {
         let (driver, _) = crate::eval::driver_pair();
@@ -4724,11 +4710,7 @@ fn try_compile_ca_bridge(
         )
     };
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
-        let terminal_declined = {
-            let (driver, _) = crate::eval::driver_pair();
-            driver.meta_interp().bridge_declined_terminally(descr_arc)
-        };
-        return CaBridgeAttempt { terminal_declined };
+        return;
     }
     // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
     // descr's own; a bridge guard has no frontend record.
@@ -4744,15 +4726,11 @@ fn try_compile_ca_bridge(
         })
     };
     let Some(exit_layout) = exit_layout else {
-        return CaBridgeAttempt {
-            terminal_declined: false,
-        };
+        return;
     };
     let frame_ptr = raw_values[0] as *mut PyFrame;
     if frame_ptr.is_null() {
-        return CaBridgeAttempt {
-            terminal_declined: false,
-        };
+        return;
     }
     let frame = unsafe { &mut *frame_ptr };
     let _guard = crate::eval::GuardCompilingScope::new(descr_arc);
@@ -4762,14 +4740,6 @@ fn try_compile_ca_bridge(
     );
     // The wasm CALL_ASSEMBLER path likewise bypasses handle_fail's dependency drain.
     crate::eval::register_quasi_immutable_deps(owning_key);
-    // `MetaInterp::compile_bridge` records a wasm `Unsupported` before the
-    // walker returns.  Reuse that canonical guard identity here rather than
-    // creating a separate CA-side decline table.
-    let terminal_declined = {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp().bridge_declined_terminally(descr_arc)
-    };
-    CaBridgeAttempt { terminal_declined }
 }
 
 /// Queue a deferred inline merge, called from the out-of-line bridge that
@@ -4942,29 +4912,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                     savedata.is_some()
                 })
             };
-            let attempt =
-                try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand, guard_exc);
-            if attempt.terminal_declined {
-                // This target cannot reach compiled steady state: each CA
-                // invocation would blackhole.  Invalidate callers so the next
-                // trace refuses this target and returns to the baseline path.
-                majit_backend_wasm::mark_call_assembler_terminal_decline(compiled_ptr as usize);
-                // "the next trace refuses this target" is a question asked at
-                // TRACE time, and until the token carries the answer nothing
-                // asks it: the tracer records the CALL_ASSEMBLER again and the
-                // backend declines the whole trace, which for a bridge means
-                // the guard it was traced from is recorded in
-                // `declined_bridge_guards` and blackholes for the rest of the
-                // run. The guard's owning token is the callee loop this
-                // decline is about, and it is what a CALL_ASSEMBLER descr
-                // names, so the refusal is recorded on it.
-                if let Some(jct) = descr_arc
-                    .as_fail_descr()
-                    .and_then(majit_backend::descr_owning_jct)
-                {
-                    jct.refuse_call_assembler();
-                }
-            }
+            try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand, guard_exc);
             // The walk above may have carried the callee past the guard —
             // running the resumed region to the callee's return, or committing
             // its end-of-walk state into the live frame — executing every
