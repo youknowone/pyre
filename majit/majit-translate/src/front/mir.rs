@@ -38093,13 +38093,19 @@ fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String,
     }
     let (trait_leaf, method_leaf) = trait_payload_owner(value, llbc)?;
     let decl_id = trait_ref_decl_id(payload.first()?, llbc)?;
-    let method = llbc
+    // A `--monomorphize` trait declaration carries no method rows, so there
+    // is no signature to read. The receiver is then guaranteed by the
+    // reference kind: a method without `self` is callable on a trait object
+    // only under `where Self: Sized`, which a `dyn Trait` never satisfies.
+    if let Some(method) = llbc
         .trait_by_id(decl_id)?
         .methods
-        .get(payload.get(1)?.as_u64()? as usize)?;
-    let inputs = method.pointer("/skip_binder/signature/inputs")?;
-    if inputs.as_array().is_none_or(|rows| rows.is_empty()) {
-        return None;
+        .get(payload.get(1)?.as_u64()? as usize)
+    {
+        let inputs = method.pointer("/skip_binder/signature/inputs")?;
+        if inputs.as_array().is_none_or(|rows| rows.is_empty()) {
+            return None;
+        }
     }
     let has_body = llbc.iter_local_fns().any(|fd| {
         let path = fd.item_meta.name_path();
@@ -38165,15 +38171,10 @@ fn trait_call_label(v: &serde_json::Value) -> String {
 fn trait_payload_owner(v: &serde_json::Value, llbc: &Llbc) -> Option<(String, String)> {
     let arr = v.as_array()?;
     let decl_id = trait_ref_decl_id(arr.first()?, llbc)?;
-    let method_idx = arr.get(1)?.as_u64()? as usize;
-    let decl = llbc.trait_by_id(decl_id)?;
-    let method_leaf = decl
-        .methods
-        .get(method_idx)?
-        .pointer("/skip_binder/name")?
-        .as_str()?
+    let method_leaf = llbc
+        .trait_method_name(decl_id, arr.get(1)?.as_u64()?)?
         .to_string();
-    let path = decl.item_meta.name_path();
+    let path = llbc.trait_by_id(decl_id)?.item_meta.name_path();
     let trait_leaf = path.rsplit("::").next()?.to_string();
     Some((trait_leaf, method_leaf))
 }
@@ -50731,6 +50732,49 @@ mod tests {
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
         let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
             "kind": {"Trait": [{"kind": "Dyn", "trait_decl_ref": {"skip_binder": {"id": 0}}}, 0]},
+            "generics": {}
+        }))
+        .expect("fixture trait call parses");
+
+        assert_eq!(
+            super::abstract_trait_call_target(&call, &llbc),
+            Some(("Storage".to_string(), "head".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_mono_trait_object_call_names_its_method_from_assoc_item_names() {
+        // Under `--monomorphize` the trait declaration of a sibling crate
+        // carries no method rows and its vtable struct is opaque, so Charon
+        // leaves `x.getitem_str(..)` on a `&dyn DictStrategy` as a
+        // `CallKind::Trait` with a `Dyn` reference. The method index is then
+        // named only by the crate's `assoc_item_names` table.
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Storage", 0]}],
+                        "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}}},
+                        "source_text": "trait Storage",
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": false
+                    },
+                    "methods": []
+                }],
+                "assoc_item_names": [{"types": [], "methods": ["len", "head"], "consts": []}],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{"kind": "Dyn", "trait_decl_ref": {"skip_binder": {"id": 0}}}, 1]},
             "generics": {}
         }))
         .expect("fixture trait call parses");

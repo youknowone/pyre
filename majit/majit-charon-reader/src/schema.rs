@@ -40,14 +40,20 @@ pub struct Translated {
     /// `SemanticProgram.known_trait_names`.
     #[serde(default)]
     pub trait_decls: Vec<Option<crate::ullbc::TraitDecl>>,
+    /// Names of every trait's associated items, indexed by trait
+    /// `def_id` and then by the item's id within the trait. Charon keeps
+    /// this table for a trait whose declaration carries no items: a
+    /// `--monomorphize` trait decl has an empty `methods`, so a
+    /// `CallKind::Trait` payload's method index is named only here.
+    #[serde(default)]
+    pub assoc_item_names: Vec<Option<AssocItemNames>>,
     /// `impl Trait for T` table, indexed by trait-impl id. Kept as raw
     /// `Value` entries and projected on demand (see
     /// [`crate::Llbc::trait_impls_raw`]).  Read by the front-end's
     /// trait-associated-type resolution.
     ///
     /// Every other top-level surface Charon emits (`ordered_decls`,
-    /// `options`, `item_names`,
-    /// `assoc_item_names`, `short_names`, …) is intentionally not
+    /// `options`, `item_names`, `short_names`, …) is intentionally not
     /// modelled: serde skips unknown fields without allocating, which
     /// both keeps the loader resilient to Charon's release-to-release
     /// renames *and* avoids materialising the whole document as a
@@ -66,6 +72,18 @@ pub struct Translated {
     /// nothing else.
     #[serde(default)]
     pub files: Vec<SourceFile>,
+}
+
+/// One row of [`Translated::assoc_item_names`]: Charon's
+/// `AssocItemNames`, each list indexed by the item's id in its trait.
+#[derive(Debug, Default, Deserialize)]
+pub struct AssocItemNames {
+    #[serde(default)]
+    pub types: Vec<String>,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub consts: Vec<String>,
 }
 
 /// One row of [`Translated::files`].

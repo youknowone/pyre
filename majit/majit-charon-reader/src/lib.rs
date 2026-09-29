@@ -569,6 +569,22 @@ impl Llbc {
             .as_ref()
     }
 
+    /// The name of the `method_id`-th method of trait `trait_id`
+    /// (`TranslatedCrate::assoc_item_name`), falling back to the trait
+    /// declaration's own `methods` row for an artefact without the
+    /// `assoc_item_names` table.
+    pub fn trait_method_name(&self, trait_id: u64, method_id: u64) -> Option<&str> {
+        let table = &self.file.translated.assoc_item_names;
+        if let Some(Some(names)) = table.get(trait_id as usize) {
+            return names.methods.get(method_id as usize).map(String::as_str);
+        }
+        self.trait_by_id(trait_id)?
+            .methods
+            .get(method_id as usize)?
+            .pointer("/skip_binder/name")?
+            .as_str()
+    }
+
     /// Iterate over every present `TypeDecl`.
     pub fn iter_type_decls(&self) -> impl Iterator<Item = &TypeDecl> {
         self.file
