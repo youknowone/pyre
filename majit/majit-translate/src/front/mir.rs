@@ -11184,6 +11184,9 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let narrow_pyobject = container_is_enum
+                        && field_name == "__pos_0"
+                        && self.enum_payload_is_nullable_pyobject(&place_ty);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::FieldRead {
@@ -11199,6 +11202,16 @@ impl<'a> Lowering<'a> {
                             pure: false,
                         },
                     });
+                    if narrow_pyobject {
+                        let narrowed = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(narrowed.clone()),
+                            kind: crate::model::cast_instance_call("PyObject", res),
+                        });
+                        return Ok(narrowed);
+                    }
                     return Ok(res);
                 }
                 // `xs[i]` element read — the symmetric counterpart of
@@ -23598,6 +23611,30 @@ impl<'a> Lowering<'a> {
             return Some(("pyobject::PyObject".to_string(), ValueType::Ref(None)));
         }
         None
+    }
+
+    /// `__pos_0` of an enum whose payload is a nullable `PyObject` pointer
+    /// (`Result<Option<*mut PyObject>, _>::Ok`, or `Result<*mut PyObject, _>`).
+    ///
+    /// The niche `Option` is the pointer itself (`option_niche_null_cast`).
+    /// A bare field read annotates as a classdef-less instance, and
+    /// `unionof` with the already-narrowed `PY_NULL` arm then drops the
+    /// `PyObject` class. The read wants the same
+    /// `__cast_instance_intrinsic("PyObject")` narrow.
+    fn enum_payload_is_nullable_pyobject(&self, place_ty: &TyRef) -> bool {
+        if self
+            .option_niche_null_cast(place_ty)
+            .is_some_and(|(root, _)| root == "pyobject::PyObject")
+        {
+            return true;
+        }
+        tyref_node(place_ty, self.llbc)
+            .and_then(|node| strip_ty_wrappers(node, self.llbc))
+            .and_then(|node| {
+                raw_ptr_pointee_class_root_with(node, self.llbc, self.tombstoned_leaves)
+            })
+            .as_deref()
+            == Some("PyObject")
     }
 
     /// Resolve the destination `Option` of a `bool::then` / `bool::then_some`
@@ -60787,6 +60824,39 @@ mod tests {
         assert!(
             has_nullable_instance,
             "PY_NULL stack clear must lower as null_mut followed by a PyObject narrow"
+        );
+    }
+
+    /// `call_method`'s `Result<Option<PyObjectRef>, PyError>::Ok.__pos_0`
+    /// is the niche pointer. The read must narrow to nullable `PyObject`
+    /// before it merges with the `PY_NULL` arm.
+    #[test]
+    #[ignore]
+    fn call_method_ok_payload_narrows_to_pyobject() {
+        use crate::model::OpKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::baseobjspace::call_method")
+            .expect("lower call_method");
+        let narrowed = graph.blocks.iter().any(|block| {
+            block.operations.windows(2).any(|ops| {
+                let OpKind::FieldRead { field, .. } = &ops[0].kind else {
+                    return false;
+                };
+                field.name == "__pos_0"
+                    && field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(|owner| owner.contains("Result") && owner.contains("PyObject"))
+                    && crate::model::cast_instance_root(&ops[1].kind) == Some("PyObject")
+            })
+        });
+        assert!(
+            narrowed,
+            "call_method Ok payload read must be followed by a PyObject narrow"
         );
     }
 
