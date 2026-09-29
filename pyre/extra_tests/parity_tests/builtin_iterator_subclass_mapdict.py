@@ -142,3 +142,5 @@ for label, base, make, iterate in cases:
     plain(label, base, make, iterate)
     slots(label, base, make)
     finalizer(label, base, make)
+
+print("OK")
