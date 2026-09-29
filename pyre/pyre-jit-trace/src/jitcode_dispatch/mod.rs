@@ -11452,6 +11452,10 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // slot value.  Pin the map with `replace_box` after guarding so a later
     // fold on the same receiver correctly elides (matching the trait
     // `implement_guard_value`).
+    // GuardClass, the `w_class` pin and the version-tag pin can minor-collect.
+    // `concrete_obj` is a copy; the receiver box is `obj`
+    // (`RefFrontendOp` / `getref_base`).
+    let concrete_obj = walker_concrete_ref_object(ctx, obj).unwrap_or(concrete_obj);
     let map_op = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, unsafe {
         crate::descr::mapdict_map_descr(concrete_obj)
     });

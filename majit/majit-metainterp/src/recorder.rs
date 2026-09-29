@@ -296,6 +296,14 @@ pub struct Trace {
     /// `history.py` `ConstPtr` is the box the collector updates; the
     /// list is the holder until the recorded slot takes over.
     live_const_indexes: Vec<u32>,
+    /// QuasiImmut descrs named by the op `record_bytes` is encoding.
+    ///
+    /// `slots` does not hold the descr until the op returns, and
+    /// `reserve_ops_bytes` can minor-collect first. `struct` and
+    /// `constantfieldbox` (`quasiimmut.py QuasiImmutDescr`) are raw
+    /// addresses the slot walk forwards; this list is the holder until
+    /// the slot takes over.
+    pending_quasi_descrs: Vec<DescrRef>,
     /// Live JIT path: `History.trace` is `opencoder.Trace`. When present,
     /// `record_*` appends bytes and a [`FrontendSlot`] instead of a 240-byte
     /// `Op`. `into_parts` materializes through `ByteTraceIter`, the
@@ -479,6 +487,7 @@ impl Trace {
             recorded_ops_total: 0,
             const_ptrs: crate::FxIndexMap::default(),
             live_const_indexes: Vec::new(),
+            pending_quasi_descrs: Vec::new(),
             trb: None,
             slots: Vec::new(),
             unique_to_box: Vec::new(),
@@ -995,6 +1004,19 @@ impl Trace {
         if let Some(fail) = fail_args {
             self.hold_const_indexes(fail);
         }
+        // `quasiimmut.py QuasiImmutDescr` stores raw `struct` and
+        // `constantfieldbox` words. Argument indexes do not rewrite
+        // those fields. Hold the descr across the reserve below;
+        // `slots.push` is what the slot walk sees afterwards.
+        let held_quasi = if let Some(d) = descr
+            .as_ref()
+            .filter(|d| d.as_quasi_immut_descr().is_some())
+        {
+            self.pending_quasi_descrs.push(d.clone());
+            true
+        } else {
+            false
+        };
         // Opcode byte, optional arity varint, one varint per arg, descr
         // varint. `append_int` writes at most four bytes.
         let reserve = 1usize
@@ -1038,6 +1060,11 @@ impl Trace {
             concrete: Cell::new(None),
             first_arg,
         });
+        if held_quasi {
+            self.pending_quasi_descrs
+                .pop()
+                .expect("quasi descr hold missing at slot publish");
+        }
         self.recorded_ops_total += 1;
         self.op_count += 1;
         // `slots` now names the indexes. Drop the recording-window hold.
@@ -1935,6 +1962,13 @@ impl Trace {
             majit_ir::const_ptr_table::trace_index(index, visitor);
             i += 1;
         }
+        // QuasiImmut descrs named by the op currently being encoded.
+        // Not in `slots` yet; `reserve_ops_bytes` collects first.
+        for descr in &self.pending_quasi_descrs {
+            if let Some(qd) = descr.as_quasi_immut_descr() {
+                qd.walk_const_ptr_refs(visitor);
+            }
+        }
         // Keys are `const_ptr_table` indexes (`history.py` `ConstPtr`),
         // stable across a move. Walk the operand cell, which still holds
         // the address `Value::Ref`.
@@ -2612,6 +2646,56 @@ mod tests {
             descr.as_quasi_immut_descr().unwrap().constantfieldbox(),
             Some(Value::Ref(GcRef(0x2000)))
         );
+    }
+
+    #[test]
+    fn walk_forwards_pending_quasiimmut_before_slot() {
+        #[derive(Debug)]
+        struct Handle;
+        impl majit_ir::QuasiImmutHandle for Handle {
+            fn is_current(&self) -> bool {
+                true
+            }
+            fn register_loop_token(
+                &self,
+                _token: &std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken>,
+            ) {
+            }
+            fn instance_identity(&self) -> usize {
+                1
+            }
+        }
+        let field = std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(0, 8, 8, Type::Ref, false))
+            as DescrRef;
+        let descr = std::sync::Arc::new(majit_ir::QuasiImmutDescr::new(
+            field.clone(),
+            0x1000,
+            std::sync::Arc::new(Handle),
+            Some(Value::Ref(GcRef(0x1000))),
+        )) as DescrRef;
+        let mut rec = Trace::new();
+        rec.pending_quasi_descrs.push(descr.clone());
+        assert!(rec.slots.is_empty());
+        rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
+        let qd = descr.as_quasi_immut_descr().unwrap();
+        assert_eq!(qd.struct_ptr(), 0x2000);
+        assert_eq!(qd.constantfieldbox(), Some(Value::Ref(GcRef(0x2000))));
+
+        let recorded = std::sync::Arc::new(majit_ir::QuasiImmutDescr::new(
+            field,
+            0x1000,
+            std::sync::Arc::new(Handle),
+            Some(Value::Ref(GcRef(0x1000))),
+        )) as DescrRef;
+        let mut rec = Trace::new();
+        let obj = rec.record_input_arg(Type::Ref);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_op_with_descr(OpCode::QuasiimmutField, &[obj], recorded.clone());
+        assert!(rec.pending_quasi_descrs.is_empty());
+        rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
+        let qd = recorded.as_quasi_immut_descr().unwrap();
+        assert_eq!(qd.struct_ptr(), 0x2000);
+        assert_eq!(qd.constantfieldbox(), Some(Value::Ref(GcRef(0x2000))));
     }
 
     #[test]

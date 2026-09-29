@@ -317,10 +317,20 @@ fn find(table: &Table, hash: u64, addr: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
+
     use super::*;
+
+    /// `walk` claims every non-null slot for the current [`Wave`]
+    /// (`claim_wave`). These tests share that process-global table, so a
+    /// parallel `walk` inside another test's wave marks its slot,
+    /// `trace_index` returns without the visitor, and `resolve` still
+    /// returns the interned address.
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn intern_is_stable_and_null_is_zero() {
+        let _serial = TEST_SERIAL.lock();
         assert_eq!(intern(GcRef::NULL), 0);
         assert!(resolve(0).is_null());
         let a = GcRef(0x1111_0000);
@@ -333,6 +343,7 @@ mod tests {
 
     #[test]
     fn walk_forwards_the_slot_the_index_names() {
+        let _serial = TEST_SERIAL.lock();
         let addr = GcRef(0x3333_0000);
         let idx = intern(addr);
         walk(&mut |slot| {
@@ -345,6 +356,7 @@ mod tests {
 
     #[test]
     fn a_later_wave_forwards_a_slot_the_previous_wave_traced() {
+        let _serial = TEST_SERIAL.lock();
         let first = GcRef(0x6E6A_ED90_0100);
         let idx = intern(first);
         {

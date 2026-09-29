@@ -4599,47 +4599,42 @@ impl PyFrame {
     /// on the compiled loop's re-run; Gap 10 removed that path (inline-frame
     /// STORE_GLOBAL records as deferred IR, applied exactly once).
     fn build_snapshot_frame(&self, allocation: FrameLocalsArrayAllocation) -> PyFrame {
-        // `live_mut` reloads an opcode's frame after a safepoint. This
-        // snapshot is the same situation one step earlier: a minor may
-        // already have moved the frame, and `set_forwarding_address` then
-        // stores the survivor in the corpse's first payload word — which
-        // for `FixedObjectArray` is `len`. Reading that word as a length
-        // asks for an allocation the size of a heap address.
-        let frame_ptr =
-            pyre_object::gc_hook::try_gc_current_object_address(self as *const Self as *mut u8)
-                as *mut PyFrame;
-        let frame = unsafe { &*frame_ptr };
-        let locals_cells_stack_w = unsafe {
-            let raw = frame.locals_cells_stack_w as *mut u8;
-            let resolved = if raw.is_null() {
-                raw
-            } else {
-                pyre_object::gc_hook::try_gc_current_object_address(raw)
-            };
-            if resolved != raw {
-                // The live frame still names the nursery corpse. The next
-                // minor traces that field; write the survivor back first.
-                store_locals_cells_stack_w(frame_ptr, resolved as *mut FixedObjectArray);
-            }
-            let values = (*(resolved as *mut FixedObjectArray)).to_vec();
-            let array = alloc_frame_locals_array(values.len(), PY_NULL, allocation);
-            for (i, value) in values.into_iter().enumerate() {
-                let value = pyre_object::gc_hook::try_gc_current_object_address(value as *mut u8)
-                    as PyObjectRef;
-                (*array).items_mut_ptr().add(i).write(value);
+        // `alloc_frame_locals_array` and `clone_debugdata_ptr` can minor-collect.
+        // `FrameAnchor` is the shadow-stack slot the collector rewrites
+        // (`FrameRoot` on the bridge path is the same slot). `live()` is that
+        // slot after the allocation. `FixedObjectArray.len` is payload offset
+        // 0, the word `GcHeader::set_forwarding_address` also stores, so the
+        // length is read only from the reloaded frame. The caller has to pass
+        // the live object: anchoring a corpse does not recover the survivor.
+        let anchor =
+            unsafe { crate::eval::FrameAnchor::from_raw(self as *const Self as *mut PyFrame) };
+        let n = unsafe {
+            let arr = (*anchor.live()).locals_cells_stack_w;
+            if arr.is_null() { 0 } else { (*arr).len }
+        };
+        let array = unsafe { alloc_frame_locals_array(n, PY_NULL, allocation) };
+        unsafe {
+            let src = (*anchor.live()).locals_cells_stack_w;
+            if !src.is_null() {
+                let items = (*src).as_slice();
+                let dst = (*array).items_mut_ptr();
+                for (i, &value) in items.iter().take(n).enumerate() {
+                    dst.add(i).write(value);
+                }
             }
             remember_frame_locals_array(array);
-            array
-        };
+        }
+        let debugdata = unsafe { clone_debugdata_ptr((*anchor.live()).debugdata, allocation) };
+        let frame = unsafe { &*anchor.live() };
         PyFrame {
             ob_header: frame_ob_header(),
             pycode: frame.pycode,
-            locals_cells_stack_w,
+            locals_cells_stack_w: array,
             valuestackdepth: frame.valuestackdepth,
             last_instr: frame.last_instr,
             flags: frame.flags,
             failed_attr_cleanup: frame.failed_attr_cleanup,
-            debugdata: unsafe { clone_debugdata_ptr(frame.debugdata, allocation) },
+            debugdata,
             vable_token: frame.vable_token,
             f_generator_wref: frame.f_generator_wref,
             w_yielding_from: frame.w_yielding_from,

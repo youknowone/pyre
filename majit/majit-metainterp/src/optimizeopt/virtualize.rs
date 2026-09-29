@@ -483,9 +483,7 @@ impl OptVirtualize {
                             .item_type();
                         let default_box = match item_type {
                             Type::Int | Type::Void => Operand::const_from_value(Value::Int(0)),
-                            Type::Ref => {
-                                Operand::const_(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
-                            }
+                            Type::Ref => Operand::const_(majit_ir::Const::Ref(0)),
                             Type::Float => Operand::const_from_value(Value::Float(0.0)),
                         };
                         vec![default_box; size as usize]

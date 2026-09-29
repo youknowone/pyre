@@ -646,6 +646,11 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
                     items,
                     index_op,
                 );
+                // `trace_items_block_getitem_value_pure` records
+                // `GetarrayitemGcPureR` and can minor-collect. `live_box_ref`
+                // re-reads `RefFrontendOp` / `getref_base`; this local is not
+                // the box.
+                let concrete_seq = live_box_ref(ctx, seq, concrete_seq);
                 let concrete_item = unsafe {
                     pyre_object::w_tuple_getitem(concrete_seq, int_val)
                         .unwrap_or(pyre_object::PY_NULL)
@@ -784,6 +789,11 @@ fn walker_emit_specialised_pair_item<Sym: WalkSym>(
     let Some(elem_ptr) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
         return Ok(None);
     };
+    // The may-force element is not a root. `wrapfloat` / `walker_box_int`
+    // record trace ops and can minor-collect before the stamp.
+    let _elem_roots = pyre_object::gc_roots::push_roots();
+    let elem_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(elem_ptr as pyre_object::PyObjectRef);
     if pair_kind == SpecialisedPairKind::Float {
         let descr = if first {
             crate::descr::specialised_tuple_ff_value0_descr()
@@ -791,13 +801,15 @@ fn walker_emit_specialised_pair_item<Sym: WalkSym>(
             crate::descr::specialised_tuple_ff_value1_descr()
         };
         let raw = majit_metainterp::box_trace::getfield_gc_f_pureornot(ctx.trace_ctx, seq, descr);
-        let elem = unsafe { pyre_object::w_float_get_value(elem_ptr as pyre_object::PyObjectRef) };
+        let elem_obj = pyre_object::gc_roots::shadow_stack_get(elem_slot);
+        let elem = unsafe { pyre_object::w_float_get_value(elem_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Float(elem));
         let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+        let elem_obj = pyre_object::gc_roots::shadow_stack_get(elem_slot);
         ctx.trace_ctx.set_opref_concrete(
             boxed,
-            majit_ir::Value::Ref(majit_ir::GcRef(elem_ptr as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(elem_obj as usize)),
         );
         return Ok(Some(boxed));
     }
@@ -808,10 +820,12 @@ fn walker_emit_specialised_pair_item<Sym: WalkSym>(
         crate::descr::specialised_tuple_ii_value1_descr()
     };
     let raw = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, seq, descr);
-    let elem = unsafe { pyre_object::w_int_get_value(elem_ptr as pyre_object::PyObjectRef) };
+    let elem_obj = pyre_object::gc_roots::shadow_stack_get(elem_slot);
+    let elem = unsafe { pyre_object::w_int_get_value(elem_obj) };
     let boxed = walker_box_int(ctx, op_pc, raw, elem)?;
+    let elem_obj = pyre_object::gc_roots::shadow_stack_get(elem_slot);
     ctx.trace_ctx
-        .set_opref_concrete(boxed, box_int_concrete(elem, elem_ptr as i64));
+        .set_opref_concrete(boxed, box_int_concrete(elem, elem_obj as i64));
     Ok(Some(boxed))
 }
 
@@ -2467,6 +2481,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                     return Ok(None);
                 };
                 walker_pin_plain_ever_mutated(ctx, op_pc, plain)?;
+                // The shape guard and the quasi-immutable pin can minor-collect.
+                // `concrete_obj` is a copy of the receiver box.
+                let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
                 let w_value = unsafe {
                     pyre_interpreter::objspace::std::mapdict::read_boxed_storage(
                         concrete_obj,
@@ -2488,6 +2505,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         // the inline value read (`mapdict.py`).  `storageindex` is a green
         // constant (the map guard pinned it); `trace_mapdict_storage_getitem`
         // stamps the dst's concrete shadow from the live block slot.
+        // The map guard can minor-collect; re-read the receiver box
+        // (`RefFrontendOp` / `getref_base`) before the storage deref.
+        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
         let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, unsafe {
             crate::descr::mapdict_storage_descr(concrete_obj)
         });
@@ -2579,7 +2599,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             .filter(|dict| !dict.is_null())
     };
     if let Some(dict) = exc_dict
-        && let Some((w_type, _version_tag, carrier, map, storageindex, unboxed)) = unsafe {
+        && let Some((w_type, _version_tag, _carrier, map, storageindex, unboxed)) = unsafe {
             pyre_interpreter::objspace::std::mapdict::instance_dict_attr_fast_path(
                 concrete_obj,
                 dict,
@@ -2628,6 +2648,12 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             crate::descr::w_exception_dict_descr_for(kind, user),
         );
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[dict_op])?;
+        // GuardClass, the class pin and the version-tag pin can minor-collect
+        // before this stamp. Re-read the dict from the receiver box
+        // (`RefFrontendOp` / `getref_base`); `dict` is the copy taken before
+        // those guards.
+        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        let dict = unsafe { pyre_object::interp_exceptions::w_exception_peek_dict(concrete_obj) };
         ctx.trace_ctx.set_opref_concrete(
             dict_op,
             majit_ir::Value::Ref(majit_ir::GcRef(dict as usize)),
@@ -2657,6 +2683,16 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
 
         let carrier_op =
             walker_record_getfield_gc_r_uncached(ctx, dict_op, crate::descr::dict_dstorage_descr());
+        // The strategy guard can minor-collect. `MapDictStrategy` stores the
+        // carrier in `W_DictObject.dstorage`, which the collector updates; the
+        // `carrier` copy from `instance_dict_attr_fast_path` is not. Stamp the
+        // live field, or the box keeps the pre-collection address and a later
+        // `live_box_ref` reads it back.
+        let dict = live_box_ref(ctx, dict_op, dict);
+        let carrier = unsafe {
+            (*(dict as *const pyre_object::dictmultiobject::W_DictObject)).dstorage
+                as pyre_object::PyObjectRef
+        };
         ctx.trace_ctx.set_opref_concrete(
             carrier_op,
             majit_ir::Value::Ref(majit_ir::GcRef(carrier as usize)),
@@ -2670,6 +2706,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(map_op, map_const);
 
+        // The map guard above can minor-collect. `carrier` is the copy;
+        // `carrier_op` is the box.
+        let carrier = live_box_ref(ctx, carrier_op, carrier);
         let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, carrier_op, unsafe {
             crate::descr::mapdict_storage_descr(carrier)
         });
@@ -2683,6 +2722,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             // consumer virtualize it away.
             Some((_, listindex)) => {
                 let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
+                let carrier = live_box_ref(ctx, carrier_op, carrier);
                 let live = unsafe {
                     pyre_interpreter::objspace::std::mapdict::read_unboxed_storage_raw(
                         carrier,
@@ -2955,6 +2995,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // a `Ref` argument, which forces an instance the trace allocated.
     let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
     let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
+    // `walker_guard_mapdict_instance_shape` records guards that can
+    // minor-collect. The receiver box is `obj`, not this local.
+    let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
     let live = unsafe {
         pyre_interpreter::objspace::std::mapdict::read_unboxed_storage_raw(
             concrete_obj,
@@ -4397,11 +4440,24 @@ fn walker_emit_super_attr_binding<Sym: WalkSym>(
     // The concrete bound method the walker's own execution must observe; a
     // fresh `Method` per evaluation is what `getattribute` produces anyway, so
     // the trace allocating its own is not an identity divergence.
-    let concrete_bound_self = if bind_to_class {
-        objtype
-    } else {
-        concrete_self
-    };
+    //
+    // The guards and `emit_bound_method_inline` above record trace ops. A
+    // minor between the earlier copies and `w_method_new` rewrites
+    // `RefFrontendOp` / `ConstPtr.getref_base`, not those copies, and
+    // `w_method_new` then stores the copy into `Method.w_self`. Re-read the
+    // boxes first.
+    let w_function = live_box_ref(ctx, func_const, w_function);
+    let objtype = live_box_ref(ctx, objtype_const, objtype);
+    let header_w_class_obj = live_box_ref(ctx, header_w_class, header_w_class_obj);
+    let concrete_bound_self = live_box_ref(
+        ctx,
+        bound_self,
+        if bind_to_class {
+            objtype
+        } else {
+            concrete_self
+        },
+    );
     let bound = if restamps_header {
         pyre_interpreter::restamped_bound_method_new(
             w_function,
@@ -5197,6 +5253,9 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         // Recording it as `setarrayitem_gc` rather than a residual also puts
         // it in the same heap cache the unboxed read uses, so a read of the
         // slot the trace just wrote answers from the trace.
+        // The shape guard can minor-collect. `concrete_obj` is a copy of the
+        // receiver box (`RefFrontendOp` / `getref_base`).
+        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
         let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, unsafe {
             crate::descr::mapdict_storage_descr(concrete_obj)
         });
@@ -5219,6 +5278,9 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                     listindex_const,
                     raw,
                 );
+                // `walker_unbox_int_exact` can minor-collect. The value box is
+                // `value` (`RefFrontendOp` / `getref_base`).
+                let concrete_value = live_box_ref(ctx, value, concrete_value);
                 unsafe { pyre_object::w_int_get_value(concrete_value) }
             }
             pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
@@ -5232,6 +5294,9 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                     value,
                     walker_numeric_builtin_class(concrete_value),
                 )?;
+                // The unbox and `w_class` pin can minor-collect. The value box
+                // is `value` (`RefFrontendOp` / `getref_base`).
+                let concrete_value = live_box_ref(ctx, value, concrete_value);
                 let live_f = unsafe { pyre_object::w_float_get_value(concrete_value) };
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
@@ -5247,7 +5312,9 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         };
         // The walk is the authoritative execution path, so apply the write
         // now (`_direct_write`'s same-type arm, mapdict.py); the ops above
-        // reproduce it in compiled code.
+        // reproduce it in compiled code. The unbox guards can minor-collect
+        // after the storage descr was read.
+        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
         unsafe {
             pyre_interpreter::objspace::std::mapdict::write_unboxed_storage_raw(
                 concrete_obj,
@@ -5495,6 +5562,10 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         }
         // The walk is the authoritative execution path, so apply the resolved
         // transition now; the emitted operations reproduce it in compiled code.
+        // The shape guard and the holder pins can minor-collect. Both pointers
+        // are copies of `obj` / `value` (`RefFrontendOp` / `getref_base`).
+        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        let concrete_value = live_box_ref(ctx, value, concrete_value);
         unsafe {
             pyre_interpreter::objspace::std::mapdict::store_attr_add_commit(
                 concrete_obj,
@@ -6843,6 +6914,12 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         else {
             return Ok(None);
         };
+        // The may-force value is live, but this copy is not a root. The
+        // guards below record trace ops and can minor-collect before
+        // `set_opref_concrete`.
+        let _result_roots = pyre_object::gc_roots::push_roots();
+        let result_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(boxed_result_i64 as pyre_object::PyObjectRef);
 
         walker_guard_class(
             ctx,
@@ -6951,9 +7028,10 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
             ),
         );
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[value])?;
+        let boxed_result = pyre_object::gc_roots::shadow_stack_get(result_slot);
         ctx.trace_ctx.set_opref_concrete(
             value,
-            majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
         );
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
         return Ok(Some(()));
@@ -8172,8 +8250,13 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
             result: Some(boxed),
         }));
     }
-    let boxed_ptr = pyre_object::w_int_new(concrete) as i64;
+    // `walker_box_int` records `wrapint` and that recording can minor-collect.
+    // Allocate the concrete after it and stamp before the next call, the
+    // same order as `walker_read_int_mutable_cell`. A `w_int_new` before
+    // the record leaves the nursery int unrooted across the collection, and
+    // `set_opref_concrete` then stores the dead pointer.
     let boxed = walker_box_int(ctx, op_pc, raw, concrete)?;
+    let boxed_ptr = pyre_object::w_int_new(concrete) as i64;
     ctx.trace_ctx
         .set_opref_concrete(boxed, box_int_concrete(concrete, boxed_ptr));
     let _ = (dst, dst_bank);
@@ -16743,6 +16826,18 @@ pub(crate) fn run_codewriter_helper_inline_call<Sym: WalkSym>(
     .map(|(outcome, _)| outcome)
 }
 
+/// Re-read a ref the collector may have moved.
+///
+/// `copied` is a Rust local. `history.py` `RefFrontendOp` / `getref_base`
+/// is the box the minor collector updates; this local is not.
+fn live_box_ref<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: OpRef,
+    copied: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    walker_concrete_ref_object(ctx, op).unwrap_or(copied)
+}
+
 /// Commit core of the #171 orthodox list-append fold, shared by the
 /// method-call (`try_walker_orthodox_list_append`) and LIST_APPEND-opcode
 /// (`try_walker_orthodox_list_append_opcode`) forms.  Stamps the receiver
@@ -16765,9 +16860,14 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     self_ref: OpRef,
     value_op: OpRef,
     mut inner_self: pyre_object::PyObjectRef,
-    value: pyre_object::PyObjectRef,
+    mut value: pyre_object::PyObjectRef,
     len_before: usize,
 ) -> Result<(), DispatchError> {
+    // The local is a copy of the receiver box (`RefFrontendOp` /
+    // `getref_base`). Guards in the caller can minor-collect before this
+    // deref (`record` → `_record_op`).
+    inner_self = live_box_ref(ctx, self_ref, inner_self);
+    value = live_box_ref(ctx, value_op, value);
     let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(inner_self) };
     // Keep the original Ref box across the helper-frame boundary.  For a
     // virtual W_IntObject/W_FloatObject, its cached payload field is the live
@@ -16827,7 +16927,10 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         // leaving the append body to record the length/item stores.
         crate::helpers::emit_promote_empty_list_inline(ctx.trace_ctx, self_ref, target);
         // Concrete promotion of the real list, then journal so a non-commit
-        // walk rolls back to Empty.
+        // walk rolls back to Empty. The transition IR above can minor-collect;
+        // re-read the boxes before touching the objects.
+        inner_self = live_box_ref(ctx, self_ref, inner_self);
+        value = live_box_ref(ctx, value_op, value);
         inner_self = unsafe { pyre_object::w_list_switch_to_strategy_for(inner_self, value) };
         ctx.trace_ctx.set_opref_concrete(
             self_ref,
@@ -16848,6 +16951,8 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // plain GC ref with no unboxing, so it carries no type precondition —
     // skip the class pin (the sub-walk's object-storage store path does
     // not read the value's class).
+    inner_self = live_box_ref(ctx, self_ref, inner_self);
+    value = live_box_ref(ctx, value_op, value);
     let is_obj_storage = unsafe { pyre_object::w_list_uses_object_storage(inner_self) };
     if !is_obj_storage {
         // Integer, Float, and Ascii storage pin the value's class so the
@@ -16891,6 +16996,9 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         // (`OrthodoxSubWalkTraceUnsupported`). Pin w_class to the concrete
         // value's field so the subclass test folds too (the recognition gate
         // already proved the strict predicate).
+        // The class guard's snapshot can minor-collect. `value` is the
+        // pre-guard copy; `value_op` is the box.
+        value = live_box_ref(ctx, value_op, value);
         let concrete_w_class = unsafe { (*value).w_class } as i64;
         let w_class_ref = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -16964,6 +17072,10 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // iterations, a traceback name list with its last frame doubled).
     // Re-read the length instead of assuming which side ran: it is the
     // receiver's own state, so it answers for both.
+    // The helper sub-walk records ops and can minor-collect. The journal
+    // and the concrete append both dereference these objects.
+    inner_self = live_box_ref(ctx, self_ref, inner_self);
+    value = live_box_ref(ctx, value_op, value);
     finish_recorded_list_append(
         ctx,
         op.pc,
@@ -18128,7 +18240,24 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
         }
         concrete_items.push(item);
     }
+    // `w_tuple_new` can collect. The items are livevars of that call, but
+    // `concrete_self` is not one of them, so the constructor's root bracket
+    // does not keep it. Publish the exception and the items together
+    // (`pin_roots`) and read the slots back after the allocation: the local
+    // passed to `pin_root` can still name the corpse
+    // (`walker_emit_recorded_builtin_raise`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut pinned = Vec::with_capacity(concrete_items.len() + 1);
+    pinned.push(concrete_self);
+    pinned.extend_from_slice(&concrete_items);
+    let self_slot = pyre_object::gc_roots::pin_roots(&pinned);
+    let concrete_items: Vec<_> = (0..concrete_items.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(self_slot + 1 + index))
+        .collect();
     let concrete_args_tuple = pyre_object::w_tuple_new(concrete_items);
+    let concrete_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
+    let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+    let concrete_args_tuple = pyre_object::gc_roots::pin_root(concrete_args_tuple);
     let args_specialised_oo = if args_len == 2 {
         let ob_type = unsafe { (*concrete_args_tuple).ob_type };
         if std::ptr::eq(
@@ -18144,9 +18273,14 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     } else {
         false
     };
-    let kind = unsafe { pyre_object::w_exception_get_kind(concrete_self) };
+    // A slot that is still not a live exception must not index
+    // `with_w_exception_group`. `w_exception_kind_checked` rejects that
+    // shape before the tag load.
+    let Some(kind) = (unsafe { pyre_object::w_exception_kind_checked(concrete_self) }) else {
+        return Ok(None);
+    };
+    let concrete_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
     let phys_type = unsafe { (*concrete_self).ob_type as i64 };
-    let w_class = unsafe { (*concrete_self).w_class };
 
     let self_box = if from_bound_method {
         let method_op = callable_op;
@@ -18191,6 +18325,7 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[dict_ref])?;
 
     let cls_ref = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, w_class_descr);
+    let w_class = unsafe { (*pyre_object::gc_roots::shadow_stack_get(self_slot)).w_class };
     let cls_const = ctx.trace_ctx.const_ref(w_class as i64);
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[cls_ref, cls_const])?;
     ctx.trace_ctx
@@ -18219,6 +18354,7 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     } else {
         crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &items)
     };
+    let concrete_args_tuple = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
     ctx.trace_ctx.set_opref_concrete(
         args_tuple,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_args_tuple as usize)),
@@ -18227,6 +18363,8 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     // pair, so `makespecialisedtuple2` builds `Cls_oo`.
     let result =
         crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, cls_const, args_tuple);
+    let w_class = unsafe { (*pyre_object::gc_roots::shadow_stack_get(self_slot)).w_class };
+    let concrete_args_tuple = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
     let concrete_result = pyre_object::w_tuple_new(vec![w_class, concrete_args_tuple]);
     ctx.trace_ctx.set_opref_concrete(
         result,
@@ -19467,6 +19605,18 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
+    // The guards below grow the trace (`history.py` `record` → `_record_op`)
+    // and can minor-collect. These copies are not boxes; pin them the way
+    // `gct_fv_gc_malloc.push_roots` keeps a livevar across the allocation.
+    // The journal is its own root (`fbw_store_journal_root_walker`).
+    let _operand_roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(list_obj);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(key_obj);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value_obj);
+    let _ = pyre_object::gc_roots::pin_root(displaced);
     // Root the original element before the sub-walk executes the store
     // (`w_list_setitem_inner`).  A post-walk getitem would read the new
     // value and rollback would restore that, leaving the list mutated.
@@ -19504,6 +19654,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         .heap_cache_mut()
         .replace_box(strategy, sid_const);
 
+    let key_obj = pyre_object::gc_roots::shadow_stack_get(key_slot);
     let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
     let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
     ctx.trace_ctx
@@ -19511,6 +19662,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
 
     if sid != 0 {
         let is_float_storage = sid == 2;
+        let value_obj = pyre_object::gc_roots::shadow_stack_get(value_slot);
         let value_is_long = unsafe { pyre_object::pyobject::is_long(value_obj) };
         let value_type_addr = if is_float_storage {
             &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64
@@ -19528,6 +19680,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         ctx.trace_ctx
             .heap_cache_mut()
             .class_now_known(value_op, value_type_addr);
+        let value_obj = pyre_object::gc_roots::shadow_stack_get(value_slot);
         let concrete_w_class = unsafe { (*value_obj).w_class } as i64;
         let w_class_ref = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -19543,6 +19696,11 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
             .replace_box(w_class_ref, w_class_const);
     }
 
+    // The pins above were updated by the minor. The frontend box was too
+    // (`RefFrontendOp` / `getref_base`). Stamp and pass that address; the
+    // pre-guard copy is the from-space word.
+    let list_obj = pyre_object::gc_roots::shadow_stack_get(list_slot);
+    let value_obj = pyre_object::gc_roots::shadow_stack_get(value_slot);
     ctx.trace_ctx.set_opref_concrete(
         list_op,
         majit_ir::Value::Ref(majit_ir::GcRef(list_obj as usize)),
@@ -20320,6 +20478,9 @@ fn try_walker_specialize_for_iter_range_step_one<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(current, Value::Int(concrete_current));
 
+    // `w_range_iter_next` boxes the yielded int and can minor-collect, which
+    // moves the iterator. The trace slot is forwarded; this local is not.
+    let iter_obj = walker_concrete_ref_object(ctx, iter_op).unwrap_or(iter_obj);
     // Journal on root walks too: a non-commit root abort leaves
     // delivery as the only way to keep this item, and delivery
     // refuses when a body-effect signal stands.  Without a cursor
@@ -20539,6 +20700,9 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(current, Value::Int(concrete_current));
 
+    // `w_range_iter_next` boxes the yielded int and can minor-collect, which
+    // moves the iterator. The trace slot is forwarded; this local is not.
+    let iter_obj = walker_concrete_ref_object(ctx, iter_op).unwrap_or(iter_obj);
     // Same journal as the step-one shape: a root abort that then
     // refuses in-flight delivery must be able to restore the cursor.
     fbw_bridge_iter_journal_push(iter_obj, concrete_current, concrete_remaining);
