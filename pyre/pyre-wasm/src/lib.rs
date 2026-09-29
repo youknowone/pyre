@@ -140,73 +140,152 @@ mod heap_prof {
 #[global_allocator]
 static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
 
-// Residual-call host trampoline for the native-host (`wasm-host`) build.
+// Residual calls for the native-host (`wasm-host`) build.
 //
-// wasm32 `call_indirect` type-checks every call. The recording / blackhole
-// path reads the callee's wasm type from the function table
-// (`residual_target_sig`, the same encoding `env.jit_func_sig` gives the
-// compiler) and calls that slot with a trampoline of that exact type.
-// A missing table type, an arity mismatch, an f32, or a shape with no
-// trampoline falls through to `majit_host.jit_call_host`, which reflects
-// the signature in the host. A published slot keeps the type it read.
-#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-mod residual_sig_call;
-
+// A table index that is one of the `extern "C"` wrappers below calls that
+// wrapper. The wrapper's declaration is the wasm type. Every other callee
+// goes through `majit_host.jit_call_host`, which reads the table signature
+// and coerces each positional argument.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 mod residual_host {
-    use std::cell::RefCell;
-
-    use majit_backend_wasm::{FuncSigVal, decode_func_sig, encode_func_sig, residual_target_sig};
-
-    fn cached_sig(slot: usize) -> Option<majit_backend_wasm::WasmSig> {
-        thread_local! {
-            static CACHE: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+    /// Direct-call the blackhole helpers whose real wasm ABI is known exactly.
+    ///
+    /// The generic path below must reflect the callee's wasm type in the host:
+    /// an `r` argument may be a real `i32` pointer, a void descriptor may name
+    /// a word-returning target, and guessing either signature traps at a wasm
+    /// `call_indirect`.  These targets are different: every one is declared as
+    /// an explicit `pub extern "C"` wrapper whose parameters and result are
+    /// `i64` words or pointers, and the CPU function table stores those exact
+    /// function addresses.  Comparing the table index therefore proves the
+    /// callee identity, and the Rust call below
+    /// converts each word to the declared parameter type ([`WordArg`]) and the
+    /// result back to a word ([`WordRet`]).  Calling the named wrapper directly
+    /// matches the native blackhole dispatch while avoiding a guest -> host ->
+    /// guest reflection round-trip.
+    ///
+    /// A `()` callee is listed separately and returns 0.  The reflective host
+    /// writes 0 when the wasm result list is empty.
+    trait WordArg {
+        fn from_word(word: i64) -> Self;
+    }
+    impl WordArg for i64 {
+        fn from_word(word: i64) -> Self {
+            word
         }
-        let cached = CACHE.with(|c| c.borrow().get(slot).copied().unwrap_or(0));
-        if let Some(sig) = decode_func_sig(cached) {
-            return Some(sig);
+    }
+    impl<T> WordArg for *mut T {
+        fn from_word(word: i64) -> Self {
+            word as usize as *mut T
         }
-        let sig = residual_target_sig(slot as i64)?;
-        let bits = encode_func_sig(&sig.params, sig.result);
-        if bits != 0 {
-            CACHE.with(|c| {
-                let mut cache = c.borrow_mut();
-                if cache.len() <= slot {
-                    cache.resize(slot + 1, 0);
-                }
-                cache[slot] = bits;
-            });
+    }
+    impl<T> WordArg for *const T {
+        fn from_word(word: i64) -> Self {
+            word as usize as *const T
         }
-        Some(sig)
+    }
+    trait WordRet {
+        fn into_word(self) -> i64;
+    }
+    impl WordRet for i64 {
+        fn into_word(self) -> i64 {
+            self
+        }
+    }
+    impl<T> WordRet for *mut T {
+        fn into_word(self) -> i64 {
+            self as usize as i64
+        }
     }
 
-    /// Call `func_ptr` when the table publishes a matching wasm type.
-    fn direct_sig_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
-        if func_ptr == 0 || args.len() > 7 {
-            return None;
+    fn direct_uniform_i64_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
+        macro_rules! uniform_i64_allow_list {
+            ($( [$($arg:ident),*] => $callee:path ),* $(,)?) => {
+                match args {
+                    $(
+                        [$($arg),*] if func_ptr == $callee as *const () as usize => {
+                            Some(WordRet::into_word($callee($(WordArg::from_word(*$arg)),*)))
+                        }
+                    )*
+                    _ => None,
+                }
+            };
         }
-        let sig = cached_sig(func_ptr)?;
-        if sig.params.len() != args.len() || sig.has_f32() {
-            return None;
+        macro_rules! uniform_void_allow_list {
+            ($( [$($arg:ident),*] => $callee:path ),* $(,)?) => {
+                match args {
+                    $(
+                        [$($arg),*] if func_ptr == $callee as *const () as usize => {
+                            $callee($(WordArg::from_word(*$arg)),*);
+                            Some(0)
+                        }
+                    )*
+                    _ => None,
+                }
+            };
         }
-        if !sig.params.is_empty() && sig.params.iter().all(|p| *p == FuncSigVal::F64) {
-            return super::residual_sig_call::call_uniform_f64(func_ptr, args, sig.result);
+        let word = uniform_i64_allow_list![
+            [] => pyre_jit::call_jit::bh_get_current_exception,
+            [] => pyre_jit::call_jit::bh_current_exception_or_none,
+            [value] => pyre_jit::call_jit::bh_box_int_fn,
+            [value] => pyre_jit::call_jit::bh_truth_fn,
+            [value] => pyre_interpreter::opcode_ops::jit_baseobjspace_len,
+            [value] => pyre_interpreter::opcode_ops::jit_baseobjspace_not_,
+            [value] => pyre_interpreter::opcode_ops::jit_descroperation_neg,
+            [iter] => pyre_interpreter::runtime_ops::jit_next,
+            [obj, key] => pyre_interpreter::opcode_ops::jit_baseobjspace_delitem,
+            [array] => pyre_jit::call_jit::bh_newtuple_from_array,
+            [array] => pyre_jit::call_jit::bh_newlist_from_array,
+            [array] => pyre_jit::call_jit::bh_build_map_from_array,
+            [subcls, cls] => pyre_object::pyobject::__majit_call_target_ll_issubclass,
+            [index, seq] => pyre_jit::call_jit::bh_unpack_item_fn,
+            [count, seq] => pyre_jit::call_jit::bh_unpack_sequence_fn,
+            [obj] => pyre_jit::call_jit::bh_get_iter_fn,
+            [dunder_result] => pyre_jit_trace::operator_continuation::bh_len_tail,
+            [frame_ptr] => pyre_jit::call_jit::bh_load_build_class_fn,
+            [callable, null_or_self] => pyre_jit::call_jit::bh_call_fn_0,
+            [globals, code_obj] => pyre_interpreter::runtime_ops::jit_make_function_from_globals,
+            [cell, value] => pyre_jit::call_jit::bh_store_deref_value_fn,
+            [lhs, rhs, op_code] => pyre_interpreter::opcode_ops::jit_binary_value_from_tag,
+            [lhs, rhs, op_code] => pyre_interpreter::opcode_ops::jit_compare_value_from_tag,
+            [frame_ptr, exc, cause] => pyre_jit::call_jit::bh_normalize_raise_varargs_with_frame,
+            [frame_ptr, w_name, value] => pyre_jit::call_jit::bh_store_global_fn,
+            [frame_ptr, w_name, value] => pyre_jit::call_jit::bh_store_name_fn,
+            [func, attr, flag] => pyre_interpreter::runtime_ops::jit_set_function_attribute,
+            [cell, w_code_ptr, deref_idx] => pyre_jit::call_jit::bh_load_deref_value_fn,
+            [dict, source, w_callable] => pyre_jit::call_jit::bh_dict_merge_fn,
+            [obj, key, value] => pyre_interpreter::opcode_ops::bh_store_subscr_fn,
+            [callable, null_or_self, arg0] => pyre_jit::call_jit::bh_call_fn,
+            [obj, w_code_ptr, name_idx] => pyre_jit::call_jit::bh_load_attr_fn,
+            [frame_ptr, w_name, namei] => pyre_jit::call_jit::bh_load_name_fn,
+            [argc, start, stop, step] => pyre_jit::call_jit::bh_build_slice_fn,
+            [subject, cls, kwd_attrs, count] => pyre_jit::call_jit::bh_match_class_fn,
+            [callable, self_or_null, starargs, kwargs_or_null] =>
+                pyre_jit::call_jit::bh_call_function_ex_fn,
+            [callable, null_or_self, arg0, arg1] => pyre_jit::call_jit::bh_call_fn_2,
+            [obj, attr, w_code_ptr, name_idx] => pyre_jit::call_jit::bh_load_method_self_fn,
+            [next_instr, is_being_profiled, pycode, frame_ptr, ec] =>
+                pyre_jit::call_jit::bh_portal_runner_c,
+            [callable, null_or_self, a0, a1, a2] => pyre_jit::call_jit::bh_call_fn_3,
+            [namespace_ptr, w_code_ptr, frame_ptr, namei] =>
+                pyre_jit::call_jit::bh_load_global_fn,
+            [callable, null_or_self, a0, a1, a2, a3] => pyre_jit::call_jit::bh_call_fn_4,
+            [callable, null_or_self, kwnames, a0, a1, a2, a3] =>
+                pyre_jit::call_jit::bh_call_kw_4,
+        ];
+        if word.is_some() {
+            return word;
         }
-        let mut mask = 0u16;
-        for (i, param) in sig.params.iter().enumerate() {
-            match param {
-                FuncSigVal::I32 => mask |= 1 << i,
-                FuncSigVal::I64 => {}
-                FuncSigVal::F64 | FuncSigVal::F32 => return None,
-            }
-        }
-        super::residual_sig_call::call_int_sig(func_ptr, args, mask, sig.result)
+        uniform_void_allow_list![
+            [] => pyre_jit::call_jit::bh_clear_in_flight_exception,
+            [exc] => pyre_jit::call_jit::bh_set_current_exception,
+            [w_obj, storageindex, value] => pyre_jit_trace::helpers::jit_mapdict_boxed_write,
+        ]
     }
 
     /// Install the trampoline on the current thread. Idempotent.
     pub fn install() {
         majit_backend::call_stub::set_residual_host_call(Some(|func_ptr, args| {
-            direct_sig_call(func_ptr, args)
+            direct_uniform_i64_call(func_ptr, args)
                 .unwrap_or_else(|| majit_backend_wasm::residual_host_call(func_ptr, args))
         }));
     }
