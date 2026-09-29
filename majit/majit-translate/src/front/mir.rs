@@ -43614,6 +43614,16 @@ fn tyref_to_value_type_with(
     if tyref_is_string_builder(ty, llbc) {
         return ValueType::StringBuilder;
     }
+    // `PyError` is `repr(transparent)` over `PyObjectRef`, one pointer word.
+    // Peeling it would paint the handle as `pyobject::PyObject` and merge the
+    // carrier with every object. The class is the handle's own leaf.
+    if let Some(path) = adt_path_of_tyref(ty, llbc) {
+        if path == "pyre_interpreter::error::PyError"
+            || strip_crate_prefix(&path) == "error::PyError"
+        {
+            return ValueType::Ref(Some("PyError".into()));
+        }
+    }
     // A transparent one-field struct has the same low-level value shape as
     // its field. Charon records the representation in `TypeDecl.layout`, so
     // preserve the field's register bank instead of treating the wrapper as

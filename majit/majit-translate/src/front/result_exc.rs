@@ -3112,7 +3112,11 @@ fn rewire_one_call_site(
     // the carried value itself.  Collapse is the first mutation and
     // errs before writing, so a decline here still leaves the graph
     // byte-identical.
+    // A shared continue block still receives the Result shell from the
+    // other predecessors. Collapsing `__pos_0` there unions `T` with the
+    // shell (`pyobject::PyObject ∪ Result<..,PyError>`).
     let continue_target = continue_link.target;
+    assert_single_pred(graph, continue_target.0, &name)?;
     for pos in payload_positions {
         let _ = collapse_pos0_read(graph, continue_target, pos, &name)?;
     }
@@ -5355,7 +5359,41 @@ fn separate_payload_from_shell(graph: &mut FunctionGraph, origin: usize, payload
             .filter(|(_, positions)| !positions.is_empty())
             .collect();
         for (target, positions) in forwarded {
-            let created = install_payload_phis(graph, target, &positions, &carried);
+            // Another predecessor still passes the shell into this slot.
+            // Putting `T` in that phi unions the payload with the Result.
+            // Keep the shell on this edge instead.
+            let mut clean = Vec::new();
+            let mut restore: Vec<(usize, Variable)> = Vec::new();
+            for pos in positions {
+                match graph.blocks[target.0].inputargs.get(pos).cloned() {
+                    Some(old)
+                        if old != carried
+                            && !is_payload_phi(&old)
+                            && edge_passes_var(graph, target, pos, &old) =>
+                    {
+                        restore.push((pos, old));
+                    }
+                    _ => clean.push(pos),
+                }
+            }
+            if !restore.is_empty() {
+                for link in &mut graph.blocks[block].exits {
+                    if link.target != target {
+                        continue;
+                    }
+                    for (pos, old) in &restore {
+                        if let Some(LinkArg::Value(var)) = link.args.get_mut(*pos)
+                            && *var == carried
+                        {
+                            *var = old.clone();
+                        }
+                    }
+                }
+            }
+            if clean.is_empty() {
+                continue;
+            }
+            let created = install_payload_phis(graph, target, &clean, &carried);
             if target == graph.returnblock {
                 continue;
             }
@@ -5419,6 +5457,21 @@ fn install_payload_phis(
 fn is_payload_phi(var: &Variable) -> bool {
     // `Variable::rename` keeps a trailing `_` (`clean_name`).
     var.name_prefix() == "exc_payload_"
+}
+
+/// Another edge into `target` still passes `var` at `pos`.
+fn edge_passes_var(
+    graph: &FunctionGraph,
+    target: crate::model::BlockId,
+    pos: usize,
+    var: &Variable,
+) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.exits.iter().any(|link| {
+            link.target == target
+                && matches!(link.args.get(pos), Some(LinkArg::Value(incoming)) if incoming == var)
+        })
+    })
 }
 
 /// A `__pos_0` read that still names the `Result` / `ControlFlow` shell
