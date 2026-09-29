@@ -1018,3 +1018,75 @@ fn result_map_of_some_builds_the_option_instead_of_a_fn_const() {
         "`.map(Some)` leaves no residual Result::map"
     );
 }
+
+fn return_producer<'a>(
+    graph: &'a majit_translate::model::FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+    depth: u32,
+) -> Option<&'a OpKind> {
+    if depth > 8 {
+        return None;
+    }
+    let kind = graph.blocks.iter().find_map(|block| {
+        block
+            .operations
+            .iter()
+            .find_map(|op| (op.result.as_ref() == Some(var)).then_some(&op.kind))
+    })?;
+    match kind {
+        OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+            return_producer(graph, operand, depth + 1)
+        }
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => args
+            .first()
+            .and_then(majit_translate::model::LinkArg::as_variable)
+            .and_then(|src| return_producer(graph, src, depth + 1)),
+        other => Some(other),
+    }
+}
+
+/// `space.index_w` returns the `Some` payload of `Option<Result<i64, PyError>>`.
+/// That shell is `Ref`; the scalar callee must forward `Ok`'s `i64` instead.
+/// `lower_function` does not stamp `FUNC.RESULT` (registration does), so this
+/// asserts the CFG return, not `return_type`.
+#[test]
+fn space_index_w_returns_ok_i64() {
+    use majit_translate::model::{LinkArg, ValueType};
+    let g = lower_function(interp(), "pyre_interpreter::builtins::space_index_w")
+        .unwrap_or_else(|e| panic!("lower: {e}"));
+    let mut ok_returns = 0usize;
+    for block in &g.blocks {
+        for link in &block.exits {
+            if link.target != g.returnblock {
+                continue;
+            }
+            assert_eq!(link.args.len(), 1, "scalar return has one arg");
+            let LinkArg::Value(var) = &link.args[0] else {
+                panic!("return arg is a value");
+            };
+            let Some(OpKind::FieldRead { field, ty, .. }) = return_producer(&g, var, 0) else {
+                panic!("return {var:?} is not a field read");
+            };
+            let owner = field.owner_root.as_deref().unwrap_or("");
+            assert_eq!(field.name, "__pos_0", "owner {owner}");
+            assert!(
+                owner.ends_with("::Ok") && owner.contains("Result<i64,PyError>"),
+                "return owner {owner}"
+            );
+            assert!(
+                !owner.ends_with("::Some"),
+                "Option shell still reaches returnblock: {owner}"
+            );
+            assert_eq!(ty, &ValueType::Int, "Ok payload ty {ty:?}");
+            ok_returns += 1;
+        }
+    }
+    assert_eq!(
+        ok_returns, 2,
+        "both as_index_value successes return the Ok i64"
+    );
+}

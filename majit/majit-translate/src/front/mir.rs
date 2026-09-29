@@ -4564,6 +4564,31 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         if range_contains_rewritten > 0 {
             crate::model::prune_dead_phis(&mut lo.graph);
         }
+        // A scoped scalar callee can `return` an `Option<Result<T, PyError>>::Some`
+        // payload it did not build. [`lower_result_exc_returns`] rewrites `Ok`/`Err`
+        // ctors and tail-forwarded calls, so that aggregate stays `Ref` and
+        // `graph_result_kind` reports `r` against the scalar `FUNC.RESULT`
+        // (`dont_look_inside_return_token`). Checked-arith's second callee rule
+        // and the late closure-select rewire can still rebuild shells, so this
+        // runs after both. `exceptiontransform.py` `transform_completely` carries
+        // `T` on the normal edge and raises on the error edge.
+        let scalar_shell_owners = if result_exc_callee {
+            lo.resolve_result_owners(&fd.signature.output)
+        } else {
+            None
+        };
+        if let Some((result_owner, ok_owner, err_owner, ok_ty, err_ty, _)) = scalar_shell_owners {
+            crate::front::result_exc::unwrap_returned_scalar_result_shells(
+                &mut lo.graph,
+                &result_owner,
+                &ok_owner,
+                &err_owner,
+                &ok_ty,
+                &err_ty,
+                static_addrs.error_carrier,
+            )
+            .map_err(LowerError::Unsupported)?;
+        }
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || option_ok_or_else_try_rewritten > 0

@@ -36,6 +36,13 @@
 //!   value `BH_LAST_EXC_VALUE` carries
 //!   (`codewriter::error_carrier_edges`).
 //!
+//! - **Returned-shell rule** ([`unwrap_returned_scalar_result_shells`]):
+//!   the same callee can `return` an `Option<Result<T, PyError>>::Some`
+//!   payload it did not construct.  That aggregate is `Ref`, so
+//!   `graph_result_kind` would report `r` against the scalar
+//!   `FUNC.RESULT`.  `Ok` forwards `T`; `Err` raises.  A return that is
+//!   already `T`, or a `Ref` this pass cannot prove is that shell, stays.
+//!
 //! - **Caller rule** ([`rewire_result_exc_call_sites`]): a `?` on a
 //!   call to a scoped callee lowers in MIR as a
 //!   `Try::branch`-diamond — `cf = branch(r)` →
@@ -859,6 +866,293 @@ fn has_tail_forwarded_call_result(graph: &FunctionGraph) -> bool {
         }
     }
     false
+}
+
+/// A scoped `Result<scalar, PyError>` callee can return a shell it did not
+/// build. `return Ok(v)` / `return Err(e)` are rewritten by
+/// [`lower_result_exc_returns`]; `return v` where `v` is the `Some` payload
+/// of `Option<Result<T, PyError>>` (`space.index_w`'s `as_index_value`
+/// fast path) never constructs a ctor in this graph, so the returnblock
+/// keeps the `Result` aggregate. Every aggregate is `Ref`, and
+/// `graph_result_kind` then reports `r` against the `i64` `FUNC.RESULT`
+/// stamp (`dont_look_inside_return_token` projects `Result<i64, PyError>`
+/// through `i64`).
+///
+/// `exceptiontransform.py` `transform_completely` never returns that shell:
+/// the normal edge carries `T` and the error edge raises. Split each such
+/// return the same way — `Ok` forwards the payload, `Err` raises the
+/// carrier (`exc_from_raise`). `codewriter::error_carrier_edges` converts
+/// that raise. A return that is already `T` (a rewritten ctor, a retyped
+/// tail-forward) is left in place. An unrecognised `Ref` is left too:
+/// exploding an arbitrary reference would read a discriminant off a value
+/// that is not this `Result`. A phi is a shell only when every predecessor
+/// is one; a mix with the scalar payload is left, because that payload has
+/// no discriminant.
+pub(crate) fn unwrap_returned_scalar_result_shells(
+    graph: &mut FunctionGraph,
+    result_owner: &str,
+    ok_owner: &str,
+    err_owner: &str,
+    ok_ty: &ValueType,
+    err_ty: &ValueType,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Result<(), String> {
+    if scalar_result_kind(ok_ty).is_none() {
+        return Ok(());
+    }
+    let returnblock = graph.returnblock;
+    let mut shells = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (ei, link) in block.exits.iter().enumerate() {
+            if link.target != returnblock || link.args.len() != 1 {
+                continue;
+            }
+            let Some(var) = link.args[0].as_variable() else {
+                continue;
+            };
+            match classify_return_var(graph, var, ok_ty, 0) {
+                ReturnClass::Shell => shells.push((bi, ei)),
+                ReturnClass::Payload | ReturnClass::Other => {}
+            }
+        }
+    }
+    for (bi, ei) in shells {
+        split_result_shell_return(
+            graph,
+            bi,
+            ei,
+            result_owner,
+            ok_owner,
+            err_owner,
+            ok_ty,
+            err_ty,
+            spec,
+        )?;
+    }
+    Ok(())
+}
+
+enum ReturnClass {
+    Payload,
+    Shell,
+    Other,
+}
+
+fn scalar_result_kind(ty: &ValueType) -> Option<char> {
+    match ty {
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::SingleFloat => {
+            Some('i')
+        }
+        ValueType::Float => Some('f'),
+        _ => None,
+    }
+}
+
+fn classify_return_var(
+    graph: &FunctionGraph,
+    var: &Variable,
+    ok_ty: &ValueType,
+    depth: u32,
+) -> ReturnClass {
+    if depth > 12 {
+        return ReturnClass::Other;
+    }
+    if let Some(kind) = producer_kind(graph, var) {
+        return match kind {
+            ProducerKind::Shell => ReturnClass::Shell,
+            ProducerKind::Typed(ty) if scalar_result_kind(&ty) == scalar_result_kind(ok_ty) => {
+                ReturnClass::Payload
+            }
+            ProducerKind::Same(inner) | ProducerKind::Cast(inner) => {
+                classify_return_var(graph, &inner, ok_ty, depth + 1)
+            }
+            ProducerKind::Typed(_) => ReturnClass::Other,
+        };
+    }
+    let Some((block, slot)) = inputarg_slot(graph, var) else {
+        return ReturnClass::Other;
+    };
+    let mut saw_shell = false;
+    let mut saw_payload = false;
+    let mut saw = false;
+    for pred in &graph.blocks {
+        for link in &pred.exits {
+            if link.target.0 != block {
+                continue;
+            }
+            let Some(arg) = link.args.get(slot) else {
+                return ReturnClass::Other;
+            };
+            let Some(src) = arg.as_variable() else {
+                return ReturnClass::Other;
+            };
+            saw = true;
+            match classify_return_var(graph, src, ok_ty, depth + 1) {
+                ReturnClass::Payload => saw_payload = true,
+                ReturnClass::Shell => saw_shell = true,
+                ReturnClass::Other => return ReturnClass::Other,
+            }
+        }
+    }
+    if !saw {
+        return ReturnClass::Other;
+    }
+    match (saw_shell, saw_payload) {
+        (true, false) => ReturnClass::Shell,
+        (false, true) => ReturnClass::Payload,
+        (true, true) | (false, false) => ReturnClass::Other,
+    }
+}
+
+enum ProducerKind {
+    Shell,
+    Typed(ValueType),
+    Same(Variable),
+    Cast(Variable),
+}
+
+fn producer_kind(graph: &FunctionGraph, var: &Variable) -> Option<ProducerKind> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return Some(match &op.kind {
+                OpKind::FieldRead { field, ty, .. }
+                    if field.name == "__pos_0"
+                        && matches!(ty, ValueType::Ref(_))
+                        && field.owner_root.as_deref().is_some_and(|owner| {
+                            owner.ends_with("::Some") && owner.contains("Result<")
+                        }) =>
+                {
+                    ProducerKind::Shell
+                }
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    ProducerKind::Same(operand.clone())
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic")
+                    && let Some(src) = args.first().and_then(LinkArg::as_variable) =>
+                {
+                    ProducerKind::Cast(src.clone())
+                }
+                OpKind::FieldRead { ty, .. }
+                | OpKind::Call { result_ty: ty, .. }
+                | OpKind::BinOp { result_ty: ty, .. }
+                | OpKind::UnaryOp { result_ty: ty, .. }
+                | OpKind::ArrayRead { item_ty: ty, .. }
+                | OpKind::RawLoad { item_ty: ty, .. } => ProducerKind::Typed(ty.clone()),
+                OpKind::ConstInt(_) | OpKind::ConstUInt(_) => ProducerKind::Typed(ValueType::Int),
+                OpKind::ConstBool(_) => ProducerKind::Typed(ValueType::Bool),
+                OpKind::ConstFloat(_) => ProducerKind::Typed(ValueType::Float),
+                OpKind::ConstSingleFloat(_) => ProducerKind::Typed(ValueType::SingleFloat),
+                _ => ProducerKind::Typed(ValueType::Ref(None)),
+            });
+        }
+    }
+    None
+}
+
+fn inputarg_slot(graph: &FunctionGraph, var: &Variable) -> Option<(usize, usize)> {
+    graph.blocks.iter().enumerate().find_map(|(bi, block)| {
+        block
+            .inputargs
+            .iter()
+            .position(|arg| arg == var)
+            .map(|slot| (bi, slot))
+    })
+}
+
+fn split_result_shell_return(
+    graph: &mut FunctionGraph,
+    block: usize,
+    exit: usize,
+    result_owner: &str,
+    ok_owner: &str,
+    err_owner: &str,
+    ok_ty: &ValueType,
+    err_ty: &ValueType,
+    // `error_carrier_edges` reads this spec after the front returns.
+    // The raise below stores the carrier itself.
+    #[allow(unused_variables)] spec: crate::ErrorCarrierSpec<'_>,
+) -> Result<(), String> {
+    let (split, split_inputs) = graph.create_block_with_arg_vars(1);
+    let shell = split_inputs[0].clone();
+    graph.blocks[block].exits[exit].target = split;
+
+    let (ok_bb, ok_inputs) = graph.create_block_with_arg_vars(1);
+    let (err_bb, err_inputs) = graph.create_block_with_arg_vars(1);
+    let disc = graph
+        .push_op_var(
+            split,
+            OpKind::FieldRead {
+                base: shell.clone(),
+                field: crate::model::FieldDescriptor::new(
+                    "__discriminant",
+                    Some(result_owner.to_string()),
+                ),
+                ty: ValueType::Int,
+                pure: true,
+            },
+            true,
+        )
+        .expect("discriminant read");
+    let shell_link = LinkArg::Value(shell);
+    graph.set_control_flow_metadata(
+        split,
+        Some(ExitSwitch::Value(disc)),
+        vec![
+            Link::new_mixed(
+                vec![shell_link.clone()],
+                ok_bb,
+                Some(crate::model::ExitCase::Const(
+                    crate::flowspace::model::ConstValue::Int(0),
+                )),
+            ),
+            Link::new_mixed(
+                vec![shell_link],
+                err_bb,
+                Some(crate::model::ExitCase::Const(
+                    crate::flowspace::model::ConstValue::Int(1),
+                )),
+            ),
+        ],
+    );
+
+    let payload = graph
+        .push_op_var(
+            ok_bb,
+            OpKind::FieldRead {
+                base: ok_inputs[0].clone(),
+                field: crate::model::FieldDescriptor::new("__pos_0", Some(ok_owner.to_string())),
+                ty: ok_ty.clone(),
+                pure: true,
+            },
+            true,
+        )
+        .expect("ok payload read");
+    graph.set_return(ok_bb, Some(payload));
+
+    let err_payload = graph
+        .push_op_var(
+            err_bb,
+            OpKind::FieldRead {
+                base: err_inputs[0].clone(),
+                field: crate::model::FieldDescriptor::new("__pos_0", Some(err_owner.to_string())),
+                ty: err_ty.clone(),
+                pure: true,
+            },
+            true,
+        )
+        .expect("err payload read");
+    // `return Err(e)` → `raise e`. The codewriter converts the raised
+    // carrier (`codewriter::error_carrier_edges`), same as
+    // [`lower_result_exc_returns`].
+    crate::front::exc_from_raise::set_raise_from_instance(graph, err_bb, err_payload);
+    Ok(())
 }
 
 pub(crate) struct UseCounts {
@@ -5701,5 +5995,200 @@ mod option_ok_or_else_try_tests {
         rewire_one_option_ok_or_else_try_site(&mut graph, &site, false)
             .expect("ok_or_else `?` diamond rewires");
         assert_link_args_defined(&graph);
+    }
+}
+
+#[cfg(test)]
+mod unwrap_returned_scalar_shell_tests {
+    use super::*;
+    use crate::model::FieldDescriptor;
+
+    fn carrier() -> crate::ErrorCarrierSpec<'static> {
+        crate::ErrorCarrierSpec {
+            carrier_path: "pyre_interpreter::error::PyError",
+            carrier_wrappers: &[],
+            to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+            from_exc_object: Some(("PyError", "from_exc_object")),
+        }
+    }
+
+    fn push_some_shell(graph: &mut FunctionGraph) -> Variable {
+        let base = graph.alloc_value_var();
+        graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("Option<Result<i64,PyError>>::Some".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("some payload")
+    }
+
+    fn return_vars(graph: &FunctionGraph) -> Vec<Variable> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.exits.iter())
+            .filter(|link| link.target == graph.returnblock)
+            .map(|link| {
+                let LinkArg::Value(var) = &link.args[0] else {
+                    panic!("return arg");
+                };
+                var.clone()
+            })
+            .collect()
+    }
+
+    fn producer<'a>(graph: &'a FunctionGraph, var: &Variable) -> Option<&'a OpKind> {
+        graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref() == Some(var))
+                .map(|op| &op.kind)
+        })
+    }
+
+    #[test]
+    fn a_returned_some_shell_forwards_the_ok_payload_and_raises() {
+        let mut graph = FunctionGraph::new("ret_shell");
+        let shell = push_some_shell(&mut graph);
+        graph.set_return(graph.startblock, Some(shell));
+        unwrap_returned_scalar_result_shells(
+            &mut graph,
+            "core::result::Result<i64,PyError>",
+            "core::result::Result<i64,PyError>::Ok",
+            "core::result::Result<i64,PyError>::Err",
+            &ValueType::Int,
+            &ValueType::Ref(None),
+            carrier(),
+        )
+        .expect("unwrap");
+
+        let returns = return_vars(&graph);
+        assert_eq!(returns.len(), 1);
+        match producer(&graph, &returns[0]) {
+            Some(OpKind::FieldRead { field, ty, .. }) => {
+                assert_eq!(field.name, "__pos_0");
+                assert_eq!(
+                    field.owner_root.as_deref(),
+                    Some("core::result::Result<i64,PyError>::Ok")
+                );
+                assert_eq!(ty, &ValueType::Int);
+            }
+            other => panic!("ok return producer {other:?}"),
+        }
+        let raise = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block
+                    .exits
+                    .iter()
+                    .any(|link| link.target == graph.exceptblock)
+            })
+            .expect("Err arm raises");
+        let [link] = raise.exits.as_slice() else {
+            panic!("raise block has one exit");
+        };
+        let [LinkArg::Value(_etype), LinkArg::Value(evalue)] = link.args.as_slice() else {
+            panic!("raise link is (type, value)");
+        };
+        match producer(&graph, evalue) {
+            Some(OpKind::FieldRead { field, .. }) => {
+                assert_eq!(field.name, "__pos_0");
+                assert_eq!(
+                    field.owner_root.as_deref(),
+                    Some("core::result::Result<i64,PyError>::Err")
+                );
+            }
+            other => panic!("raised carrier {other:?}"),
+        }
+        assert!(
+            raise.operations.iter().all(|op| {
+                !matches!(&op.kind, OpKind::Call { target, .. }
+                    if format!("{target:?}").contains("pyerror_to_exc_object"))
+            }),
+            "the front raises the carrier; error_carrier_edges emits to_exc_object"
+        );
+    }
+
+    #[test]
+    fn a_ref_payload_result_is_left_in_place() {
+        let mut graph = FunctionGraph::new("ret_ref");
+        let shell = push_some_shell(&mut graph);
+        graph.set_return(graph.startblock, Some(shell.clone()));
+        unwrap_returned_scalar_result_shells(
+            &mut graph,
+            "core::result::Result<PyObjectRef,PyError>",
+            "core::result::Result<PyObjectRef,PyError>::Ok",
+            "core::result::Result<PyObjectRef,PyError>::Err",
+            &ValueType::Ref(None),
+            &ValueType::Ref(None),
+            carrier(),
+        )
+        .expect("unwrap");
+        assert_eq!(return_vars(&graph), vec![shell]);
+        assert!(graph.blocks.iter().all(|block| {
+            block
+                .exits
+                .iter()
+                .all(|link| link.target != graph.exceptblock)
+        }));
+    }
+
+    #[test]
+    fn an_int_payload_return_is_left_in_place() {
+        let mut graph = FunctionGraph::new("ret_int");
+        let payload = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(7), true)
+            .expect("const");
+        graph.set_return(graph.startblock, Some(payload.clone()));
+        unwrap_returned_scalar_result_shells(
+            &mut graph,
+            "core::result::Result<i64,PyError>",
+            "core::result::Result<i64,PyError>::Ok",
+            "core::result::Result<i64,PyError>::Err",
+            &ValueType::Int,
+            &ValueType::Ref(None),
+            carrier(),
+        )
+        .expect("unwrap");
+        assert_eq!(return_vars(&graph), vec![payload]);
+    }
+
+    #[test]
+    fn an_unrecognised_ref_return_is_left_in_place() {
+        let mut graph = FunctionGraph::new("ret_call");
+        let value = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["other"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        graph.set_return(graph.startblock, Some(value.clone()));
+        unwrap_returned_scalar_result_shells(
+            &mut graph,
+            "core::result::Result<i64,PyError>",
+            "core::result::Result<i64,PyError>::Ok",
+            "core::result::Result<i64,PyError>::Err",
+            &ValueType::Int,
+            &ValueType::Ref(None),
+            carrier(),
+        )
+        .expect("unwrap");
+        assert_eq!(return_vars(&graph), vec![value]);
     }
 }
