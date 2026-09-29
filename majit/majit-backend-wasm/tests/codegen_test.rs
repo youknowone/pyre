@@ -1424,33 +1424,38 @@ fn build_module_with_gc_table(
     bytes
 }
 
-#[test]
-fn jitframe_barrier_checks_flags_and_reserves_arity_one_for_zero_argument_residuals() {
+fn module_with_collecting_calls(call_count: usize) -> Vec<u8> {
     const WB_TARGET: i64 = 127;
-    let call = make_op(
-        OpCode::CallMayForceI,
-        &[OpRef::const_int(42)],
-        OpRef::int_op(1),
-    );
-    call.setdescr(majit_ir::descr::make_call_descr_full(
-        0,
-        vec![],
-        Type::Int,
-        false,
-        8,
-        EffectInfo::default(),
-    ));
+    let mut ops = Vec::with_capacity(call_count + 2);
+    for i in 0..call_count {
+        let call = make_op(
+            OpCode::CallMayForceI,
+            &[OpRef::const_int(42)],
+            OpRef::int_op(1 + i as u32),
+        );
+        call.setdescr(majit_ir::descr::make_call_descr_full(
+            0,
+            vec![],
+            Type::Int,
+            false,
+            8,
+            EffectInfo::default(),
+        ));
+        ops.push(call);
+    }
     let guard = Op::new(OpCode::GuardNotForced, &[]);
     guard.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+    ops.push(guard);
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+    ops.push(finish);
     // The barrier follows the frame reload, so the collector's reload
     // helper must be configured (`gcrootmap and wbdescr`).
     let mut ca = codegen::CaParams::default();
     ca.ca_reload_fn_ptr = 1;
     let inputs = codegen::ModuleBuildInputs {
         inputargs: vec![InputArg::from_type_rc(Type::Ref, 0)],
-        ops: vec![call, guard, finish],
+        ops,
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
@@ -1477,30 +1482,212 @@ fn jitframe_barrier_checks_flags_and_reserves_arity_one_for_zero_argument_residu
     };
     let (bytes, _, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs))
         .expect("wasm codegen should succeed");
+    bytes
+}
+
+fn code_bodies(bytes: &[u8]) -> Vec<Vec<wasmparser::Operator<'_>>> {
+    let mut bodies = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            bodies.push(
+                body.get_operators_reader()
+                    .unwrap()
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            );
+        }
+    }
+    bodies
+}
+
+fn frame_barrier_flag_checks(ops: &[wasmparser::Operator], flag: i32) -> usize {
+    ops.windows(4)
+        .filter(|window| {
+            matches!(
+                window,
+                [
+                    wasmparser::Operator::I32Load8U { .. },
+                    wasmparser::Operator::I32Const { value },
+                    wasmparser::Operator::I32And,
+                    wasmparser::Operator::If { .. }
+                ] if *value == flag
+            )
+        })
+        .count()
+}
+
+#[test]
+fn jitframe_barrier_checks_flags_and_reserves_arity_one_for_zero_argument_residuals() {
+    const WB_TARGET: i64 = 127;
+    let bytes = module_with_collecting_calls(1);
     assert_eq!(direct_write_barrier_call_count(&bytes, WB_TARGET as i32), 1);
     validate_wasm(&bytes);
+    // One site does not pay for a function, so the fastpath stays in the trace.
+    let bodies = code_bodies(&bytes);
+    assert_eq!(bodies.len(), 1);
     // _reload_frame_if_necessary's frame fastpath must guard the helper;
     // otherwise every collecting call searches the managed heap even when
     // the frame has already been remembered (or has a zeroed off-GC header).
     let flag = i32::from(codegen::WriteBarrierHelpers::for_current_gc(WB_TARGET, 0).if_flag);
-    let mut flag_checks = 0;
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
-        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
-            let ops = body
-                .get_operators_reader()
-                .unwrap()
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            for window in ops.windows(4) {
-                if matches!(window, [wasmparser::Operator::I32Load8U { .. }, wasmparser::Operator::I32Const { value }, wasmparser::Operator::I32And, wasmparser::Operator::If { .. }] if *value == flag)
-                {
-                    flag_checks += 1;
+    assert_eq!(frame_barrier_flag_checks(&bodies[0], flag), 1);
+}
+
+#[test]
+fn jitframe_barrier_outlines_when_many_sites_collect() {
+    const WB_TARGET: i64 = 127;
+    // Past `outline_frame_write_barrier`: 6 * (17 - 2) > 17 + 40.
+    let bytes = module_with_collecting_calls(6);
+    validate_wasm(&bytes);
+    let bodies = code_bodies(&bytes);
+    assert_eq!(bodies.len(), 2);
+    let flag = i32::from(codegen::WriteBarrierHelpers::for_current_gc(WB_TARGET, 0).if_flag);
+    assert_eq!(frame_barrier_flag_checks(&bodies[0], flag), 0);
+    assert_eq!(frame_barrier_flag_checks(&bodies[1], flag), 1);
+    // The helper body is `FRAME_WB_BODY_OPS` plus the function `end`.
+    assert_eq!(bodies[1].len(), 18);
+    assert_eq!(direct_write_barrier_call_count(&bytes, WB_TARGET as i32), 1);
+    let helper_calls = bodies[0]
+        .iter()
+        .filter(|op| matches!(op, wasmparser::Operator::Call { function_index: 1 }))
+        .count();
+    assert_eq!(helper_calls, 6);
+}
+
+fn func_import_count(bytes: &[u8]) -> u32 {
+    let mut count = 0u32;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+            for import in reader {
+                if matches!(import.unwrap().ty, wasmparser::TypeRef::Func(_)) {
+                    count += 1;
                 }
             }
         }
     }
-    assert_eq!(flag_checks, 1);
+    count
+}
+
+fn body_has_loop(ops: &[wasmparser::Operator]) -> bool {
+    ops.iter()
+        .any(|op| matches!(op, wasmparser::Operator::Loop { .. }))
+}
+
+/// One `CallMayForce` so the ref input is live across a collecting call and
+/// takes a home. `fn_ptr == 0` keeps the frame barrier inline-or-absent, and
+/// arity 1 does not admit a spill helper, so an outlined exit is the only
+/// extra function.
+fn guard_exit_module(guard_count: usize, ref_fail: bool, exit_table_base: u32) -> Vec<u8> {
+    let fail = if ref_fail {
+        OpRef::input_arg_ref(0)
+    } else {
+        OpRef::input_arg_int(0)
+    };
+    let mut ops = Vec::with_capacity(guard_count + 2);
+    if ref_fail {
+        let call = make_op(
+            OpCode::CallMayForceI,
+            &[OpRef::const_int(42)],
+            OpRef::int_op(1),
+        );
+        call.setdescr(majit_ir::descr::make_call_descr_full(
+            0,
+            vec![],
+            Type::Int,
+            false,
+            8,
+            EffectInfo::default(),
+        ));
+        ops.push(call);
+    }
+    for _ in 0..guard_count {
+        ops.push(make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::const_int(1)],
+            &[fail],
+        ));
+    }
+    let finish = Op::new(OpCode::Finish, &[rb(fail)]);
+    finish.setfailargs(smallvec![rb(fail)]);
+    ops.push(finish);
+    let mut ca = codegen::CaParams::default();
+    ca.exit_table_base = exit_table_base;
+    let input = if ref_fail {
+        InputArg::from_type_rc(Type::Ref, 0)
+    } else {
+        InputArg::from_type_rc(Type::Int, 0)
+    };
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: vec![input],
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::compact(8, 4, 0),
+        ca,
+    };
+    let (bytes, _, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs))
+        .expect("wasm codegen should succeed");
+    bytes
+}
+
+#[test]
+fn guard_exit_one_home_stays_inline() {
+    // n=1 saves 12 operators. One site does not clear `GUARD_EXIT_OUTLINE_COST`.
+    let bytes = guard_exit_module(1, true, 0x4000);
+    validate_wasm(&bytes);
+    let bodies = code_bodies(&bytes);
+    assert_eq!(bodies.len(), 1);
+    assert!(!body_has_loop(&bodies[0]));
+}
+
+#[test]
+fn guard_exit_home_loads_outline_past_the_fixed_cost() {
+    // 24 * 12 = 288, past the helper's fixed cost of 160.
+    let bytes = guard_exit_module(24, true, 0x4000);
+    validate_wasm(&bytes);
+    let bodies = code_bodies(&bytes);
+    assert_eq!(bodies.len(), 2);
+    assert!(!body_has_loop(&bodies[0]));
+    assert!(body_has_loop(&bodies[1]));
+    let helper = func_import_count(&bytes) + 1;
+    let calls = bodies[0]
+        .iter()
+        .filter(|op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == helper))
+        .count();
+    assert_eq!(calls, 24);
+}
+
+#[test]
+fn guard_exit_without_homes_stays_inline() {
+    let bytes = guard_exit_module(24, false, 0x4000);
+    validate_wasm(&bytes);
+    let bodies = code_bodies(&bytes);
+    assert_eq!(bodies.len(), 1);
+    assert!(!body_has_loop(&bodies[0]));
+    let stores = bodies[0]
+        .iter()
+        .filter(|op| matches!(op, wasmparser::Operator::I64Store { .. }))
+        .count();
+    assert!(stores >= 24, "int fail args still spill at the site");
 }
 
 #[test]
