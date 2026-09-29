@@ -634,9 +634,8 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                     // A value `LOAD_CONST` (large int / float) routes its
                     // result through the unboxed int/float bank, so
                     // `write_ref_reg` never stamps `vstack_last_ref`.
-                    // Residual `box_int_fn` (`LOAD_SMALL_INT`) does stamp
-                    // the fresh wrapint; keep that identity. Only fill a
-                    // NONE hole from `getconstant_w` / `w_small_int_const`.
+                    // Only fill a NONE hole, from `getconstant_w` /
+                    // `w_small_int_const`.
                     top = loadconst_operand_ref(ctx, code, &instr, op_arg);
                 }
                 ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = top;
