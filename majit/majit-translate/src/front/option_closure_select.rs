@@ -108,6 +108,9 @@ pub(crate) struct ClosureSelectSite {
     /// `f(x)` (or niladic `f()`) call site lowers to — instead of
     /// `call_once(env, (x,))`.
     pub fn_item_segments: Option<Vec<String>>,
+    /// The function item is an ADT constructor: the arm builds this aggregate
+    /// (the shape `Rvalue::Aggregate` emits) instead of calling it.
+    pub fn_item_ctor: Option<crate::front::mir::AggregateShape>,
     /// The receiver `Option`'s payload `T` projected to a [`ValueType`] — the
     /// `Some::__pos_0` read kind and the `(x,)` args-tuple element.
     pub payload_ty: ValueType,
@@ -557,26 +560,59 @@ fn emit_site_callable(
     payload: Option<(Variable, ValueType, Option<String>)>,
     name: &str,
 ) -> Result<Variable, String> {
-    if let Some(segments) = site.fn_item_segments.as_ref() {
-        Ok(emit_fn_item_call(
+    emit_callable(
+        graph,
+        block,
+        env,
+        &site.call_once_owner,
+        site.fn_item_segments.as_deref(),
+        site.fn_item_ctor.as_ref(),
+        payload,
+        site.call_result_ty.clone(),
+        &site.args_tuple_suffix,
+    )
+    .map_err(|msg| format!("{name}: {msg}"))
+}
+
+/// Run a combinator's callable on `arg` (or on nothing) in `block`.  A
+/// constructor function item builds its aggregate from `arg`; any other
+/// function item is a direct `Call(FunctionPath)`; a closure is
+/// `call_once(env, (arg,))`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_callable(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    env: Option<Variable>,
+    call_once_owner: &str,
+    fn_item_segments: Option<&[String]>,
+    fn_item_ctor: Option<&crate::front::mir::AggregateShape>,
+    arg: Option<(Variable, ValueType, Option<String>)>,
+    result_ty: ValueType,
+    args_tuple_suffix: &str,
+) -> Result<Variable, String> {
+    if let Some(shape) = fn_item_ctor {
+        let args: Vec<Variable> = arg.into_iter().map(|(value, _, _)| value).collect();
+        return crate::front::mir::emit_aggregate_value(graph, block, shape, &args);
+    }
+    if let Some(segments) = fn_item_segments {
+        return Ok(emit_fn_item_call(
             graph,
             block,
             segments,
-            payload.map(|(value, _, class_root)| (value, class_root)),
-            site.call_result_ty.clone(),
-        ))
-    } else {
-        let env = env.ok_or_else(|| format!("{name}: closure env not threaded"))?;
-        Ok(emit_call_once(
-            graph,
-            block,
-            env,
-            payload,
-            &site.call_once_owner,
-            site.call_result_ty.clone(),
-            &site.args_tuple_suffix,
-        ))
+            arg.map(|(value, _, class_root)| (value, class_root)),
+            result_ty,
+        ));
     }
+    let env = env.ok_or_else(|| "closure env not threaded".to_string())?;
+    Ok(emit_call_once(
+        graph,
+        block,
+        env,
+        arg,
+        call_once_owner,
+        result_ty,
+        args_tuple_suffix,
+    ))
 }
 
 /// Emit `f(x)` / `f()` in `block` as a direct `Call(FunctionPath)` — the
@@ -711,6 +747,7 @@ mod tests {
             some_owner: RECV_SOME.into(),
             call_once_owner: "test::closure".into(),
             fn_item_segments: None,
+            fn_item_ctor: None,
             payload_ty: ValueType::Int,
             payload_class_root: None,
             call_result_ty: ValueType::Int,
@@ -1281,6 +1318,93 @@ mod tests {
         );
         assert_eq!(g.blocks[a.0].exits.len(), 2, "A branches to Some/None arms");
         assert_eq!(count_ctors(&g), 2, "map still builds Some(U) and None");
+    }
+
+    #[test]
+    fn map_constructor_fn_item_builds_the_variant() {
+        // `opt.map(Wrap)` with `Wrap` a tuple-variant constructor: the Some
+        // arm builds the variant the way `Rvalue::Aggregate` does, instead of
+        // calling the constructor.
+        let mut g = FunctionGraph::new("test_map_ctor_fn_item");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let fn_item = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::model::FN_CONST_HEAD.into(),
+                            "host".into(),
+                            "E".into(),
+                            "Wrap".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map", Some(RECV_OPTION.into())),
+                    args: crate::model::call_args(vec![opt, fn_item]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+        let mut fn_site = site(ClosureCombinator::Map, result);
+        fn_site.fn_item_segments = Some(vec!["host".into(), "E".into(), "Wrap".into()]);
+        fn_site.fn_item_ctor = Some(crate::front::mir::AggregateShape::Operand {
+            index: 0,
+            transparent: true,
+        });
+        fn_site.call_result_ty = ValueType::Ref(None);
+
+        let outcome = rewire_closure_select_call_sites(&mut g, &[fn_site]);
+        assert_eq!(outcome.rewritten, 1);
+        assert!(residual_gone(&g, "map"));
+        assert_eq!(
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::FunctionPath { segments, .. }
+                if segments.last().map(String::as_str) == Some("Wrap")
+                    && crate::model::fn_const_segments(t).is_none())
+            ),
+            0,
+            "the constructor is built, not called"
+        );
+        // A transparent wrapper is its operand: `Some(Wrap(x))` writes the
+        // payload read straight into the result's `Some`.
+        let payload = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. }
+                    if field.name == "__pos_0"
+                        && field.owner_root.as_deref() == Some(RECV_SOME) =>
+                {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("Some arm reads the payload");
+        let wrapped = g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
+            matches!(&op.kind, OpKind::FieldWrite { field, value, .. }
+                if field.name == "__pos_0"
+                    && field.owner_root.as_deref() == Some(RESULT_SOME)
+                    && *value == LinkArg::Value(payload.clone()))
+        });
+        assert!(wrapped);
     }
 
     #[test]

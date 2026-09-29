@@ -76,6 +76,14 @@ impl FunDecl {
             .as_u64()
     }
 
+    /// `true` for the function Charon synthesises for a tuple-struct or
+    /// tuple-variant constructor used as a value (`src: "AdtConstructor"`).
+    /// Its output type is the ADT and its name ends in the variant (or
+    /// struct) name.
+    pub fn is_adt_constructor(&self) -> bool {
+        self.src.as_ref().and_then(Value::as_str) == Some("AdtConstructor")
+    }
+
     /// Return the `Unstructured` (basic-block CFG) body if present.
     pub fn unstructured(&self) -> Option<Unstructured> {
         #[derive(Deserialize)]

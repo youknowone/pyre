@@ -291,38 +291,16 @@ fn rewire_one(
             // An actual propagation edge carries a trace-level exception
             // object, not the interpreter-specific carrier returned by the
             // mapper.
-            let exc = crate::front::result_exc::materialize_error_to_exc_object(
-                graph, err_block, mapped, spec,
-            );
-            let last_exception = exceptional
-                .last_exception
-                .as_ref()
-                .and_then(LinkArg::as_variable)
-                .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exception"))?;
-            let last_exc_value = exceptional
-                .last_exc_value
-                .as_ref()
-                .and_then(LinkArg::as_variable)
-                .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exc_value"))?;
-            let args =
-                exceptional
-                    .args
-                    .iter()
-                    .map(|arg| -> Result<LinkArg, String> {
-                        Ok(match arg {
-                    LinkArg::Value(value) if value == last_exception || value == last_exc_value => {
-                        LinkArg::Value(exc.clone())
-                    }
-                    LinkArg::Value(value) => LinkArg::Value(
-                        map_source(&err_sources, &err_inputs, value).ok_or_else(|| {
-                            format!("{name}: exceptional map_err edge carries an unthreaded value")
-                        })?,
-                    ),
-                    LinkArg::Const(value) => LinkArg::Const(value.clone()),
-                })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-            close_goto_mixed(graph, err_block, exceptional.target, args);
+            raise_carrier_on_exception_edge(
+                graph,
+                err_block,
+                mapped,
+                exceptional,
+                &err_sources,
+                &err_inputs,
+                spec,
+                &name,
+            )?;
         }
     } else {
         let err_result = emit_sum_variant(
@@ -365,6 +343,55 @@ fn rewire_one(
         },
     });
     graph.set_branch(a_id, disc, err_block, err_sources, ok_block, ok_sources);
+    Ok(())
+}
+
+/// Close `block` by raising the error carrier `carrier` along `exceptional`,
+/// the exception edge of a call `result_exc` made can-raise: the carrier is
+/// materialised as the trace-level exception object and fills the edge's
+/// `last_exception` / `last_exc_value` slots; every other value is remapped
+/// through `sources` → `inputs`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn raise_carrier_on_exception_edge(
+    graph: &mut FunctionGraph,
+    block: crate::model::BlockId,
+    carrier: Variable,
+    exceptional: &crate::model::Link,
+    sources: &[Variable],
+    inputs: &[Variable],
+    spec: crate::ErrorCarrierSpec<'_>,
+    name: &str,
+) -> Result<(), String> {
+    let last_exception = exceptional
+        .last_exception
+        .as_ref()
+        .and_then(LinkArg::as_variable)
+        .ok_or_else(|| format!("{name}: exceptional edge lacks last_exception"))?;
+    let last_exc_value = exceptional
+        .last_exc_value
+        .as_ref()
+        .and_then(LinkArg::as_variable)
+        .ok_or_else(|| format!("{name}: exceptional edge lacks last_exc_value"))?;
+    let exc =
+        crate::front::result_exc::materialize_error_to_exc_object(graph, block, carrier, spec);
+    let args = exceptional
+        .args
+        .iter()
+        .map(|arg| -> Result<LinkArg, String> {
+            Ok(match arg {
+                LinkArg::Value(value) if value == last_exception || value == last_exc_value => {
+                    LinkArg::Value(exc.clone())
+                }
+                LinkArg::Value(value) => {
+                    LinkArg::Value(map_source(sources, inputs, value).ok_or_else(|| {
+                        format!("{name}: exceptional edge carries an unthreaded value")
+                    })?)
+                }
+                LinkArg::Const(value) => LinkArg::Const(value.clone()),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    close_goto_mixed(graph, block, exceptional.target, args);
     Ok(())
 }
 

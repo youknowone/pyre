@@ -580,13 +580,15 @@ fn lower_result_exc_returns_inner(
                 None,
                 graph.alloc_value_var_with_type(crate::model::ConcreteType::Void),
             ),
+            // A payload-less `Err` has no exception value to raise, so it is
+            // never a return shell this rewrite lowers.  A zero-sized error
+            // (such as `i64::try_from(&rbigint)`'s) that the graph itself
+            // `match`es, or the `Err` arm of a tagged pair such as
+            // `Result<&str, Utf8Error>`, is an ordinary ADT value — the same
+            // consumed intermediate the payload-carrying case below leaves
+            // materialised.  Only a shell that reaches `returnblock` is a
+            // return this rewrite must lower.
             None => {
-                // A payload-less `Err(e)` over a zero-sized error (such as
-                // `i64::try_from(&rbigint)`'s) that the graph itself
-                // `match`es is an ordinary ADT value, the same consumed
-                // intermediate the payload-carrying case below leaves
-                // materialised.  Only a shell that reaches `returnblock` is a
-                // return this rewrite must lower.
                 if !shell_reaches_returnblock(graph, bi, &ctor_var) {
                     crate::decline::record_reason(
                         RESULT_EXC_CALLEE_GATE,
@@ -899,9 +901,9 @@ fn has_tail_forwarded_call_result(graph: &FunctionGraph) -> bool {
     false
 }
 
-struct UseCounts {
-    op_uses: usize,
-    link_uses: usize,
+pub(crate) struct UseCounts {
+    pub(crate) op_uses: usize,
+    pub(crate) link_uses: usize,
 }
 
 /// Resolve the literal tag written beside a statically selected `Result`
@@ -926,7 +928,7 @@ fn link_arg_const_int_in_block(graph: &FunctionGraph, block: usize, arg: &LinkAr
 
 /// Count uses of `var` as an op operand and as a link arg across the
 /// whole graph (producer `op.result` slots are not uses).
-fn count_var_uses(graph: &FunctionGraph, var: &Variable) -> UseCounts {
+pub(crate) fn count_var_uses(graph: &FunctionGraph, var: &Variable) -> UseCounts {
     let mut op_uses = 0usize;
     let mut link_uses = 0usize;
     for block in &graph.blocks {
@@ -2898,7 +2900,7 @@ fn project_arm_args(
 }
 
 /// Op indices of the `Ok`/`Err` ctor and its `__pos_0` write. No edit.
-fn shell_build_ops(
+pub(crate) fn shell_build_ops(
     graph: &FunctionGraph,
     block: usize,
     shell: &Variable,
@@ -2927,7 +2929,7 @@ fn shell_build_ops(
     Ok(remove)
 }
 
-fn delete_ops(graph: &mut FunctionGraph, block: usize, indices: Vec<usize>) {
+pub(crate) fn delete_ops(graph: &mut FunctionGraph, block: usize, indices: Vec<usize>) {
     for index in indices.into_iter().rev() {
         graph.blocks[block].operations.remove(index);
     }
@@ -4836,6 +4838,162 @@ mod static_result_shell_tests {
             graph.blocks[entry.0].exits[0].args,
             vec![LinkArg::Value(unit.clone())]
         );
+    }
+
+    /// Build `variant` of `Result<str,Utf8Error>` in `block` with its
+    /// `__discriminant` write and, when given, its `__pos_0` payload.
+    fn tagged_pair_arm(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        variant: &str,
+        tag: i64,
+        payload: Option<Variable>,
+    ) -> Variable {
+        let owner = "core::result::Result<str,Utf8Error>";
+        let shell = graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec![
+                            "core".into(),
+                            "result".into(),
+                            "Result<str,Utf8Error>".into(),
+                        ],
+                        variant,
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(format!("{owner}::{variant}"))),
+                },
+                true,
+            )
+            .expect("shell");
+        let disc = graph
+            .push_op_var(block, OpKind::ConstInt(tag), true)
+            .expect("tag");
+        let writes = std::iter::once(("__discriminant", owner.to_string(), disc, ValueType::Int))
+            .chain(payload.map(|p| ("__pos_0", format!("{owner}::{variant}"), p, ValueType::Str)));
+        for (name, field_owner, value, ty) in writes {
+            graph.block_mut(block).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: shell.clone(),
+                    field: crate::model::FieldDescriptor {
+                        name: name.into(),
+                        owner_root: Some(field_owner),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                    },
+                    value: LinkArg::Value(value),
+                    ty,
+                },
+            });
+        }
+        shell
+    }
+
+    /// A runtime-tagged `Result<&str, Utf8Error>` pair whose `Err` arm has no
+    /// payload, merged into `m`.  Returns the graph, `m` and its inputarg.
+    fn tagged_pair_graph() -> (FunctionGraph, crate::model::BlockId, Variable) {
+        let mut graph = FunctionGraph::new("tagged_pair_err_without_payload");
+        let entry = graph.startblock;
+        let valid = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .expect("valid");
+        let s = graph
+            .push_op_var(entry, OpKind::ConstInt(0), true)
+            .expect("str");
+        let (ok_arm, ok_in) = graph.create_block_with_arg_vars(1);
+        let (err_arm, _) = graph.create_block_with_arg_vars(0);
+        let (m, m_in) = graph.create_block_with_arg_vars(1);
+        graph.set_branch(entry, valid, ok_arm, vec![s], err_arm, vec![]);
+        let ok = tagged_pair_arm(&mut graph, ok_arm, "Ok", 0, Some(ok_in[0].clone()));
+        graph.set_goto(ok_arm, m, vec![ok]);
+        let err = tagged_pair_arm(&mut graph, err_arm, "Err", 1, None);
+        graph.set_goto(err_arm, m, vec![err]);
+        (graph, m, m_in[0].clone())
+    }
+
+    #[test]
+    fn payloadless_err_of_a_consumed_tagged_pair_is_left_materialised() {
+        // `x.as_str().ok()` inside a `Result<i64, PyError>` callee: the pair
+        // is consumed by a method, and the callee's own `Ok` return lowers.
+        let (mut graph, m, pair) = tagged_pair_graph();
+        let consumed = graph
+            .push_op_var(
+                m,
+                OpKind::Call {
+                    target: CallTarget::method("ok", Some("Result".into())),
+                    args: crate::model::call_args(vec![pair]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("ok");
+        let ret = graph
+            .push_op_var(
+                m,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<i64,PyError>".into()],
+                        "Ok",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::result::Result<i64,PyError>::Ok".into())),
+                },
+                true,
+            )
+            .expect("return shell");
+        graph.block_mut(m).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: ret.clone(),
+                field: crate::model::FieldDescriptor {
+                    name: "__pos_0".into(),
+                    owner_root: Some("core::result::Result<i64,PyError>::Ok".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                },
+                value: LinkArg::Value(consumed),
+                ty: ValueType::Ref(None),
+            },
+        });
+        let returnblock = graph.returnblock;
+        graph.set_goto(m, returnblock, vec![ret]);
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+                .expect("a consumed payload-less Err does not decline the callee"),
+            1
+        );
+        // Both arms of the pair stay ordinary values for their consumer.
+        let pair_ctors = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { owner_path, .. },
+                    ..
+                } if owner_path.last().map(String::as_str) == Some("Result<str,Utf8Error>"))
+            })
+            .count();
+        assert_eq!(pair_ctors, 2);
+    }
+
+    #[test]
+    fn payloadless_err_that_is_returned_still_declines() {
+        let (mut graph, m, pair) = tagged_pair_graph();
+        let returnblock = graph.returnblock;
+        graph.set_goto(m, returnblock, vec![pair]);
+        let err = lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+            .expect_err("a returned Err without an exception value cannot lower");
+        assert!(err.contains("Result Err ctor without a __pos_0 payload write"));
     }
 }
 

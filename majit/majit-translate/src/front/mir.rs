@@ -3807,32 +3807,59 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     )
 }
 
-/// The MIR locals that can be a fresh string-builder accumulator: the
-/// destination of an [`is_str_builder_ctor`] CALL terminator in the
-/// accumulator range `(arg_count+1..n_locals)`.
-///
-/// [`is_fresh_str_builder`] sets its `ctor_def` flag only in the
-/// call-terminator arm, so no other local can pass it — iterating these
-/// candidates instead of every one of `n_locals` locals drops the
-/// `n_locals` factor that made the builder recognizers O(n_locals × body)
-/// per function.  Resolved on demand from the body, no per-local side table.
-fn builder_ctor_dest_locals<'a>(
-    body: &'a Unstructured,
-    llbc: &'a Llbc,
-) -> impl Iterator<Item = usize> + 'a {
-    let n_locals = body.locals.locals.len();
-    let arg_count = body.locals.arg_count as usize;
-    body.body.iter().filter_map(move |bb| {
+/// Definitions of each MIR local: an `Assign` into the bare local, or a
+/// `Call` whose destination is that local.  A projection write is not a
+/// definition of the local.  [`owned_builder_dest_locals`] and
+/// [`is_fresh_str_builder`] both count through here so the candidate list
+/// and the proof cannot drift.
+fn local_def_counts(body: &Unstructured, llbc: &Llbc, n: usize) -> Vec<usize> {
+    let mut def_count = vec![0usize; n];
+    for bb in &body.body {
+        for st in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
+                && let &PlaceKind::Local(i) = &place.kind
+                && (i as usize) < n
+            {
+                def_count[i as usize] += 1;
+            }
+        }
         if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
             && let &PlaceKind::Local(i) = &call.dest.kind
-            && (arg_count + 1..n_locals).contains(&(i as usize))
-            && is_str_builder_ctor(wtf8buf_method_leaf(llbc, call))
+            && (i as usize) < n
         {
-            Some(i as usize)
-        } else {
-            None
+            def_count[i as usize] += 1;
         }
-    })
+    }
+    def_count
+}
+
+/// Whether local `c` is an owned functional-concat accumulator: not the
+/// return slot, not a parameter, declared as a by-value `Wtf8Buf` or
+/// `String`, and defined exactly once.
+fn owned_single_def_builder(body: &Unstructured, llbc: &Llbc, c: usize, def_count: usize) -> bool {
+    let n = body.locals.locals.len();
+    let arg_count = body.locals.arg_count as usize;
+    (arg_count + 1..n).contains(&c)
+        && def_count == 1
+        && tyref_is_owned_str_builder(&body.locals.locals[c].ty, llbc)
+}
+
+/// MIR locals that can be a functional-concat string accumulator.
+///
+/// Each one is a by-value `Wtf8Buf` or `String` in
+/// `(arg_count+1..n_locals)` — the return slot and every parameter are
+/// excluded — with exactly one definition.  That definition may be a
+/// builder constructor, any other call's result, or a move out of a `?`
+/// `Continue` payload.  Rust ownership of the single definition means the
+/// local is not aliased, so rebinding it as `buf = ll_strconcat(buf, piece)`
+/// is sound the same way it is for a constructor-defined accumulator.
+/// Resolved on demand from the body, no per-local side table.
+fn owned_builder_dest_locals(body: &Unstructured, llbc: &Llbc) -> Vec<usize> {
+    let n = body.locals.locals.len();
+    let def_count = local_def_counts(body, llbc, n);
+    (0..n)
+        .filter(|&c| owned_single_def_builder(body, llbc, c, def_count[c]))
+        .collect()
 }
 
 /// Whether `u` (the body of `fd`) contains at least one builder-mode string
@@ -3840,7 +3867,9 @@ fn builder_ctor_dest_locals<'a>(
 /// the canonical builder-form lowering. `builder_mode[c]` is that predicate
 /// for local `c`, already computed for this body.
 fn graph_has_builder_accumulator(llbc: &Llbc, u: &Unstructured, builder_mode: &[bool]) -> bool {
-    builder_ctor_dest_locals(u, llbc).any(|c| builder_mode.get(c).copied().unwrap_or(false))
+    owned_builder_dest_locals(u, llbc)
+        .iter()
+        .any(|c| builder_mode.get(*c).copied().unwrap_or(false))
 }
 
 /// Lower `fd` from an already-projected `Unstructured` body.
@@ -7273,7 +7302,7 @@ impl<'a> Lowering<'a> {
     fn enable_builder_mode(&mut self) -> bool {
         self.builder_mode = true;
         // Same "any builder-mode accumulator?" question as the pre-check, over
-        // the ctor-dest candidates only (see [`builder_ctor_dest_locals`]).
+        // the owned-builder candidates only (see [`owned_builder_dest_locals`]).
         self.accum.has_builder
     }
 
@@ -8960,22 +8989,27 @@ impl<'a> Lowering<'a> {
         value: LinkArg,
         declared_ty: Option<&TyRef>,
     ) -> LinkArg {
-        let Some(root) = declared_ty.and_then(|ty| {
-            let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
-            if let Some(reference) = node.as_object()?.get("Ref") {
-                let pointee = reference.as_array()?.get(1)?;
-                return adt_node_class_root_with(
-                    strip_ty_indirections(pointee, self.llbc)?,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                );
-            }
-            raw_ptr_pointee_class_root_with(node, self.llbc, self.tombstoned_leaves)
-                .or_else(|| raw_ptr_pointee_container_root(node, self.llbc))
-        }) else {
+        let Some(root) = self.typed_ref_field_narrow_root(declared_ty) else {
             return value;
         };
         self.narrow_value_to_instance_root(bb_id, value, &root)
+    }
+
+    /// The instance root a value stored into a field declared `declared_ty`
+    /// is narrowed to, or `None` when the declaration names no class.
+    fn typed_ref_field_narrow_root(&self, declared_ty: Option<&TyRef>) -> Option<String> {
+        let ty = declared_ty?;
+        let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
+        if let Some(reference) = node.as_object()?.get("Ref") {
+            let pointee = reference.as_array()?.get(1)?;
+            return adt_node_class_root_with(
+                strip_ty_indirections(pointee, self.llbc)?,
+                self.llbc,
+                self.tombstoned_leaves,
+            );
+        }
+        raw_ptr_pointee_class_root_with(node, self.llbc, self.tombstoned_leaves)
+            .or_else(|| raw_ptr_pointee_container_root(node, self.llbc))
     }
 
     /// Re-express a GC-reference value at a statically-known RPython
@@ -9678,117 +9712,31 @@ impl<'a> Lowering<'a> {
             // `CallTarget::SyntheticTransparentCtor` for the later rewrites
             // that still match that shape.
             Rvalue::Aggregate(kind, operands) => {
-                // A fieldless (C-like) enum variant carries no payload, so
-                // constructing it is just naming its discriminant integer
-                // — the by-value representation of the whole enum (RPython
-                // has no enum type; a fieldless enum is a named `int`).
-                // Fold to `ConstInt(discriminant)` so the constructed value
-                // is an int end-to-end, matching the int-modeled param /
-                // field read / `Discriminant` sites.  Emitting the
-                // transparent ctor (a `Ref` result) here would disagree
-                // with the int coloring `tyref_to_value_type` gives the
-                // destination and re-introduce the classdef-less base.
-                if let Some(tag) = self.aggregate_fieldless_enum_discriminant(&kind) {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    return Ok((Some(OpKind::ConstInt(tag)), res));
-                }
-                // A fieldless struct, unit `()`, or a borrow of one is
-                // `lltype.Void` (`getkind == 'void'`). No constructor and
-                // no register. Fieldless enums stay discriminant integers
-                // and are handled above.
-                if tyref_is_void_zst(dest_ty, self.llbc) {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
-                    return Ok((None, res));
-                }
-                // `Option<E>` over a dense fieldless enum E is the same
-                // scalar plus one reserved `None` value.  Constructing
-                // `Some(e)` therefore aliases e; constructing `None` emits
-                // the reserved niche.  No aggregate allocation or tag write
-                // exists in Rust's physical representation.
-                if let Some(niche) = tyref_option_fieldless_niche(dest_ty, self.llbc) {
-                    return match operands.as_slice() {
-                        [] => {
-                            let res = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            Ok((Some(OpKind::ConstInt(niche.none_tag)), res))
-                        }
-                        [_] => {
-                            let value = self.resolve_operand(
-                                mir_bb,
-                                operands.into_iter().next().expect("one Some payload"),
-                            )?;
-                            Ok((None, value))
-                        }
-                        _ => Err(LowerError::Unsupported(format!(
-                            "bb{mir_bb}: Option<fieldless-enum> aggregate has {} operands",
-                            operands.len()
-                        ))),
-                    };
-                }
-                // A one-word niche `Option` is represented by its payload
-                // pointer, so
-                // constructing it names either the null pointer (`None`) or
-                // the wrapped non-null pointer (`Some(p)`) directly — not a
-                // two-word aggregate with a `__discriminant` tag.  Fold `None`
-                // (zero-operand variant) to the `null_mut()` builtin call and
-                // `Some(p)` to the identity on its single pointer operand, so a
-                // constructed value is a maybe-null pointer end-to-end and both
-                // variants unify at the function return merge.  The null is a
-                // `null_mut()` call (a classdef-less nullable `SomeInstance`,
-                // the same lattice a `*mut T` value carries) rather than a
-                // `ConstRefNull` (a GCREF `_ptr`): the return merge unions the
-                // `None` value with the pointer-valued `Some` branch, and the
-                // two must share a universe — a bare `ConstRefNull` would
-                // annotate `SomePtr` and fail to union with the `SomeInstance`
-                // pointer.  (RPython has no `Option`; a maybe-null `Ptr` is the
-                // pointer itself, null for the absent case.)
-                if self.tyref_is_niche_option_ptr(dest_ty) {
-                    match operands.into_iter().next() {
-                        None => {
-                            let nullc = self.push_niche_null_ptr(mir_bb, dest_ty);
-                            return Ok((None, nullc));
-                        }
-                        Some(op) => {
-                            let p = self.resolve_operand(mir_bb, op)?;
-                            return Ok((None, p));
-                        }
+                let shape = self
+                    .aggregate_shape(&kind, dest_ty, operands.len())
+                    .map_err(|msg| LowerError::Unsupported(format!("bb{mir_bb}: {msg}")))?;
+                match shape {
+                    AggregateShape::Discriminant(tag) => {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        Ok((Some(OpKind::ConstInt(tag)), res))
                     }
-                }
-                // A `repr(transparent)` aggregate is its one sized field.
-                // Zero-sized markers are not stored, so the operand is that
-                // field rather than whichever single operand arrived. An
-                // opaque newtype, or a wrapper whose only field is zero-sized,
-                // still has one operand and stays the identity. Constructing
-                // a separate instance would split one machine word into
-                // incompatible scalar and reference annotations at later
-                // merges. The bank comes from the tombstoned classifier.
-                // `UnsafeCell<T>` is `#[repr(transparent)]` but the foreign decl
-                // is `Opaque`, so the scalar-transparent table never records
-                // it. One operand is the cell word.
-                if operands.len() == 1 && tyref_is_unsafecell(dest_ty, self.llbc) {
-                    let value = self.resolve_operand(
-                        mir_bb,
-                        operands
+                    AggregateShape::Void => {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                        Ok((None, res))
+                    }
+                    AggregateShape::NicheNull => {
+                        let nullc = self.push_niche_null_ptr(mir_bb, dest_ty);
+                        Ok((None, nullc))
+                    }
+                    AggregateShape::Operand { index, transparent } => {
+                        let operand = operands
                             .into_iter()
-                            .next()
-                            .expect("one UnsafeCell aggregate operand"),
-                    )?;
-                    return Ok((None, value));
-                }
-                if tyref_transparent_inner_value_type(dest_ty, self.llbc, self.tombstoned_leaves)
-                    .is_some()
-                {
-                    if let Some((index, _)) = tyref_transparent_nonzst_field(dest_ty, self.llbc) {
-                        let Some(operand) = operands.into_iter().nth(index) else {
-                            return Err(LowerError::Unsupported(format!(
-                                "bb{mir_bb}: transparent aggregate missing field {index}"
-                            )));
-                        };
+                            .nth(index)
+                            .expect("aggregate_shape checked the operand index");
                         let value = self.resolve_operand(mir_bb, operand)?;
                         // `GcRef(p as usize)`: the operand is the address integer
                         // from `cast_ptr_to_int` + `r_uint`, but the list item
@@ -9797,7 +9745,7 @@ impl<'a> Lowering<'a> {
                         // `llmemory.cast_ptr_to_adr` / `cast_opaque_ptr(..., GCREF)`
                         // is the same retype; `__cast_instance_intrinsic("GCREF")`
                         // annotates `SomePtr(GCREF)`.
-                        if let Some(orig) = self.address_cast_pointer(&value) {
+                        if transparent && let Some(orig) = self.address_cast_pointer(&value) {
                             let res = self
                                 .graph
                                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -9807,238 +9755,69 @@ impl<'a> Lowering<'a> {
                                 res,
                             ));
                         }
-                        return Ok((None, value));
-                    } else if operands.len() == 1 {
-                        let value = self.resolve_operand(
-                            mir_bb,
-                            operands
-                                .into_iter()
-                                .next()
-                                .expect("one transparent aggregate operand"),
-                        )?;
-                        // `GcRef(p as usize)`: the operand is the address integer
-                        // from `cast_ptr_to_int` + `r_uint`, but the list item
-                        // kind is the `GcRef::NULL` `ConstRefNull`
-                        // (`Ptr(GCREF)`). Keep that pointer word.
-                        // `llmemory.cast_ptr_to_adr` / `cast_opaque_ptr(..., GCREF)`
-                        // is the same retype; `__cast_instance_intrinsic("GCREF")`
-                        // annotates `SomePtr(GCREF)`.
-                        if let Some(orig) = self.address_cast_pointer(&value) {
-                            let res = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.pointer_word_vars.insert(res.clone());
-                            return Ok((
-                                Some(crate::model::cast_instance_call("GCREF", orig)),
-                                res,
-                            ));
+                        Ok((None, value))
+                    }
+                    AggregateShape::Ctor(ctor) => {
+                        // Resolve operand Variables up front; they flow into the
+                        // synthesised FieldWrite chain rather than the ctor's
+                        // arg list.
+                        let mut arg_vars: Vec<Variable> = Vec::with_capacity(operands.len());
+                        for op in operands {
+                            arg_vars.push(self.resolve_operand(mir_bb, op)?);
                         }
-                        return Ok((None, value));
+                        let bb_id = self.block_id[mir_bb];
+                        let res = emit_aggregate_ctor(&mut self.graph, bb_id, &ctor, &arg_vars);
+                        // Capture an exclusive int-`Range { start, end }` aggregate
+                        // (`for _ in a..b`) so `front::range_iter` can divert it to
+                        // the orthodox `range()` builtin + list-iter — the
+                        // `next`-diamond then folds the loop, instead of the
+                        // union-failing shared `core.ops.range.Range` classdef.  Only
+                        // int/uint element ranges are recorded; the divert itself is
+                        // consumer-gated in the post-pass, so a range read by a
+                        // slice-index / field read keeps this ctor + FieldWrite path.
+                        if ctor.owner_path.as_slice() == ["core", "ops", "range"]
+                            && ctor.ctor_name == "Range"
+                            && arg_vars.len() == 2
+                            && self.aggregate_head_is_int_range(&kind)
+                        {
+                            self.range_iter_new_sites.push(
+                                crate::front::range_iter::RangeNewSite {
+                                    result_var: res.clone(),
+                                },
+                            );
+                            self.slice_index_range_sites.push(
+                                crate::front::slice_index::SliceIndexRangeSite {
+                                    range_result: res.clone(),
+                                    start: arg_vars[0].clone(),
+                                    end: arg_vars[1].clone(),
+                                },
+                            );
+                        }
+                        if ctor.owner_path.as_slice() == ["core", "ops", "range"]
+                            && ctor.ctor_name == "RangeTo"
+                            && arg_vars.len() == 1
+                        {
+                            self.slice_index_rangeto_sites.push(
+                                crate::front::slice_index::SliceIndexRangeToSite {
+                                    range_result: res.clone(),
+                                    end: arg_vars[0].clone(),
+                                },
+                            );
+                        }
+                        if ctor.owner_path.as_slice() == ["core", "ops", "range"]
+                            && ctor.ctor_name == "RangeFrom"
+                            && arg_vars.len() == 1
+                        {
+                            self.slice_index_rangefrom_sites.push(
+                                crate::front::slice_index::SliceIndexRangeFromSite {
+                                    range_result: res.clone(),
+                                    start: arg_vars[0].clone(),
+                                },
+                            );
+                        }
+                        Ok((None, res))
                     }
                 }
-                // Resolve operand Variables up front; they flow into the
-                // synthesised FieldWrite chain rather than the ctor's
-                // arg list.
-                let mut arg_vars: Vec<Variable> = Vec::with_capacity(operands.len());
-                for op in operands {
-                    arg_vars.push(self.resolve_operand(mir_bb, op)?);
-                }
-                // Resolve the user-defined owner + field names and types from the
-                // Adt kind's `type_id` when possible.  Charon encodes
-                // `AggregateKind::Adt(type_id, variant_idx, ..)` as
-                // `{"Adt": [type_id, variant_idx, ..]}`; struct variants
-                // use `variant_idx = null`, enum variants index into the
-                // `TypeDeclKind::Enum` variant list.
-                let resolved = self.resolve_aggregate_adt(&kind);
-                let (
-                    owner_path,
-                    ctor_name,
-                    field_rows,
-                    aggregate_owner_id,
-                    adt_is_struct,
-                    enum_variant_tag,
-                ) = match resolved {
-                    Some((owner_path, ctor_name, field_rows, owner_id, is_struct, tag)) => (
-                        owner_path,
-                        ctor_name,
-                        field_rows,
-                        Some(owner_id),
-                        is_struct,
-                        tag,
-                    ),
-                    None => {
-                        // Synthetic placeholders for non-Adt aggregates
-                        // (`Tuple`, `Array`, `Closure`) — they have no
-                        // user-defined class to resolve into.  A non-empty
-                        // tuple or array carries its per-shape `<…>` suffix
-                        // so its `__pos_N` attrs do not collide with other
-                        // shapes on one global class; the suffix matches
-                        // `positional_aggregate_owner` (Site-A reads) and
-                        // `tyref_positional_aggregate_suffix` (Site-B reads).
-                        // The per-shape `<…>` suffix is rendered from the
-                        // destination place type, not the `AggregateKind` head:
-                        // Charon's `AggregateKind::Adt(Tuple, …)` carries no
-                        // element `types`, so keying off it would spell a bare
-                        // `Tuple` on the write while the `.N` projection reads
-                        // (which do see `place.ty`'s element types) spell the
-                        // suffixed owner — a write/read owner split.  `dest_ty`
-                        // is that same `place.ty`, so both sides agree.
-                        let leaf = format!(
-                            "{}{}",
-                            aggregate_ctor_name(&kind),
-                            tyref_positional_aggregate_suffix(dest_ty, self.llbc)
-                        );
-                        let positional = (0..arg_vars.len())
-                            .map(|i| (format!("__pos_{i}"), String::new(), None))
-                            .collect();
-                        // Not an Adt at all, so there is no struct decl to
-                        // stand behind an allocation rewrite.
-                        (Vec::new(), leaf, positional, None, false, None)
-                    }
-                };
-                let result_ty_owner = if owner_path.is_empty() {
-                    ctor_name.clone()
-                } else {
-                    format!("{}::{}", owner_path.join("::"), ctor_name)
-                };
-                let res = self
-                    .graph
-                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                // Emit the transparent ctor with empty args so the
-                // annotator's `ClassDesc::pycall` `args.fixedunpack(0)`
-                // check (`classdesc.rs`, mirroring upstream
-                // `classdesc.py`) succeeds for classes whose
-                // `__init__` is not registered with the bookkeeper —
-                // the operand values flow through the FieldWrite chain
-                // below instead.  A named struct's constructor is the
-                // malloc marker; [`scalar_replace_named_struct_aggregates`]
-                // replaces it with per-field SSA after boxing fusion.
-                let ctor_target = if owner_path.is_empty() {
-                    CallTarget::synthetic_transparent_ctor(ctor_name.clone())
-                } else if adt_is_struct {
-                    // Resolved to a `TypeDeclKind::Struct`, so the value is
-                    // its field writes and nothing else; `jtransform` may
-                    // lower the constructor to a bare allocation.
-                    CallTarget::synthetic_transparent_struct_ctor(
-                        owner_path.clone(),
-                        ctor_name.clone(),
-                    )
-                } else if let Some(tag) = enum_variant_tag {
-                    // A resolved enum variant records its declaration
-                    // index so a payload-less variant folded to a
-                    // prebuilt singleton keeps its discriminant.
-                    CallTarget::synthetic_transparent_enum_variant_ctor(
-                        owner_path.clone(),
-                        ctor_name.clone(),
-                        tag,
-                    )
-                } else {
-                    CallTarget::synthetic_transparent_ctor_with_owner(
-                        owner_path.clone(),
-                        ctor_name.clone(),
-                    )
-                };
-                let bb_id = self.block_id[mir_bb];
-                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                    result: Some(res.clone()),
-                    kind: OpKind::Call {
-                        target: ctor_target,
-                        args: Vec::new(),
-                        result_ty: ValueType::Ref(Some(result_ty_owner.clone())),
-                    },
-                });
-                // Capture an exclusive int-`Range { start, end }` aggregate
-                // (`for _ in a..b`) so `front::range_iter` can divert it to
-                // the orthodox `range()` builtin + list-iter — the
-                // `next`-diamond then folds the loop, instead of the
-                // union-failing shared `core.ops.range.Range` classdef.  Only
-                // int/uint element ranges are recorded; the divert itself is
-                // consumer-gated in the post-pass, so a range read by a
-                // slice-index / field read keeps this ctor + FieldWrite path.
-                if owner_path.as_slice() == ["core", "ops", "range"]
-                    && ctor_name == "Range"
-                    && arg_vars.len() == 2
-                    && self.aggregate_head_is_int_range(&kind)
-                {
-                    self.range_iter_new_sites
-                        .push(crate::front::range_iter::RangeNewSite {
-                            result_var: res.clone(),
-                        });
-                    self.slice_index_range_sites.push(
-                        crate::front::slice_index::SliceIndexRangeSite {
-                            range_result: res.clone(),
-                            start: arg_vars[0].clone(),
-                            end: arg_vars[1].clone(),
-                        },
-                    );
-                }
-                if owner_path.as_slice() == ["core", "ops", "range"]
-                    && ctor_name == "RangeTo"
-                    && arg_vars.len() == 1
-                {
-                    self.slice_index_rangeto_sites.push(
-                        crate::front::slice_index::SliceIndexRangeToSite {
-                            range_result: res.clone(),
-                            end: arg_vars[0].clone(),
-                        },
-                    );
-                }
-                if owner_path.as_slice() == ["core", "ops", "range"]
-                    && ctor_name == "RangeFrom"
-                    && arg_vars.len() == 1
-                {
-                    self.slice_index_rangefrom_sites.push(
-                        crate::front::slice_index::SliceIndexRangeFromSite {
-                            range_result: res.clone(),
-                            start: arg_vars[0].clone(),
-                        },
-                    );
-                }
-                // Surface every operand through a separate FieldWrite so
-                // the field-to-value binding survives into the
-                // codewriter / annotator.  Field names default to
-                // `__pos_<i>` when the resolver could not project a real
-                // schema entry (tuple aggregates, deduplicated types
-                // not in the LLBC's local table).
-                for (i, value) in arg_vars.into_iter().enumerate() {
-                    let (name, field_ty) = field_rows
-                        .get(i)
-                        .map(|(name, field_ty, _)| (name.clone(), field_ty.clone()))
-                        .unwrap_or_else(|| (format!("__pos_{i}"), String::new()));
-                    let declared_ty = field_rows.get(i).and_then(|(_, _, ty)| ty.as_ref());
-                    // `_names_without_voids()` (`lltype.py`) /
-                    // `heaptracker.py:100-101`: a
-                    // zero-sized field occupies no storage and gets no slot,
-                    // so no write is generated for it.
-                    if crate::codewriter::call::get_type_flag(&field_ty).1
-                        == majit_ir::value::Type::Void
-                    {
-                        continue;
-                    }
-                    let value = self
-                        .narrow_typed_ref_field_value(bb_id, LinkArg::Value(value), declared_ty)
-                        .as_variable()
-                        .expect("aggregate field operand stays materialized")
-                        .clone();
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: None,
-                        kind: OpKind::FieldWrite {
-                            base: res.clone(),
-                            field: crate::model::FieldDescriptor {
-                                name,
-                                owner_root: Some(result_ty_owner.clone()),
-                                owner_id: aggregate_owner_id,
-                                base_is_deref: None,
-                                taken_by_address: false,
-                                inline_vec: false,
-                                vec_part: None,
-                            },
-                            value: crate::model::LinkArg::Value(value),
-                            ty: ValueType::Ref(None),
-                        },
-                    });
-                }
-                Ok((None, res))
             }
             // `Discriminant(place)` — read the integer tag of an enum
             // value. Modeled as a synthetic `FieldRead` of an
@@ -11527,6 +11306,259 @@ impl<'a> Lowering<'a> {
     /// Charon does not spell as an operand, and the two must stay
     /// distinguishable downstream — see `CallTarget::SyntheticTransparentCtor`'s
     /// `is_struct`.
+    /// How `Rvalue::Aggregate(kind, ..)` with `n_operands` operands builds
+    /// a value of `dest_ty`.  Decided before any operand is resolved, so a
+    /// constructor function item (`Result::map(Some)`) builds the same shape
+    /// from values it already holds.
+    fn aggregate_shape(
+        &self,
+        kind: &serde_json::Value,
+        dest_ty: &TyRef,
+        n_operands: usize,
+    ) -> Result<AggregateShape, String> {
+        // A fieldless (C-like) enum variant carries no payload, so
+        // constructing it is just naming its discriminant integer
+        // — the by-value representation of the whole enum (RPython
+        // has no enum type; a fieldless enum is a named `int`).
+        // Fold to `ConstInt(discriminant)` so the constructed value
+        // is an int end-to-end, matching the int-modeled param /
+        // field read / `Discriminant` sites.  Emitting the
+        // transparent ctor (a `Ref` result) here would disagree
+        // with the int coloring `tyref_to_value_type` gives the
+        // destination and re-introduce the classdef-less base.
+        if let Some(tag) = self.aggregate_fieldless_enum_discriminant(kind) {
+            return Ok(AggregateShape::Discriminant(tag));
+        }
+        // A fieldless struct, unit `()`, or a borrow of one is
+        // `lltype.Void` (`getkind == 'void'`). No constructor and
+        // no register. Fieldless enums stay discriminant integers
+        // and are handled above.
+        if tyref_is_void_zst(dest_ty, self.llbc) {
+            return Ok(AggregateShape::Void);
+        }
+        // `Option<E>` over a dense fieldless enum E is the same
+        // scalar plus one reserved `None` value.  Constructing
+        // `Some(e)` therefore aliases e; constructing `None` emits
+        // the reserved niche.  No aggregate allocation or tag write
+        // exists in Rust's physical representation.
+        if let Some(niche) = tyref_option_fieldless_niche(dest_ty, self.llbc) {
+            return match n_operands {
+                0 => Ok(AggregateShape::Discriminant(niche.none_tag)),
+                1 => Ok(AggregateShape::Operand {
+                    index: 0,
+                    transparent: false,
+                }),
+                n => Err(format!("Option<fieldless-enum> aggregate has {n} operands")),
+            };
+        }
+        // A one-word niche `Option` is represented by its payload
+        // pointer, so
+        // constructing it names either the null pointer (`None`) or
+        // the wrapped non-null pointer (`Some(p)`) directly — not a
+        // two-word aggregate with a `__discriminant` tag.  Fold `None`
+        // (zero-operand variant) to the `null_mut()` builtin call and
+        // `Some(p)` to the identity on its single pointer operand, so a
+        // constructed value is a maybe-null pointer end-to-end and both
+        // variants unify at the function return merge.  The null is a
+        // `null_mut()` call (a classdef-less nullable `SomeInstance`,
+        // the same lattice a `*mut T` value carries) rather than a
+        // `ConstRefNull` (a GCREF `_ptr`): the return merge unions the
+        // `None` value with the pointer-valued `Some` branch, and the
+        // two must share a universe — a bare `ConstRefNull` would
+        // annotate `SomePtr` and fail to union with the `SomeInstance`
+        // pointer.  (RPython has no `Option`; a maybe-null `Ptr` is the
+        // pointer itself, null for the absent case.)
+        if self.tyref_is_niche_option_ptr(dest_ty) {
+            return Ok(if n_operands == 0 {
+                AggregateShape::NicheNull
+            } else {
+                AggregateShape::Operand {
+                    index: 0,
+                    transparent: false,
+                }
+            });
+        }
+        // A `repr(transparent)` aggregate is its one sized field.
+        // Zero-sized markers are not stored, so the operand is that
+        // field rather than whichever single operand arrived. An
+        // opaque newtype, or a wrapper whose only field is zero-sized,
+        // still has one operand and stays the identity. Constructing
+        // a separate instance would split one machine word into
+        // incompatible scalar and reference annotations at later
+        // merges. The bank comes from the tombstoned classifier.
+        // `UnsafeCell<T>` is `#[repr(transparent)]` but the foreign decl
+        // is `Opaque`, so the scalar-transparent table never records
+        // it. One operand is the cell word.
+        if n_operands == 1 && tyref_is_unsafecell(dest_ty, self.llbc) {
+            return Ok(AggregateShape::Operand {
+                index: 0,
+                transparent: false,
+            });
+        }
+        if tyref_transparent_inner_value_type(dest_ty, self.llbc, self.tombstoned_leaves).is_some()
+        {
+            if let Some((index, _)) = tyref_transparent_nonzst_field(dest_ty, self.llbc) {
+                if index >= n_operands {
+                    return Err(format!("transparent aggregate missing field {index}"));
+                }
+                return Ok(AggregateShape::Operand {
+                    index,
+                    transparent: true,
+                });
+            } else if n_operands == 1 {
+                return Ok(AggregateShape::Operand {
+                    index: 0,
+                    transparent: true,
+                });
+            }
+        }
+        // Resolve the user-defined owner + field names and types from the
+        // Adt kind's `type_id` when possible.  Charon encodes
+        // `AggregateKind::Adt(type_id, variant_idx, ..)` as
+        // `{"Adt": [type_id, variant_idx, ..]}`; struct variants
+        // use `variant_idx = null`, enum variants index into the
+        // `TypeDeclKind::Enum` variant list.
+        let resolved = self.resolve_aggregate_adt(kind);
+        let (owner_path, ctor_name, field_rows, owner_id, adt_is_struct, enum_variant_tag) =
+            match resolved {
+                Some((owner_path, ctor_name, field_rows, owner_id, is_struct, tag)) => (
+                    owner_path,
+                    ctor_name,
+                    field_rows,
+                    Some(owner_id),
+                    is_struct,
+                    tag,
+                ),
+                None => {
+                    // Synthetic placeholders for non-Adt aggregates
+                    // (`Tuple`, `Array`, `Closure`) — they have no
+                    // user-defined class to resolve into.  A non-empty
+                    // tuple or array carries its per-shape `<…>` suffix
+                    // so its `__pos_N` attrs do not collide with other
+                    // shapes on one global class; the suffix matches
+                    // `positional_aggregate_owner` (Site-A reads) and
+                    // `tyref_positional_aggregate_suffix` (Site-B reads).
+                    // The per-shape `<…>` suffix is rendered from the
+                    // destination place type, not the `AggregateKind` head:
+                    // Charon's `AggregateKind::Adt(Tuple, …)` carries no
+                    // element `types`, so keying off it would spell a bare
+                    // `Tuple` on the write while the `.N` projection reads
+                    // (which do see `place.ty`'s element types) spell the
+                    // suffixed owner — a write/read owner split.  `dest_ty`
+                    // is that same `place.ty`, so both sides agree.
+                    let leaf = format!(
+                        "{}{}",
+                        aggregate_ctor_name(kind),
+                        tyref_positional_aggregate_suffix(dest_ty, self.llbc)
+                    );
+                    let positional = (0..n_operands)
+                        .map(|i| (format!("__pos_{i}"), String::new(), None))
+                        .collect();
+                    // Not an Adt at all, so there is no struct decl to
+                    // stand behind an allocation rewrite.
+                    (Vec::new(), leaf, positional, None, false, None)
+                }
+            };
+        let result_owner = if owner_path.is_empty() {
+            ctor_name.clone()
+        } else {
+            format!("{}::{}", owner_path.join("::"), ctor_name)
+        };
+        // Emit the transparent ctor with empty args so the
+        // annotator's `ClassDesc::pycall` `args.fixedunpack(0)`
+        // check (`classdesc.rs`, mirroring upstream
+        // `classdesc.py`) succeeds for classes whose
+        // `__init__` is not registered with the bookkeeper —
+        // the operand values flow through the FieldWrite chain
+        // instead.  A named struct's constructor is the
+        // malloc marker; [`scalar_replace_named_struct_aggregates`]
+        // replaces it with per-field SSA after boxing fusion.
+        let target = if owner_path.is_empty() {
+            CallTarget::synthetic_transparent_ctor(ctor_name.clone())
+        } else if adt_is_struct {
+            // Resolved to a `TypeDeclKind::Struct`, so the value is
+            // its field writes and nothing else; `jtransform` may
+            // lower the constructor to a bare allocation.
+            CallTarget::synthetic_transparent_struct_ctor(owner_path.clone(), ctor_name.clone())
+        } else if let Some(tag) = enum_variant_tag {
+            // A resolved enum variant records its declaration
+            // index so a payload-less variant folded to a
+            // prebuilt singleton keeps its discriminant.
+            CallTarget::synthetic_transparent_enum_variant_ctor(
+                owner_path.clone(),
+                ctor_name.clone(),
+                tag,
+            )
+        } else {
+            CallTarget::synthetic_transparent_ctor_with_owner(owner_path.clone(), ctor_name.clone())
+        };
+        // Every operand is surfaced through a separate FieldWrite so
+        // the field-to-value binding survives into the
+        // codewriter / annotator.  Field names default to
+        // `__pos_<i>` when the resolver could not project a real
+        // schema entry (tuple aggregates, deduplicated types
+        // not in the LLBC's local table).
+        let fields = (0..n_operands)
+            .map(|i| {
+                let (name, field_ty) = field_rows
+                    .get(i)
+                    .map(|(name, field_ty, _)| (name.clone(), field_ty.clone()))
+                    .unwrap_or_else(|| (format!("__pos_{i}"), String::new()));
+                let declared_ty = field_rows.get(i).and_then(|(_, _, ty)| ty.as_ref());
+                AggregateField {
+                    name,
+                    // `_names_without_voids()` (`lltype.py`) /
+                    // `heaptracker.py:100-101`: a
+                    // zero-sized field occupies no storage and gets no slot,
+                    // so no write is generated for it.
+                    void: crate::codewriter::call::get_type_flag(&field_ty).1
+                        == majit_ir::value::Type::Void,
+                    narrow_root: self.typed_ref_field_narrow_root(declared_ty),
+                }
+            })
+            .collect();
+        Ok(AggregateShape::Ctor(AggregateCtor {
+            target,
+            result_owner,
+            owner_id,
+            owner_path,
+            ctor_name,
+            fields,
+        }))
+    }
+
+    /// The shape a call of the constructor function item `fd` builds, for a
+    /// call whose result type is `dest_ty` (the instantiated ADT).  `None`
+    /// when `fd` is not a constructor Charon synthesised, or its ADT or
+    /// variant does not resolve.
+    fn constructor_fn_item_shape(&self, fd: &FunDecl, dest_ty: &TyRef) -> Option<AggregateShape> {
+        if !fd.is_adt_constructor() {
+            return None;
+        }
+        let dest = self
+            .tyref_peel_ref_to_pointee(dest_ty)
+            .unwrap_or_else(|| dest_ty.clone());
+        let node = strip_ty_indirections(tyref_node(&dest, self.llbc)?, self.llbc)?;
+        let head = node.as_object()?.get("Adt")?.clone();
+        let td = self
+            .llbc
+            .type_by_id(type_decl_ref_adt_id(head.as_object()?)?)?;
+        // Charon names a tuple-variant constructor `<Enum>::<Variant>` and a
+        // tuple-struct constructor `<Struct>`.
+        let variant_idx = match &td.kind {
+            TypeDeclKind::Enum(variants) => {
+                let leaf = fd.item_meta.name_path();
+                let leaf = leaf.rsplit("::").next()?;
+                Some(variants.iter().position(|v| v.name == leaf)?)
+            }
+            TypeDeclKind::Struct(_) => None,
+            _ => return None,
+        };
+        let kind = serde_json::json!({ "Adt": [head, variant_idx, null] });
+        self.aggregate_shape(&kind, &dest, fd.signature.inputs.len())
+            .ok()
+    }
+
     fn resolve_aggregate_adt(
         &self,
         kind: &serde_json::Value,
@@ -13053,6 +13085,7 @@ impl<'a> Lowering<'a> {
         // (or a Copy/Move of a `FnDef`-typed local); that shape has no
         // closure ADT, so `second_arg_ty` alone cannot name the callee.
         let second_arg_fn_item = operand_fn_item_segments(self.llbc, call.args.get(1));
+        let second_arg_fn_decl = operand_fn_item_decl(self.llbc, call.args.get(1));
         // Third argument's MIR-declared type — `Option::map_or`'s closure env
         // operand.  Captured before the operands are consumed so the
         // `front::option_map_or` recording can resolve the closure ADT's
@@ -14653,10 +14686,10 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // Builder-mode ctor. In the canonical builder-form lowering, the
-                // single `Wtf8Buf`/`String` `new`/`with_capacity`/`from_string`
-                // def of a
-                // builder-mode accumulator (its dest local, proven single-def
-                // by that ctor in [`is_fresh_str_builder`]) mints the
+                // single definition of a builder-mode accumulator is a
+                // constructor call ([`single_def_is_str_builder_ctor`],
+                // required on top of the owned single-def rule in
+                // [`is_fresh_str_builder`]).  That call mints the
                 // `StringBuilder` once via the `__majit_stringbuilder_new`
                 // marker instead of the concat empty string; later appends
                 // mutate it in place.  Placed before the method-specific arms
@@ -14666,7 +14699,7 @@ impl<'a> Lowering<'a> {
                 //
                 // The ctor operands ride the marker verbatim: `new()` carries
                 // none and `with_capacity(n)` carries the size `n`
-                // ([`builder_ctor_dest_locals`] admits only those two), so the
+                // ([`str_builder_ctor_leaf`]), so the
                 // marker's arg count mirrors `len(hop.args_v)` in
                 // `AbstractStringBuilderRepr.rtyper_new` (rtyper/rbuilder.py) —
                 // no arg selects `ll_new(INIT_SIZE)`, the size arg threads
@@ -14745,12 +14778,13 @@ impl<'a> Lowering<'a> {
                 // push_onto: acc 1, piece 0).  The `&mut buf` accumulator
                 // arrives as a per-site ref-temp; the per-body table answers
                 // [`append_accumulator_of_arg_temp`] for it, resolving
-                // to `buf` only when `buf` is a fresh `new` / `with_capacity`
-                // local whose every borrow feeds such an append, so a
-                // `&mut`-parameter accumulator (whose caller observes the
-                // real-buffer mutation) is excluded and keeps its residual
-                // rather than miscompiling.  The call returns `()`; its dead
-                // destination binds to a defined unit constant.
+                // to `buf` only when `buf` is an owned single-def `Wtf8Buf` /
+                // `String` (not local 0, not a parameter) whose every borrow
+                // feeds such an append, so a `&mut`-parameter accumulator
+                // (whose caller observes the real-buffer mutation) is excluded
+                // and keeps its residual rather than miscompiling.  The call
+                // returns `()`; its dead destination binds to a defined unit
+                // constant.
                 if args.len() == 2
                     && let Some((acc_i, piece_i)) = str_builder_append_args(self.llbc, &reg)
                     && let Some(buf_local) = arg_locals
@@ -18393,6 +18427,7 @@ impl<'a> Lowering<'a> {
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
                 second_arg_fn_item.clone(),
+                second_arg_fn_decl,
                 &call.dest.ty,
                 &result_var,
             )
@@ -18419,8 +18454,10 @@ impl<'a> Lowering<'a> {
             )
             && let Some(site) = self.recognize_disc_combinator_site(
                 kind,
+                args,
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
+                second_arg_fn_decl,
                 &call.dest.ty,
                 &result_var,
             )
@@ -23715,8 +23752,10 @@ impl<'a> Lowering<'a> {
     fn recognize_disc_combinator_site(
         &self,
         kind: DiscCombinator,
+        call_args: &[LinkArg],
         recv_ty: Option<&TyRef>,
         env_ty: Option<&TyRef>,
+        fn_item_decl: Option<&FunDecl>,
         dest_ty: &TyRef,
         result_var: &Variable,
     ) -> Option<DiscCombinatorSite> {
@@ -23764,6 +23803,7 @@ impl<'a> Lowering<'a> {
         let mut site = DiscCombinatorSite {
             kind,
             result_var: result_var.clone(),
+            call_args: call_args.to_vec(),
             recv_owner: String::new(),
             recv_tag0_owner: String::new(),
             recv_tag1_owner: String::new(),
@@ -23779,6 +23819,8 @@ impl<'a> Lowering<'a> {
             result_payload0_class: None,
             result_payload1_class: None,
             call_once_owner: String::new(),
+            fn_item_segments: None,
+            fn_item_ctor: None,
             args_tuple_suffix: String::new(),
             call_result_ty: ValueType::Ref(None),
             call_result_class: None,
@@ -23806,9 +23848,24 @@ impl<'a> Lowering<'a> {
             site.payload1_class = err_class;
         }
 
+        // Prefer a closure ADT (`call_once(env, (x,))`); a function item has no
+        // ADT def id and is called directly, or built when it is a constructor.
+        let mut fn_item = None;
         if kind.needs_closure() {
-            let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
-            site.call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
+            match env_ty.and_then(|ty| self.tyref_ref_adt_def_id(ty)) {
+                Some(env_def_id) => {
+                    site.call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
+                }
+                None => {
+                    let fd = fn_item_decl?;
+                    let segments = fundecl_fn_item_segments(self.llbc, fd);
+                    if segments.is_empty() {
+                        return None;
+                    }
+                    site.fn_item_segments = Some(segments);
+                    fn_item = Some(fd);
+                }
+            }
         }
 
         match kind {
@@ -23915,6 +23972,23 @@ impl<'a> Lowering<'a> {
                 site.result_payload1_class = self.option_payload_instance_class_root(&dest);
             }
             DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr => {}
+        }
+        if let Some(fd) = fn_item
+            && fd.is_adt_constructor()
+        {
+            // The type the constructor builds: the callable's result.
+            let built = match kind {
+                DiscCombinator::ResultMap => crate::front::result_exc::tyref_result_ok(
+                    &self.peel_to_option_or_result(dest_ty)?,
+                    self.llbc,
+                )?,
+                DiscCombinator::ResultAndThen | DiscCombinator::ResultOrElse => {
+                    self.peel_to_option_or_result(dest_ty)?
+                }
+                DiscCombinator::ResultUnwrapOrElse => dest_ty.clone(),
+                _ => return None,
+            };
+            site.fn_item_ctor = Some(self.constructor_fn_item_shape(fd, &built)?);
         }
         Some(site)
     }
@@ -24228,6 +24302,7 @@ impl<'a> Lowering<'a> {
         recv_ty: Option<&TyRef>,
         env_ty: Option<&TyRef>,
         fn_item_segments: Option<Vec<String>>,
+        fn_item_decl: Option<&FunDecl>,
         dest_ty: &TyRef,
         result_var: &Variable,
     ) -> Option<crate::front::option_closure_select::ClosureSelectSite> {
@@ -24287,11 +24362,21 @@ impl<'a> Lowering<'a> {
         };
         let call_result_ty =
             tyref_to_value_type_with(&call_result_tyref, self.llbc, self.tombstoned_leaves);
-        let call_once_result_exc = crate::front::result_exc::tyref_is_result_of_carrier(
-            &call_result_tyref,
-            self.llbc,
-            self.static_addrs.error_carrier,
-        )
+        // A constructor function item builds its aggregate in the arm; one
+        // whose shape does not resolve declines the rewrite.
+        let fn_item_ctor = match fn_item_decl {
+            Some(fd) if fn_item_segments.is_some() && fd.is_adt_constructor() => {
+                Some(self.constructor_fn_item_shape(fd, &call_result_tyref)?)
+            }
+            _ => None,
+        };
+        // A constructor builds its `Result` value; it never raises.
+        let call_once_result_exc = (fn_item_ctor.is_none()
+            && crate::front::result_exc::tyref_is_result_of_carrier(
+                &call_result_tyref,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            ))
         .then(|| {
             let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
                 &call_result_tyref,
@@ -24342,6 +24427,7 @@ impl<'a> Lowering<'a> {
             result_fieldless_none_tag,
             call_once_owner,
             fn_item_segments,
+            fn_item_ctor,
             payload_ty,
             payload_class_root,
             call_result_ty,
@@ -27367,6 +27453,29 @@ fn is_str_builder_owner(owner: Option<&str>) -> bool {
     matches!(owner, Some("Wtf8Buf") | Some("String"))
 }
 
+/// Whether `ty` is a by-value `Wtf8Buf` or `String`.
+///
+/// A reference or a raw pointer is not an owned accumulator: rebinding the
+/// temporary would not rebind the referent.  [`adt_path_of_tyref`] peels
+/// `Ref`, so a reference is rejected here before the ADT leaf is read.
+/// Both the array form (`{"Ref": [region, ty, kind]}`) and the object form
+/// are references.
+fn tyref_is_owned_str_builder(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(obj) = node.as_object() else {
+        return false;
+    };
+    if obj.contains_key("Ref") || obj.contains_key("RawPtr") {
+        return false;
+    }
+    let Some(path) = adt_path_of_tyref(ty, llbc) else {
+        return false;
+    };
+    is_str_builder_owner(path.rsplit("::").next())
+}
+
 /// The owner of a *seed* constructor — one called on a borrowed string to
 /// build a fresh buffer, rather than one called on the buffer itself.
 ///
@@ -27384,11 +27493,13 @@ fn is_str_builder_seed_owner(owner: Option<&str>) -> bool {
 /// Whether a [`str_builder_ctor_leaf`] leaf CONSTRUCTS a fresh buffer, as
 /// opposed to appending to one already built.
 ///
-/// Named once because [`builder_ctor_dest_locals`] and
-/// [`is_fresh_str_builder`] must agree: the first selects the candidate
-/// locals, the second proves each one has no second definition.  Two
-/// hand-kept copies of this set would let a leaf be a candidate that can
-/// never pass, or pass a local the candidate scan never offers.
+/// Functional concat does not consult this set.
+/// [`owned_builder_dest_locals`] and [`is_fresh_str_builder`] admit any
+/// single definition of an owned `Wtf8Buf` / `String`.  Builder mode still
+/// requires the unique definition to be one of these leaves
+/// ([`single_def_is_str_builder_ctor`]), and the ctor rewrite arm reads the
+/// same leaf to choose the `StringBuilder` marker's arguments.  One set,
+/// so those two cannot disagree about which leaf constructs a buffer.
 fn is_str_builder_ctor(leaf: Option<&str>) -> bool {
     matches!(
         leaf,
@@ -27548,29 +27659,10 @@ impl ScanCache {
     /// One pass of [`is_fresh_str_builder`] over every local.
     fn precompute_fresh(&self, body: &Unstructured, llbc: &Llbc) {
         let n = self.n();
-        let mut def_count = vec![0usize; n];
-        let mut ctor_def = vec![false; n];
-        for bb in &body.body {
-            for st in &bb.statements {
-                if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
-                    && let &PlaceKind::Local(i) = &place.kind
-                    && (i as usize) < n
-                {
-                    def_count[i as usize] += 1;
-                }
-            }
-            if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
-                && let &PlaceKind::Local(i) = &call.dest.kind
-                && (i as usize) < n
-            {
-                let i = i as usize;
-                def_count[i] += 1;
-                ctor_def[i] = is_str_builder_ctor(wtf8buf_method_leaf(llbc, call));
-            }
-        }
+        let def_count = local_def_counts(body, llbc, n);
         let mut fresh = self.fresh.borrow_mut();
         for i in 0..n {
-            fresh[i] = Some(def_count[i] == 1 && ctor_def[i]);
+            fresh[i] = Some(owned_single_def_builder(body, llbc, i, def_count[i]));
         }
     }
 }
@@ -27601,9 +27693,9 @@ impl AccumulatorFacts {
                 builder_mode[c] = is_builder_mode_accumulator(&cache, body, llbc, c);
             }
         }
-        let ctor_dests: Vec<usize> = builder_ctor_dest_locals(body, llbc).collect();
+        let owned_dests = owned_builder_dest_locals(body, llbc);
         let mut append_accumulator = vec![None; n];
-        for c in ctor_dests.iter().copied() {
+        for c in owned_dests.iter().copied() {
             let fresh = c < n && cache.fresh.borrow()[c] == Some(true);
             if !fresh {
                 continue;
@@ -27620,7 +27712,7 @@ impl AccumulatorFacts {
             }
         }
         let mut append_piece_accumulator = vec![None; n];
-        for c in ctor_dests {
+        for c in owned_dests {
             if c >= n || !builder_mode[c] {
                 continue;
             }
@@ -27736,9 +27828,9 @@ fn ref_temp_is_sole_append_arg(
     result
 }
 
-/// Given a single-def `Wtf8Buf::new` / `with_capacity` accumulator local
+/// Given an owned single-def `Wtf8Buf` / `String` accumulator local
 /// `c`, return its append-receiver temps if every use of `c` is append-safe,
-/// else `None`.  Append-safe uses: the ctor def; a borrow `_r := &(mut) c`
+/// else `None`.  Append-safe uses: its single definition; a borrow `_r := &(mut) c`
 /// that reaches an append accumulator argument ([`append_receiver_of_borrow`],
 /// directly or through a single two-phase reborrow); or a bare `move c`
 /// (ownership transfer of the complete accumulated string).  Any other use — a
@@ -28145,34 +28237,22 @@ fn append_arg_of_borrow_scan(
     is_selected(recv).then_some(recv)
 }
 
-/// Whether MIR local `c` is a fresh owned string-builder accumulator: it has
-/// exactly one def and that def is an [`is_str_builder_ctor`] call.  A local
-/// with a second def, or one defined by a non-ctor rvalue, is not a fresh
-/// accumulator and keeps its residual.
+/// Whether MIR local `c` is an owned functional-concat accumulator: not
+/// local 0, not a parameter, declared as a by-value `Wtf8Buf` or `String`,
+/// and defined exactly once — by a constructor, by any other call, or by a
+/// move out of a `?` `Continue` payload.  A second definition, a reference
+/// or raw-pointer type, or a parameter keeps its residual.  Rust ownership
+/// of that single definition means the local is not aliased, so rebinding
+/// it as `ll_strconcat` is sound.
 fn is_fresh_str_builder(cache: &ScanCache, body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
     if c < cache.n()
         && let Some(hit) = cache.fresh.borrow()[c]
     {
         return hit;
     }
-    let mut def_count = 0usize;
-    let mut ctor_def = false;
-    for bb in &body.body {
-        for st in &bb.statements {
-            if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
-                && matches!(place.kind, PlaceKind::Local(i) if i as usize == c)
-            {
-                def_count += 1;
-            }
-        }
-        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
-            && matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == c)
-        {
-            def_count += 1;
-            ctor_def = is_str_builder_ctor(wtf8buf_method_leaf(llbc, &call));
-        }
-    }
-    let result = def_count == 1 && ctor_def;
+    let n = body.locals.locals.len();
+    let count = local_def_counts(body, llbc, n).get(c).copied().unwrap_or(0);
+    let result = owned_single_def_builder(body, llbc, c, count);
     if c < cache.n() {
         cache.fresh.borrow_mut()[c] = Some(result);
     }
@@ -28183,28 +28263,31 @@ fn is_fresh_str_builder(cache: &ScanCache, body: &Unstructured, llbc: &Llbc, c: 
 /// local `rt` passed as the append's accumulator argument (`push` / `push_str` /
 /// `push_wtf8` receiver, or `Wtf8Piece::push_onto` `&mut buf` argument).  `rt`
 /// borrows the accumulator directly (method autoref) or through a single
-/// two-phase reborrow; the owning `buf` is the [`is_str_builder_ctor`] local
-/// whose every borrow feeds such an append and whose append-receiver set
-/// ([`clean_accumulator_ref_temps`]) contains `rt`.  Lowering records the
-/// answer for every local once per body; the append arm reads that table
-/// and rebinds `buf`'s slot to `ll_strconcat(buf, piece)`.
+/// two-phase reborrow; the owning `buf` is the owned single-def `Wtf8Buf` /
+/// `String` ([`owned_builder_dest_locals`]) whose every borrow feeds such an
+/// append and whose append-receiver set ([`clean_accumulator_ref_temps`])
+/// contains `rt`.  Lowering records the answer for every local once per body;
+/// the append arm reads that table and rebinds `buf`'s slot to
+/// `ll_strconcat(buf, piece)`.
 fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
-    // Only an [`is_str_builder_ctor`] dest can pass [`is_fresh_str_builder`]
-    // ([`builder_ctor_dest_locals`], which already excludes locals 0 / the
-    // parameters), and a ref-temp borrows exactly one local so at most one
-    // accumulator's receiver set contains `rt`; check those candidates instead
-    // of every local — dropping the `n_locals` factor — and first-match order
-    // is therefore irrelevant.
+    // Only an owned single-def `Wtf8Buf` / `String` past the parameters can
+    // pass [`is_fresh_str_builder`] ([`owned_builder_dest_locals`], which
+    // already excludes local 0 and the parameters), and a ref-temp borrows
+    // exactly one local so at most one accumulator's receiver set contains
+    // `rt`; check those candidates instead of every local — dropping the
+    // `n_locals` factor — and first-match order is therefore irrelevant.
     //
     // Call lowering reads the per-body [`AccumulatorFacts`] table. This scan
     // remains for an index outside that table.
     let cache = ScanCache::new(body.locals.locals.len());
     cache.precompute_fresh(body, llbc);
-    builder_ctor_dest_locals(body, llbc).find(|&c| {
-        is_fresh_str_builder(&cache, body, llbc, c)
-            && clean_accumulator_ref_temps(&cache, body, llbc, c)
-                .is_some_and(|receivers| receivers.contains(&rt))
-    })
+    owned_builder_dest_locals(body, llbc)
+        .into_iter()
+        .find(|&c| {
+            is_fresh_str_builder(&cache, body, llbc, c)
+                && clean_accumulator_ref_temps(&cache, body, llbc, c)
+                    .is_some_and(|receivers| receivers.contains(&rt))
+        })
 }
 
 /// Resolve a shared-borrow temp used as an append piece to the completed
@@ -28221,7 +28304,7 @@ fn append_piece_accumulator_of_arg_temp(
 ) -> Option<usize> {
     let cache = ScanCache::new(body.locals.locals.len());
     cache.precompute_fresh(body, llbc);
-    for candidate in builder_ctor_dest_locals(body, llbc) {
+    for candidate in owned_builder_dest_locals(body, llbc) {
         if !is_builder_mode_accumulator(&cache, body, llbc, candidate) {
             continue;
         }
@@ -28314,20 +28397,53 @@ fn accumulator_materialization_site_count(
     moves
 }
 
+/// Whether the unique definition of local `c` is an [`is_str_builder_ctor`]
+/// call.  [`is_fresh_str_builder`] no longer requires a constructor: a call
+/// result or a `?` payload move is one definition of an owned buffer.
+/// Builder mode still does, because the ctor rewrite arm replaces that
+/// defining call with `__majit_stringbuilder_new`.
+fn single_def_is_str_builder_ctor(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
+    let mut defs = 0usize;
+    let mut ctor = false;
+    for bb in &body.body {
+        for st in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
+                && matches!(place.kind, PlaceKind::Local(i) if i as usize == c)
+            {
+                return false;
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
+            && matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == c)
+        {
+            defs += 1;
+            if defs > 1 {
+                return false;
+            }
+            ctor = is_str_builder_ctor(wtf8buf_method_leaf(llbc, call));
+        }
+    }
+    defs == 1 && ctor
+}
+
 /// Whether fresh accumulator local `c` should lift to a real RPython
 /// `StringBuilder` (approach D) rather than the functional-concat fallback:
 ///
-/// * a single-def `Wtf8Buf` / `String` `new` / `with_capacity` ctor
-///   ([`is_fresh_str_builder`]),
+/// * an owned single-def `Wtf8Buf` / `String` ([`is_fresh_str_builder`]),
+/// * whose unique definition is a buffer constructor
+///   ([`single_def_is_str_builder_ctor`]) — a non-constructor definition is
+///   an already-built string, and the ctor rewrite would replace that
+///   producer with `__majit_stringbuilder_new`,
 /// * every borrow of `c` an append ([`clean_accumulator_ref_temps`]), and
 /// * exactly one terminal consumption
 ///   ([`accumulator_materialization_site_count`]) — a by-value move or an
 ///   inner-builder append piece, both spelling the single `ll_build` point.
 ///
-/// Zero or several terminal moves keep the `ll_strconcat` fallback so the
-/// builder rewrite only fires where the ctor, the appends, and the one build
-/// point are all unambiguous.  Lowering records the answer for every local
-/// once per body; emit sites read that table.
+/// Zero or several terminal moves, or a non-constructor definition, keep
+/// the `ll_strconcat` fallback so the builder rewrite only fires where the
+/// ctor, the appends, and the one build point are all unambiguous.
+/// Lowering records the answer for every local once per body; emit sites
+/// read that table.
 #[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
 fn is_builder_mode_accumulator(
     cache: &ScanCache,
@@ -28341,6 +28457,7 @@ fn is_builder_mode_accumulator(
         return hit;
     }
     let result = is_fresh_str_builder(cache, body, llbc, c)
+        && single_def_is_str_builder_ctor(body, llbc, c)
         && clean_accumulator_ref_temps(cache, body, llbc, c).is_some()
         && accumulator_materialization_site_count(cache, body, llbc, c) == 1;
     if c < cache.n() {
@@ -36437,6 +36554,23 @@ fn operand_fn_item_segments(llbc: &Llbc, op: Option<&Operand>) -> Option<Vec<Str
     }
 }
 
+/// The `FunDecl` a combinator's function-item argument names — the operand
+/// shapes [`operand_fn_item_segments`] accepts.
+fn operand_fn_item_decl<'l>(llbc: &'l Llbc, op: Option<&Operand>) -> Option<&'l FunDecl> {
+    let fun_id = match op? {
+        Operand::Const(value) => llbc
+            .const_expr_kind(value)?
+            .get("FnDef")?
+            .get("kind")?
+            .get("Fun")?
+            .as_u64()?,
+        Operand::Copy(p) | Operand::Move(p) => {
+            type_node_fn_def_fun_id(tyref_node(&p.ty, llbc)?, llbc)?
+        }
+    };
+    llbc.fn_by_id(fun_id)
+}
+
 /// The pointee type node of a shared reference `&T` (`{"Ref": [region, ty,
 /// "Shared"]}`), after unwrapping `Deduplicated` / `Value`
 /// indirection — or `None` when `node` is not a shared reference. The
@@ -41501,6 +41635,9 @@ impl DiscCombinator {
 struct DiscCombinatorSite {
     kind: DiscCombinator,
     result_var: Variable,
+    /// The combinator call's arguments — locate the call once `result_exc`
+    /// has renamed its result to the `Ok` payload.
+    call_args: Vec<LinkArg>,
     recv_owner: String,
     recv_tag0_owner: String,
     recv_tag1_owner: String,
@@ -41516,6 +41653,12 @@ struct DiscCombinatorSite {
     result_payload0_class: Option<String>,
     result_payload1_class: Option<String>,
     call_once_owner: String,
+    /// The callable is this function item (no closure env): the arm calls it
+    /// directly.
+    fn_item_segments: Option<Vec<String>>,
+    /// The function item is an ADT constructor: the arm builds this aggregate
+    /// instead of calling it.
+    fn_item_ctor: Option<AggregateShape>,
     args_tuple_suffix: String,
     call_result_ty: ValueType,
     call_result_class: Option<String>,
@@ -41546,6 +41689,121 @@ struct ResultTryStats {
     rewritten: usize,
 }
 
+/// How an `Rvalue::Aggregate` builds its value
+/// ([`Lowering::aggregate_shape`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AggregateShape {
+    /// A fieldless enum variant (or the reserved `None` of an
+    /// `Option<fieldless enum>`) is its discriminant integer.
+    Discriminant(i64),
+    /// A zero-sized value: no constructor and no register.
+    Void,
+    /// `None` of a niche pointer `Option`: a null pointer.
+    NicheNull,
+    /// The value is operand `index` itself: a niche `Some`, an
+    /// `UnsafeCell`, or (`transparent`) a `repr(transparent)` wrapper.
+    Operand { index: usize, transparent: bool },
+    /// A variant/struct/tuple constructor plus one `FieldWrite` per operand.
+    Ctor(AggregateCtor),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AggregateCtor {
+    target: CallTarget,
+    result_owner: String,
+    owner_id: Option<majit_ir::descr::StructId>,
+    owner_path: Vec<String>,
+    ctor_name: String,
+    /// One row per operand.
+    fields: Vec<AggregateField>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AggregateField {
+    name: String,
+    /// Zero-sized: no slot, no write.
+    void: bool,
+    /// Instance root the stored value is narrowed to.
+    narrow_root: Option<String>,
+}
+
+/// Emit `ctor`'s constructor and field writes into `block` over the operand
+/// values `args`, returning the constructed value.
+fn emit_aggregate_ctor(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    ctor: &AggregateCtor,
+    args: &[Variable],
+) -> Variable {
+    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(res.clone()),
+        kind: OpKind::Call {
+            target: ctor.target.clone(),
+            args: Vec::new(),
+            result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
+        },
+    });
+    for (field, value) in ctor.fields.iter().zip(args) {
+        if field.void {
+            continue;
+        }
+        let value = match &field.narrow_root {
+            Some(root) => {
+                let narrowed = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                graph.block_mut(block).operations.push(SpaceOperation {
+                    result: Some(narrowed.clone()),
+                    kind: crate::model::cast_instance_call(root, value.clone()),
+                });
+                narrowed
+            }
+            None => value.clone(),
+        };
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: res.clone(),
+                field: crate::model::FieldDescriptor {
+                    name: field.name.clone(),
+                    owner_root: Some(ctor.result_owner.clone()),
+                    owner_id: ctor.owner_id,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                },
+                value: crate::model::LinkArg::Value(value),
+                ty: ValueType::Ref(None),
+            },
+        });
+    }
+    res
+}
+
+/// Build `shape` in `block` from operand values already in hand — a call of
+/// a constructor function item.  `Err` for a shape that has no operands to
+/// build from.
+pub(crate) fn emit_aggregate_value(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    shape: &AggregateShape,
+    args: &[Variable],
+) -> Result<Variable, String> {
+    match shape {
+        AggregateShape::Discriminant(tag) => Ok(graph
+            .push_op_var(block, OpKind::ConstInt(*tag), true)
+            .expect("ConstInt produces a value")),
+        AggregateShape::Operand { index, .. } => args
+            .get(*index)
+            .cloned()
+            .ok_or_else(|| format!("constructor call has no operand {index}")),
+        AggregateShape::Ctor(ctor) if ctor.fields.len() == args.len() => {
+            Ok(emit_aggregate_ctor(graph, block, ctor, args))
+        }
+        other => Err(format!("constructor call cannot build {other:?}")),
+    }
+}
+
 fn rewire_disc_combinator_sites(
     graph: &mut FunctionGraph,
     sites: &[DiscCombinatorSite],
@@ -41572,25 +41830,38 @@ fn rewire_one_disc_combinator(
 
 fn locate_combinator_call(
     graph: &FunctionGraph,
-    result_var: &Variable,
+    site: &DiscCombinatorSite,
     method: &str,
     name: &str,
 ) -> Result<(usize, usize, Variable, Vec<Variable>), String> {
+    // `result_exc` renames a can-raise call's result to its `Ok` payload
+    // (`remint_call_as_payload`); the call then keeps only its arguments.
+    let is_call = |op: &SpaceOperation| {
+        op.result.as_ref() == Some(&site.result_var)
+            || (!site.call_args.is_empty()
+                && matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name: m, .. },
+                        args,
+                        ..
+                    } if m == method && *args == site.call_args
+                ))
+    };
     let a = graph
         .blocks
         .iter()
-        .position(|block| {
-            block
-                .operations
-                .iter()
-                .any(|op| op.result.as_ref() == Some(result_var))
-        })
+        .position(|block| block.operations.iter().any(is_call))
         .ok_or_else(|| format!("{name}: {method} result var has no producer block"))?;
     let ci = graph.blocks[a]
         .operations
         .iter()
-        .position(|op| op.result.as_ref() == Some(result_var))
+        .position(is_call)
         .ok_or_else(|| format!("{name}: {method} call not found in block {a}"))?;
+    let result_var = graph.blocks[a].operations[ci]
+        .result
+        .as_ref()
+        .ok_or_else(|| format!("{name}: {method} call has no result"))?;
     let ops_len = graph.blocks[a].operations.len();
     let flow_result = if ci + 1 == ops_len {
         result_var.clone()
@@ -41632,8 +41903,7 @@ fn rewire_result_is_ok_err(
 ) -> Result<(), String> {
     let name = graph.name.clone();
     let method = site.kind.method_name();
-    let (a, ci, flow_result, args) =
-        locate_combinator_call(graph, &site.result_var, method, &name)?;
+    let (a, ci, flow_result, args) = locate_combinator_call(graph, site, method, &name)?;
     if args.len() != 1 {
         return Err(format!("{name}: {method} is not a one-arg call"));
     }
@@ -41676,8 +41946,7 @@ fn rewire_disc_combinator_diamond(
 
     let name = graph.name.clone();
     let method = site.kind.method_name();
-    let (a, ci, flow_result, args) =
-        locate_combinator_call(graph, &site.result_var, method, &name)?;
+    let (a, ci, flow_result, args) = locate_combinator_call(graph, site, method, &name)?;
     let recv = args
         .first()
         .cloned()
@@ -41689,7 +41958,15 @@ fn rewire_disc_combinator_diamond(
     let exception_lowered = matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException));
     let [exit] = graph.blocks[a].exits.as_slice() else {
         if exception_lowered && graph.blocks[a].exits.len() == 2 {
-            return rewire_result_map_last_exception(graph, site, spec, a, ci, recv, extra);
+            return rewire_result_map_last_exception(
+                graph,
+                site,
+                spec,
+                (a, ci),
+                recv,
+                extra,
+                flow_result,
+            );
         }
         return Err(format!(
             "{name}: {method} block does not have a single exit"
@@ -41729,6 +42006,9 @@ fn rewire_disc_combinator_diamond(
             DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr => unreachable!(),
         };
 
+    // A function-item callable is named, not threaded: only a closure env or
+    // a plain value argument flows into the arm.
+    let extra = extra.filter(|_| site.fn_item_segments.is_none());
     let mut then_sources = carried.clone();
     if then_needs_recv && !then_sources.contains(&recv) {
         then_sources.push(recv.clone());
@@ -41824,10 +42104,12 @@ fn rewire_option_filter_diamond(
     use crate::front::bool_then::{
         close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
     };
-    use crate::front::option_closure_select::emit_call_once;
     use crate::front::option_map_or::emit_narrow;
 
-    let env = extra.ok_or_else(|| format!("{name}: filter missing predicate"))?;
+    let env = match site.fn_item_segments {
+        Some(_) => None,
+        None => Some(extra.ok_or_else(|| format!("{name}: filter missing predicate"))?),
+    };
     let [exit] = graph.blocks[a].exits.as_slice() else {
         return Err(format!("{name}: filter block does not have a single exit"));
     };
@@ -41854,7 +42136,9 @@ fn rewire_option_filter_diamond(
     if !some_sources.contains(&recv) {
         some_sources.push(recv.clone());
     }
-    if !some_sources.contains(&env) {
+    if let Some(env) = env.as_ref()
+        && !some_sources.contains(env)
+    {
         some_sources.push(env.clone());
     }
     let none_sources = carried.clone();
@@ -41874,8 +42158,7 @@ fn rewire_option_filter_diamond(
 
     let recv_in = map_source(&some_sources, &some_inputs, &recv)
         .ok_or_else(|| format!("{name}: filter receiver not threaded"))?;
-    let env_in = map_source(&some_sources, &some_inputs, &env)
-        .ok_or_else(|| format!("{name}: filter env not threaded"))?;
+    let env_in = disc_callable_env(site, &some_sources, &some_inputs, env.as_ref(), name)?;
     let payload = emit_payload_read(
         graph,
         some_bb,
@@ -41883,19 +42166,17 @@ fn rewire_option_filter_diamond(
         &site.recv_tag1_owner,
         site.payload1_ty.clone(),
     );
-    let pred = emit_call_once(
+    let pred = emit_disc_callable(
         graph,
         some_bb,
+        site,
         env_in,
-        Some((
+        (
             payload.clone(),
             site.payload1_ty.clone(),
             site.payload1_class.clone(),
-        )),
-        &site.call_once_owner,
-        ValueType::Bool,
-        &site.args_tuple_suffix,
-    );
+        ),
+    )?;
 
     let mut keep_sources = some_inputs.clone();
     keep_sources.push(payload.clone());
@@ -41965,6 +42246,53 @@ fn rewire_option_filter_diamond(
     Ok(())
 }
 
+/// The arm's closure env for `site`: the threaded `extra`, or `None` for a
+/// function-item callable.
+fn disc_callable_env(
+    site: &DiscCombinatorSite,
+    sources: &[Variable],
+    inputs: &[Variable],
+    extra: Option<&Variable>,
+    name: &str,
+) -> Result<Option<Variable>, String> {
+    if site.fn_item_segments.is_some() {
+        return Ok(None);
+    }
+    let method = site.kind.method_name();
+    let extra = extra.ok_or_else(|| format!("{name}: {method} missing closure"))?;
+    crate::front::bool_then::map_source(sources, inputs, extra)
+        .map(Some)
+        .ok_or_else(|| format!("{name}: {method} env not threaded"))
+}
+
+/// Run `site`'s callable on `arg` in `block`: `call_once(env, (arg,))` for a
+/// closure, a direct call for a function item, and the constructed aggregate
+/// for a constructor function item.
+fn emit_disc_callable(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    site: &DiscCombinatorSite,
+    env: Option<Variable>,
+    arg: (Variable, ValueType, Option<String>),
+) -> Result<Variable, String> {
+    let result_ty = if site.kind == DiscCombinator::OptionFilter {
+        ValueType::Bool
+    } else {
+        site.call_result_ty.clone()
+    };
+    crate::front::option_closure_select::emit_callable(
+        graph,
+        block,
+        env,
+        &site.call_once_owner,
+        site.fn_item_segments.as_deref(),
+        site.fn_item_ctor.as_ref(),
+        Some(arg),
+        result_ty,
+        &site.args_tuple_suffix,
+    )
+}
+
 fn build_disc_arm(
     graph: &mut FunctionGraph,
     site: &DiscCombinatorSite,
@@ -41977,7 +42305,6 @@ fn build_disc_arm(
     name: &str,
 ) -> Result<Variable, String> {
     use crate::front::bool_then::{emit_option_variant, emit_sum_variant, map_source};
-    use crate::front::option_closure_select::emit_call_once;
     use crate::front::option_map_or::emit_narrow;
 
     match (site.kind, is_then) {
@@ -42027,9 +42354,7 @@ fn build_disc_arm(
         (DiscCombinator::ResultMap, true) | (DiscCombinator::ResultAndThen, true) => {
             let recv = map_source(sources, inputs, recv)
                 .ok_or_else(|| format!("{name}: Result receiver not threaded into Ok arm"))?;
-            let extra = extra.ok_or_else(|| format!("{name}: Result map missing closure"))?;
-            let env = map_source(sources, inputs, extra)
-                .ok_or_else(|| format!("{name}: Result map env not threaded"))?;
+            let env = disc_callable_env(site, sources, inputs, extra, name)?;
             let payload = emit_payload_read(
                 graph,
                 block,
@@ -42037,19 +42362,17 @@ fn build_disc_arm(
                 &site.recv_tag0_owner,
                 site.payload0_ty.clone(),
             );
-            let mapped = emit_call_once(
+            let mapped = emit_disc_callable(
                 graph,
                 block,
+                site,
                 env,
-                Some((
+                (
                     payload,
                     site.payload0_ty.clone(),
                     site.payload0_class.clone(),
-                )),
-                &site.call_once_owner,
-                site.call_result_ty.clone(),
-                &site.args_tuple_suffix,
-            );
+                ),
+            )?;
             let mapped = emit_narrow(graph, block, mapped, &site.call_result_class);
             if site.kind == DiscCombinator::ResultAndThen {
                 Ok(mapped)
@@ -42110,10 +42433,7 @@ fn build_disc_arm(
         (DiscCombinator::ResultUnwrapOrElse, false) | (DiscCombinator::ResultOrElse, false) => {
             let recv = map_source(sources, inputs, recv)
                 .ok_or_else(|| format!("{name}: Result receiver not threaded into Err arm"))?;
-            let extra =
-                extra.ok_or_else(|| format!("{name}: Result unwrap_or_else missing closure"))?;
-            let env = map_source(sources, inputs, extra)
-                .ok_or_else(|| format!("{name}: Result unwrap_or_else env not threaded"))?;
+            let env = disc_callable_env(site, sources, inputs, extra, name)?;
             let payload = emit_payload_read(
                 graph,
                 block,
@@ -42121,19 +42441,17 @@ fn build_disc_arm(
                 &site.recv_tag1_owner,
                 site.payload1_ty.clone(),
             );
-            Ok(emit_call_once(
+            emit_disc_callable(
                 graph,
                 block,
+                site,
                 env,
-                Some((
+                (
                     payload,
                     site.payload1_ty.clone(),
                     site.payload1_class.clone(),
-                )),
-                &site.call_once_owner,
-                site.call_result_ty.clone(),
-                &site.args_tuple_suffix,
-            ))
+                ),
+            )
         }
         (DiscCombinator::ResultOk, true) => {
             let recv = map_source(sources, inputs, recv)
@@ -42203,30 +42521,489 @@ fn rewire_result_map_last_exception(
     graph: &mut FunctionGraph,
     site: &DiscCombinatorSite,
     spec: crate::ErrorCarrierSpec<'_>,
-    a: usize,
-    ci: usize,
+    (a, ci): (usize, usize),
     recv: Variable,
     extra: Option<Variable>,
+    flow_result: Variable,
 ) -> Result<(), String> {
+    use crate::front::bool_then::map_source;
+
     // `result_exc` already turned this Result-returning combinator into a
-    // can-raise site.  Only `map`/`and_then` keep that form; decline any
-    // other combinator rather than guess an exception ABI.
-    if !matches!(
-        site.kind,
-        DiscCombinator::ResultMap | DiscCombinator::ResultAndThen
-    ) {
+    // can-raise site: the normal exit carries the `Ok` payload and the
+    // exception exit receives the `Err`.  `map`'s callable returns that
+    // payload; `and_then`'s returns the carrier `Result`, so it is itself a
+    // can-raise call.  A constructor `and_then` builds a `Result` value the
+    // raising form has no slot for, so it keeps the residual.
+    let name = graph.name.clone();
+    let method = site.kind.method_name();
+    let raising_callable = match site.kind {
+        DiscCombinator::ResultMap => false,
+        DiscCombinator::ResultAndThen if site.fn_item_ctor.is_none() => true,
+        _ => {
+            return Err(format!("{name}: {method} LastException form left residual"));
+        }
+    };
+    if ci + 1 != graph.blocks[a].operations.len() {
+        return Err(format!("{name}: {method} is not the raising operation"));
+    }
+    let normal = graph.blocks[a]
+        .exits
+        .iter()
+        .find(|link| link.exitcase.is_none())
+        .cloned()
+        .ok_or_else(|| format!("{name}: {method} has no normal exit"))?;
+    let raise = graph.blocks[a]
+        .exits
+        .iter()
+        .find(|link| link.exitcase.is_some())
+        .cloned()
+        .ok_or_else(|| format!("{name}: {method} has no exception exit"))?;
+    if raise
+        .last_exception
+        .as_ref()
+        .and_then(LinkArg::as_variable)
+        .is_none()
+        || raise
+            .last_exc_value
+            .as_ref()
+            .and_then(LinkArg::as_variable)
+            .is_none()
+    {
         return Err(format!(
-            "{}: {} LastException form is not lowered",
-            graph.name,
-            site.kind.method_name()
+            "{name}: {method} exception exit lacks its exception pair"
         ));
     }
-    let _ = (spec, a, ci, recv, extra);
-    Err(format!(
-        "{}: {} LastException form left residual",
-        graph.name,
-        site.kind.method_name()
-    ))
+    let arm = CombinatorArmExits {
+        normal: &normal,
+        raise: &raise,
+        flow_result: &flow_result,
+        raising_callable,
+    };
+    if drop_rebuilt_receiver_shell(graph, site, (a, ci), &recv, extra.as_ref(), &arm).is_ok() {
+        return Ok(());
+    }
+    // The receiver stays a value.  Its `Err` arm raises the carrier the way a
+    // `?` on it would; a local handler expecting the rebuilt shell is not
+    // proven here.
+    if raise.target != graph.exceptblock {
+        return Err(format!("{name}: {method} LastException form left residual"));
+    }
+    let exc_vars = [&raise.last_exception, &raise.last_exc_value];
+    let mut ok_sources: Vec<Variable> = Vec::new();
+    let mut err_sources: Vec<Variable> = Vec::new();
+    // A raising callable leaves the `Ok` arm on both exits.
+    let ok_links: &[&Link] = if raising_callable {
+        &[&normal, &raise]
+    } else {
+        &[&normal]
+    };
+    for (links, sources) in [
+        (ok_links, &mut ok_sources),
+        (&[&raise][..], &mut err_sources),
+    ] {
+        for arg in links.iter().flat_map(|link| &link.args) {
+            if let LinkArg::Value(v) = arg
+                && *v != flow_result
+                && !exc_vars.iter().any(|e| e.as_ref() == Some(arg))
+                && !sources.contains(v)
+            {
+                sources.push(v.clone());
+            }
+        }
+    }
+    if !ok_sources.contains(&recv) {
+        ok_sources.push(recv.clone());
+    }
+    if site.fn_item_segments.is_none()
+        && let Some(env) = extra.as_ref()
+        && !ok_sources.contains(env)
+    {
+        ok_sources.push(env.clone());
+    }
+    if !err_sources.contains(&recv) {
+        err_sources.push(recv.clone());
+    }
+    let (ok_bb, ok_inputs) = graph.create_block_with_arg_vars(ok_sources.len());
+    let (err_bb, err_inputs) = graph.create_block_with_arg_vars(err_sources.len());
+
+    // `Ok(x)` → `f(x)` on the normal exit.
+    let recv_ok = map_source(&ok_sources, &ok_inputs, &recv)
+        .ok_or_else(|| format!("{name}: {method} receiver not threaded into Ok arm"))?;
+    let payload = emit_payload_read(
+        graph,
+        ok_bb,
+        recv_ok,
+        &site.recv_tag0_owner,
+        site.payload0_ty.clone(),
+    );
+    let env = disc_callable_env(site, &ok_sources, &ok_inputs, extra.as_ref(), &name)?;
+    arm.close_with_callable(graph, site, ok_bb, env, payload, &|v| {
+        map_source(&ok_sources, &ok_inputs, v)
+    })?;
+
+    // `Err(e)` → raise `e` on the exception exit.
+    let recv_err = map_source(&err_sources, &err_inputs, &recv)
+        .ok_or_else(|| format!("{name}: {method} receiver not threaded into Err arm"))?;
+    let error = emit_payload_read(
+        graph,
+        err_bb,
+        recv_err,
+        &site.recv_tag1_owner,
+        site.payload1_ty.clone(),
+    );
+    crate::front::result_map_err::raise_carrier_on_exception_edge(
+        graph,
+        err_bb,
+        error,
+        &raise,
+        &err_sources,
+        &err_inputs,
+        spec,
+        &name,
+    )?;
+
+    let a_id = graph.blocks[a].id;
+    graph.blocks[a].operations.truncate(ci);
+    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    graph.set_branch(a_id, disc, err_bb, err_sources, ok_bb, ok_sources);
+    Ok(())
+}
+
+/// The two exits of a combinator call `result_exc` made can-raise.
+struct CombinatorArmExits<'l> {
+    normal: &'l Link,
+    raise: &'l Link,
+    /// The call's result on `normal`: the `Ok` payload.
+    flow_result: &'l Variable,
+    /// The callable itself raises the carrier's `Err` (`and_then`).
+    raising_callable: bool,
+}
+
+impl CombinatorArmExits<'_> {
+    /// Run the site's callable on `payload` at the end of `block` and leave on
+    /// the normal exit with its result, remapping every other value through
+    /// `remap`.  A raising callable is the block's can-raise operation: its
+    /// exception exit is a copy of the combinator's, with a fresh exception
+    /// pair.
+    fn close_with_callable(
+        &self,
+        graph: &mut FunctionGraph,
+        site: &DiscCombinatorSite,
+        block: BlockId,
+        env: Option<Variable>,
+        payload: Variable,
+        remap: &dyn Fn(&Variable) -> Option<Variable>,
+    ) -> Result<(), String> {
+        let name = graph.name.clone();
+        let result_ty = if self.raising_callable {
+            site.result_payload0_ty.clone()
+        } else {
+            site.call_result_ty.clone()
+        };
+        let value = crate::front::option_closure_select::emit_callable(
+            graph,
+            block,
+            env,
+            &site.call_once_owner,
+            site.fn_item_segments.as_deref(),
+            site.fn_item_ctor.as_ref(),
+            Some((
+                payload,
+                site.payload0_ty.clone(),
+                site.payload0_class.clone(),
+            )),
+            result_ty,
+            &site.args_tuple_suffix,
+        )
+        .map_err(|msg| format!("{name}: {msg}"))?;
+        let value = if self.raising_callable {
+            value
+        } else {
+            crate::front::option_map_or::emit_narrow(graph, block, value, &site.call_result_class)
+        };
+        let remap_arg = |arg: &LinkArg, fresh: &[(&Option<LinkArg>, &Variable)]| match arg {
+            LinkArg::Value(v) if v == self.flow_result => Some(LinkArg::Value(value.clone())),
+            LinkArg::Value(_) => fresh
+                .iter()
+                .find(|(slot, _)| slot.as_ref() == Some(arg))
+                .map(|(_, var)| LinkArg::Value((*var).clone()))
+                .or_else(|| arg.as_variable().and_then(remap).map(LinkArg::Value)),
+            LinkArg::Const(c) => Some(LinkArg::Const(c.clone())),
+        };
+        let normal_args = self
+            .normal
+            .args
+            .iter()
+            .map(|arg| remap_arg(arg, &[]))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| format!("{name}: combinator normal exit arg not threaded"))?;
+        let normal = Link::new_mixed(normal_args, self.normal.target, None);
+        if !self.raising_callable {
+            graph.set_control_flow_metadata(block, None, vec![normal]);
+            return Ok(());
+        }
+        let etype = graph.alloc_value_var();
+        let evalue = graph.alloc_value_var();
+        let raise_args = self
+            .raise
+            .args
+            .iter()
+            .map(|arg| {
+                remap_arg(
+                    arg,
+                    &[
+                        (&self.raise.last_exception, &etype),
+                        (&self.raise.last_exc_value, &evalue),
+                    ],
+                )
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| format!("{name}: combinator exception exit arg not threaded"))?;
+        let mut raise = Link::new_mixed(raise_args, self.raise.target, self.raise.exitcase.clone());
+        raise.llexitcase = self.raise.llexitcase.clone();
+        raise.last_exception = Some(LinkArg::Value(etype));
+        raise.last_exc_value = Some(LinkArg::Value(evalue));
+        graph.set_control_flow_metadata(
+            block,
+            Some(ExitSwitch::LastException),
+            vec![normal, raise],
+        );
+        Ok(())
+    }
+}
+
+/// Drop the `Ok`/`Err` shells `result_exc::catch_and_rewrap` rebuilt for
+/// the combinator's receiver alone.  The normal arm of the producing call
+/// applies the callable to its payload; its exception arm forwards the caught
+/// exception pair straight to the combinator's exception exit, so no carrier
+/// round trip happens.  Every check runs before the first edit; `Err` leaves
+/// the graph unchanged.
+fn drop_rebuilt_receiver_shell(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+    (a, ci): (usize, usize),
+    recv: &Variable,
+    env: Option<&Variable>,
+    arm: &CombinatorArmExits<'_>,
+) -> Result<(), String> {
+    use crate::front::result_exc::{count_var_uses, delete_ops, result_ctor_kind, shell_build_ops};
+
+    let block_a = &graph.blocks[a];
+    let a_id = block_a.id;
+    let only_use = |graph: &FunctionGraph, var: &Variable, ops: usize, links: usize| {
+        let uses = count_var_uses(graph, var);
+        uses.op_uses == ops && uses.link_uses == links
+    };
+    let Some(recv_pos) = block_a.inputargs.iter().position(|v| v == recv) else {
+        return Err("receiver is not an inputarg of the combinator block".to_string());
+    };
+    if block_a.inputargs.iter().filter(|v| *v == recv).count() != 1 || !only_use(graph, recv, 1, 0)
+    {
+        return Err("receiver shell has another consumer".to_string());
+    }
+    // Only function-item defines the call alone reads may precede the call.
+    let OpKind::Call {
+        args: call_args, ..
+    } = &block_a.operations[ci].kind
+    else {
+        return Err("combinator is not a call".to_string());
+    };
+    for op in &block_a.operations[..ci] {
+        let OpKind::Call { target, args, .. } = &op.kind else {
+            return Err("combinator block computes more than the call".to_string());
+        };
+        let define = args.is_empty() && crate::model::fn_const_segments(target).is_some();
+        if !define
+            || !op.result.as_ref().is_some_and(|r| {
+                call_args.contains(&LinkArg::Value(r.clone())) && only_use(graph, r, 1, 0)
+            })
+        {
+            return Err("combinator block computes more than the call".to_string());
+        }
+    }
+    let env_pos = match (&site.fn_item_segments, env) {
+        (None, Some(env)) => Some(
+            block_a
+                .inputargs
+                .iter()
+                .position(|v| v == env)
+                .ok_or("closure env is not an inputarg of the combinator block")?,
+        ),
+        _ => None,
+    };
+    // Every value leaving the block is one of its inputargs (not the shell),
+    // the call result, or the exception pair.
+    for link in [arm.normal, arm.raise] {
+        for arg in &link.args {
+            if let LinkArg::Value(v) = arg
+                && v != arm.flow_result
+                && Some(arg) != link.last_exception.as_ref()
+                && Some(arg) != link.last_exc_value.as_ref()
+                && (v == recv || !block_a.inputargs.contains(v))
+            {
+                return Err("combinator exit carries a value the block computes".to_string());
+            }
+        }
+    }
+    let preds: Vec<usize> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.exits.iter().any(|link| link.target == a_id))
+        .map(|(i, _)| i)
+        .collect();
+    let [p0, p1] = preds.as_slice() else {
+        return Err("combinator block is not private to two rebuilt shells".to_string());
+    };
+    let shell_of = |block: usize| -> Result<(Variable, bool, Vec<LinkArg>), String> {
+        let b = &graph.blocks[block];
+        let [exit] = b.exits.as_slice() else {
+            return Err(format!("shell block {block} has more than one exit"));
+        };
+        if b.exitswitch.is_some() || exit.exitcase.is_some() {
+            return Err(format!("shell block {block} exit is not a plain goto"));
+        }
+        let Some(LinkArg::Value(shell)) = exit.args.get(recv_pos) else {
+            return Err(format!("shell block {block} does not pass a shell"));
+        };
+        let is_err = b
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(shell))
+            .and_then(|op| match &op.kind {
+                OpKind::Call { target, .. } => result_ctor_kind(target),
+                _ => None,
+            })
+            .ok_or_else(|| format!("shell block {block} does not build a Result shell"))?;
+        if !only_use(graph, shell, 1, 1) {
+            return Err(format!("shell of block {block} has another consumer"));
+        }
+        Ok((shell.clone(), is_err, exit.args.clone()))
+    };
+    let (s0, err0, args0) = shell_of(*p0)?;
+    let (s1, err1, args1) = shell_of(*p1)?;
+    let ((n, ok_shell, n_args), (e, err_shell, e_args)) = match (err0, err1) {
+        (false, true) => ((*p0, s0, args0), (*p1, s1, args1)),
+        (true, false) => ((*p1, s1, args1), (*p0, s0, args0)),
+        _ => return Err("predecessors are not one Ok and one Err shell".to_string()),
+    };
+    let payload_of = |block: usize, shell: &Variable| {
+        graph.blocks[block]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    base,
+                    field,
+                    value: LinkArg::Value(value),
+                    ..
+                } if base == shell && field.name == "__pos_0" => Some(value.clone()),
+                _ => None,
+            })
+    };
+    let ok_payload = payload_of(n, &ok_shell).ok_or("Ok shell has no payload")?;
+    let err_payload = payload_of(e, &err_shell).ok_or("Err shell has no payload")?;
+    // The Err arm is `catch_and_rewrap`'s handler: its last two inputargs are
+    // the caught exception pair, and its carrier is that value or its
+    // `from_exc_object` rebuild, read by nothing but the shell.
+    let e_inputs = &graph.blocks[e].inputargs;
+    let [.., caught_type, caught_value] = e_inputs.as_slice() else {
+        return Err("Err shell block does not receive an exception pair".to_string());
+    };
+    let e_id = graph.blocks[e].id;
+    let caught_by_producer = graph.blocks.iter().any(|block| {
+        block.exits.iter().any(|link| {
+            link.target == e_id
+                && link.exitcase.is_some()
+                && link.args.len() == e_inputs.len()
+                && link.last_exception.as_ref() == link.args.get(e_inputs.len() - 2)
+                && link.last_exc_value.as_ref() == link.args.last()
+        })
+    });
+    if !caught_by_producer {
+        return Err("Err shell block is not the producer's exception handler".to_string());
+    }
+    let mut err_build = shell_build_ops(graph, e, &err_shell)?;
+    if err_payload != *caught_value {
+        let rebuild = graph.blocks[e]
+            .operations
+            .iter()
+            .position(|op| {
+                op.result.as_ref() == Some(&err_payload)
+                    && matches!(&op.kind, OpKind::Call { args, .. }
+                        if args.len() == 1 && args[0] == LinkArg::Value(caught_value.clone()))
+            })
+            .ok_or("Err shell payload is not the caught exception")?;
+        if !only_use(graph, &err_payload, 1, 0) {
+            return Err("Err shell payload has another consumer".to_string());
+        }
+        err_build.push(rebuild);
+        err_build.sort_unstable();
+    }
+    let ok_build = shell_build_ops(graph, n, &ok_shell)?;
+    let a_inputs = graph.blocks[a].inputargs.clone();
+    let via = |args: &[LinkArg], v: &Variable| {
+        a_inputs
+            .iter()
+            .position(|input| input == v)
+            .and_then(|i| args.get(i))
+            .and_then(LinkArg::as_variable)
+            .cloned()
+    };
+    let n_env = match env_pos {
+        Some(pos) => Some(
+            n_args
+                .get(pos)
+                .and_then(LinkArg::as_variable)
+                .cloned()
+                .ok_or("closure env reaches the Ok shell block as a constant")?,
+        ),
+        None => None,
+    };
+    let e_exit_args = arm
+        .raise
+        .args
+        .iter()
+        .map(|arg| match arg {
+            _ if Some(arg) == arm.raise.last_exception.as_ref() => {
+                Some(LinkArg::Value(caught_type.clone()))
+            }
+            _ if Some(arg) == arm.raise.last_exc_value.as_ref() => {
+                Some(LinkArg::Value(caught_value.clone()))
+            }
+            LinkArg::Value(v) => via(&e_args, v).map(LinkArg::Value),
+            LinkArg::Const(c) => Some(LinkArg::Const(c.clone())),
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or("combinator exception exit arg does not reach the Err shell block")?;
+    let n_remap = |v: &Variable| via(&n_args, v);
+    if arm
+        .normal
+        .args
+        .iter()
+        .chain(arm.raise.args.iter().filter(|_| arm.raising_callable))
+        .filter_map(LinkArg::as_variable)
+        .any(|v| {
+            v != arm.flow_result
+                && Some(&LinkArg::Value(v.clone())) != arm.raise.last_exception.as_ref()
+                && Some(&LinkArg::Value(v.clone())) != arm.raise.last_exc_value.as_ref()
+                && n_remap(v).is_none()
+        })
+    {
+        return Err("combinator exit arg does not reach the Ok shell block".to_string());
+    }
+
+    // Every check has run.
+    delete_ops(graph, n, ok_build);
+    delete_ops(graph, e, err_build);
+    let n_id = graph.blocks[n].id;
+    arm.close_with_callable(graph, site, n_id, n_env, ok_payload, &n_remap)?;
+    graph.set_control_flow_metadata(
+        e_id,
+        None,
+        vec![Link::new_mixed(e_exit_args, arm.raise.target, None)],
+    );
+    Ok(())
 }
 
 fn emit_enum_disc_read(
@@ -46869,6 +47646,7 @@ mod tests {
         let site = super::DiscCombinatorSite {
             kind: super::DiscCombinator::ResultMap,
             result_var: result,
+            call_args: Vec::new(),
             recv_owner: "core::result::Result".into(),
             recv_tag0_owner: "core::result::Result::Ok".into(),
             recv_tag1_owner: "core::result::Result::Err".into(),
@@ -46884,6 +47662,8 @@ mod tests {
             result_payload0_class: None,
             result_payload1_class: None,
             call_once_owner: String::new(),
+            fn_item_segments: None,
+            fn_item_ctor: None,
             args_tuple_suffix: String::new(),
             call_result_ty: ValueType::Int,
             call_result_class: None,
@@ -61452,6 +62232,486 @@ mod tests {
         );
     }
 
+    use serde_json::{Value, json};
+
+    fn str_builder_span() -> Value {
+        json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}})
+    }
+
+    fn str_builder_generics() -> Value {
+        json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []})
+    }
+
+    fn ident_seg(name: &str) -> Value {
+        json!({"Ident": [name, 0]})
+    }
+
+    fn str_builder_meta(path: Vec<Value>, is_local: bool) -> Value {
+        json!({
+            "name": path,
+            "span": str_builder_span(),
+            "source_text": null,
+            "is_local": is_local,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    }
+
+    fn wtf8_adt() -> Value {
+        json!({"Adt": {"id": 0, "generics": str_builder_generics()}})
+    }
+
+    fn outcome_adt() -> Value {
+        json!({"Adt": {"id": 1, "generics": str_builder_generics()}})
+    }
+
+    fn ref_wtf8(kind: &str) -> Value {
+        json!({"Ref": [{"Erased": null}, wtf8_adt(), kind]})
+    }
+
+    fn unit_ty() -> Value {
+        json!({"Adt": {"id": 0, "builtin": "Tuple", "generics": str_builder_generics()}})
+    }
+
+    fn word_ty() -> Value {
+        json!({"Scalar": {"Integer": {"Unsigned": "U64"}}})
+    }
+
+    fn place_of(id: u64, ty: &Value) -> Value {
+        json!({"kind": {"Local": id}, "ty": ty})
+    }
+
+    fn local_of(index: u64, ty: &Value) -> Value {
+        json!({"index": index, "name": null, "span": str_builder_span(), "ty": ty})
+    }
+
+    fn assign_stmt(place: Value, rvalue: Value) -> Value {
+        json!({"span": str_builder_span(), "kind": {"Assign": [place, rvalue]}})
+    }
+
+    fn ref_rvalue(place: Value, kind: &str) -> Value {
+        json!({"Ref": {"place": place, "kind": kind, "ptr_metadata": null}})
+    }
+
+    fn use_move(place: Value) -> Value {
+        json!({"Use": [{"Move": place}, "No"]})
+    }
+
+    fn move_op(place: Value) -> Value {
+        json!({"Move": place})
+    }
+
+    fn copy_op(place: Value) -> Value {
+        json!({"Copy": place})
+    }
+
+    fn bb(statements: Vec<Value>, term: Value) -> Value {
+        json!({
+            "statements": statements,
+            "terminator": {"span": str_builder_span(), "kind": term}
+        })
+    }
+
+    fn call_term(fun: u64, args: Vec<Value>, dest: Value, target: u64, unwind: u64) -> Value {
+        json!({"Call": {
+            "call": {
+                "func": {"Regular": {"kind": {"Fun": fun}, "generics": str_builder_generics()}},
+                "args": args,
+                "dest": dest
+            },
+            "target": target,
+            "on_unwind": unwind
+        }})
+    }
+
+    fn field_place(local: u64, base_ty: &Value, field_ty: &Value) -> Value {
+        json!({
+            "kind": {"Projection": [place_of(local, base_ty), {"Field": [0, 0]}]},
+            "ty": field_ty
+        })
+    }
+
+    fn wtf8buf_decl() -> Value {
+        json!({
+            "def_id": 0,
+            "item_meta": type_decl_meta(&["rustpython_wtf8", "Wtf8Buf"]),
+            "kind": "Opaque"
+        })
+    }
+
+    fn outcome_decl() -> Value {
+        json!({
+            "def_id": 1,
+            "item_meta": type_decl_meta(&["fixture", "Outcome"]),
+            "kind": {"Enum": [
+                {
+                    "name": "Continue",
+                    "fields": [{
+                        "name": null,
+                        "ty": wtf8_adt(),
+                        "attr_info": {
+                            "attributes": [], "inline": null, "rename": null, "public": false
+                        }
+                    }],
+                    "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}
+                },
+                {
+                    "name": "Break",
+                    "fields": [],
+                    "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}
+                }
+            ]}
+        })
+    }
+
+    fn opaque_decl(def_id: u64, path: &[&str], inputs: Vec<Value>, output: Value) -> Value {
+        json!({
+            "def_id": def_id,
+            "item_meta": str_builder_meta(
+                path.iter().copied().map(ident_seg).collect(),
+                false,
+            ),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+            "body": "Opaque"
+        })
+    }
+
+    fn push_str_decl() -> Value {
+        let impl_seg = json!({"Impl": {"Ty": {
+            "params": {
+                "regions": [], "types": [], "const_generics": [], "trait_clauses": [],
+                "regions_outlive": [], "types_outlive": [], "trait_type_constraints": []
+            },
+            "skip_binder": {"Value": [0, wtf8_adt()]},
+            "kind": "InherentImplBlock"
+        }}});
+        json!({
+            "def_id": 2,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("rustpython_wtf8"),
+                ident_seg("Wtf8Buf"),
+                impl_seg,
+                ident_seg("push_str"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_wtf8("Mut"), word_ty()],
+                "output": unit_ty()
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn subject_decl(
+        name: &str,
+        arg_count: u64,
+        inputs: Vec<Value>,
+        output: Value,
+        locals: Vec<Value>,
+        blocks: Vec<Value>,
+    ) -> Value {
+        json!({
+            "def_id": 0,
+            "item_meta": str_builder_meta(vec![ident_seg("fixture"), ident_seg(name)], true),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+            "body": {"Unstructured": {
+                "span": str_builder_span(),
+                "locals": {"arg_count": arg_count, "locals": locals},
+                "body": blocks
+            }}
+        })
+    }
+
+    fn lower_owned_concat(
+        name: &str,
+        types: Vec<Value>,
+        funs: Vec<Value>,
+    ) -> crate::model::FunctionGraph {
+        let llbc = llbc_with_types("fixture", types, funs);
+        super::lower_function(&llbc, name)
+            .unwrap_or_else(|err| panic!("{name} failed to lower: {err}"))
+    }
+
+    fn has_str_add(graph: &FunctionGraph) -> bool {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add"))
+    }
+
+    fn has_path_leaf(graph: &FunctionGraph, leaf: &str) -> bool {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(&op.kind, OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|segment| segment == leaf))
+            })
+    }
+
+    /// An owned `Wtf8Buf` defined by a non-constructor call, then `push_str`,
+    /// rebinds as `ll_strconcat`.  The producer is not a builder ctor, so the
+    /// append must not become a `StringBuilder` operation.
+    #[test]
+    fn owned_call_result_push_str_lowers_to_ll_strconcat() {
+        let wtf8 = wtf8_adt();
+        let word = word_ty();
+        let unit = unit_ty();
+        let borrow = ref_wtf8("Mut");
+        let graph = lower_owned_concat(
+            "owned_call_result_concat",
+            vec![wtf8buf_decl()],
+            vec![
+                subject_decl(
+                    "owned_call_result_concat",
+                    1,
+                    vec![word.clone()],
+                    wtf8.clone(),
+                    vec![
+                        local_of(0, &wtf8),
+                        local_of(1, &word),
+                        local_of(2, &wtf8),
+                        local_of(3, &borrow),
+                        local_of(4, &unit),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(2, &wtf8), 1, 3)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(3, &borrow),
+                                ref_rvalue(place_of(2, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(3, &borrow)), copy_op(place_of(1, &word))],
+                                place_of(4, &unit),
+                                2,
+                                3,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(0, &wtf8),
+                                use_move(place_of(2, &wtf8)),
+                            )],
+                            json!("Return"),
+                        ),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                opaque_decl(1, &["fixture", "prefix"], vec![], wtf8),
+                push_str_decl(),
+            ],
+        );
+        assert!(
+            has_str_add(&graph),
+            "a call-defined owned buffer must lower push_str to ll_strconcat: {graph:#?}"
+        );
+        assert!(
+            !has_path_leaf(&graph, "push_str"),
+            "push_str must not stay residual: {graph:#?}"
+        );
+        assert!(
+            !has_path_leaf(&graph, "__majit_stringbuilder_new"),
+            "a non-ctor producer must not become StringBuilder::new: {graph:#?}"
+        );
+    }
+
+    /// `let mut out = producer()?;` binds `out` by moving the `Continue`
+    /// payload.  That single definition is an owned `Wtf8Buf`, so `push_str`
+    /// rebinds it as `ll_strconcat`.
+    #[test]
+    fn continue_payload_move_push_str_lowers_to_ll_strconcat() {
+        let wtf8 = wtf8_adt();
+        let flow = outcome_adt();
+        let word = word_ty();
+        let unit = unit_ty();
+        let borrow = ref_wtf8("Mut");
+        let graph = lower_owned_concat(
+            "continue_payload_concat",
+            vec![wtf8buf_decl(), outcome_decl()],
+            vec![
+                subject_decl(
+                    "continue_payload_concat",
+                    1,
+                    vec![word.clone()],
+                    wtf8.clone(),
+                    vec![
+                        local_of(0, &wtf8),
+                        local_of(1, &word),
+                        local_of(2, &flow),
+                        local_of(3, &wtf8),
+                        local_of(4, &borrow),
+                        local_of(5, &unit),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(2, &flow), 1, 3)),
+                        bb(
+                            vec![
+                                assign_stmt(
+                                    place_of(3, &wtf8),
+                                    use_move(field_place(2, &flow, &wtf8)),
+                                ),
+                                assign_stmt(
+                                    place_of(4, &borrow),
+                                    ref_rvalue(place_of(3, &wtf8), "Mut"),
+                                ),
+                            ],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(4, &borrow)), copy_op(place_of(1, &word))],
+                                place_of(5, &unit),
+                                2,
+                                3,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(0, &wtf8),
+                                use_move(place_of(3, &wtf8)),
+                            )],
+                            json!("Return"),
+                        ),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                opaque_decl(1, &["fixture", "prefix"], vec![], flow),
+                push_str_decl(),
+            ],
+        );
+        assert!(
+            has_str_add(&graph),
+            "a Continue-payload accumulator must lower push_str to ll_strconcat: {graph:#?}"
+        );
+        assert!(
+            !has_path_leaf(&graph, "push_str"),
+            "push_str must not stay residual: {graph:#?}"
+        );
+    }
+
+    /// A `&mut Wtf8Buf` parameter is the caller's buffer.  `push_str` stays a
+    /// residual call.
+    #[test]
+    fn mut_wtf8buf_parameter_push_str_stays_residual() {
+        let unit = unit_ty();
+        let borrow = ref_wtf8("Mut");
+        let word = word_ty();
+        let graph = lower_owned_concat(
+            "mut_param_keeps_push",
+            vec![wtf8buf_decl()],
+            vec![
+                subject_decl(
+                    "mut_param_keeps_push",
+                    2,
+                    vec![borrow.clone(), word.clone()],
+                    unit.clone(),
+                    vec![local_of(0, &unit), local_of(1, &borrow), local_of(2, &word)],
+                    vec![
+                        bb(
+                            vec![],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(1, &borrow)), copy_op(place_of(2, &word))],
+                                place_of(0, &unit),
+                                1,
+                                2,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                opaque_decl(1, &["fixture", "prefix"], vec![], unit.clone()),
+                push_str_decl(),
+            ],
+        );
+        assert!(
+            has_path_leaf(&graph, "push_str"),
+            "a &mut Wtf8Buf parameter must keep its residual push_str: {graph:#?}"
+        );
+        assert!(
+            !has_str_add(&graph),
+            "a parameter accumulator must not become ll_strconcat: {graph:#?}"
+        );
+    }
+
+    /// An owned buffer that is also borrowed for a call other than an append
+    /// is not a clean accumulator, so `push_str` stays residual.
+    #[test]
+    fn owned_buffer_borrowed_outside_append_stays_residual() {
+        let wtf8 = wtf8_adt();
+        let word = word_ty();
+        let unit = unit_ty();
+        let shared = ref_wtf8("Shared");
+        let borrow = ref_wtf8("Mut");
+        let graph = lower_owned_concat(
+            "escaped_borrow_keeps_push",
+            vec![wtf8buf_decl()],
+            vec![
+                subject_decl(
+                    "escaped_borrow_keeps_push",
+                    1,
+                    vec![word.clone()],
+                    unit.clone(),
+                    vec![
+                        local_of(0, &unit),
+                        local_of(1, &word),
+                        local_of(2, &wtf8),
+                        local_of(3, &shared),
+                        local_of(4, &unit),
+                        local_of(5, &borrow),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(2, &wtf8), 1, 4)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(3, &shared),
+                                ref_rvalue(place_of(2, &wtf8), "Shared"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(3, &shared))],
+                                place_of(4, &unit),
+                                2,
+                                4,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(5, &borrow),
+                                ref_rvalue(place_of(2, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(5, &borrow)), copy_op(place_of(1, &word))],
+                                place_of(0, &unit),
+                                3,
+                                4,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                opaque_decl(1, &["fixture", "prefix"], vec![], wtf8),
+                push_str_decl(),
+                opaque_decl(3, &["fixture", "escape"], vec![shared], unit),
+            ],
+        );
+        assert!(
+            has_path_leaf(&graph, "push_str"),
+            "a buffer borrowed outside an append must keep residual push_str: {graph:#?}"
+        );
+        assert!(
+            !has_str_add(&graph),
+            "an escaped borrow must not become ll_strconcat: {graph:#?}"
+        );
+    }
+
     /// RPython `AbstractStringBuilderRepr.rtype_method_append` accepts both a
     /// whole string and `SomeChar`.  `bytearray_repr_string` mixes
     /// `String::push_str` and `String::push(char)` in one loop, so omitting the
@@ -63448,6 +64708,7 @@ mod tests {
         super::DiscCombinatorSite {
             kind,
             result_var,
+            call_args: Vec::new(),
             recv_owner: "core::result::Result".into(),
             recv_tag0_owner: "core::result::Result::Ok".into(),
             recv_tag1_owner: "core::result::Result::Err".into(),
@@ -63463,6 +64724,8 @@ mod tests {
             result_payload0_class: None,
             result_payload1_class: None,
             call_once_owner: "test::closure".into(),
+            fn_item_segments: None,
+            fn_item_ctor: None,
             args_tuple_suffix: String::new(),
             call_result_ty: ValueType::Int,
             call_result_class: None,
@@ -63635,6 +64898,691 @@ mod tests {
                 .operations
                 .iter()
                 .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq") })
+        );
+    }
+
+    /// `Option::<i64>::Some` as the constructor shape
+    /// `aggregate_shape` resolves for a `Some(x)` aggregate.
+    fn some_ctor_shape() -> super::AggregateShape {
+        super::AggregateShape::Ctor(super::AggregateCtor {
+            target: CallTarget::synthetic_transparent_enum_variant_ctor(
+                vec!["core".into(), "option".into(), "Option<i64>".into()],
+                "Some".to_string(),
+                1,
+            ),
+            result_owner: "core::option::Option<i64>::Some".into(),
+            owner_id: None,
+            owner_path: vec!["core".into(), "option".into(), "Option<i64>".into()],
+            ctor_name: "Some".into(),
+            fields: vec![super::AggregateField {
+                name: "__pos_0".into(),
+                void: false,
+                narrow_root: None,
+            }],
+        })
+    }
+
+    fn some_ctor_site(result: Variable) -> super::DiscCombinatorSite {
+        let mut site = disc_site(super::DiscCombinator::ResultMap, result);
+        site.call_once_owner = String::new();
+        site.fn_item_segments = Some(
+            ["core", "option", "Option", "Some"]
+                .map(str::to_string)
+                .to_vec(),
+        );
+        site.fn_item_ctor = Some(some_ctor_shape());
+        site.call_result_ty = ValueType::Ref(None);
+        site.result_payload0_ty = ValueType::Ref(None);
+        site
+    }
+
+    /// Operations that build `Option::Some` (the variant constructor) and
+    /// that call the constructor function item.
+    fn some_ctor_ops(graph: &FunctionGraph) -> (usize, usize) {
+        let ops = || graph.blocks.iter().flat_map(|block| &block.operations);
+        let built = ops()
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, variant_tag: Some(1), .. },
+                    ..
+                } if name == "Some")
+            })
+            .count();
+        let called = ops()
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call {
+                    target: target @ CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("Some")
+                    && crate::model::fn_const_segments(target).is_none())
+            })
+            .count();
+        (built, called)
+    }
+
+    #[test]
+    fn result_map_of_a_constructor_builds_the_variant() {
+        // `r.map(Some)`: the `Ok` arm builds `Some(x)` the way the
+        // `Rvalue::Aggregate` for `Some(x)` does, with no call of the
+        // constructor and no `call_once`.
+        let mut graph = FunctionGraph::new("test_result_map_some");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let some = push_fn_const(&mut graph, a, &["core", "option", "Option", "Some"]);
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map", Some("Result".into())),
+                    args: crate::model::call_args(vec![recv, some]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[some_ctor_site(result)],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "map"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 0);
+        assert_eq!(some_ctor_ops(&graph), (1, 0));
+        let payload_owner_writes = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(&op.kind, OpKind::FieldWrite { field, .. }
+                    if field.name == "__pos_0"
+                        && field.owner_root.as_deref() == Some("core::option::Option<i64>::Some"))
+            })
+            .count();
+        assert_eq!(payload_owner_writes, 1);
+        // The function-item define is no longer read; the dead-op sweep
+        // drops it like the constant it stands for.
+        crate::model::prune_dead_phis(&mut graph);
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(&op.kind, OpKind::Call { target, .. }
+                if crate::model::fn_const_segments(target).is_some())
+                })
+        );
+    }
+
+    #[test]
+    fn result_and_then_lowers_to_discriminant_switch() {
+        let (mut graph, result) = build_two_arg_combinator("and_then");
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[disc_site(super::DiscCombinator::ResultAndThen, result)],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "and_then"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 1);
+        assert_eq!(graph.blocks[graph.startblock.0].exits.len(), 2);
+    }
+
+    /// `Result::<i64, i64>::Ok` as the constructor shape.
+    fn ok_ctor_shape() -> super::AggregateShape {
+        let owner_path: Vec<String> =
+            vec!["core".into(), "result".into(), "Result<i64,i64>".into()];
+        super::AggregateShape::Ctor(super::AggregateCtor {
+            target: CallTarget::synthetic_transparent_enum_variant_ctor(
+                owner_path.clone(),
+                "Ok".to_string(),
+                0,
+            ),
+            result_owner: "core::result::Result<i64,i64>::Ok".into(),
+            owner_id: None,
+            owner_path,
+            ctor_name: "Ok".into(),
+            fields: vec![super::AggregateField {
+                name: "__pos_0".into(),
+                void: false,
+                narrow_root: None,
+            }],
+        })
+    }
+
+    #[test]
+    fn result_and_then_of_a_constructor_builds_the_variant() {
+        // `r.and_then(Ok)`: the `Ok` arm builds `Ok(x)` as the aggregate
+        // does.
+        let mut graph = FunctionGraph::new("test_result_and_then_ok");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let ok = push_fn_const(&mut graph, a, &["core", "result", "Result", "Ok"]);
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("and_then", Some("Result".into())),
+                    args: crate::model::call_args(vec![recv, ok]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let mut site = disc_site(super::DiscCombinator::ResultAndThen, result);
+        site.call_once_owner = String::new();
+        site.fn_item_segments = Some(
+            ["core", "result", "Result", "Ok"]
+                .map(str::to_string)
+                .to_vec(),
+        );
+        site.fn_item_ctor = Some(ok_ctor_shape());
+        site.call_result_ty = ValueType::Ref(None);
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[site],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "and_then"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 0);
+        let built = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, variant_tag: Some(0), .. },
+                    ..
+                } if name == "Ok")
+            })
+            .count();
+        assert_eq!(built, 1);
+    }
+
+    fn push_fn_const(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        path: &[&str],
+    ) -> Variable {
+        let mut segments = vec![crate::model::FN_CONST_HEAD.to_string()];
+        segments.extend(path.iter().map(|s| s.to_string()));
+        graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments,
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap()
+    }
+
+    /// A combinator call `result_exc` made can-raise (its result renamed to
+    /// the `Ok` payload), whose receiver is the `Ok`/`Err` shell pair
+    /// `catch_and_rewrap` rebuilt around a raising producer.
+    struct RaisingCombinator {
+        graph: FunctionGraph,
+        /// The `Ok` shell block.
+        n: crate::model::BlockId,
+        /// The `Err` shell block.
+        e: crate::model::BlockId,
+        /// The caught exception value `e` receives.
+        caught_value: Variable,
+        /// The combinator's normal target.
+        b: crate::model::BlockId,
+        /// The combinator's exception target.
+        handler: crate::model::BlockId,
+        call_args: Vec<LinkArg>,
+    }
+
+    /// `callable` is `None` for a closure env threaded as a block input, or
+    /// the path of a function item.  `rewrapped` builds the receiver as the
+    /// rebuilt shell pair; otherwise it is a plain input.  `to_exceptblock`
+    /// sends the exception exit to the graph's exceptblock instead of a
+    /// local handler.
+    fn raising_combinator(
+        method: &str,
+        callable: Option<&[&str]>,
+        rewrapped: bool,
+        to_exceptblock: bool,
+    ) -> RaisingCombinator {
+        use crate::model::{ExitSwitch, Link};
+        let mut graph = FunctionGraph::new("test_raising_combinator");
+        let p = graph.startblock;
+        let env = graph.push_op_var(p, OpKind::ConstInt(7), true).unwrap();
+        let (a, a_inputs) = graph.create_block_with_arg_vars(2);
+        let (n, e, caught_value) = if rewrapped {
+            let x = graph.alloc_value_var();
+            let (n, n_inputs) = graph.create_block_with_arg_vars(2);
+            let (e, e_inputs) = graph.create_block_with_arg_vars(3);
+            graph.blocks[p.0]
+                .operations
+                .push(crate::model::SpaceOperation {
+                    result: Some(x.clone()),
+                    kind: OpKind::Call {
+                        target: CallTarget::function_path(["test", "produce"]),
+                        args: Vec::new(),
+                        result_ty: ValueType::Int,
+                    },
+                });
+            let va = graph.alloc_value_var();
+            let vb = graph.alloc_value_var();
+            let mut exc = Link::new_mixed(
+                vec![
+                    LinkArg::Value(env.clone()),
+                    LinkArg::Value(va.clone()),
+                    LinkArg::Value(vb.clone()),
+                ],
+                e,
+                Some(crate::model::exception_exitcase()),
+            );
+            exc.last_exception = Some(LinkArg::Value(va));
+            exc.last_exc_value = Some(LinkArg::Value(vb));
+            graph.set_control_flow_metadata(
+                p,
+                Some(ExitSwitch::LastException),
+                vec![
+                    Link::new_mixed(
+                        vec![LinkArg::Value(x), LinkArg::Value(env.clone())],
+                        n,
+                        None,
+                    ),
+                    exc,
+                ],
+            );
+            let ok = crate::front::result_exc::build_shell(
+                &mut graph,
+                n,
+                "Ok",
+                n_inputs[0].clone(),
+                ValueType::Int,
+                "",
+            );
+            graph.set_goto(n, a, vec![ok, n_inputs[1].clone()]);
+            let error = graph
+                .push_op_var(
+                    e,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["test", "from_exc_object"]),
+                        args: crate::model::call_args(vec![e_inputs[2].clone()]),
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .unwrap();
+            let err = crate::front::result_exc::build_shell(
+                &mut graph,
+                e,
+                "Err",
+                error,
+                ValueType::Ref(None),
+                "",
+            );
+            graph.set_goto(e, a, vec![err, e_inputs[0].clone()]);
+            (n, e, e_inputs[2].clone())
+        } else {
+            let recv = graph.push_op_var(p, OpKind::ConstInt(0), true).unwrap();
+            graph.set_goto(p, a, vec![recv, env]);
+            (p, p, graph.alloc_value_var())
+        };
+        let callable_var = match callable {
+            Some(path) => push_fn_const(&mut graph, a, path),
+            None => a_inputs[1].clone(),
+        };
+        let call_args = crate::model::call_args(vec![a_inputs[0].clone(), callable_var]);
+        let payload = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method(method, Some("Result".into())),
+                    args: call_args.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        let etype = graph.alloc_value_var();
+        let evalue = graph.alloc_value_var();
+        let (handler, raise_args) = if to_exceptblock {
+            (
+                graph.exceptblock,
+                vec![
+                    LinkArg::Value(etype.clone()),
+                    LinkArg::Value(evalue.clone()),
+                ],
+            )
+        } else {
+            let (handler, _) = graph.create_block_with_arg_vars(1);
+            graph.set_return(handler, None);
+            (handler, vec![LinkArg::Value(evalue.clone())])
+        };
+        let mut raise = Link::new_mixed(
+            raise_args,
+            handler,
+            Some(crate::model::exception_exitcase()),
+        );
+        raise.last_exception = Some(LinkArg::Value(etype));
+        raise.last_exc_value = Some(LinkArg::Value(evalue));
+        graph.set_control_flow_metadata(
+            a,
+            Some(ExitSwitch::LastException),
+            vec![
+                Link::new_mixed(vec![LinkArg::Value(payload)], b, None),
+                raise,
+            ],
+        );
+        RaisingCombinator {
+            graph,
+            n,
+            e,
+            caught_value,
+            b,
+            handler,
+            call_args,
+        }
+    }
+
+    /// The site of a [`raising_combinator`]: its recorded result is the
+    /// pre-rename shell.
+    fn raising_site(
+        kind: super::DiscCombinator,
+        fixture: &mut RaisingCombinator,
+        callable: Option<&[&str]>,
+        ctor: Option<super::AggregateShape>,
+    ) -> super::DiscCombinatorSite {
+        let mut site = disc_site(kind, fixture.graph.alloc_value_var());
+        site.call_args = fixture.call_args.clone();
+        if let Some(path) = callable {
+            site.call_once_owner = String::new();
+            site.fn_item_segments = Some(path.iter().map(|s| s.to_string()).collect());
+        }
+        if ctor.is_some() {
+            site.call_result_ty = ValueType::Ref(None);
+            site.result_payload0_ty = ValueType::Ref(None);
+        }
+        site.fn_item_ctor = ctor;
+        site
+    }
+
+    fn rewire_raising(fixture: &mut RaisingCombinator, site: super::DiscCombinatorSite) -> usize {
+        let to_exc: &[&str] = &["test", "to_exc_object"];
+        super::rewire_disc_combinator_sites(
+            &mut fixture.graph,
+            &[site],
+            crate::ErrorCarrierSpec {
+                to_exc_object: Some(to_exc),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Operations of the blocks reachable from the start block.
+    fn live_ops(graph: &FunctionGraph) -> Vec<&crate::model::SpaceOperation> {
+        graph
+            .iterblocks_order()
+            .into_iter()
+            .flat_map(|id| &graph.blocks[id.0].operations)
+            .collect()
+    }
+
+    fn live_calls_to(graph: &FunctionGraph, leaf: &str) -> usize {
+        live_ops(graph)
+            .into_iter()
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == leaf,
+                OpKind::Call {
+                    target: target @ CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    segments.last().map(String::as_str) == Some(leaf)
+                        && crate::model::fn_const_segments(target).is_none()
+                }
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } => name == leaf,
+                _ => false,
+            })
+            .count()
+    }
+
+    /// The rebuilt shells are gone: the `Ok` block calls `callable` on the
+    /// payload and the `Err` block forwards the caught exception pair to the
+    /// combinator's exception target.
+    fn assert_receiver_shells_dropped(fixture: &RaisingCombinator, method: &str) {
+        let graph = &fixture.graph;
+        assert_eq!(live_calls_to(graph, method), 0);
+        assert_eq!(live_calls_to(graph, "Err"), 0);
+        assert_eq!(live_calls_to(graph, "from_exc_object"), 0);
+        assert_eq!(live_calls_to(graph, "to_exc_object"), 0);
+        let e = &graph.blocks[fixture.e.0];
+        assert!(e.operations.is_empty());
+        let [exit] = e.exits.as_slice() else {
+            panic!("Err block has one exit");
+        };
+        assert_eq!(exit.target, fixture.handler);
+        assert!(exit.exitcase.is_none());
+        assert_eq!(
+            exit.args,
+            vec![LinkArg::Value(fixture.caught_value.clone())]
+        );
+    }
+
+    #[test]
+    fn raising_result_map_drops_the_rebuilt_receiver_shells() {
+        let mut fixture = raising_combinator("map", None, true, false);
+        let site = raising_site(super::DiscCombinator::ResultMap, &mut fixture, None, None);
+        assert_eq!(rewire_raising(&mut fixture, site), 1);
+        assert_receiver_shells_dropped(&fixture, "map");
+        assert_eq!(live_calls_to(&fixture.graph, "Ok"), 0);
+        let n = &fixture.graph.blocks[fixture.n.0];
+        assert!(n.exitswitch.is_none());
+        assert_eq!(n.exits[0].target, fixture.b);
+        assert_eq!(count_method_calls(&fixture.graph, "call_once"), 1);
+    }
+
+    #[test]
+    fn raising_result_map_of_a_constructor_drops_the_rebuilt_receiver_shells() {
+        // `r.map(Some)` on a rebuilt receiver: `Some(x)` on the producer's
+        // normal edge, the producer's exception straight to the handler.
+        let path: &[&str] = &["core", "option", "Option", "Some"];
+        let mut fixture = raising_combinator("map", Some(path), true, false);
+        let site = raising_site(
+            super::DiscCombinator::ResultMap,
+            &mut fixture,
+            Some(path),
+            Some(some_ctor_shape()),
+        );
+        assert_eq!(rewire_raising(&mut fixture, site), 1);
+        assert_receiver_shells_dropped(&fixture, "map");
+        assert_eq!(some_ctor_ops(&fixture.graph), (1, 0));
+        let n = &fixture.graph.blocks[fixture.n.0];
+        assert_eq!(n.exits[0].target, fixture.b);
+        assert_eq!(count_method_calls(&fixture.graph, "call_once"), 0);
+    }
+
+    /// The `Ok` block ends in the callable as a raising call: normal exit to
+    /// the combinator's normal target, exception exit to its handler.
+    fn assert_ok_block_raises_through_callable(fixture: &RaisingCombinator, callee: &str) {
+        use crate::model::ExitSwitch;
+        let n = &fixture.graph.blocks[fixture.n.0];
+        assert!(matches!(n.exitswitch, Some(ExitSwitch::LastException)));
+        let last = n.operations.last().expect("raising call");
+        let called = match &last.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name.as_str(),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map_or("", String::as_str),
+            _ => "",
+        };
+        assert_eq!(called, callee);
+        let [normal, raise] = n.exits.as_slice() else {
+            panic!("raising call has two exits");
+        };
+        assert_eq!(normal.target, fixture.b);
+        assert_eq!(
+            normal.args,
+            vec![LinkArg::Value(last.result.clone().unwrap())]
+        );
+        assert_eq!(raise.target, fixture.handler);
+        assert!(raise.exitcase.is_some());
+        assert_eq!(raise.args.first(), raise.last_exc_value.as_ref());
+    }
+
+    #[test]
+    fn raising_result_and_then_calls_the_closure_as_a_raising_call() {
+        let mut fixture = raising_combinator("and_then", None, true, false);
+        let site = raising_site(
+            super::DiscCombinator::ResultAndThen,
+            &mut fixture,
+            None,
+            None,
+        );
+        assert_eq!(rewire_raising(&mut fixture, site), 1);
+        assert_receiver_shells_dropped(&fixture, "and_then");
+        assert_ok_block_raises_through_callable(&fixture, "call_once");
+    }
+
+    #[test]
+    fn raising_result_and_then_calls_the_function_item_as_a_raising_call() {
+        let path: &[&str] = &["test", "step"];
+        let mut fixture = raising_combinator("and_then", Some(path), true, false);
+        let site = raising_site(
+            super::DiscCombinator::ResultAndThen,
+            &mut fixture,
+            Some(path),
+            None,
+        );
+        assert_eq!(rewire_raising(&mut fixture, site), 1);
+        assert_receiver_shells_dropped(&fixture, "and_then");
+        assert_ok_block_raises_through_callable(&fixture, "step");
+    }
+
+    #[test]
+    fn raising_result_and_then_of_a_constructor_keeps_the_residual() {
+        let path: &[&str] = &["core", "result", "Result", "Ok"];
+        let mut fixture = raising_combinator("and_then", Some(path), true, false);
+        let site = raising_site(
+            super::DiscCombinator::ResultAndThen,
+            &mut fixture,
+            Some(path),
+            Some(ok_ctor_shape()),
+        );
+        assert_eq!(rewire_raising(&mut fixture, site), 0);
+        assert_eq!(count_method_calls(&fixture.graph, "and_then"), 1);
+        assert_eq!(live_calls_to(&fixture.graph, "Err"), 1);
+    }
+
+    #[test]
+    fn raising_result_map_with_a_local_handler_keeps_the_residual() {
+        // A receiver that is not a rebuilt shell pair stays a value; its
+        // `Err` would reach a local handler expecting a shell.
+        let mut fixture = raising_combinator("map", None, false, false);
+        let site = raising_site(super::DiscCombinator::ResultMap, &mut fixture, None, None);
+        assert_eq!(rewire_raising(&mut fixture, site), 0);
+        assert_eq!(count_method_calls(&fixture.graph, "map"), 1);
+    }
+
+    /// The receiver branches on its discriminant; the `Err` arm materialises
+    /// its carrier and raises it to the exceptblock.  Returns the `Ok` arm.
+    fn assert_err_arm_raises_to_the_exceptblock(
+        fixture: &RaisingCombinator,
+    ) -> crate::model::BlockId {
+        let graph = &fixture.graph;
+        let start = &graph.blocks[graph.startblock.0];
+        let entry = &graph.blocks[start.exits[0].target.0];
+        let arms: Vec<_> = entry.exits.iter().map(|link| link.target).collect();
+        assert_eq!(arms.len(), 2);
+        let err_arm = arms
+            .iter()
+            .map(|id| &graph.blocks[id.0])
+            .find(|arm| matches!(arm.exits.as_slice(), [exit] if exit.target == graph.exceptblock))
+            .expect("Err arm");
+        let exc = err_arm
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments == &["test", "to_exc_object"].map(str::to_string) => {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("Err arm materialises the exception value");
+        assert!(err_arm.exits[0].args.contains(&LinkArg::Value(exc)));
+        assert!(err_arm.exits[0].exitcase.is_none());
+        *arms.iter().find(|id| **id != err_arm.id).unwrap()
+    }
+
+    #[test]
+    fn raising_result_map_of_a_constructor_raises_err_to_the_exceptblock() {
+        let path: &[&str] = &["core", "option", "Option", "Some"];
+        let mut fixture = raising_combinator("map", Some(path), false, true);
+        let site = raising_site(
+            super::DiscCombinator::ResultMap,
+            &mut fixture,
+            Some(path),
+            Some(some_ctor_shape()),
+        );
+        assert_eq!(rewire_raising(&mut fixture, site), 1);
+        assert_eq!(count_method_calls(&fixture.graph, "map"), 0);
+        assert_eq!(some_ctor_ops(&fixture.graph), (1, 0));
+        let ok_arm = assert_err_arm_raises_to_the_exceptblock(&fixture);
+        let ok_arm = &fixture.graph.blocks[ok_arm.0];
+        assert!(ok_arm.exitswitch.is_none());
+        assert_eq!(ok_arm.exits[0].target, fixture.b);
+    }
+
+    #[test]
+    fn raising_result_and_then_raises_err_to_the_exceptblock() {
+        use crate::model::ExitSwitch;
+        let mut fixture = raising_combinator("and_then", None, false, true);
+        let site = raising_site(
+            super::DiscCombinator::ResultAndThen,
+            &mut fixture,
+            None,
+            None,
+        );
+        assert_eq!(rewire_raising(&mut fixture, site), 1);
+        assert_eq!(count_method_calls(&fixture.graph, "and_then"), 0);
+        let ok_arm = assert_err_arm_raises_to_the_exceptblock(&fixture);
+        let ok_arm = &fixture.graph.blocks[ok_arm.0];
+        assert!(matches!(ok_arm.exitswitch, Some(ExitSwitch::LastException)));
+        let [normal, raise] = ok_arm.exits.as_slice() else {
+            panic!("raising call has two exits");
+        };
+        assert_eq!(normal.target, fixture.b);
+        assert_eq!(raise.target, fixture.graph.exceptblock);
+        assert_eq!(
+            raise.args,
+            vec![
+                raise.last_exception.clone().unwrap(),
+                raise.last_exc_value.clone().unwrap()
+            ]
         );
     }
 

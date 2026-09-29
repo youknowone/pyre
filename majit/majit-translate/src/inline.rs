@@ -1401,6 +1401,14 @@ pub fn can_remove_op(kind: &OpKind) -> bool {
         // raising at `lloperation.py:578`, so
         // `enum_ops_without_sideeffects()` does not add it either.
         OpKind::GetSlice { .. } => false,
+        // `front::mir`'s function-item define-op stands for a `Constant`
+        // (`model.py`); one left unread after a combinator names the
+        // function directly goes the way of a dead constant.
+        OpKind::Call { target, args, .. }
+            if args.is_empty() && crate::model::fn_const_segments(target).is_some() =>
+        {
+            true
+        }
         _ => is_pure_op(kind),
     }
 }
