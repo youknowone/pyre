@@ -17054,10 +17054,59 @@ impl CraneliftBackend {
                         // Demoted frame-resident args are not block params on
                         // their target LABEL, so their incoming JUMP does not
                         // pass them; the forwarded root slot stays current.
-                        let target_keep = label_blocks
+                        let target_label_idx = label_blocks
                             .iter()
                             .find(|(_, block)| *block == target_block)
-                            .and_then(|(label_idx, _)| loop_phi_keep_by_label.get(label_idx));
+                            .map(|(label_idx, _)| *label_idx);
+                        let target_keep = target_label_idx
+                            .and_then(|label_idx| loop_phi_keep_by_label.get(&label_idx));
+                        // The LABEL's fall-through and its loader seed those
+                        // homes. A JUMP on a path neither of them precedes — a
+                        // merged bridge whose source guard sits before the LABEL
+                        // — reaches here with the values still live, so it
+                        // stores each one whose home this path never seeded
+                        // (`jump.py remap_frame_layout` moves every arg whose
+                        // source and target locations differ).
+                        if let Some(label_idx) = target_label_idx {
+                            let unseeded: Vec<(usize, i32)> = demoted_ref_positions_by_label
+                                .get(&label_idx)
+                                .into_iter()
+                                .flatten()
+                                .chain(
+                                    demoted_nonref_positions_by_label
+                                        .get(&label_idx)
+                                        .into_iter()
+                                        .flatten(),
+                                )
+                                .filter(|&&(_, raw, _)| {
+                                    !is_demoted_failarg(&demoted_failarg_slots, raw)
+                                })
+                                .map(|&(i, _, ofs)| (i, ofs))
+                                .collect();
+                            if !unseeded.is_empty() {
+                                let cur_jf = builder.ins().get_pinned_reg(ptr_type);
+                                let seeds: Vec<(CValue, i32)> = unseeded
+                                    .iter()
+                                    .map(|&(i, ofs)| {
+                                        let v = resolve_failarg_opref(
+                                            &mut builder,
+                                            &opref_var_map,
+                                            &constants,
+                                            cur_jf,
+                                            &ref_root_slots,
+                                            &stale_ref_vars,
+                                            &demoted_failarg_slots,
+                                            ref_root_base_ofs,
+                                            op.arg(i).to_opref(),
+                                        );
+                                        (coerce_ty(&mut builder, v, cl_types::I64), ofs)
+                                    })
+                                    .collect();
+                                for (v, ofs) in seeds {
+                                    builder.ins().store(MemFlagsData::new(), v, cur_jf, ofs);
+                                }
+                            }
+                        }
                         let mut jump_jf_ptr = None;
                         let vals: Vec<CValue> = op
                             .getarglist()
@@ -25178,6 +25227,123 @@ mod tests {
         let moved = backend.get_ref_value(&frame, 0);
         assert_ne!(moved, root);
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_00C1);
+    }
+
+    #[test]
+    fn merged_bridge_from_before_the_label_seeds_its_demoted_home() {
+        // `i0` is loop-invariant and deopt-only, so the loop LABEL demotes it
+        // to a frame home that its fall-through seeds. The merged bridge of
+        // the guard ahead of that LABEL enters the loop without passing the
+        // fall-through; the loop exit must still report `i0`.
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(16);
+        let pre_descr = mk_test_resume_guard_descr(0, vec![Type::Int, Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int, Type::Int]);
+        let pre = Op::with_descr(
+            OpCode::GuardTrue,
+            &[rb(OpRef::int_op(2))],
+            pre_descr.clone(),
+        );
+        pre.pos().set(OpRef::void_op(10));
+        pre.set_fail_arg_types(vec![Type::Int, Type::Int]);
+        pre.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1))
+        ]);
+        let exit = Op::with_descr(
+            OpCode::GuardTrue,
+            &[rb(OpRef::int_op(4))],
+            exit_descr.clone(),
+        );
+        exit.pos().set(OpRef::void_op(11));
+        exit.set_fail_arg_types(vec![Type::Int, Type::Int]);
+        exit.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::int_op(3))
+        ]);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let ops = vec![
+            mk_op(
+                OpCode::IntLt,
+                &[OpRef::input_arg_int(1), OpRef::const_int(1000)],
+                2,
+            ),
+            OpRc::new(pre),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(1), OpRef::const_int(1)],
+                3,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(3), OpRef::const_int(100)], 4),
+            OpRc::new(exit),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0), OpRef::int_op(3)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9206);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let before = backend.execute_token(&token, &[Value::Int(42), Value::Int(1000)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&before),
+            &pre_descr
+        ));
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntSub,
+                &[OpRef::input_arg_int(1), OpRef::const_int(1000)],
+                2,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0), OpRef::int_op(2)],
+                OpRef::NONE.raw(),
+                label,
+            ),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&pre_descr),
+                &[InputArg::new_int_rc(0), InputArg::new_int_rc(1)],
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_ne!(entry_before, entry_after);
+        let frame = backend.execute_token(&token, &[Value::Int(42), Value::Int(1000)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&frame),
+            &exit_descr
+        ));
+        assert_eq!(backend.get_int_value(&frame, 0), 42);
+        assert_eq!(backend.get_int_value(&frame, 1), 100);
     }
 
     #[test]
