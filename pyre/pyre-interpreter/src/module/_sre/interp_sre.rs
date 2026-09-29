@@ -10,8 +10,9 @@ use crate::{
     make_module_builtin_function_with_arity, module_ns_store,
 };
 use pyre_object::interp_sre::{
-    W_SRE_Match, W_SRE_Pattern, W_SRE_Scanner, is_sre_match, is_sre_pattern, is_sre_scanner,
-    w_sre_match_get_span, w_sre_match_new, w_sre_pattern_new, w_sre_scanner_new,
+    W_SRE_Match, W_SRE_Pattern, W_SRE_Scanner, W_SRE_Template, is_sre_match, is_sre_pattern,
+    is_sre_scanner, is_sre_template, w_sre_match_get_span, w_sre_match_new, w_sre_pattern_new,
+    w_sre_scanner_new, w_sre_template_new,
 };
 use pyre_object::*;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
@@ -601,6 +602,10 @@ pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
         )
     };
 }
+
+/// `_sre.SRE_Template` has no methods (`sre.c template_slots` is dealloc /
+/// traverse / clear only).
+pub(crate) fn init_sre_template_type(_ns: PyObjectRef) {}
 
 /// W_SRE_Scanner.typedef (interp_sre.py): the finditer/scanner
 /// iterator — `__iter__`/`__next__` plus the undocumented `match`/`search`
@@ -1456,7 +1461,11 @@ fn make_match(
     // `_last_index` (interp_sre.py); -1 plays None.
     let lastindex = {
         let li = state.marks.last_index();
-        if li >= 0 { li as i64 } else { -1 }
+        if li >= 0 {
+            li as i64
+        } else {
+            -1
+        }
     };
     let spans = flatten_spans(pat, state);
     w_sre_match_new(pat, string, w_buffer, pos, endpos, lastindex, &spans)
@@ -1982,9 +1991,7 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         Ok(())
     };
     let export_active = unsafe {
-        crate::builtins::buffer_export_incref(pyre_object::gc_roots::shadow_stack_get(
-            string_slot,
-        ))
+        crate::builtins::buffer_export_incref(pyre_object::gc_roots::shadow_stack_get(string_slot))
     };
     let _held_export = HeldBufferExport {
         slot: string_slot,
@@ -2065,41 +2072,124 @@ fn template_items_from_list(w_result: PyObjectRef) -> Result<Vec<TemplateItem>, 
     Ok(items)
 }
 
-/// `sre.c` `_sre_template_impl` — turn `parse_template`'s flat list into the
-/// object `re._compile_template` caches.  The list is interleaved
-/// literal / group-index / literal, odd length, indexes non-negative.
+/// `PyLong_AsSsize_t`: an int (including a subclass and a bool) or a long
+/// that fits in `ssize_t`. Anything else is `TypeError`, and a value that
+/// does not fit is `OverflowError`.
+fn template_group_index(elem: PyObjectRef) -> Result<i64, crate::PyError> {
+    if elem.is_null() || !unsafe { pyre_object::is_int_or_long(elem) } {
+        return Err(crate::PyError::type_error("an integer is required"));
+    }
+    if unsafe { pyre_object::is_bool(elem) } {
+        return Ok(i64::from(unsafe {
+            pyre_object::boolobject::w_bool_get_value(elem)
+        }));
+    }
+    if unsafe { pyre_object::is_long(elem) } {
+        let big = unsafe { pyre_object::longobject::w_long_get_value(elem) };
+        if pyre_object::longobject::jit_bigint_to_i64_fits(big) == 0 {
+            return Err(crate::PyError::overflow_error(
+                "Python int too large to convert to C ssize_t",
+            ));
+        }
+        return Ok(pyre_object::longobject::jit_bigint_to_i64_value(big));
+    }
+    Ok(unsafe { pyre_object::w_int_get_value(elem) })
+}
+
+/// Empty `str` / `bytes` literals are dropped from a group slot
+/// (`_sre_template_impl`). The leading literal is kept either way.
+fn template_literal_is_empty(elem: PyObjectRef) -> bool {
+    unsafe {
+        if is_str(elem) {
+            return pyre_object::unicodeobject::w_str_len(elem) == 0;
+        }
+        if pyre_object::is_bytes(elem) {
+            return pyre_object::bytesobject::w_bytes_len(elem) == 0;
+        }
+        false
+    }
+}
+
+/// `sre.c` `_sre_template_impl` — turn `parse_template`'s flat list into a
+/// `_sre.SRE_Template`. The list is interleaved literal / group-index /
+/// literal, odd length. A list subclass is accepted (`PyList_Check`).
 fn sre_template(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_list = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    if !unsafe { pyre_object::is_list(w_list) } {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_list);
+    let w_list = || pyre_object::gc_roots::shadow_stack_get(list_slot);
+    if !unsafe { crate::baseobjspace::isinstance_list_w(w_list()) } {
         return Err(crate::PyError::type_error(format!(
             "template() argument 2 must be list, not {}",
-            crate::baseobjspace::object_functionstr_type_name(w_list)
+            crate::baseobjspace::object_functionstr_type_name(w_list())
         )));
     }
-    let n = unsafe { pyre_object::w_list_len(w_list) };
+    let n = unsafe { pyre_object::w_list_len(w_list()) };
     if n < 1 || n % 2 == 0 {
         return Err(crate::PyError::type_error("invalid template"));
     }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let mut fields = pyre_object::gc_roots::RootedItems::new();
-    for i in 0..n {
-        let Some(elem) = (unsafe { pyre_object::w_list_getitem(w_list, i as i64) }) else {
+    let n_pairs = n / 2;
+    let Some(literal) = (unsafe { pyre_object::w_list_getitem(w_list(), 0) }) else {
+        return Err(crate::PyError::type_error("invalid template"));
+    };
+    let literal_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(literal);
+    // `self->chunks = 1 + 2*n`, then one less for each skipped empty literal.
+    let mut chunks = 1 + 2 * n_pairs as i64;
+    let mut index_slots: Vec<usize> = Vec::with_capacity(n_pairs);
+    let mut literal_slots: Vec<usize> = Vec::with_capacity(n_pairs);
+    for i in 0..n_pairs {
+        let Some(index_obj) =
+            (unsafe { pyre_object::w_list_getitem(w_list(), (2 * i + 1) as i64) })
+        else {
             return Err(crate::PyError::type_error("invalid template"));
         };
-        if i % 2 == 1 {
-            if !unsafe { is_int(elem) } {
-                let tname = crate::baseobjspace::object_functionstr_type_name(elem);
-                return Err(crate::PyError::type_error(format!(
-                    "an integer is required (got type {tname})"
-                )));
-            }
-            if unsafe { pyre_object::w_int_get_value(elem) } < 0 {
-                return Err(crate::PyError::type_error("invalid template"));
-            }
+        let index = template_group_index(index_obj)?;
+        if index < 0 {
+            return Err(crate::PyError::type_error("invalid template"));
         }
-        fields.push(elem);
+        let Some(lit) = (unsafe { pyre_object::w_list_getitem(w_list(), (2 * i + 2) as i64) })
+        else {
+            return Err(crate::PyError::type_error("invalid template"));
+        };
+        let stored = if template_literal_is_empty(lit) {
+            chunks -= 1;
+            w_none()
+        } else {
+            lit
+        };
+        // The list root keeps the literal alive, but this copy is what the
+        // template stores. Pin it before `w_int_new` can collect.
+        let literal_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(stored);
+        literal_slots.push(literal_slot);
+        let index_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(index));
+        index_slots.push(index_slot);
     }
-    Ok(w_tuple_new(fields.take()))
+    let indexes = w_tuple_new(
+        index_slots
+            .iter()
+            .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+            .collect(),
+    );
+    let indexes_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(indexes);
+    let literals = w_tuple_new(
+        literal_slots
+            .iter()
+            .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+            .collect(),
+    );
+    let literals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(literals);
+    Ok(w_sre_template_new(
+        pyre_object::gc_roots::shadow_stack_get(literal_slot),
+        chunks,
+        pyre_object::gc_roots::shadow_stack_get(indexes_slot),
+        pyre_object::gc_roots::shadow_stack_get(literals_slot),
+    ))
 }
 
 /// Parse a replacement template into [`TemplateItem`]s by calling
@@ -2139,23 +2229,46 @@ fn parse_replacement_template(
     template_items_from_compiled(w_result)
 }
 
-/// Decode the object `_sre.template` returned (a tuple copy of the parsed
-/// list) or a list left behind by a replaced compiler.
+/// Decode the `_sre.SRE_Template` `_sre.template` returned, or a list left
+/// behind by a replaced compiler. Any other type is the `compile_template`
+/// refusal.
 fn template_items_from_compiled(
     w_result: PyObjectRef,
 ) -> Result<Vec<TemplateItem>, crate::PyError> {
-    if unsafe { pyre_object::is_tuple(w_result) } {
-        let n = unsafe { pyre_object::w_tuple_len(w_result) };
-        let mut items: Vec<TemplateItem> = Vec::with_capacity(n);
-        for i in 0..n {
-            let Some(elem) = (unsafe { pyre_object::w_tuple_getitem(w_result, i as i64) }) else {
-                continue;
-            };
-            push_template_elem(&mut items, elem);
-        }
-        return Ok(items);
+    if unsafe { is_sre_template(w_result) } {
+        return template_items_from_sre_template(w_result);
     }
-    template_items_from_list(w_result)
+    if unsafe { pyre_object::is_list(w_result) } {
+        return template_items_from_list(w_result);
+    }
+    let name = crate::baseobjspace::object_functionstr_type_name(w_result);
+    Err(crate::PyError::runtime_error(format!(
+        "the result of compiling a replacement string is {name}"
+    )))
+}
+
+fn template_items_from_sre_template(
+    w_result: PyObjectRef,
+) -> Result<Vec<TemplateItem>, crate::PyError> {
+    let template = w_result as *const W_SRE_Template;
+    let mut items = Vec::new();
+    push_template_elem(&mut items, unsafe { (*template).literal });
+    let indexes = unsafe { (*template).indexes };
+    let literals = unsafe { (*template).literals };
+    let n = unsafe { pyre_object::w_tuple_len(indexes) };
+    for i in 0..n {
+        let Some(index) = (unsafe { pyre_object::w_tuple_getitem(indexes, i as i64) }) else {
+            continue;
+        };
+        push_template_elem(&mut items, index);
+        let Some(literal) = (unsafe { pyre_object::w_tuple_getitem(literals, i as i64) }) else {
+            continue;
+        };
+        if !unsafe { is_none(literal) } {
+            push_template_elem(&mut items, literal);
+        }
+    }
+    Ok(items)
 }
 
 fn push_template_elem(items: &mut Vec<TemplateItem>, elem: PyObjectRef) {

@@ -251,3 +251,45 @@ pub fn w_sre_scanner_new(
 pub unsafe fn is_sre_scanner(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &SRE_SCANNER_TYPE) }
 }
+
+/// `_sre.SRE_Template` (`sre.h TemplateObject`). `literal` is the first
+/// chunk; `indexes` and `literals` are parallel tuples, one pair per group
+/// reference. A `None` literal is the empty literal `expand_template` skips.
+#[pyre_class("_sre.SRE_Template", static_name = "SRE_TEMPLATE")]
+pub struct W_SRE_Template {
+    pub literal: PyObjectRef,
+    /// `TemplateObject.chunks`.
+    pub chunks: i64,
+    /// Group indexes, each a non-negative int.
+    pub indexes: PyObjectRef,
+    /// Literal after each group, or `None` when that literal was empty.
+    pub literals: PyObjectRef,
+}
+
+/// Allocate a `W_SRE_Template`.
+pub fn w_sre_template_new(
+    literal: PyObjectRef,
+    chunks: i64,
+    indexes: PyObjectRef,
+    literals: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let base = crate::gc_roots::pin_roots(&[literal, indexes, literals]);
+    W_SRE_Template::allocate(W_SRE_Template {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        literal: crate::gc_roots::shadow_stack_get(base),
+        chunks,
+        indexes: crate::gc_roots::shadow_stack_get(base + 1),
+        literals: crate::gc_roots::shadow_stack_get(base + 2),
+    })
+}
+
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_sre_template(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &SRE_TEMPLATE_TYPE) }
+}

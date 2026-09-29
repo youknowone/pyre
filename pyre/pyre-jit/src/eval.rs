@@ -3944,6 +3944,14 @@ fn build_gc() -> Box<MiniMarkGC> {
         complex_user_tid,
     );
 
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 163),
+    // before the cfg-gated posix / console tail.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_sre::W_SRE_Template
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // Register `posix.DirEntry`'s four inline GC edges and
     // `posix.ScandirIterator`'s entries-list edge. The entries in
     // `SUBCLASS_RANGE_HIERARCHY` and `all_subclass_range_aliases` are

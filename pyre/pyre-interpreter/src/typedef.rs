@@ -1109,6 +1109,24 @@ pub fn init_typeobjects() {
             sre_scanner_type as usize,
         );
 
+        // `_sre.SRE_Template` — `sre.c template_spec`. Not added to the module
+        // dict (`CREATE_TYPE` keeps it in module state). Immutable and not
+        // instantiable.
+        let sre_template_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
+            "_sre.SRE_Template",
+            crate::module::_sre::interp_sre::init_sre_template_type,
+            object_type,
+        ));
+        mark_cpython_heap_type(sre_template_type, true);
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(sre_template_type, false);
+            pyre_object::w_type_set_disallow_instantiation(sre_template_type);
+        }
+        reg.insert(
+            &pyre_object::interp_sre::SRE_TEMPLATE_TYPE as *const PyType as usize,
+            sre_template_type as usize,
+        );
+
         // bytearray — PyPy: bytearrayobject.py, bases=(object,)
         let bytearray_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
             "bytearray",

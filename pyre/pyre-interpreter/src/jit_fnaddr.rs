@@ -5301,6 +5301,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("interp_itertools::CHAIN_TYPE", interp_itertools::CHAIN_TYPE),
         pytype_addr!("interp_sre::SRE_SCANNER_TYPE", interp_sre::SRE_SCANNER_TYPE),
         pytype_addr!(
+            "interp_sre::SRE_TEMPLATE_TYPE",
+            interp_sre::SRE_TEMPLATE_TYPE
+        ),
+        pytype_addr!(
             "functional::LONG_RANGE_ITER_TYPE",
             functional::LONG_RANGE_ITER_TYPE
         ),

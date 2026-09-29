@@ -782,17 +782,20 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (160, Some(8)),
     (161, Some(2)),
     (162, Some(54)),
-    // Native-only type IDs 163 and 164 represent `posix.DirEntry` and
+    // `_sre.SRE_Template` — registered immediately before the cfg-gated
+    // posix / console tail so its id stays 163 on every target.
+    (163, Some(0)),
+    // Native-only type IDs 164 and 165 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (163, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
     (164, Some(0)),
-    // PEP 520 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
+    #[cfg(not(target_arch = "wasm32"))]
+    (165, Some(0)),
+    // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (165, Some(0)),
+    (166, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
