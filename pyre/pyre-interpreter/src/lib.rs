@@ -1190,20 +1190,20 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(154, typed::<crate::pycode::W_PositionsIterObject>()),
         subclass_range_alias(155, typed::<crate::pycode::W_BranchesIterObject>()),
         // `_sre.SRE_Template` is the last unconditional interpreter class
-        // (169). Posix and the Windows console follow it.
-        subclass_range_alias(169, typed::<pyre_object::interp_sre::W_SRE_Template>()),
-        // Native-only posix aliases 170 and 171 preserve `build_gc`'s rclass
+        // (176). Posix and the Windows console follow it.
+        subclass_range_alias(176, typed::<pyre_object::interp_sre::W_SRE_Template>()),
+        // Native-only posix aliases 177 and 178 preserve `build_gc`'s rclass
         // registration order after `_sre.SRE_Template`.
         // `scandir` has no seam on wasm32, so neither type exists there.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(170, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(177, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(171, typed::<crate::module::posix::W_ScandirIterator>()),
+        subclass_range_alias(178, typed::<crate::module::posix::W_ScandirIterator>()),
         // PEP 528's raw console stream closes the interpreter's classes on
         // Windows.  It is subclassable and therefore participates in the same
         // rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(172, typed::<crate::module::_io::W_WinConsoleIO>()),
+        subclass_range_alias(179, typed::<crate::module::_io::W_WinConsoleIO>()),
     ];
     aliases.extend(module_subclass_range_aliases());
     aliases
@@ -1219,11 +1219,11 @@ const WINDOWS_CONSOLE_IO: bool = cfg!(all(windows, feature = "host_env", not(fea
 /// not depend on which modules are linked; the module classes follow in the
 /// order [`module_gc_types`] lists them.
 pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
-    170
+    177
 } else if WINDOWS_CONSOLE_IO {
-    173
+    180
 } else {
-    172
+    179
 };
 
 /// The GC classes of builtin modules, in `build_gc` order: those of this

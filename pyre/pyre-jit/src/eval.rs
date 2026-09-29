@@ -586,7 +586,8 @@ unsafe fn type_object_destructor(obj_addr: usize) {
 /// # Safety
 ///
 /// `obj_addr` must be a live `W_Property` payload the collector is sweeping,
-/// and the collector must call this exactly once.
+/// and the collector must call this exactly once. `W_PropertyUser` is a
+/// `W_Property` prefix, so the same cast covers that layout.
 unsafe fn property_destructor(obj_addr: usize) {
     let p = obj_addr as *const pyre_object::descriptor::W_Property;
     unsafe { (*p).fget_watchers.reclaim() };
@@ -935,6 +936,21 @@ unsafe fn array_object_destructor(obj_addr: usize) {
     unsafe {
         pyre_object::interp_array::w_array_dealloc(obj_addr as pyre_object::PyObjectRef);
     }
+}
+
+/// `#[pyre_class(..., user_layout)]` user instance (`typedef.py`
+/// `_getusercls`). Fixed payload offsets are walked by the GC from
+/// `ptr_offsets`; this hook only forwards mapdict `storage`.
+unsafe fn pyre_class_user_layout_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
 }
 
 /// `W_ArrayUser` (`typedef.py` `_getusercls`): the base array's inline edges
@@ -1998,11 +2014,20 @@ fn build_gc() -> Box<MiniMarkGC> {
          descr: &'static pyre_object::lltype::PyreClassDescriptor,
          memory_pressure_offset: Option<usize>|
          -> u32 {
-            let mut type_info = TypeInfo::object_subclass_with_gc_ptrs(
-                descr.object_size,
-                object_tid,
-                descr.ptr_offsets.to_vec(),
-            );
+            let mut type_info = if descr.mapdict_user_layout {
+                TypeInfo::object_subclass_with_gc_ptrs_and_custom_trace(
+                    descr.object_size,
+                    object_tid,
+                    descr.ptr_offsets.to_vec(),
+                    pyre_class_user_layout_custom_trace,
+                )
+            } else {
+                TypeInfo::object_subclass_with_gc_ptrs(
+                    descr.object_size,
+                    object_tid,
+                    descr.ptr_offsets.to_vec(),
+                )
+            };
             if let Some(offset) = memory_pressure_offset {
                 type_info = type_info.with_memory_pressure_offset(offset);
             }
@@ -4172,7 +4197,49 @@ fn build_gc() -> Box<MiniMarkGC> {
         weakref_user_tid,
     );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 167),
+    // `#[pyre_class(..., user_layout)]` (`typedef.py` `_getusercls`).
+    // Each is an rclass child of its builtin layout. Fixed payload offsets
+    // stay on the descriptor; the custom trace walks mapdict storage only.
+    debug_assert_eq!(gc.types.len(), 169);
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::functional::W_ENUMERATE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::functional::W_MAP_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::functional::W_FILTER_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::functional::W_ZIP_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::functional::W_REVERSED_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::descriptor::W_SUPER_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    let property_user_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::descriptor::W_PROPERTY_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    gc.types
+        .set_destructor(property_user_tid, property_destructor);
+
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 176),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,

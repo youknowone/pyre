@@ -7761,4 +7761,26 @@ mod tests {
         apply_root_rekeys(&table, vec![(0x10, 0x11, 0xA1), (0x20, 0x20, 0xB1)]);
         assert!(table.lock().is_empty());
     }
+
+    /// `typedef.py` `_getusercls`: an enumerate subclass instance is
+    /// `W_EnumerateUser` (`ENUMERATE_USER_TYPE`) and carries mapdict storage.
+    #[test]
+    fn enumerate_subclass_instance_carries_user_typeptr() {
+        let w_subtype =
+            pyre_object::w_type_new("EnumerateSub", pyre_object::PY_NULL, std::ptr::null_mut());
+        let obj = pyre_object::functional::w_enumerate_new(
+            pyre_object::PY_NULL,
+            0,
+            pyre_object::PY_NULL,
+            w_subtype,
+        );
+        unsafe {
+            assert!(std::ptr::eq(
+                (*obj).ob_type,
+                &pyre_object::functional::ENUMERATE_USER_TYPE
+            ));
+            assert!(has_mapdict_layout(obj));
+            assert!(pyre_object::functional::is_enumerate(obj));
+        }
+    }
 }

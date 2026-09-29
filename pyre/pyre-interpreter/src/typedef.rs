@@ -4850,7 +4850,7 @@ pub(crate) unsafe fn store_subclass_tag(obj: PyObjectRef, sub: PyObjectRef) {
 /// subclass-tagging path `str`/`int`/`float` `__new__` already use so
 /// `type(obj)` / `isinstance` / overridden-dunder dispatch see the
 /// subclass while the object keeps its builtin layout.
-fn subclass_to_tag(
+pub(crate) fn subclass_to_tag(
     cls: PyObjectRef,
     base: &'static pyre_object::PyType,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
@@ -5197,18 +5197,20 @@ crate::builtin_wrapper_descriptor!(
     __majit_wrap_tuple_descr_new
 );
 
-/// `enumerate.__new__(cls, iterable, start=0)` — `functional.py:253-275
-/// W_Enumerate.descr___new__`.  `builtin_enumerate` builds a fresh
-/// `W_Enumerate`; a subclass instance is the same object with `w_class`
-/// retagged (the instance keeps the `enumerate` GC tag so iteration still
-/// dispatches through the builtin `__next__`).
+/// `enumerate.__new__(cls, iterable, start=0)` — `functional.py
+/// W_Enumerate.descr___new__`.  `allocate_instance` builds the exact
+/// `W_Enumerate` or, for a subtype, `W_EnumerateUser` (`typedef.py`
+/// `_getusercls`).
 fn enumerate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mut cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let value = pyre_object::with_roots!(cls => crate::builtins::builtin_enumerate(args.get(1..).unwrap_or(&[])))?;
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::ENUMERATE_TYPE)? {
-        tag_subclass_instance(value, sub);
-    }
-    Ok(value)
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::pin_roots(&[cls]);
+    let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+    let w_subtype = match subclass_to_tag(cls, &pyre_object::functional::ENUMERATE_TYPE)? {
+        Some(_) => pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        None => pyre_object::PY_NULL,
+    };
+    crate::builtins::builtin_enumerate(args.get(1..).unwrap_or(&[]), w_subtype)
 }
 
 /// `map.__new__(cls, func, *iterables, strict=False)` — `functional.py:888-902
@@ -5216,17 +5218,13 @@ fn enumerate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 fn map_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(cls);
-    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let value = crate::builtins::builtin_map(args.get(1..).unwrap_or(&[]))?;
-    let _ = pyre_object::gc_roots::pin_root(value);
-    let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let value = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
-    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::MAP_TYPE)? {
-        tag_subclass_instance(value, sub);
-    }
-    Ok(value)
+    let cls_slot = pyre_object::gc_roots::pin_roots(&[cls]);
+    let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+    let w_subtype = match subclass_to_tag(cls, &pyre_object::functional::MAP_TYPE)? {
+        Some(_) => pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        None => pyre_object::PY_NULL,
+    };
+    crate::builtins::builtin_map(args.get(1..).unwrap_or(&[]), w_subtype)
 }
 
 /// `filter.__new__(cls, predicate, iterable)` — `functional.py:917-925
@@ -5281,18 +5279,18 @@ fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             args_w.len()
         )));
     }
-    let value = crate::builtins::builtin_filter(&[
-        unsafe { pyre_object::gc_roots::shadow_stack_get(arg_slots[0]) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(arg_slots[1]) },
-    ])?;
-    let _ = pyre_object::gc_roots::pin_root(value);
-    let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let value = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
     let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::FILTER_TYPE)? {
-        tag_subclass_instance(value, sub);
-    }
-    Ok(value)
+    let w_subtype = match subclass_to_tag(cls, &pyre_object::functional::FILTER_TYPE)? {
+        Some(_) => pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        None => pyre_object::PY_NULL,
+    };
+    crate::builtins::builtin_filter(
+        &[
+            unsafe { pyre_object::gc_roots::shadow_stack_get(arg_slots[0]) },
+            unsafe { pyre_object::gc_roots::shadow_stack_get(arg_slots[1]) },
+        ],
+        w_subtype,
+    )
 }
 
 /// `zip.__new__(cls, *iterables, strict=False)` — `functional.py:1101-1105
@@ -5300,41 +5298,22 @@ fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 fn zip_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(cls);
-    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let value = crate::builtins::builtin_zip(args.get(1..).unwrap_or(&[]))?;
-    let _ = pyre_object::gc_roots::pin_root(value);
-    let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let value = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
-    let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::ZIP_TYPE)? {
-        tag_subclass_instance(value, sub);
-    }
-    Ok(value)
+    let cls_slot = pyre_object::gc_roots::pin_roots(&[cls]);
+    let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+    let w_subtype = match subclass_to_tag(cls, &pyre_object::functional::ZIP_TYPE)? {
+        Some(_) => pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        None => pyre_object::PY_NULL,
+    };
+    crate::builtins::builtin_zip(args.get(1..).unwrap_or(&[]), w_subtype)
 }
 
-/// `reversed.__new__(cls, sequence)` — `functional.py:330-359
-/// W_ReversedIterator`.  `builtin_reversed` returns a `W_ReversedIterator`
-/// only for the exact builtin-sequence fast path; for a range or a
-/// `__reversed__`-defining object it returns a foreign iterator, which must
-/// NOT be retagged to the subclass.  Retag only the canonical reversed
-/// object.
+/// `reversed.__new__(cls, sequence)` — `functional.py W_ReversedIterator`.
+/// `subclass_to_tag` runs inside `builtin_reversed` only for a
+/// `W_ReversedIterator` allocation. A foreign iterator returned by
+/// `__reversed__` or range is not affected (`descr___new__2`).
 fn reversed_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let _roots = pyre_object::gc_roots::push_roots();
-    let cls = pyre_object::gc_roots::pin_root(cls);
-    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let value = crate::builtins::builtin_reversed(args.get(1..).unwrap_or(&[]))?;
-    let _ = pyre_object::gc_roots::pin_root(value);
-    let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let value = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
-    if unsafe { pyre_object::functional::is_reversed(value) } {
-        let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
-        if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::REVERSED_TYPE)? {
-            unsafe { store_subclass_tag(value, sub) };
-        }
-    }
-    Ok(value)
+    crate::builtins::builtin_reversed(args.get(1..).unwrap_or(&[]), cls)
 }
 
 /// `range.__new__(cls, stop)` / `range.__new__(cls, start, stop[, step])` —
@@ -5353,11 +5332,16 @@ fn range_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// proxy; `__init__` fills it from zero, one, or two user arguments.
 fn super_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(PY_NULL);
-    let value = pyre_object::descriptor::w_super_new(PY_NULL, PY_NULL, PY_NULL);
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::descriptor::SUPER_TYPE)? {
-        unsafe { store_subclass_tag(value, sub) };
-    }
-    Ok(value)
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::pin_roots(&[cls]);
+    let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+    let w_subtype = match subclass_to_tag(cls, &pyre_object::descriptor::SUPER_TYPE)? {
+        Some(_) => pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        None => PY_NULL,
+    };
+    Ok(pyre_object::descriptor::w_super_new(
+        PY_NULL, PY_NULL, PY_NULL, w_subtype,
+    ))
 }
 
 fn descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -17795,9 +17779,11 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 }
                 // typedef.py:511-516: w_result = w_obj.getslotvalue(self.index);
                 // None → AttributeError("'%T' object has no attribute '%s'").
+                // `has_mapdict_layout` is the same gate the `Member` fast path
+                // uses: a `_getusercls` instance is not `W_ObjectObject`.
                 let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
                 let index = unsafe { pyre_object::w_member_get_index(descr) };
-                let found = if unsafe { pyre_object::is_instance(obj) } {
+                let found = if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
                     unsafe { crate::objspace::std::mapdict::getslotvalue(obj, index) }
                 } else {
                     pyre_object::with_roots!(obj => crate::baseobjspace::native_slot_get(obj, slot_name, index))?
@@ -17844,7 +17830,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 }
                 // typedef.py:522: w_obj.setslotvalue(self.index, w_value)
                 let index = unsafe { pyre_object::w_member_get_index(descr) };
-                if unsafe { pyre_object::is_instance(obj) } {
+                if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
                     unsafe { crate::objspace::std::mapdict::setslotvalue(obj, index, value) };
                 } else {
                     let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
@@ -17891,7 +17877,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
                 let slot_name = unsafe { pyre_object::w_member_get_name(descr) };
                 let index = unsafe { pyre_object::w_member_get_index(descr) };
-                let removed = if unsafe { pyre_object::is_instance(obj) } {
+                let removed = if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
                     unsafe { crate::objspace::std::mapdict::delslotvalue(obj, index) }
                 } else {
                     crate::baseobjspace::native_slot_del(obj, slot_name, index)?
@@ -19129,14 +19115,20 @@ fn property_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
             "property.__new__(): not enough arguments",
         ));
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::pin_roots(&[cls]);
     let property_type = gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE);
+    let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
     check_user_subclass(property_type, cls)?;
-    let prop = pyre_object::w_property_new(PY_NULL, PY_NULL, PY_NULL);
-    if !std::ptr::eq(cls, property_type) {
-        tag_subclass_instance(prop, cls);
-    }
-    pyre_object::gc_hook::maybe_register_finalizer(prop);
-    Ok(prop)
+    let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+    let w_subtype = if std::ptr::eq(cls, property_type) {
+        PY_NULL
+    } else {
+        cls
+    };
+    Ok(pyre_object::w_property_new(
+        PY_NULL, PY_NULL, PY_NULL, w_subtype,
+    ))
 }
 
 /// PyPy `W_Property.init`, with CPython 3.14's `prop_name` reset and

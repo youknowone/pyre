@@ -26,7 +26,7 @@ use pyre_macros::pyre_class;
 // carries the bigint value (PyPy line 297-303
 // `space.add(w_index, space.newint(1))` after `rarithmetic.ovfcheck`).
 
-#[pyre_class("enumerate", static_name = "ENUMERATE")]
+#[pyre_class("enumerate", static_name = "ENUMERATE", user_layout)]
 pub struct W_Enumerate {
     /// `functional.py:225 self.w_iter_or_list` — either the source
     /// iterator (general case) or the source list itself
@@ -49,26 +49,29 @@ pub fn w_enumerate_new(
     w_iter_or_list: PyObjectRef,
     start: i64,
     w_index: PyObjectRef,
+    w_subtype: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    let w_iter_or_list = crate::gc_roots::pin_root(w_iter_or_list);
-    let w_index = crate::gc_roots::pin_root(w_index);
-    W_Enumerate::allocate_stable(W_Enumerate {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let base = crate::gc_roots::pin_roots(&[w_iter_or_list, w_index, w_subtype]);
+    W_Enumerate::allocate_instance(
+        W_Enumerate {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_iter_or_list: crate::gc_roots::shadow_stack_get(base),
+            index: start,
+            w_index: crate::gc_roots::shadow_stack_get(base + 1),
         },
-        w_iter_or_list,
-        index: start,
-        w_index,
-    })
+        crate::gc_roots::shadow_stack_get(base + 2),
+    )
 }
 
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_enumerate(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &ENUMERATE_TYPE) }
+    unsafe { py_type_check(obj, &ENUMERATE_TYPE) || py_type_check(obj, &ENUMERATE_USER_TYPE) }
 }
 
 /// # Safety
@@ -158,7 +161,7 @@ mod enumerate_tests {
 // PyPy `reversed` object whose `__reduce__` is
 // `(reversed, (sequence,), remaining)`.
 
-#[pyre_class("reversed", static_name = "REVERSED")]
+#[pyre_class("reversed", static_name = "REVERSED", user_layout)]
 pub struct W_ReversedIterator {
     /// `functional.py:359 self.w_sequence` — the source sequence; set to
     /// `PY_NULL` once the iterator is exhausted (`:393`, `:404`).
@@ -171,24 +174,31 @@ pub struct W_ReversedIterator {
 /// Allocate a `W_ReversedIterator`.  Mirrors `functional.py
 /// __init__` with `remaining` already computed as `len(seq) - 1` by the
 /// caller.
-pub fn w_reversed_new(w_sequence: PyObjectRef, remaining: i64) -> PyObjectRef {
+pub fn w_reversed_new(
+    w_sequence: PyObjectRef,
+    remaining: i64,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    let w_sequence = crate::gc_roots::pin_root(w_sequence);
-    W_ReversedIterator::allocate_stable(W_ReversedIterator {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let base = crate::gc_roots::pin_roots(&[w_sequence, w_subtype]);
+    W_ReversedIterator::allocate_instance(
+        W_ReversedIterator {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_sequence: crate::gc_roots::shadow_stack_get(base),
+            remaining,
         },
-        w_sequence,
-        remaining,
-    })
+        crate::gc_roots::shadow_stack_get(base + 1),
+    )
 }
 
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_reversed(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &REVERSED_TYPE) }
+    unsafe { py_type_check(obj, &REVERSED_TYPE) || py_type_check(obj, &REVERSED_USER_TYPE) }
 }
 
 /// # Safety
@@ -241,7 +251,7 @@ pub unsafe fn w_reversed_set_remaining(obj: PyObjectRef, value: i64) {
 // exhausted; in `strict` mode a length mismatch raises `ValueError`.  This
 // replaces the earlier eager materialisation into a `seq_iter`.
 
-#[pyre_class("map", static_name = "MAP")]
+#[pyre_class("map", static_name = "MAP", user_layout)]
 pub struct W_Map {
     /// `functional.py:843 self.w_fun` — the mapped callable.
     pub w_fun: PyObjectRef,
@@ -254,26 +264,33 @@ pub struct W_Map {
 
 /// Allocate a `W_Map`.  `w_iterators` is a `list` of already-built
 /// iterators (`build_iterators_from_args`).
-pub fn w_map_new(w_fun: PyObjectRef, w_iterators: PyObjectRef, strict: bool) -> PyObjectRef {
+pub fn w_map_new(
+    w_fun: PyObjectRef,
+    w_iterators: PyObjectRef,
+    strict: bool,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    let w_fun = crate::gc_roots::pin_root(w_fun);
-    let w_iterators = crate::gc_roots::pin_root(w_iterators);
-    W_Map::allocate_stable(W_Map {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let base = crate::gc_roots::pin_roots(&[w_fun, w_iterators, w_subtype]);
+    W_Map::allocate_instance(
+        W_Map {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_fun: crate::gc_roots::shadow_stack_get(base),
+            w_iterators: crate::gc_roots::shadow_stack_get(base + 1),
+            strict,
         },
-        w_fun,
-        w_iterators,
-        strict,
-    })
+        crate::gc_roots::shadow_stack_get(base + 2),
+    )
 }
 
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_map(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &MAP_TYPE) }
+    unsafe { py_type_check(obj, &MAP_TYPE) || py_type_check(obj, &MAP_USER_TYPE) }
 }
 
 /// # Safety
@@ -326,7 +343,7 @@ pub unsafe fn w_map_set_strict(obj: PyObjectRef, value: bool) {
 // earlier eager materialisation into a `seq_iter`, restoring the lazy
 // `filter` object whose `__reduce__` is `(filter, (predicate, iterable))`.
 
-#[pyre_class("filter", static_name = "FILTER")]
+#[pyre_class("filter", static_name = "FILTER", user_layout)]
 pub struct W_Filter {
     /// `functional.py:921-924 self.w_predicate` — the predicate callable, or
     /// `PY_NULL` when the Python-level predicate was `None`.
@@ -338,27 +355,31 @@ pub struct W_Filter {
 
 /// Allocate a `W_Filter`.  `w_iterable` must already be an iterator;
 /// `w_predicate` is `PY_NULL` for a `None` predicate (`__init__`).
-pub fn w_filter_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
+pub fn w_filter_new(
+    w_predicate: PyObjectRef,
+    w_iterable: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    if !w_predicate.is_null() {
-        let _ = crate::gc_roots::pin_root(w_predicate);
-    }
-    let w_iterable = crate::gc_roots::pin_root(w_iterable);
-    W_Filter::allocate_stable(W_Filter {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let base = crate::gc_roots::pin_roots(&[w_predicate, w_iterable, w_subtype]);
+    W_Filter::allocate_instance(
+        W_Filter {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_predicate: crate::gc_roots::shadow_stack_get(base),
+            w_iterable: crate::gc_roots::shadow_stack_get(base + 1),
         },
-        w_predicate,
-        w_iterable,
-    })
+        crate::gc_roots::shadow_stack_get(base + 2),
+    )
 }
 
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_filter(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &FILTER_TYPE) }
+    unsafe { py_type_check(obj, &FILTER_TYPE) || py_type_check(obj, &FILTER_USER_TYPE) }
 }
 
 /// # Safety
@@ -392,7 +413,7 @@ pub unsafe fn w_filter_get_iterable(obj: PyObjectRef) -> PyObjectRef {
 // `strict`.  This replaces the earlier eager materialisation into a
 // `seq_iter`.
 
-#[pyre_class("zip", static_name = "ZIP")]
+#[pyre_class("zip", static_name = "ZIP", user_layout)]
 pub struct W_Zip {
     /// `functional.py:1016 self.iterators_w` — a `list` of sub-iterators, one
     /// per input iterable (`build_iterators_from_args`).
@@ -407,25 +428,28 @@ pub struct W_Zip {
 
 /// Allocate a `W_Zip`.  `w_iterators` is a `list` of already-built
 /// iterators (`build_iterators_from_args`).
-pub fn w_zip_new(w_iterators: PyObjectRef, strict: bool) -> PyObjectRef {
+pub fn w_zip_new(w_iterators: PyObjectRef, strict: bool, w_subtype: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    let w_iterators = crate::gc_roots::pin_root(w_iterators);
-    W_Zip::allocate_stable(W_Zip {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let base = crate::gc_roots::pin_roots(&[w_iterators, w_subtype]);
+    W_Zip::allocate_instance(
+        W_Zip {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_iterators: crate::gc_roots::shadow_stack_get(base),
+            strict,
+            iteration_progress: 0,
         },
-        w_iterators,
-        strict,
-        iteration_progress: 0,
-    })
+        crate::gc_roots::shadow_stack_get(base + 1),
+    )
 }
 
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_zip(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &ZIP_TYPE) }
+    unsafe { py_type_check(obj, &ZIP_TYPE) || py_type_check(obj, &ZIP_USER_TYPE) }
 }
 
 /// # Safety

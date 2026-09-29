@@ -2409,6 +2409,7 @@ pub fn init_array_type(ns: PyObjectRef) {
                 ),
                 PY_NULL,
                 PY_NULL,
+                PY_NULL,
             ),
         )
     };
@@ -2427,6 +2428,7 @@ pub fn init_array_type(ns: PyObjectRef) {
                     },
                     1,
                 ),
+                PY_NULL,
                 PY_NULL,
                 PY_NULL,
             ),

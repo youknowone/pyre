@@ -4402,19 +4402,12 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
 /// all -- which is also what lets the allocation die, since a virtual whose
 /// every read is answered has nothing left to materialise for.
 ///
-/// `GuardClass(su, SUPER_TYPE)` is what stands in for the `global_super` pin
-/// the opcode form carries: only `w_super_new` builds one of these, so a
-/// receiver that passes the guard came from `super()` whatever the global
-/// named at the time.
-///
-/// It does not stand in for the Python class, though.  `super_descr_new`
-/// allocates a subclass instance through `w_super_new` too and then retags only
-/// `w_class`, so `class MySuper(super)` shares the `ob_type` this guard reads
-/// and would reuse the trace.  Its `__getattribute__` override owns the answer,
-/// and this body does not run it, so the operand is pinned on the `w_class`
-/// axis as well -- the same split `walker_exact_builtin_class` handles for the
-/// numeric folds.  A proxy this walk emitted is virtual and carries the
-/// canonical class by construction, so the pin costs it nothing.
+/// `GuardClass(su, SUPER_TYPE)` matches the exact builtin layout.
+/// `allocate_instance` stamps `SUPER_USER_TYPE` on a subclass
+/// (`typedef.py` `_getusercls`), so the guard already excludes it. The
+/// `w_class` pin stays because `walker_exact_builtin_class` records the
+/// canonical Python class, and a walker-emitted proxy is virtual and
+/// already carries it.
 pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -4859,7 +4852,12 @@ fn walker_emit_super_proxy_storage<Sym: WalkSym>(
         .class_now_known(proxy_op, super_type_addr);
     // The concrete proxy the walker's own execution must observe.  Built last:
     // it allocates, and every address baked above is read before it runs.
-    let proxy = pyre_object::descriptor::w_super_new(concrete_cls, objtype, concrete_obj);
+    let proxy = pyre_object::descriptor::w_super_new(
+        concrete_cls,
+        objtype,
+        concrete_obj,
+        pyre_object::PY_NULL,
+    );
     ctx.trace_ctx.set_opref_concrete(
         proxy_op,
         majit_ir::Value::Ref(majit_ir::GcRef(proxy as usize)),

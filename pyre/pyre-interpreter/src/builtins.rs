@@ -13529,7 +13529,7 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     for &arg in args {
         let _ = pyre_object::gc_roots::pin_root(arg);
     }
-    let w_self = pyre_object::descriptor::w_super_new(PY_NULL, PY_NULL, PY_NULL);
+    let w_self = pyre_object::descriptor::w_super_new(PY_NULL, PY_NULL, PY_NULL, PY_NULL);
     let w_self = pyre_object::gc_roots::pin_root(w_self);
     let mut args_w = [PY_NULL; 2];
     for (i, arg) in args_w[..args.len()].iter_mut().enumerate() {
@@ -20002,7 +20002,10 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `filter(function or None, iterable)` — `functional.py
 /// W_Filter___new__`.  A lazy iterator: `function == None` keeps truthy
 /// items, otherwise `function(item)` is the predicate.
-pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_filter(
+    args: &[PyObjectRef],
+    w_subtype: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);
     if has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
@@ -20016,6 +20019,7 @@ pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         )));
     }
     let _roots = pyre_object::gc_roots::push_roots();
+    let subtype_slot = pyre_object::gc_roots::pin_roots(&[w_subtype]);
     let predicate_slot = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
     let iterable_slot = predicate_slot + 1;
     let func = unsafe { pyre_object::gc_roots::shadow_stack_get(predicate_slot) };
@@ -20038,13 +20042,17 @@ pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             unsafe { pyre_object::gc_roots::shadow_stack_get(predicate_slot) }
         },
         unsafe { pyre_object::gc_roots::shadow_stack_get(iterator_slot) },
+        pyre_object::gc_roots::shadow_stack_get(subtype_slot),
     ))
 }
 
 /// `map(func, *iterables, strict=False)` — `functional.py:888-902
 /// W_Map___new__` plus the CPython 3.14 `strict` keyword.  A lazy iterator:
 /// each `next()` pulls one item per iterable and calls `func(*items)`.
-pub(crate) fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_map(
+    args: &[PyObjectRef],
+    w_subtype: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["strict"], "map")?;
     if args.len() < 2 {
@@ -20056,6 +20064,7 @@ pub(crate) fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // PyPy's `args_w` and `build_iterators_from_args` keep every argument live
     // while `space.iter` and the Python 3.14 `strict` truth conversion execute.
     let _roots = pyre_object::gc_roots::push_roots();
+    let subtype_slot = pyre_object::gc_roots::pin_roots(&[w_subtype]);
     let args_base = pyre_object::gc_roots::publish_roots(args);
     let w_strict = kwarg_get(kwargs, "strict");
     let strict_slot = w_strict.map(|value| pyre_object::gc_roots::publish_roots(&[value]));
@@ -20091,6 +20100,7 @@ pub(crate) fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         unsafe { pyre_object::gc_roots::shadow_stack_get(args_base) },
         unsafe { pyre_object::gc_roots::shadow_stack_get(iterators_slot) },
         strict,
+        pyre_object::gc_roots::shadow_stack_get(subtype_slot),
     ))
 }
 
@@ -20098,7 +20108,10 @@ pub(crate) fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// A lazy iterator: each `next()` pulls one item per iterable into a tuple,
 /// stopping at the shortest (an empty `zip()` stops immediately); `strict`
 /// raises `ValueError` on a length mismatch.
-pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_zip(
+    args: &[PyObjectRef],
+    w_subtype: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     // Pyre's flat builtin ABI surfaces kwargs as a trailing dict; strip it
     // before the positional walk and look up `strict` from it.
     let (args, kwargs) = split_builtin_kwargs(args);
@@ -20108,6 +20121,7 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     clinic_arity("zip", 0, real_kwarg_count(kwargs), 0, 0, 1)?;
     kwarg_reject_unknown(kwargs, &["strict"], "zip")?;
     let _roots = pyre_object::gc_roots::push_roots();
+    let subtype_slot = pyre_object::gc_roots::pin_roots(&[w_subtype]);
     let args_base = pyre_object::gc_roots::publish_roots(args);
     let strict_slot =
         kwarg_get(kwargs, "strict").map(|value| pyre_object::gc_roots::publish_roots(&[value]));
@@ -20141,6 +20155,7 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(pyre_object::functional::w_zip_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(iterators_slot) },
         strict,
+        pyre_object::gc_roots::shadow_stack_get(subtype_slot),
     ))
 }
 
@@ -20151,7 +20166,10 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 // resolving `start` via `space.index_w` (with overflow promotion to a
 // bigint slot) and capturing either the source iterator or the
 // source list directly when `start == 0 + isinstance(it, list)`.
-pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_enumerate(
+    args: &[PyObjectRef],
+    w_subtype: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
     if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
@@ -20197,6 +20215,7 @@ pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     // arguments in the shadow stack exactly as the translated RPython locals
     // remain GC-visible across `space.index` / `space.iter`.
     let _roots = pyre_object::gc_roots::push_roots();
+    let subtype_slot = pyre_object::gc_roots::pin_roots(&[w_subtype]);
     let _ = pyre_object::gc_roots::pin_root(source);
     let source_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let raw_start = start_obj.unwrap_or(pyre_object::PY_NULL);
@@ -20240,11 +20259,25 @@ pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         w_iter_or_list,
         start,
         unsafe { pyre_object::gc_roots::shadow_stack_get(w_start_slot) },
+        pyre_object::gc_roots::shadow_stack_get(subtype_slot),
     ))
 }
 
+/// `subclass_to_tag` for a `W_ReversedIterator` allocation. A foreign
+/// iterator from `__reversed__` or range never reaches this helper.
+fn reversed_user_subtype(subtype_slot: usize) -> Result<PyObjectRef, crate::PyError> {
+    let cls = pyre_object::gc_roots::shadow_stack_get(subtype_slot);
+    if crate::typedef::subclass_to_tag(cls, &pyre_object::functional::REVERSED_TYPE)?.is_none() {
+        return Ok(pyre_object::PY_NULL);
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(subtype_slot))
+}
+
 /// `reversed()` — PyPy: functional.py W_ReversedIterator
-pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_reversed(
+    args: &[PyObjectRef],
+    w_subtype: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);
     if has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
@@ -20261,8 +20294,8 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     // iterator. The translated RPython argument remains a GC root throughout;
     // keep the Rust carrier in the shadow stack and reload at each call site.
     let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(args[0]);
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[args[0], w_subtype]);
+    let subtype_slot = obj_slot + 1;
     let obj = unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) };
     unsafe {
         // EXACT builtin list → `iterobject.py W_ReverseSeqIterObject` (the
@@ -20285,9 +20318,11 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             }
             if pyre_object::is_tuple(obj) {
                 let n = pyre_object::w_tuple_len(obj) as i64;
+                let w_subtype = reversed_user_subtype(subtype_slot)?;
                 return Ok(pyre_object::functional::w_reversed_new(
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     n - 1,
+                    w_subtype,
                 ));
             }
             // bytes / bytearray expose the sequence protocol at the C level but
@@ -20298,9 +20333,11 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
                 || pyre_object::bytearrayobject::is_bytearray(obj)
             {
                 let n = crate::baseobjspace::len_w(obj)?;
+                let w_subtype = reversed_user_subtype(subtype_slot)?;
                 return Ok(pyre_object::functional::w_reversed_new(
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     n - 1,
+                    w_subtype,
                 ));
             }
         }
@@ -20352,9 +20389,11 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         if has_getitem {
             // `functional.py` — reverse lazily through `W_ReversedIterator`.
             let n = crate::baseobjspace::len_w(obj)?;
+            let w_subtype = reversed_user_subtype(subtype_slot)?;
             return Ok(pyre_object::functional::w_reversed_new(
                 unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) },
                 n - 1,
+                w_subtype,
             ));
         }
     }

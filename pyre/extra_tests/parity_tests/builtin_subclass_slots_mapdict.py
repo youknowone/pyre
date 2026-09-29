@@ -63,6 +63,19 @@ def check(base, args):
         assert "x" not in d.__dict__, (base, d.__dict__)
         assert d.__dict__ == {"y": i}, (base, d.__dict__)
         total += d.x + d.y
+
+        # Direct member descriptor, typedef.py Member.descr_member_set.
+        member = SlotsOnly.x
+        s2 = SlotsOnly(*args)
+        member.__set__(s2, i)
+        assert member.__get__(s2, SlotsOnly) == i
+        member.__delete__(s2)
+        try:
+            member.__get__(s2, SlotsOnly)
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError("deleted slot still readable via Member on %s" % base.__name__)
     assert total == 3 * N * (N - 1) // 2, (base, total)
 
 

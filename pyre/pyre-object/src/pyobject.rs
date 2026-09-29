@@ -819,9 +819,10 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (156, Some(0)),
     (157, Some(0)),
-    // 158-168 are `typedef.py` `_getusercls` layouts
-    // (int/str/tuple/float/complex/bytes/bytearray/list/set/array/weakref user), each an rclass
-    // subclass of the builtin it was made from.
+    // 158-175 are `typedef.py` `_getusercls` layouts
+    // (int/str/tuple/float/complex/bytes/bytearray/list/set/array/weakref user,
+    // plus enumerate/map/filter/zip/reversed/super/property).
+    // 169-175 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
     (158, Some(1)),
     (159, Some(34)),
     (160, Some(8)),
@@ -833,20 +834,27 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (166, Some(30)),
     (167, Some(94)),
     (168, Some(0)),
+    (169, Some(111)),
+    (170, Some(91)),
+    (171, Some(90)),
+    (172, Some(92)),
+    (173, Some(89)),
+    (174, Some(18)),
+    (175, Some(19)),
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail so its id stays 169 on every target.
-    (169, Some(0)),
-    // Native-only type IDs 170 and 171 represent `posix.DirEntry` and
+    // posix / console tail so its id stays 176 on every target.
+    (176, Some(0)),
+    // Native-only type IDs 177 and 178 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (170, Some(0)),
+    (177, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (171, Some(0)),
+    (178, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (172, Some(0)),
+    (179, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1395,6 +1403,13 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(166, &crate::setobject::FROZENSET_USER_TYPE),
         subclass_range_alias(167, &crate::interp_array::ARRAY_USER_TYPE),
         subclass_range_alias(168, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE),
+        subclass_range_alias(169, &crate::functional::ENUMERATE_USER_TYPE),
+        subclass_range_alias(170, &crate::functional::MAP_USER_TYPE),
+        subclass_range_alias(171, &crate::functional::FILTER_USER_TYPE),
+        subclass_range_alias(172, &crate::functional::ZIP_USER_TYPE),
+        subclass_range_alias(173, &crate::functional::REVERSED_USER_TYPE),
+        subclass_range_alias(174, &crate::descriptor::SUPER_USER_TYPE),
+        subclass_range_alias(175, &crate::descriptor::PROPERTY_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
