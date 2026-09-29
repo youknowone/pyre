@@ -1167,7 +1167,9 @@ mod tests {
         let bindings: HashMap<&'static str, i64> =
             pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
         assert!(
-            bindings.contains_key("pyre_module::module::unicodedata::__majit_wrap_category"),
+            bindings.contains_key(
+                "pyre_module::module::unicodedata::interp_ucd::__majit_wrap_category"
+            ),
             "moved unicodedata #[pyre_methods] wrappers must publish residual fnaddrs",
         );
     }

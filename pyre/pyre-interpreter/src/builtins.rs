@@ -150,7 +150,7 @@ pub(crate) unsafe fn bytearray_check_exports(
         // A dead view releases its export in `W_MemoryView._finalize_`,
         // which the collections above only queue. Drain the queue the way
         // `gc.collect()` does after its collection.
-        crate::module::gc::run_finalizers_now();
+        crate::module::gc::interp_gc::run_finalizers_now();
     }
     let obj = pyre_object::gc_roots::shadow_stack_get(slot);
     if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {

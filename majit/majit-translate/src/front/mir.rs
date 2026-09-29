@@ -30941,7 +30941,7 @@ fn mark_local_def(local_idx: usize, defs: &mut bit_set::BitSet, n_locals: usize)
 /// kept in sync with the `&self` version.
 /// `func.__module__` for a lowered function: the crate-qualified leading
 /// module segments of its Charon name, spelled as `module_path!()` spells
-/// them (`pyre_module::module::unicodedata`).
+/// them (`pyre_module::module::unicodedata::interp_ucd`).
 ///
 /// A method's name is `[crate, mod.., <Impl>, method]` and ends its module
 /// at the impl segment; a free function's is `[crate, mod.., fn]` and ends
@@ -58583,7 +58583,7 @@ mod tests {
             "/../../build/llbc/pyre-module.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let name = "pyre_module::module::unicodedata::char_and_default";
+        let name = "pyre_module::module::unicodedata::interp_ucd::char_and_default";
         let graph = super::lower_function(&llbc, name)
             .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
         assert!(
@@ -58621,8 +58621,8 @@ mod tests {
             super::fundecl_module(fd)
         };
         assert_eq!(
-            module_of("pyre_module::module::unicodedata::char_and_default").as_deref(),
-            Some("pyre_module::module::unicodedata")
+            module_of("pyre_module::module::unicodedata::interp_ucd::char_and_default").as_deref(),
+            Some("pyre_module::module::unicodedata::interp_ucd")
         );
         let method = llbc
             .iter_local_fns()
@@ -58658,7 +58658,7 @@ mod tests {
             "/../../build/llbc/pyre-module.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let name = "pyre_module::module::unicodedata::ucd_method_args";
+        let name = "pyre_module::module::unicodedata::interp_ucd::ucd_method_args";
         let graph = super::lower_function(&llbc, name)
             .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
         assert!(
@@ -58697,9 +58697,11 @@ mod tests {
             "/../../build/llbc/pyre-module.ullbc"
         ))
         .expect("load real LLBC");
-        let graph =
-            super::lower_function(&llbc, "pyre_module::module::unicodedata::ucd_method_args")
-                .expect("lower actual RangeFrom get caller");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_module::module::unicodedata::interp_ucd::ucd_method_args",
+        )
+        .expect("lower actual RangeFrom get caller");
         let program =
             super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
                 &[llbc],

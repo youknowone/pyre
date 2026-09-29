@@ -2610,12 +2610,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         crate::executioncontext::register_finalizer,
     );
     // `gc.collect`'s finalizer drain, residual for the reason given at
-    // `module::gc::run_finalizers_now`.
+    // `module::gc::interp_gc::run_finalizers_now`.
     pa0(
         &mut entries,
-        "pyre_interpreter::module::gc::run_finalizers_now",
+        "pyre_interpreter::module::gc::interp_gc::run_finalizers_now",
         "pyre_interpreter::run_finalizers_now",
-        crate::module::gc::run_finalizers_now,
+        crate::module::gc::interp_gc::run_finalizers_now,
     );
     pa0(
         &mut entries,
@@ -6756,10 +6756,11 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_run_finalizers_now() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected = crate::module::gc::run_finalizers_now as *const () as usize as i64;
+        let expected =
+            crate::module::gc::interp_gc::run_finalizers_now as *const () as usize as i64;
 
         assert_eq!(
-            bindings["pyre_interpreter::module::gc::run_finalizers_now"],
+            bindings["pyre_interpreter::module::gc::interp_gc::run_finalizers_now"],
             expected
         );
         assert_eq!(bindings["pyre_interpreter::run_finalizers_now"], expected);

@@ -3899,7 +3899,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::gc::gcref::W_GcRef
+        <pyre_interpreter::module::gc::referents::gcref::W_GcRef
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // `pypy/module/gc/hook.py W_AppLevelHooks`: the process-owned hooks
@@ -3917,7 +3917,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::gc::stats::W_GcStats
+        <pyre_interpreter::module::gc::referents::stats::W_GcStats
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
 
