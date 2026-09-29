@@ -1890,6 +1890,7 @@ impl FrameBox {
         // locals slot (the latter also covers the std::alloc fallback frame)
         // across that allocation.
         let _frame_roots = pyre_object::gc_roots::push_roots();
+        let frame_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(frame_ptr as pyre_object::PyObjectRef);
         let _root = FrameLocalsRoot::new(frame_ptr);
         // generator.py `self.pycode = frame.pycode`: preserve the exact
@@ -1942,12 +1943,13 @@ impl FrameBox {
             };
         }
         // pyframe.py `initialize_as_generator`: `self.f_generator_wref =
-        // rweakref.ref(gen)`.  The frame is non-moving and pinned in
-        // `_frame_roots`; the WEAKREF allocation can move the generator, so
-        // read it back from its pin.  An old frame storing a nursery WEAKREF
-        // runs the write barrier.
+        // rweakref.ref(gen)`.  The WEAKREF allocation can move the generator
+        // and collects, so the frame is read back from its pin in
+        // `_frame_roots` after it, and the generator from its own pin below.
+        // An old frame storing a nursery WEAKREF runs the write barrier.
         unsafe {
             let wref = pyre_object::weakref::w_weakref_new(generator);
+            let frame_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame;
             (*frame_ptr).f_generator_wref = wref as PyObjectRef;
             if pyre_object::gc_hook::try_gc_owns_object(frame_ptr as *mut u8) {
                 pyre_object::gc_hook::try_gc_write_barrier(frame_ptr as *mut u8);

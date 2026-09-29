@@ -4044,14 +4044,13 @@ fn module_annotate_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     {
         return Ok(annotate);
     }
-    let none = pyre_object::w_none();
     // The lookup above is a full `finditem_str`, so a `__getitem__` on a dict
     // subclass runs Python between the pin and this store and the module dict
     // moves under it; the store therefore reads the slot rather than the word
     // pinned earlier.  The key is an immortal non-GC string and needs no slot.
     let annotate_key = pyre_object::intern_str_value("__annotate__");
-    crate::baseobjspace::setitem(roots.get(dict_slot), annotate_key, none)?;
-    Ok(none)
+    crate::baseobjspace::setitem(roots.get(dict_slot), annotate_key, pyre_object::w_none())?;
+    Ok(pyre_object::w_none())
 }
 
 fn module_annotate_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

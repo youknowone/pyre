@@ -2470,7 +2470,9 @@ fn prepare_frame_resume(
             // The delegate's StopIteration value is already on the outer
             // frame stack and its SEND completion target is installed.
             Ok(None) => return Ok(FrameResume::Dispatch(None)),
-            Err(err) => pending_operr = Some(err),
+            // The delegate's error is thrown into this frame's own dispatch;
+            // the sent value was the delegate's and is not resumed here.
+            Err(err) => return Ok(FrameResume::Dispatch(Some(err))),
         }
     }
     if pending_operr.is_none()
