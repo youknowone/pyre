@@ -4725,21 +4725,27 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
 
 /// Gateway the tracer enters for one-argument `type(x)`.
 ///
-/// The query stays in the `dont_look_inside` `type_query_cold`, so the call is
-/// residual. `StdObjSpace.type` promotes the RPython class (`ob_type` here),
-/// not the app-level class: promoting `w_class` instead retraced once per
-/// distinct class over a polymorphic iteration, and a prebuilt object's null
-/// `w_class` split the trace again.
+/// `StdObjSpace.type`: promote the RPython class (`ob_type`, the storage
+/// layout) and then `getclass`. The app-level `w_class` is not the word
+/// promoted — a polymorphic iteration retraces once per class.
 pub fn __majit_wrap_type_query(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if args.len() != 1 {
         return Err(PyError::type_error("type() takes 1 or 3 arguments"));
     }
-    type_query_cold(args[0])
+    Ok(type_query(args[0]))
 }
 
-#[majit_macros::dont_look_inside]
-fn type_query_cold(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    Ok(crate::builtins::type_of_object(obj))
+fn type_query(w_obj: PyObjectRef) -> PyObjectRef {
+    if !w_obj.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(w_obj))
+    {
+        let ob_type = unsafe { (*w_obj).ob_type };
+        let _ = majit_metainterp::jit::promote(ob_type);
+    }
+    // `W_Root.getclass` — `typedef::type`, traced. The unnamed fallback
+    // inside `type_of_object` is only the pre-init layout with no class.
+    crate::builtins::type_of_object(w_obj)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
