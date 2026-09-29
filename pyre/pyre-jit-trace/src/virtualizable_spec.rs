@@ -42,6 +42,13 @@ pub const LOCALS_CELLS_STACK_W_VABLE_ARRAY_INDEX: usize = 0;
 /// `virtualizable_entry_at` index a reader of `getorcreatedebug()` uses.
 pub const DEBUGDATA_VABLE_FIELD_INDEX: usize = 3;
 
+/// Canonical vable-field index for `pycode`.
+///
+/// A static field's flat shadow index IS its position in
+/// [`PYFRAME_VABLE_FIELDS`], so this doubles as the `virtualizable_entry_at`
+/// index `pyframe.py PyFrame.get_w_globals` uses for `jit.promote(self.pycode)`.
+pub const PYCODE_VABLE_FIELD_INDEX: usize = 1;
+
 /// Canonical vable-field index for `last_instr`.
 ///
 /// The standard-frame shadow carries the portal frame's symbolic Python
@@ -81,6 +88,10 @@ const _: () = {
         "debugdata must be registered at the expected vable field index"
     );
     assert!(
+        PYFRAME_VABLE_FIELDS[PYCODE_VABLE_FIELD_INDEX].1 == PYCODE_VABLE_FIELD_INDEX,
+        "pycode must be registered at the expected vable field index"
+    );
+    assert!(
         PYFRAME_VABLE_FIELDS[LAST_INSTR_VABLE_FIELD_INDEX].1 == LAST_INSTR_VABLE_FIELD_INDEX,
         "last_instr must be registered at the expected vable field index"
     );
@@ -113,6 +124,20 @@ const _: () = {
         assert!(
             name[i] == expected[i],
             "PYFRAME_VABLE_FIELDS[3] name mismatch"
+        );
+        i += 1;
+    }
+    let name = PYFRAME_VABLE_FIELDS[PYCODE_VABLE_FIELD_INDEX].0.as_bytes();
+    let expected = b"pycode";
+    assert!(
+        name.len() == expected.len(),
+        "PYFRAME_VABLE_FIELDS[1] name mismatch"
+    );
+    let mut i = 0;
+    while i < expected.len() {
+        assert!(
+            name[i] == expected[i],
+            "PYFRAME_VABLE_FIELDS[1] name mismatch"
         );
         i += 1;
     }
