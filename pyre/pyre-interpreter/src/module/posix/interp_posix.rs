@@ -441,10 +441,13 @@ fn run_fork_callbacks(kind: &str) {
         let Some(callback) = callback else { continue };
         if let Err(mut error) = crate::call::call_function_impl_result(callback as PyObjectRef, &[])
         {
-            let repr = unsafe { crate::display::py_repr_wtf8(callback as PyObjectRef) }
-                .unwrap_or_else(|_| {
-                    rustpython_wtf8::Wtf8Buf::from_string("<callback>".to_string())
-                });
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = error.pin(&roots);
+            let repr = unsafe { crate::display::py_repr_wtf8(callback as PyObjectRef) };
+            error.reload(&roots, slot);
+            let repr = repr.unwrap_or_else(|_| {
+                rustpython_wtf8::Wtf8Buf::from_string("<callback>".to_string())
+            });
             error.write_unraisable(
                 pyre_object::w_none(),
                 &crate::display::wtf8_format!("Exception ignored in atfork callback ", repr),

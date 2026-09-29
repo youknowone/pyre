@@ -4481,7 +4481,11 @@ impl OpcodeStepExecutor for PyFrame {
     fn cleanup_throw(&mut self) -> Result<(), PyError> {
         let w_exc = self.pop_value()?;
         let mut err = unsafe { PyError::from_exc_object(w_exc) };
-        if !err.matches_stop_iteration() {
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = err.pin(&roots);
+        let stop = err.matches_stop_iteration();
+        err.reload(&roots, slot);
+        if !stop {
             // CPython 3.14 `CLEANUP_THROW` installs the existing exception and
             // jumps straight to `exception_unwind`; unlike the ordinary
             // opcode-error path it does not prepend another traceback entry.

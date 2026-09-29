@@ -1538,13 +1538,17 @@ fn is_true_obj(obj: PyObjectRef) -> bool {
 }
 
 fn make_builtin_error(name: &str, msg: &str) -> pyre_interpreter::PyError {
-    let mut err = pyre_interpreter::PyError::value_error(msg.to_string());
-    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class(name) {
-        let args = [cls, w_str_new_managed(msg)];
-        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            err.set_exc_object(exc);
-        }
-    }
+    // `interp_zlib.py zlib_error`: the exception value, then OperationError.
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class(name) else {
+        return pyre_interpreter::PyError::value_error(msg.to_string());
+    };
+    let args = [cls, w_str_new_managed(msg)];
+    let Ok(mut exc) = pyre_interpreter::builtins::exc_exception_new(&args) else {
+        return pyre_interpreter::PyError::value_error(msg.to_string());
+    };
+    let mut err =
+        pyre_object::with_roots!(exc => pyre_interpreter::PyError::value_error(msg.to_string()));
+    err.set_exc_object(exc);
     err
 }
 
@@ -1736,23 +1740,28 @@ fn maybe_reject_amplification(
 const EXPAT_ERROR_NAME: &str = "xml.parsers.expat.ExpatError";
 
 fn pyexpat_error(msg: String, code: i64, lineno: i64, offset: i64) -> pyre_interpreter::PyError {
-    let mut err = pyre_interpreter::PyError::value_error(msg.clone());
-    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class(EXPAT_ERROR_NAME) {
-        let args = [cls, w_str_new_managed(&msg)];
-        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            // The fresh exception is named only by this local while the three
-            // stores below build their values and grow its attribute storage.
-            // One liveness pin at the mint; an exception instance does not move,
-            // so the local stays current.  `cls` is the registered class and
-            // stays reachable through the registry.
-            let roots = pyre_object::gc_roots::push_roots();
-            let exc = roots.pin_root(exc);
-            pyre_interpreter::baseobjspace::setdictvalue_native(exc, "code", w_int_new(code));
-            pyre_interpreter::baseobjspace::setdictvalue_native(exc, "lineno", w_int_new(lineno));
-            pyre_interpreter::baseobjspace::setdictvalue_native(exc, "offset", w_int_new(offset));
-            err.set_exc_object(exc);
-        }
-    }
+    // `interp_pyexpat.py XMLParser.set_error_msg` builds the instance, stores
+    // code/offset/lineno, then returns OperationError.
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class(EXPAT_ERROR_NAME) else {
+        return pyre_interpreter::PyError::value_error(msg);
+    };
+    let args = [cls, w_str_new_managed(&msg)];
+    let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) else {
+        return pyre_interpreter::PyError::value_error(msg);
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(exc);
+    let code_obj = w_int_new(code);
+    pyre_interpreter::baseobjspace::setdictvalue_native(roots.get(exc_slot), "code", code_obj);
+    let lineno_obj = w_int_new(lineno);
+    pyre_interpreter::baseobjspace::setdictvalue_native(roots.get(exc_slot), "lineno", lineno_obj);
+    let offset_obj = w_int_new(offset);
+    pyre_interpreter::baseobjspace::setdictvalue_native(roots.get(exc_slot), "offset", offset_obj);
+    let mut exc = roots.get(exc_slot);
+    drop(roots);
+    let mut err = pyre_object::with_roots!(exc => pyre_interpreter::PyError::value_error(msg));
+    err.set_exc_object(exc);
     err
 }
 

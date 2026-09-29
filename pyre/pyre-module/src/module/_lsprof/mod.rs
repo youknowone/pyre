@@ -493,8 +493,11 @@ impl W_Profiler {
         {
             Ok(value) => value,
             Err(mut err) => {
-                let repr = unsafe { pyre_interpreter::display::py_repr_wtf8(self.w_callable) }
-                    .unwrap_or_else(|_| Wtf8Buf::from_string("<timer>".to_string()));
+                let roots = pyre_object::gc_roots::push_roots();
+                let slot = err.pin(&roots);
+                let repr = unsafe { pyre_interpreter::display::py_repr_wtf8(self.w_callable) };
+                err.reload(&roots, slot);
+                let repr = repr.unwrap_or_else(|_| Wtf8Buf::from_string("<timer>".to_string()));
                 err.write_unraisable(
                     w_none(),
                     &pyre_interpreter::wtf8_format!(

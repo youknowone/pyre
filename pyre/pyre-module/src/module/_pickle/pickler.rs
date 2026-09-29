@@ -2419,14 +2419,20 @@ fn pinned_get(slot: usize, i: usize) -> PyObjectRef {
 /// saving the first, exactly like `interp_pickle.py`; the first save
 /// may run arbitrary Python and remove the second item from the source list.
 fn pinned_iter_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
-    match pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+    let next_item =
+        pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot));
+    let mut err = match next_item {
         Ok(item) => {
             let _ = pyre_object::gc_roots::pin_root(item);
-            Ok(Some(pyre_object::gc_roots::shadow_stack_len() - 1))
+            return Ok(Some(pyre_object::gc_roots::shadow_stack_len() - 1));
         }
-        Err(e) if e.matches_stop_iteration() => Ok(None),
-        Err(e) => Err(e),
-    }
+        Err(e) => e,
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = err.pin(&roots);
+    let stop = err.matches_stop_iteration();
+    err.reload(&roots, slot);
+    if stop { Ok(None) } else { Err(err) }
 }
 
 /// Snapshot the iterable pinned at `source_slot` into a GC-walked list.
@@ -2441,13 +2447,28 @@ fn snapshot_pinned_iterable(source_slot: usize) -> Result<usize, PyError> {
     let _ = pyre_object::gc_roots::pin_root(w_iter);
     let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     loop {
-        let item = match pyre_interpreter::baseobjspace::next(
+        let next_item = pyre_interpreter::baseobjspace::next(
             pyre_object::gc_roots::shadow_stack_get(iter_slot),
-        ) {
-            Ok(item) => item,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+        );
+        let mut stop_err = None;
+        let item = match next_item {
+            Ok(item) => Some(item),
+            Err(e) => {
+                stop_err = Some(e);
+                None
+            }
         };
+        if let Some(mut e) = stop_err {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = e.pin(&roots);
+            let stop = e.matches_stop_iteration();
+            e.reload(&roots, slot);
+            if stop {
+                break;
+            }
+            return Err(e);
+        }
+        let item = item.unwrap();
         {
             let _item_root = pyre_object::gc_roots::push_roots();
             let _ = pyre_object::gc_roots::pin_root(item);
@@ -2569,13 +2590,24 @@ fn batch_appends(
 /// Advance a dict-items iterator and pin its unpacked `(key, value)` pair in a
 /// two-element GC-walked list.
 fn pinned_pair_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
-    let item = match pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(
-        iter_slot,
-    )) {
-        Ok(item) => item,
-        Err(e) if e.matches_stop_iteration() => return Ok(None),
-        Err(e) => return Err(e),
+    let next_item =
+        pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot));
+    let mut stop_err = None;
+    let item = match next_item {
+        Ok(item) => Some(item),
+        Err(e) => {
+            stop_err = Some(e);
+            None
+        }
     };
+    if let Some(mut e) = stop_err {
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = e.pin(&roots);
+        let stop = e.matches_stop_iteration();
+        e.reload(&roots, slot);
+        return if stop { Ok(None) } else { Err(e) };
+    }
+    let item = item.unwrap();
     let _ = pyre_object::gc_roots::pin_root(item);
     let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
@@ -2605,12 +2637,16 @@ fn save_pair(
     save(ctx, buf, pinned_get(pair_slot, 0))?;
     match save(ctx, buf, pinned_get(pair_slot, 1)) {
         Ok(()) => Ok(()),
-        Err(err) => {
+        Err(mut err) => {
             // pickle.py only invokes the key's arbitrary __repr__ while
             // annotating a value-save failure. Successful dictionary saves
             // must not gain an observable repr call.
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = err.pin(&roots);
             let key_repr =
-                unsafe { pyre_interpreter::display::py_repr_wtf8(pinned_get(pair_slot, 0))? };
+                unsafe { pyre_interpreter::display::py_repr_wtf8(pinned_get(pair_slot, 0)) };
+            err.reload(&roots, slot);
+            let key_repr = key_repr?;
             Err(add_reduce_note(
                 err,
                 obj_slot,
@@ -3079,20 +3115,30 @@ fn save_global_surrogate_module(
 ) -> Result<(), PyError> {
     if ctx.proto < 4 {
         let encoding = if ctx.proto < 3 { "ascii" } else { "utf-8" };
-        return match pyre_interpreter::type_methods::encode_object(
-            pyre_object::gc_roots::shadow_stack_get(module_slot),
-            encoding,
-            "strict",
-        ) {
-            Ok(_) => Err(pickling_error(
-                "surrogate module identifier unexpectedly encoded",
-            )),
-            Err(error) => Err(identifier_encoding_error(
+        // The encode `Result` drops at the end of its scope, so that scope
+        // ends before either error constructor, both of which can collect.
+        let encode_err = {
+            let encoded = pyre_interpreter::type_methods::encode_object(
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+                encoding,
+                "strict",
+            );
+            match encoded {
+                Ok(_) => None,
+                Err(error) => Some(error),
+            }
+        };
+        return if let Some(error) = encode_err {
+            Err(identifier_encoding_error(
                 error,
                 pyre_object::gc_roots::shadow_stack_get(module_slot),
                 "module",
                 ctx.proto,
-            )),
+            ))
+        } else {
+            Err(pickling_error(
+                "surrogate module identifier unexpectedly encoded",
+            ))
         };
     }
     save(
@@ -3163,11 +3209,21 @@ fn save_global_surrogate_name(
 
     if ctx.proto < 4 {
         let encoding = if ctx.proto < 3 { "ascii" } else { "utf-8" };
-        if let Err(error) = pyre_interpreter::type_methods::encode_object(
-            pyre_object::gc_roots::shadow_stack_get(module_slot),
-            encoding,
-            "strict",
-        ) {
+        // Each encode `Result` drops at the end of its scope. The module
+        // result is gone before the name is encoded, and both are gone
+        // before either error constructor.
+        let module_encode_err = {
+            let module_encoded = pyre_interpreter::type_methods::encode_object(
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+                encoding,
+                "strict",
+            );
+            match module_encoded {
+                Ok(_) => None,
+                Err(error) => Some(error),
+            }
+        };
+        if let Some(error) = module_encode_err {
             return Err(identifier_encoding_error(
                 error,
                 pyre_object::gc_roots::shadow_stack_get(module_slot),
@@ -3175,20 +3231,28 @@ fn save_global_surrogate_name(
                 ctx.proto,
             ));
         }
-        return match pyre_interpreter::type_methods::encode_object(
-            pyre_object::gc_roots::shadow_stack_get(name_slot),
-            encoding,
-            "strict",
-        ) {
-            Ok(_) => Err(pickling_error(
-                "surrogate global identifier unexpectedly encoded",
-            )),
-            Err(error) => Err(identifier_encoding_error(
+        let name_encode_err = {
+            let name_encoded = pyre_interpreter::type_methods::encode_object(
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+                encoding,
+                "strict",
+            );
+            match name_encoded {
+                Ok(_) => None,
+                Err(error) => Some(error),
+            }
+        };
+        return if let Some(error) = name_encode_err {
+            Err(identifier_encoding_error(
                 error,
                 pyre_object::gc_roots::shadow_stack_get(name_slot),
                 "global",
                 ctx.proto,
-            )),
+            ))
+        } else {
+            Err(pickling_error(
+                "surrogate global identifier unexpectedly encoded",
+            ))
         };
     }
 

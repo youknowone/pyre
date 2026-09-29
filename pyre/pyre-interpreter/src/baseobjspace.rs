@@ -5311,14 +5311,29 @@ unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError
     let mut it = it;
     let mut out = Vec::new();
     loop {
-        match pyre_object::with_roots!(it => crate::baseobjspace::next(it)) {
-            Ok(w_item) => {
-                let mut w_item = w_item;
-                out.push(pyre_object::with_roots!(it, w_item => byte_w(w_item, "byte"))?);
+        let next_item = pyre_object::with_roots!(it => crate::baseobjspace::next(it));
+        // The `Result` is dropped before `matches_stop_iteration`, which can
+        // collect. The handle is pinned for that call alone.
+        let mut stop_err = None;
+        let w_item = match next_item {
+            Ok(w_item) => Some(w_item),
+            Err(e) => {
+                stop_err = Some(e);
+                None
             }
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+        };
+        if let Some(mut e) = stop_err {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = e.pin(&roots);
+            let stop = e.matches_stop_iteration();
+            e.reload(&roots, slot);
+            if stop {
+                break;
+            }
+            return Err(e);
         }
+        let mut w_item = w_item.unwrap();
+        out.push(pyre_object::with_roots!(it, w_item => byte_w(w_item, "byte"))?);
     }
     Ok(out)
 }
@@ -21408,17 +21423,29 @@ pub unsafe fn generator_invoke_execute_frame(
     // `frame_anchor` is dropped, so the return block forwards the shell
     // with no destructor between the ctor and `returnblock`.
     let (mut raised, yielded) = match executed {
-        Err(e) => {
+        Err(mut e) => {
             generator_frame_is_finished(
                 pyre_object::gc_roots::shadow_stack_get(gen_slot),
                 &mut *crate::eval::frame_anchor_live(frame_depth),
                 prompt_finalization,
             );
-            let leaked = if e.matches_stop_iteration() {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = e.pin(&roots);
+            let stop_iter = e.matches_stop_iteration();
+            e.reload(&roots, slot);
+            let stop_async = if stop_iter {
+                false
+            } else if is_async_generator(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
+                e.reload(&roots, slot);
+                let stop_async = e.matches_stop_async_iteration();
+                e.reload(&roots, slot);
+                stop_async
+            } else {
+                false
+            };
+            let leaked = if stop_iter {
                 Some("StopIteration")
-            } else if is_async_generator(pyre_object::gc_roots::shadow_stack_get(gen_slot))
-                && e.matches_stop_async_iteration()
-            {
+            } else if stop_async {
                 Some("StopAsyncIteration")
             } else {
                 None
@@ -22482,32 +22509,14 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
     // `Err(e)` leave their exception in flight in this native local, which the
     // collector does not root, and a collection there sweeps its traceback
     // chain out from under `record_application_traceback`.
-    match sent {
+    let mut e = match sent {
         Ok(_) => {
             // Generator yielded after GeneratorExit — RuntimeError.
             // generator.py:267-268 `"%s ignored GeneratorExit" % self.KIND`.
-            Err(PyError::runtime_error(format!(
+            return Err(PyError::runtime_error(format!(
                 "{} ignored GeneratorExit",
                 unsafe { generator_kind(gen_obj) }
-            )))
-        }
-        Err(mut e) if e.matches_stop_iteration() => {
-            // Python 3.13+ / 3.14: close() returns the value produced when
-            // GeneratorExit is caught and the generator executes `return x`.
-            let w_exc = e.to_exc_object();
-            let _roots = pyre_object::gc_roots::push_roots();
-            let w_exc_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_exc);
-            let value = getattr_str(pyre_object::gc_roots::shadow_stack_get(w_exc_slot), "value")
-                .unwrap_or_else(|_| w_none());
-            let value_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(value);
-            // The StopIteration has been consumed at this Rust-level catch;
-            // unlike a Python handler, no PUSH_EXC_INFO will clear the
-            // temporary propagation root for us.
-            crate::eval::set_in_flight_exception(PY_NULL);
-            generator_close_finalizer_boundary(released_graph_has_finalizer);
-            Ok(pyre_object::gc_roots::shadow_stack_get(value_slot))
+            )));
         }
         Err(e) if e.kind == PyErrorKind::GeneratorExit => {
             // generator.py:265 `except OperationError as e` consumes the
@@ -22515,9 +22524,36 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             // ownership transfer by ending pyre's propagation root here.
             crate::eval::set_in_flight_exception(PY_NULL);
             generator_close_finalizer_boundary(released_graph_has_finalizer);
-            Ok(w_none())
+            return Ok(w_none());
         }
-        Err(e) => Err(e),
+        Err(e) => e,
+    };
+    // `sent` is gone before the stop test. The handle stays pinned across it.
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = e.pin(&roots);
+    let stop = e.matches_stop_iteration();
+    e.reload(&roots, slot);
+    drop(roots);
+    if !stop {
+        return Err(e);
+    }
+    {
+        // close() returns the value produced when GeneratorExit is caught
+        // and the generator executes `return x`.
+        let w_exc = e.to_exc_object();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let w_exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_exc);
+        let value = getattr_str(pyre_object::gc_roots::shadow_stack_get(w_exc_slot), "value")
+            .unwrap_or_else(|_| w_none());
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        // The StopIteration has been consumed at this Rust-level catch;
+        // unlike a Python handler, no PUSH_EXC_INFO will clear the
+        // temporary propagation root for us.
+        crate::eval::set_in_flight_exception(PY_NULL);
+        generator_close_finalizer_boundary(released_graph_has_finalizer);
+        Ok(pyre_object::gc_roots::shadow_stack_get(value_slot))
     }
 }
 

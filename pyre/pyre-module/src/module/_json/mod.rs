@@ -1190,11 +1190,15 @@ fn encode_dict(
             gc_roots::shadow_stack_get(pair_slot + 1),
             child_level,
         )
-        .map_err(|err| {
+        .map_err(|mut err| {
+            let roots = gc_roots::push_roots();
+            let slot = err.pin(&roots);
             let key_repr = unsafe {
                 pyre_interpreter::display::py_repr_wtf8(gc_roots::shadow_stack_get(pair_slot + 2))
-            }
-            .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
+            };
+            err.reload(&roots, slot);
+            let key_repr = key_repr
+                .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
             add_json_note(
                 err,
                 pyre_interpreter::wtf8_format!(

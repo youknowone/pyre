@@ -128,12 +128,16 @@ fn deadline_from_timeout(timeout: Option<f64>) -> Option<Instant> {
 }
 
 fn empty_error() -> pyre_interpreter::PyError {
-    let mut err = pyre_interpreter::PyError::runtime_error("");
-    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_queue.Empty")
-        && let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&[cls])
-    {
-        err.set_exc_object(exc);
-    }
+    // No `pypy/module/_queue`. `interp_zlib.py zlib_error` builds the instance,
+    // then OperationError.
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_queue.Empty") else {
+        return pyre_interpreter::PyError::runtime_error("");
+    };
+    let Ok(mut exc) = pyre_interpreter::builtins::exc_exception_new(&[cls]) else {
+        return pyre_interpreter::PyError::runtime_error("");
+    };
+    let mut err = pyre_object::with_roots!(exc => pyre_interpreter::PyError::runtime_error(""));
+    err.set_exc_object(exc);
     err
 }
 

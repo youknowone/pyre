@@ -4350,13 +4350,16 @@ fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> 
 }
 
 fn input_eof_error() -> crate::PyError {
-    let mut error = crate::PyError::value_error("");
-    if let Some(cls) = lookup_exc_class("EOFError") {
-        let args = [cls];
-        if let Ok(exc) = exc_exception_new(&args) {
-            error.set_exc_object(exc);
-        }
-    }
+    // `app_io.py input` raises `EOFError` only after the instance exists.
+    let Some(cls) = lookup_exc_class("EOFError") else {
+        return crate::PyError::value_error("");
+    };
+    let args = [cls];
+    let Ok(mut exc) = exc_exception_new(&args) else {
+        return crate::PyError::value_error("");
+    };
+    let mut error = pyre_object::with_roots!(exc => crate::PyError::value_error(""));
+    error.set_exc_object(exc);
     error
 }
 
@@ -17594,8 +17597,11 @@ pub(crate) fn replace_compile_syntax_error_filename(
     filename_bytes: Option<&[u8]>,
 ) -> crate::PyError {
     if error.kind == crate::PyErrorKind::SyntaxError {
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = error.pin(&roots);
         let w_filename =
             crate::gateway::fsdecode_filename_bytes(filename_bytes.unwrap_or(filename.as_bytes()));
+        error.reload(&roots, slot);
         error.replace_syntax_error_filename(w_filename);
     }
     error
@@ -20657,7 +20663,7 @@ pub(crate) fn applevel_binding_error(
     func: PyObjectRef,
     positional: &[PyObjectRef],
     kw_names: &[Wtf8Buf],
-    err: crate::PyError,
+    mut err: crate::PyError,
 ) -> crate::PyError {
     if !crate::app_functional::is_published_sorted(func) {
         return err;
@@ -20671,7 +20677,14 @@ pub(crate) fn applevel_binding_error(
     if clinic_keyword_only_error("sort", &["key", "reverse"], 0, kw_names).is_none() {
         return err;
     }
-    if let Err(iter_err) = builtin_list_ctor(&[positional[0]]) {
+    let listed = {
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = err.pin(&roots);
+        let listed = builtin_list_ctor(&[positional[0]]);
+        err.reload(&roots, slot);
+        listed
+    };
+    if let Err(iter_err) = listed {
         return iter_err;
     }
     clinic_keyword_only_error("sort", &["key", "reverse"], 0, kw_names).unwrap_or(err)
@@ -24921,13 +24934,30 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
             // The iterator may have moved during a prior step; reload it from its
             // (post-relocation) slot before each call.
-            match crate::baseobjspace::next(roots.get(it_slot)) {
-                Ok(v) => {
-                    roots.set(item_slot, v);
-                    *pending = true;
+            let next_item = crate::baseobjspace::next(roots.get(it_slot));
+            // Drop the `Result` before `matches_stop_iteration`.
+            let mut stop_err = None;
+            let item = match next_item {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    stop_err = Some(e);
+                    None
                 }
-                Err(e) if e.matches_stop_iteration() => *exhausted = true,
-                Err(e) => return Err(e),
+            };
+            if let Some(v) = item {
+                roots.set(item_slot, v);
+                *pending = true;
+            } else {
+                let mut e = stop_err.unwrap();
+                let err_roots = pyre_object::gc_roots::push_roots();
+                let slot = e.pin(&err_roots);
+                let stop = e.matches_stop_iteration();
+                e.reload(&err_roots, slot);
+                if stop {
+                    *exhausted = true;
+                } else {
+                    return Err(e);
+                }
             }
             Ok(())
         };
