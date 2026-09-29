@@ -26,6 +26,7 @@ use std::rc::Rc;
 use indexmap::IndexSet;
 
 use majit_ir::descr::descr_identity;
+use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 /// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
@@ -634,24 +635,24 @@ impl VirtualState {
 
     /// Counts the leaves in a single top-level state entry, deduping shared
     /// `Rc<VirtualStateInfoNode>` subtrees via the caller-supplied visited map.
-    /// The visited map (Rc::as_ptr → first imported OpRef, NONE for the
+    /// The visited map (Rc::as_ptr → first imported box, NONE for the
     /// counting path) must be threaded across all top-level state entries
     /// in a single VirtualState walk so cross-entry shared substates are
     /// counted exactly once. Both the top-level Rc identity and the
     /// recursive nested Rcs participate in the dedup.
     pub fn count_forced_boxes_for_entry_static(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut crate::FxIndexMap<usize, OpRef>,
+        visited: &mut crate::FxIndexMap<usize, majit_ir::operand::Operand>,
     ) -> usize {
         // RPython virtualstate.py enum first-visit guard via
         // `position == -1` — every visited node is recorded so a later
         // visit returns 0 without re-counting. Pyre's parallel:
         //
-        // - If the entry is already present (real OpRef from
+        // - If the entry is already present (real box from
         //   `import_virtual_state_from_label_args_recurse`
         //   in `optimizer.rs`, or `NONE` from a prior counting visit),
         //   return 0. unroll.py `setinfo_from_preamble` parity:
-        //   preserve the existing real OpRef rather than overwriting.
+        //   preserve the existing real box rather than overwriting.
         // - Otherwise insert `NONE` to mark this node visited, then
         //   recurse. Without this insert, repeated top-level visits
         //   to leaf variants (Unknown/NonNull/IntBounded/KnownClass)
@@ -662,13 +663,13 @@ impl VirtualState {
         if visited.contains_key(&key) {
             return 0;
         }
-        visited.insert(key, OpRef::NONE);
+        visited.insert(key, majit_ir::operand::Operand::None);
         Self::count_forced_boxes_for_entry(rc, visited)
     }
 
     fn count_forced_boxes_for_entry(
         info: &VirtualStateInfo,
-        visited: &mut crate::FxIndexMap<usize, OpRef>,
+        visited: &mut crate::FxIndexMap<usize, majit_ir::operand::Operand>,
     ) -> usize {
         match info {
             VirtualStateInfo::Constant(_) => 0,
@@ -700,19 +701,19 @@ impl VirtualState {
     ///
     /// virtualstate.py `enum()` returns without touching
     /// `self.position` when `position != -1`; pyre must preserve any
-    /// real OpRef the caller already wrote into `visited` (e.g. from
+    /// real box the caller already wrote into `visited` (e.g. from
     /// `import_virtual_state_from_label_args_recurse`). A blind
-    /// `insert(.., NONE)` would overwrite that real OpRef before the
+    /// `insert(.., NONE)` would overwrite that real box before the
     /// `is_some()` check, leaking NONE into downstream lookups.
     fn count_forced_boxes_for_entry_rc(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut crate::FxIndexMap<usize, OpRef>,
+        visited: &mut crate::FxIndexMap<usize, majit_ir::operand::Operand>,
     ) -> usize {
         let key = Rc::as_ptr(rc) as usize;
         if visited.contains_key(&key) {
             return 0;
         }
-        visited.insert(key, OpRef::NONE);
+        visited.insert(key, majit_ir::operand::Operand::None);
         Self::count_forced_boxes_for_entry(rc, visited)
     }
 
@@ -767,9 +768,22 @@ impl VirtualState {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-    ) -> Result<Vec<OpRef>, VirtualStatesCantMatch> {
+    ) -> Result<Vec<Operand>, VirtualStatesCantMatch> {
         // boxes = [None] * self.numnotvirtuals
-        let mut boxes = vec![OpRef::NONE; self.num_boxes()];
+        let mut boxes = vec![Operand::None; self.num_boxes()];
+        // virtualstate.py `enum_forced_boxes` receives the box. Build each
+        // input box once; both passes walk the same objects. A NONE or const
+        // has no producer to bind (`Operand::from_opref`).
+        let concrete_boxes: Vec<Operand> = concrete_refs
+            .iter()
+            .map(|&r| {
+                if r.is_none() || r.is_constant() {
+                    Operand::from_opref(r)
+                } else {
+                    ctx.materialize_operand_at(r)
+                }
+            })
+            .collect();
         // virtualstate.py:664-667 — first pass with `force_boxes=True`.
         // RPython writes into the SAME `boxes` array on both passes; the
         // values converge after force because subsequent
@@ -778,18 +792,18 @@ impl VirtualState {
         // `enum_top_level` (virtualstate.py:196, 274, 352).
         if force_boxes {
             for (idx, node) in self.state.iter().enumerate() {
-                let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
+                let box_ = concrete_boxes.get(idx).cloned().unwrap_or(Operand::None);
                 Self::enum_forced_boxes_for_entry(
-                    node, opref, optimizer, ctx, &mut boxes, /* force_boxes */ true,
+                    node, &box_, optimizer, ctx, &mut boxes, /* force_boxes */ true,
                 )?;
             }
         }
         // virtualstate.py:668-669 — second pass with `force_boxes=False`,
         // unconditional. Mirrors RPython exactly.
         for (idx, node) in self.state.iter().enumerate() {
-            let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
+            let box_ = concrete_boxes.get(idx).cloned().unwrap_or(Operand::None);
             Self::enum_forced_boxes_for_entry(
-                node, opref, optimizer, ctx, &mut boxes, /* force_boxes */ false,
+                node, &box_, optimizer, ctx, &mut boxes, /* force_boxes */ false,
             )?;
         }
         Ok(boxes)
@@ -812,7 +826,7 @@ impl VirtualState {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-    ) -> Result<(Vec<OpRef>, Vec<OpRef>), VirtualStatesCantMatch> {
+    ) -> Result<(Vec<Operand>, Vec<OpRef>), VirtualStatesCantMatch> {
         let inputargs = self.make_inputargs(concrete_refs, optimizer, ctx, force_boxes)?;
         let virtuals: Vec<OpRef> = self
             .state
@@ -842,7 +856,7 @@ impl VirtualState {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
-    ) -> Result<(Vec<OpRef>, Vec<OpRef>, Vec<usize>), VirtualStatesCantMatch> {
+    ) -> Result<(Vec<Operand>, Vec<OpRef>, Vec<usize>), VirtualStatesCantMatch> {
         let (inputargs, virtuals) =
             self.make_inputargs_and_virtuals(concrete_refs, optimizer, ctx, force_boxes)?;
         let label_source_positions = self
@@ -857,7 +871,7 @@ impl VirtualState {
     fn label_source_positions_for_inputargs(
         &self,
         concrete_refs: &[OpRef],
-        inputargs: &[OpRef],
+        inputargs: &[Operand],
         ctx: &mut OptContext,
     ) -> Option<Vec<usize>> {
         if concrete_refs.len() != self.state.len() {
@@ -899,12 +913,15 @@ impl VirtualState {
         }
         inputargs
             .iter()
-            .map(|&inputarg| {
-                let resolved_inputarg = ctx.get_replacement_opref(inputarg);
+            .map(|inputarg| {
+                let resolved_inputarg = inputarg.to_opref();
                 index_by_resolved
                     .get(&resolved_inputarg)
                     .copied()
-                    .or_else(|| inputarg.is_input_arg().then_some(inputarg.raw() as usize))
+                    .or_else(|| {
+                        let r = inputarg.to_opref();
+                        r.is_input_arg().then_some(r.raw() as usize)
+                    })
             })
             .collect()
     }
@@ -937,10 +954,10 @@ impl VirtualState {
     /// and applies the same comparison at every recursive call site.
     fn enum_forced_boxes_for_entry(
         node: &VirtualStateInfoNode,
-        opref: OpRef,
+        box_: &Operand,
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
-        boxes: &mut [OpRef],
+        boxes: &mut [Operand],
         force_boxes: bool,
     ) -> Result<(), VirtualStatesCantMatch> {
         match &node.info {
@@ -956,7 +973,7 @@ impl VirtualState {
                 // operand-routing reader; cached once so the per-field walk below
                 // doesn't re-clone PtrInfo per iteration.
                 let info_snapshot = ctx
-                    .get_box_replacement_operand_opt(opref)
+                    .resolve_operand_operand_opt(box_)
                     .as_ref()
                     .and_then(|b| ctx.peek_ptr_info(b));
                 let is_virtual = info_snapshot.as_ref().is_some_and(|pi| pi.is_virtual());
@@ -975,26 +992,25 @@ impl VirtualState {
                     })
                     .unwrap_or(0);
                 let walk_count = fields.len().min(info_field_count);
-                let field_refs: Vec<_> = fields
+                let field_boxes: Vec<Operand> = fields
                     .iter()
                     .take(walk_count)
                     .map(|(field_idx, _)| {
                         info_snapshot
                             .as_ref()
                             .and_then(|info| info.getfield(*field_idx))
-                            .and_then(|e| e.as_opref())
-                            .map(|f| ctx.get_replacement_opref(f))
-                            .unwrap_or(OpRef::NONE)
+                            .and_then(|e| e.as_value())
+                            .unwrap_or(Operand::None)
                     })
                     .collect();
-                for ((_, field_state), field_ref) in
-                    fields.iter().take(walk_count).zip(field_refs.iter())
+                for ((_, field_state), field_box) in
+                    fields.iter().take(walk_count).zip(field_boxes.iter())
                 {
                     // virtualstate.py `if state.position > self.position`
                     if field_state.position.get() > node.position.get() {
                         Self::enum_forced_boxes_for_entry(
                             field_state,
-                            *field_ref,
+                            field_box,
                             optimizer,
                             ctx,
                             boxes,
@@ -1009,7 +1025,7 @@ impl VirtualState {
                 // operand-routing reader; cached once so the per-item walk
                 // below doesn't re-clone PtrInfo per iteration.
                 let info_snapshot = ctx
-                    .get_box_replacement_operand_opt(opref)
+                    .resolve_operand_operand_opt(box_)
                     .as_ref()
                     .and_then(|b| ctx.peek_ptr_info(b));
                 let is_virtual = info_snapshot.as_ref().is_some_and(|pi| pi.is_virtual());
@@ -1030,11 +1046,11 @@ impl VirtualState {
                     return Err(VirtualStatesCantMatch::default());
                 }
                 for (index, item_state) in items.iter().enumerate() {
-                    let item_ref = info_snapshot
+                    let item_box = info_snapshot
                         .as_ref()
                         .and_then(|info| info.getitem(index))
-                        .and_then(|e| e.as_opref())
-                        .unwrap_or(OpRef::NONE);
+                        .and_then(|e| e.as_value())
+                        .unwrap_or(Operand::None);
                     // virtualstate.py:272-275: an absent fieldstate is not a
                     // forced box and contributes no notvirtual slot.
                     let Some(item_state) = item_state else {
@@ -1044,7 +1060,7 @@ impl VirtualState {
                     if item_state.position.get() > node.position.get() {
                         Self::enum_forced_boxes_for_entry(
                             item_state,
-                            item_ref,
+                            &item_box,
                             optimizer,
                             ctx,
                             boxes,
@@ -1069,15 +1085,15 @@ impl VirtualState {
                 //           if fieldstate.position > self.position:
                 //               fieldstate.enum_forced_boxes(boxes, itembox, ...)
                 //
-                let runtime_fields: Vec<Vec<(u32, OpRef)>> = match ctx
-                    .get_box_replacement_operand_opt(opref)
+                let runtime_fields: Vec<Vec<(u32, Operand)>> = match ctx
+                    .resolve_operand_operand_opt(box_)
                     .as_ref()
                     .and_then(|b| ctx.peek_ptr_info(b))
                 {
                     Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => vinfo
                         .element_fields
                         .iter()
-                        .map(|row| row.iter().map(|(i, b)| (*i, b.to_opref())).collect())
+                        .map(|row| row.iter().map(|(i, b)| (*i, b.clone())).collect())
                         .collect(),
                     _ => return Err(VirtualStatesCantMatch::default()),
                 };
@@ -1095,15 +1111,15 @@ impl VirtualState {
                         // Look up the runtime ref via the proper interior
                         // accessor (info.py:_compute_index parity), not the
                         // VirtualArray-only `getitem(flat_index)` helper.
-                        let item_ref = runtime_elem
+                        let item_box = runtime_elem
                             .iter()
                             .find(|(fdidx, _)| fdidx == field_idx)
-                            .map(|(_, op)| *op)
-                            .unwrap_or(OpRef::NONE);
+                            .map(|(_, op)| op.clone())
+                            .unwrap_or(Operand::None);
                         // virtualstate.py:347-350: absent state requires an
                         // equally unwritten item and then skips recursion.
                         let Some(field_state) = field_state else {
-                            if !item_ref.is_none() {
+                            if !item_box.to_opref().is_none() {
                                 return Err(VirtualStatesCantMatch::default());
                             }
                             continue;
@@ -1112,7 +1128,7 @@ impl VirtualState {
                         if field_state.position.get() > node.position.get() {
                             Self::enum_forced_boxes_for_entry(
                                 field_state,
-                                item_ref,
+                                &item_box,
                                 optimizer,
                                 ctx,
                                 boxes,
@@ -1140,8 +1156,8 @@ impl VirtualState {
                 //             else:
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
-                let resolved_box = ctx.get_box_replacement_operand_opt(opref);
-                let resolved = resolved_box.as_ref().map(|b| b.to_opref()).unwrap_or(opref);
+                let resolved_box = ctx.resolve_operand_operand_opt(box_);
+                let resolved: Operand = resolved_box.clone().unwrap_or_else(|| box_.clone());
                 let forced = match resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                     // RPython: Virtualizable refs stay virtual across iterations.
                     Some(PtrInfo::Virtualizable(_)) => resolved,
@@ -1170,7 +1186,7 @@ impl VirtualState {
                             ctx,
                         );
                         ctx.current_pass_idx = saved_pass_idx;
-                        forced.to_opref()
+                        forced
                     }
                     _ => resolved,
                 };
@@ -1186,7 +1202,11 @@ impl VirtualState {
                      assigned by enum_top_level"
                 );
                 let slot = slot_i32 as usize;
-                let resolved_for_store = ctx.get_replacement_opref(forced);
+                let resolved_for_store = if forced.is_none() {
+                    Operand::None
+                } else {
+                    ctx.resolve_operand_operand(&forced)
+                };
                 // virtualstate.py NotVirtualStateInfo{Int,Ptr}: Box.type
                 // immutability. RPython dispatches `isinstance(self,
                 // NotVirtualStateInfoInt)` vs `NotVirtualStateInfoPtr` on a
@@ -1196,15 +1216,20 @@ impl VirtualState {
                 // bridge types; reject the cross here so the unrolled
                 // trace falls back to `jump_to_preamble` exactly as RPython
                 // raises VirtualStatesCantMatch.
-                if let (Some(expected), Some(actual)) =
-                    (node.info.info_type(), ctx.opref_type(resolved_for_store))
-                    && expected != actual
+                if let (Some(expected), Some(actual)) = (
+                    node.info.info_type(),
+                    ctx.opref_type(resolved_for_store.to_opref()),
+                ) && expected != actual
                 {
                     if crate::majit_log_enabled() {
                         eprintln!(
                             "[label-type-mismatch] slot={} expected={:?} actual={:?} \
                                  source={:?} resolved={:?}",
-                            slot, expected, actual, opref, resolved_for_store
+                            slot,
+                            expected,
+                            actual,
+                            box_.to_opref(),
+                            resolved_for_store.to_opref()
                         );
                     }
                     return Err(VirtualStatesCantMatch::default());
@@ -2399,9 +2424,11 @@ pub enum GuardRequirement {
 impl GuardRequirement {
     /// Convert this guard requirement into the concrete Op stream that
     /// upstream `extra_guards` would have appended. RPython creates
-    /// ConstInt/ConstPtr inline in ResOperation args (virtualstate.py:401,
-    /// 603, intutils.py `IntBound.make_guards`); pyre allocates
-    /// constant OpRefs via the closure-based pool seed.
+    /// ConstInt/ConstPtr inline in ResOperation args
+    /// (`NotVirtualStateInfo._generate_guards`,
+    /// `NotVirtualStateInfoPtr._generate_guards_knownclass`,
+    /// `IntBound.make_guards`); pyre builds those constant args with
+    /// `Operand::const_from_value`.
     ///
     /// Most variants emit a single guard; `GuardBounds` expands to the
     /// int_ge/int_le/int_and pairs of `IntBound::make_guards`
@@ -2432,9 +2459,9 @@ impl GuardRequirement {
                 // backend/model.py `cls_of_box()` returns
                 // `ConstInt(ptr2int(obj.typeptr))`, and backend regalloc
                 // reads `op.getarg(1).getint()`.
-                let class_const = ctx.make_constant_int(*expected_class);
                 let arg_b = ctx.materialize_operand_at(arg);
-                let class_b = ctx.materialize_operand_at(class_const);
+                let class_b =
+                    majit_ir::operand::Operand::const_from_value(Value::Int(*expected_class));
                 let mut op = Op::new(OpCode::GuardClass, &[arg_b.clone(), class_b.clone()]);
                 op.setfailargs(Default::default());
                 vec![majit_ir::OpRc::new(op)]
@@ -2455,9 +2482,9 @@ impl GuardRequirement {
                 // virtualstate.py:603 GUARD_NONNULL_CLASS [box, self.known_class].
                 // The class operand is the same ConstInt vtable address used
                 // by GUARD_CLASS.
-                let class_const = ctx.make_constant_int(*expected_class);
                 let arg_b = ctx.materialize_operand_at(arg);
-                let class_b = ctx.materialize_operand_at(class_const);
+                let class_b =
+                    majit_ir::operand::Operand::const_from_value(Value::Int(*expected_class));
                 let mut op = Op::new(OpCode::GuardNonnullClass, &[arg_b.clone(), class_b.clone()]);
                 op.setfailargs(Default::default());
                 vec![majit_ir::OpRc::new(op)]
@@ -2491,20 +2518,17 @@ impl GuardRequirement {
                         None => return Vec::new(),
                     }
                 };
-                // virtualstate.py:401: ResOperation(GUARD_VALUE,
-                // [box, self.constbox]). Preserve the Const object's type:
-                // ConstPtr must not be represented as ConstInt.
-                // history.py has no `ConstVoid` class — `LEVEL_CONSTANT`
-                // cannot be Void (mirrors the unreachable! in
-                // `_generate_guards` LEVEL_CONSTANT arm above).
-                let val_const = match expected_value {
-                    Value::Int(v) => ctx.make_constant_int(*v),
-                    Value::Float(f) => ctx.make_constant_float(*f),
-                    Value::Ref(r) => ctx.make_constant_ref(*r),
-                    Value::Void => unreachable!("LEVEL_CONSTANT cannot be Void"),
-                };
+                // virtualstate.py `NotVirtualStateInfo._generate_guards`:
+                // ResOperation(GUARD_VALUE, [box, self.constbox]). Preserve
+                // the Const object's type: ConstPtr must not be represented
+                // as ConstInt. history.py has no `ConstVoid` class —
+                // `LEVEL_CONSTANT` cannot be Void (mirrors the unreachable!
+                // in `_generate_guards` LEVEL_CONSTANT arm above).
                 let arg_b = ctx.materialize_operand_at(arg);
-                let val_b = ctx.materialize_operand_at(val_const);
+                let val_b = match expected_value {
+                    Value::Void => unreachable!("LEVEL_CONSTANT cannot be Void"),
+                    v => majit_ir::operand::Operand::const_from_value(v.clone()),
+                };
                 let mut op = Op::new(OpCode::GuardValue, &[arg_b.clone(), val_b.clone()]);
                 op.setfailargs(Default::default());
                 vec![majit_ir::OpRc::new(op)]
@@ -3426,7 +3450,10 @@ mod tests {
         let inputargs = state
             .make_inputargs(&[array_ref], &mut optimizer, &mut ctx, false)
             .expect("exported virtual array must enumerate its written slot");
-        assert_eq!(inputargs, vec![written_ref]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![written_ref]
+        );
     }
 
     #[test]
@@ -3459,7 +3486,10 @@ mod tests {
         let inputargs = state
             .make_inputargs(&[struct_ref], &mut optimizer, &mut ctx, false)
             .expect("exported virtual struct must enumerate its written slot");
-        assert_eq!(inputargs, vec![written_ref]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![written_ref]
+        );
     }
 
     #[test]
@@ -3498,7 +3528,10 @@ mod tests {
                 false,
             )
             .expect("make_inputargs");
-        assert_eq!(inputargs, vec![OpRef::int_op(10), OpRef::ref_op(12)]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![OpRef::int_op(10), OpRef::ref_op(12)]
+        );
     }
 
     #[test]
@@ -3534,7 +3567,10 @@ mod tests {
                 false,
             )
             .expect("make_inputargs_and_virtuals");
-        assert_eq!(inputargs, vec![OpRef::int_op(20), OpRef::ref_op(22)]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![OpRef::int_op(20), OpRef::ref_op(22)]
+        );
         assert_eq!(virtuals, vec![OpRef::ref_op(21)]);
     }
 
@@ -3546,17 +3582,16 @@ mod tests {
         let field = OpRef::int_op(11);
         let scalar = OpRef::int_op(12);
         ctx.materialize_operand_at(object);
-        ctx.materialize_operand_at(field);
+        // The field box `enum_forced_boxes` walks is this producer, not a
+        // second SameAs minted at the same position.
+        let field_box = ctx.materialize_operand_at(field);
         ctx.materialize_operand_at(scalar);
 
         let object_box = ctx
             .get_box_replacement_operand_opt(object)
             .expect("object box is bound");
         let mut info = PtrInfo::virtual_obj(descr, None);
-        info.setfield(
-            0,
-            crate::history::test_support::rooted_resop_operand(Type::Int, field.raw()),
-        );
+        info.setfield(0, field_box);
         ctx.set_ptr_info(&object_box, info);
 
         let state = export_state(&[object, field, scalar], &ctx);
@@ -3570,7 +3605,10 @@ mod tests {
             )
             .expect("make_inputargs_and_virtuals_with_source_positions");
 
-        assert_eq!(inputargs, vec![field, scalar]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![field, scalar]
+        );
         assert_eq!(virtuals, vec![object]);
         assert_eq!(
             source_positions,
@@ -3605,17 +3643,16 @@ mod tests {
         let field = OpRef::int_op(11);
         let scalar = OpRef::int_op(12);
         ctx.materialize_operand_at(object);
-        ctx.materialize_operand_at(field);
+        // The field box `enum_forced_boxes` walks is this producer, not a
+        // second SameAs minted at the same position.
+        let field_box = ctx.materialize_operand_at(field);
         ctx.materialize_operand_at(scalar);
 
         let object_box = ctx
             .get_box_replacement_operand_opt(object)
             .expect("object box is bound");
         let mut info = PtrInfo::virtual_obj(descr, None);
-        info.setfield(
-            0,
-            crate::history::test_support::rooted_resop_operand(Type::Int, field.raw()),
-        );
+        info.setfield(0, field_box);
         ctx.set_ptr_info(&object_box, info);
 
         let args = [object, field, scalar];
@@ -3691,7 +3728,10 @@ mod tests {
         let inputargs = state
             .make_inputargs(&[outer_a_ref, outer_b_ref], &mut optimizer, &mut ctx, false)
             .expect("make_inputargs");
-        assert_eq!(inputargs, vec![inner_field_value]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![inner_field_value]
+        );
     }
 
     /// Top-level Rc dedup parity: when two jump args resolve to the
@@ -3718,7 +3758,10 @@ mod tests {
             .make_inputargs(&[outer_ref, outer_ref], &mut optimizer, &mut ctx, false)
             .expect("make_inputargs");
         // Single deduped slot, written by the first top-level visit.
-        assert_eq!(inputargs, vec![outer_ref]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![outer_ref]
+        );
     }
 
     /// `VirtualState` assignment shares the info graph (`VirtualState.__init__`
@@ -3765,7 +3808,10 @@ mod tests {
         let inputargs = state
             .make_inputargs(&[virtual_ref], &mut optimizer, &mut ctx, false)
             .expect("make_inputargs");
-        assert_eq!(inputargs, vec![field_value]);
+        assert_eq!(
+            inputargs.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+            vec![field_value]
+        );
     }
 
     #[test]
@@ -3835,7 +3881,10 @@ mod tests {
         // forced allocation ref (which is what ctx.get_replacement
         // resolves the original virtual_ref to).
         assert_eq!(inputargs.len(), 1);
-        assert_eq!(inputargs[0], ctx.get_replacement_opref(virtual_ref));
+        assert_eq!(
+            inputargs[0].to_opref(),
+            ctx.get_replacement_opref(virtual_ref)
+        );
         assert!(virtuals.is_empty());
     }
 

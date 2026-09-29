@@ -872,11 +872,11 @@ pub struct OptHeap {
     /// Set to true when `_optimize_CALL_DICT_LOOKUP` folds a lookup;
     /// read by `optimize_GUARD_NO_EXCEPTION` to suppress the trailing guard.
     last_emitted_removed: bool,
-    /// heap.py:337: cached_dict_reads — descr_identity(extradescrs[0]) → { [dict,key] → result_opref }.
+    /// heap.py OptHeap.cached_dict_reads: cached_dict_reads — descr_identity(extradescrs[0]) → { [dict,key] → result box }.
     /// Consecutive dict lookups on the same dict+key are deduplicated.
     /// Inner key uses `DictArgKey` so Const args compare by value
     /// (util.py args_dict / args_eq via history.py same_box).
-    cached_dict_reads: crate::FxIndexMap<usize, crate::FxIndexMap<[DictArgKey; 2], OpRef>>,
+    cached_dict_reads: crate::FxIndexMap<usize, crate::FxIndexMap<[DictArgKey; 2], Operand>>,
     /// heap.py:560: corresponding_array_descrs — maps extradescrs[1] (entries
     /// array descr) → extradescrs[0] dict identity.
     ///
@@ -1751,11 +1751,11 @@ impl OptHeap {
             DictArgKey::from_arg(&op.arg(2), ctx),
         ];
 
-        if let Some(res_v) = d.get(&key).copied() {
+        if let Some(res_v) = d.get(&key).cloned() {
             // heap.py:523-525: flag != FLAG_LOOKUP → self.getintbound(res_v).known_ge_const(0)
             if flag != FLAG_LOOKUP {
                 let known_ge_zero = ctx
-                    .get_box_replacement_operand_opt(res_v)
+                    .resolve_operand_operand_opt(&res_v)
                     .and_then(|b| ctx.peek_intbound_box(&b))
                     .is_some_and(|b| b.known_ge_const(0));
                 if !known_ge_zero {
@@ -1764,9 +1764,7 @@ impl OptHeap {
             }
             // heap.py:525-527: make_equal_to + last_emitted_operation = REMOVED
             let b_old = Operand::from_bound_op(op_rc);
-            let b_res = ctx
-                .get_box_replacement_operand_opt(res_v)
-                .unwrap_or_else(|| ctx.materialize_operand_at(res_v));
+            let b_res = ctx.resolve_operand_operand(&res_v);
             ctx.make_equal_to(&b_old, &b_res);
             self.last_emitted_removed = true;
             return true;
@@ -1774,7 +1772,7 @@ impl OptHeap {
 
         // heap.py:517-518: no hit — cache if FLAG_LOOKUP
         if flag == FLAG_LOOKUP {
-            d.insert(key, op.pos().get());
+            d.insert(key, Operand::from_bound_op(op_rc));
         }
         false
     }
@@ -2528,13 +2526,14 @@ impl OptHeap {
             let cmp_arg1 = Operand::const_(majit_ir::Const::Int(0));
             let mut cmp_op = Op::new(OpCode::IntNe, &[cmp_arg0, cmp_arg1]);
             cmp_op.pos().set(cmp_pos);
-            ctx.emit(cmp_op);
+            let cmp_rc = OpRc::new(cmp_op);
+            ctx.emit_rc(cmp_rc.clone());
             // unroll.py:409 parity: synthetic guards inherit
             // rd_resume_position from patchguardop (the optimizer's
             // running GUARD_FUTURE_CONDITION). Without this, the guard
             // arrives at store_final_boxes_in_guard with -1 and would
             // be silently dropped under the patchguardop-only fallback.
-            let guard_arg = ctx.materialize_operand_at(cmp_pos);
+            let guard_arg = Operand::from_bound_op(&cmp_rc);
             let guard_op = Op::new(OpCode::GuardTrue, &[guard_arg]);
             if let Some(ref patch) = ctx.patchguardop {
                 guard_op.set_rd_resume_position(patch.rd_resume_position());
@@ -8610,15 +8609,15 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos().set(pos1);
-        // Pretend the result is known >= 0.
-        // `reserve_pos_typed` does not pre-mint a canonical host; `materialize_operand_at`
-        // materializes the operand for the reserved position here.
-        let pos1_box = ctx.materialize_operand_at(pos1);
+        // Pretend the result is known >= 0. The cache stores this op box
+        // (`OptHeap._optimize_CALL_DICT_LOOKUP` `d[key] = op`), so
+        // `getintbound(res_v)` reads the bound on that same box.
+        let op1_rc = OpRc::new(op1.clone());
         ctx.setintbound(
-            &pos1_box,
+            &Operand::from_bound_op(&op1_rc),
             &crate::optimizeopt::intutils::IntBound::from_constant(5),
         );
-        assert!(!heap._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx));
+        assert!(!heap._optimize_call_dict_lookup(&op1, &op1_rc, &mut ctx));
 
         // FLAG_STORE with known non-negative cached value → reuse.
         let pos2 = ctx.reserve_pos_typed(Type::Int);

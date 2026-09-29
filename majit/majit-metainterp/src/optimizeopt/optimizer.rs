@@ -686,7 +686,7 @@ impl Optimizer {
     fn import_virtual_state_value(
         info: &crate::optimizeopt::virtualstate::VirtualStateInfo,
         ctx: &mut OptContext,
-    ) -> OpRef {
+    ) -> Operand {
         // virtualstate.py make_inputargs parity: each VSI leaf
         // realizes a Box whose `box.type` matches the variant. Tag the
         // OpRef variant tag at allocation time so `opref.ty()` resolves
@@ -726,7 +726,7 @@ impl Optimizer {
             );
         }
         Self::apply_imported_virtual_state(info, &box_, ctx);
-        opref
+        box_
     }
 
     fn apply_imported_virtual_state(
@@ -761,16 +761,17 @@ impl Optimizer {
                     // ob_type (offset 0) class pointers — the exporter at
                     // `virtualstate.rs`'s `export_single_value` already
                     // encodes these as
-                    // `Value::Ref(GcRef)`, so `field_ref` is already a
-                    // typed `RefOp` variant carrying a `Value::Ref(class_gcref)`
-                    // const forwarding step on its `_forwarded` slot
+                    // `Value::Ref(GcRef)`, so the imported box's position is
+                    // already a typed `RefOp` variant and the box carries a
+                    // `Value::Ref(class_gcref)` const forwarding step on its
+                    // `_forwarded` slot
                     // (via `make_constant` in the `VirtualStateInfo::Constant`
                     // arm of `apply_imported_virtual_state`). The typed
                     // variant tag + Ref-typed const forwarding are
                     // the authoritative shape; no extra type marker is
                     // needed at the import side.
                     let _ = (field_descrs, known_class, field_idx);
-                    imported_fields.push((*field_idx, ctx.materialize_operand_at(field_ref)));
+                    imported_fields.push((*field_idx, field_ref));
                 }
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 ctx.set_ptr_info(
@@ -791,10 +792,7 @@ impl Optimizer {
                 let imported_items = items
                     .iter()
                     .map(|item_info| match item_info {
-                        Some(item_info) => {
-                            let item_ref = Self::import_virtual_state_value(item_info, ctx);
-                            ctx.materialize_operand_at(item_ref)
-                        }
+                        Some(item_info) => Self::import_virtual_state_value(item_info, ctx),
                         // virtualstate.py:272-280: absent fieldstate remains
                         // an unwritten virtual-array slot on import.
                         None => Operand::None,
@@ -821,7 +819,7 @@ impl Optimizer {
                 let mut imported_fields = majit_ir::ptr_info::VirtualFieldList::new();
                 for (field_idx, field_info) in fields {
                     let field_ref = Self::import_virtual_state_value(field_info, ctx);
-                    imported_fields.push((*field_idx, ctx.materialize_operand_at(field_ref)));
+                    imported_fields.push((*field_idx, field_ref));
                 }
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 ctx.set_ptr_info(
@@ -849,9 +847,7 @@ impl Optimizer {
                             .map(|(field_idx, field_info)| {
                                 let field = match field_info {
                                     Some(field_info) => {
-                                        let field_ref =
-                                            Self::import_virtual_state_value(field_info, ctx);
-                                        ctx.materialize_operand_at(field_ref)
+                                        Self::import_virtual_state_value(field_info, ctx)
                                     }
                                     // virtualstate.py _enum: retain the
                                     // dense unwritten element-field slot.
@@ -964,10 +960,10 @@ impl Optimizer {
         // tracked via `Rc::as_ptr` dedups shared subtrees across all
         // top-level state entries so `label_slot` advances by the same
         // number of leaves as `imported_label_args.len()`.
-        // The map value caches the imported Phase 2 OpRef for the first
+        // The map value caches the imported Phase 2 box for the first
         // visit so subsequent revisits resolve to the same box (mirroring
         // RPython's setinfo_from_preamble.get_forwarded sharing).
-        let mut walk_visited: crate::FxIndexMap<usize, OpRef> = crate::FxIndexMap::default();
+        let mut walk_visited: crate::FxIndexMap<usize, Operand> = crate::FxIndexMap::default();
         for (state_idx, state_info) in all_states.iter().enumerate() {
             if let Some(iv) = iv_map.get(&state_idx).copied() {
                 // Virtual state: process fields recursively, consuming slots
@@ -983,7 +979,7 @@ impl Optimizer {
                 if walk_visited.contains_key(&top_key) {
                     continue;
                 }
-                walk_visited.insert(top_key, OpRef::NONE);
+                walk_visited.insert(top_key, Operand::None);
                 //
                 // `iv.inputarg_index` is the virtualizable state's index
                 // within `next_iteration_args`, which corresponds to
@@ -1011,16 +1007,20 @@ impl Optimizer {
                 let raw =
                     OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(iv.inputarg_index));
                 let virtual_head = ctx.get_replacement_opref(raw);
-                walk_visited.insert(top_key, virtual_head);
+                let virtual_head_box = ctx
+                    .get_box_replacement_operand_opt(raw)
+                    .unwrap_or(Operand::None);
+                walk_visited.insert(top_key, virtual_head_box);
                 let mut fields = Vec::new();
                 for (descr, field_info) in &iv.fields {
-                    let field_ref = Self::import_virtual_state_from_label_args(
+                    let field_box = Self::import_virtual_state_from_label_args(
                         field_info,
                         imported_label_args,
                         &mut label_slot,
                         ctx,
                         &mut walk_visited,
                     );
+                    let field_ref = field_box.to_opref();
                     let field_idx = fields.len();
                     let field_is_virtual = ctx
                         .get_box_replacement_operand_opt(field_ref)
@@ -1186,7 +1186,7 @@ impl Optimizer {
     /// virtualstate.py `VirtualStateConstructor.create_state` cache
     /// parity for the import side: dedup nested `Rc<VirtualStateInfo>`
     /// references via pointer identity, returning the previously imported
-    /// Phase 2 OpRef on revisits so shared substates collapse onto a
+    /// Phase 2 box on revisits so shared substates collapse onto a
     /// single Phase 2 box (matching RPython's setinfo_from_preamble
     /// `if op.get_forwarded() is not None: return` semantics).
     fn import_virtual_state_from_label_args_recurse(
@@ -1194,15 +1194,15 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut crate::FxIndexMap<usize, OpRef>,
-    ) -> OpRef {
+        walk_visited: &mut crate::FxIndexMap<usize, Operand>,
+    ) -> Operand {
         let key = std::rc::Rc::as_ptr(rc) as usize;
-        if let Some(&cached) = walk_visited.get(&key) {
-            return cached;
+        if let Some(cached) = walk_visited.get(&key) {
+            return cached.clone();
         }
         // Insert a placeholder NONE to break cycles, then overwrite with
-        // the real OpRef once import_virtual_state_from_label_args returns.
-        walk_visited.insert(key, OpRef::NONE);
+        // the real box once import_virtual_state_from_label_args returns.
+        walk_visited.insert(key, Operand::None);
         let opref = Self::import_virtual_state_from_label_args(
             &rc.info,
             imported_label_args,
@@ -1210,7 +1210,7 @@ impl Optimizer {
             ctx,
             walk_visited,
         );
-        walk_visited.insert(key, opref);
+        walk_visited.insert(key, opref.clone());
         opref
     }
 
@@ -1219,8 +1219,8 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut crate::FxIndexMap<usize, OpRef>,
-    ) -> OpRef {
+        walk_visited: &mut crate::FxIndexMap<usize, Operand>,
+    ) -> Operand {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
 
         match info {
@@ -1240,7 +1240,7 @@ impl Optimizer {
                 // allocation so the PtrInfo write below lands
                 // unconditionally — a bare position resolves to `None` and
                 // would silently drop the imported virtual-ness.
-                let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
+                let (_, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_fields: majit_ir::ptr_info::VirtualFieldList = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
@@ -1257,7 +1257,7 @@ impl Optimizer {
                         // (`Value::Ref(class_gcref)`) from `make_constant`. The
                         // Ref-typed const forwarding is the authoritative shape.
                         let _ = (field_descrs, known_class, field_idx);
-                        (*field_idx, ctx.materialize_operand_at(field_ref))
+                        (*field_idx, field_ref)
                     })
                     .collect();
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
@@ -1274,14 +1274,14 @@ impl Optimizer {
                         },
                     ),
                 );
-                opref
+                head_box
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
                 // unroll.py:454 Box carries its type. VArray heads are
                 // Ref-typed. Bound at allocation via `reserve_virtual_box`
                 // so the `set_ptr_info` write below cannot land on a bare
                 // position and silently drop the imported virtual-ness.
-                let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
+                let (_, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_items = items
                     .iter()
                     .map(|item_info| match item_info {
@@ -1293,7 +1293,7 @@ impl Optimizer {
                                 ctx,
                                 walk_visited,
                             );
-                            ctx.materialize_operand_at(item_ref)
+                            item_ref
                         }
                         // virtualstate.py:272-280: absent fieldstate remains
                         // an unwritten virtual-array slot on import.
@@ -1312,7 +1312,7 @@ impl Optimizer {
                         },
                     ),
                 );
-                opref
+                head_box
             }
             VirtualStateInfo::VStruct {
                 descr,
@@ -1323,7 +1323,7 @@ impl Optimizer {
                 // Ref-typed. Bound at allocation via `reserve_virtual_box`
                 // so the `set_ptr_info` write below cannot land on a bare
                 // position and silently drop the imported virtual-ness.
-                let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
+                let (_, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_fields = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
@@ -1334,7 +1334,7 @@ impl Optimizer {
                             ctx,
                             walk_visited,
                         );
-                        (*field_idx, ctx.materialize_operand_at(r))
+                        (*field_idx, r)
                     })
                     .collect();
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
@@ -1349,7 +1349,7 @@ impl Optimizer {
                         },
                     ),
                 );
-                opref
+                head_box
             }
             VirtualStateInfo::VArrayStruct {
                 descr,
@@ -1361,7 +1361,7 @@ impl Optimizer {
                 // `reserve_virtual_box` so the `set_ptr_info` write below
                 // cannot land on a bare position and silently drop the
                 // imported virtual-ness.
-                let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
+                let (_, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_elements = element_fields
                     .iter()
                     .map(|fields| {
@@ -1378,7 +1378,7 @@ impl Optimizer {
                                                 ctx,
                                                 walk_visited,
                                             );
-                                        ctx.materialize_operand_at(field_ref)
+                                        field_ref
                                     }
                                     // virtualstate.py _enum: retain the
                                     // dense unwritten element-field slot.
@@ -1401,7 +1401,7 @@ impl Optimizer {
                         },
                     ),
                 );
-                opref
+                head_box
             }
             VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull
@@ -1427,10 +1427,11 @@ impl Optimizer {
                 // unresolvable slot (`OpRef::NONE`, e.g. the MISS fallback
                 // above) yields `None` and the write no-ops — matching the
                 // prior `materialize_operand_at(OpRef::NONE) -> None` behavior.
-                if let Some(box_) = ctx.get_box_replacement_operand_opt(opref) {
-                    Self::apply_imported_virtual_state(info, &box_, ctx);
+                let resolved = ctx.get_box_replacement_operand_opt(opref);
+                if let Some(box_) = &resolved {
+                    Self::apply_imported_virtual_state(info, box_, ctx);
                 }
-                ctx.get_replacement_opref(opref)
+                resolved.unwrap_or(Operand::None)
             }
         }
     }
@@ -1863,7 +1864,14 @@ impl Optimizer {
             match preview_virtual_state
                 .make_inputargs_and_virtuals_with_source_positions(vs_args, self, &mut ctx, false)
             {
-                Ok(pair) => pair,
+                Ok(pair) => {
+                    let (label_boxes, virtuals, positions) = pair;
+                    (
+                        label_boxes.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+                        virtuals,
+                        positions,
+                    )
+                }
                 Err(_) => {
                     // unroll.py:193,207-210: on the BRIDGE path the
                     // short-preamble/export preview does not exist — VS
@@ -8077,9 +8085,10 @@ mod tests {
     fn import_unknown_leaf_resolves_to_bound_box() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(8, 0, 0, 50);
         let info = crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(Type::Ref);
-        let opref = Optimizer::import_virtual_state_value(&info, &mut ctx);
+        let box_ = Optimizer::import_virtual_state_value(&info, &mut ctx);
         assert!(
-            ctx.get_box_replacement_operand_opt(opref).is_some(),
+            ctx.get_box_replacement_operand_opt(box_.to_opref())
+                .is_some(),
             "Unknown-leaf import must bind the canonical host at allocation"
         );
     }
@@ -8177,7 +8186,7 @@ mod tests {
             &mut walk_visited,
         );
         let b = ctx
-            .get_box_replacement_operand_opt(head)
+            .get_box_replacement_operand_opt(head.to_opref())
             .expect("virtual head must bind the canonical host at allocation");
         assert!(
             matches!(

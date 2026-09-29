@@ -10,9 +10,11 @@
 //! commit one half and lose the other.
 //!
 //! This fixture is the virt-array shape (`stackpos: int, stack: [int; virt]`)
-//! that every majit example interpreter uses. It lives in its own integration
-//! test binary because it sets `MAJIT_STEP_LIMIT`, and the knob is a
-//! process-wide `LazyLock` (`lib.rs step_limit`) — one test per process.
+//! that every majit example interpreter uses. `mainloop` sets a small
+//! `trace_limit` on the driver (`WarmEnterState::set_param`) so
+//! `TraceCtx::is_too_long` cuts the trace off inside an opcode arm. That
+//! abort is the trace-too-long abort `MetaInterp.blackhole_if_trace_too_long`
+//! answers.
 //!
 //! Short-circuiting the conversion so the abort falls back to that source pc
 //! makes the same run panic with `index out of bounds: the len is N but the
@@ -51,6 +53,11 @@ struct StackState {
 pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<StackState> =
         majit_metainterp::JitDriver::new(threshold);
+    // Cuts the trace off inside an opcode arm (`TraceCtx::is_too_long`).
+    driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .set_param("trace_limit", 2);
     let mut pc: usize = 0;
     let mut state = StackState {
         stackpos: 0,
@@ -152,14 +159,8 @@ fn sum_program() -> Vec<u8> {
 
 #[test]
 fn mid_opcode_abort_preserves_virt_stack() {
-    // Small enough that every trace attempt is cut off inside an opcode arm,
-    // which is the `run_to_end` runaway backstop's own mid-opcode `Abort` —
-    // one of the exits the conversion exists to cover. Set before any JIT call
-    // because `step_limit()` latches on first read.
-    unsafe {
-        std::env::set_var("MAJIT_STEP_LIMIT", "200");
-    }
-
+    // `mainloop` sets `trace_limit` to 2, so `TraceCtx::is_too_long` aborts
+    // inside an opcode arm and the blackhole conversion finishes it.
     let program = sum_program();
     for n in [1_i64, 2, 3, 5, 10, 20, 50, 100, 200] {
         let got = mainloop(&program, n, 3);

@@ -644,26 +644,6 @@ pub fn unroll_skip_reason(env_override: bool, enable_opts: &[String]) -> Option<
     }
 }
 
-pub fn stall_window() -> u64 {
-    static VAL: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-        std::env::var("MAJIT_STALL_WINDOW")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1_000_000)
-    });
-    *VAL
-}
-
-pub fn step_limit() -> u64 {
-    static VAL: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-        std::env::var("MAJIT_STEP_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8_000_000)
-    });
-    *VAL
-}
-
 /// A dispatch arm whose body `#[jit_interp]` could not lower, so the macro
 /// substituted a bare `BC_ABORT` sub-JitCode for it.
 ///

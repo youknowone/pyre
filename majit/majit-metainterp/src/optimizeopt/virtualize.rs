@@ -481,12 +481,14 @@ impl OptVirtualize {
                             .as_array_descr()
                             .expect("non-struct NEW_ARRAY descr must be an ArrayDescr")
                             .item_type();
-                        let default_ref = match item_type {
-                            Type::Int | Type::Void => ctx.make_constant_int(0),
-                            Type::Ref => ctx.make_constant_ref(majit_ir::GcRef::NULL),
-                            Type::Float => ctx.make_constant_float(0.0),
+                        let default_box = match item_type {
+                            Type::Int | Type::Void => Operand::const_from_value(Value::Int(0)),
+                            Type::Ref => {
+                                Operand::const_(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
+                            }
+                            Type::Float => Operand::const_from_value(Value::Float(0.0)),
                         };
-                        vec![ctx.materialize_operand_at(default_ref); size as usize]
+                        vec![default_box; size as usize]
                     } else {
                         vec![Operand::None; size as usize]
                     };
@@ -535,7 +537,7 @@ impl OptVirtualize {
 
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_box = ctx.resolve_operand_operand_opt(&op.arg(0));
-        let value_ref = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
+        let value_ref = ctx.resolve_operand_operand(&op.arg(1));
         let setfield_descr_arc = op
             .getdescr()
             .expect("optimize_setfield_gc: field op without FieldDescr");
@@ -546,10 +548,8 @@ impl OptVirtualize {
         let is_typeptr = field_descr.is_typeptr();
         // Pre-extract constant value before mutable borrow of ptr_info.
         // Class pointer may be stored as Value::Int OR Value::Ref.
-        let value_as_constant: Option<usize> = ctx
-            .get_box_replacement_operand_opt(value_ref)
-            .and_then(|b| ctx.get_constant_box(&b))
-            .and_then(|v| match v {
+        let value_as_constant: Option<usize> =
+            ctx.get_constant_box(&value_ref).and_then(|v| match v {
                 majit_ir::Value::Int(i) => Some(i as usize),
                 majit_ir::Value::Ref(gc) => Some(gc.as_usize()),
                 _ => None,
@@ -563,7 +563,7 @@ impl OptVirtualize {
         // it as a lazy_set. The virtual value is NOT forced — OptHeap delays
         // it until guard emission (force_lazy_sets_for_guard) or JUMP.
 
-        let value_op = ctx.materialize_operand_at(value_ref);
+        let value_op = value_ref.clone();
         let early = struct_box
             .as_ref()
             .and_then(|b| ctx.with_ptr_info_mut(b, |info| {
@@ -781,7 +781,7 @@ impl OptVirtualize {
                 if let Some(val_ref) = stored {
                     drop(info);
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_val = ctx.get_box_replacement_operand(val_ref);
+                    let b_val = ctx.resolve_operand_operand(&val_ref);
                     ctx.make_equal_to(&b_old, &b_val);
                     return OptimizationResult::Remove;
                 }
@@ -890,9 +890,7 @@ impl OptVirtualize {
             if let Some(val_ref) = field_val {
                 drop(info);
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_val = ctx
-                    .get_box_replacement_operand_opt(val_ref)
-                    .unwrap_or_else(|| ctx.materialize_operand_at(val_ref));
+                let b_val = ctx.resolve_operand_operand(&val_ref);
                 ctx.make_equal_to(&b_old, &b_val);
                 return OptimizationResult::Remove;
             }
@@ -981,14 +979,14 @@ impl OptVirtualize {
 
     fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
-        let value_ref = ctx.resolve_operand_operand(&op.arg(2)).to_opref();
+        let value_ref = ctx.resolve_operand_operand(&op.arg(2));
 
         if let Some(index) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             let idx = index as usize;
-            let value_op = ctx.materialize_operand_at(value_ref);
+            let value_op = value_ref.clone();
             let did_virtual_write = array_box
                 .as_ref()
                 .and_then(|b| {
@@ -1037,17 +1035,15 @@ impl OptVirtualize {
             if index < 0 || (index as usize) >= vinfo.items.len() {
                 return OptimizationResult::InvalidLoop("virtual array getitem index out of range");
             }
-            let item_ref = vinfo.items[index as usize].to_opref();
-            if item_ref.is_none() {
+            let item = vinfo.items[index as usize].clone();
+            if item.to_opref().is_none() {
                 return OptimizationResult::InvalidLoop(
                     "virtual array getitem from uninitialized slot",
                 );
             }
             drop(info);
             let b_old = Operand::from_bound_op(op_rc);
-            let b_item = ctx
-                .get_box_replacement_operand_opt(item_ref)
-                .unwrap_or_else(|| ctx.materialize_operand_at(item_ref));
+            let b_item = ctx.resolve_operand_operand(&item);
             ctx.make_equal_to(&b_old, &b_item);
             return OptimizationResult::Remove;
         }
@@ -1132,9 +1128,7 @@ impl OptVirtualize {
             }
             let fld = fld.unwrap();
             let b_old = Operand::from_bound_op(op_rc);
-            let b_fld = ctx
-                .get_box_replacement_operand_opt(fld)
-                .unwrap_or_else(|| ctx.materialize_operand_at(fld));
+            let b_fld = ctx.resolve_operand_operand(&fld);
             ctx.make_equal_to(&b_old, &b_fld);
             return OptimizationResult::Remove;
         }
@@ -1154,7 +1148,7 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
-        let value_ref = ctx.resolve_operand_operand(&op.arg(2)).to_opref();
+        let value_ref = ctx.resolve_operand_operand(&op.arg(2));
         // `info.py setinteriorfield_virtual` indexes the per-element
         // field list by `fielddescr.get_index()`.  Same shape as the GET
         // counterpart — strip the outer `InteriorFieldDescr` first.
@@ -1171,7 +1165,7 @@ impl OptVirtualize {
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             let elem_idx = index as usize;
-            let value_op = ctx.materialize_operand_at(value_ref);
+            let value_op = value_ref.clone();
             let did_write = array_box
                 .as_ref()
                 .and_then(|b| {
@@ -1732,18 +1726,13 @@ impl OptVirtualize {
     /// here on the VirtualStruct half and the setfield_gc emit path is
     /// taken only when the vref has already escaped.
     fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let vref_ref = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
-        let obj_ref = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
+        let vref_box = ctx.resolve_operand_operand(&op.arg(0));
+        let obj_box = ctx.resolve_operand_operand(&op.arg(1));
 
         // virtualize.py: `CONST_NULL.same_constant(objbox)` — only a
         // Ref-typed null constant matches; a plain ConstInt(0) does not.
-        // `get_box_replacement` resolves const-namespace OpRefs to their
-        // on-demand `Forwarded::Const` and walks the chain terminal;
-        // `is_const_null` reads `const_value()` and tolerates an unbound
-        // terminal (non-const -> false), so the null check is read-only.
-        let obj_box = ctx
-            .get_box_replacement_operand_opt(obj_ref)
-            .unwrap_or_else(|| ctx.materialize_operand_at(obj_ref));
+        // `is_const_null` reads the resolved operand's `const_value()` and
+        // tolerates a non-const terminal, so the null check is read-only.
         let obj_is_null = ctx.is_const_null(&obj_box);
 
         // If vref is still virtual, update the virtual struct fields directly
@@ -1751,41 +1740,32 @@ impl OptVirtualize {
         // there is no `send_extra_operation` re-entry to absorb the writes).
         // virtualize.py:150-153: set 'forced' to point to the real object
         // (skipped when objbox is CONST_NULL).
-        let vref_box = ctx.get_box_replacement_operand_opt(vref_ref);
-        let obj_op = ctx.materialize_operand_at(obj_ref);
-        let did_forced_write = vref_box
-            .as_ref()
-            .and_then(|b| {
-                ctx.with_ptr_info_mut(b, |info| {
-                    if !info.is_virtual() {
-                        return false;
+        let did_forced_write = ctx
+            .with_ptr_info_mut(&vref_box, |info| {
+                if !info.is_virtual() {
+                    return false;
+                }
+                if let PtrInfo::Virtual(vinfo) = info {
+                    if !obj_is_null {
+                        set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_box.clone());
                     }
-                    if let PtrInfo::Virtual(vinfo) = info {
-                        if !obj_is_null {
-                            set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_op.clone());
-                        }
-                        return true;
-                    }
-                    false
-                })
+                    return true;
+                }
+                false
             })
             .unwrap_or(false);
         if did_forced_write {
             // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
-            // make_constant_ref needs a ctx reborrow, hence two sequential
-            // with_ptr_info_mut calls.
             let null_op = Operand::const_(majit_ir::Const::Ref(majit_ir::GcRef::NULL));
-            if let Some(b) = vref_box.as_ref() {
-                ctx.with_ptr_info_mut(b, |info| {
-                    if let PtrInfo::Virtual(vinfo) = info {
-                        set_field(
-                            &mut vinfo.fields,
-                            VREF_VIRTUAL_TOKEN_FIELD_INDEX,
-                            null_op.clone(),
-                        );
-                    }
-                });
-            }
+            ctx.with_ptr_info_mut(&vref_box, |info| {
+                if let PtrInfo::Virtual(vinfo) = info {
+                    set_field(
+                        &mut vinfo.fields,
+                        VREF_VIRTUAL_TOKEN_FIELD_INDEX,
+                        null_op.clone(),
+                    );
+                }
+            });
             return OptimizationResult::Remove;
         }
 
@@ -1795,8 +1775,8 @@ impl OptVirtualize {
         // `vrefinfo.descr_forced` (the cached `cpu.fielddescrof(...)`
         // Arc from `virtualref.py:42`).
         if !obj_is_null {
-            let arg_vref = ctx.materialize_operand_at(vref_ref);
-            let arg_obj = ctx.materialize_operand_at(obj_ref);
+            let arg_vref = vref_box.clone();
+            let arg_obj = obj_box.clone();
             let mut set_forced = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_obj.clone()]);
             set_forced.setdescr(self.vrefinfo.descr_forced.clone());
             ctx.emit_extra(ctx.current_pass_idx, set_forced);
@@ -1804,7 +1784,7 @@ impl OptVirtualize {
 
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL via
         // `vrefinfo.descr_virtual_token` (`virtualref.py:40-41`).
-        let arg_vref = ctx.materialize_operand_at(vref_ref);
+        let arg_vref = vref_box.clone();
         let arg_null = Operand::const_(majit_ir::Const::Ref(majit_ir::GcRef::NULL));
         let mut set_token = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_null.clone()]);
         set_token.setdescr(self.vrefinfo.descr_virtual_token.clone());
@@ -1851,8 +1831,7 @@ impl OptVirtualize {
             return false;
         }
         // vref = getptrinfo(op.getarg(1)); if vref and vref.is_virtual():
-        let (token_ref, forced_ref) = match ctx.peek_ptr_info(&op.arg(1).get_box_replacement(false))
-        {
+        let (tok, forced) = match ctx.peek_ptr_info(&op.arg(1).get_box_replacement(false)) {
             Some(PtrInfo::Virtual(vinfo)) => {
                 // tokenop = vref.getfield(vrefinfo.descr_virtual_token, None)
                 // if tokenop is None: return False
@@ -1873,7 +1852,7 @@ impl OptVirtualize {
         // `Type::Ref` slot whose constant null is `Value::Ref(GcRef(0))`
         // (see `optimize_virtual_ref_finish`).
         let token_is_constant_null = matches!(
-            ctx.get_box_replacement_operand_opt(token_ref).and_then(|b| ctx.get_constant_box(&b)),
+            ctx.get_constant_box(&tok),
             Some(Value::Ref(r)) if r.0 == 0
         );
         if !token_is_constant_null {
@@ -1881,13 +1860,11 @@ impl OptVirtualize {
         }
         // forcedinfo = getptrinfo(forcedop)
         // if forcedinfo is not None and not forcedinfo.is_null():
-        let forced_ref = match forced_ref {
-            Some(r) if r != OpRef::NONE => r,
+        let forced_ref = match forced {
+            Some(r) if !r.to_opref().is_none() => r,
             _ => return false,
         };
-        // One chain walk; the position view falls back to the source.
-        let forced_box = ctx.get_box_replacement_operand_opt(forced_ref);
-        let forced_resolved = forced_box.as_ref().map_or(forced_ref, |b| b.to_opref());
+        let forced_box = ctx.resolve_operand_operand_opt(&forced_ref);
         let forced_ok = match forced_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             Some(info) => !info.is_null(),
             None => false,
@@ -1896,12 +1873,8 @@ impl OptVirtualize {
             return false;
         }
         // self.make_equal_to(op, forcedop)
-        // `forced_resolved` is the chain terminal of a forced virtual, which
-        // is always an emitted producer, so it resolves without minting.
         let b_old = Operand::from_bound_op(op_rc);
-        let b_forced = ctx
-            .get_box_replacement_operand_opt(forced_resolved)
-            .expect("forced virtual terminal must resolve to a bound operand");
+        let b_forced = forced_box.expect("forced virtual terminal must resolve to a bound operand");
         ctx.make_equal_to(&b_old, &b_forced);
         // self.last_emitted_operation = REMOVED
         self.last_emitted_was_removed = true;
@@ -2680,11 +2653,11 @@ fn set_field(fields: &mut majit_ir::ptr_info::VirtualFieldList, field_idx: u32, 
     fields.push((field_idx, value));
 }
 
-fn get_field(fields: &[(u32, Operand)], field_idx: u32) -> Option<OpRef> {
+fn get_field(fields: &[(u32, Operand)], field_idx: u32) -> Option<Operand> {
     fields
         .iter()
         .find(|(idx, _)| *idx == field_idx)
-        .map(|(_, b)| b.to_opref())
+        .map(|(_, b)| b.clone())
 }
 
 #[derive(Debug)]
