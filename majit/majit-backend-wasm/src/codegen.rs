@@ -324,6 +324,42 @@ impl ValueLocals {
         }
 
         let n = by_id.len();
+        let mut is_ref = vec![false; n];
+        for ia in inputargs {
+            let i = ia.index as usize;
+            if i < n && ia.tp.get() == Type::Ref {
+                is_ref[i] = true;
+            }
+        }
+        for op in ops {
+            let result = op.pos().get();
+            if result != OpRef::NONE && !result.is_constant() && op.result_type() == Type::Ref {
+                let i = result.raw() as usize;
+                if i < n {
+                    is_ref[i] = true;
+                }
+            }
+            for arg in op.getarglist() {
+                let arg = arg.to_opref();
+                if arg != OpRef::NONE && !arg.is_constant() && arg.ty() == Some(Type::Ref) {
+                    let i = arg.raw() as usize;
+                    if i < n {
+                        is_ref[i] = true;
+                    }
+                }
+            }
+            if let Some(failargs) = op.getfailargs() {
+                for arg in failargs {
+                    let arg = arg.to_opref();
+                    if arg != OpRef::NONE && !arg.is_constant() && arg.ty() == Some(Type::Ref) {
+                        let i = arg.raw() as usize;
+                        if i < n {
+                            is_ref[i] = true;
+                        }
+                    }
+                }
+            }
+        }
         let mut def_at = vec![i32::MAX; n];
         let mut last_use = vec![-1i32; n];
         for ia in inputargs {
@@ -388,6 +424,24 @@ impl ValueLocals {
                 }
             }
         }
+        // A collecting call reloads every Ref `HomeLiveness` still considers
+        // live, including `GUARD_NOT_FORCED_2` failargs whose homes stay on
+        // the gcmap through the end of the trace. That reload is a write of
+        // this value's local. Ending the range at the last IR read lets a
+        // later def reuse the local, and the reload then plants the old
+        // pointer in the new value.
+        let home_liveness = HomeLiveness::collect_with_regions(inputargs, ops, &[]);
+        for (oi, op) in ops.iter().enumerate() {
+            if !collecting_site(op) {
+                continue;
+            }
+            let at = oi as i32;
+            for id in 0..n {
+                if by_id[id].is_some() && home_liveness.live_across(id as u32, oi) {
+                    last_use[id] = last_use[id].max(at);
+                }
+            }
+        }
 
         let mut root_of = vec![usize::MAX; n];
         for id in 0..n {
@@ -408,6 +462,9 @@ impl ValueLocals {
                 remaining -= 1;
             }
             root_of[id] = root;
+            if is_ref[id] && root < n {
+                is_ref[root] = true;
+            }
         }
 
         let mut root_start = vec![i32::MAX; n];
@@ -434,24 +491,34 @@ impl ValueLocals {
         // Non-overlapping ranges share a local of the same wasm type. A
         // range ends at its last read, so the next def (a later op) may
         // reuse it: emit reads the op's args before it writes the result.
+        // A Ref keeps a private local. A collecting call reloads that id's
+        // local from its home; handing the local to a later value plants
+        // the new occupant in the traced slot.
         let mut types = Vec::new();
+        let mut local_is_ref: Vec<bool> = Vec::new();
         let mut local_end: Vec<i32> = Vec::new();
         let mut root_locals: Vec<Option<u32>> = vec![None; n];
         for root in roots {
             let start = root_start[root];
             let end = root_end[root];
             let ty = id_types[root];
-            let reused = local_end
-                .iter()
-                .enumerate()
-                .find(|&(li, &lend)| lend < start && types[li] == ty)
-                .map(|(li, _)| li);
+            let root_is_ref = is_ref[root];
+            let reused = if root_is_ref {
+                None
+            } else {
+                local_end
+                    .iter()
+                    .enumerate()
+                    .find(|&(li, &lend)| lend < start && types[li] == ty && !local_is_ref[li])
+                    .map(|(li, _)| li)
+            };
             let local = if let Some(li) = reused {
                 local_end[li] = end;
                 li as u32 + first_local
             } else {
                 let local = types.len() as u32 + first_local;
                 types.push(ty);
+                local_is_ref.push(root_is_ref);
                 local_end.push(end);
                 local
             };
