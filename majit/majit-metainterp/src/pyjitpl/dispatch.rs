@@ -12950,12 +12950,6 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
         !func_ptr.is_null(),
         "call_int_function: null function pointer"
     );
-    // Where a backend cannot build a `call_indirect` whose type matches the
-    // callee's real signature (wasm32), route through the host trampoline,
-    // which reflects the signature and coerces each positional argument.
-    if let Some(hook) = majit_backend::call_stub::residual_host_call() {
-        return hook(func_ptr as usize, args);
-    }
     unsafe {
         match args {
             [] => {
@@ -13198,12 +13192,6 @@ pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]
         !func_ptr.is_null(),
         "call_float_function: null function pointer"
     );
-    // Where a backend cannot build a `call_indirect` whose type matches the
-    // callee's real signature (wasm32), route through the host trampoline,
-    // which reflects the signature and returns an f64 result as its raw bits.
-    if let Some(hook) = majit_backend::call_stub::residual_host_call() {
-        return f64::from_bits(hook(func_ptr as usize, args) as u64);
-    }
     let classes = arg_classes_from_types(args.len(), arg_types);
     unsafe {
         majit_backend::call_stub::bh_call_f_dispatch(
@@ -13250,7 +13238,14 @@ fn arg_classes_from_types(
     for (i, slot) in classes.iter_mut().enumerate().take(args_len) {
         *slot = match arg_types.get(i) {
             Some(Type::Float) => majit_backend::call_stub::ArgClass::Float,
-            Some(Type::Int | Type::Ref) | None => majit_backend::call_stub::ArgClass::Int,
+            Some(Type::Ref) => {
+                if cfg!(target_arch = "wasm32") {
+                    majit_backend::call_stub::ArgClass::Ref
+                } else {
+                    majit_backend::call_stub::ArgClass::Int
+                }
+            }
+            Some(Type::Int) | None => majit_backend::call_stub::ArgClass::Int,
             // `descr.py TYPE('v')` is `lltype.Void`, which upstream
             // never puts in `arg_classes` for a call it dispatches.
             Some(Type::Void) => panic!("typed call: void argument class at slot {i}"),
@@ -13278,9 +13273,6 @@ pub fn call_int_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[T
         !func_ptr.is_null(),
         "call_int_function_typed: null function pointer"
     );
-    if let Some(hook) = majit_backend::call_stub::residual_host_call() {
-        return hook(func_ptr as usize, args);
-    }
     let classes = arg_classes_from_types(args.len(), arg_types);
     unsafe {
         majit_backend::call_stub::bh_call_i_dispatch(
@@ -13305,6 +13297,22 @@ pub fn call_ref_function(func_ptr: *const (), args: &[i64]) -> i64 {
     call_int_function(func_ptr, args)
 }
 
+/// `bh_call_r` for a caller that holds `descr.arg_types()`.
+pub fn call_ref_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> i64 {
+    assert!(
+        !func_ptr.is_null(),
+        "call_ref_function_typed: null function pointer"
+    );
+    let classes = arg_classes_from_types(args.len(), arg_types);
+    unsafe {
+        majit_backend::call_stub::bh_call_r_dispatch(
+            func_ptr as usize,
+            &classes[..args.len()],
+            args,
+        )
+    }
+}
+
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "The raw address is an internal JIT/GC handle validated by the descriptor and object-space boundary; making this orchestration API unsafe would incorrectly transfer collector invariants to every caller"
@@ -13314,15 +13322,6 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
         !func_ptr.is_null(),
         "call_void_function: null function pointer"
     );
-    // See `call_int_function`: the host trampoline reflects the callee's real
-    // signature, so a void-typed residual whose target actually returns `i64`
-    // (e.g. `store_subscr_fn`) — or genuinely returns `()`
-    // (`set_current_exception_fn`) — is dispatched without a wasm
-    // indirect-call type mismatch. The reflected result is discarded.
-    if let Some(hook) = majit_backend::call_stub::residual_host_call() {
-        let _ = hook(func_ptr as usize, args);
-        return;
-    }
     unsafe {
         match args {
             [] => {
@@ -13538,10 +13537,6 @@ pub fn call_void_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[
         !func_ptr.is_null(),
         "call_void_function_typed: null function pointer"
     );
-    if majit_backend::call_stub::residual_host_call().is_some() {
-        call_void_function(func_ptr, args);
-        return;
-    }
     let classes = arg_classes_from_types(args.len(), arg_types);
     unsafe {
         majit_backend::call_stub::bh_call_v_dispatch(
