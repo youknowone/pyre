@@ -614,6 +614,7 @@ fn opens_root_scope(func: &CallFunc, push_roots: &HashSet<u64>) -> bool {
 /// `push_roots` itself. `pinned_params` are 0-based positions among the call
 /// arguments; `returns_pinned` means the return place holds a pin result or
 /// a slot read.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PinHelperSummary {
     pinned_params: HashSet<usize>,
     returns_pinned: bool,
@@ -644,6 +645,8 @@ struct PinAssignIndex {
     /// Bare locals whose single assignment is a call, and that were not
     /// overwritten later. A pin result is one of these.
     call_dests: HashSet<u64>,
+    /// `_t = &mut _l` — the callee writes the live word back through `_t`.
+    mut_borrow_of: HashMap<u64, u64>,
 }
 
 /// Single-assignment locals the pin-argument chase will follow.
@@ -702,7 +705,11 @@ fn index_pin_assigns(blocks: &[BasicBlock], terms: &[Option<TermKind>]) -> PinAs
             }
         }
     }
-    PinAssignIndex { defs, call_dests }
+    PinAssignIndex {
+        defs,
+        call_dests,
+        mut_borrow_of,
+    }
 }
 
 /// Parameter positions (0-based) among `1..=arg_count` that `seeds` reaches.
@@ -729,11 +736,7 @@ fn direct_pinned_params(body: &HelperBodyFact) -> HashSet<usize> {
             continue;
         }
         for seeds in &call.arg_locals {
-            out.extend(param_positions_reaching(
-                seeds,
-                &body.defs,
-                body.arg_count,
-            ));
+            out.extend(param_positions_reaching(seeds, &body.defs, body.arg_count));
         }
     }
     out
@@ -760,9 +763,7 @@ fn returns_pinned_word(body: &HelperBodyFact) -> bool {
 }
 
 fn body_calls_pin(body: &HelperBodyFact) -> bool {
-    body.calls
-        .iter()
-        .any(|call| is_pin_fn(&call.callee_name))
+    body.calls.iter().any(|call| is_pin_fn(&call.callee_name))
 }
 
 /// Which of `bodies` are pin helpers, and which of their parameters they pin.
@@ -813,13 +814,16 @@ fn summarize_pin_helpers(bodies: &HashMap<u64, HelperBodyFact>) -> HashMap<u64, 
         let mut extras: Vec<(u64, HashSet<usize>)> = Vec::new();
         for &id in &helpers {
             let body = &bodies[&id];
-            let have = &summaries[&id].pinned_params;
+            let have = summaries[&id].pinned_params.clone();
             let mut extra = HashSet::new();
             for call in &body.calls {
-                let Some(callee) = summaries.get(&call.callee) else {
+                let Some(positions) = summaries
+                    .get(&call.callee)
+                    .map(|summary| summary.pinned_params.clone())
+                else {
                     continue;
                 };
-                for &position in &callee.pinned_params {
+                for position in positions {
                     let Some(seeds) = call.arg_locals.get(position) else {
                         continue;
                     };
@@ -838,7 +842,11 @@ fn summarize_pin_helpers(bodies: &HashMap<u64, HelperBodyFact>) -> HashMap<u64, 
             break;
         }
         for (id, extra) in extras {
-            summaries.get_mut(&id).unwrap().pinned_params.extend(extra);
+            summaries
+                .get_mut(&id)
+                .expect("helper id is in the summary map")
+                .pinned_params
+                .extend(extra);
         }
     }
     summaries
@@ -870,7 +878,9 @@ fn helper_candidate_ids(
         let grown: Vec<u64> = callees
             .iter()
             .filter(|(id, cs)| {
-                !helpers.contains(*id) && !opens(cs) && cs.iter().any(|callee| helpers.contains(callee))
+                !helpers.contains(*id)
+                    && !opens(cs)
+                    && cs.iter().any(|callee| helpers.contains(callee))
             })
             .map(|(&id, _)| id)
             .collect();
@@ -1238,7 +1248,11 @@ pub fn scan(
         // A local assigned twice is not a chain worth following, so the map is
         // built over single-assignment locals only -- which is every temporary
         // `pin_roots(&[..])` lowers through.
-        let defs = index_pin_assigns(&body.body, &terms).defs;
+        let PinAssignIndex {
+            defs,
+            mut_borrow_of,
+            ..
+        } = index_pin_assigns(&body.body, &terms);
 
         // A body whose pinned set cannot be read is not a body with an empty
         // one: grading it would turn "not understood" into "root missing".
@@ -2238,11 +2252,7 @@ mod tests {
             false,
             vec![
                 ("pyre_object::gc_roots::pin_root", 9, vec![vec![4]]),
-                (
-                    "pyre_object::gc_roots::shadow_stack_get",
-                    8,
-                    vec![vec![3]],
-                ),
+                ("pyre_object::gc_roots::shadow_stack_get", 8, vec![vec![3]]),
             ],
         );
         slot.pin_result_locals.insert(0);
