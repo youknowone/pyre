@@ -15300,11 +15300,16 @@ fn emit_reconstructed_callee_pyframe(
     let w_globals_const = ctx.const_ref(w_globals as i64);
     let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
     let freevar_cells: Vec<OpRef> = recipe.registers_r[nlocals..stack_base].to_vec();
+    // The operands live at the guard, at their `locals_cells_stack_w` slots:
+    // the walk resumes mid-body and reads the frame image there (a callee
+    // loop header's FOR_ITER reads its iterator from the stack slot).
+    let stack_items: Vec<OpRef> = recipe.registers_r[stack_base..recipe.valuestackdepth].to_vec();
     restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
     crate::helpers::emit_new_pyframe_inline_with_params(
         ctx,
         &locals_boxes,
         &freevar_cells,
+        &stack_items,
         nlocals,
         frame_array_size,
         stack_base,
