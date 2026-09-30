@@ -4324,31 +4324,6 @@ fn descr_field_name(descr: &DescrRef) -> &str {
         .unwrap_or("<unnamed>")
 }
 
-/// `_opimpl_getfield_gc_any_pureornot` ref arm: the cached box and the
-/// live field are different objects. `gc_current_object_address` repairs
-/// a forwarding stub; it does not repair a nursery slot that was reused,
-/// nor a store that missed `setfield` / `invalidate_caches`.
-fn ref_heapcache_hit_is_stale(ctx: &TraceCtx, obj: OpRef, descr: &DescrRef, cached: OpRef) -> bool {
-    let Some(majit_ir::Value::Ref(cached_ref)) = ctx.box_value(cached) else {
-        return false;
-    };
-    if cached_ref == majit_ir::GcRef::NO_CONCRETE {
-        return false;
-    }
-    let Some(struct_ptr) = concrete_gc_ptr(ctx, obj) else {
-        return false;
-    };
-    let struct_ptr = majit_gc::gc_current_object_address(struct_ptr as usize) as i64;
-    let Some(majit_ir::Value::Ref(loaded)) =
-        ctx.field_sanity_load(struct_ptr, descr, majit_ir::Type::Ref)
-    else {
-        return false;
-    };
-    let loaded_now = majit_gc::gc_current_object_address(loaded.0);
-    let cached_now = majit_gc::gc_current_object_address(cached_ref.0);
-    loaded_now != cached_now
-}
-
 fn concrete_gc_ptr(ctx: &TraceCtx, obj: OpRef) -> Option<i64> {
     let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) else {
         return None;
@@ -15471,7 +15446,12 @@ pub(crate) fn setup_reconstructed_callee_frame(
         crate::helpers::emit_current_execution_context(ctx, "ExecutionContext::ReconstructedCallee")
     };
 
-    let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
+    // A callee whose code object has no live wrapper cannot receive a
+    // concrete frame; its residual calls and the blackhole preflight would
+    // both decline on the unset frame pointer, so decline here.
+    if w_code.is_null() {
+        return None;
+    }
     let concrete_frame_ptr = {
         // `perform_call` (`pyjitpl.py`) is three lines — `newframe` +
         // `setup_call` + `raise ChangeFrame` — and `newframe` builds an
@@ -15491,56 +15471,6 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // blackhole preflight on the unset frame pointer — so the drain aborts
         // after its sub-walk already executed a side effect and the rollback to the
         // guard then replays it.
-        if !w_code.is_null() {
-            // `FrameBox::new` allocates, so the slot values captured at guard
-            // failure must be forwarded through real shadow-stack slots first
-            // (`gctransform/framework.py` push_roots/pop_roots around a collection
-            // point).  Mirror the vable image exactly: a slot with no box is the
-            // `NewArrayClear` zero-fill, i.e. an unbound local, and stays PY_NULL.
-            let arg_roots = pyre_object::gc_roots::push_roots();
-            let arg_root_base = pyre_object::gc_roots::shadow_stack_len();
-            for (k, &opref) in locals_boxes.iter().enumerate() {
-                let obj = match recipe.concrete_r.get(k) {
-                    Some(&majit_ir::Value::Ref(majit_ir::GcRef(ptr)))
-                        if ptr != 0 && !opref.is_none() =>
-                    {
-                        ptr as pyre_object::PyObjectRef
-                    }
-                    _ => PY_NULL,
-                };
-                let _ = pyre_object::gc_roots::pin_root(obj);
-            }
-            let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..locals_boxes.len())
-                .map(|k| pyre_object::gc_roots::shadow_stack_get(arg_root_base + k))
-                .collect();
-            let mut frame = pyre_interpreter::pyframe::FrameBox::new(
-                pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
-                    w_code,
-                    &concrete_locals,
-                    w_globals,
-                    execution_context,
-                    PY_NULL,
-                    pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-                ),
-            );
-            drop(arg_roots);
-            // A `new_boxed` fallback frame is freed by the `drop(frame)` below;
-            // decline rather than stamp a pointer that is about to dangle, as the
-            // recording-time frame further down does.
-            if !frame.is_gc_owned() {
-                return None;
-            }
-            let concrete_frame_ptr = frame.as_mut_ptr();
-            ctx.set_opref_concrete(
-                frame_vable,
-                majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
-            );
-            // GC-managed `FrameBox::drop` relinquishes only the host handle; the
-            // frontend op above keeps the frame reachable through
-            // `MetaInterp::walk_active_trace_refs`.
-            drop(frame);
-        }
-
         // `perform_call` (pyjitpl.py) and a bridge resume
         // (resume.py) both allocate the callee MIFrame and then fill its
         // boxes — `newframe(jitcode)` + `setup_call` / `consume_boxes`. Neither

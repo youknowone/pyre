@@ -6984,22 +6984,24 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // handling: a loop header other than start_pc retargets the
                 // green key to the true merge point (cut-to-inner-loop);
                 // start_pc closes at the trace head.
+                //
+                // `compile_loop` files the loop under
+                // `original_boxes[:num_green_args]`, the greens of the merge
+                // point the trace closed at, so both arms carry the typed key:
+                // a close that leaves only the bucket hash makes
+                // `attach_procedure_to_interp` mint a cell without a
+                // `comparekey`, which no `get_jitcell` walk can match.
+                let key = crate::driver::make_green_key(w_code, loop_header_pc, is_being_profiled);
+                ctx.set_green_key(key, (w_code as usize, loop_header_pc));
+                ctx.header_pc = loop_header_pc;
                 if loop_header_pc != start_pc {
-                    let target_key =
-                        crate::driver::make_green_key(w_code, loop_header_pc, is_being_profiled);
-                    ctx.set_green_key(target_key, (w_code as usize, loop_header_pc));
-                    ctx.header_pc = loop_header_pc;
-                    ctx.cut_inner_green_key = Some(target_key);
-                    ctx.set_close_typed_key(crate::driver::make_green_key_typed(
-                        w_code,
-                        loop_header_pc,
-                        is_being_profiled,
-                    ));
-                } else {
-                    let key = crate::driver::make_green_key(w_code, start_pc, is_being_profiled);
-                    ctx.set_green_key(key, (w_code as usize, start_pc));
-                    ctx.header_pc = start_pc;
+                    ctx.cut_inner_green_key = Some(key);
                 }
+                ctx.set_close_typed_key(crate::driver::make_green_key_typed(
+                    w_code,
+                    loop_header_pc,
+                    is_being_profiled,
+                ));
                 TraceAction::CloseLoopWithArgs {
                     jump_args,
                     loop_header_pc: Some(loop_header_pc),
