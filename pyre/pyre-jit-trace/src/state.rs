@@ -15098,6 +15098,14 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
 /// live wrapper is registered or it carries no globals yet — the callers
 /// (`reconstruct_inline_recipe` and `assemble_bridge_inline_pending`) treat a
 /// null result as "decline the multi-frame path".
+///
+/// Reading the globals off the code object is `PyFrame.get_w_globals`
+/// (pyframe.py): with no `FrameDebugData` override it returns
+/// `jit.promote(self.pycode).w_globals`, the namespace `frame_stores_global`
+/// (pycode.py) recorded first. The override case never reaches here: the
+/// forward inline declines a callee whose function globals differ from that
+/// first-seen namespace (`w_code_frame_stores_global` in `inline_call.rs`),
+/// so every callee a bridge can reconstruct carries the code's own globals.
 /// Recover the callee's `W_Code` OBJECT for a reconstructed inline frame.
 ///
 /// Sibling of [`recover_inline_callee_globals`], reading the same
