@@ -11184,9 +11184,9 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let narrow_pyobject = container_is_enum
+                    let narrow_instance_class = container_is_enum
                         && field_name == "__pos_0"
-                        && self.enum_payload_is_nullable_pyobject(&place_ty);
+                        && self.enum_payload_is_nullable_instance_ptr(&place_ty);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::FieldRead {
@@ -11202,7 +11202,7 @@ impl<'a> Lowering<'a> {
                             pure: false,
                         },
                     });
-                    if narrow_pyobject {
+                    if narrow_instance_class {
                         let narrowed = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -23621,7 +23621,7 @@ impl<'a> Lowering<'a> {
     /// `unionof` with the already-narrowed `PY_NULL` arm then drops the
     /// `PyObject` class. The read wants the same
     /// `__cast_instance_intrinsic("PyObject")` narrow.
-    fn enum_payload_is_nullable_pyobject(&self, place_ty: &TyRef) -> bool {
+    fn enum_payload_is_nullable_instance_ptr(&self, place_ty: &TyRef) -> bool {
         if self
             .option_niche_null_cast(place_ty)
             .is_some_and(|(root, _)| root == "pyobject::PyObject")
@@ -60832,7 +60832,7 @@ mod tests {
     /// before it merges with the `PY_NULL` arm.
     #[test]
     #[ignore]
-    fn call_method_ok_payload_narrows_to_pyobject() {
+    fn call_method_ok_payload_narrows_to_the_instance_class() {
         use crate::model::OpKind;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
