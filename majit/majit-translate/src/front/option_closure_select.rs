@@ -1607,7 +1607,7 @@ mod tests {
     }
 
     #[test]
-    fn niche_receiver_str_cast_is_ne_rhs() {
+    fn niche_receiver_str_cast_is_is_rhs() {
         let mut g = FunctionGraph::new("test_closure_select_recv_str_cast");
         let a = g.startblock;
         let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
@@ -1634,18 +1634,18 @@ mod tests {
             1
         );
         let (raw_null, cast_result) = str_niche_null_cast(&g);
-        let ne = g.blocks[a.0]
+        let is_none = g.blocks[a.0]
             .operations
             .iter()
-            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne"))
-            .expect("ne discriminant");
-        match &ne.kind {
+            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"))
+            .expect("is_ discriminant");
+        match &is_none.kind {
             OpKind::BinOp { lhs, rhs, .. } => {
                 assert_eq!(lhs, &opt);
                 assert_eq!(rhs, &cast_result);
                 assert_ne!(rhs, &raw_null);
             }
-            other => panic!("expected ne, got {other:?}"),
+            other => panic!("expected is_, got {other:?}"),
         }
     }
 

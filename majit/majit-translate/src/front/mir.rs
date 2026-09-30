@@ -66244,8 +66244,9 @@ mod tests {
         assert_eq!(count_method_calls(&fixture.graph, "map"), 1);
     }
 
-    /// The receiver branches on its discriminant; the `Err` arm materialises
-    /// its carrier and raises it to the exceptblock.  Returns the `Ok` arm.
+    /// The receiver branches on its discriminant; the `Err` arm raises the
+    /// carrier with `type(carrier)` and an exceptblock link. The codewriter
+    /// rewrites that raise to `to_exc_object`. Returns the `Ok` arm.
     fn assert_err_arm_raises_to_the_exceptblock(
         fixture: &RaisingCombinator,
     ) -> crate::model::BlockId {
@@ -66259,20 +66260,28 @@ mod tests {
             .map(|id| &graph.blocks[id.0])
             .find(|arm| matches!(arm.exits.as_slice(), [exit] if exit.target == graph.exceptblock))
             .expect("Err arm");
-        let exc = err_arm
+        let type_of = err_arm
             .operations
             .iter()
-            .find_map(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments == &["test", "to_exc_object"].map(str::to_string) => {
-                    op.result.clone()
-                }
-                _ => None,
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments == &["type".to_string()]
+                )
             })
-            .expect("Err arm materialises the exception value");
-        assert!(err_arm.exits[0].args.contains(&LinkArg::Value(exc)));
+            .expect("Err arm records type(carrier)");
+        let OpKind::Call { args, .. } = &type_of.kind else {
+            unreachable!("matched a type() call");
+        };
+        let carrier = args[0].as_variable().expect("type() reads the carrier");
+        assert_eq!(
+            err_arm.exits[0].args[0].as_variable(),
+            type_of.result.as_ref()
+        );
+        assert_eq!(err_arm.exits[0].args[1].as_variable(), Some(carrier));
         assert!(err_arm.exits[0].exitcase.is_none());
         *arms.iter().find(|id| **id != err_arm.id).unwrap()
     }
