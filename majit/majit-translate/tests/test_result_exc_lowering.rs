@@ -33,7 +33,7 @@ const MODULE: &str = concat!(
 /// driver spells it (`pyre-jit-trace/build/prepass.rs`).  `majit-translate`
 /// names no carrier of its own, so a test that expects `Result<T, PyError>`
 /// to become exception links has to declare it.
-const PYRE_CARRIER: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
+const ERROR_CARRIER: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
     carrier_path: "pyre_interpreter::error::PyError",
     carrier_wrappers: &[],
     to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
@@ -48,7 +48,7 @@ fn lower_function(
         llbc,
         function_name,
         HostStaticAddrs {
-            error_carrier: PYRE_CARRIER,
+            error_carrier: ERROR_CARRIER,
             ..Default::default()
         },
     )
@@ -64,7 +64,7 @@ fn lower_function_to_runtime_edges(
     let mut graph = lower_function(llbc, function_name)?;
     majit_translate::codewriter::error_carrier_edges::lower_error_carrier_edges(
         &mut graph,
-        &majit_translate::OwnedErrorCarrierSpec::own(PYRE_CARRIER),
+        &majit_translate::OwnedErrorCarrierSpec::own(ERROR_CARRIER),
     );
     Ok(graph)
 }
