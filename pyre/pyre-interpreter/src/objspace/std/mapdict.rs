@@ -5124,19 +5124,15 @@ pub unsafe fn node_write<O: MapdictObject>(
     }
 }
 
-/// These tables are the temporary carrier for builtin-layout objects that do
-/// not yet have mapdict SPECIAL fields.  PyPy's SPECIAL fields are visible to
-/// every ExecutionContext, so the compatibility carrier must be
-/// interpreter/process-owned too, never TLS.
-pub static INSTANCE_DICT: LazyLock<Mutex<HashMap<usize, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// `MapdictWeakrefSupport` keeps a weakref lifeline in the `"weakref"` SPECIAL
+/// slot when the object carries mapdict storage. An object without that layout
+/// keeps the lifeline here. PyPy's SPECIAL field is visible to every
+/// ExecutionContext, so this carrier is interpreter-owned, never TLS.
 pub static WEAKREF_TABLE: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Keys whose table value has been stored since the last minor root walk, and
 /// so may still be a nursery object.  See [`snapshot_root_entries`].
-static INSTANCE_DICT_PENDING: LazyLock<Mutex<HashSet<usize>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 static WEAKREF_TABLE_PENDING: LazyLock<Mutex<HashSet<usize>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -5145,8 +5141,6 @@ static WEAKREF_TABLE_PENDING: LazyLock<Mutex<HashSet<usize>>> =
 /// dropped its owner resets the nursery, so such a key must be resolved to
 /// where the owner moved — or dropped, if it died — before that happens.  See
 /// [`reconcile_young_owner_entries`].
-static INSTANCE_DICT_YOUNG: LazyLock<Mutex<HashSet<usize>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 static WEAKREF_TABLE_YOUNG: LazyLock<Mutex<HashSet<usize>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -5154,12 +5148,6 @@ fn note_young_owner(young: &Mutex<HashSet<usize>>, key: PyObjectRef) {
     if majit_gc::gc_is_nursery_object(key as usize) {
         young.lock().insert(key as usize);
     }
-}
-
-fn instance_dict_insert(key: PyObjectRef, w_dict: PyObjectRef) {
-    INSTANCE_DICT.lock().insert(key as usize, w_dict as usize);
-    INSTANCE_DICT_PENDING.lock().insert(key as usize);
-    note_young_owner(&INSTANCE_DICT_YOUNG, key);
 }
 
 fn weakref_table_insert(key: PyObjectRef, value: PyObjectRef) {
@@ -5824,76 +5812,56 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
 ///     return w_dict
 /// ```
 ///
-/// `dont_look_inside` — the `_obj_setdict` read twin: the miss path reads
-/// the address-keyed `INSTANCE_DICT` thread-local side table (and allocates
-/// a fresh dict), state the tracer cannot model; the call residualises via
-/// the registered fnaddr (`@objectmodel.dont_inline` upstream,
-/// mapdict.py).
+/// `dont_look_inside` — the miss path allocates the MapDictStrategy view and
+/// writes the `"dict"` SPECIAL slot, state the tracer cannot model; the call
+/// residualises via the registered fnaddr (`@objectmodel.dont_inline`
+/// upstream, mapdict.py).
 #[majit_macros::dont_look_inside]
 pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
+    debug_assert!(unsafe { has_mapdict_storage(self_ref) });
     // mapdict.py: read the "dict" SPECIAL slot; on a miss build the
     // MapDictStrategy view and write it back into that slot. `strategy.erase(self)`
     // makes the view funnel every get/set/del/iter through the instance map+storage
     // — the single `__dict__` authority.
     //
-    // Only an object that carries mapdict storage answers out of the map —
-    // the same gate `_obj_setdict` applies. User subclasses of builtin types
-    // (`class MyInt(int)`) keep the builtin layout (no map) while their type is
-    // hasdict, so their `__dict__` stays in the address-keyed INSTANCE_DICT
-    // side table as a plain own-storage dict until subclass instances grow
-    // mapdict storage (upstream `user_setup`, mapdict.py).
-    if unsafe { has_mapdict_storage(self_ref) } {
-        // mapdict.py `if w_dict is not None`.  RPython's `read` answers
-        // None both for an absent slot and for one holding None, and both mean
-        // "build the view" — so a null must not reach the caller.  It would be
-        // reported as "the receiver has no dict", which is how
-        // `descr__setattr__` decides an ordinary instance store is
-        // `"'%T' object attribute '%s' is read-only"` (descroperation.py).
-        if let Some(w_dict) = unsafe { instance_get_dict_slot(self_ref) }
-            && !w_dict.is_null()
-        {
-            return w_dict;
-        }
-        // Allocating the wrapper and claiming the SPECIAL slot both collect, so
-        // the instance is published first and every use below reads back the
-        // relocated address.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let self_slot = pyre_object::gc_roots::pin_roots(&[self_ref]);
-        let dict_slot = self_slot + 1;
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new_with(
-            &MAP_DICT_STRATEGY_REF,
-            pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut u8,
-        ));
-        unsafe {
-            let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
-            // `dstorage` is the view's only link to its backing instance
-            // (mapdict.py) and `walk_gc_refs` forwards it — but only from
-            // the collection after the wrapper became reachable.  The
-            // allocation that produced the wrapper is not covered, so restate
-            // the back-pointer from the instance's current address.
-            (*(w_dict as *mut pyre_object::W_DictObject)).dstorage =
-                pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut u8;
-            pyre_object::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
-            let flag = instance_set_dict_slot(
-                pyre_object::gc_roots::shadow_stack_get(self_slot),
-                pyre_object::gc_roots::shadow_stack_get(dict_slot),
-            );
-            debug_assert!(flag, "write to the \"dict\" SPECIAL slot failed");
-        }
-        pyre_object::gc_roots::shadow_stack_get(dict_slot)
-    } else {
-        let existing = INSTANCE_DICT
-            .lock()
-            .get(&(self_ref as usize))
-            .copied()
-            .map(|dict| dict as PyObjectRef);
-        if let Some(w_dict) = existing {
-            return w_dict;
-        }
-        let w_dict = pyre_object::w_dict_new();
-        instance_dict_insert(self_ref, w_dict);
-        w_dict
+    // mapdict.py `if w_dict is not None`.  RPython's `read` answers
+    // None both for an absent slot and for one holding None, and both mean
+    // "build the view" — so a null must not reach the caller.  It would be
+    // reported as "the receiver has no dict", which is how
+    // `descr__setattr__` decides an ordinary instance store is
+    // `"'%T' object attribute '%s' is read-only"` (descroperation.py).
+    if let Some(w_dict) = unsafe { instance_get_dict_slot(self_ref) }
+        && !w_dict.is_null()
+    {
+        return w_dict;
     }
+    // Allocating the wrapper and claiming the SPECIAL slot both collect, so
+    // the instance is published first and every use below reads back the
+    // relocated address.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::pin_roots(&[self_ref]);
+    let dict_slot = self_slot + 1;
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new_with(
+        &MAP_DICT_STRATEGY_REF,
+        pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut u8,
+    ));
+    unsafe {
+        let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+        // `dstorage` is the view's only link to its backing instance
+        // (mapdict.py) and `walk_gc_refs` forwards it — but only from
+        // the collection after the wrapper became reachable.  The
+        // allocation that produced the wrapper is not covered, so restate
+        // the back-pointer from the instance's current address.
+        (*(w_dict as *mut pyre_object::W_DictObject)).dstorage =
+            pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut u8;
+        pyre_object::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
+        let flag = instance_set_dict_slot(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        );
+        debug_assert!(flag, "write to the \"dict\" SPECIAL slot failed");
+    }
+    pyre_object::gc_roots::shadow_stack_get(dict_slot)
 }
 
 fn current_owner_key(key: usize) -> usize {
@@ -5994,17 +5962,14 @@ pub unsafe fn mapdict_storage_custom_trace(
     };
 }
 
-/// Walk roots held by pyre's temporary mapdict side tables.
+/// Walk roots held by the weakref lifeline side table.
 ///
-/// PyPy stores the instance dict and weakref lifeline in mapdict SPECIAL slots,
-/// so the translated GC sees them as ordinary object fields. A `W_ObjectObject`
-/// is GC-managed (`W_OBJECT_OBJECT_GC_TYPE_ID`): its attribute storage and "dict"
-/// SPECIAL-slot wrapper are forwarded by `object_object_custom_trace`, so this
-/// walk no longer touches instances. The remaining side tables hold the weakref
-/// lifeline and the wrappers of non-instance hasdict objects (property/member)
-/// which have no map and live in immortal `Box`es the GC never scans. Expose
-/// those value slots here so the backend GC can update them when nursery objects
-/// move.
+/// PyPy stores the weakref lifeline in a mapdict SPECIAL slot, so the translated
+/// GC sees it as an ordinary object field. A `W_ObjectObject` is GC-managed
+/// (`W_OBJECT_OBJECT_GC_TYPE_ID`): its attribute storage and `"dict"` SPECIAL-slot
+/// wrapper are forwarded by `object_object_custom_trace`. An object without
+/// mapdict storage keeps the lifeline in [`WEAKREF_TABLE`]. Expose those value
+/// slots here so the backend GC can update them when nursery objects move.
 pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
     let data = capture_mapdict_root_area();
     unsafe { walk_mapdict_roots_area(data, &mut visitor) };
@@ -6029,8 +5994,7 @@ pub fn capture_mapdict_root_area() -> *const () {
 ///
 /// Without this split each collection cloned and walked the whole table, whose
 /// entries are roots and therefore outlive their owners: the per-collection
-/// cost grew with the number of hasdict builtin-layout objects the program had
-/// ever created.
+/// cost grew with the number of weakref lifelines the program had ever created.
 fn snapshot_root_entries(
     table: &Mutex<HashMap<usize, usize>>,
     pending: &Mutex<HashSet<usize>>,
@@ -6052,12 +6016,12 @@ fn snapshot_root_entries(
 
 /// Drop every entry whose owner did not survive the collection.
 ///
-/// These tables are keyed by owner address and hold their value as a root, so
-/// without this an owner's `__dict__` / `__weakref__` outlives it: the tables
-/// only grow, and every major collection marks the whole accumulation.
-/// Upstream has no equivalent table — `typedef.py`'s generated subclass carries
-/// `w_dict` as a field of the object, which dies with it — so the entries have
-/// to be given the same ephemeron semantics explicitly.
+/// [`WEAKREF_TABLE`] is keyed by owner address and holds its value as a root,
+/// so without this an owner's weakref lifeline outlives it: the table only
+/// grows, and every major collection marks the whole accumulation. Upstream
+/// has no equivalent table — the lifeline is a SPECIAL slot of the object,
+/// which dies with it — so the entries have to be given the same ephemeron
+/// semantics explicitly.
 ///
 /// Registered with `majit_gc::shadow_stack::register_ephemeron_pruner`, which
 /// runs it from a major collection only.  `classify` returns the owner's
@@ -6065,10 +6029,7 @@ fn snapshot_root_entries(
 /// nothing, so a surviving owner always answers with the key it was asked
 /// about and the surviving entries keep their keys.
 pub fn prune_dead_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>) {
-    for (table, pending) in [
-        (&INSTANCE_DICT, &INSTANCE_DICT_PENDING),
-        (&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING),
-    ] {
+    for (table, pending) in [(&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING)] {
         let mut table = table.lock();
         let dead: Vec<usize> = table
             .keys()
@@ -6093,7 +6054,7 @@ pub fn prune_dead_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>
 /// but a major is far too late for a young one. A nursery address is reused by
 /// the very next allocation after the collection resets the nursery, so a
 /// surviving entry does not just leak — the unrelated object that lands on
-/// that address inherits the dead owner's `__dict__`.
+/// that address inherits the dead owner's weakref lifeline.
 ///
 /// Registered with `majit_gc::shadow_stack::register_young_owner_reconciler`,
 /// which runs it from a minor collection once every survivor has been
@@ -6101,10 +6062,8 @@ pub fn prune_dead_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>
 /// died. Only keys recorded as young are asked about, so the cost is
 /// proportional to the entries made since the previous minor.
 pub fn reconcile_young_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>) {
-    for (table, pending, young) in [
-        (&INSTANCE_DICT, &INSTANCE_DICT_PENDING, &INSTANCE_DICT_YOUNG),
-        (&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING, &WEAKREF_TABLE_YOUNG),
-    ] {
+    for (table, pending, young) in [(&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING, &WEAKREF_TABLE_YOUNG)]
+    {
         let keys: Vec<usize> = {
             let mut young = young.lock();
             std::mem::take(&mut *young).into_iter().collect()
@@ -6144,17 +6103,16 @@ pub fn reconcile_young_owner_entries(classify: &mut dyn FnMut(usize) -> Option<u
 
 /// Mark side-table values only for owners that survived major marking.
 ///
-/// PyPy stores both the instance dict and weakref lifeline in fields on each
-/// concrete object, so ordinary tracing reaches either value iff it first
-/// reaches the owner. The temporary address-keyed carriers must reproduce that
-/// conditional edge. In particular, unconditionally rooting an instance dict
-/// whose value points back to its owner turns `obj.attr = obj` into a permanent
-/// root and prevents the owner's finalizer from ever running.
+/// PyPy stores the weakref lifeline in a field on each concrete object, so
+/// ordinary tracing reaches the value iff it first reaches the owner. The
+/// temporary address-keyed carrier must reproduce that conditional edge.
+/// Unconditionally rooting a lifeline whose value points back at its owner
+/// would keep the owner alive for the rest of the process.
 pub fn mark_live_side_table_entries(
     classify: &mut dyn FnMut(usize) -> Option<usize>,
     roots: &mut Vec<majit_ir::GcRef>,
 ) {
-    for table in [&INSTANCE_DICT, &WEAKREF_TABLE] {
+    for table in [&WEAKREF_TABLE] {
         let entries: Vec<(usize, usize)> = table
             .lock()
             .iter()
@@ -6200,71 +6158,6 @@ pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(
     // only the entries stored since the previous minor walk are visited here.
     let minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
-    // During a major collection the instance-dict edge is conditional on its
-    // owner, exactly like the weakref-lifeline edge below; the registered
-    // ephemeron marker reports it after ordinary marking establishes owner
-    // liveness. A minor collection still forwards newly stored values here.
-    let dict_values = if minor {
-        snapshot_root_entries(&INSTANCE_DICT, &INSTANCE_DICT_PENDING, true)
-    } else {
-        Vec::new()
-    };
-    // SAFETY: do not hold the table lock while invoking callbacks. The visitor
-    // and w_dict_walk_entries_mut may re-enter mapdict/dict APIs; every write
-    // back into the table is deferred to `apply_root_rekeys`.
-    let mut dict_rekeys = Vec::new();
-    let mut dict_offgc = Vec::new();
-    for (key, mut dict) in dict_values {
-        let old_dict = dict;
-        visitor(&mut dict);
-        let new_key = current_owner_key(key);
-        if new_key != key || dict != old_dict {
-            dict_rekeys.push((key, new_key, dict as usize));
-        }
-        // A value the GC does not own — `alloc_dict_object` falls back to
-        // `malloc_typed` when no allocation hook is installed — carries no
-        // header, so `do_write_barrier` drops it (it admits only a nursery or
-        // old-generation address) and no custom trace ever reaches its entries.
-        // The entry walk below is the only thing that traces them, so such a
-        // key stays pending: a minor has to revisit it after every store into
-        // the dict, not once when the table entry was first created.
-        if !pyre_object::gc_hook::try_gc_owns_object(dict as *mut u8) {
-            dict_offgc.push(new_key);
-        }
-        // Trace the dict's own r_dict entries. INSTANCE_DICT now holds only
-        // non-instance hasdict wrappers (property/member) — never a
-        // MapDictStrategy view, since an instance's `__dict__` wrapper lives in
-        // its "dict" SPECIAL slot (forwarded by the instance custom trace). The
-        // `is_map_view` guard stays defensive: a view's `dstorage` IS the backing
-        // instance (mapdict.py), not an `IndexMap`, so
-        // `w_dict_walk_entries_mut` must never run on one.
-        let is_map_view = unsafe {
-            (*(dict as *const pyre_object::W_DictObject))
-                .dstrategy
-                .strategy_kind()
-                == pyre_object::dictmultiobject::StrategyKind::Map
-        };
-        if !is_map_view {
-            unsafe {
-                pyre_object::w_dict_walk_entries_mut(dict, |slot| {
-                    visitor(slot);
-                });
-            }
-        }
-        // An instance's own attribute storage and its "dict" SPECIAL-slot
-        // wrapper — including a devolved wrapper's own IndexMap, since that
-        // wrapper is a GC-managed `W_DictObject` (`w_dict_new_with` →
-        // `try_gc_alloc`) carrying its own `dict_object_custom_trace` and write
-        // barrier — are forwarded by `object_object_custom_trace`
-        // (`W_OBJECT_OBJECT_GC_TYPE_ID`): in major marking, and in minor collection
-        // via the instance/wrapper write barriers that enter the remembered set.
-        // So no instance is walked here.
-    }
-    apply_root_rekeys(&INSTANCE_DICT, dict_rekeys);
-    if !dict_offgc.is_empty() {
-        INSTANCE_DICT_PENDING.lock().extend(dict_offgc);
-    }
-
     // The weakref walk visits the lifeline pointer and stops there, so it needs
     // no such re-arming: an off-GC lifeline never moves, and its own fields are
     // outside what this walk ever traced.
@@ -6305,10 +6198,13 @@ pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(
 ///     assert flag
 /// ```
 ///
-/// Writes the per-instance `INSTANCE_DICT` side table through a closure the
-/// tracer cannot model; the JIT residualises the call (`@dont_look_inside`).
+/// `dont_look_inside` — the write reads the old `"dict"` SPECIAL view,
+/// materialises it off the instance, and stores the replacement, state the
+/// tracer cannot model; the JIT residualises the call
+/// (`@objectmodel.dont_inline`, mapdict.py).
 #[majit_macros::dont_look_inside]
 pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
+    debug_assert!(unsafe { has_mapdict_storage(self_ref) });
     // mapdict.py `space.isinstance_w(w_dict, space.w_dict)` accepts
     // dict subclasses. Pyre's composed dict-subclass representation is
     // resolved by the getdict backing helpers at each raw dict operation,
@@ -6319,42 +6215,35 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
     if crate::type_methods::resolve_dict_backing(w_dict).is_null() {
         return Err(crate::baseobjspace::setdict_not_a_dict(w_dict));
     }
-    if unsafe { has_mapdict_storage(self_ref) } {
-        // mapdict.py:892-900: the old dict has `self` as its dstorage, so
-        // before pointing the "dict" SPECIAL slot at the new dict, force the
-        // old view to its own storage if it is still an instance-backed
-        // `MapDictStrategy`. `_obj_getdict` returns (or materialises) that
-        // view; switching it to an ObjectDictStrategy snapshot stops it
-        // delegating to the instance once the slot is overwritten — otherwise
-        // `old = obj.__dict__; obj.__dict__ = {}` leaves `old` an empty shell
-        // that still mirrors the live instance.
-        // Materialising the old view and claiming the slot both allocate, so
-        // the receiver and the incoming dict are published across them.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let self_slot = pyre_object::gc_roots::pin_roots(&[self_ref, w_dict]);
-        let dict_slot = self_slot + 1;
-        let w_olddict = _obj_getdict(pyre_object::gc_roots::shadow_stack_get(self_slot));
-        let old_backing = crate::type_methods::resolve_dict_backing(w_olddict);
-        let is_map_view = unsafe {
-            pyre_object::dictmultiobject::w_dict_get_strategy(old_backing).strategy_kind()
-                == pyre_object::dictmultiobject::StrategyKind::Map
-        };
-        if is_map_view {
-            unsafe { mapdict_switch_to_object_strategy(old_backing) };
-        }
-        let flag = unsafe {
-            instance_set_dict_slot(
-                pyre_object::gc_roots::shadow_stack_get(self_slot),
-                pyre_object::gc_roots::shadow_stack_get(dict_slot),
-            )
-        };
-        debug_assert!(flag, "write to the \"dict\" SPECIAL slot failed");
-    } else {
-        // Non-instance hasdict objects (property/member, baseobjspace
-        // 1850/3786) keep a plain own-storage dict in the address-keyed side
-        // table; it never delegates to a backing object, so no force step.
-        instance_dict_insert(self_ref, w_dict);
+    // mapdict.py: the old dict has `self` as its dstorage, so
+    // before pointing the "dict" SPECIAL slot at the new dict, force the
+    // old view to its own storage if it is still an instance-backed
+    // `MapDictStrategy`. `_obj_getdict` returns (or materialises) that
+    // view; switching it to an ObjectDictStrategy snapshot stops it
+    // delegating to the instance once the slot is overwritten — otherwise
+    // `old = obj.__dict__; obj.__dict__ = {}` leaves `old` an empty shell
+    // that still mirrors the live instance.
+    // Materialising the old view and claiming the slot both allocate, so
+    // the receiver and the incoming dict are published across them.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::pin_roots(&[self_ref, w_dict]);
+    let dict_slot = self_slot + 1;
+    let w_olddict = _obj_getdict(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    let old_backing = crate::type_methods::resolve_dict_backing(w_olddict);
+    let is_map_view = unsafe {
+        pyre_object::dictmultiobject::w_dict_get_strategy(old_backing).strategy_kind()
+            == pyre_object::dictmultiobject::StrategyKind::Map
+    };
+    if is_map_view {
+        unsafe { mapdict_switch_to_object_strategy(old_backing) };
     }
+    let flag = unsafe {
+        instance_set_dict_slot(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        )
+    };
+    debug_assert!(flag, "write to the \"dict\" SPECIAL slot failed");
     Ok(())
 }
 
@@ -7245,11 +7134,10 @@ mod tests {
     #[test]
     fn instance_custom_trace_walks_storage_without_instance_dict() {
         // An instance's attribute values are forwarded by the per-instance
-        // custom trace worker (`instance_walk_boxed_storage`), independent of
-        // whether its `__dict__` wrapper was ever materialised in INSTANCE_DICT.
-        // The low-level `instance_node_setdictvalue` writes the attributes
-        // through map+storage WITHOUT calling `getdict`, so no INSTANCE_DICT
-        // entry exists — yet the storage walk still visits the value slots.
+        // custom trace worker (`instance_walk_boxed_storage`).
+        // `instance_node_setdictvalue` writes the attributes through
+        // map+storage without calling `getdict`, and the storage walk still
+        // visits the value slots.
         crate::test_hooks::install_hash_hook();
         unsafe {
             let term = boxed_dict_terminator();
@@ -7261,12 +7149,6 @@ mod tests {
             let v2 = sentinel(0xB2);
             assert!(instance_node_setdictvalue(obj_ref, wn("x"), v1));
             assert!(instance_node_setdictvalue(obj_ref, wn("y"), v2));
-
-            let addr = obj_ref as usize;
-            // Never entered INSTANCE_DICT (no getdict call), proving storage
-            // forwarding is decoupled from wrapper materialisation.
-            let in_instance_dict = INSTANCE_DICT.lock().contains_key(&addr);
-            assert!(!in_instance_dict);
 
             let mut seen: Vec<PyObjectRef> = Vec::new();
             instance_walk_boxed_storage(obj_ref, &mut |slot| seen.push(*slot));
@@ -7321,9 +7203,9 @@ mod tests {
     fn instance_dict_wrapper_in_special_slot_not_instance_dict() {
         use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         // An instance's `__dict__` wrapper is stored in the
-        // mapdict "dict" SPECIAL slot (mapdict.py _obj_getdict), not in
-        // the INSTANCE_DICT side table. Repeated access returns the same wrapper,
-        // and the SPECIAL slot is excluded from the `__dict__` view.
+        // mapdict "dict" SPECIAL slot (mapdict.py `_obj_getdict`). Repeated
+        // access returns the same wrapper, and the SPECIAL slot is excluded
+        // from the `__dict__` view.
         crate::test_hooks::install_hash_hook();
         unsafe {
             let term = boxed_dict_terminator();
@@ -7332,11 +7214,7 @@ mod tests {
             obj._set_mapdict_map(term);
 
             let w1 = _obj_getdict(obj_ref);
-            // stored in the SPECIAL slot, not INSTANCE_DICT.
             assert_eq!(instance_get_dict_slot(obj_ref), Some(w1));
-            let addr = obj_ref as usize;
-            let in_instance_dict = INSTANCE_DICT.lock().contains_key(&addr);
-            assert!(!in_instance_dict);
             // identity stable across repeated access.
             let w2 = _obj_getdict(obj_ref);
             assert_eq!(w1, w2);
@@ -7741,7 +7619,7 @@ mod tests {
 
     // The side-table root bookkeeping below takes its table and pending set as
     // arguments, so these exercise the real functions on local tables — the
-    // process-global `INSTANCE_DICT` / `WEAKREF_TABLE` are shared with every
+    // process-global `WEAKREF_TABLE` is shared with every
     // other test running concurrently and must not be touched here.
     fn table(entries: &[(usize, usize)]) -> Mutex<HashMap<usize, usize>> {
         Mutex::new(entries.iter().copied().collect())

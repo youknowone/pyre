@@ -595,20 +595,9 @@ mod tests {
             assert!(!crate::objspace::std::mapdict::has_mapdict_storage(obj));
             assert!(crate::baseobjspace::getdictvalue_native(obj, "x").is_none());
             assert!(W_BytesIO::from_obj(obj).unwrap().w_dict.is_null());
-            let addr = obj as usize;
-            assert!(
-                !crate::objspace::std::mapdict::INSTANCE_DICT
-                    .lock()
-                    .contains_key(&addr)
-            );
 
             let value = pyre_object::w_int_new(1);
             assert!(crate::baseobjspace::setdictvalue(obj, "x", value).unwrap());
-            assert!(
-                !crate::objspace::std::mapdict::INSTANCE_DICT
-                    .lock()
-                    .contains_key(&addr)
-            );
             let inst = W_BytesIO::from_obj(obj).unwrap();
             assert!(!inst.w_dict.is_null());
             assert_eq!(
@@ -630,20 +619,10 @@ mod tests {
                 assert_eq!(err.message_text(), refused);
             }
             assert_eq!(W_BytesIO::from_obj(obj).unwrap().w_dict, w_dict);
-            assert!(
-                !crate::objspace::std::mapdict::INSTANCE_DICT
-                    .lock()
-                    .contains_key(&addr)
-            );
 
             crate::baseobjspace::object_delattr(obj, "x").unwrap();
             assert!(crate::baseobjspace::getdictvalue_native(obj, "x").is_none());
             assert_eq!(W_BytesIO::from_obj(obj).unwrap().w_dict, w_dict);
-            assert!(
-                !crate::objspace::std::mapdict::INSTANCE_DICT
-                    .lock()
-                    .contains_key(&addr)
-            );
         }
     }
 }

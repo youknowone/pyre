@@ -1,3 +1,7 @@
+# CPython-suite gap: no test checks that BytesIO/StringIO instance attributes
+# live on the typed payload rather than a generic instance dict.
+# parity-tests reason: W_IOBase.getdict stores attributes in w_dict.
+
 """Typed _io payloads keep instance attributes on W_IOBase.w_dict."""
 
 import copy

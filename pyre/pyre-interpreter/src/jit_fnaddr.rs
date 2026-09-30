@@ -1602,7 +1602,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `pin_root` pushes onto the TLS `SHADOW_STACK` (the `shadow_stack_len`
     // twin), `dereference` reads the weakref `w_obj_weak` slot
     // (`@jit.dont_look_inside` upstream, the `proxy_type` twin), and
-    // `_obj_setdict` writes the per-instance `INSTANCE_DICT` side table —
+    // `_obj_setdict` writes the `"dict"` SPECIAL slot
+    // (`@objectmodel.dont_inline`, mapdict.py) —
     // all through closures the tracer cannot model.  Their `#[dont_look_inside]`
     // calls bind the Rust `fn` directly by qualified path (pointer / `-> ()`
     // / `-> Result<(), PyError>` signatures are JIT-representable).

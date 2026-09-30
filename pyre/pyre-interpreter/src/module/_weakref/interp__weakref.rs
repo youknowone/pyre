@@ -82,7 +82,7 @@ fn field_slot(obj: PyObjectRef, name: &str) -> Option<u32> {
 }
 
 /// Read a per-instance field from its reserved layout slot, or from the
-/// underlying `INSTANCE_DICT` directly, bypassing the public `getattr` path. The proxy fast-path in
+/// instance dict, bypassing the public `getattr` path. The proxy fast-path in
 /// `baseobjspace::getattr_str` would otherwise force the receiver and recurse
 /// indefinitely while the proxy is reading its OWN `w_obj_weak`/etc.
 fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
@@ -2677,7 +2677,7 @@ mod tests {
         let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         // Use a hasdict instance so the underlying object stores
-        // attributes in INSTANCE_DICT.
+        // attributes in its mapdict.
         let user_type = crate::typedef::make_builtin_type("ProxyTarget", |_| {});
         unsafe { pyre_object::w_type_set_hasdict(user_type, true) };
         let referent = pyre_object::objectobject::w_instance_new(user_type);

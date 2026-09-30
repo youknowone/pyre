@@ -5859,8 +5859,20 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
 
 // ── Attribute operations ──────────────────────────────────────────────
 
-// `INSTANCE_DICT` and `WEAKREF_TABLE` live in `objspace/std/mapdict.rs`,
-// mirroring PyPy's `MapdictDictSupport` and `MapdictWeakrefSupport`.
+// `MapdictDictSupport` and `MapdictWeakrefSupport` live in
+// `objspace/std/mapdict.rs`. A weakref lifeline for an object without mapdict
+// storage is `WEAKREF_TABLE`.
+
+/// A hasdict receiver that matched none of the typed `getdict` owners and
+/// has no mapdict storage. PyPy cannot reach this state: `typedef.py`
+/// `_getusercls` gives every user subclass `MapdictStorageMixin`, and the
+/// builtin owners keep the dictionary in a typed field.
+fn missing_dict_storage(w_type: PyObjectRef) -> PyError {
+    let tp_name = unsafe { pyre_object::w_type_get_name(w_type) };
+    PyError::system_error(format!(
+        "'{tp_name}' instance has no dict storage (builtin base without a user layout)"
+    ))
+}
 
 /// interpreter/baseobjspace.py W_Root.getdict(space).
 ///
@@ -5923,7 +5935,11 @@ pub fn getdict(mut obj: PyObjectRef) -> PyResult {
         None => return Ok(pyre_object::PY_NULL),
     };
     if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
-        Ok(crate::objspace::std::mapdict::_obj_getdict(obj))
+        if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) } {
+            Ok(crate::objspace::std::mapdict::_obj_getdict(obj))
+        } else {
+            Err(missing_dict_storage(w_type.as_ptr()))
+        }
     } else {
         // W_Root.getdict default — return None
         Ok(pyre_object::PY_NULL)
@@ -6091,7 +6107,11 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
         }
     };
     if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
-        crate::objspace::std::mapdict::_obj_setdict(obj, w_dict)
+        if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) } {
+            crate::objspace::std::mapdict::_obj_setdict(obj, w_dict)
+        } else {
+            Err(missing_dict_storage(w_type.as_ptr()))
+        }
     } else {
         let tp_name = unsafe { pyre_object::w_type_get_name(w_type.as_ptr()) };
         Err(PyError::type_error(format!(
@@ -23941,6 +23961,79 @@ mod tests {
         let cls = crate::typedef::make_builtin_type("TestUserClass", |_| {});
         unsafe { pyre_object::w_type_set_hasdict(cls, true) };
         w_instance_new(cls)
+    }
+
+    /// `W_ObjectObject`, `list` and `collections.deque` subclasses store
+    /// `__dict__` in mapdict (`MapdictDictSupport._obj_getdict` /
+    /// `_obj_setdict`). An exact `int` has no dict (`W_Root.setdict`).
+    #[test]
+    fn subclass_instances_round_trip_dict_and_exact_int_refuses_setdict() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+
+        fn round_trip(name: &str, base: PyObjectRef) {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = roots.base();
+            let _ = roots.pin_root(base);
+            let _ = roots.pin_root(w_str_new(name));
+            let _ = roots.pin_root(w_tuple_new(vec![roots.get(slot)]));
+            let _ = roots.pin_root(w_dict_new());
+            let cls = crate::builtins::type_descr_new(&[
+                crate::typedef::w_type(),
+                roots.get(slot + 1),
+                roots.get(slot + 2),
+                roots.get(slot + 3),
+            ])
+            .unwrap_or_else(|err| panic!("{name}: {}", err.message_text()));
+            let _ = roots.pin_root(cls);
+            let _ = roots.pin_root(w_tuple_new(Vec::new()));
+            crate::call::clear_call_error();
+            let obj = call(roots.get(slot + 4), roots.get(slot + 5), None);
+            assert!(
+                !obj.is_null(),
+                "{name}(): {}",
+                crate::call::take_call_error()
+                    .map(|err| err.message_text())
+                    .unwrap_or_else(|| "null without error".to_string())
+            );
+            let _ = roots.pin_root(obj);
+            let obj = roots.get(slot + 6);
+            assert!(
+                unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) },
+                "{name} instance must carry mapdict storage"
+            );
+            let original = getdict(obj).unwrap_or_else(|err| panic!("{name} getdict: {err}"));
+            assert!(!original.is_null(), "{name} getdict returned None");
+            let _ = roots.pin_root(w_dict_new());
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str(
+                    roots.get(slot + 7),
+                    "k",
+                    w_int_new(7),
+                );
+            }
+            setdict(roots.get(slot + 6), roots.get(slot + 7))
+                .unwrap_or_else(|err| panic!("{name} setdict: {err}"));
+            let after = getdict(roots.get(slot + 6))
+                .unwrap_or_else(|err| panic!("{name} getdict after setdict: {err}"));
+            assert!(
+                std::ptr::eq(after, roots.get(slot + 7)),
+                "{name} setdict did not install the replacement"
+            );
+            let value = unsafe { pyre_object::w_dict_getitem_str(after, "k") }
+                .unwrap_or_else(|| panic!("{name} lost key k"));
+            assert_eq!(unsafe { w_int_get_value(value) }, 7);
+        }
+
+        round_trip("ObjSub", crate::typedef::w_object());
+        round_trip(
+            "ListSub",
+            crate::typedef::gettypeobject(&pyre_object::LIST_TYPE),
+        );
+        round_trip("DequeSub", crate::module::_collections::type_object());
+
+        let err = setdict(w_int_new(1), w_dict_new()).unwrap_err();
+        assert_eq!(err.kind, PyErrorKind::TypeError);
     }
 
     /// `bound_method_attr_fast_path` must admit every descriptor kind the
