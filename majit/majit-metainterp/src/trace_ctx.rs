@@ -777,6 +777,17 @@ pub struct TraceCtx {
     /// (a static trait method with no metainterp access) can map each
     /// decoded frame value to its sym slot via `reg_idx - identity_base`.
     pub(crate) bridge_reg_indices: Option<crate::resume::FrameLivenessRegIndices>,
+    /// `resume.py` `VirtualCache`, shared by the split readers that
+    /// upstream keeps on one `ResumeDataBoxReader`: `setup_bridge_sym`
+    /// and `ResumeDataBoxReader.consume_boxes`. Indexed by virtual
+    /// number, one slot per `rd_virtuals` entry. A later reader returns
+    /// the box the first `getvirtual_ptr` allocated instead of emitting
+    /// a second `NEW`.
+    bridge_virtual_ops: Vec<Option<OpRef>>,
+    /// `resume.py` `rebuild_from_resumedata` storage, parked so
+    /// `consume_boxes` can `getvirtual_ptr` after `start_bridge_tracing`
+    /// returns. `None` outside a bridge.
+    bridge_resume_data: Option<crate::jit_state::ResumeDataResult>,
     /// Whether the source guard descr for this bridge is a
     /// ResumeGuardExcDescr analog. Set by `start_bridge_tracing` from
     /// `descr_arc.is_guard_exc()` and read by static bridge setup/walkers
@@ -2128,6 +2139,8 @@ impl TraceCtx {
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
+            bridge_virtual_ops: Vec::new(),
+            bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
             bridge_grab_seeded: false,
             bridge_replay_incomplete: false,
@@ -2214,6 +2227,8 @@ impl TraceCtx {
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
+            bridge_virtual_ops: Vec::new(),
+            bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
             bridge_grab_seeded: false,
             bridge_replay_incomplete: false,
@@ -2247,6 +2262,35 @@ impl TraceCtx {
     /// value (laid out int-bank then ref-bank then float) to its sym slot.
     pub fn bridge_reg_indices(&self) -> Option<&crate::resume::FrameLivenessRegIndices> {
         self.bridge_reg_indices.as_ref()
+    }
+
+    /// Box already allocated for virtual `vidx` by an earlier reader of
+    /// this bridge (`resume.py` `virtuals_cache.get_ptr`).
+    pub fn bridge_virtual_op(&self, vidx: usize) -> Option<OpRef> {
+        self.bridge_virtual_ops.get(vidx).copied().flatten()
+    }
+
+    /// Remember `getvirtual_ptr`'s box so the next reader stores that
+    /// same `OpRef` (`resume.py` `virtuals_cache.set_ptr` / `set_int`).
+    pub fn remember_bridge_virtual_op(&mut self, vidx: usize, op: OpRef) {
+        if op.is_none() {
+            return;
+        }
+        if self.bridge_virtual_ops.len() <= vidx {
+            self.bridge_virtual_ops.resize(vidx + 1, None);
+        }
+        self.bridge_virtual_ops[vidx] = Some(op);
+    }
+
+    /// Guard resume storage for `consume_boxes`'s `getvirtual_ptr`.
+    pub fn bridge_resume_data(&self) -> Option<&crate::jit_state::ResumeDataResult> {
+        self.bridge_resume_data.as_ref()
+    }
+
+    /// Park the guard's `ResumeDataResult` for the rebuild that runs
+    /// after `start_bridge_tracing` returns.
+    pub fn set_bridge_resume_data(&mut self, resume_data: crate::jit_state::ResumeDataResult) {
+        self.bridge_resume_data = Some(resume_data);
     }
 
     /// Mark whether this bridge's source guard is an exception guard

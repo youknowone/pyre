@@ -2904,17 +2904,17 @@ impl TraceCtx {
         after_residual_call: bool,
     ) -> i32 {
         let op_live = self.metainterp_sd.op_live as u8;
+        let liveness = self.metainterp_sd.liveness_info.snapshot_arc();
         let recorder = &mut self.recorder;
         let vable = self.virtualizable_boxes.as_deref().unwrap_or(&[]);
         let vref = self.virtualref_boxes.as_slice();
-        let liveness = self.metainterp_sd.liveness_info.as_slice();
         let id = recorder.capture_resumedata_from_framestack(
             framestack,
             vable,
             vref,
             after_residual_call,
             op_live,
-            liveness,
+            liveness.as_ref(),
         );
         self.snapshots.clear();
         id

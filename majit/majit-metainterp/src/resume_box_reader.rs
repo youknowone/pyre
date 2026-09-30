@@ -240,6 +240,18 @@ impl<'a> BridgeVirtualCache<'a> {
         self.virtuals_int_cache[i] = Some(v);
     }
 
+    /// Seed both banks from a box an earlier reader already allocated.
+    /// Out-of-range is a no-op: the caller's cache may be shorter than
+    /// the shared `TraceCtx` list when it was built without `rd_virtuals`.
+    pub fn recall_op(&mut self, i: usize, v: OpRef) {
+        if let Some(slot) = self.virtuals_ptr_cache.get_mut(i) {
+            *slot = Some(v);
+        }
+        if let Some(slot) = self.virtuals_int_cache.get_mut(i) {
+            *slot = Some(v);
+        }
+    }
+
     pub fn get_concrete_ptr(&self, i: usize) -> Option<majit_ir::GcRef> {
         self.concrete_ptr_cache.get(i).copied().flatten()
     }
@@ -545,6 +557,14 @@ pub fn materialize_bridge_virtual(
     // (ptr and int banks). This bridge helper is still OpRef-typed, so it
     // probes both banks before allocating.
     if let Some(cached) = cache.get_any(vidx) {
+        // The local cache already holds the box. Publish it so a later
+        // reader (`consume_boxes` after `setup_bridge_sym`) stores the
+        // same OpRef instead of allocating again.
+        ctx.remember_bridge_virtual_op(vidx, cached);
+        return cached;
+    }
+    if let Some(cached) = ctx.bridge_virtual_op(vidx) {
+        cache.recall_op(vidx, cached);
         return cached;
     }
 
@@ -662,6 +682,7 @@ pub fn materialize_bridge_virtual(
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py decoder.virtuals_cache.set_ptr(index, struct)
             cache.set_ptr(vidx, new_op);
+            ctx.remember_bridge_virtual_op(vidx, new_op);
             if let Some(allocator) = cache.allocator() {
                 let vtable = size_descr.as_size_descr().map_or(0, |sd| sd.vtable());
                 let ptr = allocator.allocate_with_vtable(&size_descr, vtable);
@@ -720,6 +741,7 @@ pub fn materialize_bridge_virtual(
             // is what keeps the object reachable across the allocations
             // `setfields` may itself perform.
             cache.set_ptr(vidx, new_op);
+            ctx.remember_bridge_virtual_op(vidx, new_op);
             if let Some(allocator) = cache.allocator() {
                 let ptr = allocator.bh_new(&struct_descr);
                 if ptr == 0 {
@@ -797,6 +819,7 @@ pub fn materialize_bridge_virtual(
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py decoder.virtuals_cache.set_ptr(index, array)
             cache.set_ptr(vidx, new_op);
+            ctx.remember_bridge_virtual_op(vidx, new_op);
             if let Some(allocator) = cache.allocator() {
                 let ptr = if clear {
                     allocator.bh_new_array_clear(length, &array_descr)
@@ -885,6 +908,7 @@ pub fn materialize_bridge_virtual(
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py: decoder.virtuals_cache.set_ptr(index, array)
             cache.set_ptr(vidx, new_op);
+            ctx.remember_bridge_virtual_op(vidx, new_op);
             // resume.py:752-759:
             //   p = 0
             //   for i in range(self.size):
@@ -978,6 +1002,7 @@ pub fn materialize_bridge_virtual(
             );
             // resume.py: decoder.virtuals_cache.set_int(index, buffer)
             cache.set_int(vidx, buffer);
+            ctx.remember_bridge_virtual_op(vidx, buffer);
             // resume.py:705-708 iterate by len(self.offsets), indexing
             // self.descrs[i] and self.fieldnums[i] by the same i — a short
             // descrs/fieldnums raises IndexError here (encoder bug), a longer
@@ -1055,6 +1080,7 @@ pub fn materialize_bridge_virtual(
             );
             // resume.py: decoder.virtuals_cache.set_int(index, buffer)
             cache.set_int(vidx, buffer);
+            ctx.remember_bridge_virtual_op(vidx, buffer);
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-virtual] vidx={vidx} VRawSliceInfo(offset={offset}) → {buffer:?}",
@@ -1095,6 +1121,7 @@ pub fn materialize_bridge_virtual(
             let string = ctx.record_op(alloc_opcode, &[length_ref]);
             // resume.py: decoder.virtuals_cache.set_ptr(index, string)
             cache.set_ptr(vidx, string);
+            ctx.remember_bridge_virtual_op(vidx, string);
             // resume.py: string_setitem for each filled char.
             for (i, &charnum) in fieldnums.iter().enumerate() {
                 if charnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -1158,6 +1185,7 @@ pub fn materialize_bridge_virtual(
             };
             let string = emit_stroruni_oopspec_call(ctx, oopspec, &[left, right]);
             cache.set_ptr(vidx, string);
+            ctx.remember_bridge_virtual_op(vidx, string);
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-virtual] vidx={} V{}ConcatInfo → OpRef::from_raw({})",
@@ -1219,6 +1247,7 @@ pub fn materialize_bridge_virtual(
             };
             let string = emit_stroruni_oopspec_call(ctx, oopspec, &[largerstr, start, stop]);
             cache.set_ptr(vidx, string);
+            ctx.remember_bridge_virtual_op(vidx, string);
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-virtual] vidx={} V{}SliceInfo → OpRef::from_raw({})",

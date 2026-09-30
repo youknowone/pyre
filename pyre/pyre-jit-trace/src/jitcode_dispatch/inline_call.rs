@@ -9122,27 +9122,41 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // instruction. A zero-size just-opened frame does not win
         // `find_biggest_function` (`size > max_size`).
         if sub_wc.trace_ctx.is_too_long() {
-            let ops = sub_wc.trace_ctx.num_recorded_ops();
-            crate::state::note_root_trace_too_long(
-                sub_wc.trace_ctx.current_merge_points_first_green_key_pair(),
-                sub_wc.trace_ctx.resumekey_original_loop_token().cloned(),
-            );
-            sub_wc.session.borrow_mut().trace_too_long = true;
-            // `enter` already ran. `SwitchToBlackhole` never reaches `leave`,
-            // so restore the concrete chain without recording the finish.
-            if entered_ec.is_some() {
-                let frame_ptr = sub_wc
-                    .trace_ctx
-                    .virtualref_entry_ptr((ca_callee_frame, ca_concrete_frame as usize))
-                    as *mut pyre_interpreter::PyFrame;
-                abandon_entered_frame(
-                    sub_wc.trace_ctx,
-                    frame_ptr,
-                    pyre_interpreter::call::getexecutioncontext()
-                        as *mut pyre_interpreter::PyExecutionContext,
+            // `blackhole_if_trace_too_long` after the `newframe` step.
+            // `trace_too_long_abort_safe`: latch the live framestack, and
+            // keep recording when that image cannot be built once effects
+            // have already run. Returning `TraceTooLong` with effects and
+            // no image is what `try_adopt_single_frame_blackhole` rejects.
+            // `sub_wc` is the callee `newframe` just opened.
+            // `build_multi_frame_miframe` stamps `resume_pc` onto that
+            // callee's jitcode, so the coordinate is the body's entry
+            // (`walk` starts at 0), not the caller's `op.pc`.
+            let latched = super::residual_call::latch_abort_blackhole(&sub_wc, 0, "pre-callee");
+            if !latched && fbw_executed_effect_count() != 0 {
+                majit_metainterp::mc_diag_bump(26);
+            } else {
+                let ops = sub_wc.trace_ctx.num_recorded_ops();
+                crate::state::note_root_trace_too_long(
+                    sub_wc.trace_ctx.current_merge_points_first_green_key_pair(),
+                    sub_wc.trace_ctx.resumekey_original_loop_token().cloned(),
                 );
+                sub_wc.session.borrow_mut().trace_too_long = true;
+                // `enter` already ran. `SwitchToBlackhole` never reaches `leave`,
+                // so restore the concrete chain without recording the finish.
+                if entered_ec.is_some() {
+                    let frame_ptr = sub_wc
+                        .trace_ctx
+                        .virtualref_entry_ptr((ca_callee_frame, ca_concrete_frame as usize))
+                        as *mut pyre_interpreter::PyFrame;
+                    abandon_entered_frame(
+                        sub_wc.trace_ctx,
+                        frame_ptr,
+                        pyre_interpreter::call::getexecutioncontext()
+                            as *mut pyre_interpreter::PyExecutionContext,
+                    );
+                }
+                return Err(DispatchError::TraceTooLong { pc: op.pc, ops });
             }
-            return Err(DispatchError::TraceTooLong { pc: op.pc, ops });
         }
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
             (

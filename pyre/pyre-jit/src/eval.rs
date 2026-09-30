@@ -8989,6 +8989,10 @@ fn install_build_time_liveness_before_trace(
         pyre_jit_trace::jitcode_runtime::insns_opname_to_byte(),
         pyre_jit_trace::jitcode_runtime::all_liveness(),
     );
+    // `intern_liveness` publishes onto this thread's lock. Capture reads
+    // the clone of `staticdata` taken at trace start, so that field has to
+    // be the same lock. The baked bytes above are its prefix.
+    meta.adopt_published_liveness(pyre_jit_trace::state::liveness_handle());
 }
 
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
@@ -15755,10 +15759,20 @@ mod tests {
             staticdata.op_rvmprof_code,
             i32::from(insns["rvmprof_code/ii"])
         );
-        assert_eq!(
-            staticdata.liveness_info.as_slice(),
-            pyre_jit_trace::jitcode_runtime::all_liveness()
+        let published = pyre_jit_trace::state::liveness_handle();
+        assert!(
+            staticdata.liveness_info.same_as(&published),
+            "driver liveness must be the lock intern_liveness publishes"
         );
+        let baked = pyre_jit_trace::jitcode_runtime::all_liveness();
+        let bytes = staticdata.liveness_info.snapshot_vec();
+        assert!(
+            bytes.len() >= baked.len(),
+            "published liveness {} shorter than baked {}",
+            bytes.len(),
+            baked.len()
+        );
+        assert_eq!(&bytes[..baked.len()], baked);
 
         let mut builder = pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder();
         builder.setup_cached_control_opcodes(
