@@ -128,94 +128,58 @@ pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
     }) as PyObjectRef
 }
 
-/// Allocate an arity-2 specialised float tuple. Same shape as
-/// `w_specialised_tuple_ii_new` — `gc_ptr_offsets = []`
-/// (`eval.rs`) keeps mark-sweep traversal trivially safe.
-pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
-    let header = PyObject {
-        ob_type: &SPECIALISED_TUPLE_FF_TYPE as *const PyType,
-        w_class: get_instantiate(&TUPLE_TYPE),
-    };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
-        SPECIALISED_TUPLE_FF_GC_TYPE_ID,
-        SPECIALISED_TUPLE_FF_OBJECT_SIZE,
-    );
-    if !raw.is_null() {
-        unsafe {
-            std::ptr::write(
-                raw as *mut W_SpecialisedTupleObject_ff,
-                W_SpecialisedTupleObject_ff {
-                    ob_header: header,
-                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
-                    value0,
-                    value1,
-                },
-            );
-        }
-        return raw as PyObjectRef;
+impl crate::lltype::GcType for W_SpecialisedTupleObject_ff {
+    fn type_id() -> u32 {
+        SPECIALISED_TUPLE_FF_GC_TYPE_ID
     }
-    Box::into_raw(Box::new(W_SpecialisedTupleObject_ff {
-        ob_header: header,
+    const SIZE: usize = SPECIALISED_TUPLE_FF_OBJECT_SIZE;
+}
+
+/// `Cls_ff(space, w_arg1, w_arg2)` (`specialisedtupleobject.py`) over the two
+/// already-unwrapped floats.  Same shape as `w_specialised_tuple_ii_new` —
+/// `gc_ptr_offsets = []` (`eval.rs`) keeps mark-sweep traversal trivially
+/// safe.
+#[inline(never)]
+pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
+    crate::lltype::malloc_typed_managed(W_SpecialisedTupleObject_ff {
+        ob_header: PyObject {
+            ob_type: &SPECIALISED_TUPLE_FF_TYPE as *const PyType,
+            w_class: get_instantiate(&TUPLE_TYPE),
+        },
         hash: AtomicI64::new(TUPLE_HASH_UNSET),
         value0,
         value1,
-    })) as PyObjectRef
+    }) as PyObjectRef
 }
 
-/// Allocate an arity-2 specialised object tuple. Carries
+impl crate::lltype::GcType for W_SpecialisedTupleObject_oo {
+    fn type_id() -> u32 {
+        SPECIALISED_TUPLE_OO_GC_TYPE_ID
+    }
+    const SIZE: usize = SPECIALISED_TUPLE_OO_OBJECT_SIZE;
+}
+
+/// `Cls_oo(space, w_arg1, w_arg2)` (`specialisedtupleobject.py`).  Carries
 /// `gc_ptr_offsets = [value0, value1]` (`eval.rs`); the values may
 /// transiently point at an off-heap `malloc_typed` W_IntObject /
 /// W_FloatObject during the L1 stepping-stone window — headered, but
 /// outside the collector's heap. The mark walker's
 /// `is_managed_heap_object` guard keeps that case correctness-safe.
+/// `malloc_typed_managed` does not collect, so the two values it stores are
+/// the addresses the caller passed; an old-gen fallback records the store
+/// with the write barrier.  Own graph so `fuse_boxing_alloc` rewrites the
+/// allocation to `new_with_vtable` + field stores, as for `Cls_ii`.
+#[inline(never)]
 pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py`):
-    // both inputs are live PyObjectRef roots that must survive a
-    // nursery-full spill into old-gen. The ii/ff variants take unboxed
-    // i64/f64 and need no bracket here.
-    let _roots = crate::gc_roots::push_roots();
-    let save_point = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(value0);
-    let _ = crate::gc_roots::pin_root(value1);
-    let header = PyObject {
-        ob_type: &SPECIALISED_TUPLE_OO_TYPE as *const PyType,
-        w_class: get_instantiate(&TUPLE_TYPE),
-    };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
-        SPECIALISED_TUPLE_OO_GC_TYPE_ID,
-        SPECIALISED_TUPLE_OO_OBJECT_SIZE,
-    );
-    // pop_roots: the parameters still name the pre-spill addresses, so
-    // the values stored into the tuple are read back out of the shadow stack,
-    // as `w_tuple_new_array_backed` does before filling its items block.
-    let value0 = crate::gc_roots::shadow_stack_get(save_point);
-    let value1 = crate::gc_roots::shadow_stack_get(save_point + 1);
-    if !raw.is_null() {
-        unsafe {
-            std::ptr::write(
-                raw as *mut W_SpecialisedTupleObject_oo,
-                W_SpecialisedTupleObject_oo {
-                    ob_header: header,
-                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
-                    value0,
-                    value1,
-                },
-            );
-        }
-        // Nursery-full spills this header to old-gen while `value0` /
-        // `value1` may still be young. A young header needs no barrier;
-        // `try_gc_write_barrier_managed` is a no-op there and records the
-        // old-gen store when the bump spilled (incminimark.py
-        // `write_barrier`, `w_tuple_new_array_backed`).
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
-        return raw as PyObjectRef;
-    }
-    Box::into_raw(Box::new(W_SpecialisedTupleObject_oo {
-        ob_header: header,
+    crate::lltype::malloc_typed_managed(W_SpecialisedTupleObject_oo {
+        ob_header: PyObject {
+            ob_type: &SPECIALISED_TUPLE_OO_TYPE as *const PyType,
+            w_class: get_instantiate(&TUPLE_TYPE),
+        },
         hash: AtomicI64::new(TUPLE_HASH_UNSET),
         value0,
         value1,
-    })) as PyObjectRef
+    }) as PyObjectRef
 }
 
 #[inline]
