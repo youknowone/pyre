@@ -2348,37 +2348,40 @@ fn unpack_hostent(
     }
 }
 
-// ── default socket timeout cell ──
-// `rsocket.py:setdefaulttimeout|getdefaulttimeout` — process-wide
-// default for socket() construction.  None == blocking; Some(secs)
-// == timeout in seconds.
+// `getdefaulttimeout` / `setdefaulttimeout`. `-1.0` blocks.
+// The cell is `Defaults.timeout` on unix and Windows. Wasm keeps a local
+// copy because `majit_rlib::rsocket` is not built there.
 
-// Process-global default socket timeout, encoded as f64 bits.  A valid
-// timeout is always a finite non-negative float, so the qNaN sentinel
-// below can never collide with a real value and stands in for `None`.
-const SOCKET_TIMEOUT_NONE: u64 = 0x7ff8_0000_0000_0001;
+#[cfg(not(any(unix, windows)))]
 static DEFAULT_SOCKET_TIMEOUT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(SOCKET_TIMEOUT_NONE);
+    std::sync::atomic::AtomicU64::new((-1.0f64).to_bits());
+
+fn default_socket_timeout() -> f64 {
+    #[cfg(any(unix, windows))]
+    {
+        majit_rlib::rsocket::getdefaulttimeout()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        f64::from_bits(DEFAULT_SOCKET_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
 
 fn get_default_socket_timeout() -> pyre_object::PyObjectRef {
-    let bits = DEFAULT_SOCKET_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed);
-    if bits == SOCKET_TIMEOUT_NONE {
+    let timeout = default_socket_timeout();
+    if timeout < 0.0 {
         pyre_object::w_none()
     } else {
-        pyre_object::floatobject::w_float_new(f64::from_bits(bits))
+        pyre_object::floatobject::w_float_new(timeout)
     }
 }
 
 fn set_default_socket_timeout(v: Option<f64>) {
-    let bits = match v {
-        None => SOCKET_TIMEOUT_NONE,
-        Some(s) => {
-            let b = s.to_bits();
-            debug_assert_ne!(b, SOCKET_TIMEOUT_NONE);
-            b
-        }
-    };
-    DEFAULT_SOCKET_TIMEOUT.store(bits, std::sync::atomic::Ordering::Relaxed);
+    let timeout = v.unwrap_or(-1.0);
+    #[cfg(any(unix, windows))]
+    majit_rlib::rsocket::setdefaulttimeout(timeout);
+    #[cfg(not(any(unix, windows)))]
+    DEFAULT_SOCKET_TIMEOUT.store(timeout.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
 // ── getaddrinfo / getnameinfo wiring ──
@@ -3282,15 +3285,14 @@ fn socket_init_state(
     if ty & rffi::SOCK_NONBLOCK != 0 {
         pyre_object::with_roots!(obj => socket_set_attr(obj, "_timeout", pyre_object::floatobject::w_float_new(0.0)));
     } else {
-        let bits = DEFAULT_SOCKET_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed);
-        let (native_timeout, stored_timeout) = if bits == SOCKET_TIMEOUT_NONE {
-            (-1.0, pyre_object::w_none())
+        let timeout = default_socket_timeout();
+        let stored_timeout = if timeout < 0.0 {
+            pyre_object::w_none()
         } else {
-            let timeout = f64::from_bits(bits);
-            (timeout, pyre_object::floatobject::w_float_new(timeout))
+            pyre_object::floatobject::w_float_new(timeout)
         };
         pyre_object::with_roots!(obj => socket_set_attr(obj, "_timeout", stored_timeout));
-        socket_apply_timeout(fd, native_timeout)?;
+        socket_apply_timeout(fd, timeout)?;
     }
     // `sock_new` starts this at 0 on every socket object, and only
     // `setsockopt` moves it: `SIO_TCP_SET_ACK_FREQUENCY` has no counterpart to

@@ -68,6 +68,21 @@ pub fn htonl(x: crate::rffi::UINT) -> i64 {
     unsafe { crate::_rsocket_rffi::htonl(x) as i64 }
 }
 
+/// `Defaults.timeout`. `-1.0` blocks. Every thread reads the same cell.
+static DEFAULT_TIMEOUT_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new((-1.0f64).to_bits());
+
+/// `getdefaulttimeout`.
+pub fn getdefaulttimeout() -> f64 {
+    f64::from_bits(DEFAULT_TIMEOUT_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// `setdefaulttimeout`. A negative value is stored as `-1.0`.
+pub fn setdefaulttimeout(timeout: f64) {
+    let timeout = if timeout < 0.0 { -1.0 } else { timeout };
+    DEFAULT_TIMEOUT_BITS.store(timeout.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
@@ -135,5 +150,17 @@ mod tests {
         assert_eq!(ntohs(0x0201), i64::from(libc::ntohs(0x0201)));
         assert_eq!(htonl(0x0102_0304), i64::from(libc::htonl(0x0102_0304)));
         assert_eq!(ntohl(0x0403_0201), i64::from(libc::ntohl(0x0403_0201)));
+    }
+
+    #[test]
+    fn default_timeout_blocks_until_set() {
+        let saved = getdefaulttimeout();
+        setdefaulttimeout(-1.0);
+        assert_eq!(getdefaulttimeout(), -1.0);
+        setdefaulttimeout(1.5);
+        assert_eq!(getdefaulttimeout(), 1.5);
+        setdefaulttimeout(-4.0);
+        assert_eq!(getdefaulttimeout(), -1.0);
+        setdefaulttimeout(saved);
     }
 }
