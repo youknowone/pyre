@@ -4200,6 +4200,16 @@ fn pack_inet_addr(
     }
 }
 
+#[cfg(unix)]
+fn storage_from_rsocket(bytes: &[u8], slen: i32) -> (rffi::sockaddr_storage, rffi::SockLen) {
+    let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let n = bytes.len().min(std::mem::size_of_val(&storage));
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), &mut storage as *mut _ as *mut u8, n);
+    }
+    (storage, slen as rffi::SockLen)
+}
+
 #[cfg(any(unix, windows))]
 fn unpack_inet_addr(
     storage: &rffi::sockaddr_storage,
@@ -6166,19 +6176,31 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 "getsockname",
                 |args| {
                     let fd = socket_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
-                    let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
-                    let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-                    let r = {
-                        rffi::getsockname(
-                            fd,
-                            &mut storage as *mut _ as *mut rffi::sockaddr,
-                            &mut slen,
-                        )
-                    };
-                    if r != 0 {
-                        return Err(socket_last_error());
+                    #[cfg(unix)]
+                    {
+                        let (bytes, slen) = majit_rlib::rsocket::getsockname(fd).map_err(|error| {
+                            socket_io_err(std::io::Error::from_raw_os_error(error.errno))
+                        })?;
+                        let (storage, slen) = storage_from_rsocket(&bytes, slen);
+                        return Ok(unpack_inet_addr(&storage, slen));
                     }
-                    Ok(unpack_inet_addr(&storage, slen))
+                    #[cfg(windows)]
+                    {
+                        let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
+                        let mut slen =
+                            core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+                        let r = {
+                            rffi::getsockname(
+                                fd,
+                                &mut storage as *mut _ as *mut rffi::sockaddr,
+                                &mut slen,
+                            )
+                        };
+                        if r != 0 {
+                            return Err(socket_last_error());
+                        }
+                        Ok(unpack_inet_addr(&storage, slen))
+                    }
                 },
                 1,
             ),
@@ -6193,19 +6215,31 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 "getpeername",
                 |args| {
                     let fd = socket_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
-                    let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
-                    let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-                    let r = {
-                        rffi::getpeername(
-                            fd,
-                            &mut storage as *mut _ as *mut rffi::sockaddr,
-                            &mut slen,
-                        )
-                    };
-                    if r != 0 {
-                        return Err(socket_last_error());
+                    #[cfg(unix)]
+                    {
+                        let (bytes, slen) = majit_rlib::rsocket::getpeername(fd).map_err(|error| {
+                            socket_io_err(std::io::Error::from_raw_os_error(error.errno))
+                        })?;
+                        let (storage, slen) = storage_from_rsocket(&bytes, slen);
+                        return Ok(unpack_inet_addr(&storage, slen));
                     }
-                    Ok(unpack_inet_addr(&storage, slen))
+                    #[cfg(windows)]
+                    {
+                        let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
+                        let mut slen =
+                            core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+                        let r = {
+                            rffi::getpeername(
+                                fd,
+                                &mut storage as *mut _ as *mut rffi::sockaddr,
+                                &mut slen,
+                            )
+                        };
+                        if r != 0 {
+                            return Err(socket_last_error());
+                        }
+                        Ok(unpack_inet_addr(&storage, slen))
+                    }
                 },
                 1,
             ),

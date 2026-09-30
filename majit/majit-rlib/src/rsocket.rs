@@ -341,6 +341,43 @@ pub fn socketpair(family: INT, ty: INT, proto: INT) -> Result<(INT, INT), CSocke
     Ok((fds[0], fds[1]))
 }
 
+/// `getsockname` / `getpeername`. The bytes are a `sockaddr_storage`.
+/// `addrlen` is the length the call wrote.
+#[cfg(unix)]
+fn read_socket_address(
+    call: impl FnOnce(*mut libc::sockaddr, *mut libc::socklen_t) -> INT,
+) -> Result<(Vec<u8>, i32), CSocketError> {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut addrlen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let res = call((&raw mut storage).cast(), &raw mut addrlen);
+    if res < 0 {
+        return Err(last_error());
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&raw const storage).cast::<u8>(),
+            std::mem::size_of::<libc::sockaddr_storage>(),
+        )
+    };
+    Ok((bytes.to_vec(), addrlen as i32))
+}
+
+/// `getsockname`.
+#[cfg(unix)]
+pub fn getsockname(fd: INT) -> Result<(Vec<u8>, i32), CSocketError> {
+    read_socket_address(|addr, addrlen| unsafe {
+        crate::_rsocket_rffi::socketgetsockname(fd, addr, addrlen)
+    })
+}
+
+/// `getpeername`.
+#[cfg(unix)]
+pub fn getpeername(fd: INT) -> Result<(Vec<u8>, i32), CSocketError> {
+    read_socket_address(|addr, addrlen| unsafe {
+        crate::_rsocket_rffi::socketgetpeername(fd, addr, addrlen)
+    })
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
@@ -525,6 +562,40 @@ mod tests {
                 assert!(flags >= 0 && (flags & libc::FD_CLOEXEC) != 0);
                 assert_eq!(crate::_rsocket_rffi::socketclose(fd), 0);
             }
+        }
+    }
+
+    #[test]
+    fn socket_names_match_libc() {
+        unsafe {
+            let fd = crate::_rsocket_rffi::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket errno {}", crate::rposix::get_saved_errno());
+            let (bytes, len) = getsockname(fd).expect("getsockname");
+            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+            let mut addrlen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            assert_eq!(
+                libc::getsockname(fd, (&raw mut storage).cast(), &raw mut addrlen),
+                0
+            );
+            assert_eq!(len, addrlen as i32);
+            let libc_bytes = std::slice::from_raw_parts(
+                (&raw const storage).cast::<u8>(),
+                std::mem::size_of::<libc::sockaddr_storage>(),
+            );
+            assert_eq!(bytes, libc_bytes);
+            assert_eq!(
+                getpeername(fd).expect_err("unconnected").errno,
+                libc::ENOTCONN
+            );
+            assert_eq!(crate::_rsocket_rffi::socketclose(fd), 0);
+
+            let (a, b) = socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0).expect("pair");
+            let (local, local_len) = getsockname(a).expect("local");
+            let (peer, peer_len) = getpeername(b).expect("peer");
+            assert_eq!(local_len, peer_len);
+            assert_eq!(&local[..local_len as usize], &peer[..peer_len as usize]);
+            assert_eq!(crate::_rsocket_rffi::socketclose(a), 0);
+            assert_eq!(crate::_rsocket_rffi::socketclose(b), 0);
         }
     }
 }
