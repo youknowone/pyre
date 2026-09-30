@@ -4502,26 +4502,46 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let loc1 = self.xrm.loc(
-            rhs,
-            Type::Float,
-            false,
-            &mut self.longevity,
-            &mut self.fm,
-            &self.constants,
-        );
-        let args = [lhs, rhs];
-        let loc0 = self.xrm.force_result_in_reg(
-            dst,
-            lhs,
-            Type::Float,
-            &args,
-            &mut self.longevity,
-            &mut self.fm,
-            &self.constants,
-            &mut self.pending_moves,
-        );
-        self.perform(i, [loc0, loc1], Some(loc0), output);
+        // aarch64/regalloc.py `prepare_two_regs_op`: `fadd/fmul Dd, Dn, Dm`
+        // writes a third register. x86 `addsd/mulsd` is two-operand, so the
+        // result has to land on the lhs (`force_result_in_reg`). Using that
+        // form here copies the accumulator into the destination before the
+        // arithmetic, which lengthens the loop-carried float chain.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let boxes = [lhs, rhs];
+            let loc0 = self.make_sure_var_in_reg(lhs, Type::Float, &boxes, None, false);
+            let loc1 = self.make_sure_var_in_reg(rhs, Type::Float, &boxes, None, false);
+            self.possibly_free_var(lhs, Type::Float);
+            self.possibly_free_var(rhs, Type::Float);
+            self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
+            let res = self.force_allocate_reg(dst, Type::Float, &[], None, false);
+            self.perform(i, [loc0, loc1], Some(Loc::Reg(res)), output);
+            return;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let loc1 = self.xrm.loc(
+                rhs,
+                Type::Float,
+                false,
+                &mut self.longevity,
+                &mut self.fm,
+                &self.constants,
+            );
+            let args = [lhs, rhs];
+            let loc0 = self.xrm.force_result_in_reg(
+                dst,
+                lhs,
+                Type::Float,
+                &args,
+                &mut self.longevity,
+                &mut self.fm,
+                &self.constants,
+                &mut self.pending_moves,
+            );
+            self.perform(i, [loc0, loc1], Some(loc0), output);
+        }
     }
 
     /// x86/regalloc.py `_consider_math_sqrt`:
