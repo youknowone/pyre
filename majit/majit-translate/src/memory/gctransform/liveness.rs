@@ -875,9 +875,16 @@ fn body_calls_pin(body: &HelperBodyFact) -> bool {
 /// from the locals that reach a pin argument and then grows by parameters
 /// handed to a nested helper at one of *its* pinned positions.
 fn summarize_pin_helpers(bodies: &HashMap<u64, HelperBodyFact>) -> HashMap<u64, PinHelperSummary> {
+    let opens_nested = |body: &HelperBodyFact| {
+        body.has_push_roots
+            || body
+                .calls
+                .iter()
+                .any(|call| bodies.get(&call.callee).is_some_and(|b| b.has_push_roots))
+    };
     let mut helpers: HashSet<u64> = bodies
         .iter()
-        .filter(|(_, body)| !body.has_push_roots && body_calls_pin(body))
+        .filter(|(_, body)| !opens_nested(body) && body_calls_pin(body))
         .map(|(&id, _)| id)
         .collect();
     loop {
@@ -885,7 +892,7 @@ fn summarize_pin_helpers(bodies: &HashMap<u64, HelperBodyFact>) -> HashMap<u64, 
             .iter()
             .filter(|(id, body)| {
                 !helpers.contains(*id)
-                    && !body.has_push_roots
+                    && !opens_nested(body)
                     && body.calls.iter().any(|call| helpers.contains(&call.callee))
             })
             .map(|(&id, _)| id)
@@ -944,14 +951,31 @@ fn helper_candidate_ids(
     names: &HashMap<u64, String>,
     push_roots: &HashSet<u64>,
 ) -> HashSet<u64> {
-    let opens = |cs: &HashSet<u64>| cs.iter().any(|callee| push_roots.contains(callee));
+    let mut openers: HashSet<u64> = callees
+        .iter()
+        .filter(|(_, cs)| cs.iter().any(|callee| push_roots.contains(callee)))
+        .map(|(&id, _)| id)
+        .collect();
+    loop {
+        let grown: Vec<u64> = callees
+            .iter()
+            .filter(|(id, cs)| {
+                !openers.contains(*id) && cs.iter().any(|callee| openers.contains(callee))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        if grown.is_empty() {
+            break;
+        }
+        openers.extend(grown);
+    }
     let pins = |cs: &HashSet<u64>| {
         cs.iter()
             .any(|callee| names.get(callee).is_some_and(|name| is_pin_fn(name)))
     };
     let mut helpers: HashSet<u64> = callees
         .iter()
-        .filter(|(_, cs)| !opens(cs) && pins(cs))
+        .filter(|(id, cs)| !openers.contains(*id) && pins(cs))
         .map(|(&id, _)| id)
         .collect();
     loop {
@@ -959,7 +983,7 @@ fn helper_candidate_ids(
             .iter()
             .filter(|(id, cs)| {
                 !helpers.contains(*id)
-                    && !opens(cs)
+                    && !openers.contains(*id)
                     && cs.iter().any(|callee| helpers.contains(callee))
             })
             .map(|(&id, _)| id)
@@ -2288,6 +2312,34 @@ mod tests {
         );
     }
 
+    /// A pin into a nested owned scope is not a pin into the caller.
+    #[test]
+    fn a_pin_caller_that_opens_a_scope_through_another_function_is_not_a_helper() {
+        let mut bodies = HashMap::new();
+        bodies.insert(
+            1,
+            helper_fact(
+                1,
+                true,
+                vec![("pyre_object::gc_roots::pin_root", 9, vec![vec![1]])],
+            ),
+        );
+        bodies.insert(
+            2,
+            helper_fact(
+                1,
+                false,
+                vec![
+                    ("pyre_object::gc_roots::pin_root", 9, vec![vec![1]]),
+                    ("nested_opener", 1, vec![vec![1]]),
+                ],
+            ),
+        );
+        let sums = summarize_pin_helpers(&bodies);
+        assert!(!sums.contains_key(&1));
+        assert!(!sums.contains_key(&2));
+    }
+
     /// `RootedItems::new` opens its own scope. It is not a helper, and neither
     /// is a function whose only pin goes through it.
     #[test]
@@ -2401,11 +2453,14 @@ mod tests {
         names.insert(3, "outer".into());
         callees.insert(4, HashSet::from([2]));
         names.insert(4, "caller_of_bracket".into());
+        callees.insert(5, HashSet::from([2, 9]));
+        names.insert(5, "pin_and_open".into());
         let ids = helper_candidate_ids(&callees, &names, &HashSet::from([7]));
         assert!(ids.contains(&1));
         assert!(ids.contains(&3));
         assert!(!ids.contains(&2));
         assert!(!ids.contains(&4));
+        assert!(!ids.contains(&5));
         assert!(!ids.contains(&9));
     }
 }
