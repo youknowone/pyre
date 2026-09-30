@@ -5118,6 +5118,13 @@ pub fn __majit_wrap_tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef,
         if pyre_object::is_exact_list(obj) {
             return Ok(tuple_from_exact_list(obj));
         }
+        // `tuple(FrameLocalsProxy)` is the same positional slot walk as
+        // `list(FrameLocalsProxy)`, then the exact-list copy. The generic
+        // arm calls `__len__` / `__iter__` (`framelocalsproxy_iter` is
+        // `iter(self.keys())`).
+        if crate::pyframe::frame_locals_proxy::is_frame_locals_proxy(obj) {
+            return Ok(tuple_from_frame_locals_proxy(obj));
+        }
     }
     tuple_from_one(obj)
 }
@@ -5171,8 +5178,19 @@ fn tuple_from_exact_list(obj: PyObjectRef) -> PyObjectRef {
     unsafe { pyre_object::w_tuple_new(items) }
 }
 
-/// `tuple(x)` for an iterable that is not an exact tuple or list.
-/// `__len__` stays in this residual.
+/// `tuple(FrameLocalsProxy)` — bound names, then the exact-list copy.
+///
+/// `@jit.unroll_safe` for the same reason as `pyframe.py fast2locals`:
+/// the slot walk has to stay look-inside when this graph is entered from
+/// `tuple.__new__`.
+#[majit_macros::unroll_safe]
+fn tuple_from_frame_locals_proxy(obj: PyObjectRef) -> PyObjectRef {
+    let keys = crate::pyframe::frame_locals_proxy::bound_part_list(obj, 0);
+    tuple_from_exact_list(keys)
+}
+
+/// `tuple(x)` for an iterable that is not an exact tuple, an exact list,
+/// or a `FrameLocalsProxy`. `__len__` stays in this residual.
 #[majit_macros::dont_look_inside]
 fn tuple_from_one(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     crate::builtins::builtin_tuple(std::slice::from_ref(&obj))

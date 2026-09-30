@@ -607,10 +607,10 @@ pub(crate) fn list_extend_items(
     } {
         extend_from_set(list, other)?;
     } else if unsafe { crate::pyframe::frame_locals_proxy::is_frame_locals_proxy(other) } {
-        // `framelocalsproxy_iter` is `iter(self.keys())`.  The key list is
-        // built inside this residual so `descr_init`'s graph does not gain
-        // `keys`, and `list(f_locals)` does not re-enter the interpreter.
-        // `false` means the proxy had no key list; drain it as a generic
+        // `framelocalsproxy_iter` is `iter(self.keys())`.  The key scan is
+        // `pyframe.py fast2locals`'s positional loops
+        // (`extend_from_frame_locals_proxy`), appended onto this list.
+        // `false` means `other` was not a proxy; drain it as a generic
         // iterable.
         if !pyre_object::with_roots!(list, other => extend_from_frame_locals_proxy(list, other)) {
             extend_from_iterable(list, other)?;
@@ -729,23 +729,18 @@ fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::P
     Ok(())
 }
 
-/// `list(FrameLocalsProxy)` — `keys()` then the same storage copy as
-/// `list(list)`.  `bool`, not `Result`: a `Result` residual is may-force
-/// and `descr_init` is a transparent helper that cannot record one.
-/// `false` asks the caller to use the generic iterable drain.
-#[majit_macros::dont_look_inside_cannot_raise]
+/// `list(FrameLocalsProxy)` — append each bound name onto `list`.
+///
+/// `pyframe.py fast2locals` walks the slots with `@jit.unroll_safe`. The
+/// same walk is `append_bound_entries`. `bool`, not
+/// `Result`: a `Result` residual is may-force and `descr_init` is a
+/// transparent helper. `false` asks the caller to use the generic iterable
+/// drain. The names go straight onto `list`; an intermediate key list would
+/// then call `extend_from_list`, and that may-force residual is not
+/// recordable here.
+#[majit_macros::unroll_safe]
 fn extend_from_frame_locals_proxy(list: PyObjectRef, other: PyObjectRef) -> bool {
-    // `keys_list` materializes the key list, so both operands can move
-    // under it.  `extend_from_list` pins what it is handed, which is too
-    // late for an address this frame captured before the allocation.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[list, other]);
-    let Some(Ok(keys)) = crate::pyframe::frame_locals_proxy::keys_list(
-        pyre_object::gc_roots::shadow_stack_get(base + 1),
-    ) else {
-        return false;
-    };
-    extend_from_list(pyre_object::gc_roots::shadow_stack_get(base), keys).is_ok()
+    crate::pyframe::frame_locals_proxy::extend_bound_entries(list, other, 0)
 }
 
 /// `listobject.py ListStrategy._extend_from_iterable`.  Upstream drains

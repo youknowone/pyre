@@ -3501,6 +3501,10 @@ fn transparent_helper_recordable_leaf(path: &str) -> bool {
                 | "exc_init_one_positional"
                 | "value_error_one_arg"
                 | "extend_from_frame_locals_proxy"
+                | "proxy_list_new"
+                | "proxy_list_append"
+                | "append_extra_locals"
+                | "append_extra_locals_items"
         )
     })
 }
