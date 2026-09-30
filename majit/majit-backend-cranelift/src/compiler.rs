@@ -453,21 +453,12 @@ pub fn clear_gc_allocator() {
     gc_box::clear();
 }
 
-/// Follow jf_forward chain to get the final jitframe address.
-///
-/// RPython jitframe.py jitframe_resolve:
-///   while frame.jf_forward:
-///       frame = frame.jf_forward
-///   return frame
+/// [`majit_backend::jitframe::JitFrame::resolve`]: realloc link, then a
+/// nursery forwarding stub.
 fn jitframe_resolve(jf_ptr: *mut i64) -> *mut i64 {
-    let mut ptr = jf_ptr;
-    loop {
-        let forward_addr =
-            unsafe { *((ptr as *const u8).add(JF_FORWARD_OFS as usize) as *const usize) };
-        if forward_addr == 0 {
-            return ptr;
-        }
-        ptr = forward_addr as *mut i64;
+    unsafe {
+        majit_backend::jitframe::JitFrame::resolve(jf_ptr as *mut majit_backend::jitframe::JitFrame)
+            as *mut i64
     }
 }
 
@@ -3582,6 +3573,54 @@ fn handle_fail_propagate_exception(frame_ptr: i64) -> i64 {
     value
 }
 
+/// A nursery jitframe moves, and the callee can return the corpse after
+/// popping its shadow-stack entry. [`JitFrame::resolve`](majit_backend::jitframe::JitFrame::resolve)
+/// follows the forwarding stub while that word is intact. The bridge hook
+/// allocates; pin is declined for a frame that holds GC pointers, so the
+/// owner root is what the collector updates. Re-read it after every call
+/// that can collect.
+fn rooted_call_assembler_frame(
+    frame_ptr: i64,
+) -> (i64, Option<majit_gc::shadow_stack::OwnerRootGuard>) {
+    if frame_ptr == 0 {
+        return (0, None);
+    }
+    let resolved = unsafe {
+        majit_backend::jitframe::JitFrame::resolve(
+            frame_ptr as *mut majit_backend::jitframe::JitFrame,
+        ) as i64
+    };
+    let root = majit_gc::gc_owns_object(resolved as usize)
+        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(resolved as usize)));
+    let live = root
+        .as_ref()
+        .map(|root| root.get().0 as i64)
+        .unwrap_or(resolved);
+    (live, root)
+}
+
+fn reread_rooted_call_assembler_frame(
+    frame_ptr: i64,
+    root: &Option<majit_gc::shadow_stack::OwnerRootGuard>,
+) -> i64 {
+    let Some(root) = root.as_ref() else {
+        return frame_ptr;
+    };
+    unsafe {
+        majit_backend::jitframe::JitFrame::resolve(
+            root.get().0 as *mut majit_backend::jitframe::JitFrame,
+        ) as i64
+    }
+}
+
+fn call_assembler_frame_outputs(frame_ptr: i64, outputs_ptr: *const i64) -> *const i64 {
+    if frame_ptr == 0 {
+        outputs_ptr
+    } else {
+        (frame_ptr as usize + JF_FRAME_ITEM0_OFS as usize) as *const i64
+    }
+}
+
 /// direct call_assembler path. Ultra-lightweight: just increments
 /// fail count, checks bridge (atomic + mutex only when bridge exists),
 /// and defers bridge compilation. Falls back to force_fn.
@@ -3666,6 +3705,9 @@ fn call_assembler_guard_failure_inner(
         let handle = store_call_assembler_deadframe(frame);
         return handle as i64;
     }
+
+    let (mut frame_ptr, frame_root) = rooted_call_assembler_frame(frame_ptr);
+    let outputs_ptr = call_assembler_frame_outputs(frame_ptr, outputs_ptr);
 
     // compile.py ExitFrameWithExceptionDescrRef.handle_fail:
     // FINISH descriptors are the attached singleton Arc<dyn Descr> data
@@ -3771,6 +3813,7 @@ fn call_assembler_guard_failure_inner(
     // (pyjitpl.rs).
     let owning_jct = majit_backend::descr_owning_jct(fail_descr);
     maybe_increment_fail_count(fail_descr);
+    frame_ptr = reread_rooted_call_assembler_frame(frame_ptr, &frame_root);
 
     // compile.py handle_fail → must_compile → bridge tracing.
     // Check jitcounter threshold; if reached, trace alternate path and
@@ -3789,6 +3832,7 @@ fn call_assembler_guard_failure_inner(
         }
     }
     let _ = owning_jct;
+    frame_ptr = reread_rooted_call_assembler_frame(frame_ptr, &frame_root);
 
     // resume.py blackhole_from_resumedata parity: materialize
     // virtuals before blackhole resume.
@@ -10048,9 +10092,8 @@ fn run_compiled_code_inner(
         majit_ir::debug::log_one("jit-running", &format!("post-call result_jf={result_jf:p}"));
     }
 
-    // jitframe_resolve (jitframe.py):
-    // Follow jf_forward chain — the compiled code may return the old
-    // (nursery) jf_ptr, but the jitframe has been forwarded to old gen.
+    // The compiled code may return a frame `_check_frame_depth` replaced,
+    // or a nursery pointer whose live copy is already in old gen.
     let result_jf = jitframe_resolve(result_jf);
 
     // llmodel.py get_latest_descr: read jf_descr pointer from frame.

@@ -745,16 +745,35 @@ impl JitFrame {
         }
     }
 
-    /// jitframe.py — jitframe_resolve.
+    /// jitframe.py — jitframe_resolve, plus the nursery forwarding stub.
+    ///
+    /// `jf_forward` is the `_check_frame_depth` realloc link. A minor
+    /// collection leaves that word stale on the nursery corpse and stores
+    /// the live address at payload word 0; `jitframe_trace` updates
+    /// `jf_forward` on the live copy. Follow a nursery stub before reading
+    /// `jf_forward`, then follow the link, and repeat.
+    ///
     /// # Safety
     /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
     /// invariant required by the object and pointer arguments for the entire call.
+    /// `frame` is a jitframe pointer. A nursery object is only chased when
+    /// [`majit_gc::gc_current_object_address`] reports one.
     pub unsafe fn resolve(mut frame: *mut JitFrame) -> *mut JitFrame {
         unsafe {
-            while !(*frame).jf_forward.is_null() {
+            loop {
+                let chased = majit_gc::gc_current_object_address(frame as usize) as *mut JitFrame;
+                if chased != frame {
+                    if chased.is_null() {
+                        return chased;
+                    }
+                    frame = chased;
+                    continue;
+                }
+                if (*frame).jf_forward.is_null() {
+                    return frame;
+                }
                 frame = (*frame).jf_forward;
             }
-            frame
         }
     }
 
@@ -1109,5 +1128,81 @@ mod tests {
         assert_eq!(info.depth(), high as isize);
         let consistent = base_ofs as isize + (high as isize) * SIZEOFSIGNED as isize;
         assert_eq!(info.size(), consistent);
+    }
+
+    /// Off-GC frames have a header word so the write-barrier byte load is
+    /// in range. That word is not a nursery stub: `resolve` follows only
+    /// `jf_forward` for them.
+    #[test]
+    fn resolve_follows_realloc_link_and_ignores_an_off_gc_stub() {
+        let bytes = JitFrame::alloc_size(4);
+        let corpse = alloc_off_gc_jitframe(bytes);
+        let live = alloc_off_gc_jitframe(bytes);
+        assert!(!corpse.is_null() && !live.is_null());
+        unsafe {
+            majit_gc::header::GcHeader::set_forwarding_address(
+                majit_gc::header::header_of(corpse as usize),
+                live as usize,
+            );
+            assert_eq!(JitFrame::resolve(corpse), corpse);
+            (*corpse).jf_forward = live;
+            assert_eq!(JitFrame::resolve(corpse), live);
+            free_off_gc_jitframe(live);
+            free_off_gc_jitframe(corpse);
+        }
+    }
+
+    /// The nursery stub sits at payload word 0. `jf_forward` on the corpse
+    /// is the pre-move word; the live copy's link is the one `resolve` walks.
+    #[test]
+    fn resolve_follows_a_nursery_stub_then_the_live_realloc_link() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NURSERY_CORPSE: AtomicUsize = AtomicUsize::new(0);
+
+        fn is_test_nursery(addr: usize) -> bool {
+            addr != 0 && addr == NURSERY_CORPSE.load(Ordering::Acquire)
+        }
+
+        struct HookGuard;
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                NURSERY_CORPSE.store(0, Ordering::Release);
+                majit_gc::set_active_gc_is_nursery_object(None);
+            }
+        }
+
+        assert!(
+            majit_gc::published_nursery_window().is_none(),
+            "a published nursery window would hide the test hook"
+        );
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let tid = gc.register_type(jitframe_type_info());
+        gc.set_jitframe_type_id(tid);
+        let bytes = JitFrame::alloc_size(8);
+        let corpse = malloc_jitframe_no_collect(&mut gc, bytes);
+        let live = malloc_jitframe_no_collect(&mut gc, bytes);
+        let tail = malloc_jitframe_no_collect(&mut gc, bytes);
+        assert!(gc.is_in_nursery(corpse as usize));
+        NURSERY_CORPSE.store(corpse as usize, Ordering::Release);
+        majit_gc::set_active_gc_is_nursery_object(Some(is_test_nursery));
+        let _hook = HookGuard;
+        let info = JitFrameInfo::default();
+        unsafe {
+            JitFrame::init(corpse, &info, 8);
+            JitFrame::init(live, &info, 8);
+            JitFrame::init(tail, &info, 8);
+            *JitFrame::slot_ptr(corpse, 2) = 0xdead;
+            *JitFrame::slot_ptr(live, 2) = 0x10;
+            (*corpse).jf_forward = tail;
+            majit_gc::header::GcHeader::set_forwarding_address(
+                majit_gc::header::header_of(corpse as usize),
+                live as usize,
+            );
+            assert_eq!(JitFrame::resolve(corpse), live);
+            assert_eq!(*JitFrame::slot_ptr(JitFrame::resolve(corpse), 2), 0x10);
+            (*live).jf_forward = tail;
+            assert_eq!(JitFrame::resolve(corpse), tail);
+        }
     }
 }
