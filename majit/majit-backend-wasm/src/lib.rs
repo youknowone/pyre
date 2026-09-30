@@ -3298,8 +3298,10 @@ fn stub_matches_table(
     if !majit_backend::call_stub::call_stub_arm_exists(classes) {
         return false;
     }
+    // `jit_func_sig` reads the compiled-trace table. A guest interpreter
+    // helper is not in it, so a missing encoding keeps the word-ABI stub.
     let Some(sig) = residual_target_sig(func_ptr as i64) else {
-        return false;
+        return true;
     };
     if sig.has_f32() || sig.params.len() != classes.len() {
         return false;
