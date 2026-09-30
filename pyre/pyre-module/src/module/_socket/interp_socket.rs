@@ -1251,15 +1251,25 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 let c_ip = std::ffi::CString::new(ip.as_bytes()).map_err(|_| {
                     pyre_interpreter::PyError::value_error("embedded null character")
                 })?;
-                match rffi::pton(af, &c_ip) {
-                    Ok(packed) => Ok(pyre_object::bytesobject::w_bytes_from_bytes(&packed)),
-                    Err(rffi::PtonError::Family(code)) => Err(
-                        pyre_interpreter::PyError::os_error_syscall(code, pyre_object::PY_NULL),
-                    ),
-                    Err(rffi::PtonError::Address) => Err(pyre_interpreter::PyError::os_error(
+                #[cfg(any(unix, windows))]
+                let packed = majit_rlib::rsocket::inet_pton(af, &c_ip).map_err(|error| match error {
+                    majit_rlib::rsocket::PtonError::Family(code) => {
+                        pyre_interpreter::PyError::os_error_syscall(code, pyre_object::PY_NULL)
+                    }
+                    majit_rlib::rsocket::PtonError::Address => pyre_interpreter::PyError::os_error(
                         "illegal IP address string passed to inet_pton",
-                    )),
-                }
+                    ),
+                })?;
+                #[cfg(not(any(unix, windows)))]
+                let packed = rffi::pton(af, &c_ip).map_err(|error| match error {
+                    rffi::PtonError::Family(code) => {
+                        pyre_interpreter::PyError::os_error_syscall(code, pyre_object::PY_NULL)
+                    }
+                    rffi::PtonError::Address => pyre_interpreter::PyError::os_error(
+                        "illegal IP address string passed to inet_pton",
+                    ),
+                })?;
+                Ok(pyre_object::bytesobject::w_bytes_from_bytes(&packed))
             },
             2,
         ),
@@ -1302,9 +1312,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                         "invalid length of packed IP address string",
                     ));
                 }
-                let Some(text) = rffi::ntop(af, data) else {
-                    return Err(pyre_interpreter::PyError::os_error("inet_ntop failed"));
-                };
+                #[cfg(any(unix, windows))]
+                let text = majit_rlib::rsocket::inet_ntop(af, data).map_err(|_| {
+                    pyre_interpreter::PyError::os_error("inet_ntop failed")
+                })?;
+                #[cfg(not(any(unix, windows)))]
+                let text = rffi::ntop(af, data).ok_or_else(|| {
+                    pyre_interpreter::PyError::os_error("inet_ntop failed")
+                })?;
                 Ok(pyre_object::w_str_new_managed(&text))
             },
             2,
@@ -1425,13 +1440,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     let storage = resolve_ip_host(&c, rffi::AF_INET)?;
                     let sin = unsafe { &*(&storage as *const _ as *const rffi::sockaddr_in) };
                     let packed = rffi::sockaddr_in_get_addr(sin);
-                    let Some(text) = rffi::inet_ntoa(packed.to_ne_bytes()) else {
-                        return Err(socket_converted_error(
+                    let text = majit_rlib::rsocket::inet_ntoa(&packed.to_ne_bytes()).map_err(|_| {
+                        socket_converted_error(
                             "error",
                             None,
                             "gethostbyname: address is not representable",
-                        ));
-                    };
+                        )
+                    })?;
                     Ok(pyre_object::w_str_new_managed(&text))
                 },
                 1,
@@ -2319,7 +2334,7 @@ fn unpack_hostent(
                 }
                 let addr_str = if addr_type == rffi::AF_INET && addr_length == 4 {
                     let packed = std::ptr::read_unaligned(addr_ptr as *const u32).to_ne_bytes();
-                    rffi::inet_ntoa(packed).unwrap_or_default()
+                    majit_rlib::rsocket::inet_ntoa(&packed).unwrap_or_default()
                 } else if addr_type == rffi::AF_INET6 && addr_length == 16 {
                     let mut packed_addr = [0u8; 16];
                     std::ptr::copy_nonoverlapping(
@@ -2327,18 +2342,7 @@ fn unpack_hostent(
                         packed_addr.as_mut_ptr(),
                         packed_addr.len(),
                     );
-                    let mut buf = [0u8; 64];
-                    let q = rffi::inet_ntop(
-                        rffi::AF_INET6,
-                        packed_addr.as_ptr() as *const libc::c_void,
-                        buf.as_mut_ptr() as *mut libc::c_char,
-                        buf.len() as rffi::SockLen,
-                    );
-                    if q.is_null() {
-                        String::new()
-                    } else {
-                        std::ffi::CStr::from_ptr(q).to_string_lossy().into_owned()
-                    }
+                    majit_rlib::rsocket::inet_ntop(rffi::AF_INET6, &packed_addr).unwrap_or_default()
                 } else {
                     String::new()
                 };
@@ -4146,21 +4150,23 @@ fn pack_inet_addr(
         sin.sin_family = rffi::AF_INET as rffi::SaFamily;
         sin.sin_port = port;
         // inet_pton handles both "0.0.0.0" and dotted-quad.
-        let r = if c_host.as_bytes().is_empty() {
+        let parsed = if c_host.as_bytes().is_empty() {
             // RSocket.makeipaddr('', result) uses the wildcard address for
             // bind(), as required by socketserver and socket_helper.bind_port.
             rffi::sockaddr_in_set_addr(sin, rffi::INADDR_ANY);
-            1
+            true
         } else {
-            unsafe {
-                rffi::inet_pton(
-                    rffi::AF_INET,
-                    c_host.as_ptr(),
-                    &mut sin.sin_addr as *mut _ as *mut libc::c_void,
-                )
+            match majit_rlib::rsocket::inet_pton(rffi::AF_INET, &c_host) {
+                Ok(packed) => {
+                    let mut bytes = [0u8; 4];
+                    bytes.copy_from_slice(&packed);
+                    rffi::sockaddr_in_set_addr(sin, u32::from_ne_bytes(bytes));
+                    true
+                }
+                Err(_) => false,
             }
         };
-        if r != 1 {
+        if !parsed {
             let found = resolve_ip_host(&c_host, rffi::AF_INET)?;
             let found = unsafe { &*(&found as *const _ as *const rffi::sockaddr_in) };
             rffi::sockaddr_in_set_addr(sin, rffi::sockaddr_in_get_addr(found));
@@ -4174,18 +4180,18 @@ fn pack_inet_addr(
         sin6.sin6_family = rffi::AF_INET6 as rffi::SaFamily;
         sin6.sin6_port = port;
         let mut buf = [0u8; 16];
-        let r = if c_host.as_bytes().is_empty() {
-            1
+        let parsed = if c_host.as_bytes().is_empty() {
+            true
         } else {
-            unsafe {
-                rffi::inet_pton(
-                    rffi::AF_INET6,
-                    c_host.as_ptr(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                )
+            match majit_rlib::rsocket::inet_pton(rffi::AF_INET6, &c_host) {
+                Ok(packed) => {
+                    buf.copy_from_slice(&packed);
+                    true
+                }
+                Err(_) => false,
             }
         };
-        if r != 1 {
+        if !parsed {
             let found = resolve_ip_host(&c_host, rffi::AF_INET6)?;
             let found = unsafe { &*(&found as *const _ as *const rffi::sockaddr_in6) };
             buf = rffi::sockaddr_in6_get_addr(found);
@@ -4222,20 +4228,8 @@ fn unpack_inet_addr(
     let family = storage.ss_family as libc::c_int;
     if family == rffi::AF_INET {
         let sin = unsafe { &*(storage as *const _ as *const rffi::sockaddr_in) };
-        let mut buf = [0u8; 64];
-        let p = unsafe {
-            rffi::inet_ntop(
-                rffi::AF_INET,
-                &sin.sin_addr as *const _ as *const libc::c_void,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len() as rffi::SockLen,
-            )
-        };
-        let host = if p.is_null() {
-            String::new()
-        } else {
-            unsafe { std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned() }
-        };
+        let packed = rffi::sockaddr_in_get_addr(sin).to_ne_bytes();
+        let host = majit_rlib::rsocket::inet_ntop(rffi::AF_INET, &packed).unwrap_or_default();
         let port = u16::from_be(sin.sin_port) as i64;
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(pyre_object::w_str_new_managed(&host));
@@ -4243,20 +4237,8 @@ fn unpack_inet_addr(
         pyre_object::w_tuple_new(fields.take())
     } else if family == rffi::AF_INET6 {
         let sin6 = unsafe { &*(storage as *const _ as *const rffi::sockaddr_in6) };
-        let mut buf = [0u8; 64];
-        let p = unsafe {
-            rffi::inet_ntop(
-                rffi::AF_INET6,
-                &sin6.sin6_addr as *const _ as *const libc::c_void,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len() as rffi::SockLen,
-            )
-        };
-        let host = if p.is_null() {
-            String::new()
-        } else {
-            unsafe { std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned() }
-        };
+        let packed = rffi::sockaddr_in6_get_addr(sin6);
+        let host = majit_rlib::rsocket::inet_ntop(rffi::AF_INET6, &packed).unwrap_or_default();
         let port = u16::from_be(sin6.sin6_port) as i64;
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(pyre_object::w_str_new_managed(&host));

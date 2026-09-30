@@ -152,6 +152,70 @@ pub fn inet_ntoa(packed: &[u8]) -> Result<String, RSocketError> {
         .into_owned())
 }
 
+/// `inet_pton` failures. A negative return leaves an errno; zero rejects the text.
+#[derive(Debug)]
+pub enum PtonError {
+    /// `res < 0`. `errno` is the code `last_error` read.
+    Family(i32),
+    /// `res == 0`.
+    Address,
+}
+
+fn af_inet() -> INT {
+    #[cfg(unix)]
+    {
+        libc::AF_INET
+    }
+    #[cfg(windows)]
+    {
+        crate::_rsocket_rffi::AF_INET
+    }
+}
+
+/// `inet_pton`. Four bytes for `AF_INET`, sixteen otherwise.
+pub fn inet_pton(family: INT, ip: &std::ffi::CStr) -> Result<Vec<u8>, PtonError> {
+    let mut buf = [0u8; 16];
+    let res =
+        unsafe { crate::_rsocket_rffi::inet_pton(family, ip.as_ptr(), buf.as_mut_ptr().cast()) };
+    if res < 0 {
+        return Err(PtonError::Family(last_error().errno));
+    }
+    if res == 0 {
+        return Err(PtonError::Address);
+    }
+    let width = if family == af_inet() { 4 } else { 16 };
+    Ok(buf[..width].to_vec())
+}
+
+/// `inet_ntop`. The packed bytes are the family width the caller checked.
+pub fn inet_ntop(family: INT, packed: &[u8]) -> Result<String, CSocketError> {
+    let mut buf = [0u8; 64];
+    #[cfg(unix)]
+    let text = unsafe {
+        crate::_rsocket_rffi::inet_ntop(
+            family,
+            packed.as_ptr().cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len() as libc::socklen_t,
+        )
+    };
+    #[cfg(windows)]
+    let text = unsafe {
+        crate::_rsocket_rffi::inet_ntop(
+            family,
+            packed.as_ptr().cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if text.is_null() {
+        return Err(last_error());
+    }
+    Ok(unsafe { std::ffi::CStr::from_ptr(text) }
+        .to_string_lossy()
+        .into_owned())
+}
+
 /// `gethostname`. The buffer is 1024 bytes. The result stops at the first NUL.
 #[cfg(unix)]
 pub fn gethostname() -> Result<Vec<u8>, CSocketError> {
@@ -389,5 +453,27 @@ mod tests {
             list.iter()
                 .all(|(_, name)| !name.is_empty() && !name.contains(&0))
         );
+    }
+
+    #[test]
+    fn inet_pton_and_ntop_round_trip() {
+        let packed = inet_pton(libc::AF_INET, c"127.0.0.1").expect("loopback");
+        assert_eq!(packed, [127, 0, 0, 1]);
+        assert_eq!(
+            inet_ntop(libc::AF_INET, &packed).expect("ntop"),
+            "127.0.0.1"
+        );
+        let v6 = inet_pton(libc::AF_INET6, c"::1").expect("v6");
+        assert_eq!(v6.len(), 16);
+        assert_eq!(*v6.last().unwrap(), 1);
+        assert_eq!(inet_ntop(libc::AF_INET6, &v6).expect("v6 text"), "::1");
+        assert!(matches!(
+            inet_pton(libc::AF_INET, c"nope"),
+            Err(PtonError::Address)
+        ));
+        match inet_pton(1234, c"1.2.3.4") {
+            Err(PtonError::Family(code)) => assert_eq!(code, libc::EAFNOSUPPORT),
+            other => panic!("family 1234 returned {other:?}"),
+        }
     }
 }

@@ -952,40 +952,20 @@ pub enum PtonError {
 
 /// `inet_pton` over the buffer it fills, sized by the family it was given.
 pub fn pton(family: libc::c_int, text: &std::ffi::CStr) -> Result<Vec<u8>, PtonError> {
-    let mut buf = [0u8; 16];
-    let result = unsafe {
-        inet_pton(
-            family,
-            text.as_ptr(),
-            buf.as_mut_ptr() as *mut core::ffi::c_void,
-        )
-    };
-    if result < 0 {
-        return Err(PtonError::Family(last_error_code()));
+    #[cfg(windows)]
+    init();
+    match majit_rlib::rsocket::inet_pton(family, text) {
+        Ok(packed) => Ok(packed),
+        Err(majit_rlib::rsocket::PtonError::Family(code)) => Err(PtonError::Family(code)),
+        Err(majit_rlib::rsocket::PtonError::Address) => Err(PtonError::Address),
     }
-    if result != 1 {
-        return Err(PtonError::Address);
-    }
-    let width = if family == AF_INET { 4 } else { 16 };
-    Ok(buf[..width].to_vec())
 }
 
 /// `inet_ntop` over the text buffer it fills.
 pub fn ntop(family: libc::c_int, packed: &[u8]) -> Option<String> {
-    let mut buf = [0u8; 64];
-    let text = unsafe {
-        inet_ntop(
-            family,
-            packed.as_ptr() as *const core::ffi::c_void,
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len() as SockLen,
-        )
-    };
-    (!text.is_null()).then(|| {
-        unsafe { std::ffi::CStr::from_ptr(text) }
-            .to_string_lossy()
-            .into_owned()
-    })
+    #[cfg(windows)]
+    init();
+    majit_rlib::rsocket::inet_ntop(family, packed).ok()
 }
 
 // The legacy `<netdb.h>` resolvers.

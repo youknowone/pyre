@@ -6,7 +6,7 @@
 //! `sendmsg_implementation`, `CMSG_SPACE_wrapper` and `CMSG_LEN_wrapper`
 //! stay out: each one is a separate C source. Windows here is `FD_*`,
 //! `select`, `getsockname`, `getsockopt`, the byte-order conversions,
-//! `inet_addr`, `inet_ntoa`, and `_WSAGetLastError`.
+//! `inet_addr`, `inet_ntoa`, `inet_pton`, `inet_ntop`, and `_WSAGetLastError`.
 
 #![allow(non_snake_case, non_camel_case_types)]
 
@@ -594,7 +594,7 @@ mod winsock {
 
     crate::rffi::external_compilation_info! {
         const ECI = {
-            includes: ["winsock2.h"],
+            includes: ["winsock2.h", "ws2tcpip.h"],
             libraries: ["ws2_32"],
         };
     }
@@ -756,6 +756,27 @@ mod winsock {
         *mut std::ffi::c_char,
         compilation_info = ECI,
         calling_conv = "win"
+    );
+
+    /// `AF_INET` / `AF_INET6` in WinSock.
+    pub const AF_INET: INT = 2;
+    pub const AF_INET6: INT = 23;
+
+    crate::rffi::llexternal!(
+        pub inet_pton = "inet_pton",
+        [INT, *const std::ffi::c_char, *mut core::ffi::c_void],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub inet_ntop = "inet_ntop",
+        [INT, *const core::ffi::c_void, *mut std::ffi::c_char, usize],
+        *const std::ffi::c_char,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
     );
 }
 
