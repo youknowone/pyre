@@ -9934,15 +9934,17 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
 /// The hit arm returns. A miss raises, and a helper the walk cannot
 /// record (`LoopHeaderJdIndexUnresolved`, an unscannable op) would abort
 /// the portal if it propagated. Cut the trace back, drop the heap cache
-/// the helper filled, and clear both the walker's exception slot and
-/// `take_call_error` so the residual path does not observe the miss.
+/// the helper filled, put the walker's exception slot back to what it held
+/// before the descent, and clear `take_call_error` so the residual path does
+/// not observe the miss.
 fn decline_frame_locals_getitem<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
+    exc_before: (Option<OpRef>, ConcreteValue),
 ) -> Result<Option<()>, DispatchError> {
     ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
     ctx.trace_ctx.heap_cache_mut().reset();
-    ctx.clear_last_exc_value();
+    ctx.restore_last_exc_value(exc_before.0, exc_before.1);
     let _ = pyre_interpreter::call::take_call_error();
     Ok(None)
 }
@@ -10000,6 +10002,10 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // The slot is session-wide: inside an `except` whose type expression
+    // reads the proxy, it holds the exception the match is about to test.
+    // `finish_inline_callee_return` clears it, so put it back after the walk.
+    let exc_before = (ctx.last_exc_value(), ctx.last_exc_value_concrete());
     let pytype = <pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE;
     let proxy_typeobj = pyre_object::pyobject::get_instantiate(unsafe { &*pytype });
     walker_guard_class(ctx, op_pc, seq_op, pytype as i64)?;
@@ -10041,15 +10047,16 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] FRAME-LOCALS-GETITEM-SUBWALK {error:?}");
             }
-            return decline_frame_locals_getitem(ctx, pre_fold_pos);
+            return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
         }
     };
     let Some(result) = (match walk_outcome {
         DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result),
         _ => None,
     }) else {
-        return decline_frame_locals_getitem(ctx, pre_fold_pos);
+        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
     };
+    ctx.restore_last_exc_value(exc_before.0, exc_before.1);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
     Ok(Some(()))
 }
