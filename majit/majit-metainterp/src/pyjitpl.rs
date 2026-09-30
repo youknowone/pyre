@@ -23747,7 +23747,8 @@ mod metainterp_static_data_tests {
         // `disable_noninlinable_function` is one of the two hash-form entry
         // points that create a cell, and it is what the portal-trace log and
         // the merge-point record feed on a too-long abort.
-        meta.warm_state.disable_noninlinable_function(green_key);
+        meta.warm_state
+            .disable_noninlinable_function_for_key(&typed);
 
         let action = meta.force_start_tracing(green_key, (code_ptr, pc), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -30910,7 +30911,7 @@ mod tests {
 
         // The hash-only writer and the typed key are one cell. The trace
         // carries that cell's key.
-        meta.warm_state.disable_noninlinable_function(bucket);
+        meta.warm_state.disable_noninlinable_function_for_key(&key);
         assert!(matches!(
             meta.force_start_tracing(bucket, (code, pc), None, &[Value::Int(0)]),
             BackEdgeAction::StartedTracing
@@ -31447,7 +31448,10 @@ mod tests {
         meta.warm_state
             .attach_procedure_to_interp_for_key(&parked, squatter);
         let minted = meta.warm_state.cell_key_for(&parked).expect("typed cell");
-        assert_eq!(minted, hash, "one green key is named by get_uhash");
+        assert_ne!(
+            minted, hash,
+            "the squatter keeps the raw hash; the typed cell is minted"
+        );
 
         for _ in 0..2 {
             meta.on_back_edge(1, &[0]);
@@ -31486,7 +31490,6 @@ mod tests {
             .unwrap()
             .green_key;
         assert_eq!(stored, minted);
-        assert_eq!(stored, hash);
     }
 
     #[test]

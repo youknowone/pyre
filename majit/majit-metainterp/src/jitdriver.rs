@@ -11622,17 +11622,17 @@ mod tests {
         );
         let green_key = key.get_uhash();
 
-        // The hash-only route owns the bucket key and reaches its ceiling.
+        // The key's own cell reaches its ceiling.
         driver
             .meta
             .warm_state_mut()
-            .disable_noninlinable_function(green_key);
+            .disable_noninlinable_function_for_key(&key);
         for _ in 0..MAX_TRACE_ABORT_COUNT {
-            driver.meta.warm_state_mut().abort_tracing(green_key, false);
+            driver
+                .meta
+                .warm_state_mut()
+                .abort_tracing_for_key(&key, false);
         }
-        // The typed route is the same JitCell (`make_jitcell_subclass`):
-        // it stores the greens on the cell the hash door filed.
-        driver.meta.warm_state_mut().ensure_cell_for_key(&key);
         assert_eq!(
             driver.meta.warm_state.get_stats().num_cells,
             1,
@@ -13421,6 +13421,26 @@ mod tests {
     /// MetaInterp never files frontend meta for a `compile_tmp_callback` stub
     /// (`compile.py:1101-1150`).
     fn attach_tmp_callback_cell<S: JitState>(driver: &mut JitDriver<S>, green_key: u64) {
+        let token = alive_tmp_token(driver);
+        driver
+            .meta
+            .warm_state_mut()
+            .attach_tmp_callback_to_interp(green_key, token);
+    }
+
+    /// Typed twin of [`attach_tmp_callback_cell`]: the cell carries its greens,
+    /// as the one `get_assembler_token` files does.
+    fn attach_tmp_callback_cell_for_key<S: JitState>(driver: &mut JitDriver<S>, key: &GreenKey) {
+        let token = alive_tmp_token(driver);
+        driver
+            .meta
+            .warm_state_mut()
+            .attach_tmp_callback_to_interp_for_key(key, token);
+    }
+
+    fn alive_tmp_token<S: JitState>(
+        driver: &mut JitDriver<S>,
+    ) -> std::sync::Arc<majit_backend::JitCellToken> {
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
             driver.meta.warm_state_mut().alloc_token_number(),
         ));
@@ -13434,10 +13454,7 @@ mod tests {
             .warm_state_mut()
             .memory_manager
             .keep_loop_alive(&token);
-        driver
-            .meta
-            .warm_state_mut()
-            .attach_tmp_callback_to_interp(green_key, token);
+        token
     }
 
     /// `warmstate.py maybe_compile_and_run`: a cell whose token was
@@ -13500,7 +13517,7 @@ mod tests {
         );
         let green_key = majit_ir::pypyjit_greenkey_uhash(target_pc, false, code_ptr as u64);
         assert_eq!(green_key, key.get_uhash());
-        attach_tmp_callback_cell(&mut driver, green_key);
+        attach_tmp_callback_cell_for_key(&mut driver, &key);
 
         let token_number = {
             let cell = driver
@@ -13510,7 +13527,7 @@ mod tests {
                 .expect("the temporary callback installed one cell");
             assert!(cell.next.is_none(), "the fast path only owns a lone cell");
             assert_eq!(cell.cell_bucket, green_key);
-            assert!(cell.comparekey.is_none());
+            assert!(cell.comparekey_matches(&key));
             assert!(cell.flags.contains(crate::warmstate::JcFlags::JC_TEMPORARY));
             assert!(!cell.is_tracing());
             cell.get_procedure_token()
@@ -13585,7 +13602,7 @@ mod tests {
         driver
             .meta
             .warm_state_mut()
-            .attach_tmp_callback_to_interp(hash, token);
+            .attach_tmp_callback_to_interp_for_key(&key, token);
         driver.meta.warm_state_mut().mark_dont_trace_for_key(&key);
 
         assert!(

@@ -1264,90 +1264,18 @@ impl WarmEnterState {
 
     /// Mutable chain-walk variant of [`Self::lookup_chain_with_key`].
     /// Returns `Some` only when a chained cell carries a comparekey
-    /// equal (`equal_whatever`) to `key`, or is the sole comparekey-less
-    /// cell this hash owns. The bucket head is no longer privileged.
+    /// equal (`equal_whatever`) to `key`. The bucket head is not privileged.
     fn lookup_chain_with_key_mut(&mut self, key: &GreenKey) -> Option<&mut BaseJitCell> {
         let hash = key.get_uhash();
-        let accept_unkeyed = self.sole_unkeyed_cell_for_hash(hash);
         let index = self.counter._get_index(hash);
         let mut cell = self.celltable[index].as_deref_mut();
         while let Some(c) = cell {
-            if c.comparekey_matches(key)
-                || (accept_unkeyed && c.cell_bucket == hash && c.comparekey.is_none())
-            {
+            if c.comparekey_matches(key) {
                 return Some(c);
             }
             cell = c.next.as_deref_mut();
         }
         None
-    }
-
-    /// The bucket holds exactly one cell filed under `hash`, and that cell
-    /// has no `comparekey` yet. `JitCell.__init__` always stores the greens;
-    /// a hash-only door cannot, so the cell it filed is this green key's
-    /// cell until a typed door stamps them. A second distinct key that
-    /// hashes here does not take this path: after the stamp the cell has a
-    /// comparekey, and a chain of two keyed cells is a real collision
-    /// ([`Self::mint_cell_key`]).
-    fn sole_unkeyed_cell_for_hash(&self, hash: u64) -> bool {
-        let mut owners = 0usize;
-        let mut unkeyed = false;
-        let mut cell = self.lookup_chain(hash);
-        while let Some(c) = cell {
-            if c.cell_bucket == hash {
-                owners += 1;
-                unkeyed = c.comparekey.is_none();
-            }
-            cell = c.next.as_deref();
-        }
-        owners == 1 && unkeyed
-    }
-
-    /// Stamp `key` onto the sole comparekey-less cell `hash` owns.
-    /// Returns whether that cell was this key's cell.
-    fn adopt_sole_unkeyed_cell(&mut self, key: &GreenKey) -> bool {
-        let hash = key.get_uhash();
-        if !self.sole_unkeyed_cell_for_hash(hash) {
-            return false;
-        }
-        let index = self.counter._get_index(hash);
-        let mut cell = self.celltable[index].as_deref_mut();
-        while let Some(c) = cell {
-            if c.cell_bucket == hash && c.comparekey.is_none() {
-                c.set_comparekey(key);
-                return true;
-            }
-            cell = c.next.as_deref_mut();
-        }
-        false
-    }
-
-    /// Give a lone comparekey-less `JC_TEMPORARY` cell this key's comparekey.
-    ///
-    /// `get_assembler_token` files that cell through `ensure_cell_by_key`, so
-    /// `comparekey_matches` refuses it. `maybe_compile_and_run` still hands
-    /// the found cell to `bound_reached`; without this stamp
-    /// `ensure_cell_for_key` installs another cell in the same bucket.
-    /// A chain, a different bucket in the same table slot, or a cell that
-    /// already stores a comparekey is left alone — those are not the cell
-    /// the empty-chain door found.
-    fn reuse_lone_temporary_cell(&mut self, key: &GreenKey) {
-        if self.lookup_chain_with_key(key).is_some() {
-            return;
-        }
-        let hash = key.get_uhash();
-        let index = self.counter._get_index(hash);
-        let Some(cell) = self.celltable[index].as_deref_mut() else {
-            return;
-        };
-        if cell.next.is_some()
-            || cell.cell_bucket != hash
-            || cell.comparekey.is_some()
-            || !cell.flags.contains(JcFlags::JC_TEMPORARY)
-        {
-            return;
-        }
-        cell.set_comparekey(key);
     }
 
     /// warmstate.py `WarmEnterState.bound_reached` —
@@ -1368,7 +1296,6 @@ impl WarmEnterState {
         self.counter.reset(hash);
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
-        self.reuse_lone_temporary_cell(key);
         self.ensure_cell_for_key(key);
         let cell = self
             .lookup_chain_with_key_mut(key)
@@ -1604,11 +1531,6 @@ impl WarmEnterState {
     /// Installs a temporary CALL_ASSEMBLER fallback token without
     /// changing the tracing flags or compiled state.
     ///
-    /// No typed twin: this has no callers anywhere in the workspace, so it
-    /// creates no cells and contributes nothing to the head/tail split that
-    /// [`Self::attach_procedure_to_interp_for_key`] exists to close. Adding
-    /// one would be a second uncalled entry point. Give it a typed form at
-    /// the point a caller appears, not before.
     pub fn attach_tmp_callback_to_interp(
         &mut self,
         cell_key: u64,
@@ -1616,6 +1538,22 @@ impl WarmEnterState {
     ) {
         let token = token.into();
         let cell = self.ensure_cell_by_key(cell_key);
+        let _old = cell.set_procedure_token(token, true);
+        self.bump_cell_generation();
+    }
+
+    /// Typed form of [`Self::attach_tmp_callback_to_interp`]: the cell is
+    /// `ensure_jit_cell_at_key(greenkey)`, so it carries its greens.
+    pub fn attach_tmp_callback_to_interp_for_key(
+        &mut self,
+        key: &GreenKey,
+        token: impl Into<Arc<JitCellToken>>,
+    ) {
+        let token = token.into();
+        self.ensure_cell_for_key(key);
+        let cell = self
+            .lookup_chain_with_key_mut(key)
+            .expect("ensure_cell_for_key just installed a cell matching this key");
         let _old = cell.set_procedure_token(token, true);
         self.bump_cell_generation();
     }
@@ -3619,13 +3557,11 @@ impl WarmEnterState {
     /// `(code_a, pc_a)` and `(code_b, pc_b)` with the same `get_uhash`
     /// no longer alias to the same cell.
     ///
-    /// A hash-only door files one comparekey-less cell under `get_uhash`.
-    /// That cell is the green key's only `JitCell` (`make_jitcell_subclass`):
-    /// counter, flags and the procedure token live on it. The walk below
-    /// returns it while it is still unkeyed and it is the sole occupant of
-    /// the hash. [`Self::ensure_cell_for_key`] then stores the greens
-    /// (`JitCell.__init__`). Two distinct keys that share `get_uhash` each
-    /// keep their own cell; the second is minted ([`Self::mint_cell_key`]).
+    /// `JitCell.__init__` always stores the greens, so a cell without a
+    /// `comparekey` (one a hash-only door filed) matches no key: it is not
+    /// this green key's cell, and the walk does not adopt it. Two distinct
+    /// keys that share `get_uhash` each keep their own cell; the second is
+    /// minted ([`Self::mint_cell_key`]).
     ///
     /// This is the resolve half of [`Self::cell_key_for`], which is how the
     /// `u64` API surface reaches the same cell without holding the greens: the
@@ -3639,21 +3575,13 @@ impl WarmEnterState {
     pub fn lookup_chain_with_key(&self, key: &GreenKey) -> Option<&BaseJitCell> {
         let hash = key.get_uhash();
         let mut cell = self.lookup_chain(hash);
-        let mut owners = 0usize;
-        let mut sole_unkeyed: Option<&BaseJitCell> = None;
         while let Some(c) = cell {
             if c.comparekey_matches(key) {
                 return Some(c);
             }
-            if c.cell_bucket == hash {
-                owners += 1;
-                if c.comparekey.is_none() {
-                    sole_unkeyed = Some(c);
-                }
-            }
             cell = c.next.as_deref();
         }
-        if owners == 1 { sole_unkeyed } else { None }
+        None
     }
 
     /// warmstate.py `JitCell.ensure_jit_cell_at_key(greenkey)` /
@@ -3676,19 +3604,13 @@ impl WarmEnterState {
     /// `lookup_chain_with_key`, or through [`Self::ensure_cell_key`] when what
     /// it needs is the cell's identity rather than the cell.
     ///
-    /// On a miss the helper first claims the sole comparekey-less cell this
-    /// hash owns (`JitCell.__init__` stores the greens on the cell the
-    /// hash-only door already filed). Only a real collision — another key
-    /// already holds a comparekey here, or the bucket chains — allocates a
-    /// new cell and, when the raw hash is taken, [`Self::mint_cell_key`].
+    /// On a miss a new cell carrying the greens is installed and, when the
+    /// raw hash is already taken, [`Self::mint_cell_key`] names it.
     pub fn ensure_cell_for_key(&mut self, key: &GreenKey) {
         if self
             .lookup_chain_with_key(key)
             .is_some_and(|cell| cell.comparekey_matches(key))
         {
-            return;
-        }
-        if self.adopt_sole_unkeyed_cell(key) {
             return;
         }
         let mut newcell = BaseJitCell::new();
@@ -5227,11 +5149,7 @@ mod tests {
 
         // Fixture: a hash-only writer heads the bucket, so a later typed
         // install chains behind it rather than finding it.
-        ws.disable_noninlinable_function(hash);
-        assert!(
-            ws.lookup_chain_with_key(&key).is_some(),
-            "the hash-only cell is this green key's only cell",
-        );
+        ws.disable_noninlinable_function_for_key(&key);
 
         ws.mark_as_being_traced_for_key(&key);
         assert_eq!(ws.get_stats().num_cells, 1, "one green key, one cell");
@@ -6081,7 +5999,7 @@ mod tests {
         // Put a comparator-less cell at the bucket head first. This is the
         // production migration shape in which a raw-hash precheck and a typed
         // force-start used to inspect different cells for one green key.
-        ws.disable_noninlinable_function(bucket);
+        ws.disable_noninlinable_function_for_key(&key);
         let token = std::sync::Arc::new(JitCellToken::new(0xcafe));
         ws.get_assembler_token_with_key::<(), _>(&key, |_memmgr| Ok(token.clone()))
             .expect("temporary token install");
@@ -6203,25 +6121,25 @@ mod tests {
         let mut ws = WarmEnterState::new(3);
         let key = GreenKey::new(vec![7, 9]);
         ws.disable_noninlinable_function(key.get_uhash());
+        assert!(
+            ws.lookup_chain_with_key(&key).is_none(),
+            "a cell filed without greens matches no key",
+        );
+        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert_eq!(
+            ws.get_stats().num_cells,
+            1,
+            "`get_jitcell` misses and only the counter ticks: no cell yet",
+        );
+        ws.ensure_cell_for_key(&key);
+        assert_eq!(ws.occupied_buckets(), 1, "one hash, so one bucket");
+        assert_eq!(ws.get_stats().num_cells, 2, "but two cells: a chain");
+        let typed = ws.lookup_chain_with_key(&key).expect("the typed cell");
+        assert!(
+            !typed.flags.contains(JcFlags::JC_DONT_TRACE_HERE),
+            "the hash write never reached the typed cell",
+        );
 
-        // The hash-written DONT_TRACE_HERE is on this key's only cell, so
-        // the typed decision traces immediately (`maybe_compile_and_run`).
-        assert!(matches!(
-            ws.maybe_compile_with_key(&key),
-            HotResult::StartTracing
-        ));
-
-        assert_eq!(ws.occupied_buckets(), 1, "one green key, so one bucket");
-        assert_eq!(ws.get_stats().num_cells, 1, "and one cell");
-
-        let head = ws.lookup_chain(key.get_uhash()).expect("head present");
-        assert!(head.comparekey_matches(&key));
-        assert!(head.flags.contains(JcFlags::JC_DONT_TRACE_HERE));
-        assert!(head.is_tracing());
-        assert!(head.next.is_none());
-
-        // Control: the typed form of the same mark keeps ONE cell and takes
-        // the dont-trace-here route on the very first tick.
         let mut typed = WarmEnterState::new(3);
         let key2 = GreenKey::new(vec![7, 9]);
         typed.disable_noninlinable_function_for_key(&key2);
@@ -6678,8 +6596,8 @@ mod tests {
         ws.disable_noninlinable_function(key.get_uhash());
         assert_eq!(ws.get_stats().num_cells, 1, "one cell after the hash write");
         assert!(
-            ws.lookup_chain_with_key(&key).is_some(),
-            "the hash-only cell is this green key's cell",
+            ws.lookup_chain_with_key(&key).is_none(),
+            "a cell filed without greens is not this green key's cell",
         );
 
         ws.ensure_cell_for_key(&key);
@@ -6687,8 +6605,8 @@ mod tests {
         assert_eq!(ws.occupied_buckets(), 1, "still ONE bucket");
         assert_eq!(
             ws.get_stats().num_cells,
-            1,
-            "ensure_cell_for_key stores the greens on that cell",
+            2,
+            "ensure_cell_for_key installs the key's own cell behind it",
         );
         assert!(
             ws.lookup_chain_with_key(&key)
@@ -6711,11 +6629,7 @@ mod tests {
         let key = GreenKey::new(vec![300, 400]);
 
         // A hash-only writer squats the bucket with a comparator-less cell.
-        ws.disable_noninlinable_function(key.get_uhash());
-        assert!(
-            ws.lookup_chain_with_key(&key).is_some(),
-            "the hash-only cell is this green key's cell",
-        );
+        ws.disable_noninlinable_function_for_key(&key);
 
         ws.mark_as_being_traced_for_key(&key);
 
@@ -6740,7 +6654,7 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![500, 600]);
 
-        ws.disable_noninlinable_function(key.get_uhash());
+        ws.disable_noninlinable_function_for_key(&key);
         ws.ensure_cell_for_key(&key);
         assert_eq!(ws.occupied_buckets(), 1, "one bucket");
         assert_eq!(ws.get_stats().num_cells, 1, "one cell");
@@ -6772,7 +6686,7 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![700, 800]);
 
-        ws.disable_noninlinable_function(key.get_uhash());
+        ws.disable_noninlinable_function_for_key(&key);
         assert!(ws.lookup_chain_with_key(&key).is_some());
 
         let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
@@ -6804,7 +6718,7 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![1100, 1200]);
 
-        ws.disable_noninlinable_function(key.get_uhash());
+        ws.disable_noninlinable_function_for_key(&key);
         let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
         ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
 
@@ -7665,7 +7579,7 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![900, 1000]);
 
-        ws.disable_noninlinable_function(key.get_uhash());
+        ws.disable_noninlinable_function_for_key(&key);
         assert!(ws.lookup_chain_with_key(&key).is_some());
 
         ws.mark_force_finish_tracing_for_key(&key);
