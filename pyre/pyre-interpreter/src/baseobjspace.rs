@@ -20877,9 +20877,8 @@ pub unsafe fn generator_invoke_execute_frame(
             input,
         );
         if value.is_null() {
-            Err(crate::call::take_call_error().unwrap_or_else(|| {
-                crate::PyError::runtime_error("generator resume failed")
-            }))
+            Err(crate::call::take_call_error()
+                .unwrap_or_else(|| crate::PyError::runtime_error("generator resume failed")))
         } else {
             Ok(value)
         }
