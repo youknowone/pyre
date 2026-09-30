@@ -1,11 +1,13 @@
 //! Writes `$OUT_DIR/residual_sig_call.rs`: one `extern "C"` trampoline per
 //! concrete wasm type the blackhole path `call_indirect`s.
 //!
-//! Integer mixes cover arity 0..=13 and every i32/i64 mask, with result tags
+//! Integer mixes cover arity 0..=8 and every i32/i64 mask, with result tags
 //! void / i32 / i64 / f64 / f32. Uniform f64 covers arity 1..=4 and result
-//! tags void / i64 / f64. Any other mix of i32/i64/f32/f64 covers arity 1..=6
-//! and the same five result tags. An i32 argument is truncated; an i32
-//! result is zero-extended; f32 and f64 travel as their bit patterns.
+//! tags void / i64 / f64. Any other mix of i32/i64/f32/f64 covers arity 1..=5
+//! and the same five result tags. Wider mixes stay on the host: `Module::new`
+//! compiles every guest function, and the wider tables pushed
+//! `builtin_len_descent` from 0.38s to 0.56s. An i32 argument is truncated;
+//! an i32 result is zero-extended; f32 and f64 travel as their bit patterns.
 
 use std::fmt::Write as _;
 
@@ -28,7 +30,7 @@ fn generate() -> String {
          \n",
     );
 
-    for arity in 0..=13 {
+    for arity in 0..=8 {
         let masks = 1u32 << arity;
         for mask in 0..masks {
             for tag in 0..5 {
@@ -41,7 +43,7 @@ fn generate() -> String {
             emit_f64(&mut out, arity, tag);
         }
     }
-    for arity in 1..=6 {
+    for arity in 1..=5 {
         for_each_float_mix(arity, &mut |code| {
             for tag in 0..5 {
                 emit_mix(&mut out, arity, code, tag);
@@ -203,7 +205,7 @@ fn emit_int_dispatch(out: &mut String) {
          Some(unsafe {\n        \
          match (args.len(), mask, tag) {\n",
     );
-    for arity in 0..=13 {
+    for arity in 0..=8 {
         let masks = 1u32 << arity;
         for mask in 0..masks {
             for tag in 0..5 {
@@ -258,7 +260,7 @@ fn emit_mix_dispatch(out: &mut String) {
          Some(unsafe {\n        \
          match (args.len(), code, tag) {\n",
     );
-    for arity in 1..=6 {
+    for arity in 1..=5 {
         for_each_float_mix(arity, &mut |code| {
             for tag in 0..5 {
                 let _ = writeln!(
