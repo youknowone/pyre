@@ -4503,14 +4503,16 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         // aarch64/regalloc.py `prepare_two_regs_op`: `fadd/fmul Dd, Dn, Dm`
-        // writes a third register. x86 `addsd/mulsd` is two-operand, so the
-        // result has to land on the lhs (`force_result_in_reg`). Using that
-        // form here copies the accumulator into the destination before the
-        // arithmetic, which lengthens the loop-carried float chain.
+        // writes a third register. The first `make_sure_var_in_reg` takes no
+        // forbidden vars; the second receives `op.getarglist()`. x86
+        // `addsd/mulsd` is two-operand, so the result has to land on the lhs
+        // (`force_result_in_reg`). Using that form here copies the accumulator
+        // into the destination before the arithmetic, which lengthens the
+        // loop-carried float chain.
         #[cfg(target_arch = "aarch64")]
         {
             let boxes = [lhs, rhs];
-            let loc0 = self.make_sure_var_in_reg(lhs, Type::Float, &boxes, None, false);
+            let loc0 = self.make_sure_var_in_reg(lhs, Type::Float, &[], None, false);
             let loc1 = self.make_sure_var_in_reg(rhs, Type::Float, &boxes, None, false);
             self.possibly_free_var(lhs, Type::Float);
             self.possibly_free_var(rhs, Type::Float);
