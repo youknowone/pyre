@@ -2093,13 +2093,23 @@ fn branch_shell_banks(
     found
 }
 
+/// The value `from_residual` is called with, after copies.
+///
+/// `same_as` and `__cast_instance_intrinsic` forward one value. The
+/// visited list lives only for this walk. A repeated value is not a
+/// carrier.
 fn residual_payload(
     graph: &FunctionGraph,
     arg: &Variable,
     carrier_path: &str,
 ) -> Result<ResidualPayload, String> {
     let mut current = arg.clone();
-    for _ in 0..8 {
+    let mut seen = Vec::new();
+    loop {
+        if seen.iter().any(|var| var == &current) {
+            return Err("from_residual argument chain repeats a value".to_string());
+        }
+        seen.push(current.clone());
         let Some(kind) = producing_op(graph, &current) else {
             return Err("from_residual argument has no producer".to_string());
         };
@@ -2143,7 +2153,6 @@ fn residual_payload(
             }
         }
     }
-    Err("from_residual argument chain is too deep".to_string())
 }
 
 /// Forwarding `from_residual` tails whose payload owner names a foreign
@@ -7095,7 +7104,7 @@ mod unwrap_returned_scalar_shell_tests {
 #[cfg(test)]
 mod from_residual_conversion_tests {
     use super::*;
-    use crate::model::{FieldDescriptor, LinkArg};
+    use crate::model::{FieldDescriptor, LinkArg, SpaceOperation};
 
     const CARRIER: &str = "pyre_interpreter::error::PyError";
 
@@ -7116,10 +7125,14 @@ mod from_residual_conversion_tests {
     }
 
     fn from_residual_tail(owner: &str) -> (FunctionGraph, Variable) {
+        from_residual_tail_through_copies(owner, 0)
+    }
+
+    fn from_residual_tail_through_copies(owner: &str, copies: usize) -> (FunctionGraph, Variable) {
         let mut graph = FunctionGraph::new("from_residual_tail");
         let base = graph.alloc_value_var();
         graph.blocks[graph.startblock.0].inputargs = vec![base.clone()];
-        let payload = graph
+        let mut payload = graph
             .push_op_var(
                 graph.startblock,
                 OpKind::FieldRead {
@@ -7131,6 +7144,19 @@ mod from_residual_conversion_tests {
                 true,
             )
             .expect("payload");
+        for _ in 0..copies {
+            payload = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::UnaryOp {
+                        op: "same_as".into(),
+                        operand: payload,
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .expect("same_as");
+        }
         let residual = graph
             .push_op_var(
                 graph.startblock,
@@ -7254,6 +7280,61 @@ mod from_residual_conversion_tests {
             err.contains("BytecodeCorruption") && err.contains("From::from"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_long_copy_chain_still_reaches_the_foreign_break() {
+        let (graph, _) =
+            from_residual_tail_through_copies("ControlFlow<BytecodeCorruption,i64>::Break", 8);
+        let sites = foreign_from_residual_sites(&graph, spec());
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].error_ty, "BytecodeCorruption");
+        assert!(sites[0].shell.is_none());
+    }
+
+    #[test]
+    fn a_cyclic_copy_is_not_a_foreign_carrier() {
+        let mut graph = FunctionGraph::new("cyclic_from_residual");
+        let left = graph.alloc_value_var();
+        let right = graph.alloc_value_var();
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(left.clone()),
+                kind: OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: right.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(right.clone()),
+                kind: OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: left.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        let residual = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::method("from_residual", Some("FromResidual".into())),
+                    args: crate::model::call_args(vec![left.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(graph.startblock, Some(residual));
+        let err = match residual_payload(&graph, &left, CARRIER) {
+            Err(err) => err,
+            Ok(_) => panic!("a copy cycle is not a carrier"),
+        };
+        assert!(err.contains("repeats a value"), "{err}");
+        assert!(foreign_from_residual_sites(&graph, spec()).is_empty());
     }
 
     #[test]
