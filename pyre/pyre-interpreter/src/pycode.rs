@@ -528,7 +528,11 @@ pub static CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("code");
 /// `Box::into_raw`'d; a nested body points into that permanently-live owner,
 /// matching PyPy's one recursively-owned `co_consts_w` code graph without
 /// cloning the child graph at each wrapping boundary.
+///
+/// `w_globals?` is `pycode.py` `_immutable_fields_`: the first store fills
+/// it, and a later read of the promoted code object is quasi-immutable.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("w_globals?")]
 pub struct PyCode {
     pub ob_header: PyObject,
     /// Opaque pointer to a permanently-live `CodeObject`. Top-level bodies are
@@ -764,6 +768,13 @@ pub struct PyCode {
     /// `code_ptr` is null or unaligned, the same case `globals_caches` leaves
     /// empty.
     pub loop_header_info: std::sync::atomic::AtomicPtr<crate::loop_headers::LoopHeaderInfo>,
+    /// The hidden `mutate_w_globals` of `pycode.py` `"w_globals?"`.
+    ///
+    /// Holds no GC pointers. The wrapper is born non-moving
+    /// (`malloc_typed_stable`), which is what lets a recorded watcher keep
+    /// this address. The collector runs no `Drop`, so [`pycode_destructor`]
+    /// reclaims the instance.
+    pub w_globals_watchers: pyre_object::quasiimmut::QuasiImmutField,
 }
 
 /// Field offset of `code_ptr` within `PyCode`.
@@ -1320,6 +1331,7 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
             std::sync::atomic::AtomicI64::new(ADDR2LINE_MEMO_EMPTY)
         }),
         loop_header_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        w_globals_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
     };
     // The raw-address JIT compatibility seam described above requires a
     // stable wrapper address. `malloc_typed_stable` is still a managed
@@ -3642,6 +3654,27 @@ pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
+/// `quasiimmut.py get_current_qmut_instance` for `pycode.py` `"w_globals?"`.
+///
+/// Resolved while the read is recorded, so a later store in the same trace
+/// already has a watcher to sweep, and the compiled loop registers on the
+/// same instance.
+///
+/// # Safety
+/// `obj` must point to a live [`PyCode`], or be null.
+pub unsafe fn w_code_current_w_globals_qmut(
+    obj: PyObjectRef,
+) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
+    if obj.is_null() {
+        return None;
+    }
+    Some(unsafe {
+        (*(obj as *const PyCode))
+            .w_globals_watchers
+            .get_current_qmut_instance()
+    })
+}
+
 /// PyPy: `PyCode.w_globals = w_globals`.
 #[inline]
 /// # Safety
@@ -3657,10 +3690,18 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     let obj = published.owner();
     let w_globals = published.get(0);
     unsafe {
-        std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!(
-            (*(obj as *mut PyCode)).w_globals
-        ))
-        .store(w_globals, std::sync::atomic::Ordering::Release);
+        // `rclass.py hook_setfield` runs `jit_force_quasi_immutable` ahead of
+        // every store to a `?` field (`pycode.py` `"w_globals?"`). The hook
+        // does not look at the new value, so storing the value already there
+        // invalidates too. The sweep and the store share the watcher lock:
+        // an `is_installed` test outside it lets a recorder publish a watcher
+        // for the old pointer after the test and before the store.
+        let code = obj as *mut PyCode;
+        pyre_object::quasiimmut::publish_quasi_immut_ptr(
+            &(*code).w_globals_watchers,
+            std::ptr::addr_of_mut!((*code).w_globals),
+            w_globals,
+        );
     }
     if !w_globals.is_null() {
         let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
@@ -3703,17 +3744,19 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
             publish_code_slot_store_rooting(roots.get(root_base), &[roots.get(root_base + 1)]);
         let obj = rooted.owner();
         let code = obj as *mut PyCode;
-        let slot = unsafe {
-            std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!((*code).w_globals))
-        };
         let w_globals = rooted.get(0);
-        match slot.compare_exchange(
-            pyre_object::PY_NULL,
-            w_globals,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        ) {
-            Ok(_) => {
+        // `rclass.py hook_setfield` ahead of the store to `pycode.py`
+        // `"w_globals?"`. The null check, the sweep and the store share the
+        // watcher lock. A lost race must not sweep the winner's watcher.
+        match unsafe {
+            pyre_object::quasiimmut::publish_quasi_immut_cas(
+                &(*code).w_globals_watchers,
+                std::ptr::addr_of_mut!((*code).w_globals),
+                pyre_object::PY_NULL,
+                w_globals,
+            )
+        } {
+            Ok(()) => {
                 register_live_code_wrapper(unsafe { (*code).code_ptr }, obj);
                 register_w_globals_stamped_code(obj);
                 return false;
@@ -4379,6 +4422,12 @@ fn release_constant_payload(constant: &mut crate::bytecode::ConstantData) {
 /// run at most once for it.
 pub unsafe fn pycode_destructor(obj_addr: usize) {
     let code = unsafe { &mut *(obj_addr as *mut PyCode) };
+    // The collector runs no `Drop`, so the hidden `mutate_w_globals`
+    // (`pycode.py` `"w_globals?"`) would otherwise keep its instance and its
+    // out-of-line lock. Releasing one strong count leaves an in-flight
+    // compile's clone alive. Same release `property_destructor` performs for
+    // `w_fget?`.
+    unsafe { code.w_globals_watchers.reclaim() };
     let wrapper = obj_addr as PyObjectRef;
     {
         let mut wrappers = live_code_wrappers().lock();

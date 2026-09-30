@@ -3843,8 +3843,11 @@ pub trait Backend: Send {
         // `llmodel.py bh_getfield_gc_r` always loads the value. Address
         // projections belong to `jtransform.py rewrite_op_getsubstruct`;
         // the layout flag alone cannot turn an ordinary read into one.
-        // SAFETY: see `bh_getfield_gc_i`.
-        GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
+        // `load_is_acquire` reads the same slot with Acquire.
+        // SAFETY: see `bh_getfield_gc_i`. `read_ref_at_mem` requires a
+        // naturally aligned pointer-width field.
+        let addr = (struct_ptr as usize).wrapping_add(offset);
+        GcRef(unsafe { crate::llmodel::read_ref_at_mem(addr, fielddescr.load_is_acquire()) })
     }
     /// model.py bh_getfield_gc_f(struct, fielddescr) →
     /// `read_float_at_mem(struct, ofs)`.  Size 8 is `FLOATSTORAGE`;

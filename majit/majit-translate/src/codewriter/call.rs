@@ -7982,7 +7982,7 @@ impl CallControl {
             return seen.get_cached_result(path.clone(), analyzed);
         }
         let result = 'walk: {
-            for block in &graph.blocks {
+            for block in graph.iterblocks() {
                 // RPython: analyze_simple_operation(op) per operation.
                 // canraise.py: LL_OPERATIONS[op.opname].canraise
                 for op in &block.operations {
@@ -8022,8 +8022,8 @@ impl CallControl {
             // analyzer. The normal analyzer always treats exceptblock exits as
             // raising.
             graph
-                .blocks
-                .iter()
+                .iterblocks()
+                .into_iter()
                 .flat_map(|block| block.exits.iter())
                 .any(|link| link.target == graph.exceptblock)
                 && !(ignore_memoryerror && exceptblock_is_reraise_of_caught_exception(&graph))
@@ -8052,7 +8052,7 @@ impl CallControl {
             return seen.get_cached_result(path.clone(), analyzed);
         }
         let result = 'walk: {
-            for block in &graph.blocks {
+            for block in graph.iterblocks() {
                 for op in &block.operations {
                     match &op.kind {
                         // RPython: jit_force_virtualizable / jit_force_virtual
@@ -8149,7 +8149,7 @@ impl CallControl {
         // RPython: analyze_simple_operation always returns False.
         // Only recursive calls into graphs can propagate random effects.
         let result = 'walk: {
-            for block in &graph.blocks {
+            for block in graph.iterblocks() {
                 for op in &block.operations {
                     match &op.kind {
                         OpKind::Call { target, .. } => {
@@ -8230,7 +8230,7 @@ impl CallControl {
                 return reached;
             }
         };
-        for block in &graph.blocks {
+        for block in graph.iterblocks() {
             for op in &block.operations {
                 let reason = match &op.kind {
                     OpKind::VableForce { .. } if witness == EffectWitness::ForcesVirtualizable => {
@@ -8322,7 +8322,7 @@ impl CallControl {
             return seen.get_cached_result(path.clone(), analyzed);
         }
         let result = 'walk: {
-            for block in &graph.blocks {
+            for block in graph.iterblocks() {
                 for op in &block.operations {
                     // RPython: jit_force_quasi_immutable → true
                     // majit: no such op yet, but check calls transitively
@@ -8408,7 +8408,7 @@ impl CallControl {
             return seen.get_cached_result(path.clone(), analyzed);
         }
         let result = 'walk: {
-            for block in &graph.blocks {
+            for block in graph.iterblocks() {
                 for op in &block.operations {
                     // collectanalyze.py: analyze_simple_operation
                     // RPython checks: malloc/malloc_varsize with flavor='gc' → True
@@ -9209,7 +9209,7 @@ impl CallControl {
         }
         let graphinfo = ReadWriteGraphInfo::new(&graph);
         let mut result = ReadWriteEffects::result_builder();
-        'blocks: for block in &graph.blocks {
+        'blocks: for block in graph.iterblocks() {
             for op in &block.operations {
                 // graphanalyze.py `analyze(op, seen, graphinfo)`.
                 let effects = match &op.kind {
@@ -12400,6 +12400,33 @@ mod tests {
             None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+    }
+
+    #[test]
+    fn test_getcalldescr_unreachable_raise_is_not_analyzed() {
+        // `graphanalyze.py analyze_direct_call` walks `graph.iterblocks()`:
+        // a raising block that no link from the startblock reaches does not
+        // make the graph raise.
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["orphan_raise"]);
+        let mut graph = simple_graph("orphan_raise");
+        let orphan = graph.create_block();
+        graph.set_raise(orphan, "error");
+        cc.register_function_graph(path, graph);
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["orphan_raise"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target.clone()),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
     }
 
     #[test]

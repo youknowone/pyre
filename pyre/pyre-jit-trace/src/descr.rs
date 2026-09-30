@@ -142,6 +142,17 @@ const OBJECT_W_CLASS_INDEX: u32 = OBJECT_W_CLASS_DESCR_TAG;
 const GIL_READY_DESCR_TAG: u32 = 0x5600_0000;
 const GIL_READY_INDEX: u32 = GIL_READY_DESCR_TAG;
 
+// `PyCode.w_globals` is `pycode.py` `"w_globals?"`. The index selects the
+// pointer cast in `quasi_immut_descr`, and the PyCode descr group's row
+// derives its index from the layout (`stable_field_index`) and its parent
+// ordinal, so that number is not an owner identity. Reserved in a tag of
+// its own. Disjoint from FIELD (0x10xx_xxxx), ARRAY, SIZE, CELL, MAPDICT,
+// PROPERTY, WRAPPER, CELL_FAMILY, EC, OBJECT_W_CLASS (`0x5500_0000`),
+// GIL_READY (`0x5600_0000`), `object.typeptr` (0x6000_0000), the native
+// mapdict block, and the GC tid.
+const PYCODE_DESCR_TAG: u32 = 0x5700_0000;
+const PYCODE_W_GLOBALS_INDEX: u32 = PYCODE_DESCR_TAG;
+
 // The generated native user layouts append mapdict fields at different base
 // sizes. HeapCache keys by descriptor index; give each translated STRUCT field
 // the distinct identity provided by descr.py's per-STRUCT cache.
@@ -2040,13 +2051,11 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// assume.  A tuple's backing array has its own immutable descriptor and is
 /// read with `GetarrayitemGcPureR`.
 ///
-/// `#[majit_macros::jit_immutable_fields("code?", ...)]` on the struct is the
-/// declarative spelling of the same list, and it is deliberately NOT applied:
-/// it would make the codewriter emit `record_quasiimmut_field` into the
-/// analyzer's interpreter jitcodes, and that bytecode has no trace-time arm in
-/// `pyjitpl/dispatch.rs` (unknown bytecodes panic there) and no registration in
-/// the production blackhole builder.  Until both land, the declaration lives on
-/// this group, which is what every hand-written trace path resolves through.
+/// The declarative attribute stays off this struct. Emitting
+/// `record_quasiimmut_field` for these nine fields would put the opcode in
+/// every interpreter jitcode that reads them, and `pyjitpl/dispatch.rs` still
+/// has no arm for that byte. The descriptors in this group are what the
+/// hand-written trace paths resolve.
 ///
 /// The entries are in byte-offset order and each key is the struct's own field
 /// name, which is what makes the group's numbering agree with the analyzer's.
@@ -5334,6 +5343,34 @@ pub fn pycode_code_ptr_descr() -> DescrRef {
 
 pub fn pycode_w_globals_descr() -> DescrRef {
     pycode_field_descr_at(pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET)
+}
+
+/// `pycode.py` `"w_globals?"` — the globals `pyframe.py PyFrame.get_w_globals`
+/// reads off `jit.promote(self.pycode)`.
+///
+/// Minted standalone rather than read out of [`PYCODE_DESCR_GROUP`], the way
+/// [`STATICMETHOD_W_FUNCTION_QUASI_DESCR`] is: the group's row derives its
+/// index from the layout, and this owner needs an index of its own for the
+/// reason [`PYCODE_DESCR_TAG`] records. The group keeps its census row for
+/// the field's ordinary reads.
+static PYCODE_W_GLOBALS_QUASI_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new_with_name(
+            PYCODE_W_GLOBALS_INDEX,
+            pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+            majit_ir::descr::ArrayFlag::Pointer,
+            "PyCode.w_globals".to_string(),
+            "w_globals".to_string(),
+        )
+        .with_quasi_immutable(true),
+    )
+});
+
+pub fn pycode_w_globals_quasi_descr() -> DescrRef {
+    PYCODE_W_GLOBALS_QUASI_DESCR.clone()
 }
 
 /// `PyCode.w_name` — the realized `co_name` string.  `w_code_name_obj` builds

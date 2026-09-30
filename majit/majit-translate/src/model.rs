@@ -7851,6 +7851,18 @@ impl FunctionGraph {
         order
     }
 
+    /// `FunctionGraph.iterblocks()` (`rpython/flowspace/model.py`): the
+    /// startblock-reachable blocks, in [`Self::iterblocks_order`].  A
+    /// block left in storage that no link reaches is not visited.
+    pub fn iterblocks(&self) -> Vec<&Block> {
+        let by_id: std::collections::HashMap<BlockId, &Block> =
+            self.blocks.iter().map(|b| (b.id, b)).collect();
+        self.iterblocks_order()
+            .into_iter()
+            .filter_map(|bid| by_id.get(&bid).copied())
+            .collect()
+    }
+
     /// Push an op whose fresh result `Variable` is minted in place
     /// when `has_result` is true; callers receive that `Variable`
     /// directly.

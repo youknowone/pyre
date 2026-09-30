@@ -7401,10 +7401,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     clear_walk_exception(ctx);
 
     // `pyopcode.py IMPORT_NAME` traces `get_builtin`, `getdebug`, and
-    // `get_w_globals` as ordinary reads from the live red frame.  The
-    // bytecode frontend exposes those reads as one-Ref residual helpers; fold
-    // them before CallFn recognition so the `__import__` gateway becomes a
-    // constant callable and the importer body can descend normally.
+    // `get_w_globals` as reads of the live red frame. Non-null debugdata
+    // globals stay in the fold. Null debugdata globals descend
+    // `pyframe::PyFrame::get_w_globals`.
     if ctx.is_authoritative_executor
         && matches!(
             foldable_runtime_helper,
@@ -7421,6 +7420,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             dst,
             dst_bank,
         )?
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadImportGlobals
+        && let Some(&frame_op) = r_args.first()
+        && try_walker_descend_frame_get_w_globals(ctx, op.pc, frame_op, dst, dst_bank)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }

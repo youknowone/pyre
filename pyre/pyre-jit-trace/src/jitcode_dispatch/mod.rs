@@ -9768,20 +9768,42 @@ fn walker_ensure_execution_context<Sym: WalkSym>(
 /// after the guard that references it (a use-before-def; the resume
 /// position would also stamp onto the read rather than the guard, leaving
 /// the guard with `resume_pos = -1`).  Recover here instead — at walk entry,
-/// before any opcode is dispatched and thus before any guard. When the EC is
-/// already seeded, or the frame itself is unset, this is a no-op: a frameless
-/// sym's first `ec` consumer goes through `MIFrame::ensure_execution_context`,
-/// which records the same read at an ordinary dispatch position.
+/// before any opcode is dispatched and thus before any guard. When the frame
+/// itself is unset, this is a no-op: a frameless sym's first `ec` consumer
+/// goes through `MIFrame::ensure_execution_context`, which records the same
+/// read at an ordinary dispatch position. When the EC box is already seeded
+/// the read is not repeated. Either way the live context is stamped onto
+/// that box. `pyjitpl.py opimpl_record_quasiimmut_field` reads
+/// `box.getref_base()`; the IR operand stays the red input.
 pub(crate) fn seed_execution_context_for_walk<Sym: WalkSym>(
     sym: &mut Sym,
     trace_ctx: &mut TraceCtx,
 ) {
-    if !sym.execution_context().is_none() || sym.frame().is_none() {
+    if sym.execution_context().is_none() && !sym.frame().is_none() {
+        let ec = crate::helpers::emit_current_execution_context(
+            trace_ctx,
+            "ExecutionContext::WalkEntry",
+        );
+        sym.set_execution_context(ec);
+    }
+    stamp_live_execution_context(trace_ctx, sym.execution_context());
+}
+
+/// Store the live `ExecutionContext` pointer as `ec_box`'s trace-time concrete.
+///
+/// `pyjitpl.py opimpl_record_quasiimmut_field` reads `box.getref_base()`.
+/// The portal red is an input; this is that recording-time value. The IR
+/// operand stays the input.
+fn stamp_live_execution_context(trace_ctx: &mut TraceCtx, ec_box: OpRef) {
+    if ec_box.is_none() {
         return;
     }
-    let ec =
-        crate::helpers::emit_current_execution_context(trace_ctx, "ExecutionContext::WalkEntry");
-    sym.set_execution_context(ec);
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() {
+        return;
+    }
+    let concrete = Value::Ref(majit_ir::GcRef(ec as usize));
+    trace_ctx.try_set_opref_concrete(ec_box, concrete);
 }
 
 /// Walker-native unbox of a boxed `W_IntObject` operand: `GUARD_CLASS`
@@ -12379,25 +12401,29 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     let Some(ec_box) = walker_ensure_execution_context(ctx) else {
         return Ok(());
     };
+    // The red stays an input. The concrete is what
+    // `opimpl_record_quasiimmut_field` reads with `box.getref_base()`.
+    stamp_live_execution_context(ctx.trace_ctx, ec_box);
     let descr = crate::descr::ec_w_tracefunc_descr();
+    let descr_index = descr.index();
+    // Consult the cache before the marker. The getfield below publishes
+    // the loaded constant; the marker is only the invalidation half.
+    let already = ctx
+        .trace_ctx
+        .heapcache_getfield_cached(ec_box, descr_index)
+        .is_some();
     // `_immutable_fields_ = ['w_tracefunc?']`: `gettrace` is
     // `jit.promote(self.w_tracefunc)`.  The `?` is the invalidation
     // half — `settrace` notifies, `GUARD_NOT_INVALIDATED` fails, and
     // the loop is not re-entered with the folded NULL.
     crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone());
-    let descr_index = descr.index();
-    if ctx
-        .trace_ctx
-        .heapcache_getfield_cached(ec_box, descr_index)
-        .is_some()
-    {
+    if already {
         return Ok(());
     }
     // `executioncontext.py gettrace`: `return jit.promote(self.w_tracefunc)`
     // on a `w_tracefunc?` slot.  The marker plus `GUARD_NOT_INVALIDATED`
     // is what `?` costs; `settrace` invalidates the watchers.  The
     // `GuardIsnull` is the `promote(None)` half this portal records.
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone());
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
     let read = ctx
         .trace_ctx
@@ -12436,6 +12462,7 @@ fn record_portal_profilefunc_guard<Sym: WalkSym>(
     let Some(ec_box) = walker_ensure_execution_context(ctx) else {
         return Ok(());
     };
+    stamp_live_execution_context(ctx.trace_ctx, ec_box);
     crate::state::record_quasiimmut_field(
         ctx.trace_ctx,
         ec_box,
@@ -13083,6 +13110,18 @@ fn handle<Sym: WalkSym>(
         "hint_force_virtualizable/r" => {
             let vable = read_ref_reg(code, op, 0, ctx)?;
             ctx.trace_ctx.gen_store_back_in_vable(vable);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // `jtransform.py rewrite_op_getfield` emits this ahead of a
+        // quasi-immutable getfield. Operand layout `rdd`: the struct, the
+        // field descr, and the mutate descr. The mutate descr is unused;
+        // `quasi_immut_descr` resolves the watcher from the field descr.
+        // The opcode has no result register.
+        "record_quasiimmut_field/rdd" => {
+            let obj = read_ref_reg(code, op, 0, ctx)?;
+            let descr = read_descr(code, op, 1, ctx)?;
+            let _ = crate::state::record_quasiimmut_field(ctx.trace_ctx, obj, descr);
+            walker_flush_guard_not_invalidated(ctx, op.pc)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // setfield_gc canonical shapes. `iid` / `ird` (int box)

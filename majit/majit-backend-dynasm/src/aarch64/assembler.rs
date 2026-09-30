@@ -2921,8 +2921,25 @@ impl<'a> AssemblerARM64<'a> {
                 if let (Some(Loc::Reg(base)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
                     let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
                     let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
+                    // `ldar` has a base register and no offset. x16 is ip0.
+                    let acquire = !dst.is_xmm
+                        && op
+                            .with_field_descr(|fd| fd.load_is_acquire() && fd.field_size() == 8)
+                            .unwrap_or(false);
                     if dst.is_xmm {
                         dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), ofs as u32]);
+                    } else if acquire {
+                        // `ldar` addresses a base register, not base+offset.
+                        dynasm!(self.mc ; .arch aarch64 ; mov x16, X(base.value));
+                        if ofs != 0 {
+                            if (0..4096).contains(&ofs) {
+                                dynasm!(self.mc ; .arch aarch64 ; add x16, x16, ofs as u32);
+                            } else {
+                                self.emit_mov_imm64(17, ofs as i64);
+                                dynasm!(self.mc ; .arch aarch64 ; add x16, x16, x17);
+                            }
+                        }
+                        dynasm!(self.mc ; .arch aarch64 ; ldar X(dst.value), [x16]);
                     } else {
                         match field_size {
                             1 => {

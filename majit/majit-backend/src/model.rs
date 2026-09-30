@@ -453,7 +453,8 @@ impl Cpu for DefaultCpu {
         // `llmodel.py bh_getfield_gc_r` / `read_ref_at_mem`: pointer-width
         // value load. `rewrite_op_getsubstruct` handles address projections
         // before execution; an inline layout alone does not request one.
-        GcRef(unsafe { *(addr as *const usize) })
+        // `load_is_acquire` reads the same slot with Acquire.
+        GcRef(unsafe { crate::llmodel::read_ref_at_mem(addr, fd.load_is_acquire()) })
     }
 
     fn bh_getfield_gc_f(&self, struct_ptr: usize, fd: &dyn FieldDescr) -> f64 {
@@ -498,6 +499,48 @@ pub fn default_cpu() -> Arc<dyn Cpu> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acquire_w_globals_load_reads_the_published_pointer() {
+        let published = 0xABC0usize;
+        let mut slot = 0usize;
+        unsafe {
+            std::sync::atomic::AtomicPtr::<()>::from_ptr(&mut slot as *mut usize as *mut *mut ())
+                .store(published as *mut (), std::sync::atomic::Ordering::Release);
+        }
+        let fd = majit_ir::descr::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            std::mem::size_of::<usize>(),
+            majit_ir::Type::Ref,
+            false,
+            majit_ir::descr::ArrayFlag::Pointer,
+            "PyCode.w_globals".into(),
+            "w_globals".into(),
+        )
+        .with_quasi_immutable(true);
+        assert!(fd.load_is_acquire());
+        assert_eq!(
+            DefaultCpu.bh_getfield_gc_r(&mut slot as *mut usize as usize, &fd),
+            GcRef(published)
+        );
+
+        let plain = majit_ir::descr::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            std::mem::size_of::<usize>(),
+            majit_ir::Type::Ref,
+            false,
+            majit_ir::descr::ArrayFlag::Pointer,
+            "PyCode.co_consts".into(),
+            "co_consts".into(),
+        );
+        assert!(!plain.load_is_acquire());
+        assert_eq!(
+            DefaultCpu.bh_getfield_gc_r(&mut slot as *mut usize as usize, &plain),
+            GcRef(published)
+        );
+    }
 
     #[test]
     fn reference_value_read_does_not_become_a_substructure_address() {

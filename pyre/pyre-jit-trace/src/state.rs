@@ -1330,12 +1330,9 @@ pub fn jitcode_source_has_exception_handler(jitcode_index: i32) -> Option<bool> 
 /// The pool's VALUES are immutable after build; their ADDRESSES are not.  A
 /// `residual_call` whose ref argument is a constant bakes whatever object the
 /// tracer read, and that object is non-moving only when it happens to be an
-/// old-generation number or a `malloc_typed`-immortal build-time constant.
-/// `MAKE_FUNCTION` bakes the frame's globals dict
-/// (`jit_make_function_from_globals(globals, code)`), and a frame running
-/// under `exec(code, {...})` carries an ordinary collectable one.  So this
-/// walk writes the visitor's answer back into the slot instead of marking a
-/// copy of it. Major collections walk every pool; minor collections consume
+/// old-generation number or a `malloc_typed`-immortal build-time constant, so
+/// this walk writes the visitor's answer back into the slot instead of marking
+/// a copy of it. Major collections walk every pool; minor collections consume
 /// only [`MetaInterpStaticData::jitcodes_with_young_constants`], the off-GC
 /// counterpart of incminimark's `old_objects_pointing_to_young`.
 pub fn walk_jitcode_constants_refs(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
@@ -5127,11 +5124,9 @@ pub(crate) fn module_dict_cell_value_direct(obj: PyObjectRef, slot: usize) -> Op
 /// heapcache epoch.
 ///
 /// The heapcache keys on `descr.index()` and the receiver, the same way
-/// [`opimpl_getfield_gc_i`] does.
-///
-/// The caller has already resolved the field's value and is baking it as a
-/// constant, so unlike `opimpl_getfield_gc_i` this records no load — that is
-/// exactly what quasi-immutability buys.
+/// [`opimpl_getfield_gc_i`] does. A cache hit counts and returns. The
+/// following getfield owns the ordinary field cache
+/// (`_opimpl_getfield_gc_any_pureornot`).
 pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) {
     let field_index = descr.index();
     if ctx.heap_cache().is_quasi_immut_known(field_index, obj) {
@@ -5206,6 +5201,38 @@ impl majit_ir::QuasiImmutHandle for RecordedQuasiImmut {
     }
 }
 
+/// `pycode.py` `"w_globals?"`. Analyzer `fielddescrof` stamps
+/// `PyCode.w_globals`; the reserved quasi descr uses the same offset and a
+/// `Struct.w_globals` name.
+/// A constant globals operand is its own namespace. A non-constant one is
+/// the recorded `PyCode.w_globals` read only when that field's
+/// quasi-immutable dependency is already known: the marker keeps the dict
+/// equal to the value observed while recording. A mutable read, including
+/// `debugdata.w_globals`, is not that field.
+pub(crate) fn globals_read_keeps_recorded_namespace(ctx: &TraceCtx, globals: OpRef) -> bool {
+    if globals.is_constant() {
+        return true;
+    }
+    let Some((descr, obj)) = ctx.ref_getfield_gc_r(globals) else {
+        return false;
+    };
+    is_pycode_w_globals_descr(&descr) && ctx.heap_cache().is_quasi_immut_known(descr.index(), obj)
+}
+
+fn is_pycode_w_globals_descr(descr: &DescrRef) -> bool {
+    if !descr.is_quasi_immutable() {
+        return false;
+    }
+    let Some(field) = descr.as_field_descr() else {
+        return false;
+    };
+    if field.offset() != pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET {
+        return false;
+    }
+    let name = field.field_name();
+    name == "w_globals" || name.ends_with(".w_globals")
+}
+
 /// `pyjitpl.py:1081 QuasiImmutDescr(cpu, structbox.getref_base(), fielddescr,
 /// mutatefielddescr)` — the descr a recorded `QUASIIMMUT_FIELD` carries.
 ///
@@ -5232,15 +5259,13 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     let index = descr.index();
     // The index decides which type `struct_ptr` is cast to, so an unrecognised
     // one must fail loudly rather than reinterpret a headerless map-node
-    // allocation as a `W_TypeObject`.  Dropping the old implicit `W_TypeObject`
-    // fallback is safe: the arms below are every quasi-immutable descr this
-    // binary can mint — the hand-minted singletons, including
-    // `GilReadyState.gil_ready`, plus the nine
-    // `Function` fields `function.py` declares, which
-    // `function_quasi_immut_slot` resolves as a group.  No analyzer-derived
-    // descr reaches here: a `#[jit_immutable_fields]` entry would need the
-    // `_immutable_fields_` `?` suffix and no declaration in the tree carries
-    // one, and `record_quasiimmut_field` is absent from the emitted-opname set.
+    // allocation as a `W_TypeObject`.  The arms below are every quasi-immutable
+    // descr this binary mints: the hand-minted singletons, including
+    // `GilReadyState.gil_ready`, the nine `Function` fields `function.py`
+    // declares (`function_quasi_immut_slot`), and `PyCode.w_globals`.
+    // Analyzer `fielddescrof` stamps that field from `pycode.py`
+    // `"w_globals?"`; the name plus `CODE_W_GLOBALS_OFFSET` is the same slot
+    // as the reserved `pycode_w_globals_quasi_descr` index.
     let qmut = unsafe {
         if index == crate::descr::module_dict_version_descr().index() {
             pyre_object::dictmultiobject::module_dict_strategy_current_version_qmut(
@@ -5289,6 +5314,12 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
             )
         } else if index == crate::descr::classmethod_w_function_quasi_descr().index() {
             pyre_object::function::w_classmethod_current_w_function_qmut(
+                struct_ptr as pyre_object::PyObjectRef,
+            )
+        } else if index == crate::descr::pycode_w_globals_quasi_descr().index()
+            || is_pycode_w_globals_descr(descr)
+        {
+            pyre_interpreter::pycode::w_code_current_w_globals_qmut(
                 struct_ptr as pyre_object::PyObjectRef,
             )
         } else if index == crate::descr::ec_w_tracefunc_descr().index() {

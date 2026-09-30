@@ -8136,7 +8136,10 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     let field_offset = field_offset_from_descr(op);
-                    // Load as i32 (pointer on wasm32) and extend to i64
+                    // Pointer load. The imported memory is not shared, so
+                    // this stays `i64.load32_u` when the descr's
+                    // `load_is_acquire` is set. The host sample of that
+                    // field is `bh_getfield_gc_r`.
                     sink.i64_load32_u(memarg(field_offset, 2));
                     sink.local_set(value_types.local(vi));
                 }
