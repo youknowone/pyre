@@ -114,7 +114,7 @@ pub(crate) fn reject_kwargs(args: &[PyObjectRef], name: &str) -> Result<(), crat
 
 /// [`reject_kwargs`] for a method whose declaring class is fixed rather than
 /// read off the receiver — see [`arity_no_args_of`].
-pub(crate) fn reject_kwargs_of(
+pub fn reject_kwargs_of(
     owner: Option<&str>,
     args: &[PyObjectRef],
     name: &str,
@@ -208,7 +208,7 @@ pub fn arity_at_most(args: &[PyObjectRef], name: &str, max: usize) -> Result<(),
 /// TypeError for a method whose positional count after the receiver has to
 /// land in `min..=max` — the PyArg_UnpackTuple form with both bounds set
 /// (`bytes.center`, `bytes.ljust`).  Reports whichever bound the call missed.
-pub(crate) fn arity_between(
+pub fn arity_between(
     args: &[PyObjectRef],
     name: &str,
     min: usize,
@@ -224,7 +224,7 @@ pub(crate) fn arity_between(
 /// `list.__setitem__`).  Unlike `arity_exact`, the message carries neither a
 /// trailing "()" nor the "exactly" wording; "argument" is singular when
 /// `n == 1`.
-pub(crate) fn arity_exact_unpack(
+pub fn arity_exact_unpack(
     args: &[PyObjectRef],
     name: &str,
     n: usize,
