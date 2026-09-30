@@ -1231,3 +1231,93 @@ fn getindex_w_index_from_residual_raises() {
         "from_residual raises ControlFlow::Break's carrier"
     );
 }
+
+/// `eval_loop` uses `decode_instruction_forward(code, pc)?`. The callee's
+/// error is `BytecodeCorruption` and the function returns `PyError` through
+/// `impl From<BytecodeCorruption> for PyError`. `FromResidual::from_residual`
+/// is `Err(From::from(e))`, so the raise takes that `from` result.
+#[test]
+fn eval_loop_converts_bytecode_corruption_before_raising() {
+    use majit_translate::model::LinkArg;
+    let path = "pyre_interpreter::eval::eval_loop";
+    let g = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower: {e}"));
+    let mut reachable = vec![false; g.blocks.len()];
+    let mut stack = vec![g.startblock.0];
+    while let Some(block) = stack.pop() {
+        if block >= reachable.len() || reachable[block] {
+            continue;
+        }
+        reachable[block] = true;
+        for link in &g.blocks[block].exits {
+            stack.push(link.target.0);
+        }
+    }
+    let mut converted = false;
+    let mut saw_corruption = false;
+    for (bi, block) in g.blocks.iter().enumerate() {
+        if !reachable[bi] {
+            continue;
+        }
+        for op in &block.operations {
+            if matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "from_residual"
+            ) {
+                panic!("reachable from_residual still returns a value at block {bi}");
+            }
+            if matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. }
+                    if field.owner_root.as_deref().is_some_and(|owner| {
+                        owner.contains("BytecodeCorruption")
+                    })
+            ) {
+                saw_corruption = true;
+            }
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if segments.last().map(String::as_str) != Some("pyerror_to_exc_object") {
+                continue;
+            }
+            let Some(arg) = args.first().and_then(LinkArg::as_variable) else {
+                continue;
+            };
+            let Some(OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args: from_args,
+                ..
+            }) = return_producer(&g, arg, 0)
+            else {
+                continue;
+            };
+            if segments.last().map(String::as_str) != Some("from")
+                || !segments.iter().any(|seg| seg == "PyError")
+                || !segments.iter().any(|seg| seg.starts_with("<Impl#"))
+            {
+                continue;
+            }
+            assert!(
+                from_args.is_empty(),
+                "BytecodeCorruption is a void zero-sized type; From::from has no FUNC.ARGS slot"
+            );
+            converted = true;
+        }
+    }
+    assert!(
+        saw_corruption,
+        "{path}: the residual owner must name BytecodeCorruption"
+    );
+    assert!(
+        converted,
+        "{path}: BytecodeCorruption from_residual must raise From::from"
+    );
+}

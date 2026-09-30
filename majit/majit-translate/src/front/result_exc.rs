@@ -1764,6 +1764,11 @@ pub(crate) fn foreign_residual_type(owner: &str, carrier_path: &str) -> Option<S
 }
 
 /// `Result<Infallible, E>` is the `Try::branch` residual, not `E`.
+///
+/// Charon spells that uninhabited ok as `Never`
+/// (`{"Value":[id,"Never"]}`). `charon_type_value_to_ast_string` renders a
+/// non-object payload as `??scalar`, so the owner suffix is
+/// `Result<??scalar,E>`.
 fn peel_infallible_result(ty: &str) -> String {
     let Some(rest) = ty.strip_prefix("Result<") else {
         return ty.to_string();
@@ -1772,10 +1777,15 @@ fn peel_infallible_result(ty: &str) -> String {
         return ty.to_string();
     };
     let args = split_top_level(inner);
-    if args.len() == 2 && (args[0] == "Infallible" || args[0] == "!") {
+    if args.len() == 2 && is_uninhabited_ok(&args[0]) {
         return args[1].clone();
     }
     ty.to_string()
+}
+
+/// Ok-type spellings of the `Try::branch` residual.
+fn is_uninhabited_ok(ty: &str) -> bool {
+    matches!(ty, "Infallible" | "!" | "Never" | "??scalar")
 }
 
 /// Leaf equality after a path prefix, with identical generic arguments.
@@ -6727,8 +6737,23 @@ mod from_residual_conversion_tests {
             Some("BytecodeCorruption".to_string())
         );
         assert_eq!(
+            foreign_residual_type(
+                "ControlFlow<Result<??scalar,BytecodeCorruption>,(usize,Instruction,OpArg)>::Break",
+                CARRIER
+            ),
+            Some("BytecodeCorruption".to_string())
+        );
+        assert_eq!(
             foreign_residual_type("Result<Infallible,BytecodeCorruption>::Err", CARRIER),
             Some("BytecodeCorruption".to_string())
+        );
+        assert_eq!(
+            foreign_residual_type("Result<??scalar,PyError>::Err", CARRIER),
+            None
+        );
+        assert_eq!(
+            foreign_residual_type("ControlFlow<Result<??scalar,PyError>,i64>::Break", CARRIER),
+            None
         );
         assert_eq!(
             foreign_residual_type("ControlFlow<BytecodeCorruption,i64>::Break", ""),
