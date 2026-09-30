@@ -7311,8 +7311,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `scan.poison`, which is that arm. The call inside the `try` stays
     // on the traced path. A handler that returns keeps the callee
     // residual, because its dirty ops are outside every reraise arm.
+    //
+    // A `FOR_ITER` in that callee is the structural abort the branchy gate
+    // exists to keep behind the decline: the walk raises, then
+    // `LoopBearingCalleeInlineUnsupported` fires inside the handler and the
+    // outer CALL is re-executed. `code_has_for_iter` leaves that body
+    // residual. An `except: raise` arm with no `for` still inlines.
     let handler_reraise_admit = seeded_inline
         && !branchy_poison_admit
+        && !pyre_interpreter::code_has_for_iter(callee_code)
         && branchy_handler_scan.as_ref().is_some_and(|scan| {
             scan.enforceable()
                 && scan.safety != CalleeReplaySafety::Dirty
