@@ -294,6 +294,7 @@ two-phase-never-a-subject	pyre_interpreter::display::type_metaclass_dunder_obj
 two-phase-never-a-subject	pyre_interpreter::display::unicode_decode_error_str
 two-phase-never-a-subject	pyre_interpreter::display::unicode_encode_error_str
 two-phase-never-a-subject	pyre_interpreter::display::unicode_err_end_minus_one_repr
+two-phase-never-a-subject	pyre_interpreter::display::unicode_err_index_in_range
 two-phase-never-a-subject	pyre_interpreter::display::unicode_err_int_repr
 two-phase-never-a-subject	pyre_interpreter::display::unicode_err_int_slot
 two-phase-never-a-subject	pyre_interpreter::display::unicode_err_str_slot
