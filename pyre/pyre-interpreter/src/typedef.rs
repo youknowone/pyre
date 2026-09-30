@@ -13123,15 +13123,31 @@ fn init_type_type(ns: PyObjectRef) {
                         .expect("index is in the packed type.__call__ argument range");
                         let _ = roots.pin_root(value);
                     }
+                    // `descr_call` reads its keyword names off the `Arguments`
+                    // the caller built, where `keyword_names_w` holds the
+                    // mapping's own key objects.  pyre's builtin ABI hands this
+                    // arm a packed dict instead, so unpack it with
+                    // `_combine_starstarargs_wrapped` rather than copying each
+                    // key's text, which would rebuild the name as an exact
+                    // `str` and drop a `str` subclass the mapping supplied.
+                    let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
+                    let mut keywords_w: Vec<PyObjectRef> = Vec::new();
+                    crate::argument::combine_starstarargs_wrapped(
+                        &mut keyword_names_w,
+                        &mut keywords_w,
+                        roots.get(root_base + 2),
+                        roots.get(root_base),
+                    )?;
+                    // The unpack reaches the mapping's `keys()`, so the packed
+                    // positionals are read from their slots after it.
                     let positional: Vec<PyObjectRef> = (0..nargs)
                         .map(|index| roots.get(root_base + 3 + index))
                         .collect();
-                    let kwargs =
-                        unsafe { pyre_object::w_dict_str_entries_wtf8(roots.get(root_base + 2)) };
                     crate::call::type_call_instantiate_with_kwargs(
                         roots.get(root_base),
                         &positional,
-                        &kwargs,
+                        &keyword_names_w,
+                        &keywords_w,
                     )
                 },
                 crate::Signature::new(vec!["cls"], Some("args"), Some("kwargs"), 0, 1),
