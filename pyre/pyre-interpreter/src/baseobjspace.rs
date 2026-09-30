@@ -6442,6 +6442,8 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 /// `suppress` is `_PyObject_LookupAttr`'s flag: the caller swallows the
 /// AttributeError, so a terminal module miss skips the `__spec__` shadowing
 /// diagnosis that exists only to phrase the surfaced message.
+/// The caller must have an active `push_roots()` scope. This function pins
+/// `obj` into that scope and does not open or close it.
 pub fn getattr_str_impl(
     obj: PyObjectRef,
     name: &str,
