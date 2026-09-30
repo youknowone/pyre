@@ -29,12 +29,12 @@
 //! - **Callee rule** ([`lower_result_exc_returns`]): a scoped graph
 //!   whose declared return is `Result<T, PyError>` stops building
 //!   `Ok`/`Err` shells.  `return Ok(v)` links `returnblock` with `v`;
-//!   `return Err(e)` materialises the runtime exception object
-//!   (`PyError::to_exc_object` — the trace-level exception value
-//!   domain is the `W_BaseException` ref, the same value
-//!   `BH_LAST_EXC_VALUE` carries) and closes the block towards
-//!   `exceptblock` with `(type(exc), exc)`, the
-//!   `exc_from_raise` tail (`flowcontext.py`).
+//!   `return Err(e)` closes the block towards `exceptblock` with
+//!   `(type(e), e)`, the `exc_from_raise` tail (`flowcontext.py`): the
+//!   carrier is raised the way PyPy raises `OperationError`.  The
+//!   codewriter converts the raised carrier into the runtime exception
+//!   value `BH_LAST_EXC_VALUE` carries
+//!   (`codewriter::error_carrier_edges`).
 //!
 //! - **Caller rule** ([`rewire_result_exc_call_sites`]): a `?` on a
 //!   call to a scoped callee lowers in MIR as a
@@ -68,9 +68,9 @@
 //! `eval_loop_jit*` portals whose `match step_result` merges seven
 //! predecessors) — gets the [`catch_and_rewrap`] treatment: `LastException`
 //! exits on the call block whose arms locally re-encode the `Result`
-//! (`Ok(raw)` / `Err(PyError::from_exc_object(last_exc_value))` as a
-//! static call on the registered impl path), leaving
-//! the downstream destructuring untouched.  A call shape neither rule
+//! (`Ok(raw)` / `Err(last_exc_value)`, the exception link catching the
+//! carrier class — `except OperationError as e`), leaving the downstream
+//! destructuring untouched.  A call shape neither rule
 //! recognises declines — the graph degrades to a residual call, no
 //! miscompile.
 
@@ -423,7 +423,6 @@ pub(crate) fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
 pub(crate) fn lower_result_exc_returns(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
-    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<usize, String> {
     // Every `Err` below declines the WHOLE callee to a residual call.  The
     // message says why, but it travels out as `LowerError::Unsupported` and
@@ -438,7 +437,7 @@ pub(crate) fn lower_result_exc_returns(
     // to a residual call (`jtransform.py`).  The fail-safe residual
     // is the same here — this only records the reason before it is
     // discarded, so the refusal stays countable.
-    let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns, spec);
+    let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns);
     match &outcome {
         Err(msg) => crate::decline::record_reason(
             RESULT_EXC_CALLEE_GATE,
@@ -475,7 +474,6 @@ use crate::decline::gate::{
 fn lower_result_exc_returns_inner(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
-    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<usize, String> {
     let nblocks = graph.blocks.len();
     let mut rewritten = 0usize;
@@ -555,8 +553,8 @@ fn lower_result_exc_returns_inner(
                         graph.name, field.name
                     ));
                 }
-                // The `__pos_0` payload flows on to a `to_exc_object`
-                // call / forwarding exit as an SSA operand, so an
+                // The `__pos_0` payload flows on to the raise /
+                // forwarding exit as an SSA operand, so an
                 // exception-carrying Result writes the ref-kind evalue
                 // `Variable`.  Since the int-kind `FieldWrite` widening
                 // (`LinkArg::Value`→`LinkArg::Const`) a payload write may
@@ -796,22 +794,16 @@ fn lower_result_exc_returns_inner(
             }
         }
         if is_err {
-            // `return Err(e)` → materialise the runtime exception
-            // object and raise.  The trace-level exception value is
-            // the `W_BaseException` ref (`BH_LAST_EXC_VALUE`'s
-            // domain; the trait leg reads `ob_header.ob_type` off it),
-            // so `PyError::to_exc_object` runs at the raise site.
+            // `return Err(e)` → `raise e`: the carrier is the exception
+            // (`raise OperationError(...)`).  The codewriter converts the
+            // raised carrier into the runtime exception value
+            // (`codewriter::error_carrier_edges`).
             //
-            // A carrier that declares no materialiser is already one such
-            // value — a single owned word — so the payload is forwarded
-            // into the raise unchanged and no call is emitted at all.
-            let v_exc = materialize_error_to_exc_object(graph, block_id, payload, spec);
-            // After the exception object exists and before the raise: the
-            // order the guard's destructor runs in.
+            // Before the raise: the order the guard's destructor runs in.
             for close in root_scope_closes {
                 graph.push_op_var(block_id, close, true);
             }
-            crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, v_exc);
+            crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, payload);
         } else {
             // `return Ok(v)` → forward the payload itself.
             for link in &mut graph.blocks[bi].exits {
@@ -847,38 +839,6 @@ fn lower_result_exc_returns_inner(
         ));
     }
     Ok(rewritten)
-}
-
-/// Materialise the carrier payload in the trace-level exception-value domain.
-///
-/// The free-function spelling is intentional: the helper is
-/// `dont_look_inside` and its published residual address keeps the carrier's
-/// allocation/rooting implementation out of the caller JitCode.  A consumer
-/// whose carrier already is the exception value declares no helper and gets
-/// the identity path.
-pub(crate) fn materialize_error_to_exc_object(
-    graph: &mut FunctionGraph,
-    block: BlockId,
-    payload: Variable,
-    spec: crate::ErrorCarrierSpec<'_>,
-) -> Variable {
-    match spec.to_exc_object {
-        Some(segments) => graph
-            .push_op_var(
-                block,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: segments.iter().copied().map(str::to_string).collect(),
-                        fun_decl_id: None,
-                    },
-                    args: crate::model::call_args(vec![payload]),
-                    result_ty: ValueType::Ref(None),
-                },
-                true,
-            )
-            .expect("to_exc_object call must produce a value"),
-        None => payload,
-    }
 }
 
 /// True when some block's `Call` result flows straight to `returnblock`
@@ -1417,7 +1377,6 @@ pub(crate) fn rewire_result_exc_call_sites(
     graph: &mut FunctionGraph,
     results: &[(Variable, Option<String>, ValueType)],
     enclosing_scoped: bool,
-    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<RewireOutcome, String> {
     let mut outcome = RewireOutcome {
         diamonds: 0,
@@ -1458,7 +1417,6 @@ pub(crate) fn rewire_result_exc_call_sites(
             suffix.as_deref().unwrap_or(""),
             payload_ty,
             enclosing_scoped,
-            spec,
             true,
         );
         let site = match site {
@@ -1510,11 +1468,10 @@ pub(crate) fn rewire_option_ok_or_else_try_sites(
     graph: &mut FunctionGraph,
     sites: &[OptionOkOrElseTrySite],
     enclosing_scoped: bool,
-    spec: crate::ErrorCarrierSpec<'_>,
 ) -> usize {
     let mut rewritten = 0usize;
     for site in sites {
-        match rewire_one_option_ok_or_else_try_site(graph, site, enclosing_scoped, spec) {
+        match rewire_one_option_ok_or_else_try_site(graph, site, enclosing_scoped) {
             Ok(()) => rewritten += 1,
             Err(msg) => {
                 crate::decline::record_reason(
@@ -1533,7 +1490,6 @@ fn rewire_one_option_ok_or_else_try_site(
     graph: &mut FunctionGraph,
     site: &OptionOkOrElseTrySite,
     enclosing_scoped: bool,
-    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<(), String> {
     use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
 
@@ -1577,7 +1533,6 @@ fn rewire_one_option_ok_or_else_try_site(
         "",
         &site.payload_ty,
         enclosing_scoped,
-        spec,
         false,
     )?;
     if !matches!(result_shape, SiteOutcome::Diamond) {
@@ -1691,8 +1646,7 @@ fn rewire_one_option_ok_or_else_try_site(
         site.error_ty.clone(),
         "",
     );
-    let exc = materialize_error_to_exc_object(graph, none_bb, error, spec);
-    crate::front::exc_from_raise::set_raise_from_instance(graph, none_bb, exc);
+    crate::front::exc_from_raise::set_raise_from_instance(graph, none_bb, error);
 
     graph.blocks[a].operations.truncate(call_idx);
     let disc = graph.alloc_value_var();
@@ -1817,7 +1771,6 @@ fn rewire_one_call_site(
     suffix: &str,
     payload_ty: &ValueType,
     enclosing_scoped: bool,
-    spec: crate::ErrorCarrierSpec<'_>,
     allow_fallback: bool,
 ) -> Result<SiteOutcome, String> {
     let name = graph.name.clone();
@@ -1915,7 +1868,7 @@ fn rewire_one_call_site(
                 );
             }
         }
-        catch_and_rewrap(graph, a, r, suffix, payload_ty, spec)?;
+        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
         return Ok(SiteOutcome::Rewrapped);
     };
     // The rewrite bypasses B and C on this call edge, so that chain has to
@@ -1968,7 +1921,7 @@ fn rewire_one_call_site(
                 "{name}: Result::branch block {b} is shared by multiple predecessors"
             ));
         }
-        catch_and_rewrap(graph, a, r, suffix, payload_ty, spec)?;
+        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
         return Ok(SiteOutcome::Rewrapped);
     }
     // Block B is bypassed by the rewrite (A exits straight to the
@@ -1987,7 +1940,7 @@ fn rewire_one_call_site(
                 "{name}: ControlFlow discriminant block {c} is shared by multiple predecessors"
             ));
         }
-        catch_and_rewrap(graph, a, r, suffix, payload_ty, spec)?;
+        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
         return Ok(SiteOutcome::Rewrapped);
     }
     // Block C: `d = cf.__discriminant`; switch d {0 → continue, 1 → break}.
@@ -2126,92 +2079,6 @@ fn rewire_one_call_site(
     Ok(SiteOutcome::Diamond)
 }
 
-/// The `Err` payload of the match `exit` reaches is never read.
-///
-/// Either the shell is discarded unread (`let _ = f();`), or `Err(_)` still
-/// switches on the discriminant. The handler does not use
-/// the caught carrier, so rebuilding it would pass an `Exception` into
-/// `from_exc_object`'s `PyObject` parameter.
-fn err_payload_is_dead(graph: &FunctionGraph, exit: &Link, r: &Variable) -> bool {
-    let Some(pos) = exit
-        .args
-        .iter()
-        .position(|arg| matches!(arg, LinkArg::Value(v) if v == r))
-    else {
-        return false;
-    };
-    let Some(shell) = graph.blocks[exit.target.0].inputargs.get(pos).cloned() else {
-        return false;
-    };
-    // `let _ = f()?`-less discard: the shell reaches its block and nothing
-    // reads or forwards it, so neither arm's payload is ever observed.
-    if !variable_is_used(graph, &shell) {
-        return true;
-    }
-    let Ok((_, _, disc_shell)) = match_discriminant(graph, exit.target.0) else {
-        return false;
-    };
-    if disc_shell != shell {
-        return false;
-    }
-    let Ok((_ok_link, err_link)) =
-        split_diamond_exits(&graph.blocks[exit.target.0].exits, "err payload")
-    else {
-        return false;
-    };
-    // `split_diamond_exits` returns `(case 0, case 1)`. Result's Err is 1.
-    let Ok(err_shell) = arm_shell_var(graph, &err_link, &shell) else {
-        return true;
-    };
-    let Ok(walk) = shell_pos0_reads(graph, err_link.target.0, &err_shell) else {
-        return false;
-    };
-    walk.reads.iter().all(|(block, pos)| {
-        let carrier = graph.blocks[*block].inputargs[*pos].clone();
-        let Some(result) = graph.blocks[*block]
-            .operations
-            .iter()
-            .find_map(|op| match &op.kind {
-                OpKind::FieldRead { base, field, .. }
-                    if base == &carrier && field.name == "__pos_0" && op.result.is_some() =>
-                {
-                    op.result.clone()
-                }
-                _ => None,
-            })
-        else {
-            return false;
-        };
-        !variable_is_used(graph, &result)
-    })
-}
-
-fn variable_is_used(graph: &FunctionGraph, var: &Variable) -> bool {
-    graph.blocks.iter().any(|block| {
-        block.operations.iter().any(|op| {
-            op_operand_vars(&op.kind)
-                .iter()
-                .any(|operand| operand == var)
-        }) || match &block.exitswitch {
-            Some(ExitSwitch::Value(sw)) => sw == var,
-            Some(ExitSwitch::Fused { args, .. }) => args.iter().any(|arg| arg == var),
-            Some(ExitSwitch::LastException) | None => false,
-        } || block.exits.iter().any(|link| {
-            link.args
-                .iter()
-                .any(|arg| matches!(arg, LinkArg::Value(v) if v == var))
-                || link
-                    .last_exception
-                    .as_ref()
-                    .is_some_and(|arg| matches!(arg, LinkArg::Value(v) if v == var))
-                || link
-                    .last_exc_value
-                    .as_ref()
-                    .is_some_and(|arg| matches!(arg, LinkArg::Value(v) if v == var))
-        })
-    })
-}
-
 /// Custom-match fallback: the call's `Result` is consumed by a
 /// hand-written `match` (eval.rs `eval_loop` dispatches `StepResult` +
 /// the error handler) — possibly behind a multi-predecessor merge
@@ -2221,12 +2088,10 @@ fn variable_is_used(graph: &FunctionGraph, var: &Variable) -> bool {
 /// local to the call edge: the call block gets `LastException` exits
 /// whose two arms REBUILD the value-encoded `Result` the untouched
 /// downstream keeps consuming — the normal arm wraps the raw return in
-/// an `Ok` shell, the exception arm binds the caught `W_BaseException`
-/// back into the `PyError` domain (`PyError::from_exc_object`, the
-/// inverse of the callee rule's `to_exc_object`) and wraps it in an
-/// `Err` shell.  This is the same erasure boundary the residual-call
-/// ABI implements at host calls (`Ok` → value, `Err` →
-/// `BH_LAST_EXC_VALUE`), value-encoded again one block later.  The
+/// an `Ok` shell, the exception arm catches the carrier class
+/// (`except OperationError as e`) and wraps the caught carrier in an
+/// `Err` shell.  The codewriter converts the caught runtime exception
+/// value back into the carrier (`codewriter::error_carrier_edges`).  The
 /// rebuilt shells sit in the CALLER's graph next to the sibling shells
 /// the caller already builds for its own returns, so no new shell
 /// exposure is introduced on walked paths.
@@ -2236,7 +2101,6 @@ fn catch_and_rewrap(
     r: &Variable,
     suffix: &str,
     payload_ty: &ValueType,
-    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<(), String> {
     use crate::model::BlockId;
     let name = graph.name.clone();
@@ -2310,8 +2174,7 @@ fn catch_and_rewrap(
     );
 
     // Exception arm E: receive the non-`r` Value args plus the
-    // caught `[exc_type, exc_value]` pair, rebuild `Err(from_exc_object
-    // (exc_value))`.
+    // caught `[exc_type, exc_value]` pair, rebuild `Err(exc_value)`.
     let nonr_args: Vec<LinkArg> = orig
         .args
         .iter()
@@ -2321,42 +2184,11 @@ fn catch_and_rewrap(
     let (e_id, e_inputs) = graph.create_block_with_arg_vars(nonr_args.len() + 2);
     let e_exc_value_in = e_inputs[nonr_args.len() + 1].clone();
     let (e_shell, err_payload): (Option<Variable>, Option<Variable>) = if has_r {
-        // A carrier that declares no rebuild pair is its own exception
-        // value (the mirror of the raise site's `None` arm), so the caught
-        // word goes straight into the `Err` shell.
-        //
-        // `from_exc_object` is an associated fn. A `Method` target lowers
-        // to `getattr(args[0], name)` on the caught exception and blocks.
-        // The registered identity is the impl path, spelled as a
-        // `FunctionPath` so the annotator emits a static call. That call's
-        // parameter is a `PyObject`, and the caught word is an `Exception`;
-        // those two classes have no common base, so the call is only
-        // emitted when the `Err` payload is actually read. A dead payload
-        // (`Err(_)`) keeps the caught word and no rebuild, matching a
-        // `try`/`except` whose handler does not use the exception value.
-        let payload_dead = err_payload_is_dead(graph, &orig, r);
-        let v_err = if payload_dead {
-            e_exc_value_in
-        } else {
-            match spec.from_exc_object {
-                Some((_, method)) => {
-                    let owner = crate::front::mir::strip_crate_prefix(spec.carrier_path);
-                    let path = crate::parse::CallPath::for_impl_method(&owner, method);
-                    graph
-                        .push_op_var(
-                            e_id,
-                            OpKind::Call {
-                                target: CallTarget::function_path(path.segments),
-                                args: crate::model::call_args(vec![e_exc_value_in.clone()]),
-                                result_ty: ValueType::Ref(None),
-                            },
-                            true,
-                        )
-                        .expect("from_exc_object must produce a value")
-                }
-                None => e_exc_value_in,
-            }
-        };
+        // `except OperationError as e`: the link catches the carrier class,
+        // so the caught value is the `Err` payload itself.  The codewriter
+        // converts it from the runtime exception value
+        // (`codewriter::error_carrier_edges`).
+        let v_err = e_exc_value_in;
         let shell = build_shell(
             graph,
             e_id,
@@ -2398,7 +2230,11 @@ fn catch_and_rewrap(
         .into_iter()
         .chain([LinkArg::Value(va.clone()), LinkArg::Value(vb.clone())])
         .collect();
-    let mut exc_link = Link::new_mixed(a_to_e_args, e_id, Some(crate::model::exception_exitcase()));
+    let mut exc_link = Link::new_mixed(
+        a_to_e_args,
+        e_id,
+        Some(crate::model::error_carrier_exitcase()),
+    );
     exc_link.last_exception = Some(LinkArg::Value(va));
     exc_link.last_exc_value = Some(LinkArg::Value(vb));
     // The normal arm wraps the reminted payload in a fresh `Ok` shell.
@@ -2975,8 +2811,8 @@ fn forward_alias(graph: &FunctionGraph, var: &Variable, link: &Link) -> Option<V
 /// bool-switch and reraise links into this block; the block must build an
 /// `Err` shell, write `e_payload` into it, forward to the return block, and do
 /// nothing else.  Verifying this licenses block `R`'s `raise vb` substitution:
-/// `to_exc_object(e) == vb` (the caught exception value), so `raise vb`
-/// reproduces `return Err(e)` exactly.  Any extra effect fails loud → decline.
+/// `e == vb` (the caught carrier), so `raise vb` reproduces `return Err(e)`
+/// exactly.  Any extra effect fails loud → decline.
 fn verify_drain_reraise_returns_err_payload(
     graph: &FunctionGraph,
     reraise_target: usize,
@@ -3046,8 +2882,8 @@ fn verify_drain_reraise_returns_err_payload(
 /// a `__discriminant` switch whose Err arm reads `__pos_0[Result::Err]`
 /// and calls `PyError::matches_stop_iteration`. This rewrites the `next()`
 /// block into `LastException` exits (normal → the `Ok` arm; exception → a
-/// handler `H`) whose handler calls the equivalent object-level predicate on
-/// the live exception value, preserving the MRO/subclass match.
+/// handler `H` catching the carrier) whose handler re-issues the guard's own
+/// predicate on the caught carrier, preserving the MRO/subclass match.
 ///
 /// Fail-safe: returns `Err` on ANY structural mismatch or hazard, and the
 /// caller ([`rewire_one_call_site`]) converts that into `catch_and_rewrap`
@@ -3205,6 +3041,13 @@ fn try_fuse_drain_match(
         .ok_or_else(|| {
             format!("{name}: drain fuse: Err arm lacks PyError::matches_stop_iteration")
         })?;
+    // The guard is the handler's own predicate on the caught carrier
+    // (`except OperationError as e: if e.match(space, w_StopIteration)`);
+    // `H` re-issues it on the caught value.
+    let predicate_target = match &err_ops[predicate_idx].kind {
+        OpKind::Call { target, .. } => target.clone(),
+        _ => unreachable!("predicate matched as a call"),
+    };
     if err_ops.len() != 2 || errpay_idx >= predicate_idx {
         return Err(format!(
             "{name}: drain fuse: Err arm is not exactly payload-read then StopIteration predicate"
@@ -3584,23 +3427,20 @@ fn try_fuse_drain_match(
     let (r_id, r_inputs) = graph.create_block_with_arg_vars(1 + close_vars_a.len());
     let r_vb = r_inputs[0].clone();
 
-    // H: run the object-level StopIteration predicate on `vb`. `set_branch`
-    // below wraps the result in the `bool` hop the switch condition expects.
+    // H: run the handler's StopIteration predicate on the caught carrier
+    // `vb`. `set_branch` below wraps the result in the `bool` hop the switch
+    // condition expects.
     let matched = graph
         .push_op_var(
             h_id,
             OpKind::Call {
-                target: CallTarget::function_path([
-                    crate::runtime_names::crates::INTERPRETER,
-                    "error",
-                    "exception_object_matches_stop_iteration",
-                ]),
+                target: predicate_target,
                 args: crate::model::call_args(vec![h_vb.clone()]),
                 result_ty: ValueType::Int,
             },
             true,
         )
-        .expect("exception_object_matches_stop_iteration produces a value");
+        .expect("matches_stop_iteration produces a value");
     // GAP#4: the predicate reads only `vb`; the `etype` slot must stay unused
     // so the exception edge may thread the caught type in without a live
     // consumer (H is freshly built here, so this is a construction invariant).
@@ -3687,7 +3527,8 @@ fn try_fuse_drain_match(
         reraise_args,
     );
 
-    // A: LastException exits — normal → Ok arm; exception → H (catch-all).
+    // A: LastException exits — normal → Ok arm; exception → H (`except
+    // OperationError`).
     // The exc link carries the loop-carried vars H's break edge needs (filling
     // H's leading inputargs), then the caught `(va, vb)` pair into H's trailing
     // `(etype, evalue)` slots, naming them as the `last_exception` /
@@ -3703,7 +3544,7 @@ fn try_fuse_drain_match(
         graph,
         exc_vars,
         h_id,
-        Some(crate::model::exception_exitcase()),
+        Some(crate::model::error_carrier_exitcase()),
     );
     exc_link.last_exception = Some(LinkArg::Value(va));
     exc_link.last_exc_value = Some(LinkArg::Value(vb));
@@ -4470,8 +4311,9 @@ const FUSED_KIND_CTORS: &[(&str, &str)] = &[
 /// Fuse `PyError::<kind>(msg)` and the `pyerror_to_exc_object` that consumes
 /// it into a single published call.
 ///
-/// [`lower_result_exc_returns`] leaves each raise site as a constructor in one
-/// block feeding a materialisation in its successor. The constructor is
+/// The carrier raise conversion (`codewriter::error_carrier_edges`) leaves
+/// each raise site as a constructor in one block feeding a materialisation in
+/// its successor. The constructor is
 /// `PyError::new` once inlined — a transparent constructor with no host
 /// symbol, so it can never be given an address, and the descent that reaches
 /// it is refused. Rewriting the pair to one opaque call removes it from the
@@ -4778,8 +4620,7 @@ mod static_result_shell_tests {
     fn static_ok_tag_write_is_removed_with_the_result_shell() {
         let (mut graph, shell, payload) = ok_shell_with_tag(0);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
-                .expect("matching static tag lowers"),
+            lower_result_exc_returns(&mut graph, 0).expect("matching static tag lowers"),
             1
         );
         assert!(graph.blocks.iter().flat_map(|b| &b.operations).all(|op| {
@@ -4797,7 +4638,7 @@ mod static_result_shell_tests {
     #[test]
     fn static_ok_with_err_tag_is_rejected() {
         let (mut graph, _, _) = ok_shell_with_tag(1);
-        let err = lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+        let err = lower_result_exc_returns(&mut graph, 0)
             .expect_err("mismatched variant tag must fail closed");
         assert!(err.contains("non-matching __discriminant write"));
     }
@@ -4825,8 +4666,7 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(entry, returnblock, vec![shell.clone()]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
-                .expect("payload-less Ok lowers"),
+            lower_result_exc_returns(&mut graph, 0).expect("payload-less Ok lowers"),
             1
         );
         let ops = &graph.blocks[entry.0].operations;
@@ -4969,7 +4809,7 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(m, returnblock, vec![ret]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+            lower_result_exc_returns(&mut graph, 0)
                 .expect("a consumed payload-less Err does not decline the callee"),
             1
         );
@@ -4993,7 +4833,7 @@ mod static_result_shell_tests {
         let (mut graph, m, pair) = tagged_pair_graph();
         let returnblock = graph.returnblock;
         graph.set_goto(m, returnblock, vec![pair]);
-        let err = lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+        let err = lower_result_exc_returns(&mut graph, 0)
             .expect_err("a returned Err without an exception value cannot lower");
         assert!(err.contains("Result Err ctor without a __pos_0 payload write"));
     }
@@ -5007,13 +4847,9 @@ mod rewire_dead_arm_tests {
     fn absent_collected_var_is_skipped() {
         let mut graph = FunctionGraph::new("dead_arm");
         let ghost = Variable::new();
-        let outcome = rewire_result_exc_call_sites(
-            &mut graph,
-            &[(ghost, None, ValueType::Ref(None))],
-            true,
-            crate::ErrorCarrierSpec::default(),
-        )
-        .expect("a collected var that simplify already deleted is a dead arm");
+        let outcome =
+            rewire_result_exc_call_sites(&mut graph, &[(ghost, None, ValueType::Ref(None))], true)
+                .expect("a collected var that simplify already deleted is a dead arm");
         assert_eq!(outcome.diamonds, 0);
         assert_eq!(outcome.tail_forwards, 0);
         assert_eq!(outcome.rewrapped, 0);
@@ -5031,7 +4867,6 @@ mod rewire_dead_arm_tests {
             &mut graph,
             &[(ghost, None, ValueType::Ref(None))],
             true,
-            crate::ErrorCarrierSpec::default(),
         ) {
             Ok(_) => panic!("a live use without a producer is unproven"),
             Err(msg) => msg,
@@ -5549,15 +5384,7 @@ mod rebuilt_shell_collapse_tests {
         let (tail, _) = graph.create_block_with_arg_vars(1);
         graph.set_return(tail, None);
         graph.set_goto(a, tail, vec![r.clone()]);
-        catch_and_rewrap(
-            &mut graph,
-            a.0,
-            &r,
-            "<i64,PyError>",
-            &ValueType::Int,
-            crate::ErrorCarrierSpec::default(),
-        )
-        .expect("rewrap");
+        catch_and_rewrap(&mut graph, a.0, &r, "<i64,PyError>", &ValueType::Int).expect("rewrap");
         assert!(
             matches!(
                 graph.blocks[a.0].exitswitch,
@@ -5592,14 +5419,7 @@ mod rebuilt_shell_collapse_tests {
         let (tail, _) = graph.create_block_with_arg_vars(1);
         graph.set_return(tail, None);
         graph.set_goto(a, tail, vec![r.clone()]);
-        let spec = crate::ErrorCarrierSpec {
-            carrier_path: "carrier::PyError",
-            carrier_wrappers: &[],
-            to_exc_object: None,
-            from_exc_object: Some(("PyError", "from_exc_object")),
-        };
-        catch_and_rewrap(&mut graph, a.0, &r, "<(),PyError>", &ValueType::Void, spec)
-            .expect("rewrap");
+        catch_and_rewrap(&mut graph, a.0, &r, "<(),PyError>", &ValueType::Void).expect("rewrap");
         let rebuilds = graph
             .blocks
             .iter()
@@ -5613,7 +5433,9 @@ mod rebuilt_shell_collapse_tests {
     }
 
     /// A fused guard that switches on the shell reads it, so the `Err`
-    /// payload is live and the caught word is rebuilt into the carrier.
+    /// shell carries the caught carrier as its payload.  The shell holds the
+    /// caught value itself; `codewriter::error_carrier_edges` converts it,
+    /// so no `from_exc_object` call is emitted here.
     #[test]
     fn catch_and_rewrap_rebuilds_an_err_a_fused_switch_reads() {
         let mut graph = FunctionGraph::new("rewrap_fused");
@@ -5651,14 +5473,34 @@ mod rebuilt_shell_collapse_tests {
             ),
         ];
         graph.set_goto(a, tail, vec![r.clone()]);
-        let spec = crate::ErrorCarrierSpec {
-            carrier_path: "carrier::PyError",
-            carrier_wrappers: &[],
-            to_exc_object: None,
-            from_exc_object: Some(("PyError", "from_exc_object")),
-        };
-        catch_and_rewrap(&mut graph, a.0, &r, "<(),PyError>", &ValueType::Void, spec)
-            .expect("rewrap");
+        catch_and_rewrap(&mut graph, a.0, &r, "<(),PyError>", &ValueType::Void).expect("rewrap");
+        let caught = graph.blocks[a.0]
+            .exits
+            .iter()
+            .find_map(|link| link.exitcase.as_ref().map(|_| link.clone()))
+            .expect("exception link");
+        let e_block = &graph.blocks[caught.target.0];
+        let caught_value = e_block.inputargs.last().expect("caught exc value").clone();
+        let err_payloads: Vec<&LinkArg> = e_block
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, value, .. }
+                    if field.name == "__pos_0"
+                        && field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|owner| owner.ends_with("::Err")) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(err_payloads.as_slice(), [LinkArg::Value(v)] if *v == caught_value),
+            "the Err shell a fused switch reads carries the caught carrier"
+        );
         let rebuilds = graph
             .blocks
             .iter()
@@ -5668,7 +5510,7 @@ mod rebuilt_shell_collapse_tests {
                     if format!("{target:?}").contains("from_exc_object"))
             })
             .count();
-        assert_eq!(rebuilds, 1, "an Err shell a fused switch reads is rebuilt");
+        assert_eq!(rebuilds, 0, "the codewriter converts the caught value");
     }
 }
 
@@ -5856,13 +5698,8 @@ mod option_ok_or_else_try_tests {
     #[test]
     fn ok_or_else_try_payload_is_defined_on_every_link() {
         let (mut graph, site) = ok_or_else_try_diamond();
-        rewire_one_option_ok_or_else_try_site(
-            &mut graph,
-            &site,
-            false,
-            crate::ErrorCarrierSpec::default(),
-        )
-        .expect("ok_or_else `?` diamond rewires");
+        rewire_one_option_ok_or_else_try_site(&mut graph, &site, false)
+            .expect("ok_or_else `?` diamond rewires");
         assert_link_args_defined(&graph);
     }
 }

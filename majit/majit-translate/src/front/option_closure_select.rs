@@ -140,6 +140,9 @@ pub(crate) struct ClosureSelectSite {
     /// itself (identity), not a `__pos_0` field read.  (The closure `Args`
     /// tuple `__pos_0` write is unaffected — that is a real `Tuple` field.)
     pub niche: bool,
+    /// The receiver niche is `Option<fn>`: its null test compares against
+    /// `null_fn` (int bank).
+    pub fn_ptr: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
     /// Receiver-side counterpart of `result_fieldless_none_tag`.
@@ -468,21 +471,17 @@ fn rewire_one_closure_select_site(
     }
     let disc = graph.alloc_value_var();
     if site.niche {
-        // Niche `Option<NonNull>`: discriminant = `opt != null` (`None` = null
-        // = 0, `Some` = non-null = 1) — a `ne` on two `Ref` operands lowers to
-        // `ptr_ne` with an `Int` result matching the aggregate read.  The null
-        // is a repr-adaptive `null_mut()` call, not a fixed-GCREF
-        // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
-        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(disc.clone()),
-            kind: OpKind::BinOp {
-                op: "ne".to_string(),
-                lhs: opt.clone().into_variable(),
-                rhs: nullc,
-                result_ty: ValueType::Int,
-            },
-        });
+        // Niche `Option`: discriminant = `not (opt is None)`
+        // (`None` = null = 0, `Some` = non-null = 1).  `ne` on a
+        // `StringRepr` / `ListRepr` payload is value inequality
+        // (`rstr.py` / `rlist.py` `rtype_ne`), not this null test.
+        graph.push_niche_is_some(
+            a_id,
+            opt.clone().into_variable(),
+            site.fn_ptr,
+            site.niche_null_cast.as_ref(),
+            disc.clone(),
+        );
     } else if let Some(none_tag) = site.fieldless_none_tag {
         let none = graph
             .push_op_var(a_id, OpKind::ConstInt(none_tag), true)
@@ -759,6 +758,7 @@ mod tests {
             call_result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
             niche: false,
+            fn_ptr: false,
             niche_null_cast: None,
             fieldless_none_tag: None,
             result_option_owner: RESULT_OPTION.into(),
@@ -952,12 +952,6 @@ mod tests {
             &mut g,
             &outcome.result_exc_calls,
             false,
-            crate::ErrorCarrierSpec {
-                carrier_path: "pyre_interpreter::error::PyError",
-                carrier_wrappers: &["alloc::boxed::Box"],
-                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
-                from_exc_object: Some(("PyError", "from_exc_object")),
-            },
         )
         .expect("the synthesized call has the ordinary custom-consumer shape");
         assert_eq!(result_outcome.rewrapped, 1);
@@ -1074,6 +1068,46 @@ mod tests {
             "a niche Option has no discriminant field to write"
         );
         assert_eq!(count_null_mut(&g), 1, "the None arm is the null pointer");
+    }
+
+    /// The `None` of a niche `Option<&str>` result is the string `None`:
+    /// the null is narrowed to the payload repr the `Some` arm carries.
+    #[test]
+    fn map_with_niche_str_result_narrows_the_null() {
+        let mut g = FunctionGraph::new("test_closure_select_niche_str_result");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let env = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map", Some(RECV_OPTION.into())),
+                    args: crate::model::call_args(vec![opt, env]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+        let mut site = site_with_result_niche(ClosureCombinator::Map, result, true);
+        site.result_niche_null_cast = Some(("str".into(), ValueType::Str));
+        let outcome = rewire_closure_select_call_sites(&mut g, &[site]);
+        assert_eq!(outcome.rewritten, 1);
+        assert_eq!(count_null_mut(&g), 1, "the None arm is the null pointer");
+        let casts: Vec<&str> = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+            .collect();
+        assert_eq!(
+            casts,
+            vec!["str"],
+            "the null is narrowed to the string repr"
+        );
     }
 
     #[test]
@@ -1573,7 +1607,7 @@ mod tests {
     }
 
     #[test]
-    fn niche_receiver_str_cast_is_ne_rhs() {
+    fn niche_receiver_str_cast_is_is_rhs() {
         let mut g = FunctionGraph::new("test_closure_select_recv_str_cast");
         let a = g.startblock;
         let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
@@ -1600,18 +1634,18 @@ mod tests {
             1
         );
         let (raw_null, cast_result) = str_niche_null_cast(&g);
-        let ne = g.blocks[a.0]
+        let is_none = g.blocks[a.0]
             .operations
             .iter()
-            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne"))
-            .expect("ne discriminant");
-        match &ne.kind {
+            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"))
+            .expect("is_ discriminant");
+        match &is_none.kind {
             OpKind::BinOp { lhs, rhs, .. } => {
                 assert_eq!(lhs, &opt);
                 assert_eq!(rhs, &cast_result);
                 assert_ne!(rhs, &raw_null);
             }
-            other => panic!("expected ne, got {other:?}"),
+            other => panic!("expected is_, got {other:?}"),
         }
     }
 

@@ -57,7 +57,7 @@ struct ProviderTables {
     pytypes_by_struct: Vec<(String, i64)>,
     refs: Vec<(String, i64)>,
     int_values: Vec<(String, i64)>,
-    error_carrier: OwnedErrorCarrierSpec,
+    error_carrier: crate::OwnedErrorCarrierSpec,
     scalar_field_stores: Vec<OwnedScalarFieldStore>,
     /// The funcobj hint attributes harvested across the whole input; every
     /// crate's headers read them ([`CrateLoweringState`]).
@@ -77,17 +77,6 @@ struct ProviderTables {
 struct ProvidedCrate {
     llbc: Llbc,
     state: CrateLoweringState,
-}
-
-/// Owned mirror of [`crate::ErrorCarrierSpec`], held for the same reason as
-/// the three tables beside it: the spec borrows from the caller's frame, and
-/// a demanded body has to lower with the one the whole-program pass used.
-#[derive(Debug, Default)]
-struct OwnedErrorCarrierSpec {
-    carrier_path: String,
-    carrier_wrappers: Vec<String>,
-    to_exc_object: Option<Vec<String>>,
-    from_exc_object: Option<(String, String)>,
 }
 
 /// Owned mirror of [`crate::ScalarFieldStore`], held for the reason the
@@ -122,22 +111,6 @@ impl OwnedScalarFieldStore {
     }
 }
 
-impl OwnedErrorCarrierSpec {
-    fn own(spec: crate::ErrorCarrierSpec<'_>) -> Self {
-        let own_path = |segments: &[&str]| -> Vec<String> {
-            segments.iter().map(|s| (*s).to_string()).collect()
-        };
-        Self {
-            carrier_path: spec.carrier_path.to_string(),
-            carrier_wrappers: own_path(spec.carrier_wrappers),
-            to_exc_object: spec.to_exc_object.map(own_path),
-            from_exc_object: spec
-                .from_exc_object
-                .map(|(receiver, method)| (receiver.to_string(), method.to_string())),
-        }
-    }
-}
-
 impl GraphBodyProvider {
     pub(crate) fn new(
         static_addrs: crate::HostStaticAddrs<'_>,
@@ -155,7 +128,7 @@ impl GraphBodyProvider {
             pytypes_by_struct: own(static_addrs.pytypes_by_struct),
             refs: own(static_addrs.refs),
             int_values: own(static_addrs.int_values),
-            error_carrier: OwnedErrorCarrierSpec::own(static_addrs.error_carrier),
+            error_carrier: crate::OwnedErrorCarrierSpec::own(static_addrs.error_carrier),
             scalar_field_stores: static_addrs
                 .scalar_field_stores
                 .iter()

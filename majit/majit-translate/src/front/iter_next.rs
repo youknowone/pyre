@@ -516,6 +516,27 @@ pub(crate) fn collect_transitive_dead_slots(
     Ok(set)
 }
 
+/// Every slot `carrier` is forwarded into from `block`'s exits, closed over
+/// its onward forwards, when the whole chain is dead.  The enumerate Some arm
+/// reads its payload through `__pos_0`; a copy of the Option threaded on
+/// through never-read slots is the same Rust SSA-merge artifact the None arm
+/// prunes, and packing `(count, item)` leaves it with no value to carry.
+fn forwarded_dead_slots(
+    graph: &FunctionGraph,
+    block: usize,
+    carrier: &Variable,
+) -> Result<Vec<(usize, usize)>, String> {
+    let mut set: Vec<(usize, usize)> = Vec::new();
+    for link in &graph.blocks[block].exits {
+        for (j, arg) in link.args.iter().enumerate() {
+            if matches!(arg, LinkArg::Value(v) if v == carrier) {
+                set.extend(collect_transitive_dead_slots(graph, link.target.0, j)?);
+            }
+        }
+    }
+    Ok(set)
+}
+
 /// The typed `StopIteration` exitcase the `next` block's break link
 /// carries — the handler analogue of [`crate::model::exception_exitcase`]
 /// (`Exception` catch-all), narrowed to the single exception the loop
@@ -565,43 +586,6 @@ fn int_const(i: i64) -> LinkArg {
 
 fn bool_const(value: bool) -> LinkArg {
     LinkArg::Const(Constant::new(ConstValue::Bool(value)))
-}
-
-/// The Some-arm inputarg that carries the Enumerate pair, creating one
-/// if the diamond did not already thread it (the body may not mention
-/// the adapter except on the back edge).
-fn enumerate_pair_in_some(
-    graph: &mut FunctionGraph,
-    a: usize,
-    c: usize,
-    some_target: usize,
-    some_link: &Link,
-    pair_in_a: &Variable,
-    normal_args: &mut Vec<LinkArg>,
-) -> Variable {
-    let pair_c = graph.blocks[a].exits.iter().find_map(|link| {
-        if link.target.0 != c {
-            return None;
-        }
-        link.args.iter().enumerate().find_map(|(i, arg)| {
-            matches!(arg, LinkArg::Value(v) if v == pair_in_a)
-                .then(|| graph.blocks[c].inputargs.get(i).cloned())
-                .flatten()
-        })
-    });
-    if let Some(pair_c) = pair_c
-        && let Some(pos) = some_link
-            .args
-            .iter()
-            .position(|arg| matches!(arg, LinkArg::Value(v) if *v == pair_c))
-        && let Some(v) = graph.blocks[some_target].inputargs.get(pos)
-    {
-        return v.clone();
-    }
-    let v = graph.alloc_value_var();
-    graph.blocks[some_target].inputargs.push(v.clone());
-    normal_args.push(LinkArg::Value(pair_in_a.clone()));
-    v
 }
 
 /// Rewrite every recorded `next()` call site into the `next` op +
@@ -791,20 +775,22 @@ fn rewire_one_next_site(
             ));
         }
     };
-    // `Enumerate::next` is the same Opaque-std class as slice `Iter::next`:
-    // lower the adapter into the loop it denotes (`iter_adapter`) so the
-    // inner list iterator can take the native `next` op.  Validate-only
-    // here — mutation waits until the diamond is confirmed.
-    let enumerate_inner =
+    // `Enumerate::next` over a list iterator is RPython's
+    // `next(enumerate(lst))`: the adapter becomes the `enumerate` builtin
+    // (`iter_adapter`), whose `next` yields the `(index, item)` tuple the
+    // Some arm reads.  Validate-only here — mutation waits until the
+    // diamond is confirmed.
+    let enumerate_site =
         crate::front::iter_adapter::enumerate_list_inner(graph, edges, &next_target, &iter_arg)?;
-    let enum_pair = enumerate_inner.is_some().then(|| iter_arg.clone());
-    let next_iter = enumerate_inner.clone().unwrap_or_else(|| iter_arg.clone());
+    let next_iter = enumerate_site
+        .as_ref()
+        .map_or_else(|| iter_arg.clone(), |site| site.inner.clone());
 
     // Read the element type off the still-unmutated graph: the backward
     // walk to the `iter` op's container has to see the block structure the
     // recording site saw, and the dead forwarded-slot removal below rewrites
     // exactly that.  For Enumerate the recorded kind is the *inner* element
-    // (the tuple is packed on the Some arm after this next).
+    // (the tuple's second item).
     let item_ty = iter_next_item_type(graph, edges, &next_iter, recorded_item_ty);
 
     // `lower_call` closes the block right after the raising call, so the
@@ -830,7 +816,7 @@ fn rewire_one_next_site(
     // to `["core", "slice", "iter"]`).  Anything else declines (the
     // residual call keeps the rtyper Skip), so a non-list iterator never
     // reaches the rewrite.
-    if enumerate_inner.is_none() && iter_op_container_with(graph, edges, &iter_arg).is_none() {
+    if enumerate_site.is_none() && iter_op_container_with(graph, edges, &iter_arg).is_none() {
         return Err(format!(
             "{name}: next() iterator operand does not originate from an iter op — \
              not a list-iterator for-loop"
@@ -1085,17 +1071,20 @@ fn rewire_one_next_site(
             payload_positions.len()
         ));
     }
-    if enum_pair.is_some() && (!aggregate_payload || payload_positions.is_empty()) {
+    if enumerate_site.is_some() && (!aggregate_payload || payload_positions.is_empty()) {
         return Err(format!(
             "{name}: Enumerate::next Some arm is not an aggregate Option payload — \
-             the adapter packs (i, item) onto __pos_0"
+             the (i, item) tuple is read off __pos_0"
         ));
     }
-    // `pack_enumerate_payload` collapses this read after the graph has
-    // already been rewritten. Accept only a `__pos_0` read of the payload
-    // slot, or a slot nothing reads (`for _ in ...enumerate()`). Any other
-    // use declines here, before the first edit.
-    if enum_pair.is_some() {
+    // Slots of a dead chain the Some arm forwards the payload into; pruned
+    // together with the None arm's chain below.
+    let mut some_dead: Vec<(usize, usize)> = Vec::new();
+    // The enumerate Some arm collapses this read onto the `(index, item)`
+    // tuple. Accept only `__pos_0` reads of the payload slot, or a slot
+    // nothing reads (`for _ in ...enumerate()`). Any other use declines
+    // here, before the first edit.
+    if enumerate_site.is_some() {
         let pos = payload_positions[0];
         let carrier = graph.blocks[some_target.0]
             .inputargs
@@ -1130,10 +1119,16 @@ fn rewire_one_next_site(
                     .iter()
                     .any(|arg| matches!(arg, LinkArg::Value(v) if v == &carrier))
             });
-            if uses != 0 || forwarded {
+            if uses != 0 {
                 return Err(format!(
                     "{name}: enumerate Some arm uses the payload outside a __pos_0 read"
                 ));
+            }
+            if forwarded {
+                some_dead =
+                    forwarded_dead_slots(graph, some_target.0, &carrier).map_err(|reason| {
+                        format!("{name}: enumerate Some arm forwards a live payload — {reason}")
+                    })?;
             }
         } else if pos0_at
             .iter()
@@ -1143,8 +1138,7 @@ fn rewire_one_next_site(
         } else {
             // Duplicate `__pos_0` reads are the same Some payload (`for (i, x)`
             // projects it once per field). They are merged after validation.
-            // A forward still declines unless the successor only reads
-            // `__pos_N` of that slot — then the packed tuple is what it receives.
+            // A forward is accepted only into a dead chain.
             let block = &graph.blocks[some_target.0];
             let other_operand = block.operations.iter().enumerate().any(|(i, op)| {
                 !pos0_at.contains(&i) && op_operand_vars(&op.kind).contains(&carrier)
@@ -1159,16 +1153,44 @@ fn rewire_one_next_site(
                 Some(ExitSwitch::Fused { args, .. }) if args.contains(&carrier) => true,
                 _ => false,
             };
-            let packed_forward = forwarded
-                && crate::front::iter_adapter::successor_reads_packed_payload(
-                    graph,
-                    some_target.0,
-                    &carrier,
-                );
-            if other_operand || switched || (forwarded && !packed_forward) {
+            if other_operand || switched {
                 return Err(format!(
                     "{name}: enumerate Some arm uses the payload outside a __pos_0 read"
                 ));
+            }
+            // The tuple itself may only be read here: its item reads are
+            // repainted to the tuple `next` yields, and a successor's reads
+            // would keep the old shape.
+            let tuples: Vec<Variable> = pos0_at
+                .iter()
+                .filter_map(|&i| block.operations[i].result.clone())
+                .collect();
+            let tuple_escapes = block.operations.iter().any(|op| {
+                !matches!(
+                    &op.kind,
+                    OpKind::FieldRead { base, field, .. }
+                        if tuples.contains(base)
+                            && (field.name == "__pos_0" || field.name == "__pos_1")
+                ) && op_operand_vars(&op.kind).iter().any(|v| tuples.contains(v))
+            }) || block.exits.iter().any(|link| {
+                link.args
+                    .iter()
+                    .any(|arg| matches!(arg, LinkArg::Value(v) if tuples.contains(v)))
+            }) || match &block.exitswitch {
+                Some(ExitSwitch::Value(v)) => tuples.contains(v),
+                Some(ExitSwitch::Fused { args, .. }) => args.iter().any(|v| tuples.contains(v)),
+                _ => false,
+            };
+            if tuple_escapes {
+                return Err(format!(
+                    "{name}: enumerate Some arm's (index, item) tuple leaves its item reads"
+                ));
+            }
+            if forwarded {
+                some_dead =
+                    forwarded_dead_slots(graph, some_target.0, &carrier).map_err(|reason| {
+                        format!("{name}: enumerate Some arm forwards a live payload — {reason}")
+                    })?;
             }
         }
     }
@@ -1204,6 +1226,16 @@ fn rewire_one_next_site(
         for (b, s) in set {
             dead.entry(b).or_default().insert(s);
         }
+    }
+    // A's new normal link is built from `normal_args`, which keeps every
+    // Some-target slot, so the Some target itself must not lose one.
+    if some_dead.iter().any(|&(b, _)| b == some_target.0) {
+        return Err(format!(
+            "{name}: enumerate Some arm's dead payload chain re-enters the Some target"
+        ));
+    }
+    for (b, s) in some_dead {
+        dead.entry(b).or_default().insert(s);
     }
 
     // Generalized arity guard: removing slot `s` from a block also drops arg
@@ -1264,7 +1296,7 @@ fn rewire_one_next_site(
     // All structural validation passed; mutate the graph.
     *mutated = true;
 
-    if enum_pair.is_some() {
+    if enumerate_site.is_some() {
         let pos = payload_positions[0];
         if let Some(carrier) = graph.blocks[some_target.0].inputargs.get(pos).cloned() {
             let at: Vec<usize> = graph.blocks[some_target.0]
@@ -1286,47 +1318,23 @@ fn rewire_one_next_site(
         }
     }
 
-    if let Some(pair) = &enum_pair {
-        crate::front::iter_adapter::rewrite_enumerate_ctor_to_pair(graph, edges, pair, &next_iter)?;
+    if let Some(site) = &enumerate_site {
+        crate::front::iter_adapter::rewrite_enumerate_to_builtin(graph, site);
     }
 
     // The Some target reads the payload via `opt.__pos_0`; with the `next`
     // result flowing directly, that read collapses to the carried value.
-    // Enumerate packs `(count, item)` first and collapses onto that tuple.
-    if let Some(pair) = &enum_pair {
-        let item_pos = payload_positions[0];
-        let item_in_some = graph.blocks[some_target.0]
-            .inputargs
-            .get(item_pos)
-            .cloned()
-            .ok_or_else(|| format!("{name}: enumerate Some arm lacks payload slot {item_pos}"))?;
-        let pair_in_some = enumerate_pair_in_some(
-            graph,
-            a,
-            c,
-            some_target.0,
-            &some_link,
-            pair,
-            &mut normal_args,
-        );
-        let packed = crate::front::iter_adapter::pack_enumerate_payload(
-            graph,
-            some_target.0,
-            &item_in_some,
-            &item_ty,
-            &pair_in_some,
-            &name,
-        )?;
-        crate::front::iter_adapter::rewrite_forwarded_payload(
-            graph,
-            some_target.0,
-            &item_in_some,
-            &packed,
-            &crate::front::iter_adapter::enumerate_yield_owner(&item_ty),
-        );
-    } else {
-        for pos in payload_positions {
-            collapse_pos0_read(graph, some_target, pos, &name)?;
+    // For enumerate that value is the `(index, item)` tuple.
+    for &pos in &payload_positions {
+        collapse_pos0_read(graph, some_target, pos, &name)?;
+        if enumerate_site.is_some() {
+            let carrier = graph.blocks[some_target.0].inputargs[pos].clone();
+            crate::front::iter_adapter::paint_enumerate_tuple_reads(
+                graph,
+                some_target.0,
+                &carrier,
+                &item_ty,
+            );
         }
     }
 
@@ -1354,21 +1362,19 @@ fn rewire_one_next_site(
     // `[__iter_next]` marker, the iterator as its single operand, `opt`
     // (the peeled scrutinee) reused as the element.  Truncating after the
     // raw call drops the recast tail so the native op is A's last / raising
-    // op under the `LastException` exitswitch below.
-    // Enumerate reads `pair.iter` first so the raising op's operand is the
-    // inner list iterator; ctor rewrite above may have shifted `next_idx`.
-    let mut next_idx = graph.blocks[a]
+    // op under the `LastException` exitswitch below.  The enumerate
+    // rewrite above may have shifted `next_idx`.
+    let next_idx = graph.blocks[a]
         .operations
         .iter()
         .position(|op| op.result.as_ref() == Some(&raw_next_result))
         .ok_or_else(|| format!("{name}: next() producer op vanished before native replacement"))?;
-    let native_iter = if let Some(pair) = &enum_pair {
-        let (inner_a, shifted) =
-            crate::front::iter_adapter::insert_pair_iter_read(graph, a, next_idx, pair);
-        next_idx = shifted;
-        inner_a
+    let next_result_ty = if enumerate_site.is_some() {
+        ValueType::Ref(Some(crate::front::iter_adapter::enumerate_yield_owner(
+            &item_ty,
+        )))
     } else {
-        iter_arg
+        item_ty
     };
     graph.blocks[a].operations.truncate(next_idx + 1);
     graph.blocks[a].operations[next_idx] = SpaceOperation {
@@ -1378,8 +1384,11 @@ fn rewire_one_next_site(
                 segments: next_op_segments(),
                 fun_decl_id: None,
             },
-            args: crate::model::call_args(vec![native_iter]),
-            result_ty: item_ty,
+            args: crate::model::call_args(vec![match &enumerate_site {
+                Some(site) => site.renamed(&iter_arg),
+                None => iter_arg,
+            }]),
+            result_ty: next_result_ty,
         },
     };
 

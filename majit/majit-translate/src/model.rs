@@ -1746,6 +1746,15 @@ pub enum ExitSwitch {
 pub enum ExitCase {
     Bool(bool),
     Const(ConstValue),
+    /// The interpreter's error-carrier class (`crate::ErrorCarrierSpec`),
+    /// the program's `OperationError`: a handler written `except
+    /// OperationError as e` catches with this exitcase, and `e` is the
+    /// carrier.  The class object is minted by the annotator's bookkeeper
+    /// (`Bookkeeper::set_exception_carrier`), which the front does not
+    /// reach, so the link names it symbolically; the flowspace adapter
+    /// resolves it to that class and the codewriter's
+    /// `error_carrier_edges` rewrites it to the runtime domain.
+    ErrorCarrier,
 }
 
 /// RPython `flowspace/model.py` `Link`.
@@ -1824,6 +1833,9 @@ impl Link {
             Some(ExitCase::Bool(value)) => Some(ConstValue::Bool(*value)),
             Some(ExitCase::Const(value)) if value.string_eq("default") => None,
             Some(ExitCase::Const(value)) => Some(value.clone()),
+            // A class exitcase is converted by the rtyper
+            // (`get_type_repr(...).convert_const`), not copied.
+            Some(ExitCase::ErrorCarrier) => None,
             None => None,
         };
         self
@@ -1847,6 +1859,11 @@ impl Link {
 
 pub fn exception_exitcase() -> ExitCase {
     ExitCase::Const(ConstValue::builtin("Exception"))
+}
+
+/// `except OperationError` — see [`ExitCase::ErrorCarrier`].
+pub fn error_carrier_exitcase() -> ExitCase {
+    ExitCase::ErrorCarrier
 }
 
 /// RPython `Link.args` items are Variables or Constants —
@@ -7214,6 +7231,19 @@ pub struct FunctionGraph {
     /// `with_return_type(rt)` after construction (parse.rs + lib.rs
     /// free-function, trait-method, and inherent-method registration).
     pub return_type: Option<String>,
+    /// Class key of the declared return value when it is a by-value ADT
+    /// (`core::option::Option<PyError>`, a named struct) — the
+    /// `SomeInstance` result a `_signature_` would declare.  `return_type`
+    /// only carries the residual-call register kind (`ref`), so a
+    /// `dont_look_inside` stub reads the class from here.  `None` for
+    /// scalar, pointer and unit returns.
+    pub return_class_root: Option<String>,
+    /// The declared return is a pointer to the low-level `STR` storage
+    /// (`*mut BytesBlock`) — the `SomeString` result a `_signature_`
+    /// (`returns=types.str()`) would declare.  `return_type` carries only its
+    /// register kind (`ref`), so a `dont_look_inside` stub reads the string
+    /// result from here.
+    pub return_is_str: bool,
     /// Per-graph JIT hints — the `_jit_*_` / `_elidable_function_`
     /// attributes RPython `policy.py look_inside_graph` reads off
     /// `graph.func`. Pyre carries them on the graph itself so
@@ -7344,6 +7374,8 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         blocks,
         notes: graph.notes.clone(),
         return_type: graph.return_type.clone(),
+        return_class_root: graph.return_class_root.clone(),
+        return_is_str: graph.return_is_str,
         hints: graph.hints.clone(),
         access_directly: graph.access_directly,
         func: graph.func.clone(),
@@ -7409,6 +7441,8 @@ impl FunctionGraph {
             ],
             notes: Vec::new(),
             return_type: None,
+            return_class_root: None,
+            return_is_str: false,
             owner_root: None,
             source_identity: None,
             fun_decl_id: None,
@@ -7605,6 +7639,51 @@ impl FunctionGraph {
             kind: cast_instance_call_result(root.clone(), null, ty.clone()),
         });
         narrowed
+    }
+
+    /// The discriminant of the niche `Option` `opt` into `result` (`Some` = 1):
+    /// `not (opt is None)`, spelled `eq(is_(opt, None), False)`.  A `ne` would
+    /// be value inequality on a `StringRepr` / `ListRepr` payload
+    /// (`rstr.py` / `rlist.py` `rtype_ne`), not a null test.  `fn_ptr` selects
+    /// `null_fn` (`ll_ptrtype`); every other niche uses [`Self::push_niche_null`].
+    pub fn push_niche_is_some(
+        &mut self,
+        block: BlockId,
+        opt: crate::flowspace::model::Variable,
+        fn_ptr: bool,
+        cast: Option<&(String, ValueType)>,
+        result: crate::flowspace::model::Variable,
+    ) {
+        let nullc = if fn_ptr {
+            self.push_null_fn_ptr(block)
+        } else {
+            self.push_niche_null(block, cast)
+        };
+        let is_none = self.alloc_value_var();
+        let false_var = self.alloc_value_var();
+        let ops = &mut self.block_mut(block).operations;
+        ops.push(SpaceOperation {
+            result: Some(is_none.clone()),
+            kind: OpKind::BinOp {
+                op: "is_".to_string(),
+                lhs: opt,
+                rhs: nullc,
+                result_ty: ValueType::Int,
+            },
+        });
+        ops.push(SpaceOperation {
+            result: Some(false_var.clone()),
+            kind: OpKind::ConstBool(false),
+        });
+        ops.push(SpaceOperation {
+            result: Some(result),
+            kind: OpKind::BinOp {
+                op: "eq".to_string(),
+                lhs: is_none,
+                rhs: false_var,
+                result_ty: ValueType::Int,
+            },
+        });
     }
 
     /// Null function pointer for `Option<fn>`'s `None` arm. Annotates as

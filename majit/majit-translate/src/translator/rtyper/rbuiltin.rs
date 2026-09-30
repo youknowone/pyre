@@ -44,7 +44,9 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 
-use crate::translator::rtyper::rrange::{rtype_builtin_range, rtype_builtin_xrange};
+use crate::translator::rtyper::rrange::{
+    rtype_builtin_enumerate, rtype_builtin_range, rtype_builtin_xrange,
+};
 
 /// Process-global counter for the legacy InstanceRepr→PtrRepr swap
 /// inside [`rtype_cast_ptr_to_int`].  Each fire is one
@@ -227,6 +229,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         // rrange.py:96-126 — `@typer_for(range)` / `@typer_for(xrange)`.
         ("range", rtype_builtin_range),
         ("xrange", rtype_builtin_xrange),
+        // rbuiltin.py — `typer_for(enumerate)(rrange.rtype_builtin_enumerate)`.
+        ("enumerate", rtype_builtin_enumerate),
         // rbuiltin.py:234-238
         ("min", rtype_builtin_min),
         // rbuiltin.py:246-250

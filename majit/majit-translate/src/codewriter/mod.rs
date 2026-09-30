@@ -26,6 +26,9 @@ pub mod call;
 pub mod codewriter;
 pub use codewriter::{AllJitCodes, CodeWriter};
 pub mod effectinfo;
+// Local Rust boundary: the error carrier's exception edges converted to the
+// runtime exception value, after annotation (see the module doc).
+pub mod error_carrier_edges;
 pub mod flatten;
 pub mod format;
 pub mod heaptracker;

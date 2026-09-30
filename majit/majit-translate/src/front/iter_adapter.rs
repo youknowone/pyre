@@ -17,11 +17,12 @@
 //!     self.count += 1;
 //!     Some((i, a))
 //! ```
-//! (`core::iter::adapters::enumerate::Enumerate::next`).  This pass
-//! replaces the Opaque `enumerate(it)` constructor with a two-field pair
-//! `{iter, count: 0}` the annotator can project, retargets `Enumerate::next`
-//! at the inner list iterator, and packs `(count, item)` on the Some arm
-//! after `front::iter_next` folds the inner `next` into StopIteration.
+//! (`core::iter::adapters::enumerate::Enumerate::next`) — over a list
+//! iterator, RPython's `enumerate(lst)`.  This pass respells
+//! `lst.iter().enumerate()` as `iter(__majit_enumerate(lst))`, drops the
+//! Opaque constructor, and `front::iter_next` folds `Enumerate::next` into
+//! the native `next` op yielding the `(index, item)` tuple the Some arm
+//! reads (`rrange.py` `EnumerateIteratorRepr`).
 //!
 //! Fail-safe: a site whose inner iterator is not a list `iter` op, or
 //! whose Option match is not the for-loop diamond, is left as the residual
@@ -38,19 +39,14 @@
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::front::bool_then::{close_goto_mixed, reproduce_exit_args};
 use crate::front::iter_next::{
-    BackEdges, iter_op_container_with, originates_from_iter_op, walk_back_to_source, walk_back_with,
+    BackEdges, originates_from_iter_op, walk_back_to_source, walk_back_with,
 };
 use crate::front::option_map_or::emit_narrow;
-use crate::front::result_exc::back_substitute;
+use crate::front::result_exc::{back_substitute, op_operand_vars};
 use crate::model::{
     BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg,
     OpKind, SpaceOperation, ValueType,
 };
-
-/// Owner leaf of the pair that stands in for an `Enumerate` adapter.
-/// Distinct from a source `Tuple` so the count slot cannot union with a
-/// yield-tuple `__pos_1`.
-pub(crate) const ENUMERATE_PAIR_OWNER: &str = "__majit_enumerate";
 
 /// Recognised `Enumerate::next` residual — FunctionPath of the foreign
 /// adapter impl, or a Method whose receiver leaf is `Enumerate`.
@@ -90,33 +86,6 @@ fn adapter_path_ends_with(segments: &[String], adapter: &str, leaf: &str) -> boo
             .any(|w| w[0] == "adapters" && w[1] == adapter)
 }
 
-/// The inner iterator an `Enumerate` value wraps, when the backward walk
-/// reaches `enumerate(it)` or an `Enumerate { iter, count }` aggregate.
-pub(crate) fn inner_iter_of_enumerate(
-    graph: &FunctionGraph,
-    edges: &BackEdges,
-    enum_var: &Variable,
-) -> Option<Variable> {
-    if let Some(inner) = walk_back_with(graph, edges, enum_var, |op| match &op.kind {
-        OpKind::Call { target, args, .. }
-            if is_enumerate_ctor_target(target) && args.len() == 1 =>
-        {
-            Some(args[0].clone().into_variable())
-        }
-        _ => None,
-    }) {
-        return Some(inner);
-    }
-    let origin = walk_back_with(graph, edges, enum_var, |op| match &op.kind {
-        OpKind::Call {
-            target: CallTarget::SyntheticTransparentCtor { .. },
-            ..
-        } => op.result.clone(),
-        _ => None,
-    })?;
-    field_write_value(graph, &origin, &["iter", "__pos_0"])
-}
-
 fn field_write_value(graph: &FunctionGraph, base: &Variable, names: &[&str]) -> Option<Variable> {
     for op in graph.blocks.iter().flat_map(|b| &b.operations) {
         let OpKind::FieldWrite {
@@ -135,184 +104,299 @@ fn field_write_value(graph: &FunctionGraph, base: &Variable, names: &[&str]) -> 
     None
 }
 
-fn pair_ctor_target() -> CallTarget {
-    CallTarget::synthetic_transparent_struct_ctor(
-        vec![ENUMERATE_PAIR_OWNER.to_string()],
-        ENUMERATE_PAIR_OWNER,
-    )
+/// Where `lst.iter().enumerate()` is built: the `enumerate` constructor
+/// and the list `iter` op the backward walk from its operand reaches.
+pub(crate) struct EnumerateSite {
+    /// Block and op index of `e = enumerate(it)` / `Enumerate { .. }`.
+    ctor_block: usize,
+    ctor_op: usize,
+    ctor_var: Variable,
+    /// The iterator the constructor wraps, in scope in `ctor_block`.
+    pub(crate) inner: Variable,
+    /// Block and result of `it = core::slice::iter(lst)`.
+    iter_block: usize,
+    iter_var: Variable,
+    container: Variable,
 }
 
-fn pair_field(name: &str) -> FieldDescriptor {
-    FieldDescriptor::new(name, Some(ENUMERATE_PAIR_OWNER.to_string()))
-}
-
-fn emit_pair_field_write(
-    base: &Variable,
-    name: &str,
-    value: LinkArg,
-    ty: ValueType,
-) -> SpaceOperation {
-    SpaceOperation {
-        result: None,
-        kind: OpKind::FieldWrite {
-            base: base.clone(),
-            field: pair_field(name),
-            value,
-            ty,
-        },
+impl EnumerateSite {
+    /// `v` as [`rewrite_enumerate_to_builtin`] leaves it: the constructor's
+    /// value becomes the iterator it wrapped.
+    pub(crate) fn renamed(&self, v: &Variable) -> Variable {
+        if *v == self.ctor_var {
+            self.inner.clone()
+        } else {
+            v.clone()
+        }
     }
 }
 
-/// Replace `e = enumerate(it)` (or an `Enumerate` aggregate) with
-/// `{iter: it, count: 0}` under [`ENUMERATE_PAIR_OWNER`].  The pair is
-/// mutated in place each iteration, so the count does not need a new
-/// loop-carried SSA slot.
-pub(crate) fn rewrite_enumerate_ctor_to_pair(
-    graph: &mut FunctionGraph,
+/// Locate the `enumerate` constructor behind `enum_var` and the list `iter`
+/// op beneath it.  The inner iterator may only travel from the `iter` op to
+/// the constructor: once the constructor is gone that value is the
+/// enumerate iterator, so any other reader would see the wrong iterator.
+/// Does not mutate.
+pub(crate) fn locate_enumerate_site(
+    graph: &FunctionGraph,
     edges: &BackEdges,
     enum_var: &Variable,
-    inner: &Variable,
-) -> Result<(), String> {
-    let name = graph.name.clone();
+) -> Result<EnumerateSite, String> {
+    let name = &graph.name;
     // `enum_var` is often the loop-header phi; the constructor lives on
-    // the entry edge.  Rewrite that origin op, not the phi.  `edges`
-    // indexes the graph as it stands on entry; the walk runs before this
-    // function's first mutation.
-    let origin = walk_back_with(graph, edges, enum_var, |op| match &op.kind {
+    // the entry edge.
+    let ctor_var = walk_back_with(graph, edges, enum_var, |op| match &op.kind {
         OpKind::Call { target, .. } if is_enumerate_ctor_target(target) => op.result.clone(),
         _ => None,
     })
     .ok_or_else(|| format!("{name}: enumerate value has no constructor origin"))?;
-    let (bi, oi) = graph
-        .blocks
-        .iter()
-        .enumerate()
-        .find_map(|(bi, b)| {
-            b.operations
-                .iter()
-                .position(|op| op.result.as_ref() == Some(&origin))
-                .map(|oi| (bi, oi))
-        })
+    let (ctor_block, ctor_op) = producer_of(graph, &ctor_var)
         .ok_or_else(|| format!("{name}: enumerate constructor origin has no producer op"))?;
-    let enum_var = &origin;
-    let is_call_ctor = matches!(
-        &graph.blocks[bi].operations[oi].kind,
+    let inner = match &graph.blocks[ctor_block].operations[ctor_op].kind {
         OpKind::Call { target, args, .. }
-            if is_enumerate_ctor_target(target) && args.len() == 1
-    );
-    let is_aggregate = matches!(
-        &graph.blocks[bi].operations[oi].kind,
+            if args.len() == 1
+                && !matches!(target, CallTarget::SyntheticTransparentCtor { .. }) =>
+        {
+            args[0].clone().into_variable()
+        }
         OpKind::Call {
-            target: CallTarget::SyntheticTransparentCtor { name, .. },
+            target: CallTarget::SyntheticTransparentCtor { .. },
+            args,
             ..
-        } if name == "Enumerate" || name == ENUMERATE_PAIR_OWNER
-    );
-    if !is_call_ctor && !is_aggregate {
+        } if args.is_empty() => {
+            let block = &graph.blocks[ctor_block];
+            let mut inner = None;
+            for op in &block.operations {
+                let OpKind::FieldWrite {
+                    base, field, value, ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if *base != ctor_var {
+                    continue;
+                }
+                match (field.name.as_str(), value) {
+                    ("iter" | "__pos_0", LinkArg::Value(v)) => inner = Some(v.clone()),
+                    ("count" | "__pos_1", LinkArg::Const(c))
+                        if matches!(c.value, ConstValue::Int(0)) => {}
+                    ("count" | "__pos_1", LinkArg::Value(v))
+                        if block.operations.iter().any(|op| {
+                            op.result.as_ref() == Some(v) && matches!(op.kind, OpKind::ConstInt(0))
+                        }) => {}
+                    _ => {
+                        return Err(format!(
+                            "{name}: Enumerate aggregate writes {} other than iter/count 0",
+                            field.name
+                        ));
+                    }
+                }
+            }
+            inner.ok_or_else(|| format!("{name}: Enumerate aggregate has no iter field"))?
+        }
+        _ => {
+            return Err(format!(
+                "{name}: enumerate origin is not enumerate(it) or an Enumerate aggregate"
+            ));
+        }
+    };
+    let iter_var = walk_back_with(graph, edges, &inner, |op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if args.len() == 1
+            && segments.len() >= 3
+            && segments[0] == "core"
+            && segments[1] == "slice"
+            && segments.last().is_some_and(|s| s == "iter") =>
+        {
+            op.result.clone()
+        }
+        _ => None,
+    })
+    .ok_or_else(|| {
+        format!("{name}: Enumerate inner iterator does not originate from an iter op")
+    })?;
+    let (iter_block, iter_op) = producer_of(graph, &iter_var)
+        .ok_or_else(|| format!("{name}: iter op result has no producer"))?;
+    let container = match &graph.blocks[iter_block].operations[iter_op].kind {
+        OpKind::Call { args, .. } => args[0].clone().into_variable(),
+        _ => unreachable!("walk matched a call"),
+    };
+
+    // The inner iterator may only travel from the `iter` op to the
+    // constructor, and the adapter value only to the `Enumerate::next`
+    // sites: once the constructor is gone both are the enumerate iterator.
+    let chain = forward_only_closure(
+        graph,
+        &iter_var,
+        "the iterator enumerate wraps",
+        |bi, oi, op| {
+            bi == ctor_block
+                && (oi == ctor_op
+                    || matches!(&op.kind, OpKind::FieldWrite { base, .. } if *base == ctor_var))
+        },
+    )?;
+    if !chain.contains(&inner) {
         return Err(format!(
-            "{name}: enumerate origin is not enumerate(it) or an Enumerate aggregate"
+            "{name}: enumerate's operand is not the iter op's value"
         ));
     }
-    if is_call_ctor {
-        let inner_arg = match &graph.blocks[bi].operations[oi].kind {
-            OpKind::Call { args, .. } => args[0].clone(),
-            _ => unreachable!("is_call_ctor"),
-        };
-        graph.blocks[bi].operations[oi] = SpaceOperation {
-            result: Some(enum_var.clone()),
-            kind: OpKind::Call {
-                target: pair_ctor_target(),
-                args: Vec::new(),
-                result_ty: ValueType::Ref(Some(ENUMERATE_PAIR_OWNER.into())),
-            },
-        };
-        let zero = graph.alloc_value_var();
-        graph.blocks[bi].operations.insert(
-            oi + 1,
-            SpaceOperation {
-                result: Some(zero.clone()),
-                kind: OpKind::ConstInt(0),
-            },
-        );
-        graph.blocks[bi].operations.insert(
-            oi + 2,
-            emit_pair_field_write(enum_var, "iter", inner_arg, ValueType::Ref(None)),
-        );
-        graph.blocks[bi].operations.insert(
-            oi + 3,
-            emit_pair_field_write(enum_var, "count", LinkArg::Value(zero), ValueType::Unsigned),
-        );
-        return Ok(());
-    }
-    graph.blocks[bi].operations[oi].kind = OpKind::Call {
-        target: pair_ctor_target(),
-        args: Vec::new(),
-        result_ty: ValueType::Ref(Some(ENUMERATE_PAIR_OWNER.into())),
-    };
-    for op in &mut graph.blocks[bi].operations {
-        if let OpKind::FieldWrite {
-            base, field, ty, ..
-        } = &mut op.kind
-            && base == enum_var
-        {
-            field.owner_root = Some(ENUMERATE_PAIR_OWNER.to_string());
-            if field.name == "iter" {
-                *ty = ValueType::Ref(None);
-            } else if field.name == "count" {
-                *ty = ValueType::Unsigned;
+    forward_only_closure(graph, &ctor_var, "the enumerate value", |bi, _, op| {
+        (bi == ctor_block
+            && matches!(&op.kind, OpKind::FieldWrite { base, .. } if *base == ctor_var))
+            || matches!(&op.kind, OpKind::Call { target, .. } if is_enumerate_next_target(target))
+    })?;
+    Ok(EnumerateSite {
+        ctor_block,
+        ctor_op,
+        ctor_var,
+        inner,
+        iter_block,
+        iter_var,
+        container,
+    })
+}
+
+/// Forward closure of `start` along links.  A member may be read only by an
+/// op `reader_ok` accepts (block, op index, op), is never switched on, and a
+/// block slot holding one is fed members only.
+fn forward_only_closure(
+    graph: &FunctionGraph,
+    start: &Variable,
+    what: &str,
+    reader_ok: impl Fn(usize, usize, &SpaceOperation) -> bool,
+) -> Result<Vec<Variable>, String> {
+    let name = &graph.name;
+    let mut chain: Vec<Variable> = vec![start.clone()];
+    let mut i = 0;
+    while i < chain.len() {
+        let v = chain[i].clone();
+        i += 1;
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            let defines = block.inputargs.contains(&v)
+                || block
+                    .operations
+                    .iter()
+                    .any(|op| op.result.as_ref() == Some(&v));
+            if !defines {
+                continue;
+            }
+            for (oi, op) in block.operations.iter().enumerate() {
+                if op_operand_vars(&op.kind).contains(&v) && !reader_ok(bi, oi, op) {
+                    return Err(format!(
+                        "{name}: {what} is also read by op {oi} of block {bi}"
+                    ));
+                }
+            }
+            let switched = match &block.exitswitch {
+                Some(ExitSwitch::Value(sw)) => *sw == v,
+                Some(ExitSwitch::Fused { args, .. }) => args.contains(&v),
+                _ => false,
+            };
+            if switched {
+                return Err(format!("{name}: {what} is switched on in block {bi}"));
+            }
+            for link in &block.exits {
+                for (p, arg) in link.args.iter().enumerate() {
+                    if matches!(arg, LinkArg::Value(a) if *a == v) {
+                        let slot = graph.blocks[link.target.0].inputargs[p].clone();
+                        if !chain.contains(&slot) {
+                            chain.push(slot);
+                        }
+                    }
+                }
             }
         }
     }
-    if field_write_value(graph, enum_var, &["iter"]).is_none() {
-        graph.blocks[bi].operations.insert(
-            oi + 1,
-            emit_pair_field_write(
-                enum_var,
-                "iter",
-                LinkArg::Value(inner.clone()),
-                ValueType::Ref(None),
-            ),
-        );
+    for block in &graph.blocks {
+        for link in &block.exits {
+            for (p, arg) in link.args.iter().enumerate() {
+                let Some(slot) = graph.blocks[link.target.0].inputargs.get(p) else {
+                    continue;
+                };
+                if chain.contains(slot) && !matches!(arg, LinkArg::Value(a) if chain.contains(a)) {
+                    return Err(format!(
+                        "{name}: a slot holding {what} is fed another value"
+                    ));
+                }
+            }
+        }
     }
-    if field_write_value(graph, enum_var, &["count"]).is_none() {
-        let zero = graph.alloc_value_var();
-        graph.blocks[bi].operations.insert(
-            oi + 1,
-            SpaceOperation {
-                result: Some(zero.clone()),
-                kind: OpKind::ConstInt(0),
-            },
-        );
-        graph.blocks[bi].operations.insert(
-            oi + 2,
-            emit_pair_field_write(enum_var, "count", LinkArg::Value(zero), ValueType::Unsigned),
-        );
-    }
-    Ok(())
+    Ok(chain)
 }
 
-/// Insert `inner = pair.iter` immediately before the residual `next` in
-/// block `a`.  Returns the inner iterator variable and the (shifted)
-/// index of the `next` op.
-pub(crate) fn insert_pair_iter_read(
-    graph: &mut FunctionGraph,
-    a: usize,
-    next_idx: usize,
-    pair: &Variable,
-) -> (Variable, usize) {
-    let inner = graph.alloc_value_var();
-    graph.blocks[a].operations.insert(
-        next_idx,
+fn producer_of(graph: &FunctionGraph, var: &Variable) -> Option<(usize, usize)> {
+    graph.blocks.iter().enumerate().find_map(|(bi, b)| {
+        b.operations
+            .iter()
+            .position(|op| op.result.as_ref() == Some(var))
+            .map(|oi| (bi, oi))
+    })
+}
+
+/// Give `lst.iter().enumerate()` the flow-graph shape of RPython's
+/// `enumerate(lst)`: `e = __majit_enumerate(lst); it = iter(e)`, with the
+/// adapter constructor gone and its value renamed onto the iterator.
+/// `builtin_enumerate` then types `e` as `SomeIterator(s_list,
+/// "enumerate")`, `iter` of it is itself, and its `next` yields the
+/// `(index, item)` tuple (`rrange.py` `EnumerateIteratorRepr`).
+pub(crate) fn rewrite_enumerate_to_builtin(graph: &mut FunctionGraph, site: &EnumerateSite) {
+    // Retire the constructor and, for an aggregate, its field writes.
+    let ctor_var = site.ctor_var.clone();
+    let mut oi = 0;
+    graph.blocks[site.ctor_block].operations.retain(|op| {
+        let keep = oi != site.ctor_op
+            && !matches!(&op.kind, OpKind::FieldWrite { base, .. } if *base == ctor_var);
+        oi += 1;
+        keep
+    });
+    let inner = site.inner.clone();
+    let rename = |v: &Variable| -> Variable {
+        if *v == ctor_var {
+            inner.clone()
+        } else {
+            v.clone()
+        }
+    };
+    let block = &mut graph.blocks[site.ctor_block];
+    for op in &mut block.operations {
+        op.kind = crate::inline::remap_op_kind(&op.kind, &rename);
+    }
+    let (sw, exits) = crate::model::remap_control_flow_metadata_var(
+        &block.exitswitch,
+        &block.exits,
+        rename,
+        |b| b,
+    );
+    block.exitswitch = sw;
+    block.exits = exits;
+
+    // The iter op now walks the enumerate marker instead of the list.  The
+    // removals above may have shifted it, so find it again.
+    let marker = graph.alloc_value_var();
+    let iter_op = graph.blocks[site.iter_block]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&site.iter_var))
+        .expect("the iter op survives the constructor's removal");
+    if let OpKind::Call { args, .. } = &mut graph.blocks[site.iter_block].operations[iter_op].kind {
+        args[0] = LinkArg::Value(marker.clone());
+    }
+    graph.blocks[site.iter_block].operations.insert(
+        iter_op,
         SpaceOperation {
-            result: Some(inner.clone()),
-            kind: OpKind::FieldRead {
-                base: pair.clone(),
-                field: pair_field("iter"),
-                ty: ValueType::Ref(None),
-                pure: false,
+            result: Some(marker),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::ENUMERATE.to_string()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![site.container.clone()]),
+                result_ty: ValueType::Ref(None),
             },
         },
     );
-    (inner, next_idx + 1)
 }
 
 /// `SomeTuple(items)` (`annotator/model.py`) and `TupleRepr`
@@ -338,319 +422,52 @@ pub(crate) fn enumerate_yield_owner(item_ty: &ValueType) -> String {
     format!("Tuple<usize,{atom}>")
 }
 
-fn paint_pos_owner(graph: &mut FunctionGraph, block: usize, base: &Variable, owner: &str) {
-    for op in &mut graph.blocks[block].operations {
-        let field = match &mut op.kind {
-            OpKind::FieldRead {
-                base: read_base,
-                field,
-                ..
-            }
-            | OpKind::FieldWrite {
-                base: read_base,
-                field,
-                ..
-            } if read_base == base && field.name.starts_with("__pos_") => field,
-            _ => continue,
-        };
-        field.owner_root = Some(owner.to_string());
-    }
-}
-
-/// On the Some arm: increment `pair.count` and pack `(count, item)` as
-/// the value the residual `opt.__pos_0` read named — the adapter's
-/// `Some((i, a))`.
-pub(crate) fn pack_enumerate_payload(
+/// Paint the reads of the `(index, item)` tuple `base` in `block` with the
+/// shape the enumerate `next` yields: `SomeTuple((nonneg int, item))`
+/// (`annotator/unaryop.py` `SomeIterator.next`), the item being the list's
+/// own item repr, as `ll_listnext` hands it back rather than a pointer to it.
+pub(crate) fn paint_enumerate_tuple_reads(
     graph: &mut FunctionGraph,
-    some_target: usize,
-    item: &Variable,
+    block: usize,
+    base: &Variable,
     item_ty: &ValueType,
-    pair: &Variable,
-    name: &str,
-) -> Result<Variable, String> {
-    let count = graph.alloc_value_var();
-    let one = graph.alloc_value_var();
-    let new_count = graph.alloc_value_var();
-    let tup = graph.alloc_value_var();
-    let owner = enumerate_yield_owner(item_ty);
-    let element = graph.blocks[some_target].operations.iter().find_map(|op| {
-        let OpKind::FieldRead {
-            base, field, ty, ..
-        } = &op.kind
-        else {
-            return None;
-        };
-        (base == item && field.name == "__pos_1")
-            .then(|| op.result.clone().map(|result| (result, ty.clone())))
-            .flatten()
-    });
-    let mut prefix = vec![
-        SpaceOperation {
-            result: Some(count.clone()),
-            kind: OpKind::FieldRead {
-                base: pair.clone(),
-                field: pair_field("count"),
-                ty: ValueType::Unsigned,
-                pure: false,
-            },
-        },
-        SpaceOperation {
-            result: Some(one.clone()),
-            kind: OpKind::ConstInt(1),
-        },
-        SpaceOperation {
-            result: Some(new_count.clone()),
-            kind: OpKind::BinOp {
-                op: "add".to_string(),
-                lhs: count.clone(),
-                rhs: one,
-                result_ty: ValueType::Unsigned,
-            },
-        },
-        emit_pair_field_write(
-            pair,
-            "count",
-            LinkArg::Value(new_count),
-            ValueType::Unsigned,
-        ),
-        SpaceOperation {
-            result: Some(tup.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::synthetic_transparent_ctor(&owner),
-                args: Vec::new(),
-                result_ty: ValueType::Ref(Some(owner.clone())),
-            },
-        },
-        SpaceOperation {
-            result: None,
-            kind: OpKind::FieldWrite {
-                base: tup.clone(),
-                field: FieldDescriptor::new("__pos_0", Some(owner.clone())),
-                value: LinkArg::Value(count),
-                ty: ValueType::Unsigned,
-            },
-        },
-    ];
-    let pos1_write = |value: Variable, ty: ValueType| SpaceOperation {
-        result: None,
-        kind: OpKind::FieldWrite {
-            base: tup.clone(),
-            field: FieldDescriptor::new("__pos_1", Some(owner.clone())),
-            value: LinkArg::Value(value),
-            ty,
-        },
-    };
-    if element.is_none() {
-        prefix.push(pos1_write(item.clone(), item_ty.clone()));
-    }
-    // Decide before the prefix is spliced in. The `__pos_1` write below
-    // names `item`, so a use-count taken afterwards would see that write
-    // and refuse the unread `for _ in` arm.
-    let has_pos0 = graph.blocks[some_target].operations.iter().any(|op| {
-        matches!(
-            &op.kind,
-            OpKind::FieldRead { base, field, .. }
-                if base == item && field.name == "__pos_0"
-        )
-    });
-    prefix.append(&mut graph.blocks[some_target].operations);
-    graph.blocks[some_target].operations = prefix;
-    if let Some((value, ty)) = element {
-        let at = graph.blocks[some_target]
-            .operations
-            .iter()
-            .position(|op| op.result.as_ref() == Some(&value))
-            .expect("item read precedes its copy onto the packed tuple");
-        graph.blocks[some_target]
-            .operations
-            .insert(at + 1, pos1_write(value, ty));
-    }
-    if has_pos0 {
-        collapse_pos0_onto(graph, some_target, item, &tup, name)?;
-    }
-    paint_pos_owner(graph, some_target, &tup, &owner);
-    Ok(tup)
-}
-
-/// The Some arm forwarded the old payload. Replace that exit value with
-/// the packed tuple when the successor's only use of the slot is a
-/// `__pos_N` read, and paint those reads with the packed owner.
-pub(crate) fn rewrite_forwarded_payload(
-    graph: &mut FunctionGraph,
-    some_block: usize,
-    carrier: &Variable,
-    packed: &Variable,
-    owner: &str,
 ) {
-    // Validation already declined a merge or an exitswitch on the slot.
-    // Re-check so a caller cannot paint one predecessor of a merge.
-    if !successor_reads_packed_payload(graph, some_block, carrier) {
-        return;
-    }
-    let forwards: Vec<(usize, usize)> = graph.blocks[some_block]
-        .exits
-        .iter()
-        .enumerate()
-        .flat_map(|(exit_i, link)| {
-            link.args
-                .iter()
-                .enumerate()
-                .filter_map(move |(arg_i, arg)| {
-                    matches!(arg, LinkArg::Value(v) if v == carrier).then_some((exit_i, arg_i))
-                })
-        })
-        .collect();
-    for (exit_i, arg_i) in forwards {
-        let target = graph.blocks[some_block].exits[exit_i].target.0;
-        graph.blocks[some_block].exits[exit_i].args[arg_i] = LinkArg::Value(packed.clone());
-        if let Some(slot) = graph.blocks[target].inputargs.get(arg_i).cloned() {
-            paint_pos_owner(graph, target, &slot, owner);
+    let owner = enumerate_yield_owner(item_ty);
+    for op in &mut graph.blocks[block].operations {
+        let OpKind::FieldRead {
+            base: read_base,
+            field,
+            ty,
+            ..
+        } = &mut op.kind
+        else {
+            continue;
+        };
+        if read_base != base {
+            continue;
         }
-    }
-}
-
-/// `true` when every forward of `carrier` lands on a successor input whose
-/// only uses are `__pos_N` reads. A bare forward, or any other use, keeps
-/// the old payload shape reachable and must decline.
-pub(crate) fn successor_reads_packed_payload(
-    graph: &FunctionGraph,
-    some_block: usize,
-    carrier: &Variable,
-) -> bool {
-    let mut saw = false;
-    for link in &graph.blocks[some_block].exits {
-        for (arg_i, arg) in link.args.iter().enumerate() {
-            let LinkArg::Value(value) = arg else {
-                continue;
-            };
-            if value != carrier {
-                continue;
-            }
-            saw = true;
-            let target_idx = link.target.0;
-            let preds = graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.exits)
-                .filter(|link| link.target.0 == target_idx)
-                .count();
-            // A merge still has another predecessor passing the old shape.
-            if preds != 1 {
-                return false;
-            }
-            let target = &graph.blocks[target_idx];
-            let Some(slot) = target.inputargs.get(arg_i) else {
-                return false;
-            };
-            let mut read = false;
-            for op in &target.operations {
-                let OpKind::FieldRead { base, field, .. } = &op.kind else {
-                    if crate::front::result_exc::op_operand_vars(&op.kind).contains(slot) {
-                        return false;
-                    }
-                    continue;
-                };
-                if base == slot {
-                    if !field.name.starts_with("__pos_") {
-                        return false;
-                    }
-                    read = true;
-                }
-            }
-            match &target.exitswitch {
-                Some(ExitSwitch::Value(switched)) if switched == slot => return false,
-                Some(ExitSwitch::Fused { args, .. }) if args.contains(slot) => return false,
-                _ => {}
-            }
-            if target.exits.iter().any(|link| {
-                link.args
-                    .iter()
-                    .any(|arg| matches!(arg, LinkArg::Value(v) if v == slot))
-            }) {
-                return false;
-            }
-            if !read {
-                return false;
-            }
+        match field.name.as_str() {
+            "__pos_0" => *ty = ValueType::Unsigned,
+            "__pos_1" => *ty = item_ty.clone(),
+            _ => continue,
         }
+        field.owner_root = Some(owner.clone());
     }
-    saw
-}
-
-/// `collapse_pos0_read` but the payload is `onto`, not the Option slot
-/// itself: after packing, `opt.__pos_0` is the `(i, a)` tuple.
-fn collapse_pos0_onto(
-    graph: &mut FunctionGraph,
-    some_target: usize,
-    carrier: &Variable,
-    onto: &Variable,
-    name: &str,
-) -> Result<(), String> {
-    let read_idx = graph.blocks[some_target].operations.iter().position(|op| {
-        matches!(
-            &op.kind,
-            OpKind::FieldRead { base, field, .. }
-                if base == carrier && field.name == "__pos_0"
-        )
-    });
-    let Some(read_idx) = read_idx else {
-        return Err(format!(
-            "{name}: enumerate Some arm has no __pos_0 read; the caller checked one"
-        ));
-    };
-    let read_result = graph.blocks[some_target].operations[read_idx]
-        .result
-        .clone()
-        .ok_or_else(|| format!("{name}: __pos_0 read without result"))?;
-    graph.blocks[some_target].operations.remove(read_idx);
-    let onto = onto.clone();
-    let rename = |v: &Variable| -> Variable {
-        if *v == read_result {
-            onto.clone()
-        } else {
-            v.clone()
-        }
-    };
-    let block = &mut graph.blocks[some_target];
-    for op in &mut block.operations {
-        op.kind = crate::inline::remap_op_kind(&op.kind, &rename);
-    }
-    let (sw, exits) = crate::model::remap_control_flow_metadata_var(
-        &block.exitswitch,
-        &block.exits,
-        rename,
-        |b| b,
-    );
-    block.exitswitch = sw;
-    block.exits = exits;
-    Ok(())
 }
 
 /// Look up an `Enumerate::next` residual and, if its inner iterator is a
-/// list `iter` op, return the adapter value and that inner iterator.
-/// Does not mutate; the caller validates the diamond first.
+/// list `iter` op, return where the adapter was built.  Does not mutate;
+/// the caller validates the diamond first.
 pub(crate) fn enumerate_list_inner(
     graph: &FunctionGraph,
     edges: &BackEdges,
     next_target: &CallTarget,
     enum_var: &Variable,
-) -> Result<Option<Variable>, String> {
+) -> Result<Option<EnumerateSite>, String> {
     if !is_enumerate_next_target(next_target) {
         return Ok(None);
     }
-    let inner = inner_iter_of_enumerate(graph, edges, enum_var).ok_or_else(|| {
-        format!(
-            "{}: Enumerate::next iterator does not originate from enumerate(it)",
-            graph.name
-        )
-    })?;
-    if iter_op_container_with(graph, edges, &inner).is_none() {
-        return Err(format!(
-            "{}: Enumerate inner iterator does not originate from an iter op",
-            graph.name
-        ));
-    }
-    Ok(Some(inner))
+    locate_enumerate_site(graph, edges, enum_var).map(Some)
 }
 
 /// A recognized `Map::collect` construction site.  Types are resolved
@@ -1310,6 +1127,29 @@ mod tests {
             .count()
     }
 
+    fn is_enumerate_marker(t: &CallTarget) -> bool {
+        matches!(
+            t,
+            CallTarget::FunctionPath { segments, .. }
+                if segments == &[crate::runtime_names::shims::ENUMERATE.to_string()]
+        )
+    }
+
+    fn next_result_ty(g: &FunctionGraph) -> ValueType {
+        g.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty,
+                    ..
+                } if segments == &["__iter_next".to_string()] => Some(result_ty.clone()),
+                _ => None,
+            })
+            .expect("native next op")
+    }
+
     fn build_enumerate_diamond() -> (crate::model::FunctionGraph, Variable, Variable) {
         let mut g = FunctionGraph::new("test_enumerate_next");
         let n = g.startblock;
@@ -1431,22 +1271,18 @@ mod tests {
         assert!(!is_enumerate_next_target(&iter_target()));
     }
 
-    /// `for (i, x) in xs.iter().enumerate()` lowers to inner `next` + a
-    /// count increment + a `(i, x)` tuple — the loop `Enumerate::next`
-    /// denotes.  The Opaque `enumerate` / `Enumerate::next` residuals
-    /// must not survive.
+    /// `for (i, x) in xs.iter().enumerate()` becomes RPython's
+    /// `for (i, x) in enumerate(xs)`: `iter(__majit_enumerate(xs))` and a
+    /// native `next` that yields the `(i, x)` tuple.  The Opaque
+    /// `enumerate` / `Enumerate::next` residuals must not survive, and no
+    /// count arithmetic or tuple construction is spelled out in the front.
     #[test]
-    fn rewrite_lowers_enumerate_next_to_inner_next_and_count() {
+    fn rewrite_lowers_enumerate_to_the_enumerate_builtin() {
         let (mut g, opt, _enumer) = build_enumerate_diamond();
         let rewritten = rewire_next_call_sites(&mut g, &[(opt.clone(), ValueType::Ref(None))]);
         assert_eq!(rewritten, 1, "the enumerate for-loop must fold");
         assert_eq!(
-            count_calls(&g, |t| is_enumerate_ctor_target(t)
-                && !matches!(
-                    t,
-                    CallTarget::SyntheticTransparentCtor { name, .. }
-                        if name == ENUMERATE_PAIR_OWNER
-                )),
+            count_calls(&g, is_enumerate_ctor_target),
             0,
             "Iterator::enumerate residual must be gone"
         );
@@ -1455,21 +1291,28 @@ mod tests {
             0,
             "Enumerate::next residual must be gone"
         );
-        assert_eq!(
-            count_calls(&g, |t| matches!(
-                t,
-                CallTarget::FunctionPath { segments, .. } if segments == &["__iter_next".to_string()]
+        let n = &g.blocks[g.startblock.0];
+        let marker = n
+            .operations
+            .iter()
+            .find(
+                |op| matches!(&op.kind, OpKind::Call { target, .. } if is_enumerate_marker(target)),
+            )
+            .and_then(|op| op.result.clone())
+            .expect("__majit_enumerate(container) in the entry block");
+        assert!(
+            n.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, args, .. }
+                    if *target == iter_target()
+                        && args == &crate::model::call_args(vec![marker.clone()])
             )),
-            1,
-            "native next op on the inner list iterator"
+            "the iter op walks the enumerate marker"
         );
         assert_eq!(
-            count_calls(&g, |t| matches!(
-                t,
-                CallTarget::SyntheticTransparentCtor { name, .. } if name == ENUMERATE_PAIR_OWNER
-            )),
-            1,
-            "enumerate ctor becomes the {{iter, count}} pair"
+            next_result_ty(&g),
+            ValueType::Ref(Some("Tuple<usize,Ptr>".into())),
+            "next yields the (index, item) tuple"
         );
         let adds = g
             .blocks
@@ -1477,14 +1320,14 @@ mod tests {
             .flat_map(|b| &b.operations)
             .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add"))
             .count();
-        assert_eq!(adds, 1, "count increment on the Some arm");
+        assert_eq!(adds, 0, "no count arithmetic in the front");
         assert_eq!(
             count_calls(&g, |t| matches!(
                 t,
                 CallTarget::SyntheticTransparentCtor { name, .. } if name.starts_with("Tuple<")
             )),
-            1,
-            "packed (i, item) tuple on the Some arm"
+            0,
+            "the tuple is next's result, not built on the Some arm"
         );
         assert!(
             matches!(
@@ -1501,28 +1344,59 @@ mod tests {
                 }),
                 Some(b) if matches!(b.exitswitch, Some(ExitSwitch::LastException))
             ),
-            "inner next closes with StopIteration"
+            "next closes with StopIteration"
         );
     }
 
-    /// The packed enumerate element is the base iterator's item kind.
-    /// A list of ints records `Int`; the tuple's `__pos_1` must not widen
-    /// that to `Ref`.
+    /// The tuple's item is the base iterator's item kind.  A list of ints
+    /// records `Int`; the Some arm's `.1` read must not stay `Ref`.
     #[test]
     fn enumerate_tuple_element_keeps_base_item_kind() {
         let (mut g, opt, _enumer) = build_enumerate_diamond();
-        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
-        assert_eq!(rewritten, 1, "the enumerate for-loop must fold");
-        let item_tys: Vec<ValueType> = g
+        let (some, payload) = g
             .blocks
             .iter()
-            .flat_map(|b| &b.operations)
+            .enumerate()
+            .find_map(|(bi, block)| {
+                block.operations.iter().find_map(|op| match &op.kind {
+                    OpKind::FieldRead { field, .. } if field.name == "__pos_0" => {
+                        Some((bi, op.result.clone().unwrap()))
+                    }
+                    _ => None,
+                })
+            })
+            .expect("some arm");
+        let some_id = g.blocks[some].id;
+        g.push_op_var(
+            some_id,
+            OpKind::FieldRead {
+                base: payload,
+                field: FieldDescriptor::new("__pos_1", Some("Tuple<usize,i64>".into())),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+            true,
+        );
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 1, "the enumerate for-loop must fold");
+        assert_eq!(
+            next_result_ty(&g),
+            ValueType::Ref(Some("Tuple<usize,isize>".into()))
+        );
+        let reads: Vec<(Option<String>, ValueType)> = g.blocks[some]
+            .operations
+            .iter()
             .filter_map(|op| match &op.kind {
-                OpKind::FieldWrite { field, ty, .. } if field.name == "__pos_1" => Some(ty.clone()),
+                OpKind::FieldRead { field, ty, .. } if field.name == "__pos_1" => {
+                    Some((field.owner_root.clone(), ty.clone()))
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(item_tys, vec![ValueType::Int]);
+        assert_eq!(
+            reads,
+            vec![(Some("Tuple<usize,isize>".to_string()), ValueType::Int)]
+        );
     }
 
     /// An Enumerate whose inner iterator is not a list `iter` op stays
@@ -2002,7 +1876,7 @@ mod tests {
     }
 
     /// `for _ in xs.iter().enumerate()` never reads the Some payload.
-    /// The rewrite still folds, and `__pos_1` carries the inner item type.
+    /// The rewrite still folds, and the tuple carries the inner item type.
     #[test]
     fn rewrite_enumerate_unread_payload_packs_item_type() {
         let (mut g, opt, _) = build_enumerate_diamond();
@@ -2020,17 +1894,10 @@ mod tests {
         g.set_return(some_id, None);
         let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
         assert_eq!(rewritten, 1, "an unread Some payload still folds");
-        assert!(
-            g.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::FieldWrite { field, ty, .. }
-                        if field.name == "__pos_1"
-                            && field.owner_root.as_deref() == Some("Tuple<usize,isize>")
-                            && *ty == ValueType::Int
-                )
-            }),
-            "__pos_1 is the inner item type on a Tuple"
+        assert_eq!(
+            next_result_ty(&g),
+            ValueType::Ref(Some("Tuple<usize,isize>".into())),
+            "next yields the tuple of the inner item type"
         );
         assert_eq!(
             count_calls(&g, is_enumerate_next_target),
@@ -2043,18 +1910,29 @@ mod tests {
     #[test]
     fn two_enumerate_item_types_keep_distinct_owners() {
         let mut g = FunctionGraph::new("two_enumerate_items");
-        let (b0, a0) = g.create_block_with_arg_vars(1);
-        let (b1, a1) = g.create_block_with_arg_vars(1);
-        let pair0 = g.alloc_value_var();
-        let pair1 = g.alloc_value_var();
-        pack_enumerate_payload(&mut g, b0.0, &a0[0], &ValueType::Int, &pair0, "int_site").unwrap();
-        pack_enumerate_payload(&mut g, b1.0, &a1[0], &ValueType::Str, &pair1, "str_site").unwrap();
+        let mut bases = Vec::new();
+        for _ in 0..2 {
+            let (b, a) = g.create_block_with_arg_vars(1);
+            g.push_op_var(
+                b,
+                OpKind::FieldRead {
+                    base: a[0].clone(),
+                    field: FieldDescriptor::new("__pos_1", None),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            );
+            bases.push((b, a[0].clone()));
+        }
+        paint_enumerate_tuple_reads(&mut g, bases[0].0.0, &bases[0].1, &ValueType::Int);
+        paint_enumerate_tuple_reads(&mut g, bases[1].0.0, &bases[1].1, &ValueType::Str);
         let owners: Vec<String> = g
             .blocks
             .iter()
             .flat_map(|b| &b.operations)
             .filter_map(|op| match &op.kind {
-                OpKind::FieldWrite { field, .. } if field.name == "__pos_1" => {
+                OpKind::FieldRead { field, .. } if field.name == "__pos_1" => {
                     field.owner_root.clone()
                 }
                 _ => None,
@@ -2067,25 +1945,12 @@ mod tests {
                 "Tuple<usize,String>".to_string()
             ]
         );
-        let ctors: Vec<String> = g
-            .blocks
-            .iter()
-            .flat_map(|b| &b.operations)
-            .filter_map(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::SyntheticTransparentCtor { name, .. },
-                    ..
-                } if name.starts_with("Tuple<") => Some(name.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(ctors, owners);
     }
 
-    /// A successor that reads `__pos_0` of the forwarded payload receives
-    /// the packed tuple, not the pre-collapse shape.
+    /// A successor that reads `__pos_0` of the forwarded Option is a live
+    /// use of the Some payload the fold does not rewrite: decline.
     #[test]
-    fn successor_reads_pos0_of_forwarded_packed_payload() {
+    fn rewrite_declines_forward_into_a_reading_successor() {
         let (mut g, opt, _) = build_enumerate_diamond();
         let some = g
             .blocks
@@ -2099,11 +1964,10 @@ mod tests {
         let carrier = g.blocks[some].inputargs[0].clone();
         let some_id = g.blocks[some].id;
         let (succ, succ_args) = g.create_block_with_arg_vars(1);
-        let received = succ_args[0].clone();
         g.push_op_var(
             succ,
             OpKind::FieldRead {
-                base: received.clone(),
+                base: succ_args[0].clone(),
                 field: FieldDescriptor::new("__pos_0", None),
                 ty: ValueType::Unsigned,
                 pure: false,
@@ -2113,35 +1977,208 @@ mod tests {
         .unwrap();
         g.set_return(succ, None);
         g.block_mut(some_id).exits = vec![
-            Link::new_mixed(vec![LinkArg::Value(carrier.clone())], succ, None)
-                .with_prevblock(some_id),
+            Link::new_mixed(vec![LinkArg::Value(carrier)], succ, None).with_prevblock(some_id),
         ];
         let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Str)]);
-        assert_eq!(
-            rewritten, 1,
-            "a successor __pos_0 read of the forward folds"
-        );
-        let exit_val = match &g.block_mut(some_id).exits[0].args[0] {
-            LinkArg::Value(v) => v.clone(),
-            other => panic!("packed forward must be a value, got {other:?}"),
-        };
-        assert_ne!(
-            exit_val, carrier,
-            "the successor must not receive the old payload"
-        );
-        let succ_block = g.blocks.iter().find(|b| b.id == succ).expect("successor");
+        assert_eq!(rewritten, 0, "a live forward of the payload must decline");
+        assert_eq!(count_calls(&g, is_enumerate_ctor_target), 1);
+        assert_eq!(count_calls(&g, is_enumerate_marker), 0);
+    }
+
+    /// An `Enumerate { iter, count: 0 }` aggregate built before the `iter`
+    /// op in the same block: removing it must not shift the marker onto
+    /// the wrong op.
+    #[test]
+    fn rewrite_handles_an_aggregate_built_before_the_iter_op() {
+        let (mut g, opt, enumer) = build_enumerate_diamond();
+        let n = g.startblock.0;
+        let ops = std::mem::take(&mut g.blocks[n].operations);
+        let (container_op, iter_op) = (ops[0].clone(), ops[1].clone());
+        let container = container_op.result.clone().unwrap();
+        let it = iter_op.result.clone().unwrap();
+        g.blocks[n].operations = vec![
+            container_op,
+            SpaceOperation {
+                result: Some(enumer.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["Enumerate".to_string()],
+                        "Enumerate",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("Enumerate".into())),
+                },
+            },
+            SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: enumer.clone(),
+                    field: FieldDescriptor::new("count", Some("Enumerate".into())),
+                    value: LinkArg::Const(crate::flowspace::model::Constant::new(ConstValue::Int(
+                        0,
+                    ))),
+                    ty: ValueType::Unsigned,
+                },
+            },
+            iter_op,
+            SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: enumer.clone(),
+                    field: FieldDescriptor::new("iter", Some("Enumerate".into())),
+                    value: LinkArg::Value(it.clone()),
+                    ty: ValueType::Ref(None),
+                },
+            },
+        ];
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 1, "the aggregate enumerate folds");
+        let ops = &g.blocks[n].operations;
+        assert_eq!(ops.len(), 3, "{ops:#?}");
+        let marker = ops[1].result.clone().unwrap();
+        assert!(matches!(
+            &ops[1].kind,
+            OpKind::Call { target, args, .. }
+                if is_enumerate_marker(target)
+                    && args == &crate::model::call_args(vec![container])
+        ));
+        assert_eq!(ops[2].result.as_ref(), Some(&it));
+        assert!(matches!(
+            &ops[2].kind,
+            OpKind::Call { target, args, .. }
+                if *target == iter_target() && args == &crate::model::call_args(vec![marker])
+        ));
         assert!(
-            succ_block.operations.iter().any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::FieldRead { base, field, .. }
-                        if base == &received
-                            && field.name == "__pos_0"
-                            && field.owner_root.as_deref() == Some("Tuple<usize,String>")
-                )
-            }),
-            "the successor __pos_0 read is the packed tuple owner"
+            g.blocks[n].exits[0]
+                .args
+                .iter()
+                .all(|a| !matches!(a, LinkArg::Value(v) if *v == enumer)),
+            "the adapter value is renamed onto the iterator"
         );
+    }
+
+    /// Another reader of the adapter value would see the enumerate
+    /// iterator after the rewrite: decline.
+    #[test]
+    fn rewrite_declines_an_enumerate_value_read_elsewhere() {
+        let (mut g, opt, enumer) = build_enumerate_diamond();
+        let n = g.startblock;
+        g.push_op_var(
+            n,
+            OpKind::Call {
+                target: CallTarget::function_path(["uses", "adapter"]),
+                args: crate::model::call_args(vec![enumer]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 0, "a second reader must decline");
+        assert_eq!(count_calls(&g, is_enumerate_ctor_target), 1);
+        assert_eq!(count_calls(&g, is_enumerate_marker), 0);
+    }
+
+    /// `Enumerate::next` reading the constructor's value in its own block
+    /// reads the renamed iterator afterwards.
+    #[test]
+    fn rewrite_renames_a_next_reading_the_constructor_value() {
+        let (mut g, opt, _) = build_enumerate_diamond();
+        let h = g
+            .blocks
+            .iter()
+            .position(|b| {
+                b.operations.iter().any(|op| {
+                    matches!(&op.kind, OpKind::Call { target, .. } if is_enumerate_next_target(target))
+                })
+            })
+            .expect("next block");
+        let container = g.alloc_value_var();
+        let it = g.alloc_value_var();
+        let e = g.alloc_value_var();
+        let mut prefix = vec![
+            SpaceOperation {
+                result: Some(container.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["some", "container", "make"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+            },
+            SpaceOperation {
+                result: Some(it.clone()),
+                kind: OpKind::Call {
+                    target: iter_target(),
+                    args: crate::model::call_args(vec![container]),
+                    result_ty: ValueType::Ref(None),
+                },
+            },
+            SpaceOperation {
+                result: Some(e.clone()),
+                kind: OpKind::Call {
+                    target: enumerate_ctor_target(),
+                    args: crate::model::call_args(vec![it.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+            },
+        ];
+        for op in &mut g.blocks[h].operations {
+            if let OpKind::Call { target, args, .. } = &mut op.kind
+                && is_enumerate_next_target(target)
+            {
+                *args = crate::model::call_args(vec![e.clone()]);
+            }
+        }
+        prefix.append(&mut g.blocks[h].operations);
+        g.blocks[h].operations = prefix;
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 1);
+        let next_arg = g.blocks[h]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments == &["__iter_next".to_string()] => Some(args[0].clone()),
+                _ => None,
+            })
+            .expect("native next");
+        assert_eq!(next_arg, LinkArg::Value(it));
+        assert!(
+            g.blocks[h]
+                .operations
+                .iter()
+                .all(|op| op.result.as_ref() != Some(&e)),
+            "the constructor is gone"
+        );
+    }
+
+    /// The `(i, x)` tuple forwarded to a successor keeps that successor's
+    /// item reads on the old shape: decline.
+    #[test]
+    fn rewrite_declines_a_forwarded_tuple() {
+        let (mut g, opt, _) = build_enumerate_diamond();
+        let (some, payload) = g
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(bi, block)| {
+                block.operations.iter().find_map(|op| match &op.kind {
+                    OpKind::FieldRead { field, .. } if field.name == "__pos_0" => {
+                        Some((bi, op.result.clone().unwrap()))
+                    }
+                    _ => None,
+                })
+            })
+            .expect("some arm");
+        let some_id = g.blocks[some].id;
+        let (tail, _) = g.create_block_with_arg_vars(1);
+        g.set_return(tail, None);
+        g.set_goto(some_id, tail, vec![payload]);
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 0, "a forwarded tuple must decline");
+        assert_eq!(count_calls(&g, is_enumerate_marker), 0);
     }
 
     /// A merge successor has another predecessor that still passes the old
@@ -2254,12 +2291,9 @@ mod tests {
             "enumerate ctor is not rewritten on a decline"
         );
         assert_eq!(
-            count_calls(&g, |t| matches!(
-                t,
-                CallTarget::SyntheticTransparentCtor { name, .. } if name == ENUMERATE_PAIR_OWNER
-            )),
+            count_calls(&g, is_enumerate_marker),
             0,
-            "the pair ctor is not installed on a decline"
+            "the enumerate marker is not installed on a decline"
         );
     }
 
@@ -2291,13 +2325,45 @@ mod tests {
             "enumerate ctor is not rewritten on a decline"
         );
         assert_eq!(
-            count_calls(&g, |t| matches!(
-                t,
-                CallTarget::SyntheticTransparentCtor { name, .. } if name == ENUMERATE_PAIR_OWNER
-            )),
+            count_calls(&g, is_enumerate_marker),
             0,
-            "the pair ctor is not installed on a decline"
+            "the enumerate marker is not installed on a decline"
         );
+    }
+
+    /// A carrier forwarded beside `__pos_0` into a slot no block ever reads
+    /// is a dead chain: it is pruned and the enumerate fold goes ahead.
+    #[test]
+    fn rewrite_prunes_enumerate_payload_forwarded_into_a_dead_slot() {
+        let (mut g, opt, _) = build_enumerate_diamond();
+        let some = g
+            .blocks
+            .iter()
+            .position(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0")
+                })
+            })
+            .expect("some arm");
+        let carrier = g.blocks[some].inputargs[0].clone();
+        let (tail, _tail_args) = g.create_block_with_arg_vars(1);
+        g.set_return(tail, None);
+        let some_id = g.blocks[some].id;
+        g.set_goto(some_id, tail, vec![carrier]);
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Ref(None))]);
+        assert_eq!(
+            rewritten, 1,
+            "a dead forward of the carrier must not decline"
+        );
+        assert!(
+            g.block(tail).inputargs.is_empty(),
+            "the dead slot is pruned from the successor"
+        );
+        assert!(
+            g.blocks[some].exits.iter().all(|link| link.args.is_empty()),
+            "the forwarding link drops the pruned slot"
+        );
+        assert_eq!(count_calls(&g, is_enumerate_ctor_target), 0);
     }
 
     /// A trailing recast is accepted only when it recasts the collect result.

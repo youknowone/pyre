@@ -2227,7 +2227,7 @@ fn sum_shell_size(field_offsets: &std::collections::HashMap<String, u64>) -> u64
 }
 
 /// Split `A,B<C,D>,[E;2]` at top-level commas only.
-fn split_top_level_type_args(input: &str) -> Vec<&str> {
+pub(crate) fn split_top_level_type_args(input: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
@@ -2844,6 +2844,11 @@ fn derive_program_metadata(
                             // projection refines the same shell.
                             let (row_ty, attr_ty) = if tyref_is_bytecode_arg_marker(&f.ty, llbc) {
                                 ("u32".to_string(), ValueType::Int)
+                            } else if tyref_is_type_parameter(&f.ty, llbc) {
+                                (
+                                    tyref_to_field_layout_string(&f.ty, llbc),
+                                    ValueType::Unknown,
+                                )
                             } else {
                                 (
                                     tyref_to_field_layout_string(&f.ty, llbc),
@@ -3511,8 +3516,17 @@ pub(crate) fn harden_duplicate_leaf_metadata(
             // type-vs-variant name collision, leaving every other
             // variant-leaf bucket (whose withdrawal the resume numbering
             // depends on) intact.
+            //
+            // The same holds for a variant leaf that names a struct: a
+            // variant publishes only `{Enum}::{Variant}` spellings, so a
+            // bare `leaf` key was published by the type declaration alone
+            // and denotes that one class.  `SpaceCacheInstance::SysState`
+            // (rows `[__pos_0]`) otherwise withdraws and tombstones
+            // `module::sys::state::SysState`'s bare alias, and the
+            // `ObjSpace.sys_state: SysState` row projects to no class.
             if cached_enum_base(struct_fields, head, &mut enum_base_memo)
-                && cached_enum_base(struct_fields, leaf, &mut enum_base_memo)
+                && (cached_enum_base(struct_fields, leaf, &mut enum_base_memo)
+                    || struct_fields.fields.contains_key(leaf))
             {
                 continue;
             }
@@ -3976,6 +3990,13 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     );
     let result_exc_ok_is_unit = result_exc_ok_is_unit(fd, llbc, static_addrs.error_carrier);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
+        lo.graph.return_class_root = dont_look_inside_return_class_root(
+            &fd.signature.output,
+            llbc,
+            static_addrs.error_carrier,
+        );
+        lo.graph.return_is_str =
+            dont_look_inside_return_is_str(&fd.signature.output, llbc, static_addrs.error_carrier);
         // MIR framestate argument threading must finish before adding native
         // enum arms: its successor table names MIR blocks, not these new
         // flow blocks. No temporary tagged-pair root reaches annotation.
@@ -4077,12 +4098,26 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.slice_index_rangeto_sites,
             );
         }
+        // `map`/`and_then` on a carrier Result is an if/else on the receiver
+        // (`DiscCombinatorSite::carrier_recv`); build it before the carrier
+        // becomes exception edges, as `result_map_err` does below.
+        let (carrier_disc_sites, disc_combinator_sites): (Vec<_>, Vec<_>) = lo
+            .disc_combinator_sites
+            .iter()
+            .cloned()
+            .partition(|site| site.carrier_recv);
+        if !carrier_disc_sites.is_empty() {
+            rewire_disc_combinator_sites(
+                &mut lo.graph,
+                &carrier_disc_sites,
+                static_addrs.error_carrier,
+            );
+        }
         if !lo.result_exc_call_results.is_empty() {
             let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
                 &mut lo.graph,
                 &lo.result_exc_call_results,
                 result_exc_callee,
-                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
             tail_forwarded_returns = outcome.tail_forwards;
@@ -4094,25 +4129,18 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &mut lo.graph,
                 &lo.option_ok_or_else_try_sites,
                 result_exc_callee,
-                static_addrs.error_carrier,
             )
         };
         let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
             &mut lo.graph,
             &lo.result_map_err_sites,
-            static_addrs.error_carrier,
         );
         if result_exc_callee {
             crate::front::result_exc::lower_result_exc_returns(
                 &mut lo.graph,
                 tail_forwarded_returns,
-                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
-            // Fold each raise site's `PyError` constructor into its
-            // materialisation call, so the transparent constructor — which has
-            // no host symbol and therefore no address — leaves this graph.
-            crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
             if result_exc_ok_is_unit {
                 // Stamp `FUNC.RESULT = void`.  The exception-link lowering
                 // already returns the unit `()` (the callee no longer
@@ -4232,13 +4260,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // returns cannot certify these new returns: if none of them has a
             // supported shape, the callee must decline instead of exposing a
             // mixture of unwrapped values and Result shells to its callers.
-            crate::front::result_exc::lower_result_exc_returns(
-                &mut lo.graph,
-                0,
-                static_addrs.error_carrier,
-            )
-            .map_err(LowerError::Unsupported)?;
-            crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
+            crate::front::result_exc::lower_result_exc_returns(&mut lo.graph, 0)
+                .map_err(LowerError::Unsupported)?;
         }
         // The `Layout::from_size_align(..).ok()` rewrite
         // (`front::from_size_align`) collapses the `from_size_align` + `ok`
@@ -4365,7 +4388,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         };
         // Word-sized `saturating_mul` clamp (`front::saturating_mul`) splits
         // the residual call into `lo = a * b; hi = uint_mul_high(a, b); if
-        // uint_ne(hi, 0) { MAX } else { lo }`.  Same fail-safe as add.
+        // ne(hi, 0) { MAX } else { lo }`.  Same fail-safe as add.
         let _saturating_mul_rewritten = if lo.saturating_mul_sites.is_empty() {
             0
         } else {
@@ -4469,15 +4492,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &mut lo.graph,
                 &closure_select_outcome.result_exc_calls,
                 result_exc_callee,
-                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
         }
         let closure_select_rewritten = closure_select_outcome.rewritten;
-        if !lo.disc_combinator_sites.is_empty() {
+        if !disc_combinator_sites.is_empty() {
             rewire_disc_combinator_sites(
                 &mut lo.graph,
-                &lo.disc_combinator_sites,
+                &disc_combinator_sites,
                 static_addrs.error_carrier,
             );
         }
@@ -7062,7 +7084,13 @@ fn pygraph_initial_block(
                     .or_else(|| {
                         let spelling = tyref_to_ast_string(&local.ty, llbc);
                         majit_ir::descr::is_list_container_spelling(&spelling).then_some(spelling)
-                    }),
+                    })
+                    // A tuple param (a closure's `call_once(env, args)`
+                    // args tuple, or `&(A, B)`) is an RPython tuple.
+                    // Carry the same `Tuple<A,B>` shape its `.N` reads
+                    // name as owner, so `derive_subject_inputcells`
+                    // seeds the `SomeTuple` those `getitem`s read.
+                    .or_else(|| tyref_shaped_tuple_root(&local.ty, llbc)),
                 // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
                 // so it takes the non-`Ref` arm and would otherwise carry no
                 // `class_root`.  Its variant-name metadata is a side table
@@ -7120,7 +7148,6 @@ impl<'a> Lowering<'a> {
             pygraph_initial_block(&mut graph, &body.locals, llbc, generics, tombstoned_leaves);
         let n_locals = local_var.len();
         let arg_count = body.locals.arg_count as usize;
-
         // Pre-allocate a Block for each MIR basic block so terminators
         // can refer to successors via stable BlockId. MIR bb0 maps to
         // the FunctionGraph startblock (already exists); the rest are
@@ -16846,6 +16873,8 @@ impl<'a> Lowering<'a> {
         // Rust `String`, which the residual ABI cannot express. Retarget only
         // those exact formatting boundaries to one-word `BytesBlock*`
         // wrappers; the complex sign/parenthesis builder remains in its graph.
+        // The wrapper's own body is the one caller of the host formatter that
+        // keeps it: retargeting there would make the wrapper call itself.
         let op_kind = if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -16853,6 +16882,7 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && let Some(residual) = crate::front::rfloat_call::repr_residual_path(segments)
+            && residual.join("::") != self.graph.name
         {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
@@ -16860,7 +16890,7 @@ impl<'a> Lowering<'a> {
                     fun_decl_id: None,
                 },
                 args: args.clone(),
-                result_ty: ValueType::Ref(None),
+                result_ty: ValueType::Str,
             }
         } else {
             op_kind
@@ -17763,8 +17793,8 @@ impl<'a> Lowering<'a> {
                         TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
                         TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
                     };
-                    // `Option<(usize, I::Item)>` — the inner next yields
-                    // `I::Item`, packed into the tuple on the Some arm.
+                    // `Option<(usize, I::Item)>` — the recorded kind is the
+                    // tuple's item, peeled like `I::next`'s own payload.
                     let body = if enumerate_next {
                         type_decl_ref_generics(body.get("Adt")?.as_object()?, self.llbc)?
                             .get("types")?
@@ -17772,11 +17802,8 @@ impl<'a> Lowering<'a> {
                     } else {
                         body
                     };
-                    let item = iterator_payload_element(
-                        body,
-                        self.llbc,
-                        enumerate_item_peel(enumerate_next, iterator_added_a_reference),
-                    )?;
+                    let item =
+                        iterator_payload_element(body, self.llbc, iterator_added_a_reference)?;
                     serde_json::from_value::<TyRef>(item.clone()).ok()
                 })
                 .map(|ty| tyref_to_value_type_with(&ty, self.llbc, self.tombstoned_leaves))
@@ -23381,6 +23408,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             payload_on_disc_true,
             niche,
+            fn_ptr: self.option_payload_is_fn_ptr(recv_ty),
             niche_null_cast: self.option_niche_null_cast(recv_ty),
             fieldless_none_tag,
         })
@@ -23904,12 +23932,13 @@ impl<'a> Lowering<'a> {
             }
             _ => {}
         }
-        if is_result
+        let carrier_recv = is_result
             && crate::front::result_exc::tyref_is_result_of_carrier(
                 &recv_ty,
                 self.llbc,
                 self.static_addrs.error_carrier,
-            )
+            );
+        if carrier_recv
             && matches!(
                 kind,
                 DiscCombinator::ResultUnwrapOrElse
@@ -23919,8 +23948,8 @@ impl<'a> Lowering<'a> {
             )
         {
             // Carrier Results whose combinator would rebuild a Result shell
-            // are `result_exc`'s domain.  `map`/`and_then` still lower: the
-            // post-pass handles the LastException form `result_exc` leaves.
+            // are `result_exc`'s domain.  `map`/`and_then` still lower, as an
+            // if/else on the receiver built before `result_exc` runs.
             return None;
         }
 
@@ -23948,6 +23977,7 @@ impl<'a> Lowering<'a> {
             args_tuple_suffix: String::new(),
             call_result_ty: ValueType::Ref(None),
             call_result_class: None,
+            carrier_recv,
         };
 
         if is_option {
@@ -24566,6 +24596,7 @@ impl<'a> Lowering<'a> {
             call_result_ty,
             args_tuple_suffix,
             niche,
+            fn_ptr: self.option_payload_is_fn_ptr(&recv_ty),
             niche_null_cast,
             fieldless_none_tag,
             call_once_result_exc,
@@ -35634,6 +35665,73 @@ fn dont_look_inside_return_token(
     Some(token.to_string())
 }
 
+/// Class key of a callee's by-value ADT result — the value
+/// `FunctionGraph::return_class_root` carries so a `dont_look_inside` stub
+/// returns `SomeInstance(classdef)` instead of the classdef-less `ref`
+/// shell.  Reads the same `Result<T, PyError>` payload
+/// [`dont_look_inside_return_token`] reads.
+///
+/// An enum instantiation keys as its template path plus the `<…>` suffix,
+/// the spelling a `Some(..)` / `Ok(..)` construction of that instantiation
+/// mints.  Only instantiations whose type arguments are all by-value ADTs
+/// qualify: a reference, raw-pointer or `Box` argument can make the enum a
+/// null-niche pointer, which has no enum class.  A named struct keys as its
+/// class root.  `None` otherwise.
+fn dont_look_inside_return_class_root(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Option<String> {
+    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
+        crate::front::result_exc::tyref_result_ok(output, llbc)
+    } else {
+        None
+    };
+    let ty = payload.as_ref().unwrap_or(output);
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let adt = node.as_object()?.get("Adt")?.as_object()?;
+    let td = llbc.type_by_id(adt_node_def_id(node)?)?;
+    if !matches!(td.kind, TypeDeclKind::Enum(_)) {
+        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+    }
+    let type_args = adt
+        .get("generics")
+        .and_then(|g| g.get("types"))
+        .and_then(serde_json::Value::as_array)?;
+    if type_args.is_empty() {
+        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+    }
+    let by_value_args = type_args.iter().all(|arg| {
+        strip_ty_indirections(arg, llbc).is_some_and(|arg| {
+            adt_node_def_id(arg).is_some() && type_node_box_pointee(arg, llbc).is_none()
+        })
+    });
+    if !by_value_args {
+        return None;
+    }
+    let suffix = adt_head_instantiation_suffix(adt, llbc)?;
+    Some(format!("{}{suffix}", td.item_meta.name_path()))
+}
+
+/// Whether a callee's result is a pointer to the low-level `STR` storage
+/// (`*mut BytesBlock`) — the value `FunctionGraph::return_is_str` carries so
+/// a `dont_look_inside` stub returns `SomeString` instead of the
+/// classdef-less `ref` shell.  Reads the same `Result<T, PyError>` payload
+/// [`dont_look_inside_return_token`] reads.  A by-value Rust `String` does
+/// not qualify: the residual-call ABI cannot return its three words.
+fn dont_look_inside_return_is_str(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
+        crate::front::result_exc::tyref_result_ok(output, llbc)
+    } else {
+        None
+    };
+    tyref_raw_ptr_pointee_is_string_value(payload.as_ref().unwrap_or(output), llbc)
+}
+
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the
 /// exact `majit_rlib::rbigint::RBigInt` ADT. Guards the
 /// RBigInt binary-operator retarget (`front::bigint_binop`) so a same-named
@@ -35796,16 +35894,37 @@ fn tyref_to_attr_value_type_with(
     ValueType::Ref(None)
 }
 
+/// Whether a declared field type is one of the decl's own type parameters
+/// (`core::ops::range::Range<Idx>::start`, `Option<T>::Some.0`).
+///
+/// Such a field has no register class the decl can name: `Range<usize>`
+/// stores an int there, `Range<f64>` a float.  Its FORCE attr is `Unknown`,
+/// which `valuetype_to_someshell` does not shell, so `register_struct_fields`
+/// forces nothing for it and the attribute takes the annotation of the
+/// values written to it.  Forcing the classdef-less `Ref(None)` fallback
+/// instead made every `start = <int>` write union `Integer ∪ Instance` and
+/// fail.
+fn tyref_is_type_parameter(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .and_then(typevar_bound_index)
+        .is_some()
+}
+
 /// Register-class of a struct field, matching [`tyref_to_attr_value_type`]
 /// except for a closure-env capture whose declared type is a shared borrow
 /// of a primitive: seed that attr as the scalar so FORCE does not install
 /// a Ref class field against an Int-banked getfield.  Ordinary struct
-/// fields of reference type stay `Ref`.
+/// fields of reference type stay `Ref`; a type-parameter field is
+/// `Unknown` ([`tyref_is_type_parameter`]).
 fn tyref_to_attr_value_type_for_struct_field(
     ty: &TyRef,
     owner: &TypeDecl,
     llbc: &Llbc,
 ) -> ValueType {
+    if tyref_is_type_parameter(ty, llbc) {
+        return ValueType::Unknown;
+    }
     if type_decl_is_closure_env(owner)
         && let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc)
     {
@@ -36887,12 +37006,11 @@ fn type_node_fn_def_fun_id<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) 
             node = &arr[1];
             continue;
         }
-        return obj
-            .get("FnDef")?
-            .as_object()?
-            .get("kind")?
-            .get("Fun")?
-            .as_u64();
+        // The item's `FnPtr` sits under a `RegionBinder`
+        // (`{"FnDef": {"regions": …, "skip_binder": {"kind": …}}}`).
+        let fn_def = obj.get("FnDef")?;
+        let fn_ptr = fn_def.get("skip_binder").unwrap_or(fn_def);
+        return fn_ptr.get("kind")?.get("Fun")?.as_u64();
     }
     None
 }
@@ -37458,19 +37576,6 @@ fn map_collect_payload_value_type(item_ty: &TyRef, llbc: &Llbc, adds_reference: 
     };
     let borrowed = serde_json::json!({"Ref": ["Erased", node, "Shared"]});
     tyref_to_value_type(&TyRef::Other(borrowed), llbc)
-}
-
-/// Plain `next` peels the reference [`iterator_adds_a_reference`] added
-/// ([`iterator_payload_element`]). `Enumerate<I>::next` yields
-/// `(usize, I::Item)` and the loop reads `I::Item` — the borrow, for a
-/// slice iterator — the same bank `pack_enumerate_payload` writes into
-/// `__pos_1`.
-fn enumerate_item_peel(enumerate_next: bool, iterator_added_a_reference: bool) -> bool {
-    if enumerate_next {
-        false
-    } else {
-        iterator_added_a_reference
-    }
 }
 
 fn iterator_adds_a_reference(path: &str) -> bool {
@@ -38875,6 +38980,15 @@ fn tyref_tuple_suffix(ty: &TyRef, llbc: &Llbc) -> String {
         .and_then(serde_json::Value::as_object)
         .map(|adt| tuple_shape_suffix(adt, llbc))
         .unwrap_or_default()
+}
+
+/// The `Tuple<A,B>` shape of a non-unit tuple behind `ty`'s `Ref` layers —
+/// the owner a `(*p).N` read of it names (the read place is the deref'd
+/// tuple) — or `None` for any other type.
+fn tyref_shaped_tuple_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let suffix = tyref_tuple_suffix(&TyRef::Other(node.clone()), llbc);
+    (!suffix.is_empty()).then(|| format!("Tuple{suffix}"))
 }
 
 /// The per-shape suffix for a fixed-size array destination
@@ -42028,6 +42142,12 @@ struct DiscCombinatorSite {
     args_tuple_suffix: String,
     call_result_ty: ValueType,
     call_result_class: Option<String>,
+    /// The receiver is a `Result<_, carrier>`.  Its `map`/`and_then` is
+    /// rewritten into the if/else on the receiver before `result_exc` turns
+    /// the carrier into exception edges, so the receiver call is caught and
+    /// rewrapped like any other `match` on it, and the built `Ok`/`Err`
+    /// shells reach the callee rule.
+    carrier_recv: bool,
 }
 
 #[derive(Clone)]
@@ -42371,7 +42491,6 @@ fn rewire_disc_combinator_diamond(
             DiscCombinator::ResultErr => (true, true, false, false, false),
             DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr => unreachable!(),
         };
-
     // A function-item callable is named, not threaded: only a closure env or
     // a plain value argument flows into the arm.
     let extra = extra.filter(|_| site.fn_item_segments.is_none());
@@ -42883,6 +43002,8 @@ fn build_disc_arm(
     }
 }
 
+/// Rewrite a Result combinator whose call `result_exc` already made can-raise.
+#[allow(clippy::too_many_arguments)]
 fn rewire_result_map_last_exception(
     graph: &mut FunctionGraph,
     site: &DiscCombinatorSite,
@@ -46501,8 +46622,9 @@ mod tests {
         primitive_float_const, push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
         scalar_replace_named_struct_aggregates, shaped_array_parts, simplify_lowered_graph,
         static_key_segments, type_decl_is_closure_env, tyref_array_suffix, tyref_is_closure_env,
-        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_attr_value_type,
-        tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
+        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_shaped_tuple_root,
+        tyref_to_attr_value_type, tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
+        tyref_tuple_suffix,
     };
     use crate::flowspace::model::Variable;
     use crate::model::{
@@ -46572,11 +46694,13 @@ mod tests {
         );
     }
 
-    /// `Enumerate<slice::Iter<i64>>::next` yields `(usize, &i64)`. The
-    /// loop's `tuple.1` read is that borrow. Peeling to `i64` stores an
-    /// int in the ref field `__pos_1`.
+    /// `Enumerate<slice::Iter<i64>>::next` yields `(usize, &i64)`; the
+    /// `(index, item)` tuple of `enumerate(lst)` holds the list's item repr
+    /// (`EnumerateIteratorRepr.rtype_next` converts to `items_r[1]`), so the
+    /// reference the slice iterator added is peeled exactly as for a plain
+    /// `next`.
     #[test]
-    fn enumerate_slice_iter_next_records_the_borrow_the_loop_reads() {
+    fn enumerate_slice_iter_next_records_the_list_item() {
         let llbc = empty_llbc();
         let borrow = shared_i64();
         let node = match &borrow {
@@ -46587,24 +46711,7 @@ mod tests {
         let peeled = super::iterator_payload_element(&node, &llbc, true)
             .and_then(|item| serde_json::from_value::<TyRef>(item.clone()).ok())
             .map(|ty| tyref_to_value_type(&ty, &llbc));
-        assert_eq!(
-            peeled,
-            Some(ValueType::Int),
-            "the peel itself still yields i64"
-        );
-        assert!(
-            !super::enumerate_item_peel(true, true),
-            "Enumerate::next must not peel I::Item; plain next still peels"
-        );
-        let kept =
-            super::iterator_payload_element(&node, &llbc, super::enumerate_item_peel(true, true))
-                .and_then(|item| serde_json::from_value::<TyRef>(item.clone()).ok())
-                .map(|ty| tyref_to_value_type(&ty, &llbc));
-        assert_eq!(kept, Some(ValueType::Ref(None)));
-        assert!(
-            super::enumerate_item_peel(false, true),
-            "plain slice::Iter::next still peels the reference it added"
-        );
+        assert_eq!(peeled, Some(ValueType::Int));
     }
 
     fn branch_layout(disc_off: u64, payload_off: u64) -> majit_charon_reader::ullbc::TypeLayout {
@@ -48060,6 +48167,7 @@ mod tests {
             args_tuple_suffix: String::new(),
             call_result_ty: ValueType::Int,
             call_result_class: None,
+            carrier_recv: false,
         };
         let live_before: std::collections::HashSet<_> =
             graph.blocks.iter().map(|block| block.id).collect();
@@ -48263,6 +48371,51 @@ mod tests {
             ValueType::Int,
             "RPython history.getkind(Ptr(FuncType)) uses the int bank"
         );
+    }
+
+    #[test]
+    fn a_tuple_param_names_the_shape_its_reads_name() {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [], "fun_decls": [], "global_decls": [],
+                "trait_decls": [], "trait_impls": [],
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let tuple = serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {
+                    "types": [
+                        { "Scalar": { "Integer": { "Signed": "I64" } } },
+                        { "Scalar": "Bool" }
+                    ]
+                }
+            }
+        });
+        let owner = format!(
+            "Tuple{}",
+            tyref_tuple_suffix(&TyRef::Other(tuple.clone()), &llbc)
+        );
+        assert!(majit_ir::descr::is_shaped_tuple_name(&owner), "{owner}");
+        // By value (a closure's args tuple) and behind a borrow (the read
+        // place of `(*p).N` is the deref'd tuple) both name the read owner.
+        let by_value = TyRef::Other(tuple.clone());
+        let borrowed = TyRef::Other(serde_json::json!({ "Ref": ["Erased", tuple, "Shared"] }));
+        assert_eq!(
+            tyref_shaped_tuple_root(&by_value, &llbc),
+            Some(owner.clone())
+        );
+        assert_eq!(tyref_shaped_tuple_root(&borrowed, &llbc), Some(owner));
+        let unit = TyRef::Other(serde_json::json!({
+            "Adt": { "id": 0, "builtin": "Tuple", "generics": { "types": [] } }
+        }));
+        assert_eq!(tyref_shaped_tuple_root(&unit, &llbc), None);
+        let int = TyRef::Other(serde_json::json!({ "Scalar": { "Integer": { "Signed": "I64" } } }));
+        assert_eq!(tyref_shaped_tuple_root(&int, &llbc), None);
     }
 
     #[test]
@@ -57472,6 +57625,44 @@ mod tests {
     }
 
     #[test]
+    fn harden_keeps_a_struct_leaf_that_only_a_variant_shares() {
+        let mut reg = crate::front::semantic::StructFieldRegistry::default();
+        let state = rows(&[("int_max_str_digits", "i32")]);
+        reg.fields
+            .insert("module::sys::state::SysState".to_string(), state.clone());
+        reg.fields.insert("SysState".to_string(), state.clone());
+        let base = rows(&[("__discriminant", "i64")]);
+        reg.fields
+            .insert("baseobjspace::SpaceCacheInstance".to_string(), base.clone());
+        reg.fields.insert("SpaceCacheInstance".to_string(), base);
+        let variant = rows(&[("__pos_0", "RetainedSpaceCache<SysState>")]);
+        reg.fields.insert(
+            "baseobjspace::SpaceCacheInstance::SysState".to_string(),
+            variant.clone(),
+        );
+        reg.fields
+            .insert("SpaceCacheInstance::SysState".to_string(), variant);
+        let mut origins = std::collections::HashMap::from([(
+            "SysState".to_string(),
+            "module::sys::state".to_string(),
+        )]);
+        let mut enums = std::collections::HashMap::new();
+
+        let tombstoned = harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
+
+        assert_eq!(
+            reg.fields.get("SysState"),
+            Some(&state),
+            "a variant does not publish the bare leaf, so it cannot make the struct's alias ambiguous"
+        );
+        assert!(!tombstoned.contains("SysState"));
+        assert_eq!(
+            origins.get("SysState").map(String::as_str),
+            Some("module::sys::state")
+        );
+    }
+
+    #[test]
     fn root_scope_drop_is_classified_and_live() {
         use bit_set::BitSet;
         use majit_charon_reader::ullbc::Unstructured;
@@ -59584,6 +59775,66 @@ mod tests {
                         )
                 })),
             "lookup: niche `?` break arm must return a PyObject-narrowed null"
+        );
+    }
+
+    /// `builtins::kwarg_get` opens with `let dict = kwargs?;` on its
+    /// `Option<PyObjectRef>` parameter, so the `Try::branch` sits in the
+    /// startblock after the parameters' `Input` ops and no block forwards the
+    /// Option into it.  `option_try` splits the startblock before the branch
+    /// and rewrites the `?` like any other site: no residual `branch` call.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn option_try_on_a_parameter_real_kwarg_get() {
+        use crate::model::{CallTarget, OpKind};
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "kwarg_get").expect("lower kwarg_get");
+        let branch_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
+                        if name == "branch" && args.len() == 1
+                )
+            })
+            .count();
+        assert_eq!(
+            branch_calls, 0,
+            "kwarg_get: residual Try::branch Method-call on the parameter `?`"
+        );
+    }
+
+    /// A field typed by its decl's own type parameter has no register class
+    /// the decl can name, so its FORCE row is `Unknown` and nothing is forced:
+    /// `Range<Idx>::start` and `Option<T>::Some.0` take the annotation of the
+    /// values written to them.  A concretely typed field keeps its class.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn type_parameter_fields_force_no_attribute_real() {
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let (_, _, _, _, _, attrs, _, _) = super::derive_program_metadata(&llbc);
+        let field = |owner: &str, name: &str| {
+            attrs
+                .get(owner)
+                .unwrap_or_else(|| panic!("{owner} registered"))
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, ty)| ty.clone())
+                .unwrap_or_else(|| panic!("{owner}.{name} registered"))
+        };
+        assert_eq!(field("ops::range::Range", "start"), ValueType::Unknown);
+        assert_eq!(field("ops::range::Range", "end"), ValueType::Unknown);
+        assert_eq!(field("option::Option::Some", "__pos_0"), ValueType::Unknown);
+        assert_eq!(
+            field("pyframe::FrameBlock", "valuestackdepth"),
+            ValueType::Unsigned
         );
     }
 
@@ -65216,6 +65467,7 @@ mod tests {
             args_tuple_suffix: String::new(),
             call_result_ty: ValueType::Int,
             call_result_class: None,
+            carrier_recv: false,
         }
     }
 
@@ -65992,8 +66244,9 @@ mod tests {
         assert_eq!(count_method_calls(&fixture.graph, "map"), 1);
     }
 
-    /// The receiver branches on its discriminant; the `Err` arm materialises
-    /// its carrier and raises it to the exceptblock.  Returns the `Ok` arm.
+    /// The receiver branches on its discriminant; the `Err` arm raises the
+    /// carrier with `type(carrier)` and an exceptblock link. The codewriter
+    /// rewrites that raise to `to_exc_object`. Returns the `Ok` arm.
     fn assert_err_arm_raises_to_the_exceptblock(
         fixture: &RaisingCombinator,
     ) -> crate::model::BlockId {
@@ -66007,20 +66260,28 @@ mod tests {
             .map(|id| &graph.blocks[id.0])
             .find(|arm| matches!(arm.exits.as_slice(), [exit] if exit.target == graph.exceptblock))
             .expect("Err arm");
-        let exc = err_arm
+        let type_of = err_arm
             .operations
             .iter()
-            .find_map(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments == &["test", "to_exc_object"].map(str::to_string) => {
-                    op.result.clone()
-                }
-                _ => None,
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments == &["type".to_string()]
+                )
             })
-            .expect("Err arm materialises the exception value");
-        assert!(err_arm.exits[0].args.contains(&LinkArg::Value(exc)));
+            .expect("Err arm records type(carrier)");
+        let OpKind::Call { args, .. } = &type_of.kind else {
+            unreachable!("matched a type() call");
+        };
+        let carrier = args[0].as_variable().expect("type() reads the carrier");
+        assert_eq!(
+            err_arm.exits[0].args[0].as_variable(),
+            type_of.result.as_ref()
+        );
+        assert_eq!(err_arm.exits[0].args[1].as_variable(), Some(carrier));
         assert!(err_arm.exits[0].exitcase.is_none());
         *arms.iter().find(|id| **id != err_arm.id).unwrap()
     }

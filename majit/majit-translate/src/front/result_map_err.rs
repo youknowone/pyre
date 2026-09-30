@@ -45,19 +45,14 @@ pub(crate) struct ResultMapErrSite {
 pub(crate) fn rewire_result_map_err_sites(
     graph: &mut FunctionGraph,
     sites: &[ResultMapErrSite],
-    spec: crate::ErrorCarrierSpec<'_>,
 ) -> usize {
     sites
         .iter()
-        .filter(|site| rewire_one(graph, site, spec).is_ok())
+        .filter(|site| rewire_one(graph, site).is_ok())
         .count()
 }
 
-fn rewire_one(
-    graph: &mut FunctionGraph,
-    site: &ResultMapErrSite,
-    spec: crate::ErrorCarrierSpec<'_>,
-) -> Result<(), String> {
+fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), String> {
     let name = graph.name.clone();
     if !site.closure_env_is_trivially_dropless {
         return Err(format!(
@@ -288,19 +283,10 @@ fn rewire_one(
             )?;
             close_goto_mixed(graph, err_block, rewrap_target, rewrap_args);
         } else {
-            // An actual propagation edge carries a trace-level exception
-            // object, not the interpreter-specific carrier returned by the
-            // mapper.
-            raise_carrier_on_exception_edge(
-                graph,
-                err_block,
-                mapped,
-                exceptional,
-                &err_sources,
-                &err_inputs,
-                spec,
-                &name,
-            )?;
+            // `raise mapped`. `exc_from_raise` records `etype = type(mapped)`
+            // and the exceptblock link. `codewriter::error_carrier_edges`
+            // rewrites that raise to `to_exc_object(mapped)`.
+            crate::front::exc_from_raise::set_raise_from_instance(graph, err_block, mapped);
         }
     } else {
         let err_result = emit_sum_variant(
@@ -346,52 +332,41 @@ fn rewire_one(
     Ok(())
 }
 
-/// Close `block` by raising the error carrier `carrier` along `exceptional`,
-/// the exception edge of a call `result_exc` made can-raise: the carrier is
-/// materialised as the trace-level exception object and fills the edge's
-/// `last_exception` / `last_exc_value` slots; every other value is remapped
-/// through `sources` → `inputs`.
+/// Close `block` with `raise carrier`.
+///
+/// `exc_from_raise` records `etype = type(carrier)` and the `(etype, evalue)`
+/// link to `exceptblock`. `codewriter::error_carrier_edges` rewrites a raise
+/// of that shape to `to_exc_object(carrier)`. Copying `carrier` into both
+/// exception slots leaves no `type(evalue)` producer, so that pass treats the
+/// link as an already-materialised propagation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn raise_carrier_on_exception_edge(
     graph: &mut FunctionGraph,
     block: crate::model::BlockId,
     carrier: Variable,
     exceptional: &crate::model::Link,
-    sources: &[Variable],
-    inputs: &[Variable],
-    spec: crate::ErrorCarrierSpec<'_>,
+    _sources: &[Variable],
+    _inputs: &[Variable],
+    _spec: crate::ErrorCarrierSpec<'_>,
     name: &str,
 ) -> Result<(), String> {
-    let last_exception = exceptional
+    if exceptional.target != graph.exceptblock {
+        return Err(format!("{name}: carrier raise does not target exceptblock"));
+    }
+    if exceptional
         .last_exception
         .as_ref()
         .and_then(LinkArg::as_variable)
-        .ok_or_else(|| format!("{name}: exceptional edge lacks last_exception"))?;
-    let last_exc_value = exceptional
-        .last_exc_value
-        .as_ref()
-        .and_then(LinkArg::as_variable)
-        .ok_or_else(|| format!("{name}: exceptional edge lacks last_exc_value"))?;
-    let exc =
-        crate::front::result_exc::materialize_error_to_exc_object(graph, block, carrier, spec);
-    let args = exceptional
-        .args
-        .iter()
-        .map(|arg| -> Result<LinkArg, String> {
-            Ok(match arg {
-                LinkArg::Value(value) if value == last_exception || value == last_exc_value => {
-                    LinkArg::Value(exc.clone())
-                }
-                LinkArg::Value(value) => {
-                    LinkArg::Value(map_source(sources, inputs, value).ok_or_else(|| {
-                        format!("{name}: exceptional edge carries an unthreaded value")
-                    })?)
-                }
-                LinkArg::Const(value) => LinkArg::Const(value.clone()),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    close_goto_mixed(graph, block, exceptional.target, args);
+        .is_none()
+        || exceptional
+            .last_exc_value
+            .as_ref()
+            .and_then(LinkArg::as_variable)
+            .is_none()
+    {
+        return Err(format!("{name}: exceptional edge lacks its exception pair"));
+    }
+    crate::front::exc_from_raise::set_raise_from_instance(graph, block, carrier);
     Ok(())
 }
 
@@ -571,11 +546,7 @@ mod tests {
             site.closure_env_is_trivially_dropless = true;
             let before = format!("{graph:?}");
             assert_eq!(
-                rewire_result_map_err_sites(
-                    &mut graph,
-                    &[site],
-                    crate::ErrorCarrierSpec::default()
-                ),
+                rewire_result_map_err_sites(&mut graph, &[site]),
                 0,
                 "{defect}"
             );
@@ -626,14 +597,7 @@ mod tests {
         graph.set_goto(entry, join, vec![result.clone()]);
 
         let mut site = fixture_site(result);
-        assert_eq!(
-            rewire_result_map_err_sites(
-                &mut graph,
-                &[site.clone()],
-                crate::ErrorCarrierSpec::default()
-            ),
-            0
-        );
+        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site.clone()]), 0);
         assert!(graph.blocks[entry.0].operations.iter().any(|op| {
             matches!(
                 &op.kind,
@@ -643,10 +607,7 @@ mod tests {
         }));
 
         site.closure_env_is_trivially_dropless = true;
-        assert_eq!(
-            rewire_result_map_err_sites(&mut graph, &[site], crate::ErrorCarrierSpec::default()),
-            1
-        );
+        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site]), 1);
 
         let calls: Vec<&CallTarget> = graph
             .blocks
@@ -751,11 +712,7 @@ mod tests {
 
         let mut site = fixture_site(result);
         site.closure_env_is_trivially_dropless = true;
-        let spec = crate::ErrorCarrierSpec {
-            to_exc_object: Some(&["fixture", "to_exc_object"]),
-            ..crate::ErrorCarrierSpec::default()
-        };
-        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site], spec), 1);
+        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site]), 1);
 
         let err_arm = graph
             .blocks
@@ -796,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_lowered_map_err_materializes_an_actual_propagation() {
+    fn exception_lowered_map_err_raises_the_mapped_carrier() {
         let mut graph = FunctionGraph::new("map_err_propagate_fixture");
         let entry = graph.startblock;
         let receiver = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
@@ -837,11 +794,7 @@ mod tests {
 
         let mut site = fixture_site(result);
         site.closure_env_is_trivially_dropless = true;
-        let spec = crate::ErrorCarrierSpec {
-            to_exc_object: Some(&["fixture", "to_exc_object"]),
-            ..crate::ErrorCarrierSpec::default()
-        };
-        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site], spec), 1);
+        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site]), 1);
 
         let err_arm = graph
             .blocks
@@ -856,15 +809,28 @@ mod tests {
                 })
             })
             .expect("Err arm must call the mapper");
-        assert!(err_arm.operations.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                    if segments == &["fixture".to_string(), "to_exc_object".to_string()]
-            )
-        }));
+        // `raise mapped`: `etype = type(mapped)`, then the exceptblock link.
+        // The codewriter rewrites that raise to `to_exc_object(mapped)`.
+        let type_of = err_arm
+            .operations
+            .last()
+            .expect("type(mapped) closes the raise");
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &type_of.kind
+        else {
+            panic!("raise records type(mapped)");
+        };
+        assert_eq!(segments.as_slice(), ["type".to_string()]);
+        let mapped = args[0].as_variable().expect("type() reads the carrier");
         assert_eq!(err_arm.exits.len(), 1);
         assert_eq!(err_arm.exits[0].target, graph.exceptblock);
-        assert_eq!(err_arm.exits[0].args[0], err_arm.exits[0].args[1]);
+        assert_eq!(
+            err_arm.exits[0].args[0].as_variable(),
+            type_of.result.as_ref()
+        );
+        assert_eq!(err_arm.exits[0].args[1].as_variable(), Some(mapped));
     }
 }

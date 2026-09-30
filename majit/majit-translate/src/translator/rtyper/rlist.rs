@@ -6802,6 +6802,83 @@ impl ListIteratorRepr {
     }
 }
 
+impl ListIteratorRepr {
+    /// `self.r_list.external_item_repr` — the item repr `rtype_next`
+    /// hands back, read by `EnumerateIteratorRepr.rtype_next` (`rrange.py`)
+    /// as `r_item_src`.
+    pub(crate) fn external_item_repr(&self) -> &Arc<dyn Repr> {
+        &self.external_item_repr
+    }
+
+    /// `hop.gendirectcall(self.ll_getnextindex, v_iter)` — the call
+    /// `EnumerateIteratorRepr.rtype_next` (`rrange.py`) makes through
+    /// `self.ll_getnextindex = r_baseiter.ll_getnextindex`.
+    pub(crate) fn gen_ll_getnextindex(
+        &self,
+        hop: &HighLevelOp,
+        v_iter: Hlvalue,
+    ) -> Result<Hlvalue, TyperError> {
+        let iter_lltype = self.lltype.clone();
+        let iter_for_builder = iter_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_getnextindex".to_string(),
+            vec![iter_lltype],
+            LowLevelType::Signed,
+            move |_rtyper, _args, _result| {
+                build_ll_getnextindex_helper_graph("ll_getnextindex", iter_for_builder.clone())
+            },
+        )?;
+        hop.gendirectcall(&helper, vec![v_iter])?
+            .ok_or_else(|| TyperError::message("ll_getnextindex returned Void"))
+    }
+}
+
+/// Synthesise `ll_getnextindex` (`lltypesystem/rlist.py`):
+///
+/// ```python
+/// def ll_getnextindex(iter):
+///     return iter.index
+/// ```
+pub(crate) fn build_ll_getnextindex_helper_graph(
+    name: &str,
+    iter_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let arg = variable_with_lltype("iter", iter_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let v_index = variable_with_lltype("index", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(arg), void_field_const("index")],
+        Hlvalue::Variable(v_index.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_index)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["iter".to_string()],
+        func,
+    ))
+}
+
 impl Repr for ListIteratorRepr {
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
