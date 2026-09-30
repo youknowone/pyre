@@ -23333,6 +23333,8 @@ fn builtin_open_impl(
     // Bind every argument before unwrap-style conversions start.  A conversion
     // can call Python and move objects, so the complete live argument set must
     // already be on the shadow stack before the first such callback.
+    let npos = positional.len();
+    let has_kwargs = kwargs.is_some();
     let argument_roots = pyre_object::gc_roots::push_roots();
     let file = pyre_object::gc_roots::pin_root(file);
     let mut file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -23340,6 +23342,11 @@ fn builtin_open_impl(
     // from their slots after it.
     let positional_base = pyre_object::gc_roots::pin_roots(positional);
     let kwargs_slot = pyre_object::gc_roots::pin_roots(&[kwargs.unwrap_or(PY_NULL)]);
+    let positional: Vec<PyObjectRef> = (0..npos)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
+        .collect();
+    let positional = positional.as_slice();
+    let kwargs = has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
     let w_mode =
         bind_pos_or_kw(positional, kwargs, 1, "mode", "open", 2)?.unwrap_or_else(|| w_str_new("r"));
     if unsafe { !pyre_object::is_str(w_mode) } {
@@ -23349,11 +23356,11 @@ fn builtin_open_impl(
         )));
     }
     let mode = crate::baseobjspace::str_utf8_w(w_mode)?.to_string();
-    let positional: Vec<PyObjectRef> = (0..positional.len())
+    let positional: Vec<PyObjectRef> = (0..npos)
         .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
         .collect();
     let positional = positional.as_slice();
-    let kwargs = kwargs.map(|_| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
+    let kwargs = has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
     let w_buffering = bind_pos_or_kw(positional, kwargs, 2, "buffering", "open", 3)?
         .unwrap_or_else(|| w_int_new(-1));
     let w_encoding =

@@ -6243,6 +6243,7 @@ fn build_class_inner(
     // below, then `__set_name__`).
     let body_ns = frame.get_w_locals();
     let mapping_namespace = mapping_namespace.map(|_| body_ns);
+    let body_is_mapping = mapping_namespace.is_some();
 
     // The body wrote through `body_ns`; mirror its final contents into
     // class_ns for the downstream type construction (classcell capture,
@@ -6487,7 +6488,7 @@ fn build_class_inner(
             // directly against the mapping (setdictscope above) it
             // already holds every store; replaying would re-run __setitem__
             // and, for _EnumDict, reject the duplicate member keys.
-            if mapping_namespace.is_none() {
+            if !body_is_mapping {
                 let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
                 let keys: Vec<Wtf8Buf> = unsafe {
                     pyre_object::w_dict_str_entries_wtf8(class_ns)
@@ -6506,7 +6507,7 @@ fn build_class_inner(
                     }
                     let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
                     // `w_prepared_dict` is an exact `dict` on this branch
-                    // (`mapping_namespace.is_none()`), so no user code runs.
+                    // (`!body_is_mapping`), so no user code runs.
                     unsafe {
                         pyre_object::w_dict_setitem_wtf8_no_proxy(w_prepared_dict, &key, value)
                     };

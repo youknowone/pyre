@@ -174,12 +174,14 @@ fn find_duplicate_kwarg(
     keyword_names_w: &[PyObjectRef],
     w_function: PyObjectRef,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
+    let existing_len = existingkeywords_w.len();
+    let names_len = keyword_names_w.len();
     let roots = pyre_object::gc_roots::push_roots();
     let function_slot = roots.pin_roots(&[w_function]);
     let existing_base = roots.pin_roots(existingkeywords_w);
     let names_base = roots.pin_roots(keyword_names_w);
-    let mut existing_now = existingkeywords_w.to_vec();
-    for i in 0..keyword_names_w.len() {
+    let mut existing_now = vec![pyre_object::PY_NULL; existing_len];
+    for i in 0..names_len {
         pyre_object::gc_roots::shadow_stack_copy_range(existing_base, &mut existing_now);
         if contains_w_names(roots.get(names_base + i), &existing_now) {
             return Some((roots.get(names_base + i), roots.get(function_slot)));

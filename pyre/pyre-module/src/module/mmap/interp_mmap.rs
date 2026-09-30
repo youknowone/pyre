@@ -461,7 +461,7 @@ fn mmap_handle(obj: pyre_object::PyObjectRef) -> Option<host_mmap::Handle> {
 /// it.
 #[cfg(unix)]
 fn mmap_file_size(mut obj: pyre_object::PyObjectRef) -> Result<i64, pyre_interpreter::PyError> {
-    let fd = mmap_get_attr_i64(obj, "_fd") as libc::c_int;
+    let fd = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_fd")) as libc::c_int;
     if fd < 0 {
         return Err(pyre_interpreter::PyError::os_error_with_errno(
             libc::EBADF,

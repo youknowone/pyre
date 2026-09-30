@@ -21231,13 +21231,18 @@ pub fn generator_send_ex_body(
                 // StopIteration constructor / yield return.
                 let value_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(value);
+                let frame_now = frame_for_slot(
+                    frame_owned,
+                    w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot))
+                        as *mut crate::pyframe::PyFrame,
+                    frame_slot,
+                );
                 // generator.py:109-114 — if the frame marked itself finished,
                 // it was RETURNed from; otherwise it YIELDed.
-                if (*frame_for_slot(frame_owned, frame_ptr, frame_slot)).frame_finished_execution()
-                {
+                if (*frame_now).frame_finished_execution() {
                     generator_frame_is_finished(
                         pyre_object::gc_roots::shadow_stack_get(gen_slot),
-                        &mut *frame_for_slot(frame_owned, frame_ptr, frame_slot),
+                        &mut *frame_now,
                         closing,
                     );
                     if is_async_generator(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
