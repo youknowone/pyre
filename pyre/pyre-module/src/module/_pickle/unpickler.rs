@@ -1956,7 +1956,11 @@ fn new_instance(w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef,
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&live);
     let w_new =
-        pyre_interpreter::baseobjspace::getattr_str_impl(roots.get(base), "__new__", true, false)?;
+        pyre_interpreter::baseobjspace::getattr_str_impl(roots.get(base), "__new__", true, false)
+            .map_err(|mut err| {
+            err.enrich_attribute_error_str(roots.get(base), "__new__");
+            err
+        })?;
     let w_cls = roots.get(base);
     let mut reloaded_args = vec![pyre_object::PY_NULL; nargs];
     pyre_object::gc_roots::shadow_stack_copy_range(base + 1, &mut reloaded_args);
@@ -2018,7 +2022,14 @@ fn new_instance_star(
         "__new__",
         true,
         false,
-    )?;
+    )
+    .map_err(|mut err| {
+        err.enrich_attribute_error_str(
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+            "__new__",
+        );
+        err
+    })?;
     let _ = pyre_object::gc_roots::pin_root(w_new);
     let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 

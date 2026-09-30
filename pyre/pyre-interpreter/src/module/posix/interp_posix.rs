@@ -3823,19 +3823,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         let base = roots.publish(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
         let pos_base = roots.publish(pos);
         roots.normalize(base, 1 + npos);
-        let src = crate::gateway::fsencode_path_named_w(roots.get(pos_base), name, "src");
+        let src = crate::gateway::fsencode_path_named_w(roots.get(pos_base), name, "src")?;
         let w = roots.get(base);
         kwargs = if w.is_null() { None } else { Some(w) };
-        let mut pos_buf = vec![pyre_object::PY_NULL; npos];
-        pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-        drop(roots);
-        let src = src?;
-        let roots = pyre_object::gc_roots::push_roots();
-        let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-        let dst = crate::gateway::fsencode_path_named_w(pos_buf[1], name, "dst");
+        let dst = crate::gateway::fsencode_path_named_w(roots.get(pos_base + 1), name, "dst")?;
         let w = roots.get(base);
         kwargs = if w.is_null() { None } else { Some(w) };
-        let dst = dst?;
         let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
             match crate::builtins::kwarg_get(kwargs, name) {
                 // interp_posix.py `_unwrap_dirfd` — a non-`None` value
@@ -3994,7 +3987,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         w_times = if w.is_null() { None } else { Some(w) };
         let mut pos_buf = vec![pyre_object::PY_NULL; npos];
         pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-        drop(roots);
         let path = path?;
 
         let present = |v: PyObjectRef| (!unsafe { pyre_object::is_none(v) }).then_some(v);
@@ -9788,19 +9780,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let args_base = roots.publish(args);
                 roots.normalize(base, 1 + n_args);
                 let src =
-                    crate::gateway::fsencode_path_named_w(roots.get(args_base), "link", "src");
+                    crate::gateway::fsencode_path_named_w(roots.get(args_base), "link", "src")?;
                 let w = roots.get(base);
                 kwargs = if w.is_null() { None } else { Some(w) };
-                let mut args_buf = vec![pyre_object::PY_NULL; n_args];
-                pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut args_buf);
-                drop(roots);
-                let src = src?;
-                let roots = pyre_object::gc_roots::push_roots();
-                let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-                let dst = crate::gateway::fsencode_path_named_w(args_buf[1], "link", "dst");
+                let dst =
+                    crate::gateway::fsencode_path_named_w(roots.get(args_base + 1), "link", "dst")?;
                 let w = roots.get(base);
                 kwargs = if w.is_null() { None } else { Some(w) };
-                let dst = dst?;
                 let c_src = std::ffi::CString::new(src.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
                 let c_dst = std::ffi::CString::new(dst.as_bytes.as_slice())
