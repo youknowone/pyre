@@ -1941,7 +1941,7 @@ fn instantiate(mut w_cls: PyObjectRef, mut w_args: PyObjectRef) -> Result<PyObje
 }
 
 /// `cls.__new__(cls, *args)`.
-fn new_instance(mut w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+fn new_instance(w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if !unsafe { pyre_object::typeobject::is_type(w_cls) } {
         let message = format!(
             "NEWOBJ class argument must be a type, not {}",
@@ -1950,11 +1950,15 @@ fn new_instance(mut w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObject
         return Err(unpickling_error(&message));
     }
     let nargs = args.len();
+    let mut live = Vec::with_capacity(nargs + 1);
+    live.push(w_cls);
+    live.extend_from_slice(args);
     let roots = pyre_object::gc_roots::push_roots();
-    let args_base = roots.pin_roots(args);
-    let w_new = pyre_object::with_roots!(w_cls => pyre_interpreter::baseobjspace::getattr_str(w_cls, "__new__"))?;
+    let base = roots.pin_roots(&live);
+    let w_new = pyre_interpreter::baseobjspace::getattr_str(roots.get(base), "__new__")?;
+    let w_cls = roots.get(base);
     let mut reloaded_args = vec![pyre_object::PY_NULL; nargs];
-    pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut reloaded_args);
+    pyre_object::gc_roots::shadow_stack_copy_range(base + 1, &mut reloaded_args);
     drop(roots);
     let mut call_args = vec![w_cls];
     call_args.extend_from_slice(&reloaded_args);
