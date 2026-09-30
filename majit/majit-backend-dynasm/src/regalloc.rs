@@ -2066,7 +2066,10 @@ impl<'a> RegAlloc<'a> {
                     }
                 }
                 #[cfg(target_arch = "aarch64")]
-                TargetArgLoc::Reg { regnum, is_xmm: true } => {
+                TargetArgLoc::Reg {
+                    regnum,
+                    is_xmm: true,
+                } => {
                     if !hinted.contains(arg) {
                         hinted.push(*arg);
                         let r = crate::regloc::RegLoc::new(regnum, true);
@@ -2221,7 +2224,9 @@ impl<'a> RegAlloc<'a> {
         need_lower_byte: bool,
     ) -> Loc {
         if selected_reg.is_none()
-            && let Some(loc) = self.pinned_float_loc(v, tp).or_else(|| self.pinned_int_loc(v, tp))
+            && let Some(loc) = self
+                .pinned_float_loc(v, tp)
+                .or_else(|| self.pinned_int_loc(v, tp))
         {
             return loc;
         }
@@ -6445,9 +6450,10 @@ impl<'a> RegAlloc<'a> {
                 return;
             };
             self.pinned_float = Some(bits);
-            self.xrm
-                .spill_moves
-                .push((Loc::immed_float(bits), Loc::Reg(crate::aarch64::registers::D8)));
+            self.xrm.spill_moves.push((
+                Loc::immed_float(bits),
+                Loc::Reg(crate::aarch64::registers::D8),
+            ));
         }
     }
 
