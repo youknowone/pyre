@@ -20864,18 +20864,35 @@ pub unsafe fn generator_invoke_execute_frame(
         Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
         None => None,
     };
-    let mut resume = crate::call::FrameResumeArgs {
-        w_inputvalue,
-        operr,
-        throw_args,
-    };
-    let value = crate::call::eval_resumed_frame_raw(
-        &mut *crate::eval::frame_anchor_live(frame_depth),
-        &mut resume,
-    );
-    let executed = match crate::call::take_call_error() {
-        Some(error) => Err(error),
-        None => Ok(value),
+    // `next`/`send` carry no operation error. Resume through the registered
+    // one-word helper so the walk does not abort on `execute_generator_frame`
+    // and does not hold a pointer to this frame's resume struct.
+    let executed = if operr.is_none() && throw_args.is_none() {
+        let input = match w_inputvalue {
+            Some(value) => value,
+            None => pyre_object::PY_NULL,
+        };
+        let value = crate::call::eval_resumed_frame_raw(
+            &mut *crate::eval::frame_anchor_live(frame_depth),
+            input,
+        );
+        if value.is_null() {
+            Err(crate::call::take_call_error().unwrap_or_else(|| {
+                crate::PyError::runtime_error("generator resume failed")
+            }))
+        } else {
+            Ok(value)
+        }
+    } else {
+        let mut resume = crate::call::FrameResumeArgs {
+            w_inputvalue,
+            operr,
+            throw_args,
+        };
+        crate::call::get_eval_fn()(
+            &mut *crate::eval::frame_anchor_live(frame_depth),
+            Some(&mut resume),
+        )
     };
     // `generator.py` `_leak_stopiteration` / `_leak_stopasynciteration`
     // run before the `finally`. The `Result` shell is built only after
