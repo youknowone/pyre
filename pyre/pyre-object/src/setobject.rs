@@ -780,7 +780,6 @@ unsafe fn wrap_shared_utf8(block: *mut crate::unicodeobject::Utf8Str) -> PyObjec
         value: block,
         byte_len,
         len: byte_len,
-        w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
         hash: 0,
     };
@@ -2290,18 +2289,14 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
 /// with `map`/`storage` at the `MapdictStorageMixin` initial state.
 /// `frozen` selects `FROZENSET_USER_TYPE`.
 ///
-/// `#[dont_look_inside]` for the same `RDict::default` storage-box reason as
-/// [`w_set_new`]. The subclass word is pinned before that box is built: a
-/// user class is movable, and the box allocation can collect.
+/// `#[dont_look_inside]` for the same nursery-allocation reason as
+/// [`w_set_new`]. The subclass word is pinned before the body malloc: a
+/// user class is movable, and the allocation can collect.
 #[majit_macros::dont_look_inside]
 pub fn w_set_user_new_empty(w_class: PyObjectRef, frozen: bool) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
-    let items =
-        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::default(), set_items_gc_type_id());
-    let items_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(items as PyObjectRef);
     let user_type: &'static PyType = if frozen {
         &FROZENSET_USER_TYPE
     } else {
@@ -2309,16 +2304,18 @@ pub fn w_set_user_new_empty(w_class: PyObjectRef, frozen: bool) -> PyObjectRef {
     };
     let raw =
         crate::gc_hook::try_gc_alloc_nursery_raw(W_SET_USER_GC_TYPE_ID, W_SET_USER_OBJECT_SIZE);
-    let items = crate::gc_roots::shadow_stack_get(items_slot) as *mut SetItemsStorage;
     let body = W_SetObjectUser {
         base: W_SetObject {
             ob_header: PyObject {
                 ob_type: user_type as *const PyType,
                 w_class: crate::gc_roots::shadow_stack_get(class_slot),
             },
-            items,
+            sstorage: EMPTY_SET_STRATEGY.get_empty_storage(),
+            strategy: &EMPTY_SET_STRATEGY_REF,
             len: crate::object_array::length_cell(0),
             hash: -1,
+            set_id: fresh_set_id(),
+            content_gen: crate::object_array::length_cell(0),
         },
         map: 0,
         storage: std::ptr::null_mut(),
@@ -4004,7 +4001,7 @@ mod tests {
         assert_eq!(W_SET_USER_GC_TYPE_ID, 166);
         assert_eq!(
             W_SET_OBJECT_SIZE,
-            std::mem::offset_of!(W_SetObject, hash) + std::mem::size_of::<i64>()
+            std::mem::offset_of!(W_SetObject, content_gen) + std::mem::size_of::<AtomicUsize>()
         );
         assert_eq!(
             W_SET_USER_OBJECT_SIZE,
