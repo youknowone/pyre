@@ -6803,9 +6803,11 @@ struct InteriorFieldAlias {
     header: InteriorHeader,
     index_local: usize,
     index_var: Variable,
-    /// `[Entry]` / `[Point]`. `extract_element_type_from_str` takes the
-    /// square-bracket interior before angle brackets, so the leaf is
-    /// `strip_instantiation_suffix`'d.
+    /// `GcArray<Entry>` / `GcArray<Point>`. `extract_element_type_from_str`
+    /// takes the angle-bracket interior, so the leaf is
+    /// `strip_instantiation_suffix`'d. The `GcArray<>` wrapper is the
+    /// length-prefixed ARRAY spelling: `nolength_from_array_type_id` is
+    /// false, matching `interiorfielddescrof_keyed`.
     array_type_id: String,
 }
 
@@ -32308,10 +32310,18 @@ fn struct_field_index_named(ty: &TyRef, llbc: &Llbc, name: &str) -> Option<usize
         .position(|field| field.name.as_deref() == Some(name))
 }
 
-/// `[Point]` / `[Entry]` for a `*mut`/`*const` named, non-transparent struct.
+/// `GcArray<Point>` / `GcArray<Entry>` for a `*mut`/`*const` named,
+/// non-transparent struct pointee.
 ///
 /// A scalar, a pointer, or a `repr(transparent)` pointee is `None`, so list
 /// `ArrayRead` intercepts and `direct_ptradd` keep those `.add` calls.
+///
+/// `get_array_descr` keys one ARRAY lltype, and `nolength` is a property of
+/// that lltype. `interiorfielddescrof_keyed` mints the length-prefixed
+/// shape (`!nolength`, items at `gc_typed_array_items_base`). A `[T]`
+/// spelling is an item run (`nolength_from_array_type_id`), so it cannot
+/// share an atid with that mint. `GcArray<T>` stays length-prefixed and
+/// `extract_element_type_from_str` still peels it to `T`.
 fn struct_pointee_array_type_id(
     base_ty: &TyRef,
     llbc: &Llbc,
@@ -32327,7 +32337,7 @@ fn struct_pointee_array_type_id(
     }
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
     let leaf = majit_ir::descr::strip_instantiation_suffix(&root);
-    Some(format!("[{leaf}]"))
+    Some(format!("GcArray<{leaf}>"))
 }
 
 enum HeaderProd {
@@ -70869,7 +70879,7 @@ mod tests {
         assert_eq!(field.owner_root.as_deref(), Some("Point"));
         assert_eq!(field.base_is_deref, Some(true));
         assert_eq!(item_ty, &ValueType::Int);
-        assert_eq!(array_type_id.as_deref(), Some("[Point]"));
+        assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
         assert_eq!(base, &block.inputargs[0]);
         assert_eq!(index, &block.inputargs[1]);
         assert!(
@@ -70981,7 +70991,7 @@ mod tests {
         assert_eq!(field.name, "y");
         assert_eq!(field.base_is_deref, Some(true));
         assert_eq!(item_ty, &ValueType::Int);
-        assert_eq!(array_type_id.as_deref(), Some("[Point]"));
+        assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
         assert_eq!(base, &block.inputargs[0]);
         assert_eq!(index, &block.inputargs[1]);
         assert_eq!(value, &block.inputargs[2]);
@@ -71079,7 +71089,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(field.name, "y");
-        assert_eq!(array_type_id.as_deref(), Some("[Point]"));
+        assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
         assert_eq!(value, consts[0]);
     }
 
@@ -71165,7 +71175,7 @@ mod tests {
                 } => {
                     assert_eq!(base, &block.inputargs[0]);
                     assert_eq!(index, &block.inputargs[1]);
-                    assert_eq!(array_type_id.as_deref(), Some("[Point]"));
+                    assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
                     Some(field.name.as_str())
                 }
                 _ => None,
@@ -71309,7 +71319,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(field.name, "value");
-        assert_eq!(array_type_id.as_deref(), Some("[Entry]"));
+        assert_eq!(array_type_id.as_deref(), Some("GcArray<Entry>"));
         assert_eq!(index, &block.inputargs[1]);
         assert_eq!(base, field_ops[0].result.as_ref().unwrap());
         assert!(
@@ -71434,7 +71444,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(field.name, "value");
-        assert_eq!(array_type_id.as_deref(), Some("[Entry]"));
+        assert_eq!(array_type_id.as_deref(), Some("GcArray<Entry>"));
         assert_eq!(base, &block.inputargs[0]);
         assert_eq!(index, &block.inputargs[1]);
         assert!(
