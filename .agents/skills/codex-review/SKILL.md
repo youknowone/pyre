@@ -62,7 +62,7 @@ starting this cycle or applying fixes. Run from the verified repository root:
 review_root="$(git rev-parse --show-toplevel)"
 mkdir -p "$review_root/scratchpad/codex-review"
 review_dir="$(mktemp -d "$review_root/scratchpad/codex-review/run.XXXXXX")"
-review_model='gpt-6-sol'
+review_model='gpt-6.1-sol'
 cat > "$review_dir/brief.md" <<'BRIEF'
 You are the read-only reviewer for a parent Codex review cycle.
 Read AGENTS.md and .agents/skills/parity/SKILL.md as review criteria.
@@ -86,7 +86,7 @@ writes only the child's final report; stdout carries progress. Save the exit
 status and only consume the report when the command succeeds and all four
 headings are present. Missing/truncated output is an incomplete review.
 
-`gpt-6-sol` preserves the source skill's reviewer default; honor a user
+`gpt-6.1-sol` preserves the source skill's reviewer default; honor a user
 `--model`/`-m` override. The repository requires both
 `--dangerously-bypass-approvals-and-sandbox` and `</dev/null` for noninteractive
 CLI delegation. This flag does not enforce read-only access: the brief defines
