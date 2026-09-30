@@ -490,6 +490,24 @@ pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
     }
 }
 
+/// Resume a suspended frame through the same one-word residual ABI.
+///
+/// `generator_invoke_execute_frame` used to call
+/// `PyFrame::execute_generator_frame`. That method has no fnaddr, so the
+/// walk aborts and the resume runs again. The body stays opaque here: the
+/// nested eval may enter the portal, and the enclosing trace must not.
+#[majit_macros::dont_look_inside]
+pub fn eval_resumed_frame_raw(frame: &mut PyFrame, resume: &mut FrameResumeArgs) -> PyObjectRef {
+    clear_call_error();
+    match get_eval_fn()(frame, Some(resume)) {
+        Ok(value) => value,
+        Err(error) => {
+            set_call_error(error);
+            PY_NULL
+        }
+    }
+}
+
 // ── JIT parameter injection ──────────────────────────────────────
 //
 // `pypy/interpreter/executioncontext.py settrace` invokes

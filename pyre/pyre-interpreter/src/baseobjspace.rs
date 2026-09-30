@@ -20983,18 +20983,19 @@ pub unsafe fn generator_invoke_execute_frame(
         Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
         None => None,
     };
-    // `PyFrame::execute_generator_frame` is this same body. Spelling it here
-    // keeps the portal on `get_eval_fn`: a residual call to the method has
-    // no fnaddr, the walk aborts, and this resume runs again from the top.
     let mut resume = crate::call::FrameResumeArgs {
         w_inputvalue,
         operr,
         throw_args,
     };
-    let executed = crate::call::get_eval_fn()(
+    let value = crate::call::eval_resumed_frame_raw(
         &mut *crate::eval::frame_anchor_live(frame_depth),
-        Some(&mut resume),
+        &mut resume,
     );
+    let executed = match crate::call::take_call_error() {
+        Some(error) => Err(error),
+        None => Ok(value),
+    };
     // `generator.py` `_leak_stopiteration` / `_leak_stopasynciteration`
     // run before the `finally`. The `Result` shell is built only after
     // `frame_anchor` is dropped, so the return block forwards the shell

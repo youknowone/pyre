@@ -2663,6 +2663,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::call::eval_current_frame_raw",
         crate::call::eval_current_frame_raw,
     );
+    p2(
+        &mut entries,
+        "pyre_interpreter::call::eval_resumed_frame_raw",
+        crate::call::eval_resumed_frame_raw,
+    );
     p1(
         &mut entries,
         "pyre_interpreter::display::jit_format_float_repr_rstr",
