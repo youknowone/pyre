@@ -816,31 +816,24 @@ impl W_ListObject {
         let value = *base.add(index);
         let p = base.add(index);
         std::ptr::copy(p.add(1), p, this.length_relaxed() - index - 1);
-        // Phase L2: the varsize walker forwards items[0..capacity], so clear the
-        // vacated tail slot the shift left holding a stale duplicate.
-        *base.add(this.length_relaxed() - 1) = PY_NULL;
-        this.set_length_relaxed(this.length_relaxed() - 1);
+        // `rlist.py ll_delitem_nonneg`: `ll_arraymove` then
+        // `ll_setitem_fast(newlength, null)` then `_ll_resize_le`.
+        let newlength = this.length_relaxed() - 1;
+        items_block_set_ref(this.items, newlength, PY_NULL);
+        this.set_length_relaxed(newlength);
         value
     }
 
     unsafe fn object_reverse(&mut self) {
-        // A permutation moves pointers across card pages without storing any
-        // new reference, so it owes the same barrier as the shifts above.
-        let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
-        let this = &mut *(obj as *mut W_ListObject);
-        // `rlist.py`'s `ll_reverse` operates on the logical list directly
-        // through ll_getitem_fast / ll_setitem_fast. Keep that shape here
-        // instead of manufacturing a Rust fat slice over the over-allocated
-        // items block.
-        //
-        // `rlist.py ll_reverse` look_inside_iff lives on [`w_list_reverse`].
-        let base = items_block_items_base(this.items);
+        // `rlist.py ll_reverse`: `ll_getitem_fast` / `ll_setitem_fast`.
+        // `w_list_reverse` owns the look_inside_iff and the pin.
         let mut i = 0;
-        let mut length_1_i = this.length_relaxed() as isize - 1;
+        let mut length_1_i = self.length_relaxed() as isize - 1;
         while i < length_1_i {
-            let tmp = *base.add(i as usize);
-            *base.add(i as usize) = *base.add(length_1_i as usize);
-            *base.add(length_1_i as usize) = tmp;
+            let tmp = ll_list_obj_getitem_fast(self, i as usize);
+            let other = ll_list_obj_getitem_fast(self, length_1_i as usize);
+            ll_list_obj_setitem_fast(self, i as usize, other);
+            ll_list_obj_setitem_fast(self, length_1_i as usize, tmp);
             i += 1;
             length_1_i -= 1;
         }
@@ -863,10 +856,10 @@ impl W_ListObject {
         std::ptr::copy(p.add(count), p, this.length_relaxed() - end);
         let old_len = this.length_relaxed();
         this.set_length_relaxed(this.length_relaxed() - count);
-        // Phase L2: clear the vacated tail [new_len..old_len] the shift left
-        // holding stale duplicates, so the varsize walker (0..capacity) skips them.
+        // `rlist.py ll_listdelslice_startstop`: `ll_arraymove` then
+        // `ll_setitem_fast` of null on the vacated tail.
         for i in this.length_relaxed()..old_len {
-            *base.add(i) = PY_NULL;
+            items_block_set_ref(this.items, i, PY_NULL);
         }
     }
 
@@ -921,9 +914,9 @@ impl W_ListObject {
                 base.add(s + len2),
                 old_len - s - slicelength,
             );
-            // Shrinking splice: clear the vacated tail [new_len..old_len].
+            // Shrinking splice: `ll_setitem_fast` of null on the vacated tail.
             for i in new_len..old_len {
-                *base.add(i) = PY_NULL;
+                items_block_set_ref(list.items, i, PY_NULL);
             }
             list.set_length_relaxed(new_len);
         }
@@ -6717,6 +6710,23 @@ mod tests {
             );
             // Residual `look_inside_iff` takes the orig arm (`!we_are_jitted()`).
             assert!(!w_list_reverse_iff(list));
+        }
+    }
+
+    #[test]
+    fn test_object_list_reverse_uses_setitem_fast() {
+        // `rlist.py ll_reverse` stores through `ll_setitem_fast`.
+        let a = w_int_new(1);
+        let b = w_int_new(2);
+        let c = w_int_new(3);
+        let list = w_list_new_object(vec![a, b, c]);
+        unsafe {
+            assert!(w_list_uses_object_storage(list));
+            w_list_reverse(list);
+            assert!(w_list_uses_object_storage(list));
+            assert!(std::ptr::eq(w_list_getitem(list, 0).unwrap(), c));
+            assert!(std::ptr::eq(w_list_getitem(list, 1).unwrap(), b));
+            assert!(std::ptr::eq(w_list_getitem(list, 2).unwrap(), a));
         }
     }
 
