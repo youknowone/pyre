@@ -408,6 +408,22 @@ macro_rules! define_call_sig_stubs {
                 classes => lookup_single_v(classes),
             }
         }
+
+        fn lookup_stub_s(classes: &[ArgClass]) -> unsafe fn(usize, &[i64]) -> i64 {
+            match classes {
+                $(
+                    [$(ArgClass::$class),*] => {
+                        unsafe fn stub(func: usize, args: &[i64]) -> i64 {
+                            let value: f32 =
+                                unsafe { invoke_stub!(func, args, f32 $(, $class)*) };
+                            value.to_bits() as i64
+                        }
+                        stub
+                    }
+                )*
+                classes => lookup_single_s(classes),
+            }
+        }
     };
 }
 
@@ -683,13 +699,20 @@ pub fn create_call_stub(arg_classes: &str, result_type: char) -> BhCallStub {
     }
 
     let classes = &classes_buf[..arity as usize];
+    // descr.py result 'S': the callee returns C `float`, then
+    // `singlefloat2int` stores the bits in the int result.
+    let call_i = if result_type == 'S' {
+        lookup_stub_s(classes)
+    } else {
+        lookup_stub_i(classes)
+    };
     BhCallStub::new(
         slots,
         arity,
         expect_i,
         expect_r,
         expect_f,
-        lookup_stub_i(classes),
+        call_i,
         lookup_stub_f(classes),
         lookup_stub_v(classes),
     )
@@ -1036,6 +1059,10 @@ mod tests {
         a.to_bits() as i64 + b
     }
 
+    extern "C" fn single_ret(a: f32) -> f32 {
+        a + 1.0
+    }
+
     extern "C" fn f2(a: f64, b: *const i64) -> f64 {
         a + unsafe { *b } as f64
     }
@@ -1063,6 +1090,16 @@ mod tests {
             )
         };
         assert_eq!(result, bits + 7);
+    }
+
+    /// `descr.py` result `'S'`: `singlefloat2int` of the callee's `float`.
+    #[test]
+    fn call_stub_result_singlefloat_returns_f32_bits() {
+        let stub = create_call_stub("S", 'S');
+        let bits = 1.5f32.to_bits() as i64;
+        let result =
+            unsafe { stub.call_i(single_ret as *const () as usize, Some(&[bits]), None, None) };
+        assert_eq!(result, 2.5f32.to_bits() as i64);
     }
 
     /// Rust port of

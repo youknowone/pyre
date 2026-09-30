@@ -3301,7 +3301,7 @@ fn stub_matches_table(
     let Some(sig) = residual_target_sig(func_ptr as i64) else {
         return false;
     };
-    if sig.has_f32() || sig.params.len() != classes.len() {
+    if sig.params.len() != classes.len() {
         return false;
     }
     for (param, class) in sig.params.iter().zip(classes) {
@@ -3320,6 +3320,7 @@ fn stub_matches_table(
         'v' => None,
         'r' | 'i' => Some(FuncSigVal::I64),
         'f' => Some(FuncSigVal::F64),
+        'S' => Some(FuncSigVal::F32),
         _ => return false,
     };
     sig.result == expect_result

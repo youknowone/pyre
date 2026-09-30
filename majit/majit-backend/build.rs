@@ -21,6 +21,7 @@ fn generate() -> String {
     emit_lookup(&mut out, "lookup_single_i", " -> i64", "i64", &seqs);
     emit_lookup(&mut out, "lookup_single_f", " -> f64", "f64", &seqs);
     emit_lookup(&mut out, "lookup_single_v", "", "()", &seqs);
+    emit_single_result(&mut out, &seqs);
     out
 }
 
@@ -64,4 +65,28 @@ fn emit_lookup(out: &mut String, name: &str, ret: &str, invoke_ret: &str, seqs: 
         );
     }
     out.push_str("        classes => unsupported_call_sig(classes),\n    }\n}\n\n");
+}
+
+fn emit_single_result(out: &mut String, seqs: &[Vec<&str>]) {
+    out.push_str(
+        "fn lookup_single_s(classes: &[ArgClass]) -> unsafe fn(usize, &[i64]) -> i64 {\n    \
+         match classes {\n",
+    );
+    for seq in seqs {
+        let pat = seq
+            .iter()
+            .map(|class| format!("ArgClass::{class}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let args = seq.join(", ");
+        let _ = writeln!(
+            out,
+            "        [{pat}] => {{\n            \
+             unsafe fn stub(func: usize, args: &[i64]) -> i64 {{\n                \
+             let value: f32 = unsafe {{ invoke_stub!(func, args, f32, {args}) }};\n                \
+             value.to_bits() as i64\n            \
+             }}\n            stub\n        }}"
+        );
+    }
+    out.push_str("        classes => unsupported_call_sig(classes),\n    }\n}\n");
 }
