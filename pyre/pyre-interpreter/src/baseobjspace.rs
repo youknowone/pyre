@@ -5628,6 +5628,8 @@ pub fn findattr(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
     if unsafe { is_none(obj) } {
         return Ok(None);
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj = pyre_object::gc_roots::pin_root(obj);
     match getattr_str_impl(obj, name, true, true) {
         Ok(value) if value.is_null() => Ok(None),
         Ok(value) => Ok(Some(value)),
@@ -6412,9 +6414,8 @@ pub fn clear_all_weakrefs(obj: PyObjectRef) {
 
 pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     // `space.getattr` — the full path, including the `__getattr__` fallback.
-    // The impl's own root frame is popped before this `map_err` runs, and
-    // a user `__getattr__` may have collected, so the receiver is pinned
-    // across both the lookup and the AttributeError enrichment.
+    // A user `__getattr__` may collect, so the receiver is pinned across
+    // both the lookup and the AttributeError enrichment.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
@@ -6441,7 +6442,12 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 /// `suppress` is `_PyObject_LookupAttr`'s flag: the caller swallows the
 /// AttributeError, so a terminal module miss skips the `__spec__` shadowing
 /// diagnosis that exists only to phrase the surfaced message.
-fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: bool) -> PyResult {
+pub fn getattr_str_impl(
+    obj: PyObjectRef,
+    name: &str,
+    call_getattr: bool,
+    suppress: bool,
+) -> PyResult {
     // `pypy/interpreter/baseobjspace.py:1146-1162 getattr`:
     //
     //     def getattr(self, w_obj, w_name):
@@ -6459,10 +6465,8 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
     // dedicated deref opcodes; a cell that reaches ordinary object-space
     // operations is a user-visible object in its own right.
     //
-    // `ObjSpace.getattr` keeps `w_obj` live across the lookup and the
-    // `get_and_call_function` / `w_method_new` allocations below. Pin the
-    // receiver here; each later collecting call reloads from this slot.
-    let _getattr_roots = pyre_object::gc_roots::push_roots();
+    // `ObjSpace.getattr` keeps `w_obj` live across the lookup. The
+    // entry opened the bracket; pin into that stack.
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
@@ -7838,7 +7842,7 @@ pub fn object_getattribute(mut obj: PyObjectRef, name: &str) -> PyResult {
     // their pure descriptor protocol with no `__getattr__` fallback — that
     // belongs to space.getattr, not the bare object.__getattribute__ slot
     // (descroperation.py).
-    getattr_str_impl(obj, name, false, false)
+    pyre_object::with_roots!(obj => getattr_str_impl(obj, name, false, false))
 }
 
 /// typeobject.py `W_TypeObject.descr_getattribute` — the canonical
@@ -16412,7 +16416,8 @@ pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::P
             if unsafe { is_instance(w_obj) } {
                 return Ok(default);
             }
-            match getattr_str_impl(w_obj, "__length_hint__", false, false) {
+            match pyre_object::with_roots!(w_obj => getattr_str_impl(w_obj, "__length_hint__", false, false))
+            {
                 Ok(m) => crate::call::call_function_impl_result(m, &[]),
                 Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(default),
                 Err(e) => Err(e),

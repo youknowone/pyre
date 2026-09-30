@@ -1955,7 +1955,8 @@ fn new_instance(w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef,
     live.extend_from_slice(args);
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&live);
-    let w_new = pyre_interpreter::baseobjspace::getattr_str(roots.get(base), "__new__")?;
+    let w_new =
+        pyre_interpreter::baseobjspace::getattr_str_impl(roots.get(base), "__new__", true, false)?;
     let w_cls = roots.get(base);
     let mut reloaded_args = vec![pyre_object::PY_NULL; nargs];
     pyre_object::gc_roots::shadow_stack_copy_range(base + 1, &mut reloaded_args);
@@ -2000,6 +2001,9 @@ fn new_instance_star(
             pyre_interpreter::type_methods::arg_type_name(w_kwargs),
         )));
     }
+    // One bracket for the live operands. `getattr_str` opens its own, so
+    // pin here and call `getattr_str_impl` into this stack — `load_newobj`
+    // then `space.getattr` / `space.call_args` with Arguments livevars.
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(w_cls);
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -2009,9 +2013,11 @@ fn new_instance_star(
         let _ = pyre_object::gc_roots::pin_root(kwargs);
         pyre_object::gc_roots::shadow_stack_len() - 1
     });
-    let w_new = pyre_interpreter::baseobjspace::getattr_str(
+    let w_new = pyre_interpreter::baseobjspace::getattr_str_impl(
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
         "__new__",
+        true,
+        false,
     )?;
     let _ = pyre_object::gc_roots::pin_root(w_new);
     let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -2024,10 +2030,10 @@ fn new_instance_star(
             star_slot,
         ))? == 0
     {
-        return call_fn(
-            pyre_object::gc_roots::shadow_stack_get(new_slot),
-            &[pyre_object::gc_roots::shadow_stack_get(cls_slot)],
-        );
+        let w_new = pyre_object::gc_roots::shadow_stack_get(new_slot);
+        let w_cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+        drop(_roots);
+        return call_fn(w_new, &[w_cls]);
     }
 
     let mut unpacked = Vec::new();
@@ -2064,11 +2070,10 @@ fn new_instance_star(
     call_args.push(pyre_object::gc_roots::shadow_stack_get(cls_slot));
     call_args
         .extend((positional_base..keyword_name_base).map(pyre_object::gc_roots::shadow_stack_get));
+    let w_new = pyre_object::gc_roots::shadow_stack_get(new_slot);
     if keyword_name_base == keyword_value_base {
-        return call_fn(
-            pyre_object::gc_roots::shadow_stack_get(new_slot),
-            &call_args,
-        );
+        drop(_roots);
+        return call_fn(w_new, &call_args);
     }
     let keyword_count = keyword_value_base - keyword_name_base;
     let kwargs: Vec<_> = (0..keyword_count)
@@ -2081,6 +2086,7 @@ fn new_instance_star(
             )
         })
         .collect();
+    drop(_roots);
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
         return Err(unpickling_error("no execution context for NEWOBJ_EX"));
@@ -2089,12 +2095,7 @@ fn new_instance_star(
     if frame.is_null() {
         return Err(unpickling_error("no frame for NEWOBJ_EX with kwargs"));
     }
-    pyre_interpreter::call::call_with_kwargs(
-        unsafe { &mut *frame },
-        pyre_object::gc_roots::shadow_stack_get(new_slot),
-        &call_args,
-        &kwargs,
-    )
+    pyre_interpreter::call::call_with_kwargs(unsafe { &mut *frame }, w_new, &call_args, &kwargs)
 }
 
 /// `load_build` — apply pickled state to a freshly created instance.
