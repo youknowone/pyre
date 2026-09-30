@@ -2075,7 +2075,7 @@ fn template_items_from_list(w_result: PyObjectRef) -> Result<Vec<TemplateItem>, 
     if !unsafe { pyre_object::is_list(w_result) } {
         return Err(crate::PyError::type_error(format!(
             "template() argument 2 must be list, not {}",
-            crate::baseobjspace::object_functionstr_type_name(w_result)
+            crate::type_methods::clinic_arg_type_name(w_result)
         )));
     }
     let n = unsafe { pyre_object::w_list_len(w_result) };

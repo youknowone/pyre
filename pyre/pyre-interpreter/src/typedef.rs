@@ -6471,16 +6471,6 @@ crate::builtin_wrapper_descriptor!(
     __majit_wrap_list_descr_extend
 );
 
-/// Name of `obj`'s type, for operand-type error messages.
-fn arg_type_name(obj: PyObjectRef) -> String {
-    unsafe {
-        match r#type(obj) {
-            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-            None => (*(*obj).ob_type).name.to_string(),
-        }
-    }
-}
-
 fn list_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 0)?;
     let list = crate::type_methods::require_list_receiver(args, "__sizeof__", false)?;
@@ -7734,7 +7724,7 @@ fn init_str_type(ns: PyObjectRef) {
                         if !unsafe { pyre_object::is_str(y_obj) } {
                             return Err(crate::PyError::type_error(format!(
                                 "maketrans() argument 2 must be str, not {}",
-                                crate::type_methods::arg_type_name(y_obj)
+                                crate::type_methods::clinic_arg_type_name(y_obj)
                             )));
                         }
                         if args.len() == 3 {
@@ -7742,7 +7732,7 @@ fn init_str_type(ns: PyObjectRef) {
                             if !unsafe { pyre_object::is_str(z_obj) } {
                                 return Err(crate::PyError::type_error(format!(
                                     "maketrans() argument 3 must be str, not {}",
-                                    crate::type_methods::arg_type_name(z_obj)
+                                    crate::type_methods::clinic_arg_type_name(z_obj)
                                 )));
                             }
                         }
@@ -25621,7 +25611,7 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
         }
         Some(b) => {
-            let tname = crate::error::type_name_of(b);
+            let tname = crate::type_methods::clinic_arg_type_name(b);
             return Err(crate::PyError::type_error(format!(
                 "from_bytes() argument 'byteorder' must be str, not {tname}"
             )));
@@ -33546,7 +33536,7 @@ fn tee_dataobject_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     if !unsafe { crate::baseobjspace::isinstance_list_w(w_values) } {
         return Err(crate::PyError::type_error(format!(
             "teedataobject() argument 2 must be list, not {}",
-            arg_type_name(w_values)
+            crate::type_methods::clinic_arg_type_name(w_values)
         )));
     }
 

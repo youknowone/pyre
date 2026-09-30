@@ -6755,20 +6755,20 @@ fn type_descr_new_with_metaclass(
         if !unsafe { crate::baseobjspace::isinstance_str_w(name_obj) } {
             return Err(crate::PyError::type_error(format!(
                 "type.__new__() argument 1 must be str, not {}",
-                crate::error::type_name_of(name_obj)
+                crate::type_methods::clinic_arg_type_name(name_obj)
             )));
         }
         if !unsafe { is_tuple(bases) } {
             return Err(crate::PyError::type_error(format!(
                 "type.__new__() argument 2 must be tuple, not {}",
-                crate::error::type_name_of(bases)
+                crate::type_methods::clinic_arg_type_name(bases)
             )));
         }
         let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
         if !unsafe { crate::baseobjspace::isinstance_w(w_namespace_dict, w_dict_type) } {
             return Err(crate::PyError::type_error(format!(
                 "type.__new__() argument 3 must be dict, not {}",
-                crate::error::type_name_of(w_namespace_dict)
+                crate::type_methods::clinic_arg_type_name(w_namespace_dict)
             )));
         }
         // name/bases/dict all relocate. Everything from here down
@@ -9442,7 +9442,7 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
         if !crate::baseobjspace::isinstance_str_w(slot(1)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 1 must be str, not {}",
-                crate::error::type_name_of(slot(1))
+                crate::type_methods::clinic_arg_type_name(slot(1))
             )));
         }
         let start = unicode_error_index_w(slot(2))?;
@@ -9450,7 +9450,7 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
         if !crate::baseobjspace::isinstance_str_w(slot(4)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 4 must be str, not {}",
-                crate::error::type_name_of(slot(4))
+                crate::type_methods::clinic_arg_type_name(slot(4))
             )));
         }
         // The second allocation can move the first one's result.
@@ -9507,7 +9507,7 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         if !crate::baseobjspace::isinstance_str_w(slot(1)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 1 must be str, not {}",
-                crate::error::type_name_of(slot(1))
+                crate::type_methods::clinic_arg_type_name(slot(1))
             )));
         }
         if !crate::baseobjspace::isinstance_bytes_like_w(slot(2)) {
@@ -9521,7 +9521,7 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         if !crate::baseobjspace::isinstance_str_w(slot(5)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 5 must be str, not {}",
-                crate::error::type_name_of(slot(5))
+                crate::type_methods::clinic_arg_type_name(slot(5))
             )));
         }
         // `interp_exceptions.py:1043-1046` — `space.charbuf_w` /
@@ -9606,13 +9606,13 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         if !crate::baseobjspace::isinstance_str_w(slot(1)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 1 must be str, not {}",
-                crate::error::type_name_of(slot(1))
+                crate::type_methods::clinic_arg_type_name(slot(1))
             )));
         }
         if !crate::baseobjspace::isinstance_str_w(slot(2)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 2 must be str, not {}",
-                crate::error::type_name_of(slot(2))
+                crate::type_methods::clinic_arg_type_name(slot(2))
             )));
         }
         let start = unicode_error_index_w(slot(3))?;
@@ -9620,7 +9620,7 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         if !crate::baseobjspace::isinstance_str_w(slot(5)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 5 must be str, not {}",
-                crate::error::type_name_of(slot(5))
+                crate::type_methods::clinic_arg_type_name(slot(5))
             )));
         }
         // The second allocation can move the first one's result.
@@ -11022,7 +11022,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let message = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let w_exceptions = pyre_object::gc_roots::shadow_stack_get(base + 2);
     if !unsafe { crate::baseobjspace::isinstance_str_w(message) } {
-        let type_name = crate::baseobjspace::object_functionstr_type_name(message);
+        let type_name = crate::type_methods::clinic_arg_type_name(message);
         return Err(crate::PyError::type_error(format!(
             "BaseExceptionGroup.__new__() argument 1 must be str, not {type_name}"
         )));
@@ -22037,7 +22037,7 @@ pub unsafe fn fileio_writebuf(
         // PyPy `ObjSpace.acquire_writebuf` reports the rejected exporter's
         // type.  CPython 3.14's readinto gateways keep the same information
         // but prefix it with the argument name owned by the builtin method.
-        let type_name = crate::error::type_name_of(obj);
+        let type_name = crate::type_methods::clinic_arg_type_name(obj);
         crate::PyError::type_error(format!(
             "readinto() argument must be read-write bytes-like object, not {type_name}"
         ))
@@ -23502,7 +23502,7 @@ fn builtin_open_impl(
     if unsafe { !pyre_object::is_str(w_mode) } {
         return Err(crate::PyError::type_error(format!(
             "open() argument 'mode' must be str, not {}",
-            crate::type_methods::arg_type_name(w_mode)
+            crate::type_methods::clinic_arg_type_name(w_mode)
         )));
     }
     let mode = crate::baseobjspace::str_utf8_w(w_mode)?.to_string();

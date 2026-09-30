@@ -19,7 +19,7 @@ fn generate_suggestions(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interp
     if !unsafe { is_str(item) } {
         return Err(pyre_interpreter::PyError::type_error(format!(
             "_generate_suggestions() argument 2 must be str, not {}",
-            pyre_interpreter::error::type_name_of(item)
+            pyre_interpreter::type_methods::clinic_arg_type_name(item)
         )));
     }
     // `PyList_CheckExact`, so a list subclass is refused with everything else

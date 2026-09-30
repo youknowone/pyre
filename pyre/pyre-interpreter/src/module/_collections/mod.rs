@@ -381,7 +381,7 @@ pub mod deque_iter {
         }
         let mut deque = positional[0];
         if W_Deque::from_obj(deque).is_none() {
-            let name = crate::error::type_name_of(deque);
+            let name = crate::type_methods::clinic_arg_type_name(deque);
             return Err(crate::PyError::type_error(format!(
                 "must be collections.deque, not {name}"
             )));
@@ -535,7 +535,7 @@ pub mod deque_rev_iter {
             }
             let mut deque = positional[0];
             if W_Deque::from_obj(deque).is_none() {
-                let name = crate::error::type_name_of(deque);
+                let name = crate::type_methods::clinic_arg_type_name(deque);
                 return Err(crate::PyError::type_error(format!(
                     "must be collections.deque, not {name}"
                 )));

@@ -984,7 +984,7 @@ crate::py_module! {
                 if unsafe { !pyre_object::is_tuple(skip_file_prefixes) } {
                     return Err(PyError::type_error(format!(
                         "warn() argument 'skip_file_prefixes' must be tuple, not {}",
-                        crate::baseobjspace::object_functionstr_type_name(skip_file_prefixes),
+                        crate::type_methods::clinic_arg_type_name(skip_file_prefixes),
                     )));
                 }
                 let mut prefixes = Vec::new();
