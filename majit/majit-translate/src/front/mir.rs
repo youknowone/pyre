@@ -2045,14 +2045,15 @@ impl SemanticFunctionHeader {
     /// `policy.py` `look_inside_graph` keeps the template out of the
     /// jitcode closure. A copy that folded the const has no sentinel and
     /// stays look-inside. An explicit `jit_look_inside` wins.
+    ///
+    /// The eager `build_decl` path stamps the header, and `GraphStamp::apply`
+    /// copies it onto the body. The on-demand path snapshots the header
+    /// before the body exists (`GraphBodyProvider`), so that body is stamped
+    /// by `stamp_unresolved_trait_const_residual` after it is lowered.
     fn residualize_unresolved_trait_const(&mut self, graph: &crate::model::FunctionGraph) {
-        if !graph_calls_unresolved_trait_const(graph) {
-            return;
+        if unresolved_trait_const_needs_residual(&self.hints, graph) {
+            self.hints.push("dont_look_inside".to_string());
         }
-        if self.hints.iter().any(|hint| look_inside_hint_is_set(hint)) {
-            return;
-        }
-        self.hints.push("dont_look_inside".to_string());
     }
 
     /// Stamp the header onto the lowered body and assemble the
@@ -2102,6 +2103,22 @@ impl SemanticFunctionHeader {
 /// override it.
 fn look_inside_hint_is_set(hint: &str) -> bool {
     hint == "dont_look_inside" || hint.starts_with("jit_look_inside")
+}
+
+/// The lowered body still passes the unresolved `TraitConst` sentinel and
+/// no `_jit_look_inside_` hint has already decided.
+fn unresolved_trait_const_needs_residual(hints: &[String], graph: &FunctionGraph) -> bool {
+    graph_calls_unresolved_trait_const(graph)
+        && !hints.iter().any(|hint| look_inside_hint_is_set(hint))
+}
+
+/// Stamp `residualize_unresolved_trait_const` onto a body whose header
+/// was snapshotted before the body existed. `policy.py`
+/// `look_inside_graph` reads the hint off the built graph.
+pub(crate) fn stamp_unresolved_trait_const_residual(graph: &mut FunctionGraph) {
+    if unresolved_trait_const_needs_residual(&graph.hints, graph) {
+        graph.hints.push("dont_look_inside".to_string());
+    }
 }
 
 /// The body still passes the unresolved `TraitConst` sentinel
