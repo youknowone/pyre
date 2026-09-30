@@ -6745,6 +6745,76 @@ fn emit_jitframe_write_barrier(
     builder.seal_block(cont_block);
 }
 
+/// `emit_op_zero_array`: a constant zero length stores nothing, and a short
+/// constant range is a run of stores. The inline ceiling is `14 * limit`,
+/// the cutoff that emitter uses before `memset`. Returns false when the
+/// range is not a compile-time constant inside that ceiling, or a store
+/// would run past `byte_len`; the caller then uses `zero_memory_shim`.
+fn emit_inline_zero_array(
+    builder: &mut FunctionBuilder,
+    base: CValue,
+    byte_offset: i64,
+    byte_len: i64,
+    start_byte: i64,
+    item_size: i64,
+) -> bool {
+    if byte_len == 0 {
+        return true;
+    }
+    if byte_len < 0 || byte_offset < 0 || start_byte < 0 {
+        return false;
+    }
+    let natural: i64 = if item_size & 1 != 0 {
+        1
+    } else if item_size & 2 != 0 {
+        2
+    } else if item_size & 4 != 0 {
+        4
+    } else {
+        8
+    };
+    // Constant start widens a sub-word item up to an 8-byte store.
+    let limit = if natural < 8 { 8 } else { natural };
+    if byte_len > 14 * limit {
+        return false;
+    }
+    let Some(end) = byte_offset.checked_add(byte_len) else {
+        return false;
+    };
+    if end > i32::MAX as i64 {
+        return false;
+    }
+
+    let mut next_group: i64 = if natural < 8 { (-start_byte) & 7 } else { -1 };
+    let mut planned: Vec<(i32, i64)> = Vec::new();
+    let mut i = 0i64;
+    while i < byte_len {
+        let mut sz = natural;
+        if i == next_group {
+            next_group += 8;
+            if next_group <= byte_len && (byte_offset + i) % 8 == 0 {
+                sz = 8;
+            }
+        }
+        if i + sz > byte_len {
+            return false;
+        }
+        planned.push(((byte_offset + i) as i32, sz));
+        i += sz;
+    }
+
+    for (at, sz) in planned {
+        let val = match sz {
+            8 => builder.ins().iconst(cl_types::I64, 0),
+            4 => builder.ins().iconst(cl_types::I32, 0),
+            2 => builder.ins().iconst(cl_types::I16, 0),
+            _ => builder.ins().iconst(cl_types::I8, 0),
+        };
+        builder.ins().store(MemFlagsData::trusted(), val, base, at);
+    }
+    true
+}
+
 extern "C" fn zero_memory_shim(base: u64, offset: u64, size: u64) {
     if size == 0 {
         return;
@@ -16935,6 +17005,38 @@ impl CraneliftBackend {
                         op.arg(4).to_opref(),
                         "ZERO_ARRAY scale_size",
                     )?;
+                    // emit_op_zero_array: ConstInt size 0 emits nothing, and a
+                    // short constant range is stores. A runtime start/size, or
+                    // a range past that ceiling, stays on zero_memory_shim.
+                    let start_const = lookup_const_i64(&constants, op.arg(1).to_opref());
+                    let size_const = lookup_const_i64(&constants, op.arg(2).to_opref());
+                    let byte_len_const = size_const.and_then(|sz| sz.checked_mul(scale_size));
+                    let start_byte_const = start_const.and_then(|st| st.checked_mul(scale_start));
+                    let byte_off_const =
+                        start_byte_const.and_then(|sb| (ad.base_size() as i64).checked_add(sb));
+                    let inlined = match (byte_off_const, byte_len_const, start_byte_const) {
+                        (_, Some(0), _) => true,
+                        (Some(off), Some(len), Some(start_b)) if len > 0 => {
+                            let base = resolve_opref(
+                                &mut builder,
+                                &opref_var_map,
+                                &constants,
+                                op.arg(0).to_opref(),
+                            );
+                            emit_inline_zero_array(
+                                &mut builder,
+                                base,
+                                off,
+                                len,
+                                start_b,
+                                ad.item_size() as i64,
+                            )
+                        }
+                        _ => false,
+                    };
+                    if inlined {
+                        continue;
+                    }
                     let base = resolve_opref(
                         &mut builder,
                         &opref_var_map,
@@ -29398,6 +29500,135 @@ mod tests {
         assert_eq!(&data[8..12], &[1, 1, 1, 1]);
         assert_eq!(&data[12..20], &[0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(&data[20..24], &[4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn test_zero_array_constant_zero_length_leaves_bytes() {
+        let mut backend = CraneliftBackend::new();
+        let ad = make_array_descr(8, 8, Type::Int, None);
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::ZeroArray,
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::int_op(100),
+                    OpRef::int_op(101),
+                    OpRef::int_op(102),
+                    OpRef::int_op(103),
+                ],
+                OpRef::NONE.raw(),
+                ad,
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(100, 0);
+        constants.insert(101, 0);
+        constants.insert(102, 1);
+        constants.insert(103, 1);
+        backend.set_constants(constants);
+
+        let token = JitCellToken::new(1102);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let mut data = vec![0xABu8; 32];
+        let ptr = data.as_mut_ptr() as usize;
+        backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
+        assert_eq!(data, vec![0xABu8; 32]);
+    }
+
+    #[test]
+    fn test_zero_array_inlines_constant_aligned_tail() {
+        let mut backend = CraneliftBackend::new();
+        let ad = make_array_descr(8, 8, Type::Int, None);
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::ZeroArray,
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::int_op(100),
+                    OpRef::int_op(101),
+                    OpRef::int_op(102),
+                    OpRef::int_op(103),
+                ],
+                OpRef::NONE.raw(),
+                ad,
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(100, 8);
+        constants.insert(101, 24);
+        constants.insert(102, 1);
+        constants.insert(103, 1);
+        backend.set_constants(constants);
+
+        let token = JitCellToken::new(1103);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let mut data = vec![0x11u8; 16];
+        data.extend(std::iter::repeat(0x22u8).take(24));
+        data.extend(std::iter::repeat(0x33u8).take(8));
+        let ptr = data.as_mut_ptr() as usize;
+        backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
+        assert_eq!(&data[..16], &[0x11u8; 16]);
+        assert_eq!(&data[16..40], &[0u8; 24]);
+        assert_eq!(&data[40..48], &[0x33u8; 8]);
+    }
+
+    #[test]
+    fn test_zero_array_odd_constant_length_clears_exact_bytes() {
+        let mut backend = CraneliftBackend::new();
+        let ad = make_array_descr(8, 8, Type::Int, None);
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::ZeroArray,
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::int_op(100),
+                    OpRef::int_op(101),
+                    OpRef::int_op(102),
+                    OpRef::int_op(103),
+                ],
+                OpRef::NONE.raw(),
+                ad,
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(100, 0);
+        constants.insert(101, 20);
+        constants.insert(102, 1);
+        constants.insert(103, 1);
+        backend.set_constants(constants);
+
+        let token = JitCellToken::new(1104);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let mut data = vec![0xFFu8; 40];
+        let ptr = data.as_mut_ptr() as usize;
+        backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
+        assert_eq!(&data[..8], &[0xFFu8; 8]);
+        assert_eq!(&data[8..28], &[0u8; 20]);
+        assert_eq!(&data[28..40], &[0xFFu8; 12]);
     }
 
     #[test]

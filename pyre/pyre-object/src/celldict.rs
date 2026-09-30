@@ -621,8 +621,22 @@ pub fn module_dict_entries_insert(
     if let Some(slot) = entries.get_mut(key) {
         return Some(crate::rordereddict::replace_value(slot, w_value));
     }
-    let block = crate::unicodeobject::alloc_utf8_payload(key.as_bytes(), true);
-    entries.insert(StrKey(block), w_value)
+    entries.insert(StrKey(module_dict_key_block(key)), w_value)
+}
+
+/// The `STR` a new module-dict entry is keyed by.
+///
+/// `celldict.py setitem_str` stores the caller's unwrapped `str` as the key
+/// and allocates nothing: `STORE_NAME` / `STORE_GLOBAL` pass
+/// `pycode.co_names_w[i]`'s value, which `pycode.py` interned. That object is
+/// the canonical interned `str` for these characters, so its `_utf8` block is
+/// the key upstream stores. A key nobody interned, which only a runtime-built
+/// name reaches, gets a block of its own.
+fn module_dict_key_block(key: &str) -> *mut crate::unicodeobject::Utf8Str {
+    if let Some(w_name) = crate::unicodeobject::get_interned_wtf8(rustpython_wtf8::Wtf8::new(key)) {
+        return unsafe { (*(w_name as *const crate::unicodeobject::W_UnicodeObject)).value };
+    }
+    crate::unicodeobject::alloc_utf8_payload(key.as_bytes(), true)
 }
 
 impl ModuleDictStorage {

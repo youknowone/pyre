@@ -28165,22 +28165,24 @@ pub(crate) fn set_descr_contains(
     }
 }
 
-/// `setobject.py EmptySetStrategy.remove` returns False without
-/// hashing, so an empty set removes nothing and never raises. Every other
-/// strategy hashes; pyre carries no strategies, so the length stands in for
-/// the strategy dispatch.
+/// `setobject.py W_BaseSetObject.remove` → `strategy.remove`.
+///
+/// The key is hashed before the strategy answers, on every strategy.
+/// `EmptySetStrategy.remove` returns False without hashing, so
+/// `set().remove([])` is `KeyError` and `set().discard([])` is `None` there;
+/// 3.14 raises `TypeError` for both (measured on 3.14.6). The hash happens in
+/// `set_discard_checked` before `w_set_discard_key_checked` reaches the
+/// empty arm, the shape `EmptySetStrategy.has_key` already uses.
 fn set_remove(w_set: PyObjectRef, w_item: PyObjectRef) -> Result<bool, crate::PyError> {
-    if unsafe { pyre_object::w_set_len(w_set) } == 0 {
-        return Ok(false);
-    }
     crate::type_methods::set_discard_checked(w_set, w_item)
 }
 
 /// Discard an element from a set, with automatic conversion to frozenset if
 /// the argument is a set. Returns true if successfully removed.
 ///
-/// `setobject.py W_BaseSetObject._discard_from_set`. Upstream's trailing
-/// `switch_to_empty_strategy` has no counterpart here.
+/// `setobject.py W_BaseSetObject._discard_from_set`. The trailing
+/// `switch_to_empty_strategy` runs inside `w_set_discard_key_checked` when a
+/// removal leaves the live table empty.
 fn set_discard_from_set(
     mut w_set: PyObjectRef,
     mut w_item: PyObjectRef,

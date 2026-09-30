@@ -1624,6 +1624,7 @@ two-phase-never-a-subject	pyre_object::celldict::_orig_module_dict_entries_get
 two-phase-never-a-subject	pyre_object::celldict::_orig_module_dict_entries_insert
 two-phase-never-a-subject	pyre_object::celldict::module_dict_entries_get
 two-phase-never-a-subject	pyre_object::celldict::module_dict_entries_insert
+two-phase-never-a-subject	pyre_object::celldict::module_dict_key_block
 two-phase-never-a-subject	pyre_object::dict_eq_hook::try_hash_str
 two-phase-never-a-subject	pyre_object::dictmultiobject::<Impl>::copy
 two-phase-never-a-subject	pyre_object::dictmultiobject::<Impl>::delitem
@@ -1809,11 +1810,20 @@ two-phase-never-a-subject	pyre_object::pyobject::notify_w_class_mutated_then
 two-phase-never-a-subject	pyre_object::quasiimmut::<Impl>::invalidate
 two-phase-never-a-subject	pyre_object::quasiimmut::<Impl>::invalidate_then_store
 two-phase-never-a-subject	pyre_object::quasiimmut::<Impl>::take
+two-phase-never-a-subject	pyre_object::rordereddict::<Impl>::dict_grow
 two-phase-never-a-subject	pyre_object::rordereddict::<Impl>::entry_at_mut
 two-phase-never-a-subject	pyre_object::rordereddict::<Impl>::entry_ptr
 two-phase-never-a-subject	pyre_object::rordereddict::<Impl>::entry_valid
 two-phase-never-a-subject	pyre_object::rordereddict::<Impl>::get_slot_mut
+two-phase-never-a-subject	pyre_object::rordereddict::<Impl>::insert
+two-phase-never-a-subject	pyre_object::rordereddict::<Impl>::setitem_lookup_done
+two-phase-never-a-subject	pyre_object::rordereddict_entries::alloc_entries
 two-phase-never-a-subject	pyre_object::rordereddict_entries::entries_item_ptr
+two-phase-never-a-subject	pyre_object::setobject::<Impl>::add
+two-phase-never-a-subject	pyre_object::setobject::<Impl>::get_empty_storage
+two-phase-never-a-subject	pyre_object::setobject::<Impl>::strategy_ref
+two-phase-never-a-subject	pyre_object::setobject::switch_empty_to_object_strategy
+two-phase-never-a-subject	pyre_object::setobject::unwrapped_add
 two-phase-never-a-subject	pyre_object::setobject::w_set_add_hashed_checked
 two-phase-never-a-subject	pyre_object::setobject::w_set_insert_key_checked
 two-phase-never-a-subject	pyre_object::setobject::w_set_insert_key_into
@@ -1841,6 +1851,7 @@ two-phase-never-a-subject	rordereddict::RDict::clone__spec_BytesKey_PyObject_Fnv
 two-phase-never-a-subject	rordereddict::RDict::clone__spec_IdentityKey_PyObject_RandomState_5378d02acc232104
 two-phase-never-a-subject	rordereddict::RDict::clone__spec_ObjectKey_PyObject_ObjectKeyHasher__3e864544411bdb22
 two-phase-never-a-subject	rordereddict::RDict::clone__spec_i64_PyObject_IntKeyHasher__12c318a0f62b1a1a
+two-phase-never-a-subject	rordereddict::RDict::default__spec_ObjectKey____ObjectKeyHasher__3a6fe6f759e21e8d
 two-phase-never-a-subject	rordereddict::RDict::dict_grow__spec_BytesKey_PyObject_Fnv1aHasher__8434e9d6c2632995
 two-phase-never-a-subject	rordereddict::RDict::dict_grow__spec_IdentityKey_PyObject_RandomState_8060af616cc870cc
 two-phase-never-a-subject	rordereddict::RDict::dict_grow__spec_ObjectKey_PyObject_ObjectKeyHasher__5df5df0df3493510
@@ -1887,8 +1898,10 @@ two-phase-never-a-subject	rordereddict::RDict::insert__spec_ObjectKey____ObjectK
 two-phase-never-a-subject	rordereddict::RDict::insert__spec_StrKey_PyObject_StrKeyHasher__29db97450dbd77e0
 two-phase-never-a-subject	rordereddict::RDict::insert__spec_i64_PyObject_IntKeyHasher__c8f9c317fa540864
 two-phase-never-a-subject	rordereddict::RDict::insert_known_absent__spec_ObjectKey____ObjectKeyHasher__5bcc4f08e8761c0d
+two-phase-never-a-subject	rordereddict::RDict::new__spec_AbstractUnwrappedSetStrategy_____0___const_gener_695047c25f4cca79
 two-phase-never-a-subject	rordereddict::RDict::new__spec_BytesKey_PyObject_Fnv1aHasher__8dfbc24c5e815d1d
 two-phase-never-a-subject	rordereddict::RDict::new__spec_IdentityKey_PyObject_RandomState_690f8ad56e423662
+two-phase-never-a-subject	rordereddict::RDict::new__spec_ObjectKey____ObjectKeyHasher__b24fa13580a584a0
 two-phase-never-a-subject	rordereddict::RDict::new__spec_i64_PyObject_IntKeyHasher__f93fd2581c5ddab9
 two-phase-never-a-subject	rordereddict::RDict::remove__spec_BytesKey_PyObject_Fnv1aHasher___u8__1b37ab8715f54479
 two-phase-never-a-subject	rordereddict::RDict::remove__spec_IdentityKey_PyObject_RandomState_IdentityKey_be14553c124d518d
@@ -1903,6 +1916,7 @@ two-phase-never-a-subject	rordereddict::RDict::setitem_lookup_done__spec_ObjectK
 two-phase-never-a-subject	rordereddict::RDict::setitem_lookup_done__spec_StrKey_PyObject_StrKeyHasher__0f7b738c9c3bdae4
 two-phase-never-a-subject	rordereddict::RDict::setitem_lookup_done__spec_i64_PyObject_IntKeyHasher__9fbd70f04457d5e0
 two-phase-never-a-subject	rordereddict::RDict::with_hasher__spec_BytesKey_PyObject_Fnv1aHasher__19648bbe51633266
+two-phase-never-a-subject	rordereddict::RDict::with_hasher__spec_ObjectKey____ObjectKeyHasher__394645b9d36d111b
 two-phase-never-a-subject	rordereddict::RDict::with_hasher__spec_i64_PyObject_IntKeyHasher__04665a692896d1e4
 two-phase-never-a-subject	rordereddict_entries::alloc_entries__spec_BytesKey_PyObject_e92da6b0368dcf0f
 two-phase-never-a-subject	rordereddict_entries::alloc_entries__spec_IdentityKey_PyObject_1b47ad86f2c309d3
@@ -1916,7 +1930,11 @@ two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_ObjectKey
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_ObjectKey____cbaddddd8c9d13d8
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_StrKey_PyObject_0002512fcef93ae1
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_i64_PyObject_aaa40259a54842f8
+two-phase-never-a-subject	setobject::AbstractUnwrappedSetStrategy::get_empty_storage__spec_f7ec333b98f50614
 two-phase-never-a-subject	setobject::callback_free_set_op__spec_bool_closure_ee601150793776bc
+two-phase-never-a-subject	setobject::switch_empty_to__spec_AsciiSetStrategy_ad90ba14edaa1980
+two-phase-never-a-subject	setobject::switch_empty_to__spec_BytesSetStrategy_0cf469c47f76f4f2
+two-phase-never-a-subject	setobject::switch_empty_to__spec_IntegerSetStrategy_4c93d34e314d947a
 two-phase-rtype-skipped	pyre_interpreter::builtins::split_builtin_kwargs
 two-phase-rtype-skipped	pyre_interpreter::module::__pypy__::interp_buffer::__majit_wrap___release_buffer__
 two-phase-rtype-skipped	pyre_interpreter::module::_io::buffered_random::<Impl>::__new__

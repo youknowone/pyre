@@ -987,7 +987,10 @@ fn note_forwarded_exc<Sym: WalkSym>(
 /// really does: it cannot raise, and it is a heap mutator because breaking a
 /// context cycle nulls the `__context__` of an exception other than this one.
 /// The explicit `SetfieldGc` then gives the optimizer the one write it can
-/// model.
+/// model.  `can_collect` is cleared on that effect: `chain_context` only
+/// stores pointers, `w_exception_set_context` takes `exception_write_barrier`,
+/// and `get_sys_exception` reads `getexecutioncontext`.  None of those collect,
+/// so the call is not a safepoint.
 fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete: ConcreteValue) {
     let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
         return;
@@ -1018,12 +1021,9 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
         // only the descr identity the optimizer aliases on is narrower.
         let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
         let context_descr = crate::descr::w_exception_context_descr(kind);
-        let w_context = ctx.call_ref_typed_with_effect(
-            hook,
-            &[exc],
-            &[Type::Ref],
-            majit_metainterp::cannot_raise_effect_info(),
-        );
+        let mut effect = majit_metainterp::cannot_raise_effect_info();
+        effect.can_collect = false;
+        let w_context = ctx.call_ref_typed_with_effect(hook, &[exc], &[Type::Ref], effect);
         let context_idx = context_descr.index();
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[exc, w_context], context_descr);
         ctx.heapcache_setfield_cached(exc, context_idx, w_context);

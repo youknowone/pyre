@@ -855,6 +855,32 @@ unsafe fn set_items_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
     f(storage.entries_slot() as *mut majit_ir::GcRef);
 }
 
+/// `IntegerSetStrategy` / `rerased.new_erasing_pair("integer")` for a set.
+/// Keys are `i64` and values are `()`. The entries array is a `GcArray`
+/// with no pointer offsets, so this forwards that array and nothing inside
+/// it — an `i64` is not a `PyObjectRef`.
+unsafe fn int_set_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let storage = &mut *(obj_addr as *mut pyre_object::setobject::IntSetStorage);
+    f(storage.entries_slot() as *mut majit_ir::GcRef);
+}
+
+/// `BytesSetStrategy` / `rerased.new_erasing_pair("bytes")` for a set.
+/// `bytes_dict_storage_custom_trace`: the key block is a GC ref and the
+/// value is `()`. Forward the entries array; its type registration traces
+/// the `BytesKey` block pointer.
+unsafe fn bytes_set_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let storage = &mut *(obj_addr as *mut pyre_object::setobject::BytesSetStorage);
+    f(storage.entries_slot() as *mut majit_ir::GcRef);
+}
+
+/// `AsciiSetStrategy` / `rerased.new_erasing_pair("unicode")` for a set.
+/// The key is an rstr `STR` (`StrKey` / `Utf8Str`). Forward the entries
+/// array; its type registration traces that block pointer. Values are `()`.
+unsafe fn ascii_set_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let storage = &mut *(obj_addr as *mut pyre_object::setobject::AsciiSetStorage);
+    f(storage.entries_slot() as *mut majit_ir::GcRef);
+}
+
 /// Custom trace for `W_BytesObject`. `data` points at a GC-managed leaf storage
 /// box (`Vec<u8>`, no inner refs, off-GC storage). Forward the field
 /// slot so a major GC greys the box; the box tid's own drop glue reclaims the
@@ -992,11 +1018,14 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     // before its instance finalizer resolves `__del__` through that class.
     f(&mut set.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // `sstorage` (`setobject.py`). The box traces its own entries
-    // (`set_items_storage_custom_trace`). A no-GC-hook fallback allocation
-    // is not collector-owned.
-    if !set.items.is_null() && pyre_object::gc_hook::try_gc_owns_object(set.items as *mut u8) {
-        let items_slot = std::ptr::addr_of_mut!(set.items);
-        f(items_slot as *mut majit_ir::GcRef);
+    // (`set_items_storage_custom_trace`, `int_set_storage_custom_trace`,
+    // `bytes_set_storage_custom_trace`, `ascii_set_storage_custom_trace`).
+    // The forward is the erased word, so an int box stays alive the same
+    // way an object box does. A no-GC-hook fallback allocation is not
+    // collector-owned.
+    if !set.sstorage.is_null() && pyre_object::gc_hook::try_gc_owns_object(set.sstorage) {
+        let storage_slot = std::ptr::addr_of_mut!(set.sstorage);
+        f(storage_slot as *mut majit_ir::GcRef);
     }
 }
 
@@ -2371,8 +2400,8 @@ fn build_gc() -> Box<MiniMarkGC> {
         w_dict_tid,
     );
     pytype_to_tid.insert(&pyre_object::DICT_TYPE as *const _ as usize, w_dict_tid);
-    // W_SetObject carries `items: *mut SetItemsStorage`. The trace forwards
-    // `w_class` and that pointer; the box tid traces the keys. Both `set`
+    // W_SetObject carries `sstorage: *mut u8` (the SetItemsStorage box). The
+    // trace forwards `w_class` and that pointer; the box tid traces the keys. Both `set`
     // and `frozenset` PyTypes share this Rust struct/tid.
     let w_set_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         std::mem::size_of::<pyre_object::setobject::W_SetObject>(),
@@ -3999,7 +4028,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_module_gc_types(&mut gc, &mut pytype_to_tid);
     // setobject.py stores the copied r_dict behind `sstorage`;
     // rordereddict.py makes that table a GcStruct("dicttable") the collector
-    // traces itself. `set_object_custom_trace` only greys the `items` slot.
+    // traces itself. `set_object_custom_trace` only greys the `sstorage` slot.
     // Keep this runtime id at the absolute registration tail.
     register_traced_storage_box::<pyre_object::setobject::SetItemsStorage>(
         &mut gc,
@@ -4418,6 +4447,44 @@ fn build_gc() -> Box<MiniMarkGC> {
         .with_destructor_fn(majit_metainterp::AllVirtuals::destructor),
     );
     majit_metainterp::set_all_virtuals_gc_type_id(all_virtuals_tid);
+    // `IntegerSetStrategy` storage box. After every earlier
+    // `register_traced_storage_box` (and every other registration above) so
+    // no existing type id moves. The entries array is registered next: its
+    // trace has no pointer offsets (`i64` keys, unit values).
+    register_traced_storage_box::<pyre_object::setobject::IntSetStorage>(
+        &mut gc,
+        int_set_storage_custom_trace,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::setobject::IntSetStorage>,
+        pyre_object::setobject::set_int_set_storage_gc_type_id,
+    );
+    register_dict_entries::<i64, ()>(
+        &mut gc,
+        pyre_object::setobject::set_int_set_entries_gc_type_id,
+    );
+    // `BytesSetStrategy` / `AsciiSetStrategy` storage boxes. After the int
+    // set registration (and every registration above it) so no existing type
+    // id moves. Each entries array traces its key block
+    // (`BytesKey` / `StrKey` `GC_REF_OFFSETS`); values are `()`.
+    register_traced_storage_box::<pyre_object::setobject::BytesSetStorage>(
+        &mut gc,
+        bytes_set_storage_custom_trace,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::setobject::BytesSetStorage>,
+        pyre_object::setobject::set_bytes_set_storage_gc_type_id,
+    );
+    register_dict_entries::<pyre_object::dictmultiobject::BytesKey, ()>(
+        &mut gc,
+        pyre_object::setobject::set_bytes_set_entries_gc_type_id,
+    );
+    register_traced_storage_box::<pyre_object::setobject::AsciiSetStorage>(
+        &mut gc,
+        ascii_set_storage_custom_trace,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::setobject::AsciiSetStorage>,
+        pyre_object::setobject::set_ascii_set_storage_gc_type_id,
+    );
+    register_dict_entries::<pyre_object::celldict::StrKey, ()>(
+        &mut gc,
+        pyre_object::setobject::set_ascii_set_entries_gc_type_id,
+    );
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(

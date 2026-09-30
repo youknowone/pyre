@@ -15351,6 +15351,41 @@ pub(crate) struct DirectResidualSubst {
     pub(crate) allboxes: Vec<OpRef>,
 }
 
+/// What [`try_walker_specialize_set_add_method`] recorded.
+pub(crate) enum SetAddMethodSpec {
+    /// MayForce [`pyre_interpreter::runtime_ops::jit_set_add_method`]. The
+    /// generic tail still executes it.
+    Subst(DirectResidualSubst),
+    /// The traced element is already in an integer-strategy set. Either the
+    /// intval, `set_id`, and `content_gen` guards stand in for the insert, or
+    /// [`pyre_interpreter::runtime_ops::jit_int_set_add_already_present`]
+    /// does, and the generic tail does not run.
+    Elided,
+}
+
+/// Pin `op` to `expected` unless the trace already folded it to that
+/// constant. `GUARD_VALUE` of a constant the optimizer has proved is
+/// `InvalidLoop` (`optimize_GUARD_VALUE`). A constant that is some other
+/// int is not guarded and not treated as pinned: the caller keeps the
+/// contains helper instead of the field guards.
+fn pin_int_guard_value<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op: OpRef,
+    expected: i64,
+) -> Result<bool, DispatchError> {
+    if op.is_constant() {
+        let pinned = matches!(
+            ctx.trace_ctx.box_value(op),
+            Some(majit_ir::Value::Int(n)) if n == expected
+        );
+        return Ok(pinned);
+    }
+    let expected_op = ctx.trace_ctx.const_int(expected);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[op, expected_op])?;
+    Ok(true)
+}
+
 /// `s.add(x)`: record the direct `set_add` residual the SET_ADD accumulator
 /// opcode records, in place of the generic `bh_call_fn` dispatch the
 /// bound-method spelling otherwise leaves behind.
@@ -15368,10 +15403,29 @@ pub(crate) struct DirectResidualSubst {
 /// form and the comprehension: 0.220s -> 0.130s against `list.append`'s
 /// 0.040s.
 ///
-/// The insert stays a MayForce residual, and deliberately so: `set_add_value`
+/// A miss stays a MayForce residual, and deliberately so: `set_add_value`
 /// hashes the element, which can run a user `__hash__`.  That is the other
 /// half of the gap against `list.append` (`GuardNotForced`, which even the
 /// dispatch-free comprehension carries), and this arm does not claim it.
+///
+/// A hit does not hash.  When the traced value is an exact `int`
+/// [`pyre_object::plain_int_already_in_int_set`] already finds in an
+/// [`pyre_object::setobject::IntegerSetStrategy`] set, and that set's
+/// [`pyre_object::setobject::W_SetObject::len_relaxed`] is 1, the arm guards
+/// the unboxed intval, [`pyre_object::setobject::W_SetObject::set_id`], and
+/// [`pyre_object::setobject::W_SetObject::content_gen`], then writes `None`.
+/// No helper runs.  The single element is the traced int, so a different
+/// int is a miss: the intval guard side-exits and the interpreter performs
+/// the real add.  A membership change fails the `content_gen` guard the
+/// same way.
+///
+/// A hit in a set that already holds more than one int keeps
+/// [`pyre_interpreter::runtime_ops::jit_int_set_add_already_present`] and
+/// `GuardTrue`.  Those keys share one trace (`i & 15`); pinning the traced
+/// sample side-exits on every other present key.  The helper does not
+/// insert.  A fitting `W_LongObject` is stored unboxed too, but it is not a
+/// `W_IntObject`, so it takes the helper rather than the intval guard.  A
+/// concrete miss stays the MayForce substitution below.
 ///
 /// Recognition declines before emitting IR, and what it admits is deliberately
 /// the builtin's own predicate: `require_set_receiver` is `is_set`, an
@@ -15389,7 +15443,8 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
-) -> Result<Option<DirectResidualSubst>, DispatchError> {
+    dst: usize,
+) -> Result<Option<SetAddMethodSpec>, DispatchError> {
     if r_args.len() != 3 {
         return Ok(None);
     }
@@ -15408,7 +15463,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     // verbatim, and the class guard below is emitted in the same spelling, so
     // recognition and guard admit the same set of receivers.  It excludes a
     // frozenset, which `set_add_value` would otherwise mutate.
-    let inner_func = unsafe {
+    let (inner_func, inner_self) = unsafe {
         if !pyre_object::function::is_method(callable) {
             return Ok(None);
         }
@@ -15421,8 +15476,11 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
         if pyre_interpreter::lookup_in_type(set_type, "add") != Some(inner_func) {
             return Ok(None);
         }
-        inner_func
+        (inner_func, inner_self)
     };
+    // Before any IR. A concrete miss keeps today's MayForce substitution;
+    // guarding a contains check that just returned 0 would side-exit forever.
+    let already = pyre_object::plain_int_already_in_int_set(inner_self, value);
 
     // ── tentative commit ──
     // Pin the callable to `set.add`: guard_class METHOD + guard_value on the
@@ -15469,14 +15527,73 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
         .heap_cache_mut()
         .class_now_known(self_ref, set_type_addr);
 
+    // `is_plain_int1` also accepts a fitting long. `walker_unbox_int` reads
+    // `W_IntObject.intval`, so only an exact int is pinned here, and only
+    // when it is the set's sole element. Any other present int shares this
+    // trace; a GuardValue of the sample fails on the next key.
+    if already && unsafe { pyre_object::is_int(value) } {
+        let (traced_int, traced_id, traced_gen, sole) = unsafe {
+            let n = pyre_object::w_int_get_value(value);
+            let set = &*(inner_self as *const pyre_object::setobject::W_SetObject);
+            (
+                n,
+                set.set_id as i64,
+                set.content_gen_relaxed() as i64,
+                set.len_relaxed() == 1,
+            )
+        };
+        if sole {
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            let raw = walker_unbox_int(ctx, op.pc, r_args[2], int_type_addr)?;
+            if pin_int_guard_value(ctx, op.pc, raw, traced_int)? {
+                let id_op = crate::state::opimpl_getfield_gc_i(
+                    ctx.trace_ctx,
+                    self_ref,
+                    crate::descr::set_id_descr(),
+                );
+                if pin_int_guard_value(ctx, op.pc, id_op, traced_id)? {
+                    let gen_op = crate::state::opimpl_getfield_gc_i(
+                        ctx.trace_ctx,
+                        self_ref,
+                        crate::descr::set_content_gen_descr(),
+                    );
+                    if pin_int_guard_value(ctx, op.pc, gen_op, traced_gen)? {
+                        let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+                        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
+                        return Ok(Some(SetAddMethodSpec::Elided));
+                    }
+                }
+            }
+        }
+    }
+
+    if already {
+        let mut effect = majit_metainterp::cannot_raise_effect_info();
+        effect.can_collect = false;
+        let present = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallI,
+            pyre_interpreter::runtime_ops::jit_int_set_add_already_present as *const (),
+            &[self_ref, r_args[2]],
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::Type::Int,
+            effect,
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(present, majit_ir::Value::Int(1));
+        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[present])?;
+        let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
+        return Ok(Some(SetAddMethodSpec::Elided));
+    }
+
     let funcptr = ctx
         .trace_ctx
         .const_int(pyre_interpreter::runtime_ops::jit_set_add_method as *const () as i64);
-    Ok(Some(DirectResidualSubst {
+    Ok(Some(SetAddMethodSpec::Subst(DirectResidualSubst {
         funcptr,
         descr: set_add_method_descr(),
         allboxes: vec![funcptr, self_ref, r_args[2]],
-    }))
+    })))
 }
 
 /// The descr the `s.add(x)` substitution installs: `(Ref, Ref) -> Ref`,
@@ -17234,6 +17351,79 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `raise X` without `from` lowers the cause operand to const `PY_NULL`.
+/// A live non-null Ref is an explicit cause and stays on the residual,
+/// which also writes `__cause__` and `__suppress_context__`.
+fn raise_varargs_cause_is_absent<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    cause_op: OpRef,
+) -> bool {
+    let cause_concrete = read_ref_var_list_concrete(code, op, 1, ctx);
+    match cause_concrete.get(2) {
+        Some(ConcreteValue::Ref(p)) => p.is_null(),
+        Some(ConcreteValue::Null) | None => matches!(
+            ctx.trace_ctx.box_value(cause_op),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
+        ),
+        _ => false,
+    }
+}
+
+/// `chain_exceptions` skips the write when `space.is_w(w_value, w_context)`.
+///
+/// `except E as e: raise e` raises the instance already being handled.
+/// `normalize_raise_varargs_jit` is `MayForce` because its other arm calls
+/// the exception class; this arm never does. Guard `sys_exc_value` against
+/// the raised box so a later iteration that chains a different exception
+/// side-exits to that residual.
+fn try_trace_reraise_of_handled_instance<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    let exc_op = r_args[1];
+    if !raise_varargs_cause_is_absent(ctx, code, op, r_args[2]) {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let Some(ConcreteValue::Ref(exc)) = arg_concretes.get(1).copied() else {
+        return Ok(None);
+    };
+    if exc.is_null() || unsafe { !pyre_object::is_exception(exc) } {
+        return Ok(None);
+    }
+    // `chain_context` reads `get_sys_exception`. `sys_exc_info` returns the
+    // `sys_exc_value` slot whenever that slot is set, which is the field
+    // the guard below reads. A null slot whose logical exception lives on
+    // a generator stays on the residual.
+    let active = pyre_interpreter::eval::get_current_exception();
+    if active.is_null() || !std::ptr::eq(active, exc) {
+        return Ok(None);
+    }
+    let Some(ec) = walker_ensure_execution_context(ctx) else {
+        return Ok(None);
+    };
+    let active_op = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    if exc_op != active_op {
+        let same = ctx.trace_ctx.record_op(OpCode::PtrEq, &[exc_op, active_op]);
+        ctx.trace_ctx
+            .set_opref_concrete(same, majit_ir::Value::Int(1));
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[same])?;
+    }
+    ctx.trace_ctx
+        .set_opref_concrete(exc_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', exc_op)?;
+    Ok(Some(()))
+}
+
 pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -17245,41 +17435,20 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
         return Ok(None);
     }
     let exc_op = r_args[1];
-    // Take (remove) the inline-built marker: a second raise of the same
-    // object (whose `w_context` is now stamped) must take the residual
-    // path so its runtime `attach_raise_cause` keeps the existing
-    // `__context__` and avoids the self-cycle.
+    // The inline-built marker is this OpRef's first `raise` of an exception
+    // `try_walker_trace_exception_new` just allocated. A different OpRef —
+    // `except E as e: raise e` — is not that allocation. `chain_exceptions`
+    // then skips the write when the raised instance is the one already
+    // being handled.
     if !fbw_built_exc_take(exc_op) {
-        return Ok(None);
+        return try_trace_reraise_of_handled_instance(ctx, code, op, r_args, dst);
     }
     // Explicit `raise X from Y` (concrete non-null cause) keeps the
     // residual: `attach_raise_cause` sets both `__cause__` and
     // `__suppress_context__`, which the inline `__context__` store alone
     // does not reproduce.  Re-insert the marker so the raise still routes
     // through the residual (the marker was consumed above).
-    //
-    // `raise X` without a cause lowers the cause operand to a const
-    // `PY_NULL` (`ConstPtr(GcRef(0))`), whose concrete shadow is
-    // `ConcreteValue::Null` (constant pool slots carry no `Ref` shadow);
-    // `raise X from Y` passes a live non-null Ref.  Treat the const-null
-    // operand AND a `ConcreteValue::Null`/`Ref(null)` shadow all as "no
-    // cause"; any concrete non-null Ref is an explicit cause.
-    let cause_op = r_args[2];
-    let cause_concrete = read_ref_var_list_concrete(code, op, 1, ctx);
-    let cause_is_null = match cause_concrete.get(2) {
-        Some(ConcreteValue::Ref(p)) => p.is_null(),
-        Some(ConcreteValue::Null) | None => {
-            // No live concrete: the operand is "no cause" only if it is a
-            // const PY_NULL.  A non-const opref with an unknown concrete
-            // is conservatively treated as a possible cause (decline).
-            matches!(
-                ctx.trace_ctx.box_value(cause_op),
-                Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
-            )
-        }
-        _ => false,
-    };
-    if !cause_is_null {
+    if !raise_varargs_cause_is_absent(ctx, code, op, r_args[2]) {
         fbw_built_exc_insert(exc_op);
         return Ok(None);
     }
