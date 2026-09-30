@@ -27,6 +27,11 @@ pub use buffered_random::{
     BUFFEREDRANDOM_USER_TYPE, W_BUFFEREDRANDOM_USER_GC_TYPE_ID_CELL,
     W_BUFFEREDRANDOM_USER_PYRE_CLASS_DESCRIPTOR, W_BufferedRandom, W_BufferedRandomUser,
 };
+mod interp_fileio;
+pub use interp_fileio::{
+    FILEIO_USER_TYPE, W_FILEIO_USER_GC_TYPE_ID_CELL, W_FILEIO_USER_PYRE_CLASS_DESCRIPTOR, W_FileIO,
+    W_FileIOUser,
+};
 mod interp_bytesio;
 pub use interp_bytesio::{
     BYTESIO_USER_TYPE, W_BYTESIO_USER_GC_TYPE_ID_CELL, W_BYTESIO_USER_PYRE_CLASS_DESCRIPTOR,
@@ -76,6 +81,9 @@ pub(crate) unsafe fn iobase_payload_dict_slot(obj: PyObjectRef) -> Option<*mut P
         return None;
     }
     unsafe {
+        if let Some(inst) = W_FileIO::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
         if let Some(inst) = W_BytesIO::from_obj(obj) {
             return Some(std::ptr::addr_of_mut!(inst.w_dict));
         }
@@ -1199,44 +1207,6 @@ fn text_iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
     allocate_iobase_instance(text_iobase_type(), "_TextIOBase", args)
 }
 
-/// PyPy `W_FileIO.descr_new`: allocate the concrete interpreter owner and run
-/// `W_FileIO.__init__`'s field defaults before the public initializer sees its
-/// arguments.  CPython 3.14 observes an uninitialized FileIO as closed with
-/// mode `wb`; keep that newer public state on the PyPy-shaped instance dict.
-fn fileio_new(args: &[PyObjectRef]) -> crate::PyResult {
-    let obj = allocate_iobase_instance(fileio_type(), "FileIO", args)?;
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    // Build each value before reloading the receiver.  The allocation may
-    // move it, exactly as in `type_ns_store`.
-    let store = |name: &str, value: PyObjectRef| {
-        crate::baseobjspace::setdictvalue_native(
-            pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            name,
-            value,
-        );
-    };
-    store("__file_fd__", pyre_object::w_int_new(-1));
-    store("__file_closed__", pyre_object::w_bool_from(true));
-    store("__file_closefd__", pyre_object::w_bool_from(true));
-    store("__file_mode__", pyre_object::w_str_new("wb"));
-    store("__file_public_mode__", pyre_object::w_str_new("wb"));
-    store("__file_seekable__", pyre_object::w_none());
-    store(
-        "__file_blksize__",
-        pyre_object::w_int_new(DEFAULT_BUFFER_SIZE),
-    );
-    for name in [
-        "__file_stat_mode__",
-        "__file_stat_size__",
-        "__file_stat_blksize__",
-    ] {
-        store(name, pyre_object::w_none());
-    }
-    Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
-}
-
 /// `interp_iobase.py:rawiobase_read_w` — the default raw `read` is a
 /// one-shot `readinto` over a freshly allocated bytearray.  A negative or
 /// omitted size delegates to the virtual `readall` method.
@@ -1573,31 +1543,15 @@ pub(super) fn raw_iobase_type() -> PyObjectRef {
 pub(crate) fn fileio_type() -> PyObjectRef {
     static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
     TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_base(
-            "_io.FileIO",
-            |type_ns| {
-                type_method(
-                    type_ns,
-                    "__new__",
-                    crate::typedef::make_new_descr(fileio_new),
-                );
-                crate::builtins::init_file_wrapper_type(type_ns);
-                crate::builtins::init_fileio_type(type_ns);
-                type_method(
-                    type_ns,
-                    "__init__",
-                    crate::make_builtin_function("__init__", crate::builtins::fileio_init),
-                );
-            },
-            raw_iobase_type(),
+        let tp = interp_fileio::type_object();
+        let type_ns = unsafe { pyre_object::w_type_get_dict_ptr(tp) } as PyObjectRef;
+        crate::builtins::init_file_wrapper_type(type_ns);
+        crate::builtins::init_fileio_type(type_ns);
+        type_method(
+            type_ns,
+            "__init__",
+            crate::make_builtin_function("__init__", crate::builtins::fileio_init),
         );
-        // `_iomodule.c:ADD_TYPE` creates fileio_spec as immutable heap.
-        crate::typedef::mark_cpython_heap_type(tp, true);
-        unsafe {
-            pyre_object::w_type_set_acceptable_as_base_class(tp, true);
-            pyre_object::w_type_set_weakrefable(tp, true);
-            pyre_object::typeobject::w_type_set_hasdict(tp, true);
-        }
         tp
     })
 }

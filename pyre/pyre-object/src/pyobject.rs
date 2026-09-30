@@ -965,7 +965,7 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // user layouts, and `__pypy__.Bufferable`).
     // 168 is `interp__weakref.py` `W_Weakref`, an object subclass.
     // 169-195 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
-    // 196-211 append deque, Struct, GenericAlias, big-int, weakref,
+    // 196-213 append deque, Struct, GenericAlias, big-int, weakref,
     // staticmethod, classmethod, module, `_thread._local` and typed `_io`
     // user layouts without moving the closed block above.
     (158, Some(1)),
@@ -1023,22 +1023,24 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (209, Some(130)), // W_BufferedRWPairUser
     (210, Some(131)), // W_BufferedRandomUser
     (211, Some(132)), // W_TextIOWrapperUser
+    (212, Some(0)),   // W_FileIO
+    (213, Some(212)), // W_FileIOUser
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail, after the `_getusercls` layouts (158-211).
-    (212, Some(0)),
-    // Native-only type IDs 213 and 214 represent `posix.DirEntry` and
+    // posix / console tail, after the `_getusercls` layouts (158-213).
+    (214, Some(0)),
+    // Native-only type IDs 215 and 216 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (213, Some(0)),
+    (215, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (214, Some(0)),
+    (216, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (215, Some(0)),
+    (217, Some(0)),
     #[cfg(windows)]
-    (216, Some(215)), // W_WinConsoleIOUser
+    (218, Some(217)), // W_WinConsoleIOUser
                       // The classes `pyre-module` registers follow, numbered by `build_gc` in
                       // the order the module hooks list them; `pyre-interpreter` appends them.
 ];

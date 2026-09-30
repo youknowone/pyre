@@ -4550,8 +4550,19 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut pytype_to_tid,
         &pyre_interpreter::module::_io::W_TEXTIOWRAPPER_USER_PYRE_CLASS_DESCRIPTOR,
     );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_io::W_FileIO
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_FILEIO_USER_PYRE_CLASS_DESCRIPTOR,
+    );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 212),
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 214),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,

@@ -10,6 +10,8 @@ storage, and a working base operation. `__del__` runs after `gc.collect()`.
 
 import gc
 import io
+import os
+import tempfile
 import weakref
 
 
@@ -147,6 +149,17 @@ def operate_text(x):
     return x.read() == "ab"
 
 
+def make_fileio(cls):
+    fd, path = tempfile.mkstemp()
+    os.write(fd, b"ab")
+    os.lseek(fd, 0, os.SEEK_SET)
+    return cls(fd, "rb")
+
+
+def operate_fileio(x):
+    return x.read() == b"ab"
+
+
 for label, base, make, operate in [
     ("BytesIO", io.BytesIO, make_bytesio, operate_bytesio),
     ("StringIO", io.StringIO, make_stringio, operate_stringio),
@@ -155,6 +168,7 @@ for label, base, make, operate in [
     ("BufferedRandom", io.BufferedRandom, make_random, operate_random),
     ("BufferedRWPair", io.BufferedRWPair, make_rwpair, operate_rwpair),
     ("TextIOWrapper", io.TextIOWrapper, make_text, operate_text),
+    ("FileIO", io.FileIO, make_fileio, operate_fileio),
 ]:
     plain(label, base, make, operate)
     slots(label, base, make)

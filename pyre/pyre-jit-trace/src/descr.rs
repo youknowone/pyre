@@ -5267,6 +5267,19 @@ static W_BUFFEREDRANDOM_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyL
     )
 });
 
+static W_FILEIO_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_FileIOUser>(),
+        pyre_interpreter::module::_io::W_FILEIO_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::FILEIO_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_FileIOUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_FileIOUser, storage),
+        "W_FileIOUser",
+        "module::_io::W_FileIOUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1000,
+    )
+});
+
 static W_TEXTIOWRAPPER_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_native_user_mapdict_group(
         std::mem::size_of::<pyre_interpreter::module::_io::W_TextIOWrapperUser>(),
@@ -5575,6 +5588,10 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::TEXTIOWRAPPER_USER_TYPE)
     } {
         field_descr_from_group(&W_TEXTIOWRAPPER_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::FILEIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_FILEIO_USER_DESCR_GROUP, 0)
     } else if let Some(descr) = unsafe { winconsoleio_user_mapdict_descr(obj, 0) } {
         descr
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 0) } {
@@ -5747,6 +5764,10 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::TEXTIOWRAPPER_USER_TYPE)
     } {
         field_descr_from_group(&W_TEXTIOWRAPPER_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::FILEIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_FILEIO_USER_DESCR_GROUP, 1)
     } else if let Some(descr) = unsafe { winconsoleio_user_mapdict_descr(obj, 1) } {
         descr
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 1) } {
@@ -7791,6 +7812,10 @@ mod tests {
             W_TEXTIOWRAPPER_USER_DESCR_GROUP.field_descrs[0].index(),
             0x6100_0FE0
         );
+        assert_eq!(
+            W_FILEIO_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_1000
+        );
         #[cfg(all(windows, not(feature = "sandbox")))]
         assert_eq!(
             W_WINCONSOLEIO_USER_DESCR_GROUP.field_descrs[0].index(),
@@ -9831,6 +9856,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("module::_io::W_TextIOWrapperUser", || {
         LazyLock::force(&W_TEXTIOWRAPPER_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_FileIOUser", || {
+        LazyLock::force(&W_FILEIO_USER_DESCR_GROUP);
     }),
     #[cfg(all(windows, not(feature = "sandbox")))]
     ("module::_io::W_WinConsoleIOUser", || {
