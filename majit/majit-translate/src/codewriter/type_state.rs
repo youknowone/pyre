@@ -14,10 +14,10 @@
 //! (which routes to the backing `Variable.concretetype` cell).  No
 //! external slot table survives.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::flowspace::model::Variable;
-use crate::model::{FunctionGraph, OpKind, ValueType};
+use crate::model::{FunctionGraph, OpKind, SpaceOperation, ValueType};
 
 /// Re-export the canonical [`ConcreteType`] from [`crate::model`].
 ///
@@ -230,37 +230,144 @@ pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Varia
 /// `ARRAY._gckind == 'gc'`; raw arrays go through `raw_load` /
 /// `getarrayitem_raw`).  A Signed base on those ops is the same
 /// mis-banked GC pointer FieldRead had.
+///
+/// A Signed base that `make_three_lists_from_vars` already stored in an
+/// int argument list keeps that cell. The list was split from the Signed
+/// kind, and `emit_list_of_kind` requires the cell to still say int.
+/// The access reads `cast_int_to_ptr` of the word, so regalloc colours a
+/// ref base and the call list keeps the Signed argument.
 pub(crate) fn promote_gc_field_bases(
-    graph: &FunctionGraph,
+    graph: &mut FunctionGraph,
     callcontrol: Option<&crate::call::CallControl>,
 ) {
-    for block in &graph.blocks {
-        for op in &block.operations {
-            let (base, force_gc) = match &op.kind {
-                OpKind::FieldRead { base, field, .. } | OpKind::FieldWrite { base, field, .. } => {
-                    (base, field_owner_is_gc(field, callcontrol))
-                }
-                OpKind::VableFieldRead { base, .. }
-                | OpKind::VableFieldWrite { base, .. }
-                | OpKind::VableArrayRead { base, .. }
-                | OpKind::VableArrayWrite { base, .. }
-                | OpKind::VableArrayLen { base, .. } => (base, true),
-                // `nolength` is a raw items region (`ARRAY._gckind == 'raw'`).
-                // Its base is the address integer (`getkind` → int). Promoting
-                // that address to `GcRef` puts an `int_add` result in the ref
-                // bank (`int_add/ii>r`), which no blackhole handler has.
-                // A length-prefixed array is the GC family and stays `GcRef`.
-                OpKind::ArrayRead { base, nolength, .. }
-                | OpKind::ArrayWrite { base, nolength, .. }
-                | OpKind::ArrayLen { base, nolength, .. } => (base, !nolength),
-                _ => continue,
+    let int_args = int_argument_var_ids(graph);
+    let graph_name = graph.name.clone();
+    let mut redirects: Vec<(usize, usize)> = Vec::new();
+    for (block_index, block) in graph.blocks.iter().enumerate() {
+        for (op_index, op) in block.operations.iter().enumerate() {
+            let Some((base, force_gc)) = gc_access_base(&op.kind, callcontrol) else {
+                continue;
             };
             if !force_gc {
                 continue;
             }
-            stamp_gc_ref_base(base, &graph.name);
+            if FunctionGraph::concretetype_of(base) == ConcreteType::Signed
+                && int_args.contains(&base.id())
+            {
+                redirects.push((block_index, op_index));
+                continue;
+            }
+            stamp_gc_ref_base(base, &graph_name);
         }
     }
+    // Later inserts shift higher indices in the same block. Walk back so
+    // each recorded index still names the access.
+    for (block_index, op_index) in redirects.into_iter().rev() {
+        redirect_signed_base_through_cast(graph, block_index, op_index);
+    }
+}
+
+fn gc_access_base<'a>(
+    kind: &'a OpKind,
+    callcontrol: Option<&crate::call::CallControl>,
+) -> Option<(&'a Variable, bool)> {
+    match kind {
+        OpKind::FieldRead { base, field, .. } | OpKind::FieldWrite { base, field, .. } => {
+            Some((base, field_owner_is_gc(field, callcontrol)))
+        }
+        OpKind::VableFieldRead { base, .. }
+        | OpKind::VableFieldWrite { base, .. }
+        | OpKind::VableArrayRead { base, .. }
+        | OpKind::VableArrayWrite { base, .. }
+        | OpKind::VableArrayLen { base, .. } => Some((base, true)),
+        // `nolength` is a raw items region (`ARRAY._gckind == 'raw'`).
+        // Its base is the address integer (`getkind` → int). Promoting
+        // that address to `GcRef` puts an `int_add` result in the ref
+        // bank (`int_add/ii>r`), which no blackhole handler has.
+        // A length-prefixed array is the GC family and stays `GcRef`.
+        OpKind::ArrayRead { base, nolength, .. }
+        | OpKind::ArrayWrite { base, nolength, .. }
+        | OpKind::ArrayLen { base, nolength, .. } => Some((base, !nolength)),
+        _ => None,
+    }
+}
+
+fn gc_access_base_mut(kind: &mut OpKind) -> Option<&mut Variable> {
+    match kind {
+        OpKind::FieldRead { base, .. }
+        | OpKind::FieldWrite { base, .. }
+        | OpKind::VableFieldRead { base, .. }
+        | OpKind::VableFieldWrite { base, .. }
+        | OpKind::VableArrayRead { base, .. }
+        | OpKind::VableArrayWrite { base, .. }
+        | OpKind::VableArrayLen { base, .. }
+        | OpKind::ArrayRead { base, .. }
+        | OpKind::ArrayWrite { base, .. }
+        | OpKind::ArrayLen { base, .. } => Some(base),
+        _ => None,
+    }
+}
+
+/// Variable ids sitting in an int argument list. `emit_list_of_kind`
+/// asserts each of those cells is still Signed at assemble time.
+fn int_argument_var_ids(graph: &FunctionGraph) -> HashSet<u64> {
+    let mut ids = HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::CallResidual { args_i, .. }
+                | OpKind::CallMayForce { args_i, .. }
+                | OpKind::CallElidable { args_i, .. }
+                | OpKind::InlineCall { args_i, .. }
+                | OpKind::ConditionalCall { args_i, .. }
+                | OpKind::ConditionalCallValue { args_i, .. }
+                | OpKind::RecordKnownResult { args_i, .. } => {
+                    extend_var_ids(&mut ids, args_i);
+                }
+                OpKind::RecursiveCall {
+                    greens_i, reds_i, ..
+                }
+                | OpKind::JitMergePoint {
+                    greens_i, reds_i, ..
+                } => {
+                    extend_var_ids(&mut ids, greens_i);
+                    extend_var_ids(&mut ids, reds_i);
+                }
+                _ => {}
+            }
+        }
+    }
+    ids
+}
+
+fn extend_var_ids(ids: &mut HashSet<u64>, vars: &[Variable]) {
+    for var in vars {
+        ids.insert(var.id());
+    }
+}
+
+fn redirect_signed_base_through_cast(
+    graph: &mut FunctionGraph,
+    block_index: usize,
+    op_index: usize,
+) {
+    let original = gc_access_base_mut(&mut graph.blocks[block_index].operations[op_index].kind)
+        .expect("redirect target is a GC field or array access")
+        .clone();
+    let cast_result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+    *gc_access_base_mut(&mut graph.blocks[block_index].operations[op_index].kind)
+        .expect("redirect target is a GC field or array access") = cast_result.clone();
+    graph.blocks[block_index].operations.insert(
+        op_index,
+        SpaceOperation {
+            result: Some(cast_result),
+            kind: OpKind::UnaryOp {
+                op: "cast_int_to_ptr".into(),
+                operand: original,
+                result_ty: ValueType::Ref(None),
+            },
+        },
+    );
 }
 
 fn stamp_gc_ref_base(base: &crate::flowspace::model::Variable, graph_name: &str) {
@@ -292,7 +399,7 @@ pub(crate) fn field_owner_is_gc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FieldDescriptor, OpKind, ValueType};
+    use crate::model::{FieldDescriptor, OpKind, SpaceOperation, ValueType};
 
     fn push_input(
         graph: &mut FunctionGraph,
@@ -333,7 +440,7 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
         FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
 
-        promote_gc_field_bases(&graph, None);
+        promote_gc_field_bases(&mut graph, None);
 
         assert_eq!(
             FunctionGraph::concretetype_of(&base),
@@ -364,7 +471,7 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
         FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
 
-        promote_gc_field_bases(&graph, None);
+        promote_gc_field_bases(&mut graph, None);
 
         assert_eq!(
             FunctionGraph::concretetype_of(&base),
@@ -403,13 +510,117 @@ mod tests {
                 },
             });
 
-        promote_gc_field_bases(&graph, None);
+        promote_gc_field_bases(&mut graph, None);
 
         assert_eq!(
             FunctionGraph::concretetype_of(&addr),
             ConcreteType::Signed,
             "nolength raw slice base stays an int"
         );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_lifts_an_unknown_base() {
+        let mut graph = FunctionGraph::new("unknown_base_getfield");
+        let base = push_input(&mut graph, "obj", ValueType::Ref(None));
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+        assert_eq!(FunctionGraph::concretetype_of(&base), ConcreteType::Unknown);
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::GcRef,
+            "the post-rewrite pass still publishes an untyped GC field base"
+        );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_casts_a_signed_base_that_is_an_int_call_argument() {
+        let mut graph = FunctionGraph::new("int_arg_and_field");
+        let base = push_input(&mut graph, "obj", ValueType::Int);
+        let other = push_input(&mut graph, "n", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&other, ConcreteType::GcRef);
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(read));
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::InlineCall {
+                    jitcode: crate::jitcode::JitCodeHandle::new(std::sync::Arc::new(
+                        crate::jitcode::JitCode::new("callee"),
+                    )),
+                    args_i: vec![base.clone()],
+                    args_r: vec![other],
+                    args_f: Vec::new(),
+                    result_kind: 'r',
+                },
+            });
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "an int-list argument stays Signed so emit_list_of_kind still matches"
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        let cast_at = ops
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, operand, .. }
+                        if op == "cast_int_to_ptr" && operand.id() == base.id()
+                )
+            })
+            .expect("cast_int_to_ptr of the signed argument");
+        let field_at = ops
+            .iter()
+            .position(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            .expect("field read");
+        assert!(cast_at < field_at, "the cast dominates the field read");
+        let OpKind::FieldRead {
+            base: field_base, ..
+        } = &ops[field_at].kind
+        else {
+            unreachable!("field read");
+        };
+        assert_ne!(field_base.id(), base.id());
+        assert_eq!(
+            FunctionGraph::concretetype_of(field_base),
+            ConcreteType::GcRef
+        );
+        assert!(ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::InlineCall { args_i, .. } if args_i.iter().any(|arg| arg.id() == base.id())
+        )));
     }
 
     #[test]

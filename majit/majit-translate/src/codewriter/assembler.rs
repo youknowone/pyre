@@ -8215,7 +8215,7 @@ mod tests {
             crate::codewriter::type_state::ConcreteType::Signed,
         );
 
-        crate::codewriter::type_state::promote_gc_field_bases(&graph, None);
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, None);
         regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = flatten_graph(&graph, &mut regallocs);
