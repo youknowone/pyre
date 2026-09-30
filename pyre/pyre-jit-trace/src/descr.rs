@@ -5361,7 +5361,7 @@ static PYCODE_W_GLOBALS_QUASI_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
             std::mem::size_of::<usize>(),
             Type::Ref,
             false,
-            majit_ir::descr::ArrayFlag::Unsigned,
+            majit_ir::descr::ArrayFlag::Pointer,
             "PyCode.w_globals".to_string(),
             "w_globals".to_string(),
         )
