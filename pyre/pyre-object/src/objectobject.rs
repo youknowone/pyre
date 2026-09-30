@@ -14,7 +14,9 @@ use crate::pyobject::*;
 ///
 /// Layout: `[ob_type | w_class | map | storage]`.
 ///
-/// - `ob_type`: always &INSTANCE_TYPE (for is_instance() checks)
+/// - `ob_type`: `&INSTANCE_TYPE` for exact `object()`, `&INSTANCE_USER_TYPE`
+///   (`typedef.py` `_getusercls(W_ObjectObject)`,
+///   `W_ObjectObjectUserDictWeakrefable`) for every other carrier
 /// - `w_class`: pointer to the W_TypeObject this is an instance of
 /// - `map`: the attribute map (`AbstractAttribute` chain) — the
 ///   `self.map` of `MapdictStorageMixin` (`mapdict.py`)
@@ -69,12 +71,19 @@ pub const W_OBJECT_OBJECT_SIZE: usize = std::mem::size_of::<W_ObjectObject>();
 /// traces the off-heap `storage` value slots, so a collection keeps an
 /// instance's attribute values reachable and reclaims dead instances.
 ///
-/// This id is both the GC header `w_instance_new` stamps and the
-/// `subclass_range` of `INSTANCE_TYPE`. The collector reads the header
-/// for size + custom trace; `ll_issubclass` reads the vtable range.
-/// The two agree: `INSTANCE_TYPE` is this id, a child of `W_ROOT_TYPE`
-/// (`W_Root`), not the rclass root.
+/// This id is the GC header exact `object()` stamps and the
+/// `subclass_range` base of `INSTANCE_TYPE`. The collector reads the
+/// header for size + custom trace; `ll_issubclass` reads the vtable
+/// range. `INSTANCE_TYPE` is this id, a child of `W_ROOT_TYPE`
+/// (`W_Root`). Its `_getusercls` child is
+/// [`W_OBJECT_OBJECT_USER_GC_TYPE_ID`].
 pub const W_OBJECT_OBJECT_GC_TYPE_ID: u32 = 53;
+
+/// GC type id for `W_ObjectObjectUserDictWeakrefable`
+/// (`typedef.py` `_getusercls(W_ObjectObject)`). Same size and
+/// `object_object_custom_trace` as [`W_OBJECT_OBJECT_GC_TYPE_ID`];
+/// that id is the parent.
+pub const W_OBJECT_OBJECT_USER_GC_TYPE_ID: u32 = 217;
 
 /// Allocate a new instance of a user-defined class.
 ///
@@ -116,13 +125,14 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
 /// means allocating zeroed and storing `ob_type`, `w_class`, `map` and
 /// `storage` individually, in `new_instance`'s order.
 ///
-/// Allocate a `W_ObjectObject` through the GC. The header is stamped
-/// with [`W_OBJECT_OBJECT_GC_TYPE_ID`] so `object_object_custom_trace`
-/// roots the `storage` value slots and dead instances are reclaimed.
-/// When no GC hook is installed (single-crate tests / pre-init snapshot
-/// tools) the same header id is stamped on a leaking allocation.
-/// `lltype::malloc` still writes id 0, which would disagree with the
-/// `INSTANCE_TYPE` vtable.
+/// Allocate a `W_ObjectObject` through the GC. The header tid is the one
+/// [`instance_typeptr_for`] chooses — [`W_OBJECT_OBJECT_GC_TYPE_ID`] for
+/// exact `object()`, [`W_OBJECT_OBJECT_USER_GC_TYPE_ID`] otherwise — so
+/// `object_object_custom_trace` roots the `storage` value slots and dead
+/// instances are reclaimed. When no GC hook is installed (single-crate
+/// tests / pre-init snapshot tools) that same header id is stamped on a
+/// leaking allocation. `lltype::malloc` still writes id 0, which would
+/// disagree with either vtable.
 ///
 /// PRE-EXISTING-ADAPTATION: PyPy instances live in the movable nursery
 /// (`rclass`/`gctypelayout` standard `GcStruct`). Pyre allocates them
@@ -180,12 +190,18 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
             0
         }
     };
-    let raw =
-        crate::gc_hook::try_gc_alloc_nursery_raw(W_OBJECT_OBJECT_GC_TYPE_ID, W_OBJECT_OBJECT_SIZE);
+    // Exact `object()` keeps `INSTANCE_TYPE`. Anything else — a user class,
+    // a builtin that still allocates this attribute bag, a dict subclass, a
+    // null sentinel — takes `INSTANCE_USER_TYPE` (`typedef.py`
+    // `_getusercls(W_ObjectObject)`). Builtin bags on the user typeptr are
+    // interim: `typedef.py` `_getusercls` gives each of those its own
+    // interp class.
+    let (typeptr, type_id) = instance_typeptr_for(w_class);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(type_id, W_OBJECT_OBJECT_SIZE);
     let w_class = crate::gc_roots::shadow_stack_get(class_slot);
     let value = W_ObjectObject {
         ob_header: PyObject {
-            ob_type: &INSTANCE_TYPE as *const PyType,
+            ob_type: typeptr,
             w_class,
         },
         map,
@@ -198,7 +214,29 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier(raw);
         raw as PyObjectRef
     } else {
-        majit_gc::header::alloc_with_gc_header(value, W_OBJECT_OBJECT_GC_TYPE_ID) as PyObjectRef
+        majit_gc::header::alloc_with_gc_header(value, type_id) as PyObjectRef
+    }
+}
+
+/// Typeptr and GC tid [`alloc_instance_object`] stamps for `w_class`.
+///
+/// Exact `object()` is `w_class` identical to the type object cached on
+/// `INSTANCE_TYPE` (`objectobject.py` `allocate_instance` of
+/// `W_ObjectObject`). Every other carrier uses `typedef.py`
+/// `_getusercls(W_ObjectObject)` (`W_ObjectObjectUserDictWeakrefable`).
+///
+/// Builtin attribute-bag types that still allocate `W_ObjectObject` land
+/// on `INSTANCE_USER_TYPE`. That is interim: `typedef.py` `_getusercls`
+/// gives each of those its own interp class.
+pub fn instance_typeptr_for(w_class: PyObjectRef) -> (*const PyType, u32) {
+    let exact = unsafe {
+        crate::typeobject::is_type(w_class)
+            && std::ptr::eq(w_class, get_instantiate(&INSTANCE_TYPE))
+    };
+    if exact {
+        (&INSTANCE_TYPE, W_OBJECT_OBJECT_GC_TYPE_ID)
+    } else {
+        (&INSTANCE_USER_TYPE, W_OBJECT_OBJECT_USER_GC_TYPE_ID)
     }
 }
 
@@ -216,7 +254,10 @@ pub unsafe fn w_instance_get_type(obj: PyObjectRef) -> PyObjectRef {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_instance(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &INSTANCE_TYPE)
+    // Exact `object()` is `INSTANCE_TYPE`. Every other carrier is
+    // `INSTANCE_USER_TYPE`, a child of that vtable, so the layout test
+    // is the subclass range (`rclass.py` `ll_isinstance`).
+    ll_isinstance(obj, &INSTANCE_TYPE)
 }
 
 #[cfg(test)]
@@ -225,14 +266,16 @@ mod tests {
 
     #[test]
     fn test_instance_create_and_check() {
-        // Use a sentinel as the "type"
+        // A null class is not exact `object()`, so the carrier is the
+        // `_getusercls` vtable. `is_instance` reads the published range.
+        crate::pyobject::ensure_object_subclass_ranges_initialized();
         let fake_type = PY_NULL;
         let obj = w_instance_new(fake_type);
         unsafe {
             assert!(is_instance(obj));
-            assert!(std::ptr::eq((*obj).ob_type, &INSTANCE_TYPE));
+            assert!(std::ptr::eq((*obj).ob_type, &INSTANCE_USER_TYPE));
             let hdr = majit_gc::header::header_of(obj as usize);
-            assert_eq!((*hdr).type_id(), W_OBJECT_OBJECT_GC_TYPE_ID);
+            assert_eq!((*hdr).type_id(), W_OBJECT_OBJECT_USER_GC_TYPE_ID);
             assert!(!is_int(obj));
             assert!(!crate::typeobject::is_type(obj));
             assert_eq!(w_instance_get_type(obj), fake_type);

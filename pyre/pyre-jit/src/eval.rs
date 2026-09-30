@@ -3232,7 +3232,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     // slots (and reclaims dead instances; the storage `Vec` itself
     // forwards in place). Parent stays the rclass root. `INSTANCE_TYPE`
     // is this id's vtable: header tid and `subclass_range` agree, and
-    // the range covers only `W_ObjectObject`, not every interp class.
+    // the range covers `W_ObjectObject` and its `_getusercls` child, not
+    // every interp class.
     let w_object_object_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         pyre_object::objectobject::W_OBJECT_OBJECT_SIZE,
         object_tid,
@@ -4660,7 +4661,30 @@ fn build_gc() -> Box<MiniMarkGC> {
         exception_extended_user_tid,
     );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 217),
+    // `W_ObjectObjectUserDictWeakrefable` (`typedef.py`
+    // `_getusercls(W_ObjectObject)`). Same size and
+    // `object_object_custom_trace` as `W_ObjectObject`; the child vtable
+    // is what a non-exact carrier stamps.
+    let w_object_object_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::objectobject::W_OBJECT_OBJECT_SIZE,
+        w_object_object_tid,
+        object_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        w_object_object_user_tid,
+        pyre_object::objectobject::W_OBJECT_OBJECT_USER_GC_TYPE_ID,
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::INSTANCE_USER_TYPE as *const _ as usize,
+        w_object_object_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::INSTANCE_USER_TYPE as *const _ as usize,
+        w_object_object_user_tid,
+    );
+
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 218),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,
@@ -17286,6 +17310,7 @@ mod tests {
 
         let root_r = range(&pyre_object::pyobject::W_ROOT_TYPE);
         let instance_r = range(&pyre_object::pyobject::INSTANCE_TYPE);
+        let instance_user_r = range(&pyre_object::pyobject::INSTANCE_USER_TYPE);
         let int_r = range(&pyre_object::pyobject::INT_TYPE);
         let float_r = range(&pyre_object::pyobject::FLOAT_TYPE);
         let bool_r = range(&pyre_object::pyobject::BOOL_TYPE);
@@ -17303,6 +17328,14 @@ mod tests {
         assert!(contains(root_r, none_r), "W_Root ⊇ NoneType");
         assert!(contains(root_r, instance_r), "W_Root ⊇ W_ObjectObject");
         assert!(contains(root_r, code_r), "W_Root ⊇ PyCode");
+        assert!(
+            contains(instance_r, instance_user_r),
+            "W_ObjectObject ⊇ W_ObjectObjectUserDictWeakrefable"
+        );
+        assert!(
+            !contains(instance_user_r, instance_r),
+            "the _getusercls layout does not contain W_ObjectObject"
+        );
 
         // (2) W_ObjectObject is one child, not the root of int or list.
         assert!(
@@ -17330,7 +17363,8 @@ mod tests {
         // not only in the GC's TypeInfo table. ll_issubclass reads them
         // from the typeptr without a GC indirection.
         use pyre_object::pyobject::{
-            BOOL_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INT_TYPE, LIST_TYPE, W_ROOT_TYPE,
+            BOOL_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INSTANCE_USER_TYPE, INT_TYPE, LIST_TYPE,
+            W_ROOT_TYPE,
         };
         use std::sync::atomic::Ordering;
         assert_eq!(
@@ -17373,6 +17407,14 @@ mod tests {
             assert!(pyre_object::pyobject::ll_issubclass(
                 &INSTANCE_TYPE,
                 &W_ROOT_TYPE
+            ));
+            assert!(pyre_object::pyobject::ll_issubclass(
+                &INSTANCE_USER_TYPE,
+                &INSTANCE_TYPE
+            ));
+            assert!(!pyre_object::pyobject::ll_issubclass(
+                &INSTANCE_TYPE,
+                &INSTANCE_USER_TYPE
             ));
             assert!(pyre_object::pyobject::ll_issubclass(
                 &INT_TYPE,

@@ -582,11 +582,25 @@ pub static TYPE_TYPE: PyType = new_pytype_with_weakref(
 /// and no instances: `instantiate` stays null, `user_subclass` stays
 /// null, and nothing stamps this vtable into `ob_type`.
 pub static W_ROOT_TYPE: PyType = new_pytype("W_Root");
-/// `W_ObjectObject` (`objectobject.py`). App-level `object`, one child
-/// of `W_ROOT_TYPE`. Carriers still share this vtable; it is not the
-/// rclass root.
-pub static INSTANCE_TYPE: PyType = new_pytype_with_mapdict_mixin(
+/// `W_ObjectObject` (`objectobject.py`). Exact `object()`. One child of
+/// `W_ROOT_TYPE`, not the rclass root. `user_subclass` is the
+/// `_getusercls` class below; both keep the `map` word
+/// (`MapdictStorageMixin`).
+pub static INSTANCE_TYPE: PyType = {
+    let mut tp = new_pytype_with_mapdict_mixin(
+        "object",
+        std::mem::offset_of!(crate::objectobject::W_ObjectObject, map),
+    );
+    tp.user_subclass = &INSTANCE_USER_TYPE;
+    tp
+};
+/// `W_ObjectObjectUserDictWeakrefable` (`typedef.py`
+/// `_getusercls(W_ObjectObject)`). Same `{header, map, storage}` payload
+/// as `W_ObjectObject`; a carrier whose app-level class is not exactly
+/// `object` stamps this vtable.
+pub static INSTANCE_USER_TYPE: PyType = new_user_pytype(
     "object",
+    &INSTANCE_TYPE,
     std::mem::offset_of!(crate::objectobject::W_ObjectObject, map),
 );
 
@@ -718,8 +732,10 @@ pub fn ll_issubclass_const(subcls: &PyType, minid: i64, maxid: i64) -> bool {
 /// RPython-level type check: reads `obj.typeptr` (= `ob_type`) and checks
 /// subclass ranges. This checks the **RPython class** (`W_IntObject`,
 /// `W_ListObject`, ...), NOT the Python-level class. The rclass root is
-/// `W_ROOT_TYPE` (`W_Root`). Carriers share `INSTANCE_TYPE`
-/// (`W_ObjectObject`), a child of that root.
+/// `W_ROOT_TYPE` (`W_Root`). Exact `object()` is `INSTANCE_TYPE`
+/// (`W_ObjectObject`). Every other carrier of that struct is
+/// `INSTANCE_USER_TYPE` (`typedef.py` `_getusercls(W_ObjectObject)`),
+/// a child of that vtable.
 ///
 /// For Python-level `isinstance()`, use `issubtype_w` (MRO walk on
 /// `w_class`), not this function.
@@ -1038,22 +1054,26 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (214, Some(31)),
     (215, Some(31)),  // W_BaseExceptionUser
     (216, Some(214)), // W_ExceptionExtendedUser
+    // `W_ObjectObjectUserDictWeakrefable` (`typedef.py`
+    // `_getusercls(W_ObjectObject)`). Same payload as
+    // `W_OBJECT_OBJECT_GC_TYPE_ID`.
+    (217, Some(53)),
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail, after the `_getusercls` layouts (158-216).
-    (217, Some(0)),
-    // Native-only type IDs 218 and 219 represent `posix.DirEntry` and
+    // posix / console tail, after the `_getusercls` layouts (158-217).
+    (218, Some(0)),
+    // Native-only type IDs 219 and 220 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (218, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
     (219, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (220, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (220, Some(0)),
+    (221, Some(0)),
     #[cfg(windows)]
-    (221, Some(220)), // W_WinConsoleIOUser
+    (222, Some(221)), // W_WinConsoleIOUser
                       // The classes `pyre-module` registers follow, numbered by `build_gc` in
                       // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1703,6 +1723,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(50, &crate::celldict::INT_MUTABLE_CELL_TYPE),
         subclass_range_alias(52, &crate::weakref::GC_WEAKREF_BOX_TYPE),
         subclass_range_alias(53, &INSTANCE_TYPE),
+        subclass_range_alias(217, &INSTANCE_USER_TYPE),
         subclass_range_alias(54, &COMPLEX_TYPE),
         subclass_range_alias(56, &crate::interp_exceptions::EXC_EXCEPTION_TYPE),
         subclass_range_alias(57, &crate::interp_exceptions::EXC_SYSTEM_EXIT_TYPE),

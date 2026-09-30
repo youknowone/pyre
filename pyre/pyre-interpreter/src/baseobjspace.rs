@@ -13796,7 +13796,16 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         }
         // Unlink and store under one lock so a tracer cannot install a
         // fresh watcher against the old class between the two.
+        // A `W_ObjectObject` carrier's typeptr has to name the layout the
+        // new class would have been allocated with. Exact `object()` is not
+        // a mutable heap type, so a successful store stays on
+        // `INSTANCE_USER_TYPE` and the header tid does not change. Other
+        // layouts keep the typeptr their own allocator stamped.
         pyre_object::notify_w_class_mutated_then(|| {
+            if pyre_object::is_instance(w_obj) {
+                let (typeptr, _) = pyre_object::instance_typeptr_for(w_newcls);
+                (*w_obj).ob_type = typeptr;
+            }
             (*w_obj).w_class = w_newcls;
         });
     }

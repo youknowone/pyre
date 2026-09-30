@@ -552,8 +552,16 @@ pub unsafe fn has_mapdict_layout(obj: PyObjectRef) -> bool {
 }
 
 /// Whether attribute access for `obj` routes through mapdict storage. This is
-/// the physical [`has_mapdict_layout`] test plus the owning class's `hasdict`
-/// flag for a `_getusercls` layout (`typedef.py _getusercls`).
+/// the physical [`has_mapdict_layout`] test plus, for a `_getusercls` layout
+/// whose builtin payload did not already import `MapdictStorageMixin`, the
+/// owning class's `hasdict` flag (`typedef.py` `_getusercls`).
+///
+/// `W_ObjectObject` already imports the mixin, and
+/// `W_ObjectObjectUserDictWeakrefable` keeps that storage for every
+/// app-level class, including a slots-only one (`hasdict` false). A
+/// generated layout whose `user_base` has no mixin adds the storage on top
+/// of a fixed payload and routes attributes through it only when the class
+/// has a dict.
 ///
 /// # Safety
 /// `obj` must be null or a live object reference.
@@ -563,6 +571,12 @@ pub unsafe fn has_mapdict_storage(obj: PyObjectRef) -> bool {
         return false;
     }
     if !unsafe { is_generated_user_layout_family(obj) } {
+        return true;
+    }
+    // `user_base` is non-null here. A base that already publishes the mixin
+    // (`W_ObjectObject`) routes every carrier, slotted or not.
+    let base = unsafe { (*(*obj).ob_type).user_base };
+    if unsafe { (*base).mapdict_offset } != 0 {
         return true;
     }
     let w_class = unsafe { (*obj).w_class };
@@ -7008,6 +7022,26 @@ mod tests {
             assert_eq!(instance_get_weakref_slot(obj), Some(lifeline));
             delweakref(obj);
             assert_eq!(instance_get_weakref_slot(obj), None);
+        }
+    }
+
+    #[test]
+    fn object_user_layout_routes_slots_without_hasdict() {
+        // `W_ObjectObjectUserDictWeakrefable` keeps `MapdictStorageMixin`
+        // for a slots-only class (`hasdict` false). A slots-only native
+        // subclass does not: that is
+        // `slots_only_native_subclass_has_mapdict_layout_without_routing`.
+        unsafe {
+            let w_class =
+                pyre_object::w_type_new("SlotsOnly", pyre_object::PY_NULL, std::ptr::null_mut());
+            assert!(!pyre_object::w_type_get_hasdict(w_class));
+            let obj = pyre_object::w_instance_new(w_class);
+            assert!(std::ptr::eq(
+                (*obj).ob_type,
+                &pyre_object::pyobject::INSTANCE_USER_TYPE
+            ));
+            assert!(has_mapdict_layout(obj));
+            assert!(has_mapdict_storage(obj));
         }
     }
 

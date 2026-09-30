@@ -12348,7 +12348,7 @@ pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         )? {
             return Ok(r);
         }
-        if !obj.is_null() && std::ptr::eq((*obj).ob_type, &INSTANCE_TYPE as *const PyType) {
+        if pyre_object::is_instance(obj) {
             if let Some(r) = pyre_object::with_roots!(obj =>
                 crate::display::try_call_dunder_obj_above_object(obj, "__str__")
             )? {
@@ -12415,7 +12415,7 @@ unsafe fn py_repr_obj(mut obj: PyObjectRef) -> Result<PyObjectRef, crate::PyErro
             )? {
                 return Ok(r);
             }
-            if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType)
+            if pyre_object::is_instance(obj)
                 && let Some(r) = pyre_object::with_roots!(obj =>
                     crate::display::try_call_dunder_obj(obj, "__repr__")
                 )?

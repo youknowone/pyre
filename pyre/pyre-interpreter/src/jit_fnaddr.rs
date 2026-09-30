@@ -5261,6 +5261,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("pyobject::TYPE_TYPE", pyobject::TYPE_TYPE),
         pytype_addr!("pyobject::W_ROOT_TYPE", pyobject::W_ROOT_TYPE),
         pytype_addr!("pyobject::INSTANCE_TYPE", pyobject::INSTANCE_TYPE),
+        pytype_addr!("pyobject::INSTANCE_USER_TYPE", pyobject::INSTANCE_USER_TYPE),
         pytype_addr!("setobject::SET_TYPE", setobject::SET_TYPE),
         pytype_addr!("setobject::SET_USER_TYPE", setobject::SET_USER_TYPE),
         pytype_addr!("setobject::FROZENSET_TYPE", setobject::FROZENSET_TYPE),

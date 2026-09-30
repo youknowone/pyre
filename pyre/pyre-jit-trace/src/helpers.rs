@@ -984,6 +984,11 @@ pub fn emit_make_function_inline(
 /// the inherited header `PyObject.w_class` and `map`), mirroring
 /// `objectobject.rs w_instance_new`.
 ///
+/// `user` selects `typedef.py` `_getusercls(W_ObjectObject)`
+/// (`W_ObjectObjectUserDictWeakrefable`) rather than exact `W_ObjectObject`.
+/// Both size descrs share the field Arcs, so the stores below name one
+/// index space. `NewWithVtable` writes that layout's vtable.
+///
 /// `storage` keeps the allocation's zero — `w_instance_new` stores a null
 /// there as well (`mapdict.py _mapdict_init_empty`, `storage = None`).
 /// `map` is the owning type's terminator, read eagerly for the same reason
@@ -995,8 +1000,18 @@ pub fn emit_make_function_inline(
 /// `bh_call_fn` residual lets the optimizer virtualize the instance away when
 /// it never escapes the loop — the shape PyPy gets by tracing through
 /// `typeobject.py descr_call` → `space.allocate_instance`.
-pub fn emit_instance_inline(ctx: &mut TraceCtx, header_w_class: OpRef, map: OpRef) -> OpRef {
-    let new_op = ctx.execute_new_with_vtable(crate::descr::w_object_object_size_descr());
+pub fn emit_instance_inline(
+    ctx: &mut TraceCtx,
+    header_w_class: OpRef,
+    map: OpRef,
+    user: bool,
+) -> OpRef {
+    let size_descr = if user {
+        crate::descr::w_object_object_user_size_descr()
+    } else {
+        crate::descr::w_object_object_size_descr()
+    };
+    let new_op = ctx.execute_new_with_vtable(size_descr);
     for (descr, value) in [
         (crate::descr::object_header_w_class_descr(), header_w_class),
         (crate::descr::object_map_descr(), map),

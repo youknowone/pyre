@@ -4465,12 +4465,15 @@ pub fn property_fset_descr() -> DescrRef {
 /// standalone `w_class_descr` — because the instantiation emit
 /// (`try_walker_inline_type_call`) builds instances with `NewWithVtable`, and
 /// the class a `getfield_gc(w_class)` off such a virtual must answer with is
-/// the *stored* one.  Every instance shares `INSTANCE_TYPE` as its vtable
-/// while its Python class varies per instance, so the vtable-derived fallback
-/// (`w_class_obj`, which resolves `INSTANCE_TYPE`'s `get_instantiate` to
-/// `object`) is wrong here; only a field the virtual actually tracks gives
-/// `OptVirtualize` the right answer, and materialization then reproduces the
-/// header.
+/// the *stored* one.  Exact `object()` stamps `INSTANCE_TYPE`. Every other
+/// carrier stamps `INSTANCE_USER_TYPE` (`typedef.py`
+/// `_getusercls(W_ObjectObject)`), whose Python class still varies per
+/// instance, so the vtable-derived fallback (`w_class_obj`, which resolves
+/// `get_instantiate` to `object` or to null on the user vtable) is wrong
+/// here; only a field the virtual actually tracks gives `OptVirtualize` the
+/// right answer, and materialization then reproduces the header. The user
+/// size descr below shares these field Arcs, so both vtables use one index
+/// space.
 static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     let group = build_object_descr_group_with_def_path(
         pyre_object::W_OBJECT_OBJECT_SIZE,
@@ -4524,6 +4527,42 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
     // the dead pre-move copy and the attribute is lost.
     group.size_descr.set_non_moving(true);
     group
+});
+
+/// Size index for `W_ObjectObjectUserDictWeakrefable`. Bit 27 sits inside
+/// the size mask and no struct is 128MB, so it cannot collide with a
+/// size-derived `SIZE_DESCR_TAG | size` index. Field indices stay the
+/// base group's: `set_parent_descr` is not called on the shared Arcs.
+const W_OBJECT_OBJECT_USER_SIZE_INDEX: u32 = SIZE_DESCR_TAG | 0x0800_0000;
+
+/// `NewWithVtable` descr for a non-exact `W_ObjectObject` carrier.
+/// Same field Arcs, size, and `non_moving` bit as
+/// [`W_OBJECT_OBJECT_DESCR_GROUP`]; vtable is `INSTANCE_USER_TYPE` and
+/// the GC tid is `W_OBJECT_OBJECT_USER_GC_TYPE_ID`. Registered under
+/// `objectobject::W_ObjectObjectUser`, not the exact-object STRUCT key.
+static W_OBJECT_OBJECT_USER_SIZE_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    let base = W_OBJECT_OBJECT_DESCR_GROUP.size_descr.clone();
+    let fields = base
+        .as_size_descr()
+        .expect("W_ObjectObject size descr")
+        .all_fielddescrs()
+        .to_vec();
+    let mut sd = majit_ir::descr::SimpleSizeDescr::with_vtable(
+        W_OBJECT_OBJECT_USER_SIZE_INDEX,
+        pyre_object::W_OBJECT_OBJECT_SIZE,
+        pyre_object::objectobject::W_OBJECT_OBJECT_USER_GC_TYPE_ID,
+        &pyre_object::pyobject::INSTANCE_USER_TYPE as *const _ as usize,
+    );
+    let cache_key = majit_ir::descr::path_hash("objectobject::W_ObjectObjectUser");
+    sd.set_cache_key(cache_key);
+    let sd = sd.with_all_fielddescrs(fields);
+    sd.set_non_moving(true);
+    let descr = Arc::new(sd) as DescrRef;
+    majit_ir::descr_registry::register_keyed_size(
+        majit_ir::descr::LLType::Struct(cache_key),
+        descr.clone(),
+    );
+    descr
 });
 
 fn build_native_user_mapdict_group(
@@ -5818,12 +5857,19 @@ pub fn object_header_w_class_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_OBJECT_DESCR_GROUP, 2)
 }
 
-/// Size descriptor for a `W_ObjectObject` allocation via `NewWithVtable`
+/// Size descriptor for an exact `object()` allocation via `NewWithVtable`
 /// (vtable = `&INSTANCE_TYPE`); the header `w_class` and `map` are
 /// `SetfieldGc`'d after, and `storage` stays at the allocator's zero (the
 /// `_mapdict_init_empty` `storage = None` state).
 pub fn w_object_object_size_descr() -> DescrRef {
     W_OBJECT_OBJECT_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for every other `W_ObjectObject` carrier
+/// (`typedef.py` `_getusercls(W_ObjectObject)`). Field descrs are the
+/// exact-object group's Arcs.
+pub fn w_object_object_user_size_descr() -> DescrRef {
+    W_OBJECT_OBJECT_USER_SIZE_DESCR.clone()
 }
 
 /// rlist.py:116 `l.length` — live length of a list under the Object
@@ -8182,6 +8228,7 @@ mod tests {
             ("Method", w_method_size_descr()),
             ("W_ListObject", w_list_size_descr()),
             ("W_ObjectObject", w_object_object_size_descr()),
+            ("W_ObjectObjectUser", w_object_object_user_size_descr()),
             ("W_IntObject", w_int_size_descr()),
             ("W_BoolObject", w_bool_size_descr()),
             ("W_RangeIterObject", w_range_iter_size_descr()),
@@ -8319,6 +8366,14 @@ mod tests {
             instance_size.non_moving(),
             "raw instance pointers can survive across allocation without being rooted"
         );
+        let user_instance = w_object_object_user_size_descr()
+            .as_size_descr()
+            .expect("W_ObjectObjectUser SizeDescr")
+            .non_moving();
+        assert!(
+            user_instance,
+            "a _getusercls carrier is the same non-moving W_ObjectObject allocation"
+        );
 
         let storage_descr = crate::state::mapdict_storage_gcarray_descr();
         let storage_array = storage_descr
@@ -8328,6 +8383,56 @@ mod tests {
             storage_array.non_moving(),
             "the mapdict custom tracer marks raw storage pointers but cannot rewrite them"
         );
+    }
+
+    /// `W_ObjectObjectUser` is the same payload as `W_ObjectObject` with a
+    /// different vtable (`typedef.py` `_getusercls`). The field Arcs stay
+    /// one index space; the STRUCT key and GC tid do not.
+    #[test]
+    fn object_user_size_descr_shares_w_object_object_fields() {
+        use std::sync::Arc;
+
+        let exact = w_object_object_size_descr();
+        let user = w_object_object_user_size_descr();
+        let exact_sd = exact.as_size_descr().expect("W_ObjectObject SizeDescr");
+        let user_sd = user.as_size_descr().expect("W_ObjectObjectUser SizeDescr");
+        assert_eq!(
+            user_sd.type_id(),
+            pyre_object::objectobject::W_OBJECT_OBJECT_USER_GC_TYPE_ID
+        );
+        assert_eq!(
+            user_sd.vtable(),
+            &pyre_object::pyobject::INSTANCE_USER_TYPE as *const _ as usize
+        );
+        assert_eq!(
+            exact_sd.type_id(),
+            pyre_object::objectobject::W_OBJECT_OBJECT_GC_TYPE_ID
+        );
+        assert_eq!(user_sd.size(), exact_sd.size());
+        assert!(user_sd.non_moving());
+        assert_eq!(user.index(), super::W_OBJECT_OBJECT_USER_SIZE_INDEX);
+        assert_ne!(user.index(), exact.index());
+        assert_ne!(user_sd.cache_key(), 0);
+        assert_ne!(user_sd.cache_key(), exact_sd.cache_key());
+        assert_eq!(
+            majit_ir::descr::gc_cache()
+                .lock()
+                .resolve_struct_tid(user_sd.cache_key()),
+            Some(pyre_object::objectobject::W_OBJECT_OBJECT_USER_GC_TYPE_ID)
+        );
+        assert_eq!(exact_sd.all_fielddescrs().len(), 3);
+        assert_eq!(
+            exact_sd.all_fielddescrs().len(),
+            user_sd.all_fielddescrs().len()
+        );
+        for (exact_field, user_field) in exact_sd
+            .all_fielddescrs()
+            .iter()
+            .zip(user_sd.all_fielddescrs().iter())
+        {
+            assert!(Arc::ptr_eq(exact_field, user_field));
+        }
+        assert_eq!(user_sd.class_word_index_in_parent(), Some(2));
     }
 
     /// The named `pyframe_*_descr` accessors pick their descr by position in
@@ -10124,6 +10229,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("objectobject::W_ObjectObject", || {
         LazyLock::force(&W_OBJECT_OBJECT_DESCR_GROUP);
+    }),
+    ("objectobject::W_ObjectObjectUser", || {
+        LazyLock::force(&W_OBJECT_OBJECT_USER_SIZE_DESCR);
     }),
     ("interp_exceptions::W_BaseException", || {
         let _ = w_exception_descrs_for(ExcKind::BaseException, false);

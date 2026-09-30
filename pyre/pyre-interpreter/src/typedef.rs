@@ -34899,6 +34899,49 @@ fn descr_get_weakref(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn object_user_layout_splits_exact_object_from_user_instances() {
+        use pyre_object::*;
+
+        super::init_typeobjects();
+        let _roots = gc_roots::push_roots();
+        let exact = gc_roots::pin_root(w_instance_new(super::w_object()));
+        unsafe {
+            assert!(std::ptr::eq((*exact).ob_type, &INSTANCE_TYPE));
+            assert!(is_instance(exact));
+            let hdr = majit_gc::header::header_of(exact as usize);
+            assert_eq!((*hdr).type_id(), objectobject::W_OBJECT_OBJECT_GC_TYPE_ID);
+        }
+
+        let ns_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_dict_new());
+        let bases_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_tuple_new(vec![super::w_object()]));
+        let child = gc_roots::pin_root(w_type_new(
+            "A",
+            gc_roots::shadow_stack_get(bases_slot),
+            gc_roots::shadow_stack_get(ns_slot) as *mut u8,
+        ));
+        unsafe {
+            crate::call::create_all_slots(child, gc_roots::shadow_stack_get(bases_slot)).unwrap();
+        }
+        let inst = gc_roots::pin_root(w_instance_new(child));
+        unsafe {
+            assert!(std::ptr::eq((*inst).ob_type, &INSTANCE_USER_TYPE));
+            assert!(is_instance(inst));
+            let hdr = majit_gc::header::header_of(inst as usize);
+            assert_eq!(
+                (*hdr).type_id(),
+                objectobject::W_OBJECT_OBJECT_USER_GC_TYPE_ID
+            );
+            assert!(pyobject::ll_issubclass(&INSTANCE_USER_TYPE, &INSTANCE_TYPE));
+            assert!(!pyobject::ll_issubclass(
+                &INSTANCE_TYPE,
+                &INSTANCE_USER_TYPE
+            ));
+        }
+    }
+
+    #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn list_append_uses_a_registered_gateway_body() {
         use pyre_object::*;

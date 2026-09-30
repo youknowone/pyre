@@ -10012,16 +10012,20 @@ fn emit_walker_instance<Sym: WalkSym>(
 ) -> (OpRef, pyre_object::PyObjectRef) {
     let concrete_instance = pyre_object::w_instance_new(w_type);
     let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
+    // The vtable `alloc_instance_object` stamps for this `w_type`. Exact
+    // `object()` is `INSTANCE_TYPE`; every other carrier is
+    // `INSTANCE_USER_TYPE` (`typedef.py` `_getusercls(W_ObjectObject)`).
+    let (typeptr, _) = pyre_object::instance_typeptr_for(w_type);
+    let user = !std::ptr::eq(typeptr, &pyre_object::pyobject::INSTANCE_TYPE);
     let instance =
-        crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const);
+        crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const, user);
     ctx.trace_ctx.set_opref_concrete(
         instance,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_instance as usize)),
     );
-    ctx.trace_ctx.heap_cache_mut().class_now_known(
-        instance,
-        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
-    );
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(instance, typeptr as *const _ as i64);
     (instance, concrete_instance)
 }
 
