@@ -128,7 +128,7 @@ LIVENESS_KEYS = (
 LIVENESS_SKIPPED = "liveness scan skipped"
 
 # Ratcheted: may fall, may not rise.  A column the baseline entry does not
-# record yet is unrecorded and is not a failure until `--update` stores it.
+# record yet is unrecorded and fails until `--update` stores it.
 RATCHET = (
     "unbracketed_calls",
     "frames_across_collecting",
@@ -336,8 +336,8 @@ def compare(got: dict, want: dict) -> int:
     """Score one run against one platform's baseline entry.
 
     Returns 0 when every invariant is zero and no ratcheted column rose.
-    A column the baseline does not record yet is printed as unrecorded and
-    does not fail.  A rise fails even when this run's base is not the base
+    A ratcheted column the baseline does not record yet fails as unrecorded.
+    A rise fails even when this run's base is not the base
     the baseline recorded: the gate holds main's own code too, and a rise on
     main is fixed on main.
     """
@@ -352,9 +352,10 @@ def compare(got: dict, want: dict) -> int:
 
     base_now = got.get("base", "")
     if base_now and base_now != want.get("base"):
-        recorded = want.get("base", "(unrecorded)")
+        recorded = want.get("base")
+        recorded = recorded[:12] if recorded else "(unrecorded)"
         print(
-            f"\nNOTE: the baseline was taken against {recorded[:12]}"
+            f"\nNOTE: the baseline was taken against {recorded}"
             f" and this run sits on {base_now[:12]}. Interpreter code the"
             f" baseline never saw is in this count; attribute a rise before"
             f" paying it down."
@@ -369,7 +370,12 @@ def compare(got: dict, want: dict) -> int:
                        f"unbracketed collecting call is a use-after-move, not "
                        f"a backlog entry.")
     for k in RATCHET:
-        if k in want and got[k] > want[k]:
+        if k not in want:
+            bad.append(
+                f"{k} is {got[k]} (unrecorded). Seed this platform's "
+                f"baseline with --update so the column is enforced."
+            )
+        elif got[k] > want[k]:
             bad.append(
                 f"{k} rose {want[k]} -> {got[k]}. Root the new call, "
                 f"or pay the baseline down with --update."

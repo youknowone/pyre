@@ -202,15 +202,15 @@ class GateTests(unittest.TestCase):
         self.assertIn("NOTE:", text)
         self.assertNotIn("WARN", text)
 
-    def test_unrecorded_key_is_reported_and_passes(self) -> None:
+    def test_unrecorded_key_is_reported_and_fails(self) -> None:
         got = measured(short_brackets=999)
         want = measured()
         del want["short_brackets"]
         text, rc = run_compare(got, want)
-        self.assertEqual(rc, 0)
-        self.assertIn("OK", text)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL", text)
         self.assertRegex(text, r"short_brackets\s+999\s+\(unrecorded\)")
-        self.assertNotIn("FAIL", text)
+        self.assertIn("short_brackets is 999 (unrecorded)", text)
         self.assertNotIn("rose", text)
 
     def test_tier15_calls_above_zero_fails_as_invariant(self) -> None:
