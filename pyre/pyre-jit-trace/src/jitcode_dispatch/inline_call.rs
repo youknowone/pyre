@@ -7114,8 +7114,19 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // bound in practice: a third Python frame residualized however
                 // straight-line it was, which is a two-deep helper called from
                 // any dunder at all.
-                let seeded_callee_resume =
-                    callable_guard_op.is_constant() && (try_multiframe || strict_seed);
+                // A closure's green key is `Function.code` (`function.py`
+                // `getcode`), not the function object.  `guards_the_callee_function`
+                // reads that field and threads the cells as red getfields, so a
+                // `def` inside the caller — a fresh function on every call, one
+                // code object — can inline.  The predicate is that flag, not
+                // `has_closure` alone: a guard operand that is not the callee
+                // still pins identity (`GuardValue`), and a fresh function
+                // fails that guard on every call.  A non-closure operand keeps
+                // the constant screen: dropping it inlined `self.cb(...)`
+                // wherever the callable really varied.
+                let seeded_callee_resume = (try_multiframe || strict_seed)
+                    && (callable_guard_op.is_constant()
+                        || (has_closure && guards_the_callee_function));
                 // The handler exemption below was measured on a CALL entry
                 // (`blackhole_inlined_callee_local_after_escape_declined`).
                 // A seeded frame does not widen that exemption.
