@@ -5204,6 +5204,21 @@ impl majit_ir::QuasiImmutHandle for RecordedQuasiImmut {
 /// `pycode.py` `"w_globals?"`. Analyzer `fielddescrof` stamps
 /// `PyCode.w_globals`; the reserved quasi descr uses the same offset and a
 /// `Struct.w_globals` name.
+/// A constant globals operand is its own namespace. A non-constant one is
+/// the recorded `PyCode.w_globals` read only when that field's
+/// quasi-immutable dependency is already known: the marker keeps the dict
+/// equal to the value observed while recording. A mutable read, including
+/// `debugdata.w_globals`, is not that field.
+pub(crate) fn globals_read_keeps_recorded_namespace(ctx: &TraceCtx, globals: OpRef) -> bool {
+    if globals.is_constant() {
+        return true;
+    }
+    let Some((descr, obj)) = ctx.ref_getfield_gc_r(globals) else {
+        return false;
+    };
+    is_pycode_w_globals_descr(&descr) && ctx.heap_cache().is_quasi_immut_known(descr.index(), obj)
+}
+
 fn is_pycode_w_globals_descr(descr: &DescrRef) -> bool {
     if !descr.is_quasi_immutable() {
         return false;

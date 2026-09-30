@@ -3853,6 +3853,23 @@ impl TraceCtx {
     /// arrives here into a blackhole frame's ref bank, and resuming through
     /// that frame dereferences it. Answer unresolved instead, so those sites
     /// decline the image the way they already do for a color with no box.
+    /// The `GetfieldGcR` that produced `opref`, when that box is one.
+    ///
+    /// Byte-mode traces keep the producer in a frontend slot;
+    /// `get_op_by_raw_pos` answers after the op has been materialized.
+    pub fn ref_getfield_gc_r(&self, opref: OpRef) -> Option<(DescrRef, OpRef)> {
+        if let Some(pair) = self.recorder.getfield_gc_r_at(opref.raw()) {
+            return Some(pair);
+        }
+        let op = self.recorder.get_op_by_raw_pos(opref.raw())?;
+        if op.opcode != OpCode::GetfieldGcR {
+            return None;
+        }
+        let descr = op.descr.borrow().clone()?;
+        let obj = op.args_slice().first()?.to_opref();
+        Some((descr, obj))
+    }
+
     pub fn recover_ref_value(&self, opref: OpRef, depth: u32) -> Option<Value> {
         if let Some(v) = self.concrete_of_opref(opref) {
             if matches!(v, Value::Ref(r) if r == majit_ir::GcRef::NO_CONCRETE) {

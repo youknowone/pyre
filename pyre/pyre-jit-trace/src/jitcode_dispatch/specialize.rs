@@ -6414,11 +6414,12 @@ fn walker_write_const_bool_result<Sym: WalkSym>(
 /// `Function` per iteration.
 ///
 /// Everything the constructor stores is loop-invariant when `code` is a
-/// constant. `globals` is the frame's `get_w_globals()` result (the
-/// `LoadImportGlobals` lowering): a constant, or the getfield that read
-/// records. The getfield is stored as `w_func_globals`; the quasi-immutable
-/// marker on that read invalidates a changed namespace. `code` comes from a
-/// `LOAD_CONST`, and the remaining slots are derived from the operands:
+/// constant and `globals` names one fixed dict. A constant globals operand
+/// is that dict. A non-constant one is accepted only when it is the
+/// `GetfieldGcR` of `PyCode.w_globals` whose quasi-immutable dependency is
+/// already recorded, so the dict stays the one `__builtins__` was read
+/// from. `code` comes from a `LOAD_CONST`, and the remaining slots are
+/// derived from the operands:
 ///
 /// * `name` — `function.py:51 self.name = code.co_name`, a pointer into the
 ///   `Box::into_raw`'d `CodeObject`, which is never rewritten in place nor
@@ -6435,18 +6436,20 @@ fn walker_write_const_bool_result<Sym: WalkSym>(
 ///   default-module build, which mint a fresh object per call and so cannot be
 ///   baked — those decline to the residual.
 ///
-/// Soundness rests on the globals read's quasi-immutable marker, so another
-/// namespace invalidates the loop, and on the module dict's `version?`, so
-/// rebinding `globals['__builtins__']` runs `mutated()` and revokes the loop,
+/// Soundness for a quasi `PyCode.w_globals` read is that marker: it keeps
+/// `globals` equal to the dict whose `__builtins__` was baked. The module
+/// dict's `version?` still revokes the loop when that name is rebound,
 /// exactly as it does for a shadowing insert under the LOAD_GLOBAL cell
 /// fold.  Nothing watches the code object's `co_name` / `co_qualname`
 /// because neither is mutable in place — `code.replace()` clones first and
 /// yields a different code object, which is a different constant.
 ///
 /// Declines (each falls through to the residual, which stays correct): a
-/// non-constant `code` operand, a globals operand with no concrete module
-/// dict, a non-`PyCode` or bodyless code object, an unbakeable
-/// `__builtins__`, and any baked pointer the collector may relocate.
+/// non-constant `code` operand, a globals operand that is neither a
+/// constant nor that quasi `PyCode.w_globals` read, a globals operand with
+/// no concrete module dict, a non-`PyCode` or bodyless code object, an
+/// unbakeable `__builtins__`, and any baked pointer the collector may
+/// relocate.
 pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -6517,6 +6520,11 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     // arguments of the MAKE_FUNCTION body below.  Those slots are forwarded
     // by `walk_const_ptr_refs` and loaded from the gcref table at run;
     // movability does not decide the fold.
+    // `__builtins__` was read from the dict observed on this iteration.
+    // A mutable globals box is not that dict for the rest of the trace.
+    if !crate::state::globals_read_keeps_recorded_namespace(ctx.trace_ctx, globals_live) {
+        return Ok(None);
+    }
 
     // commit to the fold: emit IR (no further declines)
     // `globals['__builtins__']` may be rebound after this function is built,
