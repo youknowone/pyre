@@ -4662,7 +4662,10 @@ pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerS
             saw_return = true;
             continue;
         }
-        if op.key.starts_with("reraise") {
+        // `raise/r` is how a bare `RERAISE` leaves the frame. It does not
+        // fall through: the bytes after it are the next block, and walking
+        // into them reports a `ref_return` the handler never reaches.
+        if op.key.starts_with("reraise") || op.key.starts_with("raise") {
             saw_reraise = true;
             continue;
         }
@@ -4685,6 +4688,129 @@ pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerS
         ExcHandlerShape::Reraise
     } else {
         ExcHandlerShape::Unproven
+    }
+}
+
+/// Whether every pc in `poison` sits on a `Reraise` handler and off both the
+/// happy path and every other handler.
+///
+/// `perform_call` (`pyjitpl.py`) traces the path the interpreter takes.
+/// `can_inline_callable` (`warmstate.py`) does not residualize a callee
+/// because an `except: raise` arm exists: that arm is the guard's side exit.
+/// The replay scan names the arm's ops in `poison`. This answers whether
+/// refusing the walk at exactly those pcs leaves the traced `try` body free
+/// of them. An empty set, a poison pc on the happy path, a poison pc a
+/// non-`Reraise` handler can reach, or a body this scan cannot decode all
+/// decline — a returning handler stays residual.
+pub(crate) fn poison_confined_to_reraise_handlers(code: &[u8], poison: &[usize]) -> bool {
+    if poison.is_empty() {
+        return false;
+    }
+    let Some(happy) = reachable_op_pcs(code, 0) else {
+        return false;
+    };
+    if poison.iter().any(|pc| happy.contains(pc)) {
+        return false;
+    }
+    let mut reraise_reach = std::collections::HashSet::new();
+    let mut other_reach = std::collections::HashSet::new();
+    let mut saw_reraise = false;
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let Some(op) = decode_op_at(code, pc) else {
+            return false;
+        };
+        if op.key == "catch_exception/L" {
+            let target = read_label(code, &op, 0);
+            match exc_handler_shape(code, target) {
+                ExcHandlerShape::Reraise => {
+                    saw_reraise = true;
+                    let Some(reach) = reachable_op_pcs(code, target) else {
+                        return false;
+                    };
+                    reraise_reach.extend(reach);
+                }
+                ExcHandlerShape::Unproven => return false,
+                ExcHandlerShape::Returns | ExcHandlerShape::Rejoins => {
+                    let Some(reach) = reachable_op_pcs(code, target) else {
+                        return false;
+                    };
+                    other_reach.extend(reach);
+                }
+            }
+        }
+        pc = op.next_pc;
+    }
+    saw_reraise
+        && poison
+            .iter()
+            .all(|pc| reraise_reach.contains(pc) && !other_reach.contains(pc))
+}
+
+/// Ops reachable from `start` by ordinary control edges.
+///
+/// `None` when the region cannot be decoded: a `switch`, a label whose
+/// width this scan does not model, a budget overrun, or a byte that is not
+/// an opcode. Callers treat that as "do not admit". `catch_exception/L`
+/// contributes its fall-through only — the label is the handler, and
+/// blackhole jumps there. `goto/L` contributes its label only. Every other
+/// labeled op contributes both edges.
+fn reachable_op_pcs(code: &[u8], start: usize) -> Option<std::collections::HashSet<usize>> {
+    let mut visited = std::collections::HashSet::new();
+    let mut work = vec![start];
+    let mut budget = 4096usize;
+    while let Some(pc) = work.pop() {
+        if budget == 0 {
+            return None;
+        }
+        budget -= 1;
+        if !visited.insert(pc) {
+            continue;
+        }
+        let op = decode_op_at(code, pc)?;
+        work.extend(control_successors(code, &op)?);
+    }
+    Some(visited)
+}
+
+fn control_successors(code: &[u8], op: &DecodedOp) -> Option<Vec<usize>> {
+    let key = op.key;
+    if key.starts_with("raise")
+        || key.starts_with("reraise")
+        || key == "unreachable/"
+        || key == "void_return/"
+        || key.starts_with("ref_return/")
+        || key.starts_with("int_return/")
+        || key.starts_with("float_return/")
+    {
+        return Some(Vec::new());
+    }
+    if key == "goto/L" {
+        return Some(succ_in_code(code, read_label(code, op, 0)));
+    }
+    if key == "catch_exception/L" {
+        return Some(succ_in_code(code, op.next_pc));
+    }
+    if key.starts_with("switch") {
+        return None;
+    }
+    let labeled = label_operand_offset(key).is_some()
+        || key.starts_with("goto_if")
+        || key.contains("jump_if_ovf");
+    if labeled {
+        let offset = label_operand_offset(key)?;
+        let mut succs = succ_in_code(code, read_label(code, op, offset));
+        succs.extend(succ_in_code(code, op.next_pc));
+        return Some(succs);
+    }
+    Some(succ_in_code(code, op.next_pc))
+}
+
+fn succ_in_code(code: &[u8], pc: usize) -> Vec<usize> {
+    if pc < code.len() {
+        vec![pc]
+    } else {
+        Vec::new()
     }
 }
 

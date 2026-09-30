@@ -3673,6 +3673,17 @@ pub(crate) fn fbw_callee_body_replay_scan(
     // frames, so it stops claiming anything.
     let mut vable_reg: Option<u8> = None;
     let mut deferred_call = false;
+    // `RETURN_VALUE` stores `frame_finished_execution` as
+    // `getfield flags; int_or FLAG_FRAME_FINISHED; setfield flags`
+    // immediately before `ref_return` (`pyopcode.py`). The bit is sticky.
+    // A `try` that returns still does this store after its `CallFn`, and
+    // that call clears `callee_owned_frame`; without this pair the store
+    // is poison on the hot path and the whole callee stays residual.
+    // Each of the two field ops mints its own descr (`fielddescrof`), so
+    // the indices differ; the field is the one at `PYFRAME_FLAGS_OFFSET`.
+    // `(frame register, int register)`.
+    let mut flags_get: Option<(u8, u8)> = None;
+    let mut finished_or: Option<(u8, u8)> = None;
     let mut pc = 0usize;
     while pc < body_code.len() {
         if branch_targets.contains(&pc) {
@@ -3686,6 +3697,8 @@ pub(crate) fn fbw_callee_body_replay_scan(
             // the register half resets to empty rather than to a seed.
             rewind_built_ref_regs = [false; u8::MAX as usize + 1];
             rewind_built_slots = seed_rewind_built_slots;
+            flags_get = None;
+            finished_or = None;
         }
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
             replay_unscannable!("DecodeOpFailed", pc, "-");
@@ -4059,6 +4072,13 @@ pub(crate) fn fbw_callee_body_replay_scan(
                             | majit_ir::RuntimeHelperKind::CallFunctionEx
                             | majit_ir::RuntimeHelperKind::RaiseVarargs
                             | majit_ir::RuntimeHelperKind::SetCurrentException
+                            // `try_walker_lower_exc_info_residual` applies
+                            // `set_in_flight_exception(NULL)` and records no
+                            // call. A replay clears the same carrier again.
+                            // `pyopcode.py` `PUSH_EXC_INFO` moves
+                            // `OperationError` onto `sys_exc_operror` and has
+                            // no residual clear of its own.
+                            | majit_ir::RuntimeHelperKind::ClearInFlightException
                             | majit_ir::RuntimeHelperKind::LoadAttr
                             | majit_ir::RuntimeHelperKind::BinaryOp
                             | majit_ir::RuntimeHelperKind::CompareOp
@@ -4151,7 +4171,28 @@ pub(crate) fn fbw_callee_body_replay_scan(
                 // A deferred call can publish the frame, at which point that
                 // ownership proof no longer holds.
                 let callee_owned_frame = vable_reg == Some(target_reg) && !deferred_call;
-                if !callee_owned_frame && (!fresh_ref_regs[target_reg as usize] || !immutable_field)
+                // The `RETURN_VALUE` finished-bit or, recognized while the
+                // previous two ops were scanned. Idempotent, and it is the
+                // store an inlined return already records when the body has
+                // no handler. Replaying it ORs the same bit.
+                let finished_return = finished_or.is_some_and(|(frame, value_reg)| {
+                    let descr = decode_descr_index(body_code, &d, 2);
+                    let flags_field = callee_descr_refs
+                        .get(descr)
+                        .and_then(|descr| descr.as_field_descr())
+                        .is_some_and(|field| {
+                            field.offset() == crate::frame_layout::PYFRAME_FLAGS_OFFSET
+                        });
+                    vable_reg == Some(frame)
+                        && target_reg == frame
+                        && body_code.get(d.pc + 2).copied() == Some(value_reg)
+                        && flags_field
+                        && crate::jitcode_runtime::decode_op_at(body_code, d.next_pc)
+                            .is_some_and(|next| next.key == "ref_return/r")
+                });
+                if !finished_return
+                    && !callee_owned_frame
+                    && (!fresh_ref_regs[target_reg as usize] || !immutable_field)
                 {
                     replay_poison!(poison, "SetfieldGcTargetNotFreshOrMutable", d.pc, d.opname);
                 }
@@ -4272,6 +4313,43 @@ pub(crate) fn fbw_callee_body_replay_scan(
                         .get(d.pc + 1)
                         .is_some_and(|src| plain_int_ref_regs[*src as usize]));
         }
+        let mut next_get = None;
+        let mut next_or = None;
+        if d.key == "getfield_gc_i/rd>i" {
+            if let (Some(&frame), Some(&dst)) = (
+                body_code.get(d.pc + 1),
+                body_code.get(d.next_pc.wrapping_sub(1)),
+            ) {
+                let descr = decode_descr_index(body_code, &d, 1);
+                let is_flags = callee_descr_refs
+                    .get(descr)
+                    .and_then(|descr| descr.as_field_descr())
+                    .is_some_and(|field| {
+                        field.offset() == crate::frame_layout::PYFRAME_FLAGS_OFFSET
+                    });
+                if is_flags {
+                    next_get = Some((frame, dst));
+                }
+            }
+        } else if d.key == "int_or/ii>i" {
+            if let Some((frame, src)) = flags_get {
+                let a = body_code.get(d.pc + 1).copied();
+                let b = body_code.get(d.pc + 2).copied();
+                let dst = body_code.get(d.next_pc.wrapping_sub(1)).copied();
+                if let (Some(a), Some(b), Some(dst)) = (a, b, dst) {
+                    let finished = i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED);
+                    let a_const = body_int_operand_constant(a, num_regs_i, constants_i);
+                    let b_const = body_int_operand_constant(b, num_regs_i, constants_i);
+                    let ors_finished = (a == src && a_const.is_none() && b_const == Some(finished))
+                        || (b == src && b_const.is_none() && a_const == Some(finished));
+                    if ors_finished {
+                        next_or = Some((frame, dst));
+                    }
+                }
+            }
+        }
+        flags_get = next_get;
+        finished_or = next_or;
         pc = d.next_pc;
     }
     CalleeReplayScan {
