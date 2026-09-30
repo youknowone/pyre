@@ -189,6 +189,30 @@ fn emit_pair_tuple_item<Sym: WalkSym>(
     Ok((boxed, rehomed))
 }
 
+/// Pin every ref already stored in `concretes`, run `body`, then copy the
+/// collector's forwarded slots back. `body` may allocate (`wrapint` does).
+fn with_arg_refs_pinned<T>(concretes: &mut [ConcreteValue], body: impl FnOnce() -> T) -> T {
+    let mut live = Vec::new();
+    let mut slots = Vec::new();
+    for (i, concrete) in concretes.iter().copied().enumerate() {
+        if let ConcreteValue::Ref(obj) = concrete
+            && !obj.is_null()
+        {
+            slots.push((i, live.len()));
+            live.push(obj);
+        }
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&live);
+    let result = body();
+    for (i, slot) in slots {
+        if let ConcreteValue::Ref(obj) = &mut concretes[i] {
+            *obj = pyre_object::gc_roots::shadow_stack_get(base + slot);
+        }
+    }
+    result
+}
+
 /// The [`DefaultsRepr`] a tuple of this exact `ob_type` stores its elements
 /// in, or `None` for a layout the walker has no element read for.
 fn defaults_repr_of(ob_type: *const pyre_object::pyobject::PyType) -> Option<DefaultsRepr> {
@@ -8364,8 +8388,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         } else {
             for (index, &value) in star.values.iter().enumerate() {
-                let (elem, concrete) =
-                    emit_pair_tuple_item(ctx, op.pc, star.starargs_op, star.repr, index, value)?;
+                let (elem, concrete) = with_arg_refs_pinned(&mut callee_arg_concretes, || {
+                    emit_pair_tuple_item(ctx, op.pc, star.starargs_op, star.repr, index, value)
+                })?;
                 callee_args[index] = elem;
                 if let Some(concrete) = concrete {
                     callee_arg_concretes[index] = concrete;
@@ -8816,14 +8841,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
             DefaultsRepr::PairObject | DefaultsRepr::PairInt => {
                 for (param_index, tuple_index, value) in defaults.values {
-                    let (elem, concrete) = emit_pair_tuple_item(
-                        ctx,
-                        op.pc,
-                        defaults_op,
-                        defaults.repr,
-                        tuple_index,
-                        value,
-                    )?;
+                    let (elem, concrete) = with_arg_refs_pinned(&mut callee_arg_concretes, || {
+                        emit_pair_tuple_item(
+                            ctx,
+                            op.pc,
+                            defaults_op,
+                            defaults.repr,
+                            tuple_index,
+                            value,
+                        )
+                    })?;
                     callee_args[param_index] = elem;
                     if let Some(concrete) = concrete {
                         callee_arg_concretes[param_index] = concrete;
