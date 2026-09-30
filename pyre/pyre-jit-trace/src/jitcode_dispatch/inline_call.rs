@@ -8459,6 +8459,36 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // ...)` per keyword that named no parameter (`_match_signature`),
     // replacing the placeholder pushed above.
     if varkw_slot.is_some() {
+        // `newdict` / `setitem` allocate. The vararg tuple and the keyword
+        // values are already live objects; pin them before that, then read
+        // the slots the collector rewrites. A raw copy in
+        // `callee_arg_concretes` would otherwise keep the pre-move address.
+        let mut live = Vec::new();
+        let mut concrete_slots = Vec::new();
+        for (i, concrete) in callee_arg_concretes.iter().copied().enumerate() {
+            if let ConcreteValue::Ref(obj) = concrete
+                && !obj.is_null()
+            {
+                concrete_slots.push((i, live.len()));
+                live.push(obj);
+            }
+        }
+        let mut extra_slots = Vec::with_capacity(varkw_extra.len());
+        for extra in &varkw_extra {
+            let name_slot = live.len();
+            live.push(extra.name);
+            let value_slot = match extra.concrete {
+                ConcreteValue::Ref(obj) if !obj.is_null() => {
+                    let slot = live.len();
+                    live.push(obj);
+                    Some(slot)
+                }
+                _ => None,
+            };
+            extra_slots.push((name_slot, value_slot));
+        }
+        let pre_kw_roots = pyre_object::gc_roots::push_roots();
+        let pre_kw_base = pre_kw_roots.pin_roots(&live);
         let effect = majit_ir::EffectInfo::new(
             majit_ir::ExtraEffect::CannotRaise,
             majit_ir::OopSpecIndex::None,
@@ -8474,17 +8504,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             dict_op,
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_dict as usize)),
         );
-        for extra in varkw_extra {
-            let value = match ctx.trace_ctx.concrete_of_opref(extra.value) {
-                Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as i64,
-                _ => match extra.concrete {
-                    ConcreteValue::Ref(value) => value as i64,
+        for (extra, (name_slot, value_slot)) in varkw_extra.iter().zip(extra_slots) {
+            let name = pyre_object::gc_roots::shadow_stack_get(pre_kw_base + name_slot);
+            let value = match value_slot {
+                Some(slot) => pyre_object::gc_roots::shadow_stack_get(pre_kw_base + slot) as i64,
+                None => match ctx.trace_ctx.concrete_of_opref(extra.value) {
+                    Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as i64,
                     _ => unreachable!("checked by the resolve above"),
                 },
             };
             concrete_dict =
-                crate::helpers::jit_kwargs_dict_setitem(concrete_dict, extra.name as i64, value);
-            let name_op = ctx.trace_ctx.const_ref(extra.name as i64);
+                crate::helpers::jit_kwargs_dict_setitem(concrete_dict, name as i64, value);
+            let name_op = ctx.trace_ctx.const_ref(name as i64);
             dict_op = ctx.trace_ctx.call_ref_typed_with_effect(
                 crate::helpers::jit_kwargs_dict_setitem as *const (),
                 &[dict_op, name_op, extra.value],
@@ -8499,6 +8530,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         callee_args[varkw_index] = dict_op;
         callee_arg_concretes[varkw_index] =
             ConcreteValue::Ref(concrete_dict as pyre_object::PyObjectRef);
+        for (i, slot) in concrete_slots {
+            if let ConcreteValue::Ref(obj) = &mut callee_arg_concretes[i] {
+                *obj = pyre_object::gc_roots::shadow_stack_get(pre_kw_base + slot);
+            }
+        }
     }
 
     let (callee_regs_r, callee_regs_i, callee_regs_f, callee_concrete_r, mut callee_concrete_i) =
