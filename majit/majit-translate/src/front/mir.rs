@@ -9038,6 +9038,46 @@ impl<'a> Lowering<'a> {
                         )),
                     }
                 } else if let Some(local) = inner_local
+                    && !self.index_elem_alias.contains_key(&local)
+                    && let Some((item_ty, array_type_id)) =
+                        raw_ptr_typed_items_element(&field_base_ty, self.llbc)
+                    && base_traces_to_typed_items_block_accessor(self.body, local, self.llbc)
+                {
+                    // `*(typed_items_block_items_base(..) as *mut i64) = v`
+                    // is `setarrayitem` on `GcArray(Signed|Float)` at index 0,
+                    // the write half of the `getarrayitem` the matching deref
+                    // read emits. `heap.py` `emitting_operation` treats
+                    // `raw_store` as having no effect on GC array caches, so
+                    // a later `getarrayitem` would reuse the pre-store word.
+                    // `.add(idx)` stores already take the `index_elem_alias`
+                    // arm above.
+                    let arr = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(base.clone()),
+                            &array_type_id,
+                        )
+                        .as_variable()
+                        .expect("a materialized typed-items base stays a Variable")
+                        .clone();
+                    let index = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(index.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    OpKind::ArrayWrite {
+                        base: arr,
+                        index,
+                        value: value.clone(),
+                        item_ty,
+                        array_type_id: Some(array_type_id.clone()),
+                        nolength: crate::front::typestr::nolength_from_array_type_id(Some(
+                            array_type_id.as_str(),
+                        )),
+                    }
+                } else if let Some(local) = inner_local
                     && let Some(referent) = self.atomic_ref_place.get(&local).map(clone_place)
                 {
                     // `*p = v` where `p` was bound as `&mut place` is that
@@ -9218,8 +9258,10 @@ impl<'a> Lowering<'a> {
     /// A multi-word pointee is the field-wise move `exchange_deref_aggregate`
     /// already emits for `mem::replace` (`rffi.py` `_get_structcopy_fn`).
     /// A one-word raw pointer is `raw_store` at offset 0
-    /// (`rewrite_op_raw_store`). Anything else declines the graph: a
-    /// symbolic `__deref_write` has no code address.
+    /// (`rewrite_op_raw_store`). A `TypedItemsBlock` word is `setarrayitem`
+    /// and is emitted before this helper (`emit_projection_write`).
+    /// Anything else declines the graph: a symbolic `__deref_write` has no
+    /// code address.
     ///
     /// `Ok(None)` means the field writes were already pushed.
     fn deref_word_store_or_decline(
@@ -62456,6 +62498,34 @@ mod tests {
                 );
             }
         }
+        let store =
+            super::lower_function(&llbc, "pyre_object::listobject::set_sizehint_state_value")
+                .expect("lower set_sizehint_state_value");
+        let raw_stores: Vec<_> = store
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| matches!(op.kind, OpKind::RawStore { .. }))
+            .collect();
+        assert!(
+            raw_stores.is_empty(),
+            "set_sizehint_state_value must not raw_store a GcArray cell: {raw_stores:?}"
+        );
+        assert!(
+            store
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::ArrayWrite {
+                        item_ty: ValueType::Int,
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if array_type_id == "[i64]"
+                )),
+            "set_sizehint_state_value must setarrayitem the Signed cell"
+        );
     }
 
     /// `complex_val` returns the RPython spelling of an optional pair.  The

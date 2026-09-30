@@ -142,14 +142,17 @@ fn sizehint_deref_loads_an_int_word() {
     assert!(
         ops(&store).any(|op| matches!(
             &op.kind,
-            OpKind::RawStore {
+            OpKind::ArrayWrite {
                 item_ty: ValueType::Int,
-                itemsize: 8,
-                is_item_signed: true,
+                array_type_id: Some(array_type_id),
                 ..
-            }
+            } if array_type_id == "[i64]"
         )),
-        "set_sizehint_state_value must raw_store the i64"
+        "set_sizehint_state_value must setarrayitem the Signed cell"
+    );
+    assert!(
+        ops(&store).all(|op| !matches!(op.kind, OpKind::RawStore { .. })),
+        "set_sizehint_state_value must not raw_store a GcArray cell"
     );
 }
 
