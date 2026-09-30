@@ -1191,14 +1191,7 @@ pub fn create_call_stub(arg_classes: &str, result_type: char) -> BhCallStub {
         }
         let (bank, class) = match c {
             'i' => (BhCallStub::BANK_I, ArgClass::Int),
-            'r' => (
-                BhCallStub::BANK_R,
-                if cfg!(target_arch = "wasm32") {
-                    ArgClass::Ref
-                } else {
-                    ArgClass::Int
-                },
-            ),
+            'r' => (BhCallStub::BANK_R, ArgClass::Int),
             'f' => (BhCallStub::BANK_F, ArgClass::Float),
             'L' => (BhCallStub::BANK_F, ArgClass::Int),
             'S' => {
@@ -1433,11 +1426,7 @@ pub fn collect_call_args(
             }
             'r' => {
                 out.push(
-                    if cfg!(target_arch = "wasm32") {
-                        ArgClass::Ref
-                    } else {
-                        ArgClass::Int
-                    },
+                    ArgClass::Int,
                     args_r.expect("BhCallDescr.collect_call_args: args_r missing")[ri],
                 );
                 ri += 1;
@@ -1777,6 +1766,10 @@ mod tests {
         ]));
         assert!(call_stub_arm_exists(&[ArgClass::Int; 8]));
         assert!(call_stub_arm_exists(&[ArgClass::Ref; 8]));
+        let collected =
+            collect_call_args("iriririr", Some(&[1, 2, 3, 4]), Some(&[5, 6, 7, 8]), None);
+        assert!(collected.classes().iter().all(|c| *c == ArgClass::Int));
+        assert!(call_stub_arm_exists(collected.classes()));
         assert!(!call_stub_arm_exists(&[ArgClass::Float; 6]));
     }
 
