@@ -2002,10 +2002,19 @@ fn state_field_frame_value_count(jitcode_index: i32, pc: i32) -> usize {
         let Some(data) = data.as_ref() else {
             return 0;
         };
-        let Some(jc) = data.jitcodes.get(jitcode_index as usize) else {
+        // A negative index or pc is not a registry slot. `as usize`
+        // wraps it and `get_live_vars_info` then reads another frame's
+        // liveness.
+        let Some(index) = usize::try_from(jitcode_index).ok() else {
             return 0;
         };
-        let off = jc.get_live_vars_info(pc as usize, data.op_live);
+        let Some(resolved_pc) = usize::try_from(pc).ok() else {
+            return 0;
+        };
+        let Some(jc) = data.jitcodes.get(index) else {
+            return 0;
+        };
+        let off = jc.get_live_vars_info(resolved_pc, data.op_live);
         let all_liveness = &data.all_liveness;
         if off + 2 < all_liveness.len() {
             all_liveness[off] as usize
@@ -3184,7 +3193,20 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.single_pass_finish = true;
                     return Some(usize::MAX);
                 };
-                let resume_pc = resume_pc as usize;
+                // A negative green is not a guest pc. `as usize` wraps it
+                // and the dispatch loop resumes in unrelated code. The
+                // chain has already run, so end it the same way a missing
+                // green does.
+                let Ok(resume_pc) = usize::try_from(resume_pc) else {
+                    debug_assert!(false, "merge point reported a negative green pc");
+                    eprintln!(
+                        "[bh] abort-blackhole: ContinueRunningNormally green pc {resume_pc} \
+                         is not a position — ending the dispatch loop"
+                    );
+                    writeback(state, usize::MAX);
+                    self.meta.single_pass_finish = true;
+                    return Some(usize::MAX);
+                };
                 // `iirrr` portal registers pack greens in front of reds
                 // (`next_instr`, `is_being_profiled`, then `pycode`). A
                 // state with no scalar identity slots has `int_scalar_base`
@@ -5915,13 +5937,15 @@ impl<S: JitState> JitDriver<S> {
             // is the one this driver re-enters at, so a root that names any
             // jitcode other than the dispatch one is a decline.
             let dispatch_index = dispatch.try_index().ok_or(Decline::NoResumeState)?;
-            if resume
-                .frames
-                .first()
-                .ok_or(Decline::NoResumeState)?
-                .jitcode_index as usize
-                != dispatch_index
-            {
+            let root_index = usize::try_from(
+                resume
+                    .frames
+                    .first()
+                    .ok_or(Decline::NoResumeState)?
+                    .jitcode_index,
+            )
+            .map_err(|_| Decline::ForeignJitcode)?;
+            if root_index != dispatch_index {
                 // Unlike the pending-fields decline this one cannot be
                 // hoisted: the frame it reads only exists once
                 // `rebuild_from_resumedata` has run, which is inside the call
@@ -5974,7 +5998,16 @@ impl<S: JitState> JitDriver<S> {
             let mut sections: Vec<(std::sync::Arc<crate::jitcode::JitCode>, usize)> =
                 Vec::with_capacity(resume.frames.len());
             for frame in &resume.frames {
-                let Some(jitcode) = jitcodes.get(frame.jitcode_index as usize) else {
+                let Some(index) = usize::try_from(frame.jitcode_index).ok() else {
+                    if crate::bridge_debug_enabled() {
+                        eprintln!(
+                            "[bridgeB] DECLINE negative jitcode_index={}",
+                            frame.jitcode_index
+                        );
+                    }
+                    return Err(Decline::UnregisteredJitcode);
+                };
+                let Some(jitcode) = jitcodes.get(index) else {
                     if crate::bridge_debug_enabled() {
                         eprintln!(
                             "[bridgeB] DECLINE unregistered jitcode_index={}",
@@ -7339,10 +7372,15 @@ impl<S: JitState> JitDriver<S> {
             let jitcode_registry: &[std::sync::Arc<crate::jitcode::JitCode>] = self.meta.jitcodes();
             let resolve_jitcode =
                 |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
-                    let resolved_jitcode = jitcode_registry.get(jitcode_index as usize)?.clone();
+                    // `jitcodes[jitcode_pos]` and `setposition(jitcode, pc)`.
+                    // `as usize` wraps a negative index or pc into a huge
+                    // slot and resumes mid-instruction in unrelated code.
+                    let index = usize::try_from(jitcode_index).ok()?;
+                    let resolved_pc = usize::try_from(pc).ok()?;
+                    let resolved_jitcode = jitcode_registry.get(index)?.clone();
                     Some(crate::resume::ResolvedJitCode::new(
                         resolved_jitcode,
-                        pc as usize,
+                        resolved_pc,
                     ))
                 };
 
@@ -7530,7 +7568,15 @@ impl<S: JitState> JitDriver<S> {
                         // path (e.g. a branch fall-through that leaves
                         // the loop), in which case the green pc differs
                         // from the loop-header `target_pc`.
-                        let green_pc = green_int.first().map(|&pc| pc as usize);
+                        // `as usize` wraps a negative green into a huge pc
+                        // and the interpreter resumes there. That is not a
+                        // position; end the dispatch loop instead of falling
+                        // back to the loop-header `target_pc`, which would
+                        // re-execute the opcodes the blackhole already ran.
+                        let green_pc = green_int
+                            .first()
+                            .copied()
+                            .map(|pc| usize::try_from(pc).unwrap_or(usize::MAX));
                         if portal_rca_enabled() {
                             eprintln!(
                                 "[portal-rca][crn] target_pc={} green_int={:?} \
@@ -7614,14 +7660,12 @@ impl<S: JitState> JitDriver<S> {
                         // The register file just flushed above is the state
                         // AT the green pc — the blackhole ran the failing
                         // opcode forward to the next merge point. Resuming
-                        // anywhere else (the loop-header `target_pc` was
-                        // used here for label-entered runs) re-executes the
-                        // header..green_pc opcodes on post-green state,
-                        // corrupting every value they recompute. The entry
-                        // dispatch key does not change the guard's resume
-                        // snapshot, so label-entered runs resume at the
-                        // green pc like every other run.
-                        let resume_pc = Some(green_pc.unwrap_or(target_pc));
+                        // at the loop-header `target_pc` re-executes the
+                        // header..green opcodes on post-green state. A CRN
+                        // with no green pc has no position to resume at, so
+                        // end the dispatch loop the same way a negative
+                        // green does.
+                        let resume_pc = Some(green_pc.unwrap_or(usize::MAX));
                         bh.recycle_merge_point_args(args);
                         resume_pc
                     }
@@ -10708,9 +10752,12 @@ impl<S: JitState> JitDriver<S> {
             // is the liveness coordinate for this single-frame macro bridge.
             let bridge_reg_indices = self.dispatch_jitcode().and_then(|jc| {
                 bfm.frames.first().map(|frame| {
+                    let Ok(pc) = usize::try_from(frame.pc) else {
+                        return crate::resume::FrameLivenessRegIndices::default();
+                    };
                     crate::resume::read_frame_liveness_reg_indices(
                         jc,
-                        frame.pc as usize,
+                        pc,
                         self.meta.staticdata.op_live as u8,
                         &self.meta.staticdata.liveness_info,
                     )

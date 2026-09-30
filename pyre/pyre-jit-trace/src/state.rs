@@ -8445,8 +8445,11 @@ fn reconstruct_inline_recipe(
         None
     };
     let pending_result_color = if in_a_call {
+        let Some(pc) = usize::try_from(frame.pc).ok() else {
+            decline!("NoPendingResultColor");
+        };
         let Some(color) = pyjitcode_for_jitcode_index(frame.jitcode_index).and_then(|p| {
-            p.result_color_trivia_for_jitcode_pc(frame.pc as usize)
+            p.result_color_trivia_for_jitcode_pc(pc)
                 .map(|c| c as usize)
                 .filter(|&c| c != u16::MAX as usize)
         }) else {

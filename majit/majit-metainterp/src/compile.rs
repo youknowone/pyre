@@ -6111,8 +6111,10 @@ impl TraceCtx {
     /// reads the closing boxes; slot 56 counts a close that never recorded
     /// a pc, where the session header is the only value left.
     pub fn close_header_pc(&self) -> usize {
-        if let Some(pc) = self.close_green_pc {
-            return pc as usize;
+        // A negative pc is not a jitcode position. `as usize` would wrap it
+        // into a huge header and file the merge point on the wrong loop.
+        if let Some(pc) = self.close_green_pc.and_then(|pc| usize::try_from(pc).ok()) {
+            return pc;
         }
         crate::mc_diag_bump(56);
         self.header_pc

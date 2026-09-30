@@ -880,6 +880,34 @@ impl Drop for CompileTracingGuard {
     }
 }
 
+/// `compile.py` `compile_loop` / `compile_retrace` / `compile_trace`:
+/// after `jitlog.start_new_trace`, the trace is attached or
+/// `jitlog.trace_aborted` runs. Arm this at the start and `disarm`
+/// only when the trace was attached, or when the `InvalidLoop` arm
+/// already wrote the marker.
+struct JitlogAbortGuard {
+    tid: u64,
+    armed: bool,
+}
+
+impl JitlogAbortGuard {
+    fn arm(tid: u64) -> Self {
+        Self { tid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for JitlogAbortGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::rjitlog::trace_aborted(self.tid);
+        }
+    }
+}
+
 /// A stack-resident red (Grain's `Vm` / frame) recorded as `ConstPtr`
 /// must number as TAGBOX. `make_constant_box` already refuses that fold
 /// in the optimizer; the tracer can still snapshot the concrete address
@@ -8000,8 +8028,10 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py compile_loop: jitlog.start_new_trace before the JUMP.
         // compile_retrace is a separate entry and increments itself.
         // compile_loop does not pass jd_name.
+        let mut jitlog_guard = None;
         if self.partial_trace.is_none() {
             self.jitlog_start_new_trace(false, 0, "");
+            jitlog_guard = Some(JitlogAbortGuard::arm(self.jitlog_trace_id));
         }
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
@@ -8079,6 +8109,21 @@ impl<M: Clone> MetaInterp<M> {
                         from_retry: false,
                     };
                 }
+                // `compile.py compile_retrace` `return None` restores the
+                // tracer (`InvalidLoop`, declined cut). A drained tracer is
+                // a give-up. `tracing_done` already staged
+                // `ABORT_TOO_LONG` and the merge-point payload; do not
+                // count a cancel or run a second teardown over that reason.
+                if self.tracing.is_none() {
+                    if self.pending_abort_reason.is_none() {
+                        self.clear_retrace_state();
+                        if let Some(green_key) = retrace_green_key {
+                            self.warm_state.abort_tracing(green_key, false);
+                        }
+                        self.clear_trace_session();
+                    }
+                    return CompileOutcome::Aborted;
+                }
                 // pyjitpl.py:3004: creation of the loop was cancelled!
                 self.cancel_count += 1;
                 if self.cancelled_too_many_times() {
@@ -8086,30 +8131,6 @@ impl<M: Clone> MetaInterp<M> {
                     self.clear_retrace_state();
                     if let Some(ctx) = self.tracing.take() {
                         self.warm_state.abort_tracing(ctx.green_key, false);
-                    }
-                    // Keep tracing + session in lockstep (pyjitpl.py:3015).
-                    self.clear_trace_session();
-                    return CompileOutcome::Aborted;
-                }
-                if self.tracing.is_none() {
-                    // compile.py has no "late cancel after draining the
-                    // tracer" state. If compile_retrace consumed the
-                    // tracing ctx, it was a hard backend failure and the
-                    // caller must abort instead of continuing to trace.
-                    //
-                    // Tear the session down the way the two sibling abort
-                    // arms do. `abort_trace_live` cannot do it for us: its
-                    // whole body is inside `if let Some(ctx) =
-                    // self.tracing.take()`, so with `tracing` already None
-                    // it skips everything, leaving `active_trace_session`
-                    // and `bridge_info` set and — because
-                    // `leave_profiler_tracing` never runs —
-                    // `profiler_tracing_active` true. The next trace start
-                    // calls `enter_profiler_tracing`, whose release
-                    // `assert!` on that flag would then abort the process.
-                    self.clear_retrace_state();
-                    if let Some(green_key) = retrace_green_key {
-                        self.warm_state.abort_tracing(green_key, false);
                     }
                     // Keep tracing + session in lockstep (pyjitpl.py:3015).
                     self.clear_trace_session();
@@ -9331,6 +9352,9 @@ impl<M: Clone> MetaInterp<M> {
                 if is_invalid_loop {
                     // compile.py compile_loop: jitlog.trace_aborted on InvalidLoop.
                     self.jitlog_trace_aborted();
+                    if let Some(guard) = jitlog_guard.as_mut() {
+                        guard.disarm();
+                    }
                 }
                 if is_invalid_loop && crate::debug::have_debug_prints() {
                     crate::debug::log_one(
@@ -9547,6 +9571,9 @@ impl<M: Clone> MetaInterp<M> {
                 // layout, but is_compatible uses meta to extract live_values
                 // so the meta must stay consistent with the entry point.
                 self.last_compiled_key = Some(green_key);
+                if let Some(guard) = jitlog_guard.as_mut() {
+                    guard.disarm();
+                }
                 CompileOutcome::Compiled {
                     green_key,
                     from_retry,
@@ -10082,6 +10109,7 @@ impl<M: Clone> MetaInterp<M> {
                             ctx.cut_trace(cut_at);
                         }
                     }
+                    self.jitlog_trace_aborted();
                     return CompileOutcome::Cancelled;
                 }
                 let descr_arc = match self.bridge_info() {
@@ -10092,6 +10120,7 @@ impl<M: Clone> MetaInterp<M> {
                                 ctx.cut_trace(cut_at);
                             }
                         }
+                        self.jitlog_trace_aborted();
                         return CompileOutcome::Cancelled;
                     }
                 };
@@ -10150,6 +10179,7 @@ impl<M: Clone> MetaInterp<M> {
                             ctx.cut_trace(cut_at);
                         }
                     }
+                    self.jitlog_trace_aborted();
                     return CompileOutcome::Cancelled;
                 };
                 let success = self.compile_entry_bridge(
@@ -10237,6 +10267,7 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(0);
         // compile.py compile_retrace does not pass jd_name.
         self.jitlog_start_new_trace(true, descr_id, "");
+        let mut jitlog_guard = JitlogAbortGuard::arm(self.jitlog_trace_id);
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -10322,7 +10353,26 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
         if let Some(reason) = tracing_failed {
+            // `opencoder.py tracing_done` raises
+            // `SwitchToBlackhole(ABORT_TOO_LONG)`. Same staging as the
+            // loop arm: the reason, the cell, and whether
+            // `current_merge_points` is non-empty, read before the
+            // parked tracer is dropped. The jitlog guard writes
+            // `trace_aborted` once on the way out.
+            let key = self
+                .compile_tracing
+                .as_ref()
+                .map(|ctx| ctx.green_key)
+                .unwrap_or(0);
             self.pending_abort_reason = Some(reason);
+            self.warm_state.abort_tracing(key, false);
+            self.pending_abort_has_merge_points = self
+                .compile_tracing
+                .as_ref()
+                .is_some_and(|ctx| !ctx.current_merge_points.is_empty());
+            self.pending_abort_green_key = self.pending_abort_has_merge_points.then_some(key);
+            self.pending_abort_permanent = false;
+            self.clear_trace_session();
             return false;
         }
         let (
@@ -10435,15 +10485,21 @@ impl<M: Clone> MetaInterp<M> {
                         trace.ops.len(),
                     );
                 }
-                // As in `compile_loop_body`: a declined cut cannot fall back to
-                // the uncut trace, because the retrace is installed against the
-                // merge point's entry contract.  Cancel the retrace instead.
+                // A declined cut cannot fall back to the uncut trace: the
+                // retrace is installed against the merge point's entry
+                // contract. `compile.py compile_retrace` `cut_trace_from` is
+                // total, so this is the same outcome as `InvalidLoop`:
+                // `history.cut` the tentative JUMP and keep tracing.
                 let Some(cut) = trace.cut_trace_from_with_consts(
                     start,
                     original_boxes,
                     &initial_inputarg_consts,
                     true,
                 ) else {
+                    ctx.cut_trace(jump_cut);
+                    self.tracing = Some(ctx);
+                    self.partial_trace = Some(partial);
+                    self.retracing_from = retracing_from_kept;
                     return false;
                 };
                 cut
@@ -10614,6 +10670,7 @@ impl<M: Clone> MetaInterp<M> {
                 // continues; the caller counts a cancel instead of giving
                 // the trace up.
                 self.jitlog_trace_aborted();
+                jitlog_guard.disarm();
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-abort",
@@ -10749,7 +10806,7 @@ impl<M: Clone> MetaInterp<M> {
         // (virtualstate.py). Installing a retrace as the front door
         // therefore feeds a collapsed arg list from a positional value list.
         if let Some(bridge) = retrace_resumekey {
-            return self.attach_retrace_to_source_guard(
+            let attached = self.attach_retrace_to_source_guard(
                 bridge,
                 green_key,
                 loop_jitcell_token,
@@ -10760,6 +10817,10 @@ impl<M: Clone> MetaInterp<M> {
                 num_combined_ops,
                 quasi_immutable_deps,
             );
+            if attached {
+                jitlog_guard.disarm();
+            }
+            return attached;
         }
 
         // compile.py send_loop_to_backend virtualizable hook —
@@ -11024,6 +11085,7 @@ impl<M: Clone> MetaInterp<M> {
                     hook(green_key, 0, num_combined_ops, &opcodes_after);
                 }
                 self.last_quasi_immutable_deps = quasi_immutable_deps;
+                jitlog_guard.disarm();
                 true
             }
             Err(e) => {
@@ -11630,6 +11692,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py compile_trace: jd_name=jitdriver_sd.jitdriver.name.
         let jd_name = self.jitlog_jd_name();
         self.jitlog_start_new_trace(true, green_key, &jd_name);
+        let mut jitlog_guard = JitlogAbortGuard::arm(self.jitlog_trace_id);
         // resume.py ResumeDataLoopMemo.number consumes the encoded snapshot
         // arrays without a materialized intermediate. Taking the parked ctx
         // ends walk_active_trace_refs coverage; the recorder's `_refs` stay
@@ -11757,6 +11820,7 @@ impl<M: Clone> MetaInterp<M> {
             Err(invalid_loop) => {
                 // compile.py compile_trace: jitlog.trace_aborted on InvalidLoop.
                 self.jitlog_trace_aborted();
+                jitlog_guard.disarm();
                 if crate::majit_log_enabled() || crate::debug::have_debug_prints() {
                     eprintln!(
                         "[jit] finish_and_compile: InvalidLoop(\"{}\") at key={}",
@@ -12130,6 +12194,7 @@ impl<M: Clone> MetaInterp<M> {
                 return Err(SwitchToBlackhole::giveup());
             }
         }
+        jitlog_guard.disarm();
         Ok(())
     }
 
@@ -15449,6 +15514,7 @@ impl<M: Clone> MetaInterp<M> {
         majit_gc::ensure_type_registry_closed();
         if !self.compiled_loops.contains_key(&green_key) {
             crate::mc_diag_bump(34); // compile_entry_bridge: target has no compiled loop
+            self.jitlog_trace_aborted();
             return false;
         }
 
@@ -15459,6 +15525,7 @@ impl<M: Clone> MetaInterp<M> {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
             let Some(tok) = compiled.live_token() else {
                 crate::mc_diag_bump(35); // compile_entry_bridge: target token dead
+                self.jitlog_trace_aborted();
                 return false;
             };
             (
@@ -15797,6 +15864,7 @@ impl<M: Clone> MetaInterp<M> {
             Err(payload) => {
                 crate::mc_diag_bump(38); // compile_entry_bridge: backend compile_loop panicked
                 self.note_jit_panic_or_reraise(payload, "compile_entry_bridge backend", green_key);
+                self.jitlog_trace_aborted();
                 return false;
             }
         };
@@ -15958,6 +16026,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             Err(_) => {
                 crate::mc_diag_bump(39); // compile_entry_bridge: backend refused the loop
+                self.jitlog_trace_aborted();
                 false
             }
         }
@@ -16083,6 +16152,7 @@ impl<M: Clone> MetaInterp<M> {
         self.last_compiled_artifact_token = None;
         crate::mc_diag_bump(8); // compile_bridge entered
         if !self.compiled_loops.contains_key(&green_key) {
+            self.jitlog_trace_aborted();
             return false;
         }
         let cell_token_key = self.bridge_cell_token_key(green_key, jump_target_key);
@@ -16123,6 +16193,7 @@ impl<M: Clone> MetaInterp<M> {
                         green_key, fail_index,
                     );
                 }
+                self.jitlog_trace_aborted();
                 return false;
             }
         };
@@ -16246,6 +16317,7 @@ impl<M: Clone> MetaInterp<M> {
                 })
             });
             let Some(tok) = compiled.live_token() else {
+                self.jitlog_trace_aborted();
                 return false;
             };
             (
@@ -16807,6 +16879,7 @@ impl<M: Clone> MetaInterp<M> {
                 true
             }
             Err(e) => {
+                self.jitlog_trace_aborted();
                 // `AbstractResumeGuardDescr.done_compiling`: a bridge that
                 // did not compile already had its jitcounter reset by
                 // `jitcounter.tick`. The caller's `done_compiling` clears
@@ -18970,10 +19043,16 @@ impl<M: Clone> MetaInterp<M> {
             let Ok(pc) = usize::try_from(section.pc) else {
                 return false;
             };
+            // `jitcode_index as usize` wraps a negative index into a huge
+            // slot and would pair this section against the wrong jitcode.
             let jitcode = materialized
                 .get(i)
                 .and_then(|slot| slot.clone())
-                .or_else(|| registered.get(section.jitcode_index as usize).cloned())
+                .or_else(|| {
+                    usize::try_from(section.jitcode_index)
+                        .ok()
+                        .and_then(|pos| registered.get(pos).cloned())
+                })
                 .unwrap_or_else(|| self.framestack.frames[i].jitcode.clone());
             let indices =
                 crate::resume::read_frame_liveness_reg_indices(&jitcode, pc, op_live, &liveness);
@@ -30875,6 +30954,92 @@ mod tests {
         assert_eq!(
             meta.trace_ctx().unwrap().current_merge_points.len(),
             before + 1
+        );
+    }
+
+    #[test]
+    fn retrace_tracing_done_tag_overflow_aborts_too_long() {
+        // `opencoder.py tracing_done` raises `SwitchToBlackhole(ABORT_TOO_LONG)`.
+        // A retrace takes that give-up, not `compile_retrace`'s `return None`.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let green_key = 42u64;
+        for _ in 0..2 {
+            meta.on_back_edge(green_key, &[0]);
+        }
+        let log_path = std::env::temp_dir().join("pyre-retrace-tag-overflow.jitlog");
+        let _ = std::fs::remove_file(&log_path);
+        if !crate::rjitlog::jitlog_enabled() {
+            // `JITLOG` is process-global. The test opens it only when no
+            // earlier test already did.
+            unsafe { std::env::set_var("JITLOG", &log_path) };
+            crate::rjitlog::setup_once();
+        }
+        assert!(
+            crate::rjitlog::jitlog_enabled(),
+            "jitlog must be open so trace_aborted writes MARK_ABORT_TRACE"
+        );
+        let before_log = std::fs::read(&log_path).unwrap_or_default();
+        let sd = std::sync::Arc::clone(&meta.staticdata);
+        {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.recorder.attach_byte_buffer(sd);
+            ctx.recorder.append_out_of_range_int();
+        }
+        let start = meta.trace_ctx().unwrap().current_merge_points[0].position;
+        let token = std::sync::Arc::new(JitCellToken::new(9));
+        token.set_compiled(Box::new(()));
+        token.record_target_token(crate::history::TargetToken::new_loop(1).as_jump_target_descr());
+        meta.warm_state_mut().memory_manager.keep_loop_alive(&token);
+        meta.warm_state_mut()
+            .attach_procedure_to_interp(green_key, token);
+        meta.partial_trace = Some(PartialTrace {
+            ops: Vec::new(),
+            inputargs: Vec::new(),
+        });
+        meta.retracing_from = Some(start);
+        meta.exported_state = Some(crate::optimizeopt::unroll::ExportedState::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
+            indexmap::IndexMap::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        let loops_before = meta.stats.loops_aborted;
+        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        assert!(
+            matches!(outcome, CompileOutcome::Aborted),
+            "tag overflow must abort, got {outcome:?}"
+        );
+        assert!(meta.tracing.is_none());
+        assert!(meta.partial_trace().is_none());
+        assert!(!meta.take_keep_tracing_after_close());
+        assert_eq!(meta.pending_abort_reason, Some(counters::ABORT_TOO_LONG));
+        meta.abort_trace(false);
+        assert_eq!(
+            meta.staticdata.profiler.snapshot().abort_too_long,
+            1,
+            "aborted_tracing counts ABORT_TOO_LONG once"
+        );
+        assert_eq!(meta.stats.loops_aborted, loops_before + 1);
+        assert!(meta.take_pending_abort_reason().is_none());
+        let after_log = std::fs::read(&log_path).expect("jitlog file");
+        let tid = meta.jitlog_trace_id.to_le_bytes();
+        let mut needle = Vec::with_capacity(1 + tid.len());
+        needle.push(crate::rjitlog::MARK_ABORT_TRACE);
+        needle.extend_from_slice(&tid);
+        let count_from = |bytes: &[u8]| -> usize {
+            bytes.windows(needle.len()).filter(|w| *w == needle).count()
+        };
+        assert_eq!(
+            count_from(&after_log) - count_from(&before_log),
+            1,
+            "trace_aborted is written once for the retrace"
         );
     }
 

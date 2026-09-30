@@ -1182,7 +1182,9 @@ pub extern "C" fn ll_portal_runner_shim(
     // wrong bytecode.
     if frame_ptr != 0 {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        frame.set_last_instr_from_next_instr(next_instr as usize);
+        if let Some(pc) = crate::eval::green_pc_position(next_instr) {
+            frame.set_last_instr_from_next_instr(pc);
+        }
     }
     run_frame_through_portal(frame_ptr, PortalEntry::TracedActivation)
 }
@@ -1319,13 +1321,15 @@ pub extern "C" fn bh_portal_runner_c(
             frame.pycode,
         );
     }
-    frame.set_last_instr_from_next_instr(next_instr as usize);
-    // The blackhole wrote the failing guard's recorded operand depth into the
-    // frame; resuming at the merge-point `next_instr` (a different pc) would
-    // carry that over-count and overflow the frame at its peak stack use.
-    // Re-derive the depth from the resume pc — the same correction the
-    // CALL_ASSEMBLER CRN arm applies to the same kind of green `next_instr`.
-    crate::eval::correct_resume_vsd(frame, next_instr as usize);
+    if let Some(pc) = crate::eval::green_pc_position(next_instr) {
+        frame.set_last_instr_from_next_instr(pc);
+        // The blackhole wrote the failing guard's recorded operand depth into the
+        // frame; resuming at the merge-point `next_instr` (a different pc) would
+        // carry that over-count and overflow the frame at its peak stack use.
+        // Re-derive the depth from the resume pc — the same correction the
+        // CALL_ASSEMBLER CRN arm applies to the same kind of green `next_instr`.
+        crate::eval::correct_resume_vsd(frame, pc);
+    }
     // The bracket is owed, but not for the reason a reading of
     // `bhimpl_recursive_call_r` suggests.  pyre's codewriter emits no
     // `recursive_call`, so the live door here is `bhimpl_jit_merge_point`'s
@@ -3493,7 +3497,10 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             // warmspot.py:976-1005: portal_ptr(*args), and if it raises a
             // regular exception propagate it like ExitFrameWithExceptionRef
             // instead of collapsing it to a null Ref.
-            let next_instr = all_i.first().copied().unwrap_or(0) as usize;
+            let next_instr = match all_i.first().copied() {
+                None => Some(0),
+                Some(pc) => crate::eval::green_pc_position(pc),
+            };
             let pycode = all_r.first().copied().unwrap_or(0) as PyObjectRef;
             let frame_ptr = all_r.get(1).copied().unwrap_or(0) as *mut PyFrame;
             let ec =
@@ -3516,13 +3523,15 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                     frame.pycode,
                 );
             }
-            frame.set_last_instr_from_next_instr(next_instr);
-            // The blackhole wrote the failing guard's recorded operand depth
-            // into the frame; resuming at the merge-point `next_instr` (a
-            // different pc) would carry that over-count and overflow the frame
-            // at its peak stack use.  Re-derive the depth from the resume pc —
-            // the CALL_ASSEMBLER-path mirror of the eval.rs CRN handoff.
-            crate::eval::correct_resume_vsd(frame, next_instr);
+            if let Some(next_instr) = next_instr {
+                frame.set_last_instr_from_next_instr(next_instr);
+                // The blackhole wrote the failing guard's recorded operand depth
+                // into the frame; resuming at the merge-point `next_instr` (a
+                // different pc) would carry that over-count and overflow the frame
+                // at its peak stack use.  Re-derive the depth from the resume pc —
+                // the CALL_ASSEMBLER-path mirror of the eval.rs CRN handoff.
+                crate::eval::correct_resume_vsd(frame, next_instr);
+            }
             let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
             if !ec.is_null() {
                 pyre_interpreter::call::set_last_exec_ctx(ec);
@@ -3873,9 +3882,9 @@ pub fn trace_and_compile_from_bridge(
         }
         return BridgeResolution::ResumeBlackhole;
     }
-    // resume.py rebuild_from_resumedata: one newframe(jitcode) per
-    // encoded section, no greenkey. The portal jitcode is the Python
-    // driver's mainjitcode for every inlined user function.
+    // resume.py `rebuild_from_resumedata`: `newframe(jitcodes[jitcode_pos])`
+    // per section, then `setup_resume_at_op` and `consume_boxes`. The portal
+    // jitcode is only the stand-in when a section has no registered jitcode.
     if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
         // resume.py `rebuild_from_resumedata` reads one section at a time:
         // `newframe`, `setup_resume_at_op(pc)`, then `consume_boxes`.

@@ -7779,7 +7779,9 @@ fn drive_portal_metatrace(
             // only the carried green next_instr becomes the native loop PC.
             let resumed = args.red_ref[0] as *mut PyFrame;
             assert_eq!(resumed, FrameView::reload(frame));
-            unsafe { &mut *resumed }.set_last_instr_from_next_instr(args.green_int[0] as usize);
+            if let Some(pc) = green_pc_position(args.green_int[0]) {
+                unsafe { &mut *resumed }.set_last_instr_from_next_instr(pc);
+            }
             Some(LoopResult::ContinueRunningNormally)
         }
         JitException::DoneWithThisFrameRef(value) => {
@@ -9974,7 +9976,12 @@ pub(crate) fn pyre_portal_runner(
     let _all_f = (green_float, red_float);
 
     // warmspot.py:976-978: result = portal_ptr(*args)
-    let next_instr = all_i.first().copied().unwrap_or(0) as usize;
+    // An empty bank still starts at 0, as before. A present negative
+    // green is not a position: writing 0 would replay the frame.
+    let next_instr = match all_i.first().copied() {
+        None => Some(0),
+        Some(pc) => green_pc_position(pc),
+    };
     let pycode = all_r.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
     let frame_ptr = all_r.get(1).copied().unwrap_or(0) as *mut PyFrame;
     let ec = all_r.get(2).copied().unwrap_or(0) as *const pyre_interpreter::PyExecutionContext;
@@ -10004,19 +10011,21 @@ pub(crate) fn pyre_portal_runner(
             frame.pycode,
         );
     }
-    frame.set_last_instr_from_next_instr(next_instr);
-    // Same correction every other blackhole resume leg applies: the frame still
-    // carries the FAILING GUARD's recorded operand depth, and this handoff
-    // resumes at the CRN's merge-point pc instead, so that depth over-counts
-    // and the header's pushes overflow the frame at its peak stack use.
-    // Re-derive it from the pc actually resumed at.
-    //
-    // Spelled here rather than through `apply_blackhole_crn_handoff`, which
-    // pairs the same two calls: that helper takes its pc from `green_int` alone
-    // and does nothing when it is empty, while this leg reads the MERGED
-    // `all_i`.  Routing through it would change which value becomes the resume
-    // pc, which is a separate question from the depth this fixes.
-    correct_resume_vsd(frame, next_instr);
+    if let Some(next_instr) = next_instr {
+        frame.set_last_instr_from_next_instr(next_instr);
+        // Same correction every other blackhole resume leg applies: the frame still
+        // carries the FAILING GUARD's recorded operand depth, and this handoff
+        // resumes at the CRN's merge-point pc instead, so that depth over-counts
+        // and the header's pushes overflow the frame at its peak stack use.
+        // Re-derive it from the pc actually resumed at.
+        //
+        // Spelled here rather than through `apply_blackhole_crn_handoff`, which
+        // pairs the same two calls: that helper takes its pc from `green_int` alone
+        // and does nothing when it is empty, while this leg reads the MERGED
+        // `all_i`.  Routing through it would change which value becomes the resume
+        // pc, which is a separate question from the depth this fixes.
+        correct_resume_vsd(frame, next_instr);
+    }
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);
@@ -11290,6 +11299,15 @@ enum HandleFailOutcome {
 /// CALL_ASSEMBLER arm in `handle_blackhole_result`) so the resume coordinate and
 /// its operand depth stay consistent.  A `None` depth (missing liveness) leaves
 /// the frame untouched, matching the bridge path's skip-on-None.
+/// A CRN green pc is a bytecode position only when it is non-negative.
+/// `as usize` wraps a negative and the next `next_instr()` read resumes
+/// in unrelated code. `None` means leave the frame where the blackhole
+/// already put it.
+#[majit_macros::dont_look_inside]
+pub(crate) fn green_pc_position(pc: i64) -> Option<usize> {
+    usize::try_from(pc).ok()
+}
+
 #[majit_macros::dont_look_inside]
 pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
     if let Some(corrected) =
@@ -11312,8 +11330,11 @@ fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
     let Some(&ni) = green_int.first() else {
         return;
     };
-    frame.set_last_instr_from_next_instr(ni as usize);
-    correct_resume_vsd(frame, ni as usize);
+    let Some(ni) = green_pc_position(ni) else {
+        return;
+    };
+    frame.set_last_instr_from_next_instr(ni);
+    correct_resume_vsd(frame, ni);
 }
 
 /// compile.py handle_fail.

@@ -2430,6 +2430,14 @@ where
         }
     }
 
+    /// A merge-point green pc is a guest position only when it is
+    /// non-negative. `as usize` wraps a negative into a huge index and the
+    /// dispatch loop resumes in unrelated code. `usize::MAX` is the
+    /// no-position sentinel the loop already breaks on.
+    fn guest_pc_position(pc: i64) -> usize {
+        usize::try_from(pc).unwrap_or(usize::MAX)
+    }
+
     /// pyjitpl.py `MIFrame._create_segmented_trace_and_blackhole`,
     /// recording half.
     ///
@@ -2521,7 +2529,7 @@ where
         // one it was left holding — the same handoff the abort path
         // publishes (`jitdriver.rs` `TraceAction::Abort` arm).  Without it
         // the walked iterations are executed a second time.
-        ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
+        ctx.walk_final_pc = mp_green_pc.map(Self::guest_pc_position);
         ctx.walk_final_reds = Vec::new();
         // pyjitpl.py:1673 `raise SwitchToBlackhole(ABORT_SEGMENTED_TRACE)`.
         if is_loop_trace {
@@ -7537,8 +7545,13 @@ where
                                 // `MergePoint::header_pc` is this visit's guest pc
                                 // (`same_greenkey`'s pc green), not the
                                 // trace-start `ctx.header_pc`.
-                                let recorded_pc =
-                                    mp_green_pc.map(|p| p as usize).unwrap_or(ctx.header_pc);
+                                // A present negative green is not this visit's
+                                // header. Falling back to the trace-start pc
+                                // would file it on a different loop.
+                                let recorded_pc = match mp_green_pc {
+                                    Some(pc) => Self::guest_pc_position(pc),
+                                    None => ctx.header_pc,
+                                };
                                 ctx.add_merge_point_with_key(
                                     close_key,
                                     close_key_typed,
@@ -7556,7 +7569,7 @@ where
                             // red values are transferred into native state by the
                             // hook (`restore_values`); storage caches re-derive via
                             // `recover`.
-                            ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
+                            ctx.walk_final_pc = mp_green_pc.map(Self::guest_pc_position);
                             ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
                         }
                         // GUARD_FUTURE_CONDITION already emitted unconditionally at
@@ -7710,7 +7723,7 @@ where
                             ctx.close_green_pc = Some(pc);
                             ctx.close_jump_into_key = Some(inner_key);
                             if capture_walk_reds {
-                                ctx.walk_final_pc = Some(pc as usize);
+                                ctx.walk_final_pc = Some(Self::guest_pc_position(pc));
                                 ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
                             }
                             if crate::majit_log_enabled() {
@@ -7766,7 +7779,7 @@ where
                                 // native state by the merge-point hook
                                 // (`restore_values`); storage caches are then
                                 // re-derived by `recover`.
-                                ctx.walk_final_pc = Some(pc as usize);
+                                ctx.walk_final_pc = Some(Self::guest_pc_position(pc));
                                 ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
                             }
                             // GUARD_FUTURE_CONDITION already emitted
@@ -7823,7 +7836,7 @@ where
                                 inner_key,
                                 Some(inner_key_typed),
                                 original_boxes,
-                                pc as usize,
+                                Self::guest_pc_position(pc),
                             );
                         }
                     }

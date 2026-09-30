@@ -15056,9 +15056,15 @@ fn handle<Sym: WalkSym>(
             let (Some(&pc_green), Some(&code_green)) = (gi.first(), gr.first()) else {
                 return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
             };
+            // `next_instr` is a Python bytecode position. A negative green
+            // is not one; `as usize` would wrap it and file the loop under
+            // a different header.
             let next_instr = match ctx.trace_ctx.concrete_of_opref(pc_green) {
-                Some(Value::Int(v)) => v as usize,
-                _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
+                Some(Value::Int(v)) => usize::try_from(v).ok(),
+                _ => None,
+            };
+            let Some(next_instr) = next_instr else {
+                return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
             };
 
             // `MIFrame.debug_merge_point` records a real

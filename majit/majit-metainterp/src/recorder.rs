@@ -546,6 +546,17 @@ impl Trace {
         Ok(())
     }
 
+    /// `opencoder.py append_int` of a value outside `[MIN_VALUE, MAX_VALUE]`.
+    /// Sets `tag_overflow`; the next `tracing_done` is `ABORT_TOO_LONG`.
+    #[cfg(test)]
+    pub(crate) fn append_out_of_range_int(&mut self) {
+        let trb = self
+            .trb
+            .as_mut()
+            .expect("append_out_of_range_int requires opencoder.Trace");
+        trb.append_int(i64::MAX);
+    }
+
     pub fn snapshot_offset_count(&self) -> usize {
         self.snapshot_offsets.len()
     }
