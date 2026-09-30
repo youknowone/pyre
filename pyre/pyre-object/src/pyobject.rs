@@ -1072,10 +1072,10 @@ mod subclass_range_publication_tests {
             ensure_object_subclass_ranges_initialized();
             assert!(unsafe { ll_issubclass(&BOOL_TYPE, &INT_TYPE) });
         } else {
-            // Omit one interpreter-only class that nothing else parents on.
-            // On a native target that is the posix tail. On wasm32 the
-            // object-crate user layouts close the table, so the omitted id
-            // is `_struct.Struct`'s user layout in the middle.
+            // Omit one interpreter-only class that nothing else parents on:
+            // the last such id. That is the posix tail here, the Windows
+            // console where it is compiled in, and `_sre.SRE_Template` on
+            // wasm32 (the object-crate user layouts stay in the table).
             let omitted_index = SUBCLASS_RANGE_HIERARCHY
                 .iter()
                 .rposition(|(id, _)| {

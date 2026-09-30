@@ -7273,17 +7273,13 @@ pub unsafe fn create_all_slots(
         let base_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
         assert!(!base_layout.is_null(), "ready base must own a Layout");
         let base_nslots = (*base_layout).nslots;
-        // A variable-sized base may add a managed instance dict, but may not
-        // add weakrefs or any explicit `__slots__` entry.  Derive this from
-        // the same layout metadata which exposes `tp_itemsize`, so newly
-        // ported variable builtins cannot be omitted from type creation
-        // semantics.  `typedef.py` `_getusercls` is a fixed payload plus
-        // mapdict, so `typeobject.py` `create_all_slots` still adds both.
+        // `type_new_slots`: a variable-sized base may add a
+        // managed instance dict, but may not add weakrefs or any explicit
+        // `__slots__` entry.  Derive this from the same layout metadata which
+        // exposes `tp_itemsize`, so newly ported variable builtins cannot be
+        // omitted from type creation semantics.
         let base_has_variable_items = crate::typedef::cpython_type_layout(w_bestbase)
             .is_some_and(|(_, itemsize)| itemsize != 0);
-        let layout_tp = pyre_object::w_type_get_layout(w_bestbase);
-        let user_layout = !layout_tp.is_null() && !(*layout_tp).user_subclass.is_null();
-        let variable_without_user_layout = base_has_variable_items && !user_layout;
 
         // typeobject.py create_all_slots
         let mut newslotnames = Vec::new();
@@ -7294,7 +7290,7 @@ pub unsafe fn create_all_slots(
             wantweakref = false;
             let all_names =
                 pyre_object::with_roots!(w_bestbase, w_type => collect_slot_names(w_slots))?;
-            if variable_without_user_layout && !all_names.is_empty() {
+            if base_has_variable_items && !all_names.is_empty() {
                 return Err(crate::PyError::type_error(format!(
                     "nonempty __slots__ not supported for subtype of '{}'",
                     pyre_object::w_type_get_name(w_bestbase)
@@ -7380,7 +7376,7 @@ pub unsafe fn create_all_slots(
         } else {
             // typeobject.py:1151-1153: no __slots__
             wantdict = true;
-            wantweakref = !variable_without_user_layout;
+            wantweakref = !base_has_variable_items;
         }
 
         // PyPy dict subclasses are W_DictMultiObject instances, so their

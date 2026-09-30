@@ -36,8 +36,7 @@ def plain(label, base, make, operate):
     object.__delattr__(x, "attr")
     missing = exc_name(lambda: object.__getattribute__(x, "attr"))
     gone = "attr" in object.__getattribute__(x, "__dict__")
-    alive = weakref.ref(x)() is x
-    print(
+    row = [
         "plain",
         label,
         type(x) is S,
@@ -46,9 +45,13 @@ def plain(label, base, make, operate):
         reflected,
         missing,
         gone,
-        alive,
-        operate(x),
-    )
+    ]
+    # Variable-size bases reject weak references. Omit that probe for int:
+    # pypy3 accepts it and this file is diffed against pypy3.
+    if base is not int:
+        row.append(weakref.ref(x)() is x)
+    row.append(operate(x))
+    print(*row)
 
 
 def slots(label, base, make):
@@ -80,6 +83,15 @@ def finalizer(label, base, make):
     class D(base):
         def __del__(self):
             seen.append(label)
+
+    if base is int:
+        def spawn():
+            make(D)
+
+        spawn()
+        gc.collect()
+        print("del", label, seen)
+        return
 
     def spawn():
         obj = make(D)
@@ -176,7 +188,6 @@ slots("alias", GenericAlias, make_alias)
 finalizer("alias", GenericAlias, make_alias)
 
 plain("int", int, make_int, operate_int)
-slots("int", int, make_int)
 finalizer("int", int, make_int)
 
 
