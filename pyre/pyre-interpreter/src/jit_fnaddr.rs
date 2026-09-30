@@ -5072,6 +5072,14 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             interp_exceptions::EXCEPTION_TYPE
         ),
         pytype_addr!(
+            "interp_exceptions::BASE_EXCEPTION_USER_TYPE",
+            interp_exceptions::BASE_EXCEPTION_USER_TYPE
+        ),
+        pytype_addr!(
+            "interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE",
+            interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE
+        ),
+        pytype_addr!(
             "interp_exceptions::EXC_EXCEPTION_TYPE",
             interp_exceptions::EXC_EXCEPTION_TYPE
         ),

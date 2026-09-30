@@ -1004,6 +1004,50 @@ unsafe fn weakref_user_object_custom_trace(
     };
 }
 
+/// `W_BaseExceptionUser` (`typedef.py` `_getusercls`): slim exception
+/// pointers plus mapdict `storage`. `object_subclass_with_custom_trace`
+/// does not inherit the OBJECT `w_class` edge, so the hook visits it.
+unsafe fn base_exception_user_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let exc =
+        unsafe { &mut *(obj_addr as *mut pyre_object::interp_exceptions::W_BaseExceptionUser) };
+    f(&mut exc.base.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    for offset in pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS {
+        f((obj_addr + offset) as *mut majit_ir::GcRef);
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
+/// `W_ExceptionExtendedUser`: extended exception pointers plus mapdict
+/// `storage`. Same `w_class` visit as the slim user hook.
+unsafe fn exception_extended_user_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let exc =
+        unsafe { &mut *(obj_addr as *mut pyre_object::interp_exceptions::W_ExceptionExtendedUser) };
+    f(
+        &mut exc.base.base.ob_header.w_class as *mut pyre_object::PyObjectRef
+            as *mut majit_ir::GcRef,
+    );
+    for offset in pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS {
+        f((obj_addr + offset) as *mut majit_ir::GcRef);
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
 unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f) };
 }
@@ -2597,9 +2641,9 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::setobject::FROZENSET_TYPE as *const _ as usize,
         w_set_tid,
     );
-    // Slim `W_BaseException` / `_new_exception` layout.  Extra-field
-    // subclasses (`W_OSError`, `W_ImportError`, …) get a tail TypeInfo
-    // so a ValueError stays on the slim SizeDescr (header + weakref).
+    // Slim `W_BaseException` layout. Extra-field realbases share
+    // `W_ExceptionExtended` (closed tid, registered with the `_getusercls`
+    // tail). A ValueError stays on the slim user SizeDescr.
     let w_exception_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::interp_exceptions::W_BaseException>(),
         object_tid,
@@ -3277,15 +3321,13 @@ fn build_gc() -> Box<MiniMarkGC> {
     // the descriptor's `gc_type_id` matches the order here so the
     // hardcoded `type_id` constants on the `#[pyre_class]`
     // attribute cannot silently drift.
-    // Per-`ExcKind` GC type ids.  The pre-registration loop at the
-    // top of this function mapped every exception PyType to a
-    // single `W_BASE_EXCEPTION_GC_TYPE_ID` so `new_with_vtable` knows
-    // the `W_BaseException` payload size for allocation; the
-    // shared tid also meant `gc.subclass_range(any_exception_
-    // pytype)` returned the same range for every subclass, which
-    // collapses RPython's per-class `subclassrange_{min,max}`
-    // discrimination (rclass.py `OBJECT.typeptr = specific
-    // class` + rclass.py `ll_issubclass`).
+    // Per-`ExcKind` subclass ranges for the class vtables
+    // (`exc_kind_to_pytype`). Instance malloc does not use these tids:
+    // `allocate_instance` stamps `EXCEPTION_TYPE`, the extended realbase,
+    // `BASE_EXCEPTION_USER_TYPE` or `EXCEPTION_EXTENDED_USER_TYPE`. The
+    // pre-registration loop mapped every exception PyType onto tid 31,
+    // so `subclass_range` could not tell the classes apart
+    // (rclass.py `OBJECT.typeptr = specific class` + `ll_issubclass`).
     //
     // To restore per-class ranges without renumbering the post-31
     // hardcoded tid constants (W_GENERATOR_GC_TYPE_ID = 32, …,
@@ -4562,7 +4604,62 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_interpreter::module::_io::W_FILEIO_USER_PYRE_CLASS_DESCRIPTOR,
     );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 214),
+    // `W_ExceptionExtended` — shared extra-field payload. Inside the
+    // subclass-range census (parent is the slim exception tid) and before
+    // the two `_getusercls` layouts that parent on it. No vtable: exact
+    // realbases keep their per-kind PyTypes.
+    let w_exception_extended_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_SIZE,
+        w_exception_tid,
+        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS.to_vec(),
+    ));
+    debug_assert_eq!(
+        w_exception_extended_tid,
+        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_TYPE_ID
+    );
+    pyre_object::interp_exceptions::set_exception_extended_gc_type_id(w_exception_extended_tid);
+    // `W_BaseExceptionUser` / `W_ExceptionExtendedUser` (`typedef.py`
+    // `_getusercls`). Traces walk the base pointer offsets, then mapdict
+    // `storage`.
+    let base_exception_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::interp_exceptions::W_BASE_EXCEPTION_USER_SIZE,
+        w_exception_tid,
+        base_exception_user_custom_trace,
+    ));
+    debug_assert_eq!(
+        base_exception_user_tid,
+        pyre_object::interp_exceptions::W_BASE_EXCEPTION_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE as *const _ as usize,
+        base_exception_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE as *const _ as usize,
+        base_exception_user_tid,
+    );
+    let exception_extended_user_tid =
+        gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+            pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_USER_SIZE,
+            w_exception_extended_tid,
+            exception_extended_user_custom_trace,
+        ));
+    debug_assert_eq!(
+        exception_extended_user_tid,
+        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE as *const _ as usize,
+        exception_extended_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE as *const _ as usize,
+        exception_extended_user_tid,
+    );
+
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 217),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,
@@ -5003,18 +5100,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_interpreter::active_subclass_range_hierarchy(),
         "GC rclass.OBJECT registration order must match the shared subclass-range census",
     );
-    // Extra-field exception layout.  Registered after the census so the
-    // pinned ids do not move; no vtable / subclass-range entry, only the
-    // TypeInfo NewWithVtable and `w_exception_new_empty_extended` allocate.
-    let w_exception_extended_tid = gc.register_type(
-        TypeInfo::object_subclass_with_gc_ptrs(
-            pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_SIZE,
-            w_exception_tid,
-            pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS.to_vec(),
-        )
-        .object_layout_without_subclass_range(),
-    );
-    pyre_object::interp_exceptions::set_exception_extended_gc_type_id(w_exception_extended_tid);
 
     // compile.py AllVirtuals — llopaque leaf hidden in jf_savedata.
     // Absolute tail so no hardcoded / `#[pyre_class(type_id = N)]` id

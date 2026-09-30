@@ -1,24 +1,24 @@
 //! W_BaseException — Python exception instance.
 //!
 //! Each exception carries a `kind` tag (mapping to PyErrorKind) and a
-//! message string. `ob_type` is the per-subclass `PyType` static
-//! (`EXC_VALUE_ERROR_TYPE`, `EXC_TYPE_ERROR_TYPE`, …) registered with
-//! the appropriate parent in `all_foreign_pytypes`, so backend
-//! `GuardClass` at `OB_TYPE_OFFSET` discriminates exception
-//! subclasses without any IR/backend change — matching RPython
-//! `OBJECT.typeptr = specific class` (`rclass.py`).
-//! `EXCEPTION_TYPE` is the BaseException root that every per-kind
-//! `PyType` chains up to; `is_exception` is an `ll_isinstance` against
-//! it via the assigned `subclassrange_{min,max}`.
+//! message string. `ob_type` is the instance layout vtable, not the Python
+//! class: `allocate_instance` (`objspace.py`) stamps the realbase interp
+//! class when `w_class` is that realbase's own type, and the realbase's
+//! `_getusercls` layout (`typedef.py`) otherwise. `_new_exception` classes
+//! (`W_ValueError`, `W_KeyError`, `W_Exception`, ...) are never the
+//! allocated layout. `w_class` is the Python class. `EXCEPTION_TYPE` is the
+//! BaseException root; `is_exception` is an `ll_isinstance` against it via
+//! the assigned `subclassrange_{min,max}`.
 
 use crate::pyobject::*;
 use rustpython_wtf8::Wtf8;
 
-/// Every instance vtable from [`exc_kind_to_pytype`] carries
-/// `W_BaseException.w_weakreflifeline`. The group layout static is not one
-/// of those vtables.
+/// Per-kind class vtable. Instance allocation does not use this pointer
+/// unless `w_class` is exactly that kind's realbase (`exc_instance_pytype`).
+/// `W_BaseException.typedef` is hasdict and not weakrefable, so the vtable
+/// publishes neither a mapdict offset nor a `_lifeline_` field.
 const fn exc_pytype(name: &'static str) -> PyType {
-    crate::pyobject::new_pytype_with_weakref(name, EXC_W_WEAKREF_OFFSET)
+    crate::pyobject::new_pytype(name)
 }
 
 pub static EXCEPTION_TYPE: PyType = exc_pytype("BaseException");
@@ -87,10 +87,9 @@ pub static EXC_UNICODE_ERROR_TYPE: PyType = exc_pytype("UnicodeError");
 /// of Exception raised by `compile`/`exec`/`eval`/`ast.parse`.
 pub static EXC_SYNTAX_ERROR_TYPE: PyType = exc_pytype("SyntaxError");
 
-/// Per-`ExcKind` `ob_type` resolver. `w_exception_new` writes the
-/// returned pointer into the allocated `W_BaseException` so the
-/// backend's `GuardClass` at `OB_TYPE_OFFSET` matches the actual
-/// subclass.
+/// Per-`ExcKind` class-identity vtable. Instance allocation uses
+/// [`exc_instance_pytype`]. `allocate_exception`'s exact-group arm is the
+/// one caller that still stamps this pointer onto a slim kind.
 #[inline]
 pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
     match kind {
@@ -252,12 +251,12 @@ impl ExcKind {
 }
 
 /// Layout: `[ob_header | kind: ExcKind | args_w | w_cause | w_context |
-/// w_traceback | suppress_context | w_dict | w_weakreflifeline]`.
+/// w_traceback | suppress_context | w_dict]`.
 ///
-/// Matches `interp_exceptions.py W_BaseException` and every
-/// `_new_exception` class that adds no instance fields (`W_ValueError`,
-/// `W_TypeError`, …).  Subclasses that declare extra slots live in
-/// [`W_ExceptionExtended`].
+/// Matches `interp_exceptions.py W_BaseException`. `_new_exception` classes
+/// that add no instance fields allocate [`W_BaseExceptionUser`] instead.
+/// Subclasses that declare extra slots live in [`W_ExceptionExtended`] or
+/// [`W_ExceptionExtendedUser`].
 ///
 /// `args_w` mirrors `W_BaseException.descr_init`:
 ///
@@ -303,14 +302,9 @@ pub struct W_BaseException {
     /// per-instance attribute dict, lazily allocated by `getdict`
     /// and replaced wholesale by `setdict`.
     /// Extra attributes (`e.note = ...`, PEP 678 `__notes__`) live
-    /// here.
+    /// here. `W_BaseException.typedef` is hasdict, so `_getusercls` does
+    /// not mix `MapdictDictSupport`: ordinary attributes stay in this slot.
     pub w_dict: PyObjectRef,
-    /// Per-object weakref lifeline. Builtin exception classes are
-    /// weakrefable (`weakref.ref(ValueError(1))`), as are user
-    /// subclasses and `new_exception_class` module exceptions. The
-    /// slot lives on this slim prefix so a fieldless instance can
-    /// hold it without the extended layout.
-    pub w_weakreflifeline: PyObjectRef,
 }
 
 /// Extra-field subclasses of `W_BaseException`.
@@ -319,9 +313,9 @@ pub struct W_BaseException {
 /// `W_Unicode*Error`, `W_StopIteration`, `W_NameError`,
 /// `W_AttributeError`, `W_SystemExit`, and `W_BaseExceptionGroup` its
 /// own interp-level class and SizeDescr.  Until those are split, they
-/// share this prefix-compatible extended layout so a `ValueError` can
-/// stay on the slim [`W_BaseException`] SizeDescr (~72) instead of
-/// carrying every unused subclass slot.
+/// share this prefix-compatible extended layout so a fieldless class
+/// stays on the slim layout ([`W_BaseException`] or
+/// [`W_BaseExceptionUser`]) instead of carrying every unused subclass slot.
 #[repr(C)]
 pub struct W_ExceptionExtended {
     pub base: W_BaseException,
@@ -450,6 +444,56 @@ pub struct W_ExceptionExtended {
     pub w_group_exceptions_repr: PyObjectRef,
 }
 
+/// `typedef.py` `_getusercls(W_BaseException)`: the base payload plus
+/// `MapdictStorageMixin`. The typedef is hasdict, so the map is not the
+/// instance dict; it carries `__slots__` and, because the typedef is not
+/// weakrefable, the `MapdictWeakrefSupport` `"weakref"` SPECIAL slot.
+#[repr(C)]
+pub struct W_BaseExceptionUser {
+    pub base: W_BaseException,
+    pub map: usize,
+    pub storage: *mut crate::object_array::ItemsBlock,
+}
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_BaseExceptionUser, storage)
+            == std::mem::offset_of!(W_BaseExceptionUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
+/// `typedef.py` `_getusercls` of an extra-field realbase (`W_OSError`,
+/// `W_ImportError`, `W_StopIteration`, ...). Same mapdict tail as
+/// [`W_BaseExceptionUser`], prefixed by [`W_ExceptionExtended`].
+#[repr(C)]
+pub struct W_ExceptionExtendedUser {
+    pub base: W_ExceptionExtended,
+    pub map: usize,
+    pub storage: *mut crate::object_array::ItemsBlock,
+}
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_ExceptionExtendedUser, storage)
+            == std::mem::offset_of!(W_ExceptionExtendedUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
+/// Slim `_getusercls` typeptr (`typedef.py` `_getusercls(W_BaseException)`).
+pub static BASE_EXCEPTION_USER_TYPE: PyType = new_user_pytype(
+    "BaseException",
+    &EXCEPTION_TYPE,
+    std::mem::offset_of!(W_BaseExceptionUser, map),
+);
+
+/// Extra-field `_getusercls` typeptr. One vtable covers every extended
+/// realbase's user layout; `w_class` names the Python class.
+pub static EXCEPTION_EXTENDED_USER_TYPE: PyType = new_user_pytype(
+    "BaseException",
+    &EXCEPTION_TYPE,
+    std::mem::offset_of!(W_ExceptionExtendedUser, map),
+);
+
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_BaseException, kind);
 pub const EXC_ARGS_W_OFFSET: usize = std::mem::offset_of!(W_BaseException, args_w);
 pub const EXC_W_CAUSE_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_cause);
@@ -501,7 +545,11 @@ pub const EXC_W_GROUP_EXCEPTIONS_OFFSET: usize =
     std::mem::offset_of!(W_ExceptionExtended, w_group_exceptions);
 pub const EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET: usize =
     std::mem::offset_of!(W_ExceptionExtended, w_group_exceptions_repr);
-pub const EXC_W_WEAKREF_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_weakreflifeline);
+pub const EXC_USER_MAP_OFFSET: usize = std::mem::offset_of!(W_BaseExceptionUser, map);
+pub const EXC_USER_STORAGE_OFFSET: usize = std::mem::offset_of!(W_BaseExceptionUser, storage);
+pub const EXC_EXTENDED_USER_MAP_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtendedUser, map);
+pub const EXC_EXTENDED_USER_STORAGE_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtendedUser, storage);
 
 /// The pointer slots a traced construction emit must reproduce itself.
 ///
@@ -515,7 +563,7 @@ pub unsafe fn w_exception_traced_construction_slots(obj: PyObjectRef) -> Vec<(us
         EXC_W_TRACEBACK_OFFSET,
         EXC_W_DICT_OFFSET,
     ];
-    const EXTENDED_OFFSETS: [usize; 33] = [
+    const EXTENDED_OFFSETS: [usize; 32] = [
         EXC_W_CAUSE_OFFSET,
         EXC_W_TRACEBACK_OFFSET,
         EXC_W_OBJECT_OFFSET,
@@ -548,7 +596,6 @@ pub unsafe fn w_exception_traced_construction_slots(obj: PyObjectRef) -> Vec<(us
         EXC_W_GROUP_EXCEPTIONS_OFFSET,
         EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET,
         EXC_W_DICT_OFFSET,
-        EXC_W_WEAKREF_OFFSET,
     ];
     let kind = unsafe { (*(obj as *const W_BaseException)).kind };
     let offsets: &[usize] = if exc_kind_uses_extended_layout(kind) {
@@ -568,18 +615,28 @@ pub unsafe fn w_exception_traced_construction_slots(obj: PyObjectRef) -> Vec<(us
 
 /// GC pointer slots on the slim [`W_BaseException`] layout
 /// (`interp_exceptions.py W_BaseException` class defaults).
-pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 6] = [
+pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 5] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
     EXC_W_TRACEBACK_OFFSET,
     EXC_W_DICT_OFFSET,
-    EXC_W_WEAKREF_OFFSET,
+];
+
+/// Slim user layout: the base pointers plus mapdict `storage`.
+/// `map` is a `usize`, not a GC edge.
+pub const W_BASE_EXCEPTION_USER_GC_PTR_OFFSETS: [usize; 6] = [
+    EXC_ARGS_W_OFFSET,
+    EXC_W_CAUSE_OFFSET,
+    EXC_W_CONTEXT_OFFSET,
+    EXC_W_TRACEBACK_OFFSET,
+    EXC_W_DICT_OFFSET,
+    EXC_USER_STORAGE_OFFSET,
 ];
 
 /// GC pointer slots on [`W_ExceptionExtended`] — the slim base plus every
 /// extra-field subclass slot PyPy keeps on a dedicated interp class.
-pub const W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS: [usize; 35] = [
+pub const W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS: [usize; 34] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -614,25 +671,76 @@ pub const W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS: [usize; 35] = [
     EXC_W_GROUP_EXCEPTIONS_OFFSET,
     EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET,
     EXC_W_DICT_OFFSET,
-    EXC_W_WEAKREF_OFFSET,
+];
+
+/// Extended user layout: the extended pointers plus mapdict `storage`.
+pub const W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS: [usize; 35] = [
+    EXC_ARGS_W_OFFSET,
+    EXC_W_CAUSE_OFFSET,
+    EXC_W_CONTEXT_OFFSET,
+    EXC_W_TRACEBACK_OFFSET,
+    EXC_W_OBJECT_OFFSET,
+    EXC_W_START_OFFSET,
+    EXC_W_END_OFFSET,
+    EXC_W_REASON_OFFSET,
+    EXC_W_ENCODING_OFFSET,
+    EXC_W_ERRNO_OFFSET,
+    EXC_W_WINERROR_OFFSET,
+    EXC_W_STRERROR_OFFSET,
+    EXC_W_FILENAME_OFFSET,
+    EXC_W_FILENAME2_OFFSET,
+    EXC_W_CODE_OFFSET,
+    EXC_W_VALUE_OFFSET,
+    EXC_W_NAME_OFFSET,
+    EXC_W_ATTR_OBJ_OFFSET,
+    EXC_W_IMPORT_PATH_OFFSET,
+    EXC_W_IMPORT_NAME_FROM_OFFSET,
+    EXC_W_IMPORT_MSG_OFFSET,
+    EXC_W_SYNTAX_MSG_OFFSET,
+    EXC_W_SYNTAX_FILENAME_OFFSET,
+    EXC_W_SYNTAX_LINENO_OFFSET,
+    EXC_W_SYNTAX_OFFSET_OFFSET,
+    EXC_W_SYNTAX_TEXT_OFFSET,
+    EXC_W_SYNTAX_END_LINENO_OFFSET,
+    EXC_W_SYNTAX_END_OFFSET_OFFSET,
+    EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
+    EXC_W_SYNTAX_METADATA_OFFSET,
+    EXC_W_GROUP_MESSAGE_OFFSET,
+    EXC_W_GROUP_EXCEPTIONS_OFFSET,
+    EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET,
+    EXC_W_DICT_OFFSET,
+    EXC_EXTENDED_USER_STORAGE_OFFSET,
 ];
 
 /// GC type id assigned to slim `W_BaseException` at JitDriver init time.
 pub const W_BASE_EXCEPTION_GC_TYPE_ID: u32 = 31;
 
-/// Runtime tid for [`W_ExceptionExtended`].  Assigned at the tail of
-/// `build_gc` so it does not shift the hardcoded / census-pinned ids.
-static W_EXCEPTION_EXTENDED_GC_TYPE_ID_CELL: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+/// Closed tid of [`W_ExceptionExtended`]. Registered in `build_gc` immediately
+/// after the `_io.FileIO` user layout and before [`W_BaseExceptionUser`], so
+/// the extended user layout can parent on it. Constant before GC init:
+/// `try_gc_alloc_collecting_rooted` with no hook is `NoRoute` and the
+/// allocator falls through to `malloc_typed`.
+pub const W_EXCEPTION_EXTENDED_GC_TYPE_ID: u32 = 214;
 
-/// Publish the GC tid for the extra-field exception layout.
+/// `W_BaseExceptionUser` (`typedef.py` `_getusercls`). Parents on
+/// [`W_BASE_EXCEPTION_GC_TYPE_ID`].
+pub const W_BASE_EXCEPTION_USER_GC_TYPE_ID: u32 = 215;
+
+/// `W_ExceptionExtendedUser`. Parents on [`W_EXCEPTION_EXTENDED_GC_TYPE_ID`].
+pub const W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID: u32 = 216;
+
+/// Publish the GC tid for the extra-field exception layout. `build_gc`
+/// calls this with the constant tid as a registration-order check.
 pub fn set_exception_extended_gc_type_id(tid: u32) {
-    W_EXCEPTION_EXTENDED_GC_TYPE_ID_CELL.store(tid, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        tid, W_EXCEPTION_EXTENDED_GC_TYPE_ID,
+        "W_ExceptionExtended must register at its closed tid"
+    );
 }
 
-/// Tid of [`W_ExceptionExtended`].  0 until `build_gc` publishes it.
+/// Tid of [`W_ExceptionExtended`].
 pub fn exception_extended_gc_type_id() -> u32 {
-    W_EXCEPTION_EXTENDED_GC_TYPE_ID_CELL.load(std::sync::atomic::Ordering::Acquire)
+    W_EXCEPTION_EXTENDED_GC_TYPE_ID
 }
 
 /// rlist.py `LIST = GcStruct("list", ("length", Signed), ("items", Ptr(ITEMARRAY)))`.
@@ -694,9 +802,29 @@ impl crate::lltype::GcType for W_BaseException {
 
 impl crate::lltype::GcType for W_ExceptionExtended {
     fn type_id() -> u32 {
-        exception_extended_gc_type_id()
+        W_EXCEPTION_EXTENDED_GC_TYPE_ID
     }
     const SIZE: usize = W_EXCEPTION_EXTENDED_SIZE;
+}
+
+/// Payload size of [`W_BaseExceptionUser`].
+pub const W_BASE_EXCEPTION_USER_SIZE: usize = std::mem::size_of::<W_BaseExceptionUser>();
+
+/// Payload size of [`W_ExceptionExtendedUser`].
+pub const W_EXCEPTION_EXTENDED_USER_SIZE: usize = std::mem::size_of::<W_ExceptionExtendedUser>();
+
+impl crate::lltype::GcType for W_BaseExceptionUser {
+    fn type_id() -> u32 {
+        W_BASE_EXCEPTION_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_BASE_EXCEPTION_USER_SIZE;
+}
+
+impl crate::lltype::GcType for W_ExceptionExtendedUser {
+    fn type_id() -> u32 {
+        W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_EXCEPTION_EXTENDED_USER_SIZE;
 }
 
 /// True when `kind` is a PyPy class that declares extra instance fields
@@ -723,6 +851,155 @@ pub fn exc_kind_uses_extended_layout(kind: ExcKind) -> bool {
             | ExcKind::UnicodeEncodeError
             | ExcKind::UnicodeTranslateError
     )
+}
+
+/// The realbase whose interp class owns `kind`'s payload.
+///
+/// `_new_exception` children share that realbase: `ModuleNotFoundError` is
+/// `W_ImportError`, `FileNotFoundError` is `W_OSError`, `UnboundLocalError`
+/// is `W_NameError`. Fieldless classes share `W_BaseException`.
+#[inline]
+pub fn exc_realbase_pytype(kind: ExcKind) -> &'static PyType {
+    match kind {
+        ExcKind::ImportError | ExcKind::ModuleNotFoundError => &EXC_IMPORT_ERROR_TYPE,
+        ExcKind::StopIteration => &EXC_STOP_ITERATION_TYPE,
+        ExcKind::OSError | ExcKind::FileNotFoundError => &EXC_OS_ERROR_TYPE,
+        ExcKind::NameError | ExcKind::UnboundLocalError => &EXC_NAME_ERROR_TYPE,
+        ExcKind::SyntaxError => &EXC_SYNTAX_ERROR_TYPE,
+        ExcKind::SystemExit => &EXC_SYSTEM_EXIT_TYPE,
+        ExcKind::UnicodeDecodeError => &EXC_UNICODE_DECODE_ERROR_TYPE,
+        ExcKind::UnicodeEncodeError => &EXC_UNICODE_ENCODE_ERROR_TYPE,
+        ExcKind::UnicodeTranslateError => &EXC_UNICODE_TRANSLATE_ERROR_TYPE,
+        ExcKind::AttributeError => &EXC_ATTRIBUTE_ERROR_TYPE,
+        _ => &EXCEPTION_TYPE,
+    }
+}
+
+/// Whether the canonical class of `kind` allocates the `_getusercls` layout.
+///
+/// Realbases (`W_BaseException`, `W_OSError`, `W_StopIteration`, ...) allocate
+/// their own interp class. Every other `ExcKind` is a `_new_exception` class
+/// and allocates the realbase's user layout. App-level subclasses are not
+/// canonical; [`exc_instance_pytype`] decides those from `w_class`.
+#[inline]
+pub fn exc_kind_canonical_is_user_layout(kind: ExcKind) -> bool {
+    !matches!(
+        kind,
+        ExcKind::BaseException
+            | ExcKind::ImportError
+            | ExcKind::StopIteration
+            | ExcKind::OSError
+            | ExcKind::NameError
+            | ExcKind::SyntaxError
+            | ExcKind::SystemExit
+            | ExcKind::UnicodeDecodeError
+            | ExcKind::UnicodeEncodeError
+            | ExcKind::UnicodeTranslateError
+            | ExcKind::AttributeError
+    )
+}
+
+/// `ExcKind` of the realbase class `allocate_instance` compares against.
+///
+/// `_new_exception` children share that class: `FileNotFoundError` and
+/// `ModuleNotFoundError` are not their own realbase, and every fieldless
+/// class shares `W_BaseException`.
+#[inline]
+fn exc_realbase_kind(kind: ExcKind) -> ExcKind {
+    match kind {
+        ExcKind::ImportError | ExcKind::ModuleNotFoundError => ExcKind::ImportError,
+        ExcKind::StopIteration => ExcKind::StopIteration,
+        ExcKind::OSError | ExcKind::FileNotFoundError => ExcKind::OSError,
+        ExcKind::NameError | ExcKind::UnboundLocalError => ExcKind::NameError,
+        ExcKind::SyntaxError => ExcKind::SyntaxError,
+        ExcKind::SystemExit => ExcKind::SystemExit,
+        ExcKind::UnicodeDecodeError => ExcKind::UnicodeDecodeError,
+        ExcKind::UnicodeEncodeError => ExcKind::UnicodeEncodeError,
+        ExcKind::UnicodeTranslateError => ExcKind::UnicodeTranslateError,
+        ExcKind::AttributeError => ExcKind::AttributeError,
+        _ => ExcKind::BaseException,
+    }
+}
+
+/// `allocate_instance`: exact realbase class → base layout, anything else →
+/// `_getusercls`.
+///
+/// The realbase is the class `register_exc_class_for_kind` stored for
+/// [`exc_realbase_kind`]. Extended realbase vtables never receive
+/// `set_instantiate` (only `EXCEPTION_TYPE` does, and that slot is the
+/// pre-init `"exception"` stub), so the instantiate word is not the Python
+/// class. Before registration, the comparison falls back to
+/// `get_instantiate` of the realbase vtable. A null fallback is the
+/// exact-base case: an allocation before either slot is filled does not
+/// stamp a mapdict typeptr.
+#[inline]
+pub fn exc_instance_is_user_layout(kind: ExcKind, w_class: PyObjectRef) -> bool {
+    let registered = lookup_exc_class_for_kind(exc_realbase_kind(kind));
+    let realbase = if !registered.is_null() {
+        registered
+    } else {
+        get_instantiate(exc_realbase_pytype(kind))
+    };
+    !realbase.is_null() && !std::ptr::eq(w_class, realbase)
+}
+
+/// Instance `ob_type` for `(kind, w_class)`.
+///
+/// Exact realbase → the vtable that realbase uses (`EXCEPTION_TYPE` for the
+/// slim base, `exc_realbase_pytype` for an extended realbase). Otherwise the
+/// matching user PyType.
+#[inline]
+pub fn exc_instance_pytype(kind: ExcKind, w_class: PyObjectRef) -> &'static PyType {
+    if exc_instance_is_user_layout(kind, w_class) {
+        if exc_kind_uses_extended_layout(kind) {
+            &EXCEPTION_EXTENDED_USER_TYPE
+        } else {
+            &BASE_EXCEPTION_USER_TYPE
+        }
+    } else if exc_kind_uses_extended_layout(kind) {
+        exc_realbase_pytype(kind)
+    } else {
+        &EXCEPTION_TYPE
+    }
+}
+
+/// Whether `ob_type` is a `_getusercls` exception vtable.
+#[inline]
+pub fn exc_typeptr_is_user_layout(ob_type: *const PyType) -> bool {
+    std::ptr::eq(ob_type, &BASE_EXCEPTION_USER_TYPE)
+        || std::ptr::eq(ob_type, &EXCEPTION_EXTENDED_USER_TYPE)
+}
+
+/// Whether `obj` was allocated by `_getusercls` (`exc_instance_pytype`).
+///
+/// # Safety
+/// `obj` must be a live object. A null object answers false.
+#[inline]
+pub unsafe fn exc_obj_is_user_layout(obj: PyObjectRef) -> bool {
+    !obj.is_null() && exc_typeptr_is_user_layout(unsafe { (*obj).ob_type })
+}
+
+/// GC pointer slots of an unmanaged exception, selected by `ob_type`.
+///
+/// User layouts include mapdict `storage`. Exact group instances keep a slim
+/// `kind` on the extended struct and stay on the kind table.
+///
+/// # Safety
+/// `obj` must be a live exception (`is_exception`).
+pub unsafe fn exception_unmanaged_gc_ptr_offsets(obj: PyObjectRef) -> &'static [usize] {
+    let tp = unsafe { (*obj).ob_type };
+    if std::ptr::eq(tp, &BASE_EXCEPTION_USER_TYPE) {
+        &W_BASE_EXCEPTION_USER_GC_PTR_OFFSETS
+    } else if std::ptr::eq(tp, &EXCEPTION_EXTENDED_USER_TYPE) {
+        &W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS
+    } else {
+        let kind = unsafe { w_exception_get_kind(obj) };
+        if exc_kind_uses_extended_layout(kind) {
+            &W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS
+        } else {
+            &W_BASE_EXCEPTION_GC_PTR_OFFSETS
+        }
+    }
 }
 
 /// Allocate a new exception object on the heap.
@@ -776,7 +1053,19 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
 /// Like `w_exception_new` but stores an arbitrary WTF-8 message,
 /// preserving lone surrogates that a `&str` message cannot carry.
 pub fn w_exception_new_wtf8(kind: ExcKind, message: &Wtf8) -> PyObjectRef {
-    let exc = w_exception_new_empty(kind);
+    w_exception_new_wtf8_for_class(kind, message, PY_NULL)
+}
+
+/// [`w_exception_new_wtf8`] for a caller that already resolved `cls`.
+///
+/// `W_OSError.descr_new` retargets `w_subtype` through `ERRNO_MAP` before
+/// `allocate_instance`, so the user-vs-base choice sees that class.
+pub fn w_exception_new_wtf8_for_class(
+    kind: ExcKind,
+    message: &Wtf8,
+    cls: PyObjectRef,
+) -> PyObjectRef {
+    let exc = w_exception_new_empty_for_class(kind, cls);
     if message.is_empty() {
         return exc;
     }
@@ -814,11 +1103,12 @@ pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
 
 /// Allocate the extra-field layout even when `kind` is a slim class.
 ///
-/// `interp_group.W_BaseExceptionGroup.descr_new` builds a group instance
-/// tagged as `Exception` / `BaseException` and then writes the group
-/// slots; those slots only exist on [`W_ExceptionExtended`].
+/// Prefer [`w_exception_new_empty_extended_for_class`] when the Python class
+/// is already known: a group instance is [`W_ExceptionExtended`] or
+/// [`W_ExceptionExtendedUser`] while its `kind` stays `Exception` /
+/// `BaseException`. This entry uses the canonical class of `kind`.
 pub fn w_exception_new_empty_extended(kind: ExcKind) -> PyObjectRef {
-    w_exception_new_empty_extended_impl(kind, false)
+    w_exception_new_empty_extended_for_class(kind, PY_NULL, false)
 }
 
 /// Immortal variant for the prebuilt singletons (`memory_error_singleton` /
@@ -831,7 +1121,7 @@ pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
 
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
 /// `w_dict_new` / `w_dict_view_iterator_new_direction` twin: the body picks
-/// the exception's type word at runtime (`exc_kind_to_pytype(kind)`), and a
+/// the exception's type word at runtime (`exc_instance_pytype`), and a
 /// cluster whose type word is not a constant address does not lower — the word
 /// rides on the allocation or not at all, since a `setfield_gc` whose descr
 /// `is_typeptr()` is removed downstream. The primary allocation is hand-rolled
@@ -912,30 +1202,22 @@ fn set_exception_header_w_class<T>(value: &mut T, w_class: PyObjectRef) {
     }
 }
 
-#[majit_macros::dont_look_inside]
-fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
-    if exc_kind_uses_extended_layout(kind) {
-        return w_exception_new_empty_extended_impl(kind, immortal);
-    }
-    let value = w_exception_base_defaults(kind);
-    if !immortal {
-        return alloc_exception_nursery(value);
-    }
-    crate::lltype::malloc_typed(value) as PyObjectRef
-}
-
-fn w_exception_base_defaults(kind: ExcKind) -> W_BaseException {
+fn canonical_exc_class(kind: ExcKind) -> PyObjectRef {
     let w_class = lookup_exc_class_for_kind(kind);
-    let w_class = if w_class != PY_NULL {
+    if w_class != PY_NULL {
         w_class
     } else {
         get_instantiate(&EXCEPTION_TYPE)
-    };
+    }
+}
+
+fn w_exception_base_defaults(
+    kind: ExcKind,
+    ob_type: *const PyType,
+    w_class: PyObjectRef,
+) -> W_BaseException {
     W_BaseException {
-        ob_header: PyObject {
-            ob_type: exc_kind_to_pytype(kind) as *const PyType,
-            w_class,
-        },
+        ob_header: PyObject { ob_type, w_class },
         kind,
         args_w: PY_NULL,
         w_cause: PY_NULL,
@@ -943,14 +1225,12 @@ fn w_exception_base_defaults(kind: ExcKind) -> W_BaseException {
         w_traceback: PY_NULL,
         suppress_context: false,
         w_dict: PY_NULL,
-        w_weakreflifeline: PY_NULL,
     }
 }
 
-#[majit_macros::dont_look_inside]
-fn w_exception_new_empty_extended_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
-    let value = W_ExceptionExtended {
-        base: w_exception_base_defaults(kind),
+fn extended_payload(base: W_BaseException) -> W_ExceptionExtended {
+    W_ExceptionExtended {
+        base,
         w_object: PY_NULL,
         w_start: PY_NULL,
         w_end: PY_NULL,
@@ -981,11 +1261,87 @@ fn w_exception_new_empty_extended_impl(kind: ExcKind, immortal: bool) -> PyObjec
         w_group_message: PY_NULL,
         w_group_exceptions: PY_NULL,
         w_group_exceptions_repr: PY_NULL,
-    };
-    if !immortal {
-        return alloc_exception_nursery(value);
     }
-    crate::lltype::malloc_typed(value) as PyObjectRef
+}
+
+fn alloc_typed<T: crate::lltype::GcType>(value: T, immortal: bool) -> PyObjectRef {
+    if immortal {
+        crate::lltype::malloc_typed(value) as PyObjectRef
+    } else {
+        alloc_exception_nursery(value)
+    }
+}
+
+/// `allocate_instance` enqueues a user finalizer after `user_setup`.
+/// Pin first: the hook can collect.
+fn register_user_finalizer(obj: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    crate::gc_hook::maybe_register_finalizer(crate::gc_roots::shadow_stack_get(slot));
+    crate::gc_roots::shadow_stack_get(slot)
+}
+
+/// `objspace.py allocate_instance` for an exception class.
+///
+/// `force_extended` selects [`W_ExceptionExtended`] even for a slim `kind`
+/// (exception groups). `force_user` overrides [`exc_instance_is_user_layout`]:
+/// `Some(false)` on a slim kind stamps `exc_kind_to_pytype` (the vtable
+/// `W_BaseExceptionGroup.descr_new` uses for an exact group class);
+/// `Some(true)` stamps the extended user PyType. `None` is
+/// [`exc_instance_pytype`].
+#[majit_macros::dont_look_inside]
+fn allocate_exception(
+    kind: ExcKind,
+    w_class: PyObjectRef,
+    immortal: bool,
+    force_extended: bool,
+    force_user: Option<bool>,
+) -> PyObjectRef {
+    let extended = force_extended || exc_kind_uses_extended_layout(kind);
+    let user = force_user.unwrap_or_else(|| exc_instance_is_user_layout(kind, w_class));
+    let ob_type: *const PyType = match force_user {
+        Some(false) if !exc_kind_uses_extended_layout(kind) => exc_kind_to_pytype(kind),
+        _ if extended && user => &EXCEPTION_EXTENDED_USER_TYPE,
+        _ if user => &BASE_EXCEPTION_USER_TYPE,
+        _ if extended && exc_kind_uses_extended_layout(kind) => exc_realbase_pytype(kind),
+        _ if extended => exc_kind_to_pytype(kind),
+        _ => &EXCEPTION_TYPE,
+    };
+    let base = w_exception_base_defaults(kind, ob_type, w_class);
+    let obj = if !extended && !user {
+        alloc_typed(base, immortal)
+    } else if !extended {
+        alloc_typed(
+            W_BaseExceptionUser {
+                base,
+                map: 0,
+                storage: std::ptr::null_mut(),
+            },
+            immortal,
+        )
+    } else if !user {
+        alloc_typed(extended_payload(base), immortal)
+    } else {
+        alloc_typed(
+            W_ExceptionExtendedUser {
+                base: extended_payload(base),
+                map: 0,
+                storage: std::ptr::null_mut(),
+            },
+            immortal,
+        )
+    };
+    if user && !immortal {
+        register_user_finalizer(obj)
+    } else {
+        obj
+    }
+}
+
+#[majit_macros::dont_look_inside]
+fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
+    allocate_exception(kind, canonical_exc_class(kind), immortal, false, None)
 }
 
 /// Per-`ExcKind` class-pointer registry. Populated by
@@ -1101,8 +1457,39 @@ pub fn exception_layout_kind_for_class(kind: ExcKind, cls: PyObjectRef) -> ExcKi
 
 /// Allocate for `cls(...)`, where `cls` may be a heap subclass whose best
 /// base owns a wider layout than the class that supplied `__new__`.
+///
+/// `cls` is the Python class `allocate_instance` compares against the
+/// realbase. Null `cls` falls back to the canonical class of the layout kind.
+#[majit_macros::dont_look_inside]
 pub fn w_exception_new_empty_for_class(kind: ExcKind, cls: PyObjectRef) -> PyObjectRef {
-    w_exception_new_empty(exception_layout_kind_for_class(kind, cls))
+    let layout_kind = exception_layout_kind_for_class(kind, cls);
+    let w_class = if cls.is_null() {
+        canonical_exc_class(layout_kind)
+    } else {
+        cls
+    };
+    allocate_exception(layout_kind, w_class, false, false, None)
+}
+
+/// Group allocation: `kind` stays slim (`Exception` / `BaseException`) while
+/// the bytes are [`W_ExceptionExtended`] or [`W_ExceptionExtendedUser`].
+///
+/// `user_layout` is `w_subtype is not W_BaseExceptionGroup` after
+/// `W_BaseExceptionGroup.descr_new` promotes an all-Exception payload to
+/// `ExceptionGroup`. Exact `BaseExceptionGroup` passes `false` and keeps
+/// `exc_kind_to_pytype(kind)` as its vtable.
+#[majit_macros::dont_look_inside]
+pub fn w_exception_new_empty_extended_for_class(
+    kind: ExcKind,
+    cls: PyObjectRef,
+    user_layout: bool,
+) -> PyObjectRef {
+    let w_class = if cls.is_null() {
+        canonical_exc_class(kind)
+    } else {
+        cls
+    };
+    allocate_exception(kind, w_class, false, true, Some(user_layout))
 }
 
 /// `interp_exceptions.py W_BaseException.descr_getargs` parity —
@@ -2784,6 +3171,35 @@ mod tests {
             <W_ExceptionExtended as crate::lltype::GcType>::SIZE,
             W_EXCEPTION_EXTENDED_SIZE
         );
+        assert_eq!(W_EXCEPTION_EXTENDED_GC_TYPE_ID, 214);
+        assert_eq!(W_BASE_EXCEPTION_USER_GC_TYPE_ID, 215);
+        assert_eq!(W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID, 216);
+        assert_eq!(
+            <W_ExceptionExtended as crate::lltype::GcType>::type_id(),
+            W_EXCEPTION_EXTENDED_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_BaseExceptionUser as crate::lltype::GcType>::type_id(),
+            W_BASE_EXCEPTION_USER_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_ExceptionExtendedUser as crate::lltype::GcType>::type_id(),
+            W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_BaseExceptionUser as crate::lltype::GcType>::SIZE,
+            W_BASE_EXCEPTION_USER_SIZE
+        );
+        assert_eq!(
+            <W_ExceptionExtendedUser as crate::lltype::GcType>::SIZE,
+            W_EXCEPTION_EXTENDED_USER_SIZE
+        );
+        assert_eq!(EXCEPTION_TYPE.weakref_offset, 0);
+        assert_eq!(EXCEPTION_TYPE.mapdict_offset, 0);
+        assert_eq!(BASE_EXCEPTION_USER_TYPE.weakref_offset, 0);
+        assert_eq!(EXCEPTION_EXTENDED_USER_TYPE.weakref_offset, 0);
+        assert_ne!(BASE_EXCEPTION_USER_TYPE.mapdict_offset, 0);
+        assert_ne!(EXCEPTION_EXTENDED_USER_TYPE.mapdict_offset, 0);
         assert!(
             W_BASE_EXCEPTION_SIZE <= 80,
             "slim W_BaseException must stay near PyPy SizeDescr 72, got {}",
@@ -2817,5 +3233,68 @@ mod tests {
             !unsafe { (*(empty as *const RList)).items }.is_null(),
             "ll_newlist mallocs a 0-length items array"
         );
+    }
+
+    /// Install `kind`'s realbase instantiate slot and class registry.
+    ///
+    /// The pyre-object test binary never runs `init_typeobjects`. A null
+    /// instantiate reads as the exact realbase, so `ValueError()` would stay
+    /// on `EXCEPTION_TYPE` until a distinct class is registered. Only this
+    /// test registers these kinds. If the slot already holds a class, keep
+    /// that class: overwriting a foreign instantiate would retarget every
+    /// later exact construction in this process.
+    fn install_realbase(kind: ExcKind, tp: &'static PyType) -> PyObjectRef {
+        let shell = crate::typeobject::w_type_alloc_builtin();
+        let installed = tp.instantiate.compare_exchange(
+            std::ptr::null_mut(),
+            shell,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        let instantiate = match installed {
+            Ok(_) => shell,
+            Err(existing) => existing,
+        };
+        let registered = register_exc_class_for_kind(kind, instantiate);
+        if installed.is_ok() && !std::ptr::eq(registered, shell) {
+            set_instantiate(tp, registered);
+        }
+        registered
+    }
+
+    #[test]
+    fn allocate_instance_stamps_user_layout_unless_class_is_realbase() {
+        seed_subclass_ranges();
+        let base_cls = install_realbase(ExcKind::BaseException, &EXCEPTION_TYPE);
+        let value_shell = crate::typeobject::w_type_alloc_builtin();
+        let value_cls = register_exc_class_for_kind(ExcKind::ValueError, value_shell);
+        assert!(
+            !std::ptr::eq(value_cls, base_cls),
+            "ValueError must not be the BaseException realbase"
+        );
+        let _os_cls = install_realbase(ExcKind::OSError, &EXC_OS_ERROR_TYPE);
+        let perm = crate::typeobject::w_type_alloc_builtin();
+
+        let base = w_exception_new_empty(ExcKind::BaseException);
+        let value = w_exception_new_empty(ExcKind::ValueError);
+        let os = w_exception_new_empty(ExcKind::OSError);
+        let perm_exc = w_exception_new_empty_for_class(ExcKind::OSError, perm);
+        unsafe {
+            assert!(std::ptr::eq((*base).ob_type, &EXCEPTION_TYPE));
+            assert!(std::ptr::eq((*value).ob_type, &BASE_EXCEPTION_USER_TYPE));
+            assert!(std::ptr::eq((*os).ob_type, &EXC_OS_ERROR_TYPE));
+            assert!(std::ptr::eq(
+                (*perm_exc).ob_type,
+                &EXCEPTION_EXTENDED_USER_TYPE
+            ));
+            assert!(is_exception(base));
+            assert!(is_exception(value));
+            assert!(is_exception(os));
+            assert!(is_exception(perm_exc));
+            assert_eq!(w_exception_get_kind(base), ExcKind::BaseException);
+            assert_eq!(w_exception_get_kind(value), ExcKind::ValueError);
+            assert_eq!(w_exception_get_kind(os), ExcKind::OSError);
+            assert_eq!(w_exception_get_kind(perm_exc), ExcKind::OSError);
+        }
     }
 }

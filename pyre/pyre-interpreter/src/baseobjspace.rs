@@ -15536,16 +15536,12 @@ fn pin_unmanaged_exception_children(exc: PyObjectRef) -> Option<(usize, &'static
     if pyre_object::gc_hook::try_gc_owns_object(exc as *mut u8) {
         return None;
     }
-    let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
-    let offsets: &'static [usize] =
-        if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
-            &pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS
-        } else {
-            &pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS
-        };
+    let offsets =
+        unsafe { pyre_object::interp_exceptions::exception_unmanaged_gc_ptr_offsets(exc) };
     let mut buf = [pyre_object::PY_NULL; 35];
-    const _: () =
-        assert!(pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS.len() <= 35);
+    const _: () = assert!(
+        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS.len() <= 35
+    );
     debug_assert!(offsets.len() <= buf.len());
     for (index, &offset) in offsets.iter().enumerate() {
         buf[index] = unsafe { *((exc as usize + offset) as *const PyObjectRef) };

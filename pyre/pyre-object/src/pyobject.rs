@@ -1025,22 +1025,28 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (211, Some(132)), // W_TextIOWrapperUser
     (212, Some(0)),   // W_FileIO
     (213, Some(212)), // W_FileIOUser
+    // Extra-field exception payload (`W_ExceptionExtended`). No PyType alias:
+    // exact realbases keep their class vtables, and `_getusercls` instances
+    // use the user layouts below.
+    (214, Some(31)),
+    (215, Some(31)),  // W_BaseExceptionUser
+    (216, Some(214)), // W_ExceptionExtendedUser
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail, after the `_getusercls` layouts (158-213).
-    (214, Some(0)),
-    // Native-only type IDs 215 and 216 represent `posix.DirEntry` and
+    // posix / console tail, after the `_getusercls` layouts (158-216).
+    (217, Some(0)),
+    // Native-only type IDs 218 and 219 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (215, Some(0)),
+    (218, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (216, Some(0)),
+    (219, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (217, Some(0)),
+    (220, Some(0)),
     #[cfg(windows)]
-    (218, Some(217)), // W_WinConsoleIOUser
+    (221, Some(220)), // W_WinConsoleIOUser
                       // The classes `pyre-module` registers follow, numbered by `build_gc` in
                       // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1655,6 +1661,11 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(31, &crate::interp_exceptions::EXC_BUFFER_ERROR_TYPE),
         subclass_range_alias(31, &crate::interp_exceptions::EXC_STOP_ASYNC_ITERATION_TYPE),
         subclass_range_alias(31, &crate::interp_exceptions::EXC_EOF_ERROR_TYPE),
+        // `_getusercls` instance layouts. `W_ExceptionExtended` (214) has no
+        // vtable alias; these two are the mapdict typeptrs `is_exception`
+        // must accept.
+        subclass_range_alias(215, &crate::interp_exceptions::BASE_EXCEPTION_USER_TYPE),
+        subclass_range_alias(216, &crate::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE),
         subclass_range_alias(32, &crate::generator::GENERATOR_TYPE),
         subclass_range_alias(33, &TYPE_TYPE),
         subclass_range_alias(34, &STR_TYPE),

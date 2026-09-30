@@ -1018,9 +1018,11 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
     if !hook.is_null() && !exc.is_none() {
         // `w_context` sits at one offset for every kind, so the recording
         // iteration's kind names the right bytes even if a later one differs;
-        // only the descr identity the optimizer aliases on is narrower.
+        // the descr must still name the layout `allocate_instance` stamped,
+        // because a realbase and its `_getusercls` do not share a SizeDescr.
         let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
-        let context_descr = crate::descr::w_exception_context_descr(kind);
+        let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc_ptr) };
+        let context_descr = crate::descr::w_exception_context_descr_for(kind, user);
         let mut effect = majit_metainterp::cannot_raise_effect_info();
         effect.can_collect = false;
         let w_context = ctx.call_ref_typed_with_effect(hook, &[exc], &[Type::Ref], effect);
@@ -1570,6 +1572,7 @@ fn emit_traceback_node<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
     kind: pyre_object::interp_exceptions::ExcKind,
+    user: bool,
     site: &TracebackNodeSite,
     w_next: OpRef,
     opcode_position: usize,
@@ -1649,7 +1652,7 @@ fn emit_traceback_node<Sym: WalkSym>(
     });
     walker_capture_inline_nonstandard_vable_guard(ctx, opcode_position, guards_before, write)?;
 
-    let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
+    let traceback_descr = crate::descr::w_exception_traceback_descr_for(kind, user);
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[exc, traceback],
@@ -1727,11 +1730,12 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
         return Ok(false);
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
+    let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc_ptr) };
     // `tb = operror.get_traceback()`.  MUST precede the node's own store, or
     // the heapcache answers with the node being built and `w_next` self-links.
-    let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
+    let traceback_descr = crate::descr::w_exception_traceback_descr_for(kind, user);
     let w_next = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, exc, traceback_descr);
-    emit_traceback_node(ctx, exc, kind, &site, w_next, opcode_position)?;
+    emit_traceback_node(ctx, exc, kind, user, &site, w_next, opcode_position)?;
     Ok(true)
 }
 
@@ -1766,8 +1770,9 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
         return Ok(false);
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
+    let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc_ptr) };
     let w_next = ctx.trace_ctx.const_ref(0);
-    emit_traceback_node(ctx, exc, kind, &site, w_next, opcode_position)?;
+    emit_traceback_node(ctx, exc, kind, user, &site, w_next, opcode_position)?;
     Ok(true)
 }
 
@@ -8941,9 +8946,9 @@ pub(crate) fn walker_record_guard_exception<Sym: WalkSym>(
     // `pyjitpl.py` / `pyjitpl.rs`: always emit
     // `GuardException` with a const class pin, but keep its live result box
     // unless the exception class was already proven constant.
-    // Pyre's `W_BaseException.ob_header.ob_type` is the per-`ExcKind`
-    // `PyType` static (`interp_exceptions.rs::exc_kind_to_pytype`), matching
-    // upstream `OBJECT.typeptr = specific class` (`rclass.py`).
+    // `ob_header.ob_type` is the layout vtable `allocate_instance` stamps.
+    // `_getusercls` shares one vtable across every `_new_exception` class of
+    // a realbase, so the guard pins the layout, not the Python class.
     let exc_type_ptr = unsafe {
         (*(exc_obj as *const pyre_object::interp_exceptions::W_BaseException))
             .ob_header
@@ -14215,9 +14220,9 @@ fn handle<Sym: WalkSym>(
             // semantics as the snapshot's tail).
             //
             // Mirrors the retired trait-side raise path.  The read at
-            // `ob_header.ob_type` resolves to the per-`ExcKind` `PyType`
-            // static (`interp_exceptions.rs::exc_kind_to_pytype`), so the
-            // emitted `GuardClass` discriminates the actual subclass.
+            // `ob_header.ob_type` is the layout vtable `allocate_instance`
+            // stamps. `_getusercls` shares one vtable across `_new_exception`
+            // classes, so `GuardClass` pins that layout.
             // Stashes the concrete into `ctx.last_exc_value_concrete()`
             // so a downstream
             // `last_exc_value/>r` can propagate it into its dst slot.

@@ -6042,9 +6042,8 @@ fn weakref_layout_offset(obj: PyObjectRef) -> usize {
 }
 
 /// `TypeDef.weakrefable` (`typedef.py`). Exact `object` shares `INSTANCE_TYPE`
-/// with user instances, and every exception kind shares one layout typeptr, so
-/// the offset alone is not the flag. Both the `_lifeline_` field and the
-/// `"weakref"` SPECIAL slot are gated on it.
+/// with user instances, so the offset alone is not the flag. Both the
+/// `_lifeline_` field and the `"weakref"` SPECIAL slot are gated on it.
 fn class_is_weakrefable(obj: PyObjectRef) -> bool {
     crate::typedef::r#type(obj)
         .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })

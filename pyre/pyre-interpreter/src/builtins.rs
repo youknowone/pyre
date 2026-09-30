@@ -7702,15 +7702,12 @@ fn value_error_one_arg(cls: PyObjectRef, arg: PyObjectRef) -> PyObjectRef {
             pyre_object::gc_roots::shadow_stack_get(cls_slot),
         )
     };
-    // `tag_subclass_instance` registers a finalizer and `w_exception_args_new`
-    // allocates the args list, so the fresh exception has to be rooted and
-    // re-read rather than carried in a raw local across either one.
+    // `w_exception_args_new` allocates the args list, so the fresh exception
+    // has to be rooted and re-read rather than carried in a raw local.
+    // `allocate_instance` already stamped `w_class` and, for a user layout,
+    // enqueued the finalizer.
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(exc);
-    crate::typedef::tag_subclass_instance(
-        pyre_object::gc_roots::shadow_stack_get(exc_slot),
-        pyre_object::gc_roots::shadow_stack_get(cls_slot),
-    );
     let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
         pyre_object::gc_roots::shadow_stack_get(arg_slot),
     ]);
@@ -7939,11 +7936,13 @@ fn exception_args_already(w_self: PyObjectRef, positional: &[PyObjectRef]) -> bo
 /// `filename` / `filename2` slots; when a filename is present it is
 /// dropped from `args_w` (`self.args_w = [w_errno, w_strerror]`, line
 /// 652) for pickle / repr compatibility.  `kind` is `OSError` for the base type and
-/// `FileNotFoundError` for that dedicated kind; every other OSError subclass
-/// routes here as `OSError` with its `w_class` retagged by `exc_new_wrapper!`.
+/// `FileNotFoundError` for that dedicated kind. `cls` selects the layout
+/// kind; `stamp` is the class `allocate_instance` compares with the realbase
+/// (`W_OSError.descr_new` may already have retargeted it through `ERRNO_MAP`).
 fn os_error_build(
     kind: pyre_object::interp_exceptions::ExcKind,
     cls: Option<PyObjectRef>,
+    stamp: Option<PyObjectRef>,
     args: &[PyObjectRef],
 ) -> PyObjectRef {
     use pyre_object::interp_exceptions;
@@ -7959,6 +7958,11 @@ fn os_error_build(
         let _ = pyre_object::gc_roots::pin_root(cls);
         slot
     });
+    let stamp_slot = stamp.map(|stamp| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(stamp);
+        slot
+    });
     let kind = match cls_slot {
         Some(slot) => interp_exceptions::exception_layout_kind_for_class(
             kind,
@@ -7966,10 +7970,14 @@ fn os_error_build(
         ),
         None => kind,
     };
+    let stamp_ptr = match stamp_slot.or(cls_slot) {
+        Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
+        None => pyre_object::PY_NULL,
+    };
     let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
     let exc = if args.len() == 1 && unsafe { pyre_object::is_str(arg(0)) } {
         let w = unsafe { pyre_object::w_str_get_wtf8(arg(0)) };
-        interp_exceptions::w_exception_new_wtf8(kind, w)
+        interp_exceptions::w_exception_new_wtf8_for_class(kind, w, stamp_ptr)
     } else {
         let msg: rustpython_wtf8::Wtf8Buf = if args.is_empty() {
             rustpython_wtf8::Wtf8Buf::new()
@@ -7991,7 +7999,7 @@ fn os_error_build(
             parts.push_str(")");
             parts
         };
-        interp_exceptions::w_exception_new_wtf8(kind, &msg)
+        interp_exceptions::w_exception_new_wtf8_for_class(kind, &msg, stamp_ptr)
     };
     // Seed `args_w` so a deferred-init instance (`_use_init`, no `__new__`
     // slot fill) still reports the empty tuple until `__init__` runs.
@@ -9198,22 +9206,26 @@ fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 fn exc_os_error(
     cls: Option<PyObjectRef>,
+    stamp: Option<PyObjectRef>,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     Ok(os_error_build(
         pyre_object::interp_exceptions::ExcKind::OSError,
         cls,
+        stamp,
         args,
     ))
 }
 
 fn exc_file_not_found_error(
     cls: Option<PyObjectRef>,
+    stamp: Option<PyObjectRef>,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     Ok(os_error_build(
         pyre_object::interp_exceptions::ExcKind::FileNotFoundError,
         cls,
+        stamp,
         args,
     ))
 }
@@ -9222,13 +9234,17 @@ fn exc_file_not_found_error(
 /// by `OSError` and every errno subclass.  For the exact `OSError` type it
 /// rejects keyword arguments (line 591-593) and remaps a recognised errno to
 /// the matching subclass (line 596-608), so `OSError(ENOENT, ...)`
-/// constructs a `FileNotFoundError`.  A subclass call keeps its own class,
-/// `w_class`-retagged like `exc_new_wrapper!`.  `ctor` builds the base object
+/// constructs a `FileNotFoundError`.  The remap runs before `allocate_instance`
+/// (`descr_new` retargets `w_subtype`, then `_new`).  `ctor` builds the object
 /// with the called type's `ExcKind` (`OSError` for the base type and every
-/// retagged subclass, `FileNotFoundError` for that dedicated kind).
+/// errno subclass, `FileNotFoundError` for that dedicated kind).
 fn os_error_family_new(
     args: &[PyObjectRef],
-    ctor: impl Fn(Option<PyObjectRef>, &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    ctor: impl Fn(
+        Option<PyObjectRef>,
+        Option<PyObjectRef>,
+        &[PyObjectRef],
+    ) -> Result<PyObjectRef, crate::PyError>,
 ) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied();
     let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
@@ -9262,24 +9278,13 @@ fn os_error_family_new(
         slot
     });
     let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
-    let mut live_positional = Vec::new();
-    if !use_init {
-        for index in 0..positional.len() {
-            live_positional.push(pyre_object::gc_roots::shadow_stack_get(
-                positional_base + index,
-            ));
-        }
-    }
-    let exc = ctor(cls, &live_positional)?;
-    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(exc);
-    let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    // Full positional list, including when `_use_init` leaves `__new__`'s
+    // own args empty: `ERRNO_MAP` still sees the original arguments.
     let positional: Vec<PyObjectRef> = (0..positional.len())
         .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
         .collect();
-    let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
-    // Only the exact OSError type remaps the errno to a subclass; resolve the
-    // retag target (subclass on a recognised errno, else the called class).
+    // Only the exact OSError type remaps the errno to a subclass. Resolve it
+    // before allocation so the user layout is chosen from that class.
     let w_target = if is_exact_os_error {
         os_error_errno_subclass_for(&positional)
             .and_then(lookup_exc_class)
@@ -9287,11 +9292,20 @@ fn os_error_family_new(
     } else {
         cls
     };
-    if let Some(w_target) = w_target {
-        crate::typedef::tag_subclass_instance(exc(), w_target);
+    let mut live_positional = Vec::new();
+    if !use_init {
+        live_positional.clone_from(&positional);
     }
-    // Fill the slots after the retag so `os_error_fill_slots` can see the
-    // resolved class (the `BlockingIOError` numeric-filename special-case).
+    let exc = ctor(cls, w_target, &live_positional)?;
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    // The constructor collected. Re-read the arguments before filling slots.
+    let positional: Vec<PyObjectRef> = (0..positional.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
+        .collect();
+    // `os_error_fill_slots` reads the resolved class (`BlockingIOError`'s
+    // numeric-filename special-case) off `w_class`, which allocation stamped.
     if !use_init {
         os_error_fill_slots(exc(), &positional)?;
     }
@@ -9678,18 +9692,10 @@ macro_rules! exc_new_wrapper {
                 slot
             });
             let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
+            // `allocate_instance` stamps `w_class` from `cls` and enqueues a
+            // user finalizer when the layout is `_getusercls`.
             let exc = $ctor(cls, positional)?;
-            let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(exc);
-            // Set the exception's w_class to the actual exception type (e.g. AssertionError)
-            // so that `type(e) is AssertionError` holds and `except ExcType` via isinstance works.
-            if let Some(slot) = cls_slot {
-                crate::typedef::tag_subclass_instance(
-                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
-                    pyre_object::gc_roots::shadow_stack_get(slot),
-                );
-            }
-            Ok(pyre_object::gc_roots::shadow_stack_get(exc_slot))
+            Ok(exc)
         }
     };
 }
@@ -11116,15 +11122,21 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // whichever class the instance is about to be tagged with.
     let _ = pyre_object::gc_roots::pin_root(cls_now());
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // Exact `BaseExceptionGroup` is the plain extended layout. `ExceptionGroup`
+    // (including the promotion above) and app subclasses are `_getusercls`.
+    let user_layout = !std::ptr::eq(
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        base_group,
+    );
     // Each allocation below is a safepoint, so the nascent group and the tuple
     // it stores both go on the shadow stack before the next one runs.
-    let exc = pyre_object::interp_exceptions::w_exception_new_empty_extended(kind);
+    let exc = pyre_object::interp_exceptions::w_exception_new_empty_extended_for_class(
+        kind,
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        user_layout,
+    );
     let _ = pyre_object::gc_roots::pin_root(exc);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    crate::typedef::tag_subclass_instance(
-        pyre_object::gc_roots::shadow_stack_get(exc_slot),
-        pyre_object::gc_roots::shadow_stack_get(cls_slot),
-    );
     unsafe {
         // `isinstance` / `issubclass` above can collect.  Rebuild the
         // tuple from the pinned slots, not the pre-check Vec.
@@ -23266,37 +23278,36 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // implementation dispatches the possibly overridden `flush` while the
     // stream is still open and marks its own closed state in `finally`.
     let base_close_error = crate::module::_io::iobase_close(&[current()]).err();
+    // `W_FileIO._close` copies `fd` before storing `-1`. `file_set_closed`
+    // is that store, so the descriptor has to be read first.
+    let owned_fd = file_get_fd(current()).filter(|_| file_closefd(current()));
     file_set_closed(current(), true)?;
 
-    let close_result: Result<(), crate::PyError> = if let Some(fd) = file_get_fd(current()) {
-        if file_closefd(current()) {
-            #[cfg(all(
-                feature = "host_env",
-                not(target_arch = "wasm32"),
-                not(feature = "sandbox")
-            ))]
-            {
-                // SAFETY: close(2) on the file object's own fd.
-                if crt_call!(libc::close(fd)) < 0 {
-                    Err(crate::PyError::os_error_with_errno(crt_errno(), "close"))
-                } else {
-                    Ok(())
-                }
-            }
-            #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
-            {
-                crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))
-            }
-            #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
-            {
-                wasm_fd::fd_close(fd)
-            }
-            #[cfg(not(feature = "host_env"))]
-            {
-                let _ = fd;
+    let close_result: Result<(), crate::PyError> = if let Some(fd) = owned_fd {
+        #[cfg(all(
+            feature = "host_env",
+            not(target_arch = "wasm32"),
+            not(feature = "sandbox")
+        ))]
+        {
+            // SAFETY: close(2) on the file object's own fd.
+            if crt_call!(libc::close(fd)) < 0 {
+                Err(crate::PyError::os_error_with_errno(crt_errno(), "close"))
+            } else {
                 Ok(())
             }
-        } else {
+        }
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
+        {
+            crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))
+        }
+        #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+        {
+            wasm_fd::fd_close(fd)
+        }
+        #[cfg(not(feature = "host_env"))]
+        {
+            let _ = fd;
             Ok(())
         }
     } else {

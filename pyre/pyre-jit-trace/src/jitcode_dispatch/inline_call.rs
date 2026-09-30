@@ -6261,6 +6261,7 @@ fn record_inline_attribute_error_context<Sym: WalkSym>(
     if kind != pyre_object::interp_exceptions::ExcKind::AttributeError {
         return Ok(());
     }
+    let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc_ptr) };
     let current_name = unsafe { pyre_object::interp_exceptions::w_exception_get_name(exc_ptr) };
     let current_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(exc_ptr) };
     let fills = current_name.is_null() && current_obj.is_null();
@@ -6279,7 +6280,7 @@ fn record_inline_attribute_error_context<Sym: WalkSym>(
         let read_name = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             exc,
-            crate::descr::w_exception_attr_slot_descr(kind, Slot::Name),
+            crate::descr::w_exception_attr_slot_descr_for(kind, Slot::Name, user),
         );
         ctx.trace_ctx.set_opref_concrete(
             read_name,
@@ -6288,7 +6289,7 @@ fn record_inline_attribute_error_context<Sym: WalkSym>(
         let read_obj = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             exc,
-            crate::descr::w_exception_attr_slot_descr(kind, Slot::AttrObj),
+            crate::descr::w_exception_attr_slot_descr_for(kind, Slot::AttrObj, user),
         );
         ctx.trace_ctx.set_opref_concrete(
             read_obj,
@@ -6307,7 +6308,7 @@ fn record_inline_attribute_error_context<Sym: WalkSym>(
         }
         if fills {
             for (slot, value) in [(Slot::Name, attr.name), (Slot::AttrObj, attr.obj)] {
-                let descr = crate::descr::w_exception_attr_slot_descr(kind, slot);
+                let descr = crate::descr::w_exception_attr_slot_descr_for(kind, slot, user);
                 let descr_index = descr.index();
                 ctx.trace_ctx
                     .record_op_with_descr(OpCode::SetfieldGc, &[exc, value], descr);

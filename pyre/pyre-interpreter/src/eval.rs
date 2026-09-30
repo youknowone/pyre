@@ -576,10 +576,9 @@ pub unsafe fn walk_enrolled_code_roots(
 /// objects, so when an exception is the only holder of those children (a caught
 /// `except X as e` bound to a frame local) a collection sweeps them and a
 /// later `e.args` / `e.errno` reads freed memory. Visit every GC pointer
-/// slot of the instance layout in place — slim
-/// `W_BASE_EXCEPTION_GC_PTR_OFFSETS`, or
-/// `W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS` for extra-field kinds —
-/// the same shape `walk_raw_function_roots` / `walk_raw_getset_roots`
+/// slot of the instance layout in place — selected by `ob_type` so a
+/// `_getusercls` instance also reaches mapdict `storage` — the same shape
+/// `walk_raw_function_roots` / `walk_raw_getset_roots`
 /// use for Box/`malloc_typed`-held children. No-op for non-exception values.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -595,13 +594,7 @@ pub unsafe fn walk_raw_exception_roots(
         // Positive predicate (see `walk_raw_getset_roots`): `!is_exception`
         // over a cross-crate bool is `UnaryNotUnknownOperand` to the annotator.
         if pyre_object::interp_exceptions::is_exception(value) {
-            let kind = pyre_object::interp_exceptions::w_exception_get_kind(value);
-            let offsets: &[usize] =
-                if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
-                    &pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS
-                } else {
-                    &pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS
-                };
+            let offsets = pyre_object::interp_exceptions::exception_unmanaged_gc_ptr_offsets(value);
             for &offset in offsets {
                 let slot = (value as usize + offset) as *mut PyObjectRef;
                 visitor(&mut *(slot as *mut majit_ir::GcRef));

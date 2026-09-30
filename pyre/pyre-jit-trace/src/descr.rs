@@ -3471,20 +3471,23 @@ use pyre_object::functional::{
     RANGE_PROMOTE_STEP_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, RANGE_STOP_OFFSET, W_Range,
 };
 use pyre_object::interp_exceptions::{
-    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_SUPPRESS_CONTEXT_OFFSET,
-    EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET, EXC_W_CODE_OFFSET, EXC_W_CONTEXT_OFFSET,
-    EXC_W_DICT_OFFSET, EXC_W_ENCODING_OFFSET, EXC_W_END_OFFSET, EXC_W_ERRNO_OFFSET,
-    EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET, EXC_W_GROUP_EXCEPTIONS_OFFSET,
-    EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET, EXC_W_GROUP_MESSAGE_OFFSET, EXC_W_IMPORT_MSG_OFFSET,
-    EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET, EXC_W_NAME_OFFSET,
-    EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET, EXC_W_STRERROR_OFFSET,
-    EXC_W_SYNTAX_END_LINENO_OFFSET, EXC_W_SYNTAX_END_OFFSET_OFFSET, EXC_W_SYNTAX_FILENAME_OFFSET,
-    EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET, EXC_W_SYNTAX_MSG_OFFSET,
-    EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET, EXC_W_SYNTAX_TEXT_OFFSET,
-    EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET, EXC_W_WINERROR_OFFSET,
+    EXC_ARGS_W_OFFSET, EXC_EXTENDED_USER_MAP_OFFSET, EXC_EXTENDED_USER_STORAGE_OFFSET,
+    EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_SUPPRESS_CONTEXT_OFFSET, EXC_USER_MAP_OFFSET,
+    EXC_USER_STORAGE_OFFSET, EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET, EXC_W_CODE_OFFSET,
+    EXC_W_CONTEXT_OFFSET, EXC_W_DICT_OFFSET, EXC_W_ENCODING_OFFSET, EXC_W_END_OFFSET,
+    EXC_W_ERRNO_OFFSET, EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET,
+    EXC_W_GROUP_EXCEPTIONS_OFFSET, EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET, EXC_W_GROUP_MESSAGE_OFFSET,
+    EXC_W_IMPORT_MSG_OFFSET, EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET,
+    EXC_W_NAME_OFFSET, EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET,
+    EXC_W_STRERROR_OFFSET, EXC_W_SYNTAX_END_LINENO_OFFSET, EXC_W_SYNTAX_END_OFFSET_OFFSET,
+    EXC_W_SYNTAX_FILENAME_OFFSET, EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET,
+    EXC_W_SYNTAX_MSG_OFFSET, EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
+    EXC_W_SYNTAX_TEXT_OFFSET, EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WINERROR_OFFSET,
     EXC_WRITTEN_OFFSET, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE,
-    W_EXCEPTION_EXTENDED_SIZE, exc_kind_to_pytype, exc_kind_uses_extended_layout,
-    exception_extended_gc_type_id,
+    W_BASE_EXCEPTION_USER_GC_TYPE_ID, W_BASE_EXCEPTION_USER_SIZE, W_EXCEPTION_EXTENDED_GC_TYPE_ID,
+    W_EXCEPTION_EXTENDED_SIZE, W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID,
+    W_EXCEPTION_EXTENDED_USER_SIZE, exc_kind_canonical_is_user_layout,
+    exc_kind_uses_extended_layout, exc_realbase_pytype,
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::W_CLASS_OFFSET;
@@ -5596,6 +5599,20 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         descr
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 0) } {
         descr
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE,
+        )
+    } {
+        exception_user_mapdict_descr(false, EXC_USER_MAP_OFFSET)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE,
+        )
+    } {
+        exception_user_mapdict_descr(true, EXC_EXTENDED_USER_MAP_OFFSET)
     } else {
         object_map_descr()
     }
@@ -5772,6 +5789,20 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         descr
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 1) } {
         descr
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE,
+        )
+    } {
+        exception_user_mapdict_descr(false, EXC_USER_STORAGE_OFFSET)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE,
+        )
+    } {
+        exception_user_mapdict_descr(true, EXC_EXTENDED_USER_STORAGE_OFFSET)
     } else {
         object_storage_descr()
     }
@@ -6345,11 +6376,10 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
     SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
 }
 
-/// SizeDescr + field descrs for exception allocation via NewWithVtable,
-/// one set per `ExcKind`.  The vtable (`ob_type`) differs per kind
-/// (`exc_kind_to_pytype`), so each kind owns its group.  `_new_exception`
-/// classes use the slim [`W_BaseException`] SizeDescr; extra-field
-/// subclasses use [`W_ExceptionExtended`].  Constructor-written fields
+/// SizeDescr + field descrs for exception allocation via NewWithVtable.
+/// `user` selects the realbase struct or its `_getusercls` layout. Exact
+/// realbases keep `exc_realbase_pytype` (the slim base is `EXCEPTION_TYPE`);
+/// every other class shares the user PyType. Constructor-written fields
 /// share offsets across both layouts. `w_context` is written separately
 /// by the raise lowering; remaining pointer slots stay zeroed by GC
 /// pointer clearing (PY_NULL), matching `w_exception_new_empty`.
@@ -6358,7 +6388,7 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
 /// dropped, matching `heaptracker.py all_fielddescrs` /
 /// `get_fielddescr_index_in`.  The class word is appended last so every
 /// real field keeps the index that walk numbers.
-fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
+fn build_w_exception_group(kind: ExcKind, user: bool) -> PyreObjectDescrGroup {
     const SLIM_FIELDS: &[(&str, usize, usize, Type, bool, bool, bool)] = &[
         ("kind", EXC_KIND_OFFSET, 1, Type::Int, false, false, false),
         (
@@ -6416,15 +6446,6 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             false,
         ),
         (
-            "w_weakreflifeline",
-            EXC_W_WEAKREF_OFFSET,
-            WORD,
-            Type::Ref,
-            false,
-            false,
-            false,
-        ),
-        (
             "w_class",
             W_CLASS_OFFSET,
             WORD,
@@ -6435,35 +6456,12 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
         ),
     ];
     if !exc_kind_uses_extended_layout(kind) {
-        return build_object_descr_group_with_extra_gc_edges(
-            W_BASE_EXCEPTION_SIZE,
-            pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID,
-            exc_kind_to_pytype(kind) as *const _ as usize,
-            SLIM_FIELDS,
-            "W_BaseException",
-            "interp_exceptions::W_BaseException",
-            &[],
-            &[],
-            "W_BaseException",
-            false,
-        );
+        return finish_exception_descr_group(kind, user, SLIM_FIELDS.to_vec());
     }
-    let extended_tid = exception_extended_gc_type_id();
-    #[cfg(not(test))]
-    assert_ne!(
-        extended_tid, 0,
-        "W_ExceptionExtended GC type id is not initialised"
-    );
-    let extended_tid = if extended_tid == 0 {
-        pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID
-    } else {
-        extended_tid
-    };
-    build_object_descr_group_with_extra_gc_edges(
-        W_EXCEPTION_EXTENDED_SIZE,
-        extended_tid,
-        exc_kind_to_pytype(kind) as *const _ as usize,
-        &[
+    finish_exception_descr_group(
+        kind,
+        user,
+        vec![
             // Positional order is `W_BaseException` declaration order with the
             // two `ob_header` words dropped, matching `heaptracker.py
             // all_fielddescrs` / `get_fielddescr_index_in`.  The class word is
@@ -6802,15 +6800,6 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "w_weakreflifeline",
-                EXC_W_WEAKREF_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
                 "w_class",
                 W_CLASS_OFFSET,
                 WORD,
@@ -6820,14 +6809,105 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
         ],
-        "W_ExceptionExtended",
-        "interp_exceptions::W_ExceptionExtended",
+    )
+}
+
+/// Size, tid, vtable and STRUCT key for one exception layout.
+///
+/// `cache_key_name` is the full struct path so [`DECLARED_GROUPS`] hashes
+/// the same identity `NewWithVtable` allocates. User layouts append `map`
+/// and `storage` immediately before the trailing class word.
+fn finish_exception_descr_group(
+    kind: ExcKind,
+    user: bool,
+    mut fields: Vec<(&'static str, usize, usize, Type, bool, bool, bool)>,
+) -> PyreObjectDescrGroup {
+    let extended = exc_kind_uses_extended_layout(kind);
+    if user {
+        let class = fields
+            .pop()
+            .expect("exception descr group ends with w_class");
+        if extended {
+            fields.push((
+                "map",
+                EXC_EXTENDED_USER_MAP_OFFSET,
+                WORD,
+                Type::Int,
+                false,
+                false,
+                false,
+            ));
+            fields.push((
+                "storage",
+                EXC_EXTENDED_USER_STORAGE_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ));
+        } else {
+            fields.push((
+                "map",
+                EXC_USER_MAP_OFFSET,
+                WORD,
+                Type::Int,
+                false,
+                false,
+                false,
+            ));
+            fields.push((
+                "storage",
+                EXC_USER_STORAGE_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ));
+        }
+        fields.push(class);
+    }
+    let (size, tid, vtable, simple_name, def_path) = match (extended, user) {
+        (false, false) => (
+            W_BASE_EXCEPTION_SIZE,
+            W_BASE_EXCEPTION_GC_TYPE_ID,
+            &pyre_object::interp_exceptions::EXCEPTION_TYPE as *const _ as usize,
+            "W_BaseException",
+            "interp_exceptions::W_BaseException",
+        ),
+        (false, true) => (
+            W_BASE_EXCEPTION_USER_SIZE,
+            W_BASE_EXCEPTION_USER_GC_TYPE_ID,
+            &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE as *const _ as usize,
+            "W_BaseExceptionUser",
+            "interp_exceptions::W_BaseExceptionUser",
+        ),
+        (true, false) => (
+            W_EXCEPTION_EXTENDED_SIZE,
+            W_EXCEPTION_EXTENDED_GC_TYPE_ID,
+            exc_realbase_pytype(kind) as *const _ as usize,
+            "W_ExceptionExtended",
+            "interp_exceptions::W_ExceptionExtended",
+        ),
+        (true, true) => (
+            W_EXCEPTION_EXTENDED_USER_SIZE,
+            W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID,
+            &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE as *const _ as usize,
+            "W_ExceptionExtendedUser",
+            "interp_exceptions::W_ExceptionExtendedUser",
+        ),
+    };
+    build_object_descr_group_with_extra_gc_edges(
+        size,
+        tid,
+        vtable,
+        &fields,
+        simple_name,
+        def_path,
         &[],
         &[],
-        // Extra-field kinds share one STRUCT identity distinct from the
-        // slim `W_BaseException` key above, so `_cache_size` cannot
-        // first-write-wins the 72-byte SizeDescr onto an OSError.
-        "W_ExceptionExtended",
+        def_path,
         false,
     )
 }
@@ -6835,13 +6915,43 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
 static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
     LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
 
-fn with_w_exception_group<R>(kind: ExcKind, f: impl FnOnce(&PyreObjectDescrGroup) -> R) -> R {
+/// `_getusercls` groups, indexed by the same `ExcKind` as the base cache.
+/// Two `Vec`s, not a side table: base versus user is one bit.
+static W_EXCEPTION_USER_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
+    LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
+
+fn with_w_exception_group_for<R>(
+    kind: ExcKind,
+    user: bool,
+    f: impl FnOnce(&PyreObjectDescrGroup) -> R,
+) -> R {
     let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
+    let cache = if user {
+        &W_EXCEPTION_USER_DESCR_CACHE
+    } else {
+        &W_BASE_EXCEPTION_DESCR_CACHE
+    };
+    let mut cache = cache.lock();
     if cache[idx].is_none() {
-        cache[idx] = Some(build_w_exception_group(kind));
+        cache[idx] = Some(build_w_exception_group(kind, user));
     }
     f(cache[idx].as_ref().unwrap())
+}
+
+fn with_w_exception_group<R>(kind: ExcKind, f: impl FnOnce(&PyreObjectDescrGroup) -> R) -> R {
+    with_w_exception_group_for(kind, exc_kind_canonical_is_user_layout(kind), f)
+}
+
+/// Map or storage field of a `_getusercls` exception, looked up by offset on
+/// the user SizeDescr (`ValueError` for the slim layout, `FileNotFoundError`
+/// for the extended one). Both share one struct identity per layout.
+fn exception_user_mapdict_descr(extended: bool, offset: usize) -> DescrRef {
+    let kind = if extended {
+        ExcKind::FileNotFoundError
+    } else {
+        ExcKind::ValueError
+    };
+    with_w_exception_group_for(kind, true, |group| w_exception_field_at(group, offset))
 }
 
 fn w_exception_field_at(group: &PyreObjectDescrGroup, offset: usize) -> DescrRef {
@@ -6855,14 +6965,21 @@ fn w_exception_field_at(group: &PyreObjectDescrGroup, offset: usize) -> DescrRef
 
 /// Locate a field of the per-kind exception group by offset.  See
 /// [`w_exception_dict_descr`] for why offset lookup is the right idiom.
+fn w_exception_field_descr_by_offset_for(kind: ExcKind, user: bool, offset: usize) -> DescrRef {
+    with_w_exception_group_for(kind, user, |group| w_exception_field_at(group, offset))
+}
+
 fn w_exception_field_descr_by_offset(kind: ExcKind, offset: usize) -> DescrRef {
-    with_w_exception_group(kind, |group| w_exception_field_at(group, offset))
+    w_exception_field_descr_by_offset_for(kind, exc_kind_canonical_is_user_layout(kind), offset)
 }
 
 /// Field descrs for the exception construction emit: `(size, kind,
 /// w_class, args_w)`.  Built and cached per `ExcKind` on first use.
-pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
-    with_w_exception_group(kind, |group| {
+pub fn w_exception_descrs_for(
+    kind: ExcKind,
+    user: bool,
+) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
+    with_w_exception_group_for(kind, user, |group| {
         (
             group.size_descr.clone() as DescrRef,
             w_exception_field_at(group, EXC_KIND_OFFSET),
@@ -6872,12 +6989,20 @@ pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, Descr
     })
 }
 
+pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
+    w_exception_descrs_for(kind, exc_kind_canonical_is_user_layout(kind))
+}
+
 /// Field descr for `W_BaseException.w_context` (the `__context__`
 /// slot).  Used by the RAISE_VARARGS `__context__` chaining lowering;
 /// shares the same parent `SizeDescr` as the `NewWithVtable` emit so the
 /// optimizer recognises the store as a field of the virtual exception.
+pub fn w_exception_context_descr_for(kind: ExcKind, user: bool) -> DescrRef {
+    w_exception_field_descr_by_offset_for(kind, user, EXC_W_CONTEXT_OFFSET)
+}
+
 pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
-    w_exception_field_descr_by_offset(kind, EXC_W_CONTEXT_OFFSET)
+    w_exception_context_descr_for(kind, exc_kind_canonical_is_user_layout(kind))
 }
 
 /// Field descr for `W_BaseException.w_dict` (the lazily allocated instance
@@ -6892,19 +7017,31 @@ pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
 /// ordinary subclass, which turns the shadowing guard below into a no-op
 /// and lets compiled code keep calling a method an instance attribute has
 /// already shadowed.
+pub fn w_exception_dict_descr_for(kind: ExcKind, user: bool) -> DescrRef {
+    w_exception_field_descr_by_offset_for(kind, user, EXC_W_DICT_OFFSET)
+}
+
 pub fn w_exception_dict_descr(kind: ExcKind) -> DescrRef {
-    w_exception_field_descr_by_offset(kind, EXC_W_DICT_OFFSET)
+    w_exception_dict_descr_for(kind, exc_kind_canonical_is_user_layout(kind))
 }
 
 /// Field descr for the plain `W_BaseException.suppress_context` byte.
+pub fn w_exception_suppress_context_descr_for(kind: ExcKind, user: bool) -> DescrRef {
+    w_exception_field_descr_by_offset_for(kind, user, EXC_SUPPRESS_CONTEXT_OFFSET)
+}
+
 pub fn w_exception_suppress_context_descr(kind: ExcKind) -> DescrRef {
-    w_exception_field_descr_by_offset(kind, EXC_SUPPRESS_CONTEXT_OFFSET)
+    w_exception_suppress_context_descr_for(kind, exc_kind_canonical_is_user_layout(kind))
 }
 
 /// Field descriptor for `W_BaseException.w_traceback`, sharing the
 /// per-kind exception allocation descriptor with the other exception slots.
+pub fn w_exception_traceback_descr_for(kind: ExcKind, user: bool) -> DescrRef {
+    w_exception_field_descr_by_offset_for(kind, user, EXC_W_TRACEBACK_OFFSET)
+}
+
 pub fn w_exception_traceback_descr(kind: ExcKind) -> DescrRef {
-    w_exception_field_descr_by_offset(kind, EXC_W_TRACEBACK_OFFSET)
+    w_exception_traceback_descr_for(kind, exc_kind_canonical_is_user_layout(kind))
 }
 
 static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -7065,17 +7202,48 @@ pub fn w_exception_attr_slot_descr(
     w_exception_field_descr_by_offset(kind, offset)
 }
 
+pub fn w_exception_attr_slot_descr_for(
+    kind: ExcKind,
+    slot: pyre_interpreter::baseobjspace::ExceptionAttrSlot,
+    user: bool,
+) -> DescrRef {
+    use pyre_interpreter::baseobjspace::ExceptionAttrSlot as Slot;
+    let offset = match slot {
+        Slot::Args => EXC_ARGS_W_OFFSET,
+        Slot::Context => EXC_W_CONTEXT_OFFSET,
+        Slot::Cause => EXC_W_CAUSE_OFFSET,
+        Slot::Errno => EXC_W_ERRNO_OFFSET,
+        Slot::Strerror => EXC_W_STRERROR_OFFSET,
+        Slot::Filename => EXC_W_FILENAME_OFFSET,
+        Slot::Filename2 => EXC_W_FILENAME2_OFFSET,
+        Slot::Code => EXC_W_CODE_OFFSET,
+        Slot::Traceback => EXC_W_TRACEBACK_OFFSET,
+        Slot::UnicodeObject => EXC_W_OBJECT_OFFSET,
+        Slot::UnicodeStart => EXC_W_START_OFFSET,
+        Slot::UnicodeEnd => EXC_W_END_OFFSET,
+        Slot::UnicodeReason => EXC_W_REASON_OFFSET,
+        Slot::UnicodeEncoding => EXC_W_ENCODING_OFFSET,
+        Slot::Name => EXC_W_NAME_OFFSET,
+        Slot::AttrObj => EXC_W_ATTR_OBJ_OFFSET,
+    };
+    w_exception_field_descr_by_offset_for(kind, user, offset)
+}
+
 /// Cached field descriptor for a flattened `W_BaseException` slot selected
 /// by byte offset.  Returns `None` when the per-kind group does not carry the
 /// requested offset.
-pub fn w_exception_slot_descr(kind: ExcKind, offset: usize) -> Option<DescrRef> {
-    with_w_exception_group(kind, |group| {
+pub fn w_exception_slot_descr_for(kind: ExcKind, offset: usize, user: bool) -> Option<DescrRef> {
+    with_w_exception_group_for(kind, user, |group| {
         group
             .field_descrs
             .iter()
             .position(|d| d.offset() == offset)
             .map(|field| field_descr_from_group(group, field))
     })
+}
+
+pub fn w_exception_slot_descr(kind: ExcKind, offset: usize) -> Option<DescrRef> {
+    w_exception_slot_descr_for(kind, offset, exc_kind_canonical_is_user_layout(kind))
 }
 
 /// Field descr for `ExecutionContext::sys_exc_value`, used by the JIT
@@ -7553,7 +7721,7 @@ mod tests {
     /// GC offsets across its neighbours.
     #[test]
     fn name_registry_less_groups_still_carry_a_cache_size_identity() {
-        let (exception, ..) = w_exception_descrs(ExcKind::ValueError);
+        let (exception, ..) = w_exception_descrs(ExcKind::BaseException);
         let exception = exception.as_size_descr().expect("exception SizeDescr");
         assert_ne!(exception.cache_key(), 0);
         assert_eq!(
@@ -7561,6 +7729,17 @@ mod tests {
                 .lock()
                 .resolve_struct_tid(exception.cache_key()),
             Some(W_BASE_EXCEPTION_GC_TYPE_ID)
+        );
+        let (value_error, ..) = w_exception_descrs(ExcKind::ValueError);
+        let value_error = value_error
+            .as_size_descr()
+            .expect("ValueError user SizeDescr");
+        assert_ne!(value_error.cache_key(), exception.cache_key());
+        assert_eq!(
+            majit_ir::descr::gc_cache()
+                .lock()
+                .resolve_struct_tid(value_error.cache_key()),
+            Some(W_BASE_EXCEPTION_USER_GC_TYPE_ID)
         );
 
         let traceback = pytraceback_size_descr();
@@ -8228,7 +8407,7 @@ mod tests {
 
     #[test]
     fn exception_size_descr_clears_every_runtime_traced_gc_field() {
-        let (descr, _, _, _) = w_exception_descrs(ExcKind::ValueError);
+        let (descr, _, _, _) = w_exception_descrs(ExcKind::BaseException);
         let size = descr.as_size_descr().expect("W_BaseException SizeDescr");
         assert_eq!(size.size(), W_BASE_EXCEPTION_SIZE);
         let mut actual: Vec<usize> = size.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
@@ -8240,6 +8419,20 @@ mod tests {
         expected.sort_unstable();
         expected.dedup();
         assert_eq!(actual, expected);
+
+        let (user, _, _, _) = w_exception_descrs(ExcKind::ValueError);
+        let user = user.as_size_descr().expect("W_BaseExceptionUser SizeDescr");
+        assert_eq!(user.size(), W_BASE_EXCEPTION_USER_SIZE);
+        let mut user_actual: Vec<usize> =
+            user.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
+        user_actual.sort_unstable();
+        user_actual.dedup();
+        let mut user_expected = W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec();
+        user_expected.push(EXC_USER_STORAGE_OFFSET);
+        user_expected.push(W_CLASS_OFFSET);
+        user_expected.sort_unstable();
+        user_expected.dedup();
+        assert_eq!(user_actual, user_expected);
     }
 
     /// `heaptracker.py all_fielddescrs` and `get_fielddescr_index_in` walk
@@ -8249,14 +8442,14 @@ mod tests {
     /// trailing so it does not occupy a walk-numbered slot.
     #[test]
     fn w_base_exception_field_indices_match_all_fielddescrs_order() {
-        let (descr, _, _, _) = w_exception_descrs(ExcKind::ValueError);
+        let (descr, _, _, _) = w_exception_descrs(ExcKind::BaseException);
         let fields = descr
             .as_size_descr()
             .expect("W_BaseException SizeDescr")
             .all_fielddescrs();
-        // Eight declaration-order fields after `ob_header`, plus the
-        // trailing class word. `ValueError` stays on this slim group.
-        assert_eq!(fields.len(), 9);
+        // Seven declaration-order fields after `ob_header`, plus the
+        // trailing class word. Exact `BaseException` stays on this group.
+        assert_eq!(fields.len(), 8);
         for (i, field) in fields.iter().enumerate() {
             assert_eq!(
                 field.index_in_parent(),
@@ -8283,6 +8476,23 @@ mod tests {
         let class_word = fields.last().expect("group is non-empty");
         assert_eq!(class_word.offset(), W_CLASS_OFFSET);
         assert!(class_word.is_w_class());
+
+        let (user, _, _, _) = w_exception_descrs(ExcKind::ValueError);
+        let user_size = user.as_size_descr().expect("W_BaseExceptionUser SizeDescr");
+        assert_eq!(user_size.size(), W_BASE_EXCEPTION_USER_SIZE);
+        assert_eq!(user_size.type_id(), W_BASE_EXCEPTION_USER_GC_TYPE_ID);
+        let user_fields = user_size.all_fielddescrs();
+        // The slim fields, then `map` and `storage`, then the class word.
+        assert_eq!(user_fields.len(), 10);
+        assert_eq!(user_fields[7].offset(), EXC_USER_MAP_OFFSET);
+        // Display name is `STRUCT._name + '.' + fieldname` (`get_field_descr`).
+        assert_eq!(user_fields[7].field_name(), "W_BaseExceptionUser.map");
+        assert_eq!(user_fields[8].offset(), EXC_USER_STORAGE_OFFSET);
+        assert_eq!(user_fields[8].field_name(), "W_BaseExceptionUser.storage");
+        assert_ne!(user_fields[7].index(), user_fields[8].index());
+        let user_class = user_fields.last().expect("user group is non-empty");
+        assert_eq!(user_class.offset(), W_CLASS_OFFSET);
+        assert!(user_class.is_w_class());
     }
 
     #[test]
@@ -8292,7 +8502,14 @@ mod tests {
             .as_size_descr()
             .expect("W_ExceptionExtended SizeDescr");
         assert_eq!(size.size(), W_EXCEPTION_EXTENDED_SIZE);
+        assert_eq!(size.type_id(), W_EXCEPTION_EXTENDED_GC_TYPE_ID);
         assert!(size.size() > W_BASE_EXCEPTION_SIZE);
+        let (user, _, _, _) = w_exception_descrs_for(ExcKind::FileNotFoundError, true);
+        let user = user
+            .as_size_descr()
+            .expect("W_ExceptionExtendedUser SizeDescr");
+        assert_eq!(user.size(), W_EXCEPTION_EXTENDED_USER_SIZE);
+        assert_eq!(user.type_id(), W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID);
     }
 
     #[test]
@@ -9905,6 +10122,18 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("objectobject::W_ObjectObject", || {
         LazyLock::force(&W_OBJECT_OBJECT_DESCR_GROUP);
+    }),
+    ("interp_exceptions::W_BaseException", || {
+        let _ = w_exception_descrs_for(ExcKind::BaseException, false);
+    }),
+    ("interp_exceptions::W_BaseExceptionUser", || {
+        let _ = w_exception_descrs_for(ExcKind::ValueError, true);
+    }),
+    ("interp_exceptions::W_ExceptionExtended", || {
+        let _ = w_exception_descrs_for(ExcKind::OSError, false);
+    }),
+    ("interp_exceptions::W_ExceptionExtendedUser", || {
+        let _ = w_exception_descrs_for(ExcKind::FileNotFoundError, true);
     }),
 ];
 
