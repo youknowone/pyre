@@ -420,6 +420,42 @@ pub fn close(fd: INT) -> Result<(), CSocketError> {
     Ok(())
 }
 
+/// `accept`. The bytes are a `sockaddr_storage`. The new descriptor has
+/// `FD_CLOEXEC` set. `addrlen` is the length the call wrote.
+#[cfg(unix)]
+pub fn accept(fd: INT) -> Result<(INT, Vec<u8>, i32), CSocketError> {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut addrlen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let newfd = unsafe {
+        crate::_rsocket_rffi::socketaccept(fd, (&raw mut storage).cast(), &raw mut addrlen)
+    };
+    if newfd < 0 {
+        return Err(last_error());
+    }
+    unsafe {
+        crate::_rsocket_rffi::fcntl(newfd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&raw const storage).cast::<u8>(),
+            std::mem::size_of::<libc::sockaddr_storage>(),
+        )
+    };
+    Ok((newfd, bytes.to_vec(), addrlen as i32))
+}
+
+/// `connect`. `addr` is the `sockaddr` bytes, and its length is `addrlen`.
+#[cfg(unix)]
+pub fn connect(fd: INT, addr: &[u8]) -> Result<(), CSocketError> {
+    let res = unsafe {
+        crate::_rsocket_rffi::socketconnect(fd, addr.as_ptr().cast(), addr.len() as libc::socklen_t)
+    };
+    if res < 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
@@ -663,5 +699,93 @@ mod tests {
             close(a).expect("close a");
             close(b).expect("close b");
         }
+    }
+
+    fn loopback_listener() -> (INT, Vec<u8>) {
+        unsafe {
+            let fd = crate::_rsocket_rffi::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket errno {}", crate::rposix::get_saved_errno());
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let bytes = std::slice::from_raw_parts(
+                (&raw const addr).cast::<u8>(),
+                std::mem::size_of::<libc::sockaddr_in>(),
+            );
+            bind(fd, bytes).expect("bind");
+            listen(fd, 1).expect("listen");
+            let (stored, nlen) = getsockname(fd).expect("getsockname");
+            assert!(nlen > 0);
+            (fd, stored[..nlen as usize].to_vec())
+        }
+    }
+
+    #[test]
+    fn accept_sets_cloexec_and_connects() {
+        let (listener, addr) = loopback_listener();
+        let connect_addr = addr.clone();
+        let peer = std::thread::spawn(move || unsafe {
+            let client = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(client >= 0, "client socket");
+            let rc = libc::connect(
+                client,
+                connect_addr.as_ptr().cast(),
+                connect_addr.len() as libc::socklen_t,
+            );
+            assert_eq!(rc, 0, "peer connect {}", std::io::Error::last_os_error());
+            assert_eq!(libc::close(client), 0);
+        });
+        unsafe {
+            let mut pfd = libc::pollfd {
+                fd: listener,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert!(
+                libc::poll(&raw mut pfd, 1, 2000) > 0,
+                "listener not readable"
+            );
+            let (newfd, bytes, addrlen) = accept(listener).expect("accept");
+            assert!(newfd >= 0);
+            assert!(addrlen > 0);
+            assert_eq!(bytes.len(), std::mem::size_of::<libc::sockaddr_storage>());
+            let flags = crate::_rsocket_rffi::fcntl(newfd, libc::F_GETFD, 0);
+            assert!(flags >= 0 && (flags & libc::FD_CLOEXEC) != 0);
+            assert_eq!(accept(-1).expect_err("bad fd").errno, libc::EBADF);
+            close(newfd).expect("close accepted");
+            close(listener).expect("close listener");
+        }
+        peer.join().expect("peer");
+
+        let (listener, addr) = loopback_listener();
+        let accepted = std::thread::spawn(move || unsafe {
+            let mut pfd = libc::pollfd {
+                fd: listener,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert!(
+                libc::poll(&raw mut pfd, 1, 2000) > 0,
+                "connect listener not readable"
+            );
+            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+            let mut addrlen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            let cfd = libc::accept(listener, (&raw mut storage).cast(), &raw mut addrlen);
+            assert!(cfd >= 0, "libc accept");
+            assert_eq!(libc::close(cfd), 0);
+            assert_eq!(libc::close(listener), 0);
+        });
+        unsafe {
+            let client = crate::_rsocket_rffi::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(
+                client >= 0,
+                "client errno {}",
+                crate::rposix::get_saved_errno()
+            );
+            connect(client, &addr).expect("connect");
+            close(client).expect("close client");
+            assert_eq!(connect(-1, &addr).expect_err("bad fd").errno, libc::EBADF);
+        }
+        accepted.join().expect("accepted");
     }
 }
