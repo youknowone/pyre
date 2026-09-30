@@ -35,6 +35,11 @@
 //!   codewriter converts the raised carrier into the runtime exception
 //!   value `BH_LAST_EXC_VALUE` carries
 //!   (`codewriter::error_carrier_edges`).
+//!   A shell the callee did not build — `__pos_0` of
+//!   `Option<Result<T, carrier>>::Some`, forwarded straight to
+//!   `returnblock` — is split the same way: tag 0 links `T`, tag 1
+//!   raises. `exceptiontransform` carries `T` on the normal edge and
+//!   the error in `last_exc_value`.
 //!
 //! - **Returned-shell rule** ([`unwrap_returned_scalar_result_shells`]):
 //!   the same callee can `return` an `Option<Result<T, PyError>>::Some`
@@ -84,10 +89,10 @@
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
 
-use crate::flowspace::model::Variable;
+use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
-    BlockId, CallFuncPtr, CallTarget, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg,
-    OpKind, SpaceOperation, ValueType,
+    BlockId, CallFuncPtr, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link,
+    LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
@@ -478,12 +483,19 @@ use crate::decline::gate::{
     RESULT_EXC_CALLEE as RESULT_EXC_CALLEE_GATE, RESULT_EXC_CALLER as RESULT_EXC_CALLER_GATE,
 };
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn lower_result_exc_returns_inner(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
 ) -> Result<usize, String> {
     let nblocks = graph.blocks.len();
     let mut rewritten = 0usize;
+    // `Ok` payloads extracted below are already `T`. A later forward of
+    // one of them must not be unwrapped a second time.
+    let mut ok_payloads: std::collections::HashSet<Variable> = std::collections::HashSet::new();
     for bi in 0..nblocks {
         let block_id = crate::model::BlockId(bi);
         // Locate a Result ctor in this block.
@@ -824,9 +836,14 @@ fn lower_result_exc_returns_inner(
             // fresh variable so the payload's kind is not copied into the
             // shell's ref (`exceptiontransform`'s normal edge).
             separate_payload_from_shell(graph, bi, &payload, &[], false)?;
+            ok_payloads.insert(payload.clone());
         }
         rewritten += 1;
     }
+    // `return existing_result` where the value is `Option<Result<T, E>>::Some`'s
+    // payload still carries the shell. Split that edge the way a ctor return
+    // is split: tag 0 links `T`, tag 1 raises (`exceptiontransform`).
+    rewritten += unwrap_forwarded_carrier_returns(graph, spec, &ok_payloads)?;
     if rewritten == 0 && tail_forwarded_returns == 0 {
         // A scoped callee whose body is `return f(...)?` where the
         // caller rule never recorded `f`'s `?`-site — `f`'s return is not
@@ -1272,6 +1289,425 @@ fn split_result_shell_return(
     // [`lower_result_exc_returns`].
     crate::front::exc_from_raise::set_raise_from_instance(graph, err_bb, err_payload);
     Ok(())
+}
+
+/// Template spellings of the explicit `Result` shell.
+///
+/// `explicit_sum_shell` records `__discriminant` at byte 0 and `__pos_0`
+/// at byte 8 on `Result` / `Result::Ok` / `Result::Err`. `fielddescrof`
+/// resolves that owner through `struct_layout_for`: a suffixed
+/// `Result<…>::Ok` key is either absent or a payload-only row from
+/// `register_ref_enum_instantiation_rows`, and a miss keeps the
+/// fallback offset 0 (the tag word). The annotator reads the receiver
+/// classdef, not this owner (`FieldRead` → `getattr`).
+const RESULT_TEMPLATE: &str = "Result";
+const RESULT_OK_TEMPLATE: &str = "Result::Ok";
+const RESULT_ERR_TEMPLATE: &str = "Result::Err";
+
+/// Split `return` edges that forward a carrier `Result` the block did
+/// not construct.
+///
+/// The ctor loop rewrites `Ok`/`Err` aggregates. A `?`-free
+/// `return some_option_of_result` survives as a `FieldRead` of
+/// `Option<Result<T, carrier>>::Some.__pos_0` (or a `same_as` of one)
+/// linked at `returnblock`. That value is the shell. Tag 0 forwards
+/// `__pos_0`; tag 1 materialises the carrier and raises.
+///
+/// An empty `carrier_path` matches nothing, so a pipeline that has not
+/// named a carrier leaves the graph alone. `ok_payloads` are values
+/// this pass already extracted from an `Ok` ctor; they are `T`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn unwrap_forwarded_carrier_returns(
+    graph: &mut FunctionGraph,
+    spec: crate::ErrorCarrierSpec<'_>,
+    ok_payloads: &std::collections::HashSet<Variable>,
+) -> Result<usize, String> {
+    if spec.carrier_path.is_empty() {
+        return Ok(0);
+    }
+    let nblocks = graph.blocks.len();
+    let returnblock = graph.returnblock;
+    let mut sites: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    for bi in 0..nblocks {
+        for (ei, link) in graph.blocks[bi].exits.iter().enumerate() {
+            if link.target != returnblock {
+                continue;
+            }
+            let mut base: Option<String> = None;
+            let mut shell: Option<Variable> = None;
+            let mut positions = Vec::new();
+            for (pos, arg) in link.args.iter().enumerate() {
+                let LinkArg::Value(var) = arg else {
+                    continue;
+                };
+                let mut seen = std::collections::HashSet::new();
+                let Some(found) =
+                    forwarded_shell_base(graph, bi, var, spec, ok_payloads, &mut seen)
+                else {
+                    continue;
+                };
+                if let Some(prev) = &base
+                    && prev != &found
+                {
+                    return Err(format!(
+                        "{}: block {bi} exit {ei} forwards two carrier Result shells",
+                        graph.name
+                    ));
+                }
+                if let Some(prev) = &shell
+                    && prev != var
+                {
+                    return Err(format!(
+                        "{}: block {bi} exit {ei} forwards two carrier Result values",
+                        graph.name
+                    ));
+                }
+                base = Some(found);
+                shell = Some(var.clone());
+                positions.push(pos);
+            }
+            if !positions.is_empty() {
+                sites.push((bi, ei, positions));
+            }
+        }
+    }
+    let split = sites.len();
+    for (bi, ei, positions) in sites {
+        split_forwarded_return(graph, bi, ei, &positions, spec)?;
+    }
+    Ok(split)
+}
+
+/// The carrier-`Result` spelling stored in `var`, when `var` is a
+/// forwarded container payload rather than a value this pass built.
+///
+/// `Call` results are not shells: a tail-forward the caller rule already
+/// narrowed is `T`, and a cast is a call. `Result::Ok` / `Result::Err`
+/// `__pos_0` reads are the payload, not the shell.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn forwarded_shell_base(
+    graph: &FunctionGraph,
+    block: usize,
+    var: &Variable,
+    spec: crate::ErrorCarrierSpec<'_>,
+    ok_payloads: &std::collections::HashSet<Variable>,
+    seen: &mut std::collections::HashSet<(usize, Variable)>,
+) -> Option<String> {
+    if ok_payloads.contains(var) || !seen.insert((block, var.clone())) {
+        return None;
+    }
+    if let Some(op) = graph.blocks[block]
+        .operations
+        .iter()
+        .rev()
+        .find(|op| op.result.as_ref() == Some(var))
+    {
+        return match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "__pos_0" => field
+                .owner_root
+                .as_deref()
+                .and_then(|owner| container_payload_result_base(owner, spec)),
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                forwarded_shell_base(graph, block, operand, spec, ok_payloads, seen)
+            }
+            _ => None,
+        };
+    }
+    let slot = graph.blocks[block]
+        .inputargs
+        .iter()
+        .position(|arg| arg == var)?;
+    let preds = graph.predecessors(BlockId(block));
+    if preds.is_empty() {
+        return None;
+    }
+    let mut base: Option<String> = None;
+    for pred in preds {
+        let mut found_link = false;
+        for link in graph.blocks[pred.0]
+            .exits
+            .iter()
+            .filter(|link| link.target == BlockId(block))
+        {
+            let LinkArg::Value(incoming) = link.args.get(slot)? else {
+                return None;
+            };
+            let incoming_base =
+                forwarded_shell_base(graph, pred.0, incoming, spec, ok_payloads, seen)?;
+            if let Some(prev) = &base
+                && prev != &incoming_base
+            {
+                return None;
+            }
+            base = Some(incoming_base);
+            found_link = true;
+        }
+        if !found_link {
+            return None;
+        }
+    }
+    base
+}
+
+/// `Option<Result<…, carrier>>::Some` → the bare `Result<…>` spelling.
+///
+/// `Ok` / `Err` payload reads are not the shell. The head's leaf must be
+/// `Option`; the first type argument must be a `Result` whose error type,
+/// after the spec's wrappers, is the carrier. The returned spelling drops
+/// the `Result` module prefix and keeps the original arguments.
+fn container_payload_result_base(owner: &str, spec: crate::ErrorCarrierSpec<'_>) -> Option<String> {
+    let (head, variant) = split_owner_variant(owner)?;
+    // `Ok` / `Err` `__pos_0` is the payload. Only `Option::Some` carries
+    // the `Result` shell itself.
+    if variant != "Some" {
+        return None;
+    }
+    if type_leaf(head) != "Option" {
+        return None;
+    }
+    let args = generic_args_body(head)?;
+    let first = split_top_level_args(args).into_iter().next()?;
+    carrier_result_spelling(first, spec)
+}
+
+fn carrier_result_spelling(ty: &str, spec: crate::ErrorCarrierSpec<'_>) -> Option<String> {
+    let (start, end) = find_result_span(ty)?;
+    let args = generic_args_body(&ty[start..end])?;
+    let err = split_top_level_args(args).into_iter().next_back()?;
+    if err.is_empty() {
+        return None;
+    }
+    let peeled = peel_carrier_wrappers(err, spec);
+    let carrier_leaf = type_leaf(spec.carrier_path);
+    if carrier_leaf.is_empty() || type_leaf(peeled) != carrier_leaf {
+        return None;
+    }
+    Some(format!("Result<{args}>"))
+}
+
+fn peel_carrier_wrappers<'a>(mut ty: &'a str, spec: crate::ErrorCarrierSpec<'_>) -> &'a str {
+    for wrapper in spec.carrier_wrappers {
+        let leaf = type_leaf(wrapper);
+        if leaf.is_empty() {
+            break;
+        }
+        let Some(inner) = peel_one_wrapper(ty, leaf) else {
+            break;
+        };
+        ty = inner;
+    }
+    ty
+}
+
+fn peel_one_wrapper<'a>(ty: &'a str, leaf: &str) -> Option<&'a str> {
+    let lt = ty.find('<')?;
+    if type_leaf(&ty[..lt]) != leaf {
+        return None;
+    }
+    let end = matching_closer(ty, lt, b'<', b'>')?;
+    let first = split_top_level_args(&ty[lt + 1..end]).into_iter().next()?;
+    if first.is_empty() { None } else { Some(first) }
+}
+
+/// Last `::` outside brackets. The tail is the variant segment.
+fn split_owner_variant(owner: &str) -> Option<(&str, &str)> {
+    let bytes = owner.as_bytes();
+    let mut depth = 0i32;
+    let mut last = None;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        depth += bracket_depth_delta(bytes[i]);
+        if depth == 0 && bytes[i] == b':' && bytes[i + 1] == b':' {
+            last = Some(i);
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    let i = last?;
+    let variant = &owner[i + 2..];
+    if variant.is_empty() {
+        None
+    } else {
+        Some((&owner[..i], variant))
+    }
+}
+
+fn find_result_span(ty: &str) -> Option<(usize, usize)> {
+    let bytes = ty.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"Result<") && (i == 0 || bytes[i - 1] == b':') {
+            let open = i + "Result".len();
+            let end = matching_closer(ty, open, b'<', b'>')?;
+            return Some((i, end + 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn generic_args_body(ty: &str) -> Option<&str> {
+    let open = ty.find('<')?;
+    let end = matching_closer(ty, open, b'<', b'>')?;
+    Some(&ty[open + 1..end])
+}
+
+fn matching_closer(ty: &str, open_at: usize, open: u8, close: u8) -> Option<usize> {
+    let bytes = ty.as_bytes();
+    if bytes.get(open_at) != Some(&open) {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (offset, byte) in bytes[open_at..].iter().copied().enumerate() {
+        if byte == open {
+            depth += 1;
+        } else if byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(open_at + offset);
+            }
+        }
+    }
+    None
+}
+
+fn split_top_level_args(args: &str) -> Vec<&str> {
+    let bytes = args.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, byte) in bytes.iter().copied().enumerate() {
+        depth += bracket_depth_delta(byte);
+        if byte == b',' && depth == 0 {
+            parts.push(args[start..i].trim());
+            start = i + 1;
+        }
+    }
+    parts.push(args[start..].trim());
+    parts
+}
+
+fn bracket_depth_delta(byte: u8) -> i32 {
+    match byte {
+        b'<' | b'(' | b'[' => 1,
+        b'>' | b')' | b']' => -1,
+        _ => 0,
+    }
+}
+
+fn type_leaf(ty: &str) -> &str {
+    let trimmed = ty.trim();
+    let base = trimmed.split(['<', '(']).next().unwrap_or(trimmed).trim();
+    base.rsplit("::").next().unwrap_or(base).trim()
+}
+
+fn split_forwarded_return(
+    graph: &mut FunctionGraph,
+    block: usize,
+    exit_index: usize,
+    positions: &[usize],
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Result<(), String> {
+    let arity = graph.blocks[block].exits[exit_index].args.len();
+    if positions.is_empty() || positions.iter().any(|pos| *pos >= arity) {
+        return Err(format!(
+            "{}: block {block} forwarded shell position is outside the return link",
+            graph.name
+        ));
+    }
+    let (split_bb, split_inputs) = graph.create_block_with_arg_vars(arity);
+    let (ok_bb, ok_inputs) = graph.create_block_with_arg_vars(arity);
+    let (err_bb, err_inputs) = graph.create_block_with_arg_vars(arity);
+    graph.blocks[block].exits[exit_index].target = split_bb;
+
+    // The shell rides both arms so `follow_link` can apply the
+    // discriminant's knowntypedata. An already-`Ok` shell makes the
+    // `Err` arm `Impossible` (`improve_instance`); the arm stays in the
+    // graph. The exitswitch is the integer tag, not `set_branch`'s bool.
+    let shell_in_split = split_inputs[positions[0]].clone();
+    let disc = push_field_read(
+        graph,
+        split_bb,
+        shell_in_split,
+        "__discriminant",
+        RESULT_TEMPLATE,
+        ValueType::Int,
+    );
+    let ok_link = Link::from_variables(
+        graph,
+        split_inputs.clone(),
+        ok_bb,
+        Some(ExitCase::Const(ConstValue::Int(0))),
+    )
+    .with_llexitcase_from_exitcase();
+    let err_link = Link::from_variables(
+        graph,
+        split_inputs,
+        err_bb,
+        Some(ExitCase::Const(ConstValue::Int(1))),
+    )
+    .with_llexitcase_from_exitcase();
+    graph.set_control_flow_metadata(
+        split_bb,
+        Some(ExitSwitch::Value(disc)),
+        vec![ok_link, err_link],
+    );
+
+    let payload = push_field_read(
+        graph,
+        ok_bb,
+        ok_inputs[positions[0]].clone(),
+        "__pos_0",
+        RESULT_OK_TEMPLATE,
+        ValueType::Ref(None),
+    );
+    let mut ok_args = ok_inputs;
+    for &pos in positions {
+        ok_args[pos] = payload.clone();
+    }
+    let returnblock = graph.returnblock;
+    graph.set_goto(ok_bb, returnblock, ok_args);
+
+    let err_payload = push_field_read(
+        graph,
+        err_bb,
+        err_inputs[positions[0]].clone(),
+        "__pos_0",
+        RESULT_ERR_TEMPLATE,
+        ValueType::Ref(None),
+    );
+    let exc = materialize_error_to_exc_object(graph, err_bb, err_payload, spec);
+    crate::front::exc_from_raise::set_raise_from_instance(graph, err_bb, exc);
+    Ok(())
+}
+
+fn push_field_read(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    base: Variable,
+    name: &str,
+    owner: &str,
+    ty: ValueType,
+) -> Variable {
+    graph
+        .push_op_var(
+            block,
+            OpKind::FieldRead {
+                base,
+                field: crate::model::FieldDescriptor::new(name, Some(owner.to_string())),
+                ty,
+                pure: true,
+            },
+            true,
+        )
+        .expect("field read produces a value")
 }
 
 pub(crate) struct UseCounts {
@@ -7697,6 +8133,318 @@ mod static_result_shell_tests {
             graph.blocks[entry.0].exits[0].args,
             vec![LinkArg::Value(unit.clone())]
         );
+    }
+
+    const CARRIER_TO_EXC: &[&str] = &["carrier", "to_exc_object"];
+
+    fn carrier_spec() -> crate::ErrorCarrierSpec<'static> {
+        crate::ErrorCarrierSpec {
+            carrier_path: "carrier::PyError",
+            carrier_wrappers: &[],
+            to_exc_object: Some(CARRIER_TO_EXC),
+            from_exc_object: None,
+        }
+    }
+
+    fn push_ok_ctor(graph: &mut FunctionGraph, block: BlockId, payload: Variable) -> Variable {
+        let shell = graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec![
+                            "core".into(),
+                            "result".into(),
+                            "Result<*mut PyObject,PyError>".into(),
+                        ],
+                        "Ok",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(
+                        "core::result::Result<*mut PyObject,PyError>::Ok".into(),
+                    )),
+                },
+                true,
+            )
+            .expect("shell");
+        let disc = graph
+            .push_op_var(block, OpKind::ConstInt(0), true)
+            .expect("tag");
+        for (name, owner, value) in [
+            (
+                "__discriminant",
+                "core::result::Result<*mut PyObject,PyError>",
+                disc,
+            ),
+            (
+                "__pos_0",
+                "core::result::Result<*mut PyObject,PyError>::Ok",
+                payload,
+            ),
+        ] {
+            graph.block_mut(block).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: shell.clone(),
+                    field: crate::model::FieldDescriptor::new(name, Some(owner.into())),
+                    value: LinkArg::Value(value),
+                    ty: ValueType::Int,
+                },
+            });
+        }
+        shell
+    }
+
+    fn push_forwarded_shell(graph: &mut FunctionGraph, block: BlockId, owner: &str) -> Variable {
+        let base = graph.alloc_value_var();
+        push_field_read(graph, block, base, "__pos_0", owner, ValueType::Ref(None))
+    }
+
+    fn mixed_forward_graph(owner: &str) -> (FunctionGraph, Variable, Variable, Variable) {
+        let mut graph = FunctionGraph::new("mixed_forwarded_shell");
+        let entry = graph.startblock;
+        let (ok_arm, _) = graph.create_block_with_arg_vars(0);
+        let (fwd_arm, _) = graph.create_block_with_arg_vars(0);
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("cond");
+        graph.set_branch(entry, cond, ok_arm, vec![], fwd_arm, vec![]);
+        let payload = graph
+            .push_op_var(ok_arm, OpKind::ConstInt(7), true)
+            .expect("payload");
+        let ctor = push_ok_ctor(&mut graph, ok_arm, payload.clone());
+        graph.set_goto(ok_arm, graph.returnblock, vec![ctor.clone()]);
+        let forwarded = push_forwarded_shell(&mut graph, fwd_arm, owner);
+        graph.set_goto(fwd_arm, graph.returnblock, vec![forwarded.clone()]);
+        (graph, payload, ctor, forwarded)
+    }
+
+    fn forward_only_graph(owner: &str) -> (FunctionGraph, BlockId, Variable) {
+        let mut graph = FunctionGraph::new("forward_only_shell");
+        let entry = graph.startblock;
+        let forwarded = push_forwarded_shell(&mut graph, entry, owner);
+        graph.set_goto(entry, graph.returnblock, vec![forwarded.clone()]);
+        (graph, entry, forwarded)
+    }
+
+    fn return_link_values(graph: &FunctionGraph) -> Vec<Variable> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.exits)
+            .filter(|link| link.target == graph.returnblock)
+            .flat_map(|link| &link.args)
+            .filter_map(|arg| match arg {
+                LinkArg::Value(var) => Some(var.clone()),
+                LinkArg::Const(_) => None,
+            })
+            .collect()
+    }
+
+    fn field_read_owners(graph: &FunctionGraph, name: &str) -> Vec<String> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name == name => field.owner_root.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forwarded_option_some_splits_beside_an_ok_ctor() {
+        let (mut graph, payload, ctor, forwarded) =
+            mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0, carrier_spec()).expect("mixed forward lowers"),
+            2
+        );
+        let returned = return_link_values(&graph);
+        assert!(!returned.iter().any(|var| *var == ctor || *var == forwarded));
+        assert!(returned.iter().any(|var| *var == payload));
+        assert!(field_read_owners(&graph, "__discriminant").contains(&"Result".to_string()));
+        assert!(field_read_owners(&graph, "__pos_0").contains(&"Result::Ok".to_string()));
+        assert!(field_read_owners(&graph, "__pos_0").contains(&"Result::Err".to_string()));
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock)
+        }));
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments == &["carrier".to_string(), "to_exc_object".to_string()]
+                    )
+                })
+        );
+    }
+
+    #[test]
+    fn forwarded_shell_without_a_carrier_is_not_rewritten() {
+        let (mut graph, entry, forwarded) =
+            forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
+        let err = lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+            .expect_err("empty carrier has nothing to rewrite");
+        assert!(err.contains("no rewritable returns"));
+        assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
+        assert_eq!(
+            graph.blocks[entry.0].exits[0].args,
+            vec![LinkArg::Value(forwarded)]
+        );
+    }
+
+    #[test]
+    fn mixed_forward_keeps_the_shell_when_no_carrier_is_declared() {
+        let (mut graph, _payload, _ctor, forwarded) =
+            mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+                .expect("the ctor still lowers"),
+            1
+        );
+        assert!(
+            return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
+        );
+    }
+
+    #[test]
+    fn result_ok_payload_read_is_not_a_forwarded_shell() {
+        let (mut graph, entry, forwarded) = forward_only_graph("Result<*mut PyObject,PyError>::Ok");
+        let err = lower_result_exc_returns(&mut graph, 0, carrier_spec())
+            .expect_err("an Ok payload read is already T");
+        assert!(err.contains("no rewritable returns"));
+        assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
+        assert!(
+            return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
+        );
+    }
+
+    #[test]
+    fn option_of_a_different_error_is_not_split() {
+        let (mut graph, entry, forwarded) =
+            forward_only_graph("Option<Result<i64,Utf8Error>>::Some");
+        let err = lower_result_exc_returns(&mut graph, 0, carrier_spec())
+            .expect_err("Utf8Error is not the carrier");
+        assert!(err.contains("no rewritable returns"));
+        assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
+        assert!(
+            return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
+        );
+    }
+
+    #[test]
+    fn container_payload_result_base_matches_the_carrier_leaf() {
+        let spec = carrier_spec();
+        assert_eq!(
+            container_payload_result_base("Option<Result<*mut PyObject,PyError>>::Some", spec)
+                .as_deref(),
+            Some("Result<*mut PyObject,PyError>")
+        );
+        assert_eq!(
+            container_payload_result_base(
+                "core::option::Option<core::result::Result<*mut PyObject,PyError>>::Some",
+                spec
+            )
+            .as_deref(),
+            Some("Result<*mut PyObject,PyError>")
+        );
+        assert_eq!(
+            container_payload_result_base(
+                "option::Option<Result<Tuple<i64,i64>,PyError>>::Some",
+                spec
+            )
+            .as_deref(),
+            Some("Result<Tuple<i64,i64>,PyError>")
+        );
+        assert_eq!(
+            container_payload_result_base("Result<*mut PyObject,PyError>::Ok", spec),
+            None
+        );
+        assert_eq!(
+            container_payload_result_base("Option<Result<*mut PyObject,MyPyError>>::Some", spec),
+            None
+        );
+        let boxed = crate::ErrorCarrierSpec {
+            carrier_path: "carrier::PyError",
+            carrier_wrappers: &["alloc::boxed::Box"],
+            to_exc_object: None,
+            from_exc_object: None,
+        };
+        assert_eq!(
+            container_payload_result_base(
+                "Option<Result<*mut PyObject,Box<PyError>>>::Some",
+                boxed
+            )
+            .as_deref(),
+            Some("Result<*mut PyObject,Box<PyError>>")
+        );
+        assert_eq!(
+            container_payload_result_base(
+                "Option<Result<*mut PyObject,MyBox<PyError>>>::Some",
+                boxed
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ok_ctor_of_a_forwarded_shell_is_not_unwrapped_again() {
+        let mut graph = FunctionGraph::new("ok_of_forwarded_shell");
+        let entry = graph.startblock;
+        let forwarded =
+            push_forwarded_shell(&mut graph, entry, "Option<Result<i64,PyError>>::Some");
+        let ctor = push_ok_ctor(&mut graph, entry, forwarded.clone());
+        graph.set_goto(entry, graph.returnblock, vec![ctor]);
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0, carrier_spec())
+                .expect("the ctor lowers and the payload stays"),
+            1
+        );
+        assert!(
+            return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
+        );
+        assert!(!field_read_owners(&graph, "__discriminant").contains(&"Result".to_string()));
+    }
+
+    #[test]
+    fn forward_only_carrier_shell_is_a_rewritable_return() {
+        let (mut graph, _entry, forwarded) =
+            forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0, carrier_spec()).expect("forward lowers"),
+            1
+        );
+        assert!(
+            !return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
+        );
+        assert!(field_read_owners(&graph, "__discriminant").contains(&"Result".to_string()));
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock)
+        }));
     }
 
     /// Build `variant` of `Result<str,Utf8Error>` in `block` with its

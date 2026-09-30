@@ -6798,6 +6798,13 @@ struct IndexElemAlias {
     /// Identity the paired write must repeat, so `arr[i] = v` keys the
     /// same ARRAY as the `arr[i]` read that recorded this alias.
     array_type_id: Option<String>,
+    /// List spelling the paired read and write narrow the base through.
+    /// `None` when the base is already that list (a `Vec` / slice place).
+    /// An object-items pointer is not: its descr key is
+    /// [`OBJECT_REF_GCARRAY_TYPE_ID`], which `project_struct_field_type`
+    /// does not read as a list, so `getitem` would stay on the
+    /// classdef-less pointer.
+    list_root: Option<String>,
 }
 
 /// Header of a `(*p.add(i)).field` access.
@@ -9377,11 +9384,22 @@ impl<'a> Lowering<'a> {
                         // setitem; the typer lowers this marker back to the
                         // exact cast_opaque_ptr operation.
                         value = self.narrow_value_to_instance_root(bb_id, value, "str");
+                    } else if let Some(item) =
+                        alias.list_root.as_deref().and_then(list_spelling_item)
+                    {
+                        // Same external-item boundary as `FixedObjectArray::set_ref`:
+                        // setitem must see the element class before the ListDef
+                        // generalizes (`ll_setitem_fast`, `rlist.py`).
+                        value = self.narrow_value_to_instance_root(bb_id, value, item);
                     }
-                    let cast_root = match alias.array_type_id.as_deref() {
-                        Some("[i64]" | "[f64]") => alias.array_type_id.as_deref(),
-                        Some(id) if id == STRING_GCREF_GCARRAY_TYPE_ID => Some(id),
-                        _ => None,
+                    let cast_root = if let Some(root) = alias.list_root.as_deref() {
+                        Some(root)
+                    } else {
+                        match alias.array_type_id.as_deref() {
+                            Some("[i64]" | "[f64]") => alias.array_type_id.as_deref(),
+                            Some(id) if id == STRING_GCREF_GCARRAY_TYPE_ID => Some(id),
+                            _ => None,
+                        }
                     };
                     let arr = if let Some(root) = cast_root {
                         self.narrow_value_to_instance_root(bb_id, LinkArg::Value(arr), root)
@@ -17093,6 +17111,7 @@ impl<'a> Lowering<'a> {
                             index_var: args[1].clone(),
                             item_ty,
                             array_type_id,
+                            list_root: None,
                         },
                     );
                     // This intercept returns before the generic call-result
@@ -17317,6 +17336,7 @@ impl<'a> Lowering<'a> {
                             index_var: args[1].clone(),
                             item_ty,
                             array_type_id: Some(array_type_id),
+                            list_root: None,
                         },
                     );
                     self.local_var[dest_local] = Some(res);
@@ -17332,13 +17352,32 @@ impl<'a> Lowering<'a> {
                     first_arg_ty.as_ref(),
                     dest_local,
                 ) {
+                    // The accessor returns a pointer to the element pointer,
+                    // null when the block is null. That word is a classdef-less
+                    // instance, and `getitem` on it rewrites to
+                    // `getattr("__getitem__")` (`getitem_SomeInstance`). The
+                    // descr key stays `OBJECT_REF_GCARRAY_TYPE_ID`; the list
+                    // spelling is the element class, which
+                    // `project_struct_field_type` models as `SomeList`
+                    // (`ll_getitem_fast`, `rlist.py`).
+                    let list_root = first_arg_ty
+                        .as_ref()
+                        .and_then(|ty| object_ref_items_list_root(ty, self.llbc));
+                    let base = match list_root.as_deref() {
+                        Some(root) => self
+                            .narrow_value_to_instance_root(bb_id, args[0].clone().into(), root)
+                            .as_variable()
+                            .expect("a materialized object-items base stays a Variable")
+                            .clone(),
+                        None => args[0].clone(),
+                    };
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::ArrayRead {
-                            base: args[0].clone(),
+                            base: base.clone(),
                             index: args[1].clone(),
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
@@ -17350,11 +17389,12 @@ impl<'a> Lowering<'a> {
                         dest_local,
                         IndexElemAlias {
                             base_local: arg_locals.first().copied().flatten(),
-                            base_var: args[0].clone(),
+                            base_var: base,
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            list_root,
                         },
                     );
                     self.local_var[dest_local] = Some(res);
@@ -17412,6 +17452,7 @@ impl<'a> Lowering<'a> {
                             index_var: args[1].clone(),
                             item_ty,
                             array_type_id: Some(array_type_id),
+                            list_root: None,
                         },
                     );
                     self.local_var[dest_local] = Some(res);
@@ -45127,15 +45168,80 @@ fn nominal_adt_class_root(
     adt_node_class_root_leaf(&pointee, llbc, tombstoned)
 }
 
-/// Class of a `repr(transparent)` one-field GC handle's `Deref::Target`.
+/// Whether `decl` is a GC handle whose `Deref::Target` class applies.
 ///
-/// The field must already be a `Ref` (including `Ref(None)`). `Target`
-/// must be one struct decl; its class is [`nominal_adt_class_root`], so a
+/// A `Struct` must have one sized field that is already a `Ref`. The
+/// field being this wrapper would re-enter the rule; `*mut T` is not an
+/// ADT, so a pointer field does not trip that check. An `Opaque`
+/// dependency view has no field list: one pointer word that is not a
+/// linked scalar is the same handle.
+fn transparent_handle_has_deref_class(
+    decl: &TypeDecl,
+    wrapper_id: u64,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> bool {
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) => {
+            let Some((index, _)) = transparent_nonzst_field(decl, llbc) else {
+                return false;
+            };
+            let Some(field) = fields.get(index) else {
+                return false;
+            };
+            if let Some(field_node) =
+                tyref_node(&field.ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))
+                && adt_node_def_id(field_node) == Some(wrapper_id)
+            {
+                return false;
+            }
+            matches!(
+                tyref_to_value_type_with(&field.ty, llbc, tombstoned),
+                ValueType::Ref(_)
+            )
+        }
+        TypeDeclKind::Opaque => opaque_pointer_handle(decl, llbc),
+        _ => false,
+    }
+}
+
+/// `Opaque` `repr(transparent)` declaration whose layout is one pointer
+/// and which [`discover_transparent_scalar_kinds`] did not link as a
+/// scalar. The `Deref` impl, not the missing field type, names the class.
+fn opaque_pointer_handle(decl: &TypeDecl, llbc: &Llbc) -> bool {
+    if !decl.is_repr_transparent() {
+        return false;
+    }
+    if llbc
+        .transparent_scalar_kind(&decl.item_meta.name_path())
+        .is_some()
+    {
+        return false;
+    }
+    let Some(width) = llbc.target_pointer_size() else {
+        return false;
+    };
+    decl.layout_for_target(llbc, "")
+        .and_then(|layout| layout.size)
+        == Some(u64::from(width))
+}
+
+/// Class of a `repr(transparent)` GC handle's `Deref::Target`.
+///
+/// The defining crate records one sized field, and that field must
+/// already be a `Ref` (including `Ref(None)`). A dependency artefact
+/// keeps the `repr(transparent)` layout and the `Deref` impl but emits
+/// the declaration as `Opaque`, with no field type
+/// (`link_transparent_scalar_types` is the same opacity for scalars).
+/// That view is this handle when its layout is one pointer word and it
+/// is not a scalar whose bank was linked from the defining crate.
+/// `Target` must be one struct, or the same struct seen as `Opaque` in
+/// a dependency artefact. Its class is [`nominal_adt_class_root`], so a
 /// tombstoned leaf stays disambiguated and the target lookup does not
-/// re-enter this rule. No impl, a non-struct `Target`, or two struct
-/// targets with different classes keep the transparent peel. A struct
-/// `Target` with no class root does not apply. Two impls that name the
-/// same class do.
+/// re-enter this rule. No impl, an enum or alias `Target`, or two
+/// targets with different classes keep the transparent peel. A target
+/// with no class root does not apply. Two impls that name the same
+/// class do.
 fn transparent_deref_target_class(
     ty: &TyRef,
     llbc: &Llbc,
@@ -45144,23 +45250,7 @@ fn transparent_deref_target_class(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let wrapper_id = adt_node_def_id(node)?;
     let decl = llbc.type_by_id(wrapper_id)?;
-    let TypeDeclKind::Struct(fields) = &decl.kind else {
-        return None;
-    };
-    let (index, _) = transparent_nonzst_field(decl, llbc)?;
-    let field_ty = &fields.get(index)?.ty;
-    // The field is this wrapper. Typing it would re-enter the rule.
-    // `*mut T` is not an ADT, so a pointer field does not trip this.
-    if let Some(field_node) =
-        tyref_node(field_ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))
-        && adt_node_def_id(field_node) == Some(wrapper_id)
-    {
-        return None;
-    }
-    if !matches!(
-        tyref_to_value_type_with(field_ty, llbc, tombstoned),
-        ValueType::Ref(_)
-    ) {
+    if !transparent_handle_has_deref_class(decl, wrapper_id, llbc, tombstoned) {
         return None;
     }
     let trait_id = deref_trait_decl_id(llbc)?;
@@ -45195,10 +45285,15 @@ fn transparent_deref_target_class(
         let Some(target_decl) = llbc.type_by_id(target_id) else {
             continue;
         };
-        if !matches!(target_decl.kind, TypeDeclKind::Struct(_)) {
+        // A dependency may see the target struct as `Opaque`. An enum,
+        // union, or alias is not that class.
+        if !matches!(
+            target_decl.kind,
+            TypeDeclKind::Struct(_) | TypeDeclKind::Opaque
+        ) {
             continue;
         }
-        // A struct whose class root is `None` (core/std/alloc with type
+        // A target whose class root is `None` (core/std/alloc with type
         // arguments, via the nominal leaf) does not apply. The nominal
         // root keeps a handle `Target` from re-entering this function
         // through [`adt_node_class_root_with`].
@@ -45841,6 +45936,36 @@ fn is_object_ref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     raw_ptr_pointee_class_root(inner, llbc).is_some()
+}
+
+/// List spelling of an object-items pointer (`*mut *mut Class`).
+///
+/// `items_block_items_base` returns that pointer, null when the block is
+/// null, and the null arm is a classdef-less instance. Brick 3 lowers
+/// `*base.add(idx)` to `ArrayRead`, which flowspace spells `getitem`. On a
+/// classdef-less receiver that rewrites to `getattr("__getitem__")`
+/// (`getitem_SomeInstance`). [`OBJECT_REF_GCARRAY_TYPE_ID`] is the descr
+/// key, not a list type, so the base is narrowed through the `[Class]`
+/// spelling `Bookkeeper::project_struct_field_type` already models as
+/// `SomeList` — the same boundary the `[str]` and `[i64]` arms use. The
+/// element class is the pointee's own leaf (`bookkeeper.py`
+/// `getuniqueclassdef`).
+fn object_ref_items_list_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let outer = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
+    let inner = outer
+        .as_object()?
+        .get("RawPtr")?
+        .as_array()?
+        .first()
+        .and_then(|n| strip_ty_wrappers(n, llbc))?;
+    let root = raw_ptr_pointee_class_root(inner, llbc)?;
+    Some(format!("[{root}]"))
+}
+
+/// Item spelling inside a `[Class]` list root. A `[T; N]` tail is not one.
+fn list_spelling_item(list_root: &str) -> Option<&str> {
+    let item = list_root.strip_prefix('[')?.strip_suffix(']')?;
+    (!item.is_empty() && !item.contains(';')).then_some(item)
 }
 
 /// RPython item bank and ARRAY identity carried by a raw pointer into a
@@ -58667,6 +58792,49 @@ mod tests {
     }
 
     #[test]
+    fn object_items_pointer_names_its_element_list() {
+        use super::object_ref_items_list_root;
+
+        let pyobject = struct_decl(
+            2,
+            ident_path(&["pyobject", "PyObject"]),
+            empty_fields(),
+            false,
+        );
+        let (llbc, _) = load_handle(vec![(2, pyobject)], serde_json::json!([]), 2);
+        let items = TyRef::Other(serde_json::json!({
+            "RawPtr": [
+                {"RawPtr": [
+                    {"Adt": {"id": 2, "generics": {"types": []}}},
+                    "Mut"
+                ]},
+                "Mut"
+            ]
+        }));
+        assert_eq!(
+            object_ref_items_list_root(&items, &llbc).as_deref(),
+            Some("[PyObject]")
+        );
+        assert_eq!(super::list_spelling_item("[PyObject]"), Some("PyObject"));
+        assert_eq!(super::list_spelling_item("[PyObject; 0]"), None);
+        let scalar = TyRef::Other(serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Signed": "I64"}}}, "Mut"]
+        }));
+        assert_eq!(object_ref_items_list_root(&scalar, &llbc), None);
+        let header = TyRef::Other(serde_json::json!({
+            "RawPtr": [
+                {"Adt": {"id": 2, "generics": {"types": []}}},
+                "Mut"
+            ]
+        }));
+        assert_eq!(
+            object_ref_items_list_root(&header, &llbc),
+            None,
+            "a pointer to the object itself is not the items pointer"
+        );
+    }
+
+    #[test]
     fn items_block_base_accessor_gate_excludes_deref_in_place() {
         use super::graph_is_items_block_base_accessor;
 
@@ -64380,6 +64548,158 @@ mod tests {
             ValueType::Ref(Some("PyErrorObject".into()))
         );
         assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
+    }
+
+    fn opaque_handle_decl(def_id: u64, name: serde_json::Value, size: u64) -> serde_json::Value {
+        let mut decl = serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(name),
+            "kind": "Opaque"
+        });
+        let mut layout = transparent_layout();
+        layout[0]["value"]["size"] = serde_json::json!(size);
+        layout[0]["value"]["align"] = serde_json::json!(size);
+        decl["layout"] = layout;
+        decl
+    }
+
+    fn load_handle_with_width(
+        type_decls: Vec<(u64, serde_json::Value)>,
+        trait_impls: serde_json::Value,
+        query: u64,
+        pointer_size: Option<u8>,
+    ) -> (Llbc, TyRef) {
+        let mut translated = serde_json::json!({
+            "crate_name": "fixture",
+            "type_decls": indexed_rows(type_decls),
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": indexed_rows(vec![(
+                1,
+                serde_json::json!({
+                    "def_id": 1,
+                    "item_meta": fixture_item_meta(ident_path(&[
+                        "core", "ops", "deref", "Deref"
+                    ])),
+                    "methods": []
+                })
+            )]),
+            "trait_impls": trait_impls
+        });
+        if let Some(width) = pointer_size {
+            translated["target_information"] = serde_json::json!([{
+                "key": "fixture-target",
+                "value": {
+                    "target_pointer_size": width,
+                    "is_little_endian": true
+                }
+            }]);
+        }
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": translated
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let ty = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [9000 + query, adt_body(query)]
+        }))
+        .expect("query TyRef parses");
+        (llbc, ty)
+    }
+
+    /// An external `repr(transparent)` handle is `Opaque`. The `Deref`
+    /// impl and the pointer-sized layout are what the defining crate's
+    /// field recorded.
+    #[test]
+    fn opaque_transparent_gc_handle_follows_deref_target() {
+        let mut decls = pointer_handle_decls();
+        decls[2] = (
+            3,
+            opaque_handle_decl(3, ident_path(&["fixture", "PyError"]), 8),
+        );
+        let (llbc, ty) = load_handle_with_width(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+            Some(8),
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Ref(Some("PyErrorObject".into()))
+        );
+        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
+        assert_eq!(
+            super::tyref_to_field_layout_string(&ty, &llbc),
+            "*mut PyErrorObject"
+        );
+
+        // The target struct is `Opaque` in a crate that never reads its
+        // fields. The class is still the nominal leaf.
+        let mut opaque_target = decls.clone();
+        opaque_target[1] = (
+            2,
+            serde_json::json!({
+                "def_id": 2,
+                "item_meta": fixture_item_meta(ident_path(&["fixture", "PyErrorObject"])),
+                "kind": "Opaque"
+            }),
+        );
+        let (llbc, ty) = load_handle_with_width(
+            opaque_target,
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+            Some(8),
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Ref(Some("PyErrorObject".into()))
+        );
+        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
+
+        // No extraction target: the width is unknown, so the opaque
+        // view does not guess a class.
+        let (llbc, ty) = load_handle_with_width(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+            None,
+        );
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
+        assert_handle_class(&llbc, &ty, Some("PyError"));
+
+        // A narrower transparent word is not this handle.
+        decls[2] = (
+            3,
+            opaque_handle_decl(3, ident_path(&["fixture", "Narrow"]), 4),
+        );
+        let (llbc, ty) = load_handle_with_width(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+            Some(8),
+        );
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
+        assert_handle_class(&llbc, &ty, Some("Narrow"));
+
+        // A linked scalar keeps its bank even when a `Deref` impl is
+        // present. The class rule runs before the scalar peel.
+        decls[2] = (
+            3,
+            opaque_handle_decl(3, ident_path(&["fixture", "Word"]), 8),
+        );
+        let (llbc, ty) = load_handle_with_width(
+            decls,
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+            Some(8),
+        );
+        llbc.register_transparent_scalar_kinds([(
+            "fixture::Word".to_string(),
+            majit_charon_reader::TransparentScalarKind::Signed,
+        )]);
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
+        assert_handle_class(&llbc, &ty, Some("Word"));
     }
 
     #[test]

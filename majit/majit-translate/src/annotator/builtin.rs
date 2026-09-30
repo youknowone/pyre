@@ -3077,6 +3077,61 @@ mod tests {
     }
 
     #[test]
+    fn cast_instance_intrinsic_object_items_list_root_is_a_typed_list() {
+        // `*items_block_items_base(block).add(idx)` narrows its base through
+        // `[PyObject]`. The operand is the accessor's nullable classdef-less
+        // pointer. `project_struct_field_type` must answer `SomeList` of the
+        // element class so `getitem` takes ListRepr (`ll_getitem_fast`,
+        // `rlist.py`) instead of `getitem_SomeInstance`.
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        // Production publishes this origin before annotation, so the bare
+        // element leaf and `pyobject::PyObject` are one ClassDef.
+        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from([(
+            "PyObject".to_string(),
+            "pyobject".to_string(),
+        )]));
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        reg.fields.insert(
+            "PyObject".to_string(),
+            reg.fields["pyobject::PyObject"].clone(),
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("pyobject::PyObject")
+            .expect("PyObject classdef");
+        let s_ptr = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("[PyObject]"))
+            .expect("list-root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_ptr), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("object-items list root must accept a classdef-less pointer");
+        let SomeValue::List(list) = out else {
+            panic!("[PyObject] must project to SomeList, got {out:?}");
+        };
+        let SomeValue::Instance(item) = list.listdef.s_value() else {
+            panic!("object-items element must be an instance");
+        };
+        assert!(
+            item.classdef
+                .as_ref()
+                .is_some_and(|got| Rc::ptr_eq(got, &classdef)),
+            "object-items element must be the PyObject class"
+        );
+    }
+
+    #[test]
     fn call_builtin_unknown_name_errors() {
         let bk = bk();
         let err = call_builtin(&bk, "definitely_not_a_builtin", &[], &no_kwds()).unwrap_err();
