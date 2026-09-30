@@ -625,44 +625,56 @@ fn mmap_gfind(
             "{who} expected {bound} {limit} argument{plural}, got {nargs}"
         )));
     }
-    let obj = args[0];
     let _roots = pyre_object::gc_roots::push_roots();
+    // `acquire` pins the pattern into this scope, and the conversions below
+    // run `__index__`. The mapping and those arguments are reloaded from this
+    // pin; the argument slice itself is not read again after it.
+    let args_base = _roots.pin_roots(args);
     // Taken before the conversions below, which run `__index__`, and released
     // when this returns — the `Py_buffer` converter's export brackets the whole
     // call.  `interp_mmap.py find` snapshots `space.bufferstr_w(w_tofind)` here
     // instead, which neither sees an in-place edit made by one of those hooks
     // nor refuses a resize.
-    let pattern = unsafe { MmapPattern::acquire(args[1]) }?;
+    let pattern = unsafe { MmapPattern::acquire(_roots.get(args_base + 1)) }?;
     // `mmap_gfind_lock_held` takes the `self->pos` and `self->size` defaults
     // and performs its first `CHECK_VALID` before either conversion.
-    let (_, len_at_entry) = mmap_ptr(obj)?;
-    let cur = mmap_get_attr_i64(obj, "_pos") as usize;
-    let (start_raw, end_raw) = match args.get(2) {
-        Some(&start_obj) if !unsafe { pyre_object::is_none(start_obj) } => {
+    let (_, len_at_entry) = mmap_ptr(_roots.get(args_base))?;
+    let cur = mmap_get_attr_i64(_roots.get(args_base), "_pos") as usize;
+    // `end` is converted only when `start` is present and not `None`.
+    let (start_raw, end_raw) = if nargs >= 2 {
+        let start_obj = _roots.get(args_base + 2);
+        if unsafe { pyre_object::is_none(start_obj) } {
+            (None, None)
+        } else {
             // Both upstreams finish converting the optional arguments before
             // checking the mapping again.  In particular, an end conversion
             // still runs after the start conversion closes the mapping.
             let start = pyre_interpreter::baseobjspace::int_w(
                 pyre_interpreter::baseobjspace::space_index(start_obj)?,
             )?;
-            let end = match args.get(3) {
-                Some(&end_obj) if !unsafe { pyre_object::is_none(end_obj) } => {
+            let end = if nargs >= 3 {
+                let end_obj = _roots.get(args_base + 3);
+                if unsafe { pyre_object::is_none(end_obj) } {
+                    None
+                } else {
                     Some(pyre_interpreter::baseobjspace::int_w(
                         pyre_interpreter::baseobjspace::space_index(end_obj)?,
                     )?)
                 }
-                _ => None,
+            } else {
+                None
             };
             (Some(start), end)
         }
-        _ => (None, None),
+    } else {
+        (None, None)
     };
     // `rmmap.find` reads `self.data` and `self.size` at this point, after the
     // `check_valid()` that follows `getindex_w`: an `__index__` above is free
     // to `resize()` the mapping, which installs a new view at a new address.
     // Both the pointer and every bound are therefore taken from the mapping as
     // it is now.
-    let (p, len) = mmap_ptr(obj)?;
+    let (p, len) = mmap_ptr(_roots.get(args_base))?;
     let clamp = |v: i64| {
         if v < 0 {
             ((v + len as i64).max(0)) as usize

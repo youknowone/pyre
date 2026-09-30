@@ -5378,19 +5378,24 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         "recv_into() missing buffer",
                     ));
                 }
-                let obj = args[0];
-                let buf_obj = args[1];
+                let nargs = args.len();
                 let _roots = pyre_object::gc_roots::push_roots();
-                let mut buffer = { SocketWritableBuffer::acquire(buf_obj) }?;
+                // `acquire` pins the buffer into this scope. `socket_fd` and
+                // `socket_wait_readable` can run Python, so the socket is
+                // reloaded from the same pin; the argument slice is not read
+                // again after it.
+                let args_base = _roots.pin_roots(args);
+                let mut buffer = { SocketWritableBuffer::acquire(_roots.get(args_base + 1)) }?;
                 let slot = { buffer.as_mut_slice() };
                 let buf_len = slot.len();
-                let nbytes = if args.len() >= 3 {
-                    if !{ pyre_object::is_int(args[2]) } {
+                let nbytes = if nargs >= 3 {
+                    let nbytes_obj = _roots.get(args_base + 2);
+                    if !{ pyre_object::is_int(nbytes_obj) } {
                         return Err(pyre_interpreter::PyError::type_error(
                             "recv_into: nbytes must be an integer",
                         ));
                     }
-                    let raw = { pyre_object::w_int_get_value(args[2]) };
+                    let raw = { pyre_object::w_int_get_value(nbytes_obj) };
                     if raw < 0 {
                         return Err(pyre_interpreter::PyError::value_error(
                             "negative buffersize in recv_into",
@@ -5406,18 +5411,19 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         "buffer too small for requested bytes",
                     ));
                 }
-                let flags = if args.len() >= 4 {
-                    if !{ pyre_object::is_int(args[3]) } {
+                let flags = if nargs >= 4 {
+                    let flags_obj = _roots.get(args_base + 3);
+                    if !{ pyre_object::is_int(flags_obj) } {
                         return Err(pyre_interpreter::PyError::type_error(
                             "recv_into: flags must be an integer",
                         ));
                     }
-                    pyre_object::w_int_get_value(args[3]) as libc::c_int
+                    pyre_object::w_int_get_value(flags_obj) as libc::c_int
                 } else {
                     0
                 };
-                let fd = socket_fd(obj)?;
-                socket_wait_readable(obj, fd)?;
+                let fd = socket_fd(_roots.get(args_base))?;
+                socket_wait_readable(_roots.get(args_base), fd)?;
                 let got = loop {
                     let (r, errno) = socket_call(|| {
                         rffi::recv(fd, slot.as_mut_ptr() as *mut libc::c_void, nbytes, flags)
@@ -5427,7 +5433,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                     if !rffi::error_is_interrupted(errno) {
                         return Err(socket_io_err_for_operation(
-                            obj,
+                            _roots.get(args_base),
                             std::io::Error::from_raw_os_error(errno),
                         ));
                     }
@@ -5453,19 +5459,24 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         "recvfrom_into() missing buffer",
                     ));
                 }
-                let obj = args[0];
-                let buf_obj = args[1];
+                let nargs = args.len();
                 let _roots = pyre_object::gc_roots::push_roots();
-                let mut buffer = { SocketWritableBuffer::acquire(buf_obj) }?;
+                // `acquire` pins the buffer into this scope. `socket_fd` and
+                // `socket_wait_readable` can run Python, so the socket is
+                // reloaded from the same pin; the argument slice is not read
+                // again after it.
+                let args_base = _roots.pin_roots(args);
+                let mut buffer = { SocketWritableBuffer::acquire(_roots.get(args_base + 1)) }?;
                 let slot = { buffer.as_mut_slice() };
                 let buf_len = slot.len();
-                let nbytes = if args.len() >= 3 {
-                    if !{ pyre_object::is_int(args[2]) } {
+                let nbytes = if nargs >= 3 {
+                    let nbytes_obj = _roots.get(args_base + 2);
+                    if !{ pyre_object::is_int(nbytes_obj) } {
                         return Err(pyre_interpreter::PyError::type_error(
                             "recvfrom_into: nbytes must be an integer",
                         ));
                     }
-                    let raw = { pyre_object::w_int_get_value(args[2]) };
+                    let raw = { pyre_object::w_int_get_value(nbytes_obj) };
                     if raw < 0 {
                         return Err(pyre_interpreter::PyError::value_error(
                             "negative buffersize in recvfrom_into",
@@ -5481,20 +5492,21 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         "nbytes is greater than the length of the buffer",
                     ));
                 }
-                let flags = if args.len() >= 4 {
-                    if !{ pyre_object::is_int(args[3]) } {
+                let flags = if nargs >= 4 {
+                    let flags_obj = _roots.get(args_base + 3);
+                    if !{ pyre_object::is_int(flags_obj) } {
                         return Err(pyre_interpreter::PyError::type_error(
                             "recvfrom_into: flags must be an integer",
                         ));
                     }
-                    pyre_object::w_int_get_value(args[3]) as libc::c_int
+                    pyre_object::w_int_get_value(flags_obj) as libc::c_int
                 } else {
                     0
                 };
-                let fd = socket_fd(obj)?;
+                let fd = socket_fd(_roots.get(args_base))?;
                 let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-                socket_wait_readable(obj, fd)?;
+                socket_wait_readable(_roots.get(args_base), fd)?;
                 let got = loop {
                     let (r, errno) = socket_call(|| {
                         rffi::recvfrom(
@@ -5511,7 +5523,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                     if !rffi::error_is_interrupted(errno) {
                         return Err(socket_io_err_for_operation(
-                            obj,
+                            _roots.get(args_base),
                             std::io::Error::from_raw_os_error(errno),
                         ));
                     }

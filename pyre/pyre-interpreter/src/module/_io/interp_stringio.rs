@@ -413,9 +413,15 @@ impl W_StringIO {
         // one that does not fit is an OverflowError from the converter rather
         // than a value the range check below ever sees. The position is not:
         // 3.14 takes it as a `Py_ssize_t`, and `seek(2**32)` is a position it
-        // accepts. Both stay on the index protocol.
-        let pos = crate::baseobjspace::index_int_w_preserve_negative(w_pos)?;
-        let whence = crate::baseobjspace::index_c_int_w(w_whence)?;
+        // accepts. Both stay on the index protocol. The position conversion
+        // runs `__index__`, so whence is reloaded from this pin afterwards.
+        let arg_base = pyre_object::gc_roots::pin_roots(&[w_pos, w_whence]);
+        let pos = crate::baseobjspace::index_int_w_preserve_negative(
+            pyre_object::gc_roots::shadow_stack_get(arg_base),
+        )?;
+        let whence = crate::baseobjspace::index_c_int_w(pyre_object::gc_roots::shadow_stack_get(
+            arg_base + 1,
+        ))?;
         let this = Self::from_slot(slot);
         this.check_closed()?;
         if !(0..=2).contains(&whence) {

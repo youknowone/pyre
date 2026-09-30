@@ -12802,6 +12802,8 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
     // reread every use that crosses one of those calls.
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pin_slot(w_self);
+    // `pin_slot` normalises. Every later read is the slot, not the argument.
+    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
     let w_bases = pyre_object::typeobject::w_type_get_bases(w_self);
     validate_c3_mro(w_bases, true)?;
     let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
