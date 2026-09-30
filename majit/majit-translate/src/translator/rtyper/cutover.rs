@@ -2407,7 +2407,8 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if !lifted.insert(entry_ptr) {
             continue;
         }
-        install_source_graph(registry, key, graph, entry, signature, body);    }
+        install_source_graph(registry, key, graph, entry, signature, body);
+    }
     // Pass 3 — make impl methods visible in their owner's class dict.
     // RPython's ClassDesc reads methods straight off the class object
     // (`classdesc.py find_source_for` → `cls.__dict__[name]`):

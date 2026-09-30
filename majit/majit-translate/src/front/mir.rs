@@ -59819,7 +59819,7 @@ mod tests {
     fn type_parameter_fields_force_no_attribute_real() {
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let attrs = super::struct_field_attrs_of(&llbc);
+        let (_, _, _, _, _, attrs, _, _) = super::derive_program_metadata(&llbc);
         let field = |owner: &str, name: &str| {
             attrs
                 .get(owner)

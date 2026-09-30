@@ -283,39 +283,10 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
             )?;
             close_goto_mixed(graph, err_block, rewrap_target, rewrap_args);
         } else {
-            // A propagation edge raises the mapped carrier; the codewriter
-            // converts it into the runtime exception value
-            // (`codewriter::error_carrier_edges`).
-            let exc = mapped;
-            let last_exception = exceptional
-                .last_exception
-                .as_ref()
-                .and_then(LinkArg::as_variable)
-                .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exception"))?;
-            let last_exc_value = exceptional
-                .last_exc_value
-                .as_ref()
-                .and_then(LinkArg::as_variable)
-                .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exc_value"))?;
-            let args =
-                exceptional
-                    .args
-                    .iter()
-                    .map(|arg| -> Result<LinkArg, String> {
-                        Ok(match arg {
-                    LinkArg::Value(value) if value == last_exception || value == last_exc_value => {
-                        LinkArg::Value(exc.clone())
-                    }
-                    LinkArg::Value(value) => LinkArg::Value(
-                        map_source(&err_sources, &err_inputs, value).ok_or_else(|| {
-                            format!("{name}: exceptional map_err edge carries an unthreaded value")
-                        })?,
-                    ),
-                    LinkArg::Const(value) => LinkArg::Const(value.clone()),
-                })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-            close_goto_mixed(graph, err_block, exceptional.target, args);
+            // `raise mapped`. `exc_from_raise` records `etype = type(mapped)`
+            // and the exceptblock link. `codewriter::error_carrier_edges`
+            // rewrites that raise to `to_exc_object(mapped)`.
+            crate::front::exc_from_raise::set_raise_from_instance(graph, err_block, mapped);
         }
     } else {
         let err_result = emit_sum_variant(
@@ -361,53 +332,41 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
     Ok(())
 }
 
-/// Close `block` by raising the error carrier `carrier` along `exceptional`,
-/// the exception edge of a call `result_exc` made can-raise. The edge's
-/// `last_exception` / `last_exc_value` slots carry `carrier`; every other
-/// value is remapped through `sources` → `inputs`.
+/// Close `block` with `raise carrier`.
+///
+/// `exc_from_raise` records `etype = type(carrier)` and the `(etype, evalue)`
+/// link to `exceptblock`. `codewriter::error_carrier_edges` rewrites a raise
+/// of that shape to `to_exc_object(carrier)`. Copying `carrier` into both
+/// exception slots leaves no `type(evalue)` producer, so that pass treats the
+/// link as an already-materialised propagation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn raise_carrier_on_exception_edge(
     graph: &mut FunctionGraph,
     block: crate::model::BlockId,
     carrier: Variable,
     exceptional: &crate::model::Link,
-    sources: &[Variable],
-    inputs: &[Variable],
-    spec: crate::ErrorCarrierSpec<'_>,
+    _sources: &[Variable],
+    _inputs: &[Variable],
+    _spec: crate::ErrorCarrierSpec<'_>,
     name: &str,
 ) -> Result<(), String> {
-    let last_exception = exceptional
+    if exceptional.target != graph.exceptblock {
+        return Err(format!("{name}: carrier raise does not target exceptblock"));
+    }
+    if exceptional
         .last_exception
         .as_ref()
         .and_then(LinkArg::as_variable)
-        .ok_or_else(|| format!("{name}: exceptional edge lacks last_exception"))?;
-    let last_exc_value = exceptional
-        .last_exc_value
-        .as_ref()
-        .and_then(LinkArg::as_variable)
-        .ok_or_else(|| format!("{name}: exceptional edge lacks last_exc_value"))?;
-    // The edge carries the carrier. `codewriter::error_carrier_edges` turns
-    // it into the runtime exception value.
-    let _ = spec;
-    let exc = carrier;
-    let args = exceptional
-        .args
-        .iter()
-        .map(|arg| -> Result<LinkArg, String> {
-            Ok(match arg {
-                LinkArg::Value(value) if value == last_exception || value == last_exc_value => {
-                    LinkArg::Value(exc.clone())
-                }
-                LinkArg::Value(value) => {
-                    LinkArg::Value(map_source(sources, inputs, value).ok_or_else(|| {
-                        format!("{name}: exceptional edge carries an unthreaded value")
-                    })?)
-                }
-                LinkArg::Const(value) => LinkArg::Const(value.clone()),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    close_goto_mixed(graph, block, exceptional.target, args);
+        .is_none()
+        || exceptional
+            .last_exc_value
+            .as_ref()
+            .and_then(LinkArg::as_variable)
+            .is_none()
+    {
+        return Err(format!("{name}: exceptional edge lacks its exception pair"));
+    }
+    crate::front::exc_from_raise::set_raise_from_instance(graph, block, carrier);
     Ok(())
 }
 
@@ -850,15 +809,28 @@ mod tests {
                 })
             })
             .expect("Err arm must call the mapper");
-        // `raise mapped`: the carrier itself; the codewriter materialises
-        // the runtime exception object (`codewriter::error_carrier_edges`).
-        let mapped = err_arm
+        // `raise mapped`: `etype = type(mapped)`, then the exceptblock link.
+        // The codewriter rewrites that raise to `to_exc_object(mapped)`.
+        let type_of = err_arm
             .operations
             .last()
-            .and_then(|op| op.result.clone())
-            .expect("the mapped carrier is the arm's last value");
+            .expect("type(mapped) closes the raise");
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &type_of.kind
+        else {
+            panic!("raise records type(mapped)");
+        };
+        assert_eq!(segments.as_slice(), ["type".to_string()]);
+        let mapped = args[0].as_variable().expect("type() reads the carrier");
         assert_eq!(err_arm.exits.len(), 1);
         assert_eq!(err_arm.exits[0].target, graph.exceptblock);
-        assert_eq!(err_arm.exits[0].args[1].as_variable(), Some(&mapped));
+        assert_eq!(
+            err_arm.exits[0].args[0].as_variable(),
+            type_of.result.as_ref()
+        );
+        assert_eq!(err_arm.exits[0].args[1].as_variable(), Some(mapped));
     }
 }

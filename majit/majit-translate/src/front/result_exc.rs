@@ -4809,7 +4809,7 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(m, returnblock, vec![ret]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+            lower_result_exc_returns(&mut graph, 0)
                 .expect("a consumed payload-less Err does not decline the callee"),
             1
         );
@@ -4833,7 +4833,7 @@ mod static_result_shell_tests {
         let (mut graph, m, pair) = tagged_pair_graph();
         let returnblock = graph.returnblock;
         graph.set_goto(m, returnblock, vec![pair]);
-        let err = lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+        let err = lower_result_exc_returns(&mut graph, 0)
             .expect_err("a returned Err without an exception value cannot lower");
         assert!(err.contains("Result Err ctor without a __pos_0 payload write"));
     }
