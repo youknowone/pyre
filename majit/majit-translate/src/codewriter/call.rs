@@ -9135,11 +9135,18 @@ fn user_path_behind_majit_call_target(path: &CallPath) -> Option<CallPath> {
 }
 
 /// `call.py` `guess_call_kind` rejects `rposix._get_errno` and
-/// `rposix._set_errno` by function-object identity. Those helpers live at
-/// `majit_rlib::rposix::{_get_errno,_set_errno}`.
+/// `rposix._set_errno` by function-object identity. Call sites spell
+/// those two helpers as `majit_rlib::rposix::{_get_errno,_set_errno}`
+/// (`name_path()` split on `::`). A different crate's `rposix` module
+/// is not those function objects.
 fn is_rposix_errno_helper(path: &CallPath) -> bool {
-    let errno = matches!(path.last_segment(), Some("_get_errno") | Some("_set_errno"));
-    errno && path.segments.iter().any(|seg| seg == "rposix")
+    matches!(
+        path.segments.as_slice(),
+        [crate_name, module, leaf]
+            if crate_name == "majit_rlib"
+                && module == "rposix"
+                && matches!(leaf.as_str(), "_get_errno" | "_set_errno")
+    )
 }
 
 pub(crate) fn is_dont_look_inside_residual_helper(path: &CallPath) -> bool {
@@ -11632,6 +11639,22 @@ mod tests {
         assert_eq!(
             cc.guess_call_kind(&direct_call_op(CallTarget::function_path([
                 "other",
+                "_get_errno"
+            ]))),
+            CallKind::Regular
+        );
+    }
+
+    #[test]
+    fn guess_call_kind_allows_application_rposix_get_errno() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["application", "rposix", "_get_errno"]);
+        cc.register_function_graph(path, FunctionGraph::new("_get_errno"));
+        cc.find_all_graphs_for_tests();
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::function_path([
+                "application",
+                "rposix",
                 "_get_errno"
             ]))),
             CallKind::Regular
