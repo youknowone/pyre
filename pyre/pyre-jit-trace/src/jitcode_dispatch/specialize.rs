@@ -14115,6 +14115,9 @@ fn walker_emit_jit_int_str_padded<Sym: WalkSym>(
     pad: Option<IntStrPad>,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    // A declined `newutf8` walk must not leave `ll_int2dec` ahead of the
+    // residual format.
+    let pre_emit = ctx.trace_ctx.get_trace_position();
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     walker_guard_class(ctx, op_pc, operand, int_type_addr)?;
@@ -14188,7 +14191,11 @@ fn walker_emit_jit_int_str_padded<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(length, majit_ir::Value::Int(concrete_len));
 
-    walker_wrap_int_str_payload(ctx, op_pc, payload, length, pad, boxed_result, dst)?;
+    if walker_wrap_int_str_payload(ctx, op_pc, payload, length, pad, boxed_result, dst)?.is_none() {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
     Ok(Some(()))
 }
 
@@ -14277,7 +14284,7 @@ fn walker_wrap_int_str_payload<Sym: WalkSym>(
     pad: Option<IntStrPad>,
     boxed_result: pyre_object::PyObjectRef,
     dst: usize,
-) -> Result<(), DispatchError> {
+) -> Result<Option<()>, DispatchError> {
     let (storage, wrap_len) = match pad {
         None => (payload, length),
         Some(IntStrPad::Fill { fill, width, left }) => {
@@ -14333,31 +14340,12 @@ fn walker_wrap_int_str_payload<Sym: WalkSym>(
         }
     };
 
-    let wrapped = if let Some(descended) =
-        try_walker_orthodox_newutf8(ctx, op_pc, storage, wrap_len, boxed_result)?
-    {
-        descended
-    } else {
-        // Fold fallback: residual wrap.  The generated `newutf8` is
-        // look-inside `malloc_typed_managed` so a descent records
-        // NewWithVtable; this emit is only reached when that walk declines.
-        let wrap = pyre_object::unicodeobject::jit_w_str_from_storage_and_length as *const ();
-        let wrapped = ctx.trace_ctx.call_typed_with_effect(
-            OpCode::CallR,
-            wrap,
-            &[storage, wrap_len],
-            &[majit_ir::Type::Ref, majit_ir::Type::Int],
-            majit_ir::Type::Ref,
-            majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
-        );
-        ctx.trace_ctx.set_opref_concrete(
-            wrapped,
-            majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
-        );
-        wrapped
+    let Some(wrapped) = try_walker_orthodox_newutf8(ctx, op_pc, storage, wrap_len, boxed_result)?
+    else {
+        return Ok(None);
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', wrapped)?;
-    Ok(())
+    Ok(Some(()))
 }
 
 /// Descend `space.newutf8` / `W_UnicodeObject.__init__` instead of the
