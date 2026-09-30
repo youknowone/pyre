@@ -6850,6 +6850,15 @@ struct Lowering<'a> {
     /// Parameter locals declared `&mut T` where `T` is a GC reference.
     /// The local holds the one-field cell, not the reference word.
     gc_mut_ref_params: std::collections::HashSet<usize>,
+    /// MIR locals whose value is the address of a primitive, produced by a
+    /// call that returns `&T` / `&mut T` (`MutexGuard::deref` → `&bool`).
+    ///
+    /// `Rvalue::Ref` does not enter: that borrow aliases the scalar, and
+    /// [`Lowering::atomic_ref_place`] already names the place. A copy or
+    /// move of one of these locals carries the same address. Only locals
+    /// outside [`Lowering::multi_assigned_locals`] enter, for the same
+    /// reason as [`Lowering::atomic_ref_place`].
+    scalar_address_locals: Vec<usize>,
     /// MIR locals bound to a `core::sync::atomic::Ordering` value, mapped to
     /// the variant's name.
     ///
@@ -7450,6 +7459,7 @@ impl<'a> Lowering<'a> {
             index_elem_alias: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
             gc_mut_ref_params,
+            scalar_address_locals: Vec::new(),
             atomic_ordering_locals: std::collections::HashMap::new(),
             spec: None,
             spec_body: false,
@@ -8454,6 +8464,16 @@ impl<'a> Lowering<'a> {
                         if self.raw_primitive_reborrow_inner(&place).is_none() {
                             self.atomic_ref_place.insert(i as usize, place);
                         }
+                    }
+                    // `_j = copy _i` where `_i` is a call's `&T`. The copy
+                    // is that same address (`Rvalue::Use` aliases the
+                    // Variable), so `*_j` still has to `RawLoad`.
+                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                        && let PlaceKind::Local(src_local) = src.kind
+                        && self.scalar_address_locals.contains(&(src_local as usize))
+                        && !self.scalar_address_locals.contains(&(i as usize))
+                    {
+                        self.scalar_address_locals.push(i as usize);
                     }
                     // `_i = Ordering::<V>` — the ordering the store arm has
                     // to read before it may fold.
@@ -11852,22 +11872,28 @@ impl<'a> Lowering<'a> {
                         }
                     }
                 }
-                // `*(p as *const i64)` reads one primitive at that
-                // address. `jtransform.py` `rewrite_op_raw_load` emits
-                // `raw_load_<kind>` and `history.py` `getkind` banks the
-                // loaded word as `int` (signed), `int` (unsigned / bool)
-                // or `float`. Aliasing `p` returns the pointer, which
-                // this front end banks as `Ref`, so a function declared
-                // to return the word disagrees with its CFG. A reference
-                // deref stays the collapse below: `Rvalue::Ref` already
-                // aliased the scalar, and loading through it would treat
-                // that word as an address. A raw pointer bound by
-                // `&raw` of a scalar place is that same alias, so a local
-                // on `atomic_ref_place` is excluded. `&raw const *p` of an
-                // address is not recorded there.
+                // `*(p as *const i64)` and `*guard` where `guard: &bool`
+                // came back from a call (`MutexGuard::deref`) read one
+                // primitive at that address. `jtransform.py`
+                // `rewrite_op_raw_load` emits `raw_load_<kind>` and
+                // `history.py` `getkind` banks the loaded word as `int`
+                // (signed), `int` (unsigned / bool) or `float`. Aliasing
+                // `p` returns the pointer, which this front end banks as
+                // `Ref`, so a function declared to return the word
+                // disagrees with its CFG. A reference `Rvalue::Ref` already
+                // aliased is that word, and loading through it would treat
+                // the word as an address — those locals sit on
+                // `atomic_ref_place` and are excluded. A call result is not
+                // that alias: it is recorded on `scalar_address_locals`.
+                // `&raw const *p` of an address is not recorded as an alias.
+                let scalar_address = matches!(
+                    inner.kind,
+                    PlaceKind::Local(local)
+                        if self.scalar_address_locals.contains(&(local as usize))
+                );
                 if let ProjectionElem::Atom(name) = &elem
                     && name == "Deref"
-                    && tyref_is_raw_pointer(&inner.ty, self.llbc)
+                    && (tyref_is_raw_pointer(&inner.ty, self.llbc) || scalar_address)
                     && !matches!(inner.kind, PlaceKind::Local(local)
                         if self.atomic_ref_place.contains_key(&(local as usize)))
                     && tyref_is_primitive_scalar(&place_ty, self.llbc)
@@ -18594,6 +18620,19 @@ impl<'a> Lowering<'a> {
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.local_var[dest_local] = Some(result_var.clone());
+        // A call returning `&T` / `&mut T` for a primitive `T` yields the
+        // address, not the word `Rvalue::Ref` would have aliased.
+        // `*dest` is then `rewrite_op_raw_load` and `history.getkind` of
+        // the loaded bool / int is `int`. A raw pointer stays on the
+        // raw-pointer arm and is not recorded here.
+        if matches!(op_kind, OpKind::Call { .. })
+            && !self.multi_assigned_locals.contains(&dest_local)
+            && !tyref_is_raw_pointer(&call.dest.ty, self.llbc)
+            && tyref_scalar_pointee_value_type(&call.dest.ty, self.llbc).is_some()
+            && !self.scalar_address_locals.contains(&dest_local)
+        {
+            self.scalar_address_locals.push(dest_local);
+        }
         // Last-write-wins: a residual Call is not `as_bytes` /
         // `w_str_get_wtf8`.  Those arms mark dest and return above.
         // `as_bytes()[a..b]` falls through as `__getslice_*`, not a
