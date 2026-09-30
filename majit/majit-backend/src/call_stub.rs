@@ -23,9 +23,8 @@ use majit_jitcode::jitcode::{BhCallDescr, BhCallStub};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArgClass {
     Int,
-    /// GCREF. A 64-bit integer register on SysV/AAPCS, an `i32` pointer on
-    /// wasm32. The two stay distinct so a wasm `call_indirect` uses the
-    /// callee's real parameter type.
+    /// GCREF. Staged wrappers pass it as an `i64` word, including on wasm32.
+    /// A callee whose table type is a real `i32` pointer is host-reflected.
     Ref,
     Float,
 }
@@ -68,7 +67,7 @@ macro_rules! invoke_ty {
         i64
     };
     (Ref) => {
-        i32
+        i64
     };
     (Float) => {
         f64
@@ -94,7 +93,7 @@ macro_rules! invoke_arg {
         $a[$i]
     };
     (Ref, $a:ident, $i:tt) => {
-        $a[$i] as i32
+        $a[$i]
     };
     (Float, $a:ident, $i:tt) => {
         f64::from_bits($a[$i] as u64)
@@ -911,24 +910,6 @@ macro_rules! define_call_sig_stubs {
             }
         }
 
-        /// wasm32 GCREF result: the callee returns `i32`; the blackhole word
-        /// is that pointer zero-extended.
-        #[cfg(target_arch = "wasm32")]
-        fn lookup_stub_ptr(classes: &[ArgClass]) -> unsafe fn(usize, &[i64]) -> i64 {
-            match classes {
-                $(
-                    [$(ArgClass::$class),*] => {
-                        unsafe fn stub(func: usize, args: &[i64]) -> i64 {
-                            let v: i32 = unsafe { invoke_stub!(func, args, i32 $(, $class)*) };
-                            v as u32 as i64
-                        }
-                        stub
-                    }
-                )*
-                classes => unsupported_call_sig(classes),
-            }
-        }
-
         fn lookup_stub_f(classes: &[ArgClass]) -> unsafe fn(usize, &[i64]) -> f64 {
             match classes {
                 $(
@@ -995,6 +976,26 @@ call_sig_table!(define_call_sig_stubs);
 /// wasm32 `call_indirect` type-checks the callee. The descr class list is not
 /// that type: published targets are widening `i64` shims, raw pointers are
 /// `i32`. The host reads the table signature. Native keeps the stub.
+/// The static stub table has every sequence through arity 5, all-`Int` and
+/// all-`Ref` through [`MAX_HOST_CALL_ARITY`], and mixed `Int`/`Ref` through
+/// arity 7. A float appears only through arity 5.
+pub fn call_stub_arm_exists(classes: &[ArgClass]) -> bool {
+    let n = classes.len();
+    if n > MAX_HOST_CALL_ARITY {
+        return false;
+    }
+    let has_float = classes.contains(&ArgClass::Float);
+    let has_ref = classes.contains(&ArgClass::Ref);
+    let has_int = classes.contains(&ArgClass::Int);
+    if has_float {
+        return n <= 5;
+    }
+    if has_ref && has_int {
+        return n <= 7;
+    }
+    true
+}
+
 fn wasm_residual_host_call(
     func: usize,
     args: &[i64],
@@ -1016,9 +1017,8 @@ pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
     unsafe { (lookup_stub_i(classes))(func, args) }
 }
 
-/// `llmodel.py bh_call_r`. On wasm32 the callee returns an `i32` pointer,
-/// zero-extended into the blackhole word. Elsewhere the pointer is already
-/// an `i64`.
+/// `llmodel.py bh_call_r`. The staged wrapper returns the pointer as an `i64`
+/// word. A table type that is a real `i32` is host-reflected.
 ///
 /// # Safety
 /// `func` must match `classes`, and its result must be a GCREF.
@@ -1033,7 +1033,7 @@ pub unsafe fn bh_call_r_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
         if let Some(result) = wasm_residual_host_call(func, args, classes, 'r') {
             return result;
         }
-        unsafe { (lookup_stub_ptr(classes))(func, args) }
+        unsafe { (lookup_stub_i(classes))(func, args) }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -1241,9 +1241,8 @@ pub fn create_call_stub(arg_classes: &str, result_type: char) -> BhCallStub {
     let classes = &classes_buf[..arity as usize];
     let call_i = {
         #[cfg(target_arch = "wasm32")]
-        if result_type == 'r' {
-            lookup_stub_ptr(classes)
-        } else {
+        {
+            let _ = result_type;
             lookup_stub_i(classes)
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -1762,6 +1761,23 @@ mod tests {
     #[should_panic(expected = "is not one of \"r\"")]
     fn verify_result_type_rejects_the_default_descr_s_null_result_type() {
         verify_result_type('\0', "r");
+    }
+
+    #[test]
+    fn mixed_int_ref_past_arity_7_has_no_stub_arm() {
+        assert!(!call_stub_arm_exists(&[
+            ArgClass::Int,
+            ArgClass::Ref,
+            ArgClass::Int,
+            ArgClass::Ref,
+            ArgClass::Int,
+            ArgClass::Ref,
+            ArgClass::Int,
+            ArgClass::Ref,
+        ]));
+        assert!(call_stub_arm_exists(&[ArgClass::Int; 8]));
+        assert!(call_stub_arm_exists(&[ArgClass::Ref; 8]));
+        assert!(!call_stub_arm_exists(&[ArgClass::Float; 6]));
     }
 
     /// Mixed `i`/`r` past arity 7 has no stub-table arm. The host hook must run

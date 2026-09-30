@@ -3295,6 +3295,9 @@ fn stub_matches_table(
     use func_sig::FuncSigVal;
     use majit_backend::call_stub::ArgClass;
 
+    if !majit_backend::call_stub::call_stub_arm_exists(classes) {
+        return false;
+    }
     let Some(sig) = residual_target_sig(func_ptr as i64) else {
         return false;
     };
@@ -3303,8 +3306,7 @@ fn stub_matches_table(
     }
     for (param, class) in sig.params.iter().zip(classes) {
         let expect = match class {
-            ArgClass::Int => FuncSigVal::I64,
-            ArgClass::Ref => FuncSigVal::I32,
+            ArgClass::Int | ArgClass::Ref => FuncSigVal::I64,
             ArgClass::Float => FuncSigVal::F64,
         };
         if *param != expect {
@@ -3315,9 +3317,8 @@ fn stub_matches_table(
     // returns those bits and the float bank stores them.
     let expect_result = match result {
         'v' => None,
-        'r' => Some(FuncSigVal::I32),
+        'r' | 'i' => Some(FuncSigVal::I64),
         'f' => Some(FuncSigVal::F64),
-        'i' => Some(FuncSigVal::I64),
         _ => return false,
     };
     sig.result == expect_result
