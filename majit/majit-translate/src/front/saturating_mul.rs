@@ -151,7 +151,7 @@ fn rewire_one_saturating_mul_site(
     graph.block_mut(a_id).operations.push(SpaceOperation {
         result: Some(lo.clone()),
         kind: OpKind::BinOp {
-            op: "mul".to_string(),
+            op: "uint_mul".to_string(),
             lhs: factor_a.clone(),
             rhs: factor_b.clone(),
             result_ty: ValueType::Unsigned,
@@ -177,7 +177,7 @@ fn rewire_one_saturating_mul_site(
     graph.block_mut(a_id).operations.push(SpaceOperation {
         result: Some(ovf.clone()),
         kind: OpKind::BinOp {
-            op: "ne".to_string(),
+            op: "eq".to_string(),
             lhs: high,
             rhs: zero,
             result_ty: ValueType::Int,
@@ -220,7 +220,9 @@ fn rewire_one_saturating_mul_site(
     )?;
     close_goto_mixed(graph, else_bb, b_target, else_link_args);
 
-    graph.set_branch(a_id, ovf, then_bb, carried, else_bb, else_sources);
+    // `eq` is true when the high word is zero, so the product arm is
+    // the true target. `uint_ne` never binds a bool in the annotator.
+    graph.set_branch(a_id, ovf, else_bb, else_sources, then_bb, carried);
     Ok(())
 }
 
@@ -276,7 +278,7 @@ mod tests {
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::BinOp { op, .. } if op == "mul"
+                OpKind::BinOp { op, .. } if op == "uint_mul"
             )),
             "A wrapping-muls a * b"
         );
@@ -290,7 +292,7 @@ mod tests {
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::BinOp { op, .. } if op == "ne"
+                OpKind::BinOp { op, .. } if op == "eq"
             )),
             "A tests the high word against zero"
         );

@@ -496,6 +496,15 @@ fn lower_result_exc_returns_inner(
     // `Ok` payloads extracted below are already `T`. A later forward of
     // one of them must not be unwrapped a second time.
     let mut ok_payloads: std::collections::HashSet<Variable> = std::collections::HashSet::new();
+    // This pass runs only for a `Result<T, PyError>` callee. The codewriter
+    // converts the raised carrier (`error_carrier_edges`), so the splitter
+    // names that carrier and does not emit `to_exc_object`.
+    let spec = crate::ErrorCarrierSpec {
+        carrier_path: "pyre_interpreter::error::PyError",
+        carrier_wrappers: &[],
+        to_exc_object: None,
+        from_exc_object: None,
+    };
     for bi in 0..nblocks {
         let block_id = crate::model::BlockId(bi);
         // Locate a Result ctor in this block.
@@ -1376,7 +1385,7 @@ fn unwrap_forwarded_carrier_returns(
     }
     let split = sites.len();
     for (bi, ei, positions) in sites {
-        split_forwarded_return(graph, bi, ei, &positions, spec)?;
+        split_forwarded_return(graph, bi, ei, &positions)?;
     }
     Ok(split)
 }
@@ -1613,7 +1622,6 @@ fn split_forwarded_return(
     block: usize,
     exit_index: usize,
     positions: &[usize],
-    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<(), String> {
     let arity = graph.blocks[block].exits[exit_index].args.len();
     if positions.is_empty() || positions.iter().any(|pos| *pos >= arity) {
@@ -1683,8 +1691,7 @@ fn split_forwarded_return(
         RESULT_ERR_TEMPLATE,
         ValueType::Ref(None),
     );
-    let exc = materialize_error_to_exc_object(graph, err_bb, err_payload, spec);
-    crate::front::exc_from_raise::set_raise_from_instance(graph, err_bb, exc);
+    crate::front::exc_from_raise::set_raise_from_instance(graph, err_bb, err_payload);
     Ok(())
 }
 
@@ -4353,6 +4360,8 @@ fn catch_and_rewrap(
         // `from_exc_object`.
         let payload_dead = err_payload_is_dead(graph, &orig, r);
         if payload_dead {
+            // Nothing reads a dead payload, so the shell is the discriminant
+            // ctor alone and the collapse below does not run.
             let shell = build_result_ctor(graph, e_id, "Err", suffix);
             (Some(shell), None)
         } else {
@@ -8258,7 +8267,7 @@ mod static_result_shell_tests {
         let (mut graph, payload, ctor, forwarded) =
             mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, carrier_spec()).expect("mixed forward lowers"),
+            lower_result_exc_returns(&mut graph, 0).expect("mixed forward lowers"),
             2
         );
         let returned = return_link_values(&graph);
@@ -8273,48 +8282,34 @@ mod static_result_shell_tests {
                 .iter()
                 .any(|link| link.target == graph.exceptblock)
         }));
-        assert!(
-            graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            ..
-                        } if segments == &["carrier".to_string(), "to_exc_object".to_string()]
-                    )
-                })
-        );
     }
 
     #[test]
-    fn forwarded_shell_without_a_carrier_is_not_rewritten() {
+    fn forwarded_pyerror_shell_is_split() {
         let (mut graph, entry, forwarded) =
             forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
-        let err = lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
-            .expect_err("empty carrier has nothing to rewrite");
-        assert!(err.contains("no rewritable returns"));
-        assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
         assert_eq!(
-            graph.blocks[entry.0].exits[0].args,
-            vec![LinkArg::Value(forwarded)]
+            lower_result_exc_returns(&mut graph, 0).expect("PyError shell splits"),
+            1
+        );
+        assert_ne!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
+        assert!(
+            !return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
         );
     }
 
     #[test]
-    fn mixed_forward_keeps_the_shell_when_no_carrier_is_declared() {
+    fn mixed_forward_splits_the_pyerror_shell() {
         let (mut graph, _payload, _ctor, forwarded) =
             mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
-                .expect("the ctor still lowers"),
-            1
+            lower_result_exc_returns(&mut graph, 0).expect("ctor and shell lower"),
+            2
         );
         assert!(
-            return_link_values(&graph)
+            !return_link_values(&graph)
                 .iter()
                 .any(|var| *var == forwarded)
         );
@@ -8323,7 +8318,7 @@ mod static_result_shell_tests {
     #[test]
     fn result_ok_payload_read_is_not_a_forwarded_shell() {
         let (mut graph, entry, forwarded) = forward_only_graph("Result<*mut PyObject,PyError>::Ok");
-        let err = lower_result_exc_returns(&mut graph, 0, carrier_spec())
+        let err = lower_result_exc_returns(&mut graph, 0)
             .expect_err("an Ok payload read is already T");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
@@ -8338,7 +8333,7 @@ mod static_result_shell_tests {
     fn option_of_a_different_error_is_not_split() {
         let (mut graph, entry, forwarded) =
             forward_only_graph("Option<Result<i64,Utf8Error>>::Some");
-        let err = lower_result_exc_returns(&mut graph, 0, carrier_spec())
+        let err = lower_result_exc_returns(&mut graph, 0)
             .expect_err("Utf8Error is not the carrier");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
@@ -8413,7 +8408,7 @@ mod static_result_shell_tests {
         let ctor = push_ok_ctor(&mut graph, entry, forwarded.clone());
         graph.set_goto(entry, graph.returnblock, vec![ctor]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, carrier_spec())
+            lower_result_exc_returns(&mut graph, 0)
                 .expect("the ctor lowers and the payload stays"),
             1
         );
@@ -8430,7 +8425,7 @@ mod static_result_shell_tests {
         let (mut graph, _entry, forwarded) =
             forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, carrier_spec()).expect("forward lowers"),
+            lower_result_exc_returns(&mut graph, 0).expect("forward lowers"),
             1
         );
         assert!(

@@ -797,6 +797,9 @@ impl Drop for FallbackEcGuard {
 /// threadlocals slot is empty, `enter_thread` / `createexecutioncontext`
 /// installs one. Used by `repr_enter` so a missing EC is not treated
 /// as "already in repr" and is not a silent first-enter without a set.
+/// `dont_look_inside`: the fallback `RefCell` lives in a function-local
+/// thread-local, and that `.with` has no extractable graph.
+#[majit_macros::dont_look_inside]
 pub fn ensure_executioncontext() -> *const crate::PyExecutionContext {
     let existing = take_last_exec_ctx();
     if !existing.is_null() {

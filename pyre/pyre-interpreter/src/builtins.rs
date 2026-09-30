@@ -12917,9 +12917,9 @@ pub unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, crate::P
     if maxdigits != 0 {
         let bits = value.bits();
         let decimal_digits_lower_bound = if bits == 0 {
-            1
+            1u64
         } else {
-            ((bits - 1).saturating_mul(30_103) / 100_000) + 1
+            ((bits - 1).saturating_mul(30_103u64) / 100_000u64) + 1u64
         };
         if decimal_digits_lower_bound > maxdigits as u64 {
             return Err(too_long(maxdigits));

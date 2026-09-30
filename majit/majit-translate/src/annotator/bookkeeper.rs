@@ -3572,6 +3572,23 @@ impl Bookkeeper {
         match &c.value {
             ConstValue::List(items) => self.immutable_list_with_key(Some(c), &c.value, items),
             ConstValue::Dict(items) => self.immutable_dict_with_key(Some(c), &c.value, items),
+            // `ConstUInt` is stored as `ConstValue::Int` with
+            // `concretetype = Unsigned` (`flowspace_adapter`). The value
+            // branch only sees the signed carrier, so `u64::MAX` becomes
+            // `-1` and a later `r_uint` binding no longer contains it.
+            ConstValue::Int(i)
+                if matches!(
+                    c.concretetype,
+                    Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Unsigned)
+                ) =>
+            {
+                let mut s = SomeInteger::new(true, true);
+                s.base.const_box = Some(Constant::with_concretetype(
+                    ConstValue::Int(*i),
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Unsigned,
+                ));
+                Ok(SomeValue::Integer(s))
+            }
             _ => self.immutablevalue(&c.value),
         }
     }

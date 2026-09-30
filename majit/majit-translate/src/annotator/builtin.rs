@@ -1729,6 +1729,23 @@ fn cast_instance_intrinsic(
     let can_be_none = match operand {
         SomeValue::Instance(_) | SomeValue::None_(_) => operand_can_be_none,
         SomeValue::Ptr(_) | SomeValue::Address(_) => false,
+        // `addr_of_mut!((*entries).items).cast()` reads `[Entry; 0]`.
+        // The field projects as a list of `Impossible`. The cast target
+        // is `*mut Entry`, the address of that tail.
+        SomeValue::List(list) => {
+            let item = list.listdef.read_item(None);
+            if !matches!(item, SomeValue::Impossible) {
+                return Err(AnnotatorError::new(format!(
+                    "__cast_instance_intrinsic: non-pointer operand for root {root:?}: {operand:?}"
+                )));
+            }
+            let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
+            return Ok(SomeValue::Instance(super::model::SomeInstance::new(
+                Some(classdef),
+                operand_can_be_none,
+                std::collections::BTreeMap::new(),
+            )));
+        }
         other => {
             // A root the bookkeeper models as a list or string (a
             // `FixedObjectArray` projected to its `_items` element list,
@@ -2082,10 +2099,24 @@ fn lltype_direct_ptradd(
     let s_p = arg_at(args_s, 0, "lltype.direct_ptradd");
     match s_p {
         SomeValue::Ptr(_) => Ok(s_p.clone()),
+        // `alloc_zeroed` returns `*mut u8`. That bank is `Ref(None)`,
+        // shelled as a classdef-less instance. The add result is a raw
+        // pointer.
+        SomeValue::Instance(inst) if inst.classdef.is_none() => Ok(raw_alloc_ptr_somevalue()),
         other => Err(AnnotatorError::new(format!(
             "direct_ptradd of non-pointer: {other:?}"
         ))),
     }
+}
+
+fn raw_alloc_ptr_somevalue() -> SomeValue {
+    use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr, SomePtr};
+    let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
+    let placeholder_ptr = Ptr::from_container_type(
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Opaque(Box::new(opaque)),
+    )
+    .expect("Opaque container yields a valid Ptr");
+    SomeValue::Ptr(SomePtr::new(placeholder_ptr))
 }
 
 /// Upstream `ann_cast_int_to_ptr(PtrT, s_int)`

@@ -59,22 +59,33 @@ const PERTURB_SHIFT: u32 = 5;
 /// Walk live `d.entries` slots with `ll_getitem_fast`, not
 /// `Enumerate` / `FilterMap`.
 pub struct LiveIter<'a, K, V> {
-    entries: &'a [Entry<K, V>],
-    front: usize,
+    entries: *const Entry<K, V>,
     back: usize,
+    front: usize,
+    _mark: std::marker::PhantomData<&'a Entry<K, V>>,
 }
+
+unsafe impl<K: Send, V: Send> Send for LiveIter<'_, K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for LiveIter<'_, K, V> {}
 
 impl<'a, K, V> LiveIter<'a, K, V> {
     fn new(entries: &'a [Entry<K, V>]) -> Self {
+        Self::from_ptr(entries.as_ptr(), entries.len())
+    }
+
+    /// `ll_getitem_fast` over `entries[0:num_ever_used_items]`. The prefix
+    /// is a pointer plus a length, not `slice::from_raw_parts`.
+    fn from_ptr(entries: *const Entry<K, V>, len: usize) -> Self {
         Self {
             entries,
             front: 0,
-            back: entries.len(),
+            back: len,
+            _mark: std::marker::PhantomData,
         }
     }
 
     fn entry_at(&self, i: usize) -> Option<(&'a K, &'a V)> {
-        let e = &self.entries[i];
+        let e = unsafe { &*self.entries.add(i) };
         if e.f_valid {
             Some((&e.key, &e.value))
         } else {
@@ -147,7 +158,10 @@ pub struct LiveKeys<'a, K, V> {
 impl<'a, K, V> Iterator for LiveKeys<'a, K, V> {
     type Item = &'a K;
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, _)| k)
+        match self.inner.next() {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
     }
 }
 
@@ -577,6 +591,14 @@ impl<K, V, S> RDict<K, V, S> {
         Some((&e.key, &e.value))
     }
 
+    /// `entries[i].key` without building the `(key, value)` pair.
+    pub fn slot_key(&self, slot: usize) -> Option<&K> {
+        if slot >= self.num_ever_used_items || !self.entry_valid(slot) {
+            return None;
+        }
+        Some(&self.entry_at(slot).key)
+    }
+
     #[inline]
     pub fn get_slot_mut(&mut self, slot: usize) -> Option<(&K, &mut V)> {
         if slot >= self.num_ever_used_items {
@@ -607,7 +629,7 @@ impl<K, V, S> RDict<K, V, S> {
 
     pub fn keys(&self) -> LiveKeys<'_, K, V> {
         LiveKeys {
-            inner: LiveIter::new(self.used_entries()),
+            inner: LiveIter::from_ptr(self.entry_ptr(), self.num_ever_used_items),
         }
     }
 

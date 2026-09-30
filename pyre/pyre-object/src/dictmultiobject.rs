@@ -567,7 +567,10 @@ pub unsafe fn dict_entries_key_obj_at(
     entries: &ObjectDictStorage,
     index: usize,
 ) -> Option<PyObjectRef> {
-    entries.get_slot(index).map(|(stored, _)| stored.obj)
+    match entries.slot_key(index) {
+        Some(stored) => Some(stored.obj),
+        None => None,
+    }
 }
 
 /// The stored key's cached digest at an entry index — `rordereddict.py:1053
@@ -580,7 +583,10 @@ pub unsafe fn dict_entries_key_obj_at(
 /// # Safety
 /// Same as [`dict_entries_value_at`].
 pub unsafe fn dict_entries_key_hash_at(entries: &ObjectDictStorage, index: usize) -> i64 {
-    entries.get_slot(index).unwrap().0.hash
+    match entries.slot_key(index) {
+        Some(stored) => stored.hash,
+        None => 0,
+    }
 }
 
 /// `d.num_ever_used_items` — the bound of a slot walk, and not the pair count
