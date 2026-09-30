@@ -2393,8 +2393,9 @@ fn raise_returned_from_residual(
         .map_err(|err| format!("{name}: {err}"))?;
     graph.blocks[block].operations.remove(op_idx);
     let block_id = crate::model::BlockId(block);
-    let v_exc = materialize_error_to_exc_object(graph, block_id, carrier, spec);
-    crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, v_exc);
+    // `return from_residual(e)` → `raise e`. The codewriter converts
+    // the raised carrier (`codewriter::error_carrier_edges`).
+    crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, carrier);
     Ok(())
 }
 
@@ -2407,6 +2408,7 @@ pub(crate) fn rewire_result_exc_call_sites(
     graph: &mut FunctionGraph,
     results: &[(Variable, Option<String>, ValueType)],
     enclosing_scoped: bool,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<RewireOutcome, String> {
     let mut outcome = RewireOutcome {
         diamonds: 0,
@@ -5894,9 +5896,13 @@ mod rewire_dead_arm_tests {
     fn absent_collected_var_is_skipped() {
         let mut graph = FunctionGraph::new("dead_arm");
         let ghost = Variable::new();
-        let outcome =
-            rewire_result_exc_call_sites(&mut graph, &[(ghost, None, ValueType::Ref(None))], true)
-                .expect("a collected var that simplify already deleted is a dead arm");
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &[(ghost, None, ValueType::Ref(None))],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("a collected var that simplify already deleted is a dead arm");
         assert_eq!(outcome.diamonds, 0);
         assert_eq!(outcome.tail_forwards, 0);
         assert_eq!(outcome.rewrapped, 0);
@@ -5914,6 +5920,7 @@ mod rewire_dead_arm_tests {
             &mut graph,
             &[(ghost, None, ValueType::Ref(None))],
             true,
+            crate::ErrorCarrierSpec::default(),
         ) {
             Ok(_) => panic!("a live use without a producer is unproven"),
             Err(msg) => msg,
@@ -7232,22 +7239,22 @@ mod from_residual_conversion_tests {
         )
     }
 
-    fn pyerror_arg(graph: &FunctionGraph) -> Variable {
+    fn raised_carrier(graph: &FunctionGraph) -> Variable {
         graph
             .blocks
             .iter()
-            .flat_map(|block| &block.operations)
-            .find_map(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    args,
-                    ..
-                } if segments.last().map(String::as_str) == Some("pyerror_to_exc_object") => {
-                    args.first().and_then(LinkArg::as_variable).cloned()
-                }
-                _ => None,
+            .find_map(|block| {
+                block.exits.iter().find_map(|link| {
+                    if link.target != graph.exceptblock {
+                        return None;
+                    }
+                    match link.args.as_slice() {
+                        [LinkArg::Value(_etype), LinkArg::Value(evalue)] => Some(evalue.clone()),
+                        _ => None,
+                    }
+                })
             })
-            .expect("pyerror_to_exc_object")
+            .expect("raise link")
     }
 
     #[test]
@@ -7307,7 +7314,7 @@ mod from_residual_conversion_tests {
             from_residual_tail("core::ops::control_flow::ControlFlow::Break");
         let outcome = rewire(&mut graph, residual).expect("unsuffixed break raises");
         assert_eq!(outcome.tail_forwards, 0);
-        let arg = pyerror_arg(&graph);
+        let arg = raised_carrier(&graph);
         let Some(OpKind::FieldRead { field, .. }) = producing_op(&graph, &arg) else {
             panic!("direct raise reads Break.__pos_0");
         };
@@ -7416,14 +7423,14 @@ mod from_residual_conversion_tests {
                 }),
                 "from_residual does not remain on the return edge"
             );
-            let arg = pyerror_arg(&graph);
+            let arg = raised_carrier(&graph);
             let Some(OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
             }) = producing_op(&graph, &arg)
             else {
-                panic!("pyerror_to_exc_object argument is From::from");
+                panic!("raised carrier is From::from");
             };
             assert_eq!(segments, &from_segments());
             assert_eq!(args.is_empty(), !pass_payload);

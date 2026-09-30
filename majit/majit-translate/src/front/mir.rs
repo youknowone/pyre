@@ -4235,6 +4235,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &mut lo.graph,
                 &lo.result_exc_call_results,
                 result_exc_callee,
+                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
             tail_forwarded_returns = outcome.tail_forwards;
@@ -4609,6 +4610,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &mut lo.graph,
                 &closure_select_outcome.result_exc_calls,
                 result_exc_callee,
+                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
         }
