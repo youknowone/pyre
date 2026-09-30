@@ -3311,11 +3311,13 @@ fn stub_matches_table(
             return false;
         }
     }
+    // `'L'` returns `i64` and `bh_call_f` would call the `f64` stub. The host
+    // returns those bits and the float bank stores them.
     let expect_result = match result {
         'v' => None,
         'r' => Some(FuncSigVal::I32),
         'f' => Some(FuncSigVal::F64),
-        'i' | 'L' => Some(FuncSigVal::I64),
+        'i' => Some(FuncSigVal::I64),
         _ => return false,
     };
     sig.result == expect_result

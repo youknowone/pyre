@@ -1792,6 +1792,30 @@ mod tests {
         assert_eq!(result, 42);
     }
 
+    /// `'L'` is an i64 return stored in the float bank. The host result is the
+    /// raw bits; `bh_call_f_with_descr` reinterprets them.
+    #[test]
+    fn host_hook_longlong_result_is_stored_as_float_bits() {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                set_residual_host_call(None);
+            }
+        }
+        let _clear = Clear;
+        set_residual_host_call(Some(|_func, _args, _classes, result| {
+            assert_eq!(result, 'L');
+            Some(f64::to_bits(1.0) as i64)
+        }));
+        let descr = BhCallDescr::from_arg_classes(
+            "i".to_string(),
+            'L',
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let value = unsafe { bh_call_f_with_descr(3, Some(&[9]), None, None, &descr) };
+        assert_eq!(value, 1.0);
+    }
+
     /// `descr.py CallDescr.create_call_stub` + `llmodel.py AbstractLLCPU.bh_call_f`
     /// for the interleaved float/ref case of `test_call_stubs_2`.
     #[test]
