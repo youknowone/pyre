@@ -4214,6 +4214,23 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             );
         }
         if !lo.result_exc_call_results.is_empty() {
+            let carrier = static_addrs.error_carrier;
+            let foreign_sites =
+                crate::front::result_exc::foreign_from_residual_sites(&lo.graph, carrier);
+            let mut conversions = Vec::with_capacity(foreign_sites.len());
+            for site in &foreign_sites {
+                conversions.push(
+                    from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty).map_err(
+                        |err| LowerError::Unsupported(format!("{}: {err}", lo.graph.name)),
+                    )?,
+                );
+            }
+            crate::front::result_exc::apply_foreign_from_residuals(
+                &mut lo.graph,
+                &foreign_sites,
+                &conversions,
+            )
+            .map_err(LowerError::Unsupported)?;
             let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
                 &mut lo.graph,
                 &lo.result_exc_call_results,
@@ -35036,6 +35053,105 @@ fn trait_impl_id_for_fundecl(fd: &FunDecl) -> Option<u64> {
         _ => return None,
     };
     impl_payload.as_object()?.get("Trait")?.as_u64()
+}
+
+/// The `From::from` body selected for `error_ty` into `carrier_path`.
+///
+/// `impl From<T> for U` stores `[U, T]` on `impl_trait.generics.types`,
+/// the same order `blanket_into_devirt` reads off a `U: From<T>`
+/// obligation. The call path is the one `for_trait_impl_method`
+/// registers, so `from` stays a `FunctionPath` (it is an associated
+/// function; a `CallTarget::Method` would bind the argument as the
+/// receiver). Zero matches and several matches both decline: raising
+/// the foreign payload would skip `From::from`.
+fn from_impl_conversion(
+    llbc: &Llbc,
+    carrier_path: &str,
+    error_ty: &str,
+) -> Result<crate::front::result_exc::FromResidualConversion, String> {
+    use crate::front::result_exc::same_type_spelling;
+    let from_id = llbc
+        .iter_trait_decls()
+        .find(|decl| decl.item_meta.name_path() == "core::convert::From")
+        .map(|decl| decl.def_id);
+    let Some(from_id) = from_id else {
+        return Err(format!(
+            "core::convert::From is absent, so {error_ty} cannot convert into {carrier_path}"
+        ));
+    };
+    let mut found = Vec::new();
+    for row in llbc.trait_impls_raw() {
+        let Some(impl_trait) = row.get("impl_trait") else {
+            continue;
+        };
+        let Some(trait_id) = impl_trait.get("id").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        if trait_id != from_id {
+            continue;
+        }
+        let Some(types) = impl_trait
+            .get("generics")
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        let (Some(self_ty), Some(arg_ty)) = (types.first(), types.get(1)) else {
+            continue;
+        };
+        let self_rendered = charon_type_value_to_ast_string(self_ty, llbc, 0);
+        let arg_rendered = charon_type_value_to_ast_string(arg_ty, llbc, 0);
+        if !same_type_spelling(&self_rendered, carrier_path)
+            || !same_type_spelling(&arg_rendered, error_ty)
+        {
+            continue;
+        }
+        let Some(methods) = row.get("methods").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for method in methods {
+            let Some(fn_id) = method
+                .get("skip_binder")
+                .and_then(|binder| binder.get("id"))
+                .and_then(serde_json::Value::as_u64)
+            else {
+                continue;
+            };
+            let Some(fd) = llbc.fn_by_id(fn_id) else {
+                continue;
+            };
+            let leaf = fd.item_meta.name_path();
+            if leaf.rsplit("::").next() != Some("from") {
+                continue;
+            }
+            let Some((owner, method_name)) = impl_method_owner_for_fundecl(llbc, fd) else {
+                continue;
+            };
+            let Some(impl_id) = trait_impl_id_for_fundecl(fd) else {
+                continue;
+            };
+            let path = crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, &method_name);
+            let pass_payload = fd
+                .signature
+                .inputs
+                .first()
+                .is_some_and(|ty| !tyref_is_void_zst(ty, llbc));
+            found.push(crate::front::result_exc::FromResidualConversion {
+                segments: path.segments,
+                pass_payload,
+            });
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(format!(
+            "no From impl converts {error_ty} into {carrier_path}"
+        )),
+        _ => Err(format!(
+            "several From impls convert {error_ty} into {carrier_path}"
+        )),
+    }
 }
 
 /// Detect a trait-default body — a function whose penultimate NameSeg
