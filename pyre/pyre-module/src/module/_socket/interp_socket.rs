@@ -2799,9 +2799,9 @@ fn socket_io_err(e: std::io::Error) -> pyre_interpreter::PyError {
     }
 }
 
-/// The exception for a socket call that has just failed, read from wherever
+/// The exception for a WinSock call that has just failed, read from wherever
 /// the host records it.
-#[cfg(any(unix, windows))]
+#[cfg(windows)]
 fn socket_last_error() -> pyre_interpreter::PyError {
     socket_io_err(rffi::last_error())
 }
@@ -4506,13 +4506,22 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                     // `socket` and the cloexec `fcntl` release the interpreter.
                     // `obj` is reloaded before `socket_init_state` writes it.
-                    let fd = pyre_object::with_roots!(obj => rffi::socket(family, ty, proto));
-                    if rffi::is_invalid(fd) {
-                        return Err(socket_last_error());
-                    }
-                    // `RSocket.__init__` keeps every newly created socket out of
-                    // an exec'd child (PEP 446).
-                    pyre_object::with_roots!(obj => rffi::set_cloexec(fd));
+                    // The new descriptor is not inherited across exec.
+                    #[cfg(unix)]
+                    let fd = {
+                        pyre_object::with_roots!(obj => {
+                            majit_rlib::rsocket::socket(family, ty, proto).map_err(rsocket_os_error)
+                        })?
+                    };
+                    #[cfg(windows)]
+                    let fd = {
+                        let fd = pyre_object::with_roots!(obj => rffi::socket(family, ty, proto));
+                        if rffi::is_invalid(fd) {
+                            return Err(socket_last_error());
+                        }
+                        pyre_object::with_roots!(obj => rffi::set_cloexec(fd));
+                        fd
+                    };
                     socket_init_state(obj, fd, family, ty, proto)?;
                     return Ok(pyre_object::w_none());
                 }

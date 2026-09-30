@@ -313,6 +313,19 @@ pub fn sethostname(hostname: &[u8]) -> Result<(), CSocketError> {
     Ok(())
 }
 
+/// `socket`. The new descriptor has `FD_CLOEXEC` set.
+#[cfg(unix)]
+pub fn socket(family: INT, ty: INT, proto: INT) -> Result<INT, CSocketError> {
+    let fd = unsafe { crate::_rsocket_rffi::socket(family, ty, proto) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    unsafe {
+        crate::_rsocket_rffi::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    Ok(fd)
+}
+
 /// `dup`. The new descriptor has `FD_CLOEXEC` set.
 #[cfg(unix)]
 pub fn dup(fd: INT) -> Result<INT, CSocketError> {
@@ -1010,5 +1023,17 @@ mod tests {
             );
             close(fd).expect("close");
         }
+    }
+
+    #[test]
+    fn socket_sets_cloexec() {
+        let fd = socket(libc::AF_INET, libc::SOCK_STREAM, 0).expect("socket");
+        let flags = unsafe { crate::_rsocket_rffi::fcntl(fd, libc::F_GETFD, 0) };
+        assert!(flags >= 0 && (flags & libc::FD_CLOEXEC) != 0);
+        assert_eq!(
+            socket(-1, libc::SOCK_STREAM, 0).expect_err("family").errno,
+            libc::EAFNOSUPPORT
+        );
+        close(fd).expect("close");
     }
 }
