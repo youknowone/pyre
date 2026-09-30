@@ -245,13 +245,11 @@ pub unsafe fn pytype_has_mapdict_mixin(obj: PyObjectRef) -> bool {
 /// True when `obj`'s Python class is exactly the builtin type for its
 /// layout — i.e. NOT a user subclass.
 ///
-/// A user subclass instance of `int`, `float`, `complex`, `str`, `tuple`,
-/// `list`, `set`, `frozenset`, `array.array` or `weakref.ref` carries the
-/// builtin's `_getusercls` class as its typeptr, which alone decides exactness.
-/// A user subclass of any other builtin keeps the builtin `ob_type` (and
-/// therefore the builtin struct layout and the `is_list` / … layout predicates)
-/// while `w_class` is retagged to the subclass type object
-/// (`typedef::subclass_to_tag`).
+/// A `#[pyre_class(..., user_layout)]` subclass carries that class as its
+/// typeptr (`typedef.py` `_getusercls`), which alone decides exactness.
+/// A builtin without `user_layout` keeps the builtin `ob_type` (and therefore
+/// the builtin struct layout and the `is_list` / … layout predicates) and
+/// retags `w_class` (`typedef::subclass_to_tag`).
 /// The type-specific
 /// fast paths in
 /// `space.is_true` / `eq_w` / `len` / `getitem` / … assume the receiver's

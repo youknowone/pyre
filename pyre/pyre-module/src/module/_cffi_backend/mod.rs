@@ -110,11 +110,18 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
         destructor: None,
     });
     // `FreeCtxObj.__del__` releases an FFI object's copied parser context.
+    // A subclass is `typedef.py` `_getusercls` and shares that destructor.
+    let ffi_layout = ModuleGcLayout::PyreClass {
+        memory_pressure_offset: None,
+    };
     types.push(ModuleGcType {
         descriptor: <ffi_obj::W_FFIObject as PyreClassPyTypeOf>::DESCRIPTOR,
-        layout: ModuleGcLayout::PyreClass {
-            memory_pressure_offset: None,
-        },
+        layout: ffi_layout,
+        destructor: Some(gc_destructor!(ffi_obj::w_ffi_dealloc)),
+    });
+    types.push(ModuleGcType {
+        descriptor: &ffi_obj::W_FFIOBJECT_USER_PYRE_CLASS_DESCRIPTOR,
+        layout: ffi_layout,
         destructor: Some(gc_destructor!(ffi_obj::w_ffi_dealloc)),
     });
     types.push(ModuleGcType {

@@ -5066,6 +5066,81 @@ static W_BUFFERABLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock:
     )
 });
 
+struct ModuleUserLayoutGroup {
+    /// `ob_type` of a `typedef.py` `_getusercls` instance.
+    pytype: usize,
+    /// Crate-stripped `struct_path`, the `DECLARED_GROUPS` def-path spelling.
+    def_path: &'static str,
+    group: PyreObjectDescrGroup,
+}
+
+/// `MapdictStorageMixin` groups for module user layouts (`typedef.py`
+/// `_getusercls`).
+///
+/// Built from `for_each_class_descriptor`, keeping `mapdict_user_layout`
+/// descriptors whose `struct_path` starts with `pyre_module`. Sorted by
+/// `struct_path`: `linkme` order differs between the build-script process
+/// and the runtime binary, and the field index has to agree across that
+/// boundary. With no such descriptors linked the vector is empty.
+static MODULE_USER_LAYOUT_DESCR_GROUPS: LazyLock<Vec<ModuleUserLayoutGroup>> =
+    LazyLock::new(|| {
+        const PREFIX: &str = "pyre_module::";
+        let mut descrs: Vec<&'static pyre_object::lltype::PyreClassDescriptor> = Vec::new();
+        pyre_object::lltype::for_each_class_descriptor(|descr| {
+            if descr.mapdict_user_layout && descr.struct_path.starts_with(PREFIX) {
+                descrs.push(descr);
+            }
+        });
+        descrs.sort_by(|left, right| left.struct_path.cmp(right.struct_path));
+        descrs
+            .into_iter()
+            .enumerate()
+            .map(|(index, descr)| {
+                let map_off = unsafe { (*descr.pytype_ptr).mapdict_offset };
+                assert!(map_off != 0, "{}", descr.struct_path);
+                let def_path = &descr.struct_path[PREFIX.len()..];
+                let simple_name = match def_path.rsplit_once("::") {
+                    Some((_, name)) => name,
+                    None => def_path,
+                };
+                let tag = NATIVE_MAPDICT_DESCR_TAG | (0x260 + 0x10 * (index as u32));
+                let group = build_native_user_mapdict_group(
+                    descr.object_size,
+                    descr.gc_type_id.get(),
+                    descr.pytype_ptr as usize,
+                    map_off,
+                    map_off + WORD,
+                    simple_name,
+                    def_path,
+                    tag,
+                );
+                ModuleUserLayoutGroup {
+                    pytype: descr.pytype_ptr as usize,
+                    def_path,
+                    group,
+                }
+            })
+            .collect()
+    });
+
+/// Map or storage descr for a module user layout. Exact instances carry the
+/// base typeptr and return `None`. `field` is 0 for `map` and 1 for `storage`.
+///
+/// # Safety
+/// `obj` must be a live object.
+unsafe fn module_user_layout_mapdict_descr(
+    obj: pyre_object::PyObjectRef,
+    field: usize,
+) -> Option<DescrRef> {
+    let ob_type = unsafe { (*obj).ob_type } as usize;
+    for entry in MODULE_USER_LAYOUT_DESCR_GROUPS.iter() {
+        if entry.pytype == ob_type {
+            return Some(field_descr_from_group(&entry.group, field));
+        }
+    }
+    None
+}
+
 /// `W_ObjectObject.map` (`objectobject.rs`) — the instance shape word,
 /// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). Read as an
 /// `Int` word so the LOAD_ATTR fast path can `guard_value` it to a constant map
@@ -5179,6 +5254,8 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         )
     } {
         field_descr_from_group(&W_BUFFERABLE_USER_DESCR_GROUP, 0)
+    } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 0) } {
+        descr
     } else {
         object_map_descr()
     }
@@ -5273,6 +5350,8 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         )
     } {
         field_descr_from_group(&W_BUFFERABLE_USER_DESCR_GROUP, 1)
+    } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 1) } {
+        descr
     } else {
         object_storage_descr()
     }
@@ -7091,18 +7170,25 @@ mod tests {
         for (_, force) in DECLARED_GROUPS {
             force();
         }
+        std::sync::LazyLock::force(&MODULE_USER_LAYOUT_DESCR_GROUPS);
         let gc = majit_ir::descr::gc_cache().lock();
-        let unstamped: Vec<&str> = DECLARED_GROUPS
+        let is_unstamped = |def_path: &str| {
+            let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(def_path));
+            gc._cache_size
+                .get(&key)
+                .and_then(|descr| descr.as_size_descr())
+                .is_some_and(|sd| sd.is_gc_managed() && !sd.headerless() && sd.type_id() == 0)
+        };
+        let mut unstamped: Vec<&str> = DECLARED_GROUPS
             .iter()
-            .filter(|(def_path, _)| {
-                let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(def_path));
-                gc._cache_size
-                    .get(&key)
-                    .and_then(|descr| descr.as_size_descr())
-                    .is_some_and(|sd| sd.is_gc_managed() && !sd.headerless() && sd.type_id() == 0)
-            })
+            .filter(|(def_path, _)| is_unstamped(def_path))
             .map(|(def_path, _)| *def_path)
             .collect();
+        for entry in MODULE_USER_LAYOUT_DESCR_GROUPS.iter() {
+            if is_unstamped(entry.def_path) {
+                unstamped.push(entry.def_path);
+            }
+        }
         assert!(
             unstamped.is_empty(),
             "gc-managed groups with no type id and no headerless declaration: {unstamped:?}",
@@ -9298,10 +9384,21 @@ static DECLARED_GROUP_BY_KEY: LazyLock<std::collections::HashMap<u64, fn()>> =
 /// serialized `BhDescr` can.
 ///
 /// Idempotent and cheap after the first call for a STRUCT: the group is a
-/// `LazyLock` and the second force is a load.
+/// `LazyLock` and the second force is a load. A key this module does not
+/// declare still scans [`MODULE_USER_LAYOUT_DESCR_GROUPS`], whose `def_path`
+/// owns the same slot.
 fn force_declared_group(cache_key: u64) {
     if let Some(force) = DECLARED_GROUP_BY_KEY.get(&cache_key) {
         force();
+        return;
+    }
+    // Module user layouts are not `DECLARED_GROUPS` rows. Forcing the vec
+    // publishes each `def_path` before a `BhDescr` can mint the slot
+    // (`descr.py get_size_descr`).
+    for entry in MODULE_USER_LAYOUT_DESCR_GROUPS.iter() {
+        if majit_ir::descr::path_hash(entry.def_path) == cache_key {
+            break;
+        }
     }
 }
 

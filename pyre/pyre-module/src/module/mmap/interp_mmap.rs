@@ -175,13 +175,11 @@ impl Drop for NativeMMap {
 
 /// PyPy `interp_mmap.py W_MMap`: cursor/access/offset/export state is stored
 /// on the object and the low-level `rmmap.MMap` is owned by that same object.
-/// The mapdict prefix is required because mmap is an acceptable base class.
+/// A user subclass is `typedef.py` `_getusercls` (`MapdictStorageMixin`).
 #[cfg(any(unix, windows))]
-#[pyre_interpreter::pyre_class("mmap.mmap", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("mmap.mmap", cpython_heaptype, user_layout)]
 #[derive(Default)]
 pub struct W_MMap {
-    pub map: usize,
-    pub storage: *mut pyre_object::object_array::ItemsBlock,
     backend: *mut NativeMMap,
     pos: i64,
     access: i64,
@@ -194,19 +192,6 @@ pub struct W_MMap {
     offset: i64,
     exports: i64,
 }
-
-#[cfg(any(unix, windows))]
-const _: () = assert!(
-    std::mem::offset_of!(W_MMap, map)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, map),
-    "W_MMap must keep W_ObjectObject's map offset"
-);
-#[cfg(any(unix, windows))]
-const _: () = assert!(
-    std::mem::offset_of!(W_MMap, storage)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, storage),
-    "W_MMap must keep W_ObjectObject's storage offset"
-);
 
 #[cfg(any(unix, windows))]
 fn mmap_this(
@@ -2068,9 +2053,9 @@ const MMAP_ACCESS_WRITE: i64 = 2;
 const MMAP_ACCESS_COPY: i64 = 3;
 
 /// `interp_mmap.py W_MMap.__init__` — hand the finished mapping to a
-/// fresh instance of `cls`.  `mmap` is an acceptable base class, so the object
-/// carries the mapdict prefix and the subclass tag rather than being allocated
-/// against the builtin type directly.
+/// fresh instance of `cls`. `objspace.py` `allocate_instance` builds the
+/// builtin layout, or `typedef.py` `_getusercls` for a subclass. The sweep
+/// destructor still closes the mapping.
 #[cfg(any(unix, windows))]
 fn mmap_new_object(
     cls: pyre_object::PyObjectRef,
@@ -2083,38 +2068,18 @@ fn mmap_new_object(
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(cls);
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    // PyPy `mmap_new` / `W_MMap.__init__` creates the wrapper through
-    // `space.allocate_instance(W_MMap, w_subtype)`: it is an ordinary young
-    // GC object, not a non-moving side owner.  That placement is observable
-    // on Windows because the lightweight destructor closes the mapping
-    // section that otherwise prevents a mapped file from being truncated or
-    // unlinked.  The native mapping itself lives in the stable `Box` behind
-    // `backend`; no address derived from this movable wrapper is retained.
-    let pytype = unsafe { &*<W_MMap as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE };
-    let obj = pyre_object::lltype::malloc_typed_managed(W_MMap {
-        ob: pyre_object::PyObject {
-            ob_type: pytype,
-            w_class: pyre_object::pyobject::get_instantiate(pytype),
+    W_MMap::allocate_instance(
+        W_MMap {
+            ob: pyre_object::PyObject::default(),
+            backend,
+            pos: 0,
+            access,
+            mode,
+            offset,
+            exports: 0,
         },
-        map: 0,
-        storage: std::ptr::null_mut(),
-        backend,
-        pos: 0,
-        access,
-        mode,
-        offset,
-        exports: 0,
-    }) as pyre_object::PyObjectRef;
-    // `tag_subclass_instance` can allocate while it installs mapdict state;
-    // reload the movable wrapper through the same root bracket that protects
-    // `cls` across the allocation above.
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_interpreter::typedef::tag_subclass_instance(
-        pyre_object::gc_roots::shadow_stack_get(obj_slot),
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
-    );
-    pyre_object::gc_roots::shadow_stack_get(obj_slot)
+    )
 }
 
 // `interp_mmap.py:55-130 mmap_new` / CPython 3.14's `trackfd` addition.

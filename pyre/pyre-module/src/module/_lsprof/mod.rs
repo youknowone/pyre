@@ -9,16 +9,14 @@ use rustpython_wtf8::Wtf8Buf;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// `interp_lsprof.py W_Profiler`.  The entry trees and the context stack
-/// belong to the wrapper object.  The mapdict prefix is required because
-/// `cProfile.Profile` subclasses the type.
+/// `interp_lsprof.py W_Profiler`. The entry trees and the context stack
+/// belong to the wrapper object. A user subclass (`cProfile.Profile`) is
+/// `typedef.py` `_getusercls` (`MapdictStorageMixin`).
 // CPython 3.14 Modules/_lsprof.c:_lsprof_exec uses
 // PyType_FromModuleAndSpec with IMMUTABLETYPE.
-#[pyre_interpreter::pyre_class("_lsprof.Profiler", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_lsprof.Profiler", cpython_heaptype, user_layout)]
 #[derive(Default)]
 pub struct W_Profiler {
-    pub map: usize,
-    pub storage: *mut pyre_object::object_array::ItemsBlock,
     subcalls: bool,
     builtins: bool,
     current_context: Option<Box<ProfilerContext>>,
@@ -30,17 +28,6 @@ pub struct W_Profiler {
     total_timestamp: i64,
     total_real_time: f64,
 }
-
-const _: () = assert!(
-    std::mem::offset_of!(W_Profiler, map)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, map),
-    "W_Profiler must keep W_ObjectObject's map offset"
-);
-const _: () = assert!(
-    std::mem::offset_of!(W_Profiler, storage)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, storage),
-    "W_Profiler must keep W_ObjectObject's storage offset"
-);
 
 /// `interp_lsprof.py W_StatsEntry`.  Its typedef publishes no `__new__`, so
 /// no subclass of it can be instantiated and it carries no mapdict prefix; the
@@ -717,18 +704,24 @@ mod profiler_methods {
                 w_callable
             };
             let _roots = pyre_object::gc_roots::push_roots();
-            let callable_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(cls);
             let _ = pyre_object::gc_roots::pin_root(callable);
-            let obj = W_Profiler::allocate_stable(W_Profiler {
-                ob: PyObject::default(),
-                subcalls: subcalls != 0,
-                builtins: builtins != 0,
-                w_callable: pyre_object::gc_roots::shadow_stack_get(callable_slot),
-                time_unit,
-                ..W_Profiler::default()
-            });
-            unsafe { (*obj).w_class = cls };
-            Ok(obj)
+            let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 2;
+            let callable_slot = cls_slot + 1;
+            // `objspace.py` `allocate_instance`: the builtin is the base
+            // layout; a subclass is `typedef.py` `_getusercls` and enqueues
+            // `__del__` from that class.
+            Ok(W_Profiler::allocate_instance(
+                W_Profiler {
+                    ob: PyObject::default(),
+                    subcalls: subcalls != 0,
+                    builtins: builtins != 0,
+                    w_callable: pyre_object::gc_roots::shadow_stack_get(callable_slot),
+                    time_unit,
+                    ..W_Profiler::default()
+                },
+                pyre_object::gc_roots::shadow_stack_get(cls_slot),
+            ))
         }
 
         fn enable(
@@ -859,11 +852,24 @@ pyre_interpreter::py_module! {
     },
 }
 
-/// `_lsprof.Profiler`'s trace: the mapdict prefix, then the entry trees.
+/// `_lsprof.Profiler`'s trace: `w_class`, then the entry trees. Mapdict
+/// storage belongs to the `_getusercls` layout, not this base.
 unsafe fn profiler_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let profiler = unsafe { &mut *(obj_addr as *mut W_Profiler) };
+    f(std::ptr::addr_of_mut!(profiler.ob.w_class) as *mut majit_ir::GcRef);
+    unsafe { w_profiler_custom_trace(obj_addr, f) };
+}
+
+/// User layout (`typedef.py` `_getusercls`): the base edges plus
+/// `MapdictStorageMixin` storage. The entry trees live in `Vec`s, so this
+/// hook walks them itself rather than inheriting fixed offsets.
+unsafe fn profiler_user_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { profiler_custom_trace(obj_addr, f) };
     unsafe {
-        pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f);
-        w_profiler_custom_trace(obj_addr, f);
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        );
     }
 }
 
@@ -872,11 +878,16 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
     use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
     // `interp_lsprof.py` keeps the profiler's entry trees on the W_Root owner,
-    // behind Rust vectors no inline offset can name, so it needs a marker; it is
-    // also `cProfile.Profile`'s base class, hence the mapdict prefix walk.
+    // behind Rust vectors no inline offset can name. The user layout is a
+    // child of this tid and adds the mapdict storage walk.
     types.push(ModuleGcType {
         descriptor: <W_Profiler as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::CustomTrace(profiler_custom_trace),
+        destructor: Some(gc_destructor!(w_profiler_dealloc)),
+    });
+    types.push(ModuleGcType {
+        descriptor: &W_PROFILER_USER_PYRE_CLASS_DESCRIPTOR,
+        layout: ModuleGcLayout::CustomTrace(profiler_user_custom_trace),
         destructor: Some(gc_destructor!(w_profiler_dealloc)),
     });
     // The two stats result objects hold their code and call-list references in

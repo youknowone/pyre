@@ -24,12 +24,10 @@ pub struct FreeCtxObj {
     free_mems: Vec<*mut u8>,
 }
 
-/// `W_FFIObject`.
-#[pyre_interpreter::pyre_class("_cffi_backend.FFI", cpython_heaptype)]
+/// `W_FFIObject`. A user subclass is `typedef.py` `_getusercls`
+/// (`MapdictStorageMixin`), allocated by `objspace.py` `allocate_instance`.
+#[pyre_interpreter::pyre_class("_cffi_backend.FFI", cpython_heaptype, user_layout)]
 pub struct W_FFIObject {
-    /// Mapdict prefix used by subclasses of `FFI`.
-    pub map: usize,
-    pub storage: *mut pyre_object::object_array::ItemsBlock,
     /// `W_FFIObject.types_dict`.
     pub types_dict: PyObjectRef,
     /// `W_FFIObject.ctxobj`.
@@ -57,8 +55,6 @@ impl Default for W_FFIObject {
                 ob_type: std::ptr::null(),
                 w_class: pyre_object::PY_NULL,
             },
-            map: 0,
-            storage: std::ptr::null_mut(),
             types_dict: pyre_object::PY_NULL,
             ctxobj: std::ptr::null_mut(),
             finalizer: std::ptr::null_mut(),
@@ -72,17 +68,6 @@ impl Default for W_FFIObject {
         }
     }
 }
-
-const _: () = assert!(
-    std::mem::offset_of!(W_FFIObject, map)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, map),
-    "W_FFIObject must keep W_ObjectObject's map offset"
-);
-const _: () = assert!(
-    std::mem::offset_of!(W_FFIObject, storage)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, storage),
-    "W_FFIObject must keep W_ObjectObject's storage offset"
-);
 
 pub(crate) fn ffi_arg(w_ffi: PyObjectRef) -> Result<&'static mut W_FFIObject, PyError> {
     W_FFIObject::from_obj(w_ffi).ok_or_else(|| PyError::type_error("expected an FFI object"))
@@ -125,24 +110,23 @@ pub(crate) fn initialize_ffi(
     let _ = roots.pin_root(pyre_object::dictmultiobject::w_dict_new());
     let once_marker_slot = once_cache_slot + 1;
     let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
-    let obj = W_FFIObject::allocate_stable(W_FFIObject {
-        types_dict: roots.get(dict_slot),
-        ctxobj,
-        finalizer: Box::into_raw(Box::new(FreeCtxObj {
+    Ok(W_FFIObject::allocate_instance(
+        W_FFIObject {
+            types_dict: roots.get(dict_slot),
             ctxobj,
-            free_mems: Vec::new(),
-        })),
-        cached_types: roots.get(cached_slot),
-        is_static: i64::from(!src_ctx.is_null()),
-        is_nonempty: i64::from(!src_ctx.is_null()),
-        included_ffis_libs: roots.get(included_slot),
-        w_init_once_cache: roots.get(once_cache_slot),
-        w_init_once_marker: roots.get(once_marker_slot),
-        init_once_locks: Box::into_raw(Box::new(InitOnceLocks::default())),
-        ..Default::default()
-    });
-    Ok(pyre_interpreter::typedef::tag_subclass_instance(
-        obj,
+            finalizer: Box::into_raw(Box::new(FreeCtxObj {
+                ctxobj,
+                free_mems: Vec::new(),
+            })),
+            cached_types: roots.get(cached_slot),
+            is_static: i64::from(!src_ctx.is_null()),
+            is_nonempty: i64::from(!src_ctx.is_null()),
+            included_ffis_libs: roots.get(included_slot),
+            w_init_once_cache: roots.get(once_cache_slot),
+            w_init_once_marker: roots.get(once_marker_slot),
+            init_once_locks: Box::into_raw(Box::new(InitOnceLocks::default())),
+            ..Default::default()
+        },
         roots.get(type_slot),
     ))
 }

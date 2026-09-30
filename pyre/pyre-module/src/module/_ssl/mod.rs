@@ -10,16 +10,14 @@ use pyre_native::ssl::{
 };
 use pyre_object::*;
 
-/// The mapdict prefix is required because `ssl.SSLContext` is an app-level
-/// subclass of this native type.  PyPy composes `MapdictStorageMixin` into
-/// that allocation; pyre preserves the same native prefix.
+/// `ssl.SSLContext` is an app-level subclass of this native type. That
+/// instance is `typedef.py` `_getusercls` (`MapdictStorageMixin`), allocated
+/// by `objspace.py` `allocate_instance`.
 // CPython 3.14 Modules/_ssl.c:_ssl_exec uses PyType_FromModuleAndSpec;
 // the SSLContext spec is immutable.
-#[pyre_interpreter::pyre_class("_ssl._SSLContext", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_ssl._SSLContext", cpython_heaptype, user_layout)]
 #[derive(Default)]
 pub struct W_SSLContext {
-    pub map: usize,
-    pub storage: *mut pyre_object::object_array::ItemsBlock,
     pub backend: *mut pyre_native::ssl::Context,
     pub sni_callback: PyObjectRef,
     pub msg_callback: PyObjectRef,
@@ -29,37 +27,14 @@ pub struct W_SSLContext {
     pub num_tickets: i32,
 }
 
-/// PyPy owns `MemoryBIO` as an app-level class, so it uses the same mapdict
-/// prefix rather than relying on a side table for instance attributes.
+/// `MemoryBIO` is not an acceptable base in this module. The payload is the
+/// native BIO alone.
 // `_ssl_exec` creates the immutable MemoryBIO module heap type.
 #[pyre_interpreter::pyre_class("_ssl.MemoryBIO", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_MemoryBIO {
-    pub map: usize,
-    pub storage: *mut pyre_object::object_array::ItemsBlock,
     pub backend: *mut pyre_native::ssl::MemoryBio,
 }
-
-const _: () = assert!(
-    std::mem::offset_of!(W_SSLContext, map)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, map),
-    "W_SSLContext must keep W_ObjectObject's map offset"
-);
-const _: () = assert!(
-    std::mem::offset_of!(W_SSLContext, storage)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, storage),
-    "W_SSLContext must keep W_ObjectObject's storage offset"
-);
-const _: () = assert!(
-    std::mem::offset_of!(W_MemoryBIO, map)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, map),
-    "W_MemoryBIO must keep W_ObjectObject's map offset"
-);
-const _: () = assert!(
-    std::mem::offset_of!(W_MemoryBIO, storage)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, storage),
-    "W_MemoryBIO must keep W_ObjectObject's storage offset"
-);
 
 // `_ssl_exec` creates the immutable SSLSession module heap type.
 #[pyre_interpreter::pyre_class("_ssl.SSLSession", cpython_heaptype)]
@@ -674,24 +649,22 @@ mod context_methods {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(cls);
         let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let obj = W_SSLContext::allocate_stable(W_SSLContext {
-            ob: PyObject {
-                ob_type: std::ptr::null(),
-                w_class: std::ptr::null_mut(),
+        W_SSLContext::allocate_instance(
+            W_SSLContext {
+                ob: PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+                backend,
+                sni_callback: w_none(),
+                msg_callback: w_none(),
+                keylog_filename: w_none(),
+                host_flags: 0,
+                post_handshake_auth: false,
+                num_tickets: 2,
             },
-            map: 0,
-            storage: std::ptr::null_mut(),
-            backend,
-            sni_callback: w_none(),
-            msg_callback: w_none(),
-            keylog_filename: w_none(),
-            host_flags: 0,
-            post_handshake_auth: false,
-            num_tickets: 2,
-        });
-        pyre_interpreter::typedef::tag_subclass_instance(obj, {
-            pyre_object::gc_roots::shadow_stack_get(cls_slot)
-        })
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        )
     }
 
     #[pyre_interpreter::pyre_methods(doc = "An SSLContext holds TLS configuration and state.")]
@@ -1709,8 +1682,6 @@ mod memory_bio_methods {
                     ob_type: std::ptr::null(),
                     w_class: std::ptr::null_mut(),
                 },
-                map: 0,
-                storage: std::ptr::null_mut(),
                 backend: pyre_native::ssl::memory_bio_new(),
             });
             Ok(pyre_interpreter::typedef::tag_subclass_instance(
@@ -3589,16 +3560,6 @@ pyre_interpreter::py_module! {
     },
 }
 
-/// `_ssl._SSLContext` has the native-layout mapdict prefix plus the three
-/// Python callback/path references owned by the context wrapper.
-unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    unsafe { pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f) };
-    let context = unsafe { &mut *(obj_addr as *mut W_SSLContext) };
-    f(std::ptr::addr_of_mut!(context.sni_callback) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(context.msg_callback) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(context.keylog_filename) as *mut majit_ir::GcRef);
-}
-
 /// `_ssl._SSLSocket` owns its context, transport endpoints, public owner,
 /// and hostname directly on the typed object.
 unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
@@ -3616,20 +3577,26 @@ unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
     use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
-    // rustls objects sit behind opaque native pointers.  Context and
-    // MemoryBIO are subclassable native layouts, so their marker walks the
-    // mapdict prefix; Context additionally owns Python callbacks/path values.
-    // The sweep destructors release the opaque rustls allocations.
+    // rustls objects sit behind opaque native pointers. `_SSLContext` traces
+    // its callback and path references inline; a user subclass is
+    // `typedef.py` `_getusercls` and adds mapdict storage. `MemoryBIO` is
+    // not a base. The sweep destructors release the opaque rustls allocations.
+    let pyre_class = ModuleGcLayout::PyreClass {
+        memory_pressure_offset: None,
+    };
     types.push(ModuleGcType {
         descriptor: <W_SSLContext as PyreClassPyTypeOf>::DESCRIPTOR,
-        layout: ModuleGcLayout::CustomTrace(ssl_context_custom_trace),
+        layout: pyre_class,
+        destructor: Some(gc_destructor!(w_ssl_context_dealloc)),
+    });
+    types.push(ModuleGcType {
+        descriptor: &W_SSLCONTEXT_USER_PYRE_CLASS_DESCRIPTOR,
+        layout: pyre_class,
         destructor: Some(gc_destructor!(w_ssl_context_dealloc)),
     });
     types.push(ModuleGcType {
         descriptor: <W_MemoryBIO as PyreClassPyTypeOf>::DESCRIPTOR,
-        layout: ModuleGcLayout::CustomTrace(
-            pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace,
-        ),
+        layout: pyre_class,
         destructor: Some(gc_destructor!(w_memory_bio_dealloc)),
     });
     types.push(ModuleGcType {

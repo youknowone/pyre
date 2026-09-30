@@ -2113,9 +2113,21 @@ fn build_gc() -> Box<MiniMarkGC> {
                         TypeInfo::object_subclass(descr.object_size, object_tid)
                     }
                     ModuleGcLayout::CustomTrace(trace) => {
+                        // `typedef.py` `_getusercls` parents on its builtin
+                        // tid. The hook already walks the base fields, so the
+                        // child does not inherit the parent's offsets.
+                        let parent_tid = if descr.mapdict_user_layout {
+                            let base = unsafe { pyre_object::layout_base(descr.pytype_ptr) };
+                            pytype_to_tid
+                                .get(&(base as usize))
+                                .copied()
+                                .unwrap_or(object_tid)
+                        } else {
+                            object_tid
+                        };
                         TypeInfo::object_subclass_with_custom_trace(
                             descr.object_size,
-                            object_tid,
+                            parent_tid,
                             trace,
                         )
                     }

@@ -5955,8 +5955,9 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
 }
 
 /// Custom trace for objects carrying the `MapdictStorageMixin` prefix
-/// (`W_ObjectObject` and native-layout Python subclasses such as
-/// `W_Random`; instance `map`+`storage`, `mapdict.py`).
+/// (`W_ObjectObject`; instance `map`+`storage`, `mapdict.py`). A
+/// `#[pyre_class(..., user_layout)]` subclass carries that prefix on its
+/// `_getusercls` layout (`typedef.py`), not on the builtin base.
 ///
 /// `storage` is a GC-managed leaf block (`W_MAPDICT_STORAGE_GC_TYPE_ID`,
 /// nursery-born by `alloc_mapdict_storage_block`), so the collector reaches

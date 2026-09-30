@@ -1276,8 +1276,10 @@ pub fn module_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRan
 }
 
 /// The rclass hierarchy present in this interpreter configuration: the
-/// object and interpreter classes of `SUBCLASS_RANGE_HIERARCHY`, then one
-/// direct `object` subclass per class the module hooks register.
+/// object and interpreter classes of `SUBCLASS_RANGE_HIERARCHY`, then the
+/// classes the module hooks register. A `#[pyre_class(..., user_layout)]`
+/// class (`typedef.py` `_getusercls`) is a child of its builtin tid; every
+/// other module class is a direct `object` subclass.
 pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
     let hierarchy = pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY;
     // On Windows the table ends with `_WindowsConsoleIO`; drop it where this
@@ -1290,22 +1292,47 @@ pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
     let mut active = core.to_vec();
     // Registered after the platform tail, before the module classes.
     let instancemethod_id = if cfg!(target_arch = "wasm32") {
-        177
+        197
     } else if WINDOWS_CONSOLE_IO {
-        180
+        200
     } else {
-        179
+        199
     };
     active.push((instancemethod_id, Some(0)));
+    let module_types = module_gc_types();
     active.extend(
-        module_gc_types()
+        module_types
             .iter()
             .enumerate()
             // A `WithGcPtrs` class takes an id without an rclass.OBJECT node.
             .filter(|(_, ty)| !matches!(ty.layout, crate::importing::ModuleGcLayout::WithGcPtrs))
-            .map(|(index, _)| (MODULE_FIRST_TYPE_ID + index as u32, Some(0))),
+            .map(|(index, ty)| {
+                (
+                    MODULE_FIRST_TYPE_ID + index as u32,
+                    module_user_layout_parent(&module_types, ty.descriptor),
+                )
+            }),
     );
     active
+}
+
+/// Parent tid of a module class. `mapdict_user_layout` names `typedef.py`
+/// `_getusercls` and parents on the builtin layout's tid; every other module
+/// class parents on `object`.
+fn module_user_layout_parent(
+    types: &[crate::importing::ModuleGcType],
+    descr: &pyre_object::lltype::PyreClassDescriptor,
+) -> Option<u32> {
+    if !descr.mapdict_user_layout {
+        return Some(0);
+    }
+    let base = unsafe { pyre_object::layout_base(descr.pytype_ptr) };
+    for (index, ty) in types.iter().enumerate() {
+        if std::ptr::eq(ty.descriptor.pytype_ptr, base) {
+            return Some(MODULE_FIRST_TYPE_ID + index as u32);
+        }
+    }
+    Some(0)
 }
 
 // ── Print / stderr hooks for wasm (fd-1 / fd-2 capture) ──
