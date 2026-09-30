@@ -21468,14 +21468,35 @@ fn fileio_get_slot(args: &[PyObjectRef], storage: &str) -> Result<PyObjectRef, c
 }
 
 fn fileio_get_closed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return Ok(w_bool_from(fileio.closed()));
+    }
     fileio_get_slot(args, "__file_closed__")
 }
 
 fn fileio_get_closefd(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return Ok(w_bool_from(fileio.closefd()));
+    }
     fileio_get_slot(args, "__file_closefd__")
 }
 
 fn fileio_get_mode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return Ok(w_str_new(fileio.mode_str()));
+    }
     fileio_get_slot(args, "__file_public_mode__")
 }
 
@@ -21484,6 +21505,9 @@ fn fileio_get_blksize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         .get(1)
         .copied()
         .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return Ok(w_int_new(fileio.blksize()));
+    }
     let mut w_descr = args[0];
     if pyre_object::with_roots!(w_descr, self_obj =>
         fileio_stat_field(self_obj, "__file_stat_blksize__")
@@ -21597,21 +21621,34 @@ fn fileio_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     } else {
         "False"
     };
-    let mode = pyre_object::with_roots!(self_obj =>
-        crate::baseobjspace::getattr_str(self_obj, "__file_public_mode__")
-    )
-    .ok()
-    .and_then(|value| unsafe {
-        if pyre_object::is_str(value) {
-            crate::baseobjspace::str_utf8_w(value)
-                .ok()
-                .map(str::to_string)
-        } else {
-            None
-        }
-    })
-    .unwrap_or_default();
-    let body = if let Ok(name) =
+    let mode = if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        fileio.mode_str().to_string()
+    } else {
+        pyre_object::with_roots!(self_obj =>
+            crate::baseobjspace::getattr_str(self_obj, "__file_public_mode__")
+        )
+        .ok()
+        .and_then(|value| unsafe {
+            if pyre_object::is_str(value) {
+                crate::baseobjspace::str_utf8_w(value)
+                    .ok()
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+    };
+    let typed_name = crate::module::_io::W_FileIO::from_obj(self_obj)
+        .map(|fileio| fileio.name())
+        .filter(|name| !name.is_null());
+    let body = if let Some(name) = typed_name {
+        crate::display::wtf8_format!(
+            "name=",
+            unsafe { crate::display::py_repr_wtf8(name)? },
+            format!(" mode='{mode}' closefd={closefd}")
+        )
+    } else if let Ok(name) =
         pyre_object::with_roots!(self_obj => crate::baseobjspace::getattr_str(self_obj, "name"))
     {
         crate::display::wtf8_format!(
@@ -21658,9 +21695,13 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // before doing anything that can reject the new arguments.  The fresh
     // snapshot is published only after the complete initialization succeeds.
     pyre_object::with_roots!(self_obj => fileio_clear_stat_atopen(self_obj));
-    pyre_object::with_roots!(self_obj =>
-        crate::baseobjspace::setdictvalue_native(self_obj, "__file_seekable__", w_none())
-    );
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        fileio.set_seekable_flag(-1);
+    } else {
+        pyre_object::with_roots!(self_obj =>
+            crate::baseobjspace::setdictvalue_native(self_obj, "__file_seekable__", w_none())
+        );
+    }
     pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
     let mut file = bind_pos_or_kw(&pos_buf, kwargs(), 1, "file", "FileIO", 1)?
         .ok_or_else(|| crate::PyError::type_error("FileIO() missing required argument 'file'"))?;
@@ -21787,21 +21828,47 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
     }
     // PyPy keeps these on W_FileIO fields and exposes them through typedef
-    // descriptors.  Our generic instance layout stores the corresponding
-    // fields under private mapdict names so descriptor writes cannot be
-    // shadowed by user attributes.
-    let public_mode_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(binary_mode));
-    if !crate::baseobjspace::setdictvalue(
-        self_obj,
-        "__file_public_mode__",
-        pyre_object::gc_roots::shadow_stack_get(public_mode_slot),
-    )? || !crate::baseobjspace::setdictvalue(self_obj, "__file_closefd__", w_bool_from(closefd))?
-        || !crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(false))?
-    {
-        return Err(crate::PyError::runtime_error(
-            "FileIO instance has no state dictionary",
-        ));
+    // descriptors.
+    let readable = primary == 'r' || updating;
+    let writable = primary != 'r' || updating;
+    let created = primary == 'x';
+    let appending = primary == 'a';
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        fileio.set_mode_flags(readable, writable, created, appending);
+        fileio.set_closefd(closefd);
+        if let Some(fd) = file_get_fd(opened) {
+            fileio.set_fd(fd);
+        }
+        if let Ok(name) = crate::baseobjspace::getattr_str(opened, "name") {
+            fileio.set_name(name);
+        } else {
+            fileio.set_name(pyre_object::gc_roots::shadow_stack_get(file_slot));
+        }
+        if let Some(blksize) = fileio_stat_field(opened, "__file_stat_blksize__") {
+            if blksize > 1 {
+                fileio.set_blksize(blksize);
+            }
+        }
+    } else {
+        let public_mode_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(binary_mode));
+        if !crate::baseobjspace::setdictvalue(
+            self_obj,
+            "__file_public_mode__",
+            pyre_object::gc_roots::shadow_stack_get(public_mode_slot),
+        )? || !crate::baseobjspace::setdictvalue(
+            self_obj,
+            "__file_closefd__",
+            w_bool_from(closefd),
+        )? || !crate::baseobjspace::setdictvalue(
+            self_obj,
+            "__file_closed__",
+            w_bool_from(false),
+        )? {
+            return Err(crate::PyError::runtime_error(
+                "FileIO instance has no state dictionary",
+            ));
+        }
     }
     // PyPy `W_FileIO.descr_init`: append streams are positioned at EOF
     // immediately, rather than waiting for their first O_APPEND write.
@@ -21836,6 +21903,9 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn file_is_closed(mut self_obj: PyObjectRef) -> bool {
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return fileio.closed();
+    }
     for name in ["__file_closed__", "closed"] {
         if let Ok(value) =
             pyre_object::with_roots!(self_obj => crate::baseobjspace::getattr_str(self_obj, name))
@@ -21847,6 +21917,12 @@ fn file_is_closed(mut self_obj: PyObjectRef) -> bool {
 }
 
 fn file_set_closed(mut self_obj: PyObjectRef, closed: bool) -> Result<(), crate::PyError> {
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        if closed {
+            fileio.set_fd(-1);
+        }
+        return Ok(());
+    }
     if pyre_object::with_roots!(self_obj =>
         crate::baseobjspace::getattr_str(self_obj, "__file_closed__")
     )
@@ -21861,6 +21937,9 @@ fn file_set_closed(mut self_obj: PyObjectRef, closed: bool) -> Result<(), crate:
 }
 
 fn file_closefd(mut self_obj: PyObjectRef) -> bool {
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return fileio.closefd();
+    }
     for name in ["__file_closefd__", "closefd"] {
         if let Ok(value) =
             pyre_object::with_roots!(self_obj => crate::baseobjspace::getattr_str(self_obj, name))
@@ -22400,7 +22479,11 @@ fn file_method_seekable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // `_checkClosed` precedes the cache lookup in `_pyio.FileIO.seekable`, so
     // a cached answer can never make a closed stream appear usable.
     pyre_object::with_roots!(self_obj => file_check_closed(self_obj))?;
-    if let Ok(cached) = pyre_object::with_roots!(self_obj =>
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        if fileio.seekable_flag() >= 0 {
+            return Ok(w_bool_from(fileio.seekable_flag() == 1));
+        }
+    } else if let Ok(cached) = pyre_object::with_roots!(self_obj =>
         crate::baseobjspace::getattr_str(self_obj, "__file_seekable__")
     ) && unsafe { pyre_object::is_bool(cached) }
     {
@@ -22431,6 +22514,10 @@ fn file_method_seekable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     } else {
         true
     };
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        fileio.set_seekable_flag(if seekable { 1 } else { 0 });
+        return Ok(w_bool_from(seekable));
+    }
     let mut result = w_bool_from(seekable);
     pyre_object::with_roots!(result =>
         crate::baseobjspace::setdictvalue_native(self_obj, "__file_seekable__", result)
@@ -22488,6 +22575,10 @@ fn file_set_pos(self_obj: PyObjectRef, pos: usize) {
 /// it as a descriptor would send every read, seek and close down the fd path
 /// with nothing to call.
 fn file_get_fd(self_obj: PyObjectRef) -> Option<i32> {
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        let fd = fileio.fd();
+        return (fd >= 0).then_some(fd);
+    }
     crate::baseobjspace::getattr_str(self_obj, "__file_fd__")
         .ok()
         .and_then(|v| unsafe {

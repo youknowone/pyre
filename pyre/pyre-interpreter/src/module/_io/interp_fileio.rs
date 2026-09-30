@@ -13,6 +13,7 @@ pub struct W_FileIO {
     seekable: i32,
     closefd: bool,
     w_name: PyObjectRef,
+    blksize: i64,
     // interp_iobase.py W_IOBase.w_dict — null until getdict.
     pub(crate) w_dict: PyObjectRef,
 }
@@ -29,9 +30,84 @@ impl Default for W_FileIO {
             seekable: -1,
             closefd: true,
             w_name: PY_NULL,
+            blksize: super::DEFAULT_BUFFER_SIZE,
             w_dict: PY_NULL,
             lifeline: PY_NULL,
         }
+    }
+}
+
+impl W_FileIO {
+    pub(crate) fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    pub(crate) fn set_fd(&mut self, fd: i32) {
+        self.fd = fd;
+    }
+
+    /// `_closed`: a negative fd is the closed / not-yet-opened sentinel.
+    pub(crate) fn closed(&self) -> bool {
+        self.fd < 0
+    }
+
+    pub(crate) fn closefd(&self) -> bool {
+        self.closefd
+    }
+
+    pub(crate) fn set_closefd(&mut self, closefd: bool) {
+        self.closefd = closefd;
+    }
+
+    pub(crate) fn set_mode_flags(
+        &mut self,
+        readable: bool,
+        writable: bool,
+        created: bool,
+        appending: bool,
+    ) {
+        self.readable = readable;
+        self.writable = writable;
+        self.created = created;
+        self.appending = appending;
+    }
+
+    /// `W_FileIO._mode`.
+    pub(crate) fn mode_str(&self) -> &'static str {
+        if self.created {
+            if self.readable { "xb+" } else { "xb" }
+        } else if self.appending {
+            if self.readable { "ab+" } else { "ab" }
+        } else if self.readable {
+            if self.writable { "rb+" } else { "rb" }
+        } else {
+            "wb"
+        }
+    }
+
+    pub(crate) fn name(&self) -> PyObjectRef {
+        self.w_name
+    }
+
+    pub(crate) fn set_name(&mut self, w_name: PyObjectRef) {
+        self.w_name = w_name;
+        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+    }
+
+    pub(crate) fn blksize(&self) -> i64 {
+        self.blksize
+    }
+
+    pub(crate) fn set_blksize(&mut self, blksize: i64) {
+        self.blksize = blksize;
+    }
+
+    pub(crate) fn seekable_flag(&self) -> i32 {
+        self.seekable
+    }
+
+    pub(crate) fn set_seekable_flag(&mut self, seekable: i32) {
+        self.seekable = seekable;
     }
 }
 
@@ -52,34 +128,6 @@ impl W_FileIO {
             pyre_object::gc_roots::shadow_stack_get(cls_slot),
         );
         let obj = super::tag_io_instance(obj, pyre_object::gc_roots::shadow_stack_get(cls_slot));
-        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(obj);
-        // Public uninitialized state still lives in w_dict until the
-        // remaining FileIO methods read the typed fields.
-        let store = |name: &str, value: PyObjectRef| {
-            crate::baseobjspace::setdictvalue_native(
-                pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                name,
-                value,
-            );
-        };
-        store("__file_fd__", pyre_object::w_int_new(-1));
-        store("__file_closed__", pyre_object::w_bool_from(true));
-        store("__file_closefd__", pyre_object::w_bool_from(true));
-        store("__file_mode__", pyre_object::w_str_new("wb"));
-        store("__file_public_mode__", pyre_object::w_str_new("wb"));
-        store("__file_seekable__", pyre_object::w_none());
-        store(
-            "__file_blksize__",
-            pyre_object::w_int_new(super::DEFAULT_BUFFER_SIZE),
-        );
-        for name in [
-            "__file_stat_mode__",
-            "__file_stat_size__",
-            "__file_stat_blksize__",
-        ] {
-            store(name, pyre_object::w_none());
-        }
-        Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        Ok(obj)
     }
 }
