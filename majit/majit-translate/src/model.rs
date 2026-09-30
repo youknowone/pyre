@@ -701,17 +701,23 @@ pub struct FieldDescriptor {
     /// Excluded from equality: it describes the access, and the part below
     /// is what makes two reads of one field distinct.
     pub inline_vec: bool,
-    /// Which word of an inline `Vec<T>` this read loads. `None` is the
-    /// field's own value. `Buf` / `Len` add the measured offset of that
-    /// word (`vec_layout::probe`) on top of the field's offset.
+    /// Which word of an inline aggregate this read loads. `None` is the
+    /// field's own value. `Buf` / `Len` add `vec_layout::probe`'s offset;
+    /// `FatData` / `FatLen` add `fat_ptr_layout::probe`'s offset. The add
+    /// sits on top of the field's own offset.
     pub vec_part: Option<VecFieldPart>,
 }
 
-/// A word of `alloc::vec::Vec<T>`: the buffer pointer or the length.
+/// One word of an inline aggregate the field read does not load whole.
+///
+/// `Buf` / `Len` are `alloc::vec::Vec<T>` (`vec_layout`). `FatData` /
+/// `FatLen` are the two words of `Box<[T]>` (`fat_ptr_layout`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VecFieldPart {
     Buf,
     Len,
+    FatData,
+    FatLen,
 }
 
 impl PartialEq for FieldDescriptor {

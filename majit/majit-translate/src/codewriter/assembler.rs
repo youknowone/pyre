@@ -4886,32 +4886,45 @@ fn fielddescrof(
     }
     // `rlist.py` `ll_getitem_fast` is `l.ll_items()[index]` and `ll_length`
     // is `l.length`. A Rust `Vec<T>` is those two words inside the value.
-    // The field offset above is the value; the component offset is measured
-    // in `vec_layout::probe` because Charon's `Vec` decl has no layout.
-    // Applied after the slot census so the parent slot stays the field's.
+    // `Box<[T]>` is a fat pointer: data word, then length word
+    // (`fat_ptr_layout::probe`). Charon records neither split. Applied
+    // after the slot census so the parent slot stays the field's.
     if let Some(part) = field.vec_part {
-        let layout = crate::vec_layout::probe();
+        let vec_layout = crate::vec_layout::probe();
+        let fat_layout = crate::fat_ptr_layout::probe();
         let word = crate::layout::target_word_size();
-        let add = match part {
-            crate::model::VecFieldPart::Buf => layout.ptr_offset,
-            crate::model::VecFieldPart::Len => layout.len_offset,
+        let (add, ty, flag, suffix) = match part {
+            crate::model::VecFieldPart::Buf => (
+                vec_layout.ptr_offset,
+                majit_ir::value::Type::Ref,
+                majit_ir::descr::ArrayFlag::Pointer,
+                ".buf",
+            ),
+            crate::model::VecFieldPart::Len => (
+                vec_layout.len_offset,
+                majit_ir::value::Type::Int,
+                majit_ir::descr::ArrayFlag::Unsigned,
+                ".len",
+            ),
+            crate::model::VecFieldPart::FatData => (
+                fat_layout.data_offset,
+                majit_ir::value::Type::Ref,
+                majit_ir::descr::ArrayFlag::Pointer,
+                ".data",
+            ),
+            crate::model::VecFieldPart::FatLen => (
+                fat_layout.len_offset,
+                majit_ir::value::Type::Int,
+                majit_ir::descr::ArrayFlag::Unsigned,
+                ".len",
+            ),
         };
         offset = offset.saturating_add(add);
         field_size = word;
-        match part {
-            crate::model::VecFieldPart::Buf => {
-                field_type = majit_ir::value::Type::Ref;
-                field_flag = majit_ir::descr::ArrayFlag::Pointer;
-                is_field_signed = false;
-                field_key = format!("{field_key}.buf");
-            }
-            crate::model::VecFieldPart::Len => {
-                field_type = majit_ir::value::Type::Int;
-                field_flag = majit_ir::descr::ArrayFlag::Unsigned;
-                is_field_signed = false;
-                field_key = format!("{field_key}.len");
-            }
-        }
+        field_type = ty;
+        field_flag = flag;
+        is_field_signed = false;
+        field_key = format!("{field_key}{suffix}");
     }
     crate::jitcode::BhDescr::Field {
         offset,
@@ -5672,8 +5685,8 @@ mod tests {
                     .with_owner_id(Some(owner_id))
                     .with_vec_part(part),
                 &match part {
-                    VecFieldPart::Buf => ValueType::Ref(None),
-                    VecFieldPart::Len => ValueType::Int,
+                    VecFieldPart::Buf | VecFieldPart::FatData => ValueType::Ref(None),
+                    VecFieldPart::Len | VecFieldPart::FatLen => ValueType::Int,
                 },
                 Some(&cc),
             );
@@ -5687,22 +5700,26 @@ mod tests {
                 } => (offset, field_size, field_flag, name),
                 other => panic!("expected field descr, got {other:?}"),
             };
+            let fat = crate::fat_ptr_layout::probe();
             let add = match part {
                 VecFieldPart::Buf => layout.ptr_offset,
                 VecFieldPart::Len => layout.len_offset,
+                VecFieldPart::FatData => fat.data_offset,
+                VecFieldPart::FatLen => fat.len_offset,
             };
             assert_eq!(offset, field_off + add, "{field} {part:?}");
             assert_eq!(size, word);
             let expect_flag = match part {
-                VecFieldPart::Buf => ArrayFlag::Pointer,
-                VecFieldPart::Len => ArrayFlag::Unsigned,
+                VecFieldPart::Buf | VecFieldPart::FatData => ArrayFlag::Pointer,
+                VecFieldPart::Len | VecFieldPart::FatLen => ArrayFlag::Unsigned,
             };
             assert_eq!(flag, expect_flag);
             assert!(name.ends_with(match part {
                 VecFieldPart::Buf => ".buf",
-                VecFieldPart::Len => ".len",
+                VecFieldPart::Len | VecFieldPart::FatLen => ".len",
+                VecFieldPart::FatData => ".data",
             }));
-            if part == VecFieldPart::Buf {
+            if matches!(part, VecFieldPart::Buf | VecFieldPart::FatData) {
                 assert!(crate::front::typestr::nolength_from_array_type_id(Some(id)));
                 let array = arraydescrof(&ValueType::Int, &Some(id.to_string()), None, Some(&cc));
                 match array {
@@ -5724,6 +5741,8 @@ mod tests {
         check("bytes", 0, VecFieldPart::Len, "Vec<u8>", 1);
         check("words", 3 * word, VecFieldPart::Buf, "Vec<i64>", word);
         check("words", 3 * word, VecFieldPart::Len, "Vec<i64>", word);
+        check("bytes", 0, VecFieldPart::FatData, "Vec<u8>", 1);
+        check("bytes", 0, VecFieldPart::FatLen, "Vec<u8>", 1);
         // A pointer to the Vec (Box<Vec<_>> after the box load) adds nothing
         // but the component offset.
         let boxed = fielddescrof(

@@ -73,6 +73,8 @@ mod codegen;
         reason = "the graph-body census retains Charon's literal nested block/body map shape so extraction and source-translation parity remain directly auditable"
     )
 )]
+pub mod codeobject_layout;
+pub mod fat_ptr_layout;
 pub mod front;
 pub mod vec_layout;
 // TODO(pyre): pyre-interpreter handler JitCode registry
