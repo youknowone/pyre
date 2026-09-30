@@ -2942,10 +2942,10 @@ static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
 // (`rbigint.py` `divmod` / `int_divmod`). Not a PyObject — no vtable, and the
 // trace never NEWs one: it arrives as an elidable's result and is only read.
 //
-// Headerless, because `alloc_rbigint_pair_nursery_collecting` and
-// `alloc_rbigint_pair_no_collect` both end in `malloc_raw` when the collector
-// has no tid for the pair or the nursery cannot satisfy the request, so a
-// loaded pointer may have no `GcHeader` for `GUARD_GC_TYPE` to read.
+// Headerless, because `alloc_rbigint_pair_nursery_collecting` ends in
+// `malloc_raw` when the collector has no tid for the pair or the nursery
+// cannot satisfy the request, so a loaded pointer may have no `GcHeader` for
+// `GUARD_GC_TYPE` to read.
 //
 // Both fields are `Type::Ref`, which is what puts them in `gc_fielddescrs`, and
 // both are immutable, so the two reads CSE the way upstream's pair of
@@ -5099,16 +5099,6 @@ pub fn complex_imag_descr() -> DescrRef {
 /// inline-NEW boxing of a `jit_w_long_*_raw` result.
 pub fn long_value_descr() -> DescrRef {
     field_descr_from_group(&W_LONG_DESCR_GROUP, 0)
-}
-
-/// `RBigIntPair.item0` — the quotient half of a divmod `tuple2`.
-pub fn rbigint_pair_item0_descr() -> DescrRef {
-    field_descr_from_group(&RBIGINT_PAIR_DESCR_GROUP, 0)
-}
-
-/// `RBigIntPair.item1` — the remainder half of a divmod `tuple2`.
-pub fn rbigint_pair_item1_descr() -> DescrRef {
-    field_descr_from_group(&RBIGINT_PAIR_DESCR_GROUP, 1)
 }
 
 /// Address a `FrameDebugData` field by its byte offset rather than by its

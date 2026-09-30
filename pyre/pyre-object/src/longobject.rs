@@ -109,16 +109,6 @@ pub fn alloc_bigint_pair_nursery_collecting(
     majit_rlib::rbigint::alloc_rbigint_pair_nursery_collecting(item0, item1)
 }
 
-/// Non-collecting `tuple2` over two already-reachable payloads, for the
-/// walker's record-time shadow.
-#[inline]
-pub fn alloc_bigint_pair_no_collect(
-    item0: *mut BigInt,
-    item1: *mut BigInt,
-) -> *mut majit_rlib::rbigint::RBigIntPair {
-    majit_rlib::rbigint::alloc_rbigint_pair_no_collect(item0, item1)
-}
-
 // GC type id for the raw `rbigint` payload is published at JitDriver init by
 // `set_bigint_gc_type_id`. It remains 0 until then, in which case the alloc
 // helpers fall back to leaked raw allocations in bare tests/pre-init bootstrap.

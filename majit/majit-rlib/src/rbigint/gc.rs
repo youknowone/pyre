@@ -436,29 +436,6 @@ pub fn alloc_rbigint_pair_nursery_collecting(item0: RBigInt, item1: RBigInt) -> 
     crate::malloc_raw(RBigIntPair { item0, item1 })
 }
 
-/// Build the `tuple2` over two payloads that are already reachable.
-///
-/// The walker needs a concrete pair to attach to the `CallR` it records, but it
-/// runs on the host stack with no gcmap over its live set — which is the one
-/// thing [`alloc_rbigint_pair_nursery_collecting`] requires of its caller. This
-/// allocation therefore cannot collect, so the caller's live payloads keep the
-/// addresses it read them at.
-pub fn alloc_rbigint_pair_no_collect(item0: *mut RBigInt, item1: *mut RBigInt) -> *mut RBigIntPair {
-    let tid = rbigint_pair_gc_type_id();
-    if tid != 0
-        && let Some(raw) =
-            GcAllocOutcome::classify(majit_gc::alloc_nursery_typed(tid, RBIGINT_PAIR_SIZE))
-                .allocated_or_abort(RBIGINT_PAIR_SIZE)
-    {
-        unsafe {
-            std::ptr::write(raw as *mut RBigIntPair, RBigIntPair { item0, item1 });
-        }
-        majit_gc::gc_write_barrier(majit_ir::GcRef(raw as usize));
-        return raw as *mut RBigIntPair;
-    }
-    crate::malloc_raw(RBigIntPair { item0, item1 })
-}
-
 // PendingPartsCacheDigitRoot
 /// Explicit root for a cached rbigint that has been computed but is not yet
 /// reachable from the translated module-global `_parts_cache` graph.

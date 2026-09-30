@@ -408,7 +408,6 @@ spec_folds! {
     Unpack               => ("unpack",                   "residual_call", "-"),
     SubscrTupleDescent   => ("subscr_tuple_descent",     "specialize",    "subscr"),
     SubscrTupleSlice2    => ("subscr_tuple_slice2",      "specialize",    "subscr"),
-    BuiltinDivmodLongInt => ("builtin_divmod_long_int",  "specialize",    "builtin_divmod_descent"),
     ZipTwoTupleIters     => ("zip_two_tuple_iters",      "specialize",    "for_iter_next"),
     ForIterList          => ("for_iter_list",            "specialize",    "for_iter_next"),
     InstanceNext         => ("instance_next",            "residual_call", "-"),
