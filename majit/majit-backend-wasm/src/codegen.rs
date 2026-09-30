@@ -3694,6 +3694,40 @@ fn conditional_call_typed_sig(
     residual_callee_direct_emit_sig_at(op, constants, 1, &expected)
 }
 
+/// `_emit_call` / `simple_call`: one lowering for CALL and COND_CALL.
+/// Arguments follow the descr `ValType`, the func slot is the table index,
+/// then `call_indirect`. The caller handles the result.
+fn emit_typed_residual_call(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    args: &[Operand],
+    params: &[ValType],
+    func: OpRef,
+    site_gcmap: &[i64],
+    op_idx: usize,
+    type_idx: u32,
+) {
+    for (arg, ty) in args.iter().zip(params) {
+        match *ty {
+            ValType::F64 => {
+                emit_resolve_f64(sink, constants, value_types, arg.to_opref());
+            }
+            ValType::I32 => {
+                emit_resolve(sink, constants, value_types, arg.to_opref());
+                sink.i32_wrap_i64();
+            }
+            _ => {
+                emit_resolve(sink, constants, value_types, arg.to_opref());
+            }
+        }
+    }
+    emit_resolve(sink, constants, value_types, func);
+    sink.i32_wrap_i64();
+    emit_push_site(sink, site_gcmap, op_idx);
+    sink.call_indirect(0, type_idx);
+}
+
 /// If `op` is a residual CALL whose ABI is uniformly i64 (all Int/Ref args and
 /// an Int/Ref result), return its argument count — eligible for a direct
 /// `call_indirect` of type `(i64×n) -> i64`. `None` keeps the `jit_call`
@@ -8491,24 +8525,17 @@ fn build_function(
                     })
                 {
                     let (params, result_ty) = &sig;
-                    for (arg, ty) in call_args.iter().zip(params) {
-                        match *ty {
-                            ValType::F64 => {
-                                emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
-                            }
-                            ValType::I32 => {
-                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                                sink.i32_wrap_i64();
-                            }
-                            _ => {
-                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                            }
-                        }
-                    }
-                    emit_resolve(&mut sink, constants, value_types, func);
-                    sink.i32_wrap_i64();
-                    emit_push_site(&mut sink, &site_gcmap, op_idx);
-                    sink.call_indirect(0, type_idx);
+                    emit_typed_residual_call(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        call_args,
+                        params,
+                        func,
+                        &site_gcmap,
+                        op_idx,
+                        type_idx,
+                    );
                     if result_ty.is_some() {
                         sink.drop();
                     }
@@ -8612,24 +8639,17 @@ fn build_function(
                     })
                 {
                     let (params, result_ty) = &sig;
-                    for (arg, ty) in call_args.iter().zip(params) {
-                        match *ty {
-                            ValType::F64 => {
-                                emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
-                            }
-                            ValType::I32 => {
-                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                                sink.i32_wrap_i64();
-                            }
-                            _ => {
-                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                            }
-                        }
-                    }
-                    emit_resolve(&mut sink, constants, value_types, func);
-                    sink.i32_wrap_i64();
-                    emit_push_site(&mut sink, &site_gcmap, op_idx);
-                    sink.call_indirect(0, type_idx);
+                    emit_typed_residual_call(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        call_args,
+                        params,
+                        func,
+                        &site_gcmap,
+                        op_idx,
+                        type_idx,
+                    );
                     if has_result {
                         if *result_ty == Some(ValType::I32) {
                             // `get_call_descr` records result signedness.
@@ -10333,25 +10353,17 @@ fn build_function(
                     let (params, result_ty) = &sig;
                     let call_args = &op.getarglist()[func_ofs + 1..];
                     debug_assert_eq!(call_args.len(), params.len());
-                    for (arg, ty) in call_args.iter().zip(params) {
-                        match *ty {
-                            ValType::F64 => {
-                                emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
-                            }
-                            ValType::I32 => {
-                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                                sink.i32_wrap_i64();
-                            }
-                            _ => {
-                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                            }
-                        }
-                    }
-                    // func_ptr (arg 0) is the table slot — wrap to i32 index.
-                    emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
-                    sink.i32_wrap_i64();
-                    emit_push_site(&mut sink, &site_gcmap, op_idx);
-                    sink.call_indirect(0, type_idx);
+                    emit_typed_residual_call(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        call_args,
+                        params,
+                        func_ptr_ref,
+                        &site_gcmap,
+                        op_idx,
+                        type_idx,
+                    );
                     let is_void_op = matches!(
                         op.opcode,
                         OpCode::CallN

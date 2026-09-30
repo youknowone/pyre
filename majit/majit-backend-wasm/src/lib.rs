@@ -3306,7 +3306,7 @@ fn stub_matches_table(
     }
     for (param, class) in sig.params.iter().zip(classes) {
         let expect = match class {
-            ArgClass::Int | ArgClass::Ref => FuncSigVal::I64,
+            ArgClass::Int => FuncSigVal::I64,
             ArgClass::Float => FuncSigVal::F64,
         };
         if *param != expect {
