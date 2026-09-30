@@ -1780,6 +1780,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     ));
                 }
                 let fd = rffi::socket_from_i64(unsafe { pyre_object::w_int_get_value(args[0]) });
+                #[cfg(unix)]
+                majit_rlib::rsocket::close(fd).map_err(rsocket_os_error)?;
+                #[cfg(windows)]
                 if unsafe { rffi::close(fd) } != 0 {
                     return Err(socket_last_error());
                 }
@@ -2801,6 +2804,11 @@ fn socket_io_err(e: std::io::Error) -> pyre_interpreter::PyError {
 #[cfg(any(unix, windows))]
 fn socket_last_error() -> pyre_interpreter::PyError {
     socket_io_err(rffi::last_error())
+}
+
+#[cfg(unix)]
+fn rsocket_os_error(error: majit_rlib::rsocket::CSocketError) -> pyre_interpreter::PyError {
+    socket_io_err(std::io::Error::from_raw_os_error(error.errno))
 }
 
 /// Run a socket call and return the failure code it reported.
@@ -4328,7 +4336,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                                 obj,
                             ));
                         }
-                        let _ = { rffi::close(fd) };
+                        #[cfg(unix)]
+                        {
+                            let _ = majit_rlib::rsocket::close(fd);
+                        }
+                        #[cfg(windows)]
+                        {
+                            let _ = { rffi::close(fd) };
+                        }
                         socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
                     }
                     Ok(pyre_object::w_none())
@@ -4641,6 +4656,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         // syscall and still reports its failure.  This prevents a
                         // later double close while preserving EBADF/ENOTSOCK.
                         socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                        #[cfg(unix)]
+                        majit_rlib::rsocket::close(fd).map_err(rsocket_os_error)?;
+                        #[cfg(windows)]
                         if { rffi::close(fd) } != 0 {
                             return Err(socket_last_error());
                         }
@@ -4709,7 +4727,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                             pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")),
                         );
                         if !rffi::is_invalid(fd) {
-                            let _ = { rffi::close(fd) };
+                            #[cfg(unix)]
+                            {
+                                let _ = majit_rlib::rsocket::close(fd);
+                            }
+                            #[cfg(windows)]
+                            {
+                                let _ = { rffi::close(fd) };
+                            }
                             socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
                         }
                     }
@@ -4742,11 +4767,25 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     let proto = pyre_object::with_roots!(w_addr => socket_get_attr_i64(obj, "_proto"))
                         as libc::c_int;
                     let (storage, slen) = pack_inet_addr("bind", family, proto, w_addr)?;
-                    let r = { rffi::bind(fd, &storage as *const _ as *const rffi::sockaddr, slen) };
-                    if r != 0 {
-                        return Err(socket_last_error());
+                    #[cfg(unix)]
+                    {
+                        let bytes = std::slice::from_raw_parts(
+                            &storage as *const _ as *const u8,
+                            slen as usize,
+                        );
+                        majit_rlib::rsocket::bind(fd, bytes).map_err(rsocket_os_error)?;
+                        return Ok(pyre_object::w_none());
                     }
-                    Ok(pyre_object::w_none())
+                    #[cfg(windows)]
+                    {
+                        let r = {
+                            rffi::bind(fd, &storage as *const _ as *const rffi::sockaddr, slen)
+                        };
+                        if r != 0 {
+                            return Err(socket_last_error());
+                        }
+                        Ok(pyre_object::w_none())
+                    }
                 },
                 2,
             ),
@@ -4766,11 +4805,19 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 } else {
                     128
                 };
-                let r = { rffi::listen(fd, backlog) };
-                if r != 0 {
-                    return Err(socket_last_error());
+                #[cfg(unix)]
+                {
+                    majit_rlib::rsocket::listen(fd, backlog).map_err(rsocket_os_error)?;
+                    return Ok(pyre_object::w_none());
                 }
-                Ok(pyre_object::w_none())
+                #[cfg(windows)]
+                {
+                    let r = { rffi::listen(fd, backlog) };
+                    if r != 0 {
+                        return Err(socket_last_error());
+                    }
+                    Ok(pyre_object::w_none())
+                }
             }),
         )
     };
@@ -6157,11 +6204,19 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     let mut w_how = args[1];
                     let fd = pyre_object::with_roots!(w_how => socket_fd(w_self))?;
                     let how = pyre_interpreter::baseobjspace::c_int_w(w_how)?;
-                    let r = { rffi::shutdown(fd, how) };
-                    if r != 0 {
-                        return Err(socket_last_error());
+                    #[cfg(unix)]
+                    {
+                        majit_rlib::rsocket::shutdown(fd, how).map_err(rsocket_os_error)?;
+                        return Ok(pyre_object::w_none());
                     }
-                    Ok(pyre_object::w_none())
+                    #[cfg(windows)]
+                    {
+                        let r = { rffi::shutdown(fd, how) };
+                        if r != 0 {
+                            return Err(socket_last_error());
+                        }
+                        Ok(pyre_object::w_none())
+                    }
                 },
                 2,
             ),
@@ -6657,7 +6712,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")),
                     );
                     if !rffi::is_invalid(fd) {
-                        let _ = { rffi::close(fd) };
+                        #[cfg(unix)]
+                        {
+                            let _ = majit_rlib::rsocket::close(fd);
+                        }
+                        #[cfg(windows)]
+                        {
+                            let _ = { rffi::close(fd) };
+                        }
                         socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
                     }
                 }

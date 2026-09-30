@@ -378,6 +378,48 @@ pub fn getpeername(fd: INT) -> Result<(Vec<u8>, i32), CSocketError> {
     })
 }
 
+/// `bind`. `addr` is the `sockaddr` bytes, and its length is `addrlen`.
+#[cfg(unix)]
+pub fn bind(fd: INT, addr: &[u8]) -> Result<(), CSocketError> {
+    let res = unsafe {
+        crate::_rsocket_rffi::socketbind(fd, addr.as_ptr().cast(), addr.len() as libc::socklen_t)
+    };
+    if res < 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// `listen`.
+#[cfg(unix)]
+pub fn listen(fd: INT, backlog: INT) -> Result<(), CSocketError> {
+    let res = unsafe { crate::_rsocket_rffi::socketlisten(fd, backlog) };
+    if res < 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// `shutdown`.
+#[cfg(unix)]
+pub fn shutdown(fd: INT, how: INT) -> Result<(), CSocketError> {
+    let res = unsafe { crate::_rsocket_rffi::socketshutdown(fd, how) };
+    if res < 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// `close`. A non-zero return is `CSocketError`.
+#[cfg(unix)]
+pub fn close(fd: INT) -> Result<(), CSocketError> {
+    let res = unsafe { crate::_rsocket_rffi::socketclose(fd) };
+    if res != 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
@@ -596,6 +638,30 @@ mod tests {
             assert_eq!(&local[..local_len as usize], &peer[..peer_len as usize]);
             assert_eq!(crate::_rsocket_rffi::socketclose(a), 0);
             assert_eq!(crate::_rsocket_rffi::socketclose(b), 0);
+        }
+    }
+
+    #[test]
+    fn bind_listen_shutdown_and_close() {
+        unsafe {
+            let fd = crate::_rsocket_rffi::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket errno {}", crate::rposix::get_saved_errno());
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let bytes = std::slice::from_raw_parts(
+                (&raw const addr).cast::<u8>(),
+                std::mem::size_of::<libc::sockaddr_in>(),
+            );
+            bind(fd, bytes).expect("bind");
+            listen(fd, 1).expect("listen");
+            close(fd).expect("close");
+            assert_eq!(close(fd).expect_err("closed").errno, libc::EBADF);
+
+            let (a, b) = socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0).expect("pair");
+            shutdown(a, libc::SHUT_WR).expect("shutdown");
+            close(a).expect("close a");
+            close(b).expect("close b");
         }
     }
 }
