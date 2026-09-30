@@ -7781,11 +7781,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     do_jit_force_virtual_guard(ei, op.pc)?;
 
     if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
-        // A TO_BOOL / POP_JUMP truth residual on an exact builtin walks
-        // `opcode_ops::truth_value` (`is_true` → `is_true_slot`). That
-        // elides the may-force call whose force/exc guards mis-resume the
-        // kept short-circuit stack (`(i % 7) and ...`, and the boxed bool
-        // a COMPARE_OP leaves for `if a == b:`).
+        // A TO_BOOL / POP_JUMP truth residual walks
+        // `opcode_ops::truth_value` (`is_true`). That elides the may-force
+        // call whose force/exc guards mis-resume the kept short-circuit
+        // stack (`(i % 7) and ...`, and the boxed bool a COMPARE_OP leaves
+        // for `if a == b:`).
         if foldable_runtime_helper == majit_ir::RuntimeHelperKind::Truth {
             if let Some(outcome) = try_walker_orthodox_truth(ctx, op.pc, r_args[0], dst, dst_bank)?
             {

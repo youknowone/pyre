@@ -147,35 +147,13 @@ const TRUTH_VALUE_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "TRUTH-VALUE-SUBWALK",
 };
 
-/// `is_true_slot` answers these exact builtins from the object layout.
-/// Anything else reaches `is_true_lookup`, which runs `__bool__` / `__len__`.
-fn truth_layout_builtin(obj: pyre_object::PyObjectRef) -> bool {
-    unsafe {
-        if !pyre_object::is_exact_builtin_instance(obj) {
-            return false;
-        }
-        pyre_object::is_bool(obj)
-            || pyre_object::is_int(obj)
-            || pyre_object::is_long(obj)
-            || pyre_object::is_float(obj)
-            || pyre_object::is_complex(obj)
-            || pyre_object::is_str(obj)
-            || pyre_object::is_bytes(obj)
-            || pyre_object::is_bytearray(obj)
-            || pyre_object::is_list(obj)
-            || pyre_object::is_tuple(obj)
-            || pyre_object::is_dict(obj)
-            || pyre_object::is_set_or_frozenset(obj)
-            || pyre_object::is_w_range(obj)
-            || pyre_object::is_none(obj)
-    }
-}
-
-/// Exact-builtin truth residual: walk `opcode_ops::truth_value`.
+/// Truth residual: walk `opcode_ops::truth_value` for an exact builtin.
 ///
-/// The generated body is `is_true` then `is_true_slot`, and the jitcode
-/// returns the raw bool in the int bank. A subclass, or an exact builtin
-/// with no layout arm, stays on the residual: `is_true_lookup` calls Python.
+/// `is_true` sends an exact builtin to `is_true_slot` and every other
+/// object to `is_true_lookup`. The lookup calls Python, and a sub-walk
+/// that reaches that call and then declines has already run it. Those
+/// objects stay on the truth residual. The jitcode returns the raw bool
+/// in the int bank.
 pub(crate) fn try_walker_orthodox_truth<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -189,7 +167,7 @@ pub(crate) fn try_walker_orthodox_truth<Sym: WalkSym>(
     let Some(obj) = walker_concrete_ref_object(ctx, operand) else {
         return Ok(None);
     };
-    if !truth_layout_builtin(obj) {
+    if unsafe { !pyre_object::is_exact_builtin_instance(obj) } {
         return Ok(None);
     }
     try_walker_orthodox_descent(
