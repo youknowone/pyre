@@ -1557,336 +1557,291 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     str_strip_impl(args, "rstrip", false, true)
 }
 
-/// `rstring.py startswith` at default bounds: the `@jit.elidable` byte
-/// walk `u_self[i] != prefix[i]`.  A macro so the walk is in the
-/// wrapper's LLBC — a standalone callee is never a CodeWriter candidate.
-/// Bind `as_bytes()` first so `len` is `Rvalue::Len` and `value[i]` is
-/// the frontend's `ord(s[i])` (`__string_byte_getitem`).
-macro_rules! rstring_prefix_eq {
-    ($w_self:expr, $w_needle:expr) => {{
-        let value = unsafe { pyre_object::w_str_get_wtf8($w_self) }.as_bytes();
-        let prefix = unsafe { pyre_object::w_str_get_wtf8($w_needle) }.as_bytes();
-        let n = prefix.len();
-        if value.len() < n {
-            false
-        } else {
-            let mut i = 0;
-            let mut ok = true;
-            while i < n {
-                if value[i] != prefix[i] {
-                    ok = false;
-                    break;
-                }
-                i += 1;
-            }
-            ok
-        }
-    }};
-}
-
-/// `rstring.py endswith` at default bounds.
-macro_rules! rstring_suffix_eq {
-    ($w_self:expr, $w_needle:expr) => {{
-        let value = unsafe { pyre_object::w_str_get_wtf8($w_self) }.as_bytes();
-        let suffix = unsafe { pyre_object::w_str_get_wtf8($w_needle) }.as_bytes();
-        let n = suffix.len();
-        if value.len() < n {
-            false
-        } else {
-            let start = value.len() - n;
-            let mut i = 0;
-            let mut ok = true;
-            while i < n {
-                if value[start + i] != suffix[i] {
-                    ok = false;
-                    break;
-                }
-                i += 1;
-            }
-            ok
-        }
-    }};
-}
-
-/// `unicodeobject.py descr_startswith` — accepts either a single str
-/// prefix or a tuple of str prefixes (CPython parity).
-/// unicodeobject.py descr_startswith(self, prefix, start=0, end=sys.maxsize)
+/// `unicodeobject.py _unwrap_and_compute_idx_params` — unwrap the optional
+/// `start` / `end` code-point bounds and return them as byte offsets into
+/// `_utf8`.  `sliceobject.py unwrap_start_stop` runs each bound through
+/// `adapt_lower_bound(_eval_slice_index(...))`, so a non-index bound raises a
+/// TypeError and one carrying `__index__` is coerced.
 ///
-/// Bounds, a tuple needle, and the TypeError arm stay behind
-/// [`str_prefix_match_slow`] so the generated wrapper graph is the
-/// default-bounds exact-str path: `rstring.py startswith` plus
-/// `space.newbool`.
-pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "startswith", 1)?;
-    arity_at_most(args, "startswith", 3)?;
-    if args.len() == 2 {
-        unsafe {
-            if pyre_object::is_str(args[0])
-                && !pyre_object::is_tuple(args[1])
-                && pyre_object::is_str(args[1])
-            {
-                return Ok(w_bool_from(rstring_prefix_eq!(args[0], args[1])));
-            }
+/// A `start` past the end becomes `end_index + 1` rather than being clamped,
+/// and `end` is lowered only when it is short of the end, so the window
+/// inverts instead of emptying.  That is why `'abc'.startswith('', 5, 10)` is
+/// `False` even for an empty needle, while `'abc'.startswith('', 3, 10)` — a
+/// start exactly at the end — is `True`.
+///
+/// `__index__` can collect, so the receiver is re-read from its shadow-stack
+/// slot after each bound rather than held across the conversions.
+fn str_unwrap_and_compute_idx_params(
+    recv_slot: usize,
+    start_slot: Option<usize>,
+    end_slot: Option<usize>,
+) -> Result<(i64, i64), crate::PyError> {
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
+    let length = unsafe { pyre_object::w_str_len(recv()) } as i64;
+    // An absent bound, and a `None` in its place, mean "this side unbounded":
+    // start is 0 and end is the code point count.
+    let mut start = 0i64;
+    if let Some(slot) = start_slot {
+        let bound = pyre_object::gc_roots::shadow_stack_get(slot);
+        if !unsafe { pyre_object::is_none(bound) } {
+            start = crate::sliceobject::adapt_lower_bound(length, bound)?;
         }
     }
-    str_prefix_match_slow(args, "startswith", true)
-}
-
-pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "endswith", 1)?;
-    arity_at_most(args, "endswith", 3)?;
-    if args.len() == 2 {
-        unsafe {
-            if pyre_object::is_str(args[0])
-                && !pyre_object::is_tuple(args[1])
-                && pyre_object::is_str(args[1])
-            {
-                return Ok(w_bool_from(rstring_suffix_eq!(args[0], args[1])));
-            }
+    let mut end = length;
+    if let Some(slot) = end_slot {
+        let bound = pyre_object::gc_roots::shadow_stack_get(slot);
+        if !unsafe { pyre_object::is_none(bound) } {
+            end = crate::sliceobject::adapt_lower_bound(length, bound)?;
         }
     }
-    str_prefix_match_slow(args, "endswith", false)
+    let mut start_index = 0i64;
+    // `as_bytes()` first so the length is an `Rvalue::Len`: `Wtf8::len` is an
+    // un-lowered method leaf that would stop the graph.
+    let mut end_index = unsafe { pyre_object::w_str_get_wtf8(recv()) }
+        .as_bytes()
+        .len() as i64;
+    if start > 0 {
+        start_index = if start > length {
+            end_index + 1
+        } else {
+            let byte = unsafe { pyre_object::w_str_index_to_byte(recv(), start as usize) };
+            byte as i64
+        };
+    }
+    if end < length {
+        let byte = unsafe { pyre_object::w_str_index_to_byte(recv(), end as usize) };
+        end_index = byte as i64;
+    }
+    Ok((start_index, end_index))
 }
 
-/// Bounds / tuple / TypeError residual of `descr_startswith`.
-/// `dont_look_inside` so those arms do not drag the slice-index helpers
-/// into the generated wrapper (`__import__` look-inside split).
-#[majit_macros::dont_look_inside]
-fn str_prefix_match_slow(
+/// `unicodeobject.py _startswith` / `_endswith` for one `str` needle whose
+/// bounds are already byte offsets: an inverted window matches nothing, an
+/// empty needle matches anything else, and the rest is `rstring.py
+/// startswith` / `endswith`, which are `@jit.elidable` — one pure call over
+/// the two `_utf8` payloads, not a walked byte loop.
+///
+/// WTF-8 is self-synchronizing, so the byte-level match those perform
+/// coincides with the code-point-level one.
+fn str_prefix_match_one(
+    w_self: PyObjectRef,
+    w_needle: PyObjectRef,
+    start: i64,
+    end: i64,
+    is_start: bool,
+) -> bool {
+    if start > end {
+        return false;
+    }
+    if unsafe { pyre_object::w_str_get_wtf8(w_needle) }
+        .as_bytes()
+        .is_empty()
+    {
+        return true;
+    }
+    unsafe {
+        if is_start {
+            pyre_object::unicodeobject::startswith(w_self, w_needle, start, end)
+        } else {
+            pyre_object::unicodeobject::endswith(w_self, w_needle, start, end)
+        }
+    }
+}
+
+/// `stringmethods.py _startswith_tuple` / `_endswith_tuple` — the first
+/// member that matches wins.  A non-`str` member is reported against the
+/// tuple rather than against the argument as a whole.
+fn str_prefix_match_tuple(
+    w_self: PyObjectRef,
+    w_needles: PyObjectRef,
+    start: i64,
+    end: i64,
+    method: &str,
+    is_start: bool,
+) -> Result<bool, crate::PyError> {
+    let n = unsafe { pyre_object::w_tuple_len(w_needles) } as i64;
+    for i in 0..n {
+        let item =
+            unsafe { pyre_object::w_tuple_getitem(w_needles, i) }.expect("index is in range");
+        if !unsafe { pyre_object::is_str(item) } {
+            return Err(crate::PyError::type_error(format!(
+                "tuple for {method} must only contain str, not {}",
+                arg_type_name(item)
+            )));
+        }
+        if str_prefix_match_one(w_self, item, start, end, is_start) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `unicodeobject.py descr_startswith` / `descr_endswith` — the bounds, then
+/// either the tuple arm or the single needle.  `interp2app` unwraps
+/// `(w_prefix, w_start=None, w_end=None)`; the flat `BuiltinCodeFn` slice
+/// carries them positionally behind the receiver.
+///
+/// The whole method is one graph: the bounds arithmetic and the elidable
+/// match are what the descent records, so a bounded call is not a residual.
+fn str_descr_prefix_match(
     args: &[PyObjectRef],
     method: &str,
-    start: bool,
+    is_start: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
+    arity_at_least(args, method, 1)?;
+    arity_at_most(args, method, 3)?;
+    // `__index__` on a bound can collect, so the receiver, the needle and
+    // both bounds are pinned before any of them is unwrapped.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
-    let Some(slice) = str_slice_window(
+    let (start, end) = str_unwrap_and_compute_idx_params(
         base,
         (args.len() >= 3).then_some(base + 2),
         (args.len() >= 4).then_some(base + 3),
-    )?
-    else {
-        return validate_prefix_arg(pyre_object::gc_roots::shadow_stack_get(base + 1), method)
-            .map(|()| w_bool_from(false));
-    };
-    str_prefix_match(
-        &slice,
-        pyre_object::gc_roots::shadow_stack_get(base + 1),
-        method,
-        start,
-    )
-    .map(w_bool_from)
+    )?;
+    let w_self = pyre_object::gc_roots::shadow_stack_get(base);
+    let w_needle = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    if unsafe { pyre_object::is_tuple(w_needle) } {
+        return str_prefix_match_tuple(w_self, w_needle, start, end, method, is_start)
+            .map(w_bool_from);
+    }
+    if !unsafe { pyre_object::is_str(w_needle) } {
+        return Err(crate::PyError::type_error(format!(
+            "{method} first arg must be str or a tuple of str, not {}",
+            arg_type_name(w_needle)
+        )));
+    }
+    Ok(w_bool_from(str_prefix_match_one(
+        w_self, w_needle, start, end, is_start,
+    )))
 }
 
-/// The whole `str.startswith` method behind the gateway's fast arm.
-#[majit_macros::dont_look_inside]
-fn str_startswith_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    str_method_startswith(args)
+/// `unicodeobject.py descr_startswith`.
+pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_descr_prefix_match(args, "startswith", true)
 }
 
-/// The whole `str.endswith` method behind the gateway's fast arm.
-#[majit_macros::dont_look_inside]
-fn str_endswith_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    str_method_endswith(args)
+/// `unicodeobject.py descr_endswith`.
+pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_descr_prefix_match(args, "endswith", false)
 }
 
-/// `BuiltinCode.func` PBC member for `str.startswith`.
+/// `unicodeobject.py _unwrap_and_compute_idx_params` for the operand shapes
+/// that reach the match without running a user slot, returning the receiver,
+/// the needle and the two byte offsets.
 ///
-/// `interp2app` would generate this wrapper; the descent walker keys the
-/// args-array heap-cache off the element reads, the same shape
-/// `__majit_wrap_builtin_len` uses.  The fast arm comes before the arity
-/// check: a keyword argument rides the same slice as a trailing dict, which
-/// is never a `str`, so two `str` elements are exactly one positional
-/// prefix.  Every other shape, the arity and keyword errors included, runs
-/// the method through the `dont_look_inside` [`str_startswith_slow`], so the
-/// kwargs scan and `__getslice_minusone` stay out of this graph.  The match
-/// is `rstring.py startswith`, which is `@jit.elidable`: one pure call.
+/// Each condition is one upstream branch, not a shortcut: `int`/absent bounds
+/// are `getindex_w`'s `isinstance_w(w_int)` arm, a `str` needle is
+/// `descr_startswith`'s non-tuple arm, and an ascii receiver is
+/// `_index_to_byte`'s `is_ascii()` arm, for which the byte offset *is* the
+/// code point index.  `None` hands the call to the residual, which runs the
+/// same method over every arm.
+///
+/// Nothing here can collect, so no argument needs rooting — which is what
+/// lets the descent reach [`str_prefix_match_one`]'s `@jit.elidable` match
+/// with no un-lowered call and no executed effect before it.
+fn str_idx_params_unrooted(args: &[PyObjectRef]) -> Option<(PyObjectRef, PyObjectRef, i64, i64)> {
+    // `startswith(prefix[, start[, end]])` behind the receiver.  A keyword
+    // argument rides the same slice as a trailing marker dict, which is
+    // neither `int` nor `None`, so the bound tests below decline it.
+    if args.len() < 2 || args.len() > 4 {
+        return None;
+    }
+    let w_self = args[0];
+    let w_needle = args[1];
+    if !unsafe {
+        pyre_object::is_str(w_self)
+            && pyre_object::is_str(w_needle)
+            && pyre_object::w_str_is_ascii(w_self)
+    } {
+        return None;
+    }
+    // ascii: the code point count and the byte length are the same number.
+    let length = unsafe { pyre_object::w_str_get_wtf8(w_self) }
+        .as_bytes()
+        .len() as i64;
+    let mut start = 0i64;
+    if args.len() >= 3 {
+        let bound = args[2];
+        if !unsafe { pyre_object::is_none(bound) } {
+            if !unsafe { pyre_object::is_int(bound) } {
+                return None;
+            }
+            let index = unsafe { pyre_object::w_int_get_value(bound) };
+            start = crate::sliceobject::adapt_bound(length, index);
+        }
+    }
+    let mut end = length;
+    if args.len() >= 4 {
+        let bound = args[3];
+        if !unsafe { pyre_object::is_none(bound) } {
+            if !unsafe { pyre_object::is_int(bound) } {
+                return None;
+            }
+            let index = unsafe { pyre_object::w_int_get_value(bound) };
+            end = crate::sliceobject::adapt_bound(length, index);
+        }
+    }
+    let mut start_index = 0i64;
+    let mut end_index = length;
+    if start > 0 {
+        start_index = if start > length { end_index + 1 } else { start };
+    }
+    if end < length {
+        end_index = end;
+    }
+    Some((w_self, w_needle, start_index, end_index))
+}
+
+/// `BuiltinCode.func` PBC member for `str.startswith` — the wrapper
+/// `interp2app` would generate.  The descent walker keys the args-array
+/// heap-cache off the element reads, the same shape
+/// `__majit_wrap_builtin_len` uses.
+///
+/// The arm in this graph is `descr_startswith`'s own body over the operand
+/// shapes [`str_idx_params_unrooted`] admits, and the match it ends in is
+/// `rstring.py startswith`, which is `@jit.elidable`: one pure call, which
+/// the optimizer folds when the operands are constant.  Every other shape
+/// runs the *same* method through the residual below, so there is one
+/// implementation and not two.
 pub fn __majit_wrap_str_descr_startswith(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 2 {
-        let w_self = args[0];
-        let w_prefix = args[1];
-        if unsafe {
-            pyre_object::is_str(w_self)
-                && !pyre_object::is_tuple(w_prefix)
-                && pyre_object::is_str(w_prefix)
-        } {
-            let found =
-                unsafe { pyre_object::unicodeobject::startswith(w_self, w_prefix, 0, i64::MAX) };
-            return Ok(w_bool_from(found));
-        }
+    if let Some((w_self, w_prefix, start, end)) = str_idx_params_unrooted(args) {
+        return Ok(w_bool_from(str_prefix_match_one(
+            w_self, w_prefix, start, end, true,
+        )));
     }
-    str_startswith_slow(args)
+    str_descr_startswith_residual(args)
 }
 
 /// `BuiltinCode.func` PBC member for `str.endswith`.
 pub fn __majit_wrap_str_descr_endswith(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 2 {
-        let w_self = args[0];
-        let w_suffix = args[1];
-        if unsafe {
-            pyre_object::is_str(w_self)
-                && !pyre_object::is_tuple(w_suffix)
-                && pyre_object::is_str(w_suffix)
-        } {
-            let found =
-                unsafe { pyre_object::unicodeobject::endswith(w_self, w_suffix, 0, i64::MAX) };
-            return Ok(w_bool_from(found));
-        }
+    if let Some((w_self, w_suffix, start, end)) = str_idx_params_unrooted(args) {
+        return Ok(w_bool_from(str_prefix_match_one(
+            w_self, w_suffix, start, end, false,
+        )));
     }
-    str_endswith_slow(args)
+    str_descr_endswith_residual(args)
 }
 
-/// Apply `startswith`/`endswith`'s optional `start`/`end` bounds to `s`,
-/// returning the code-point window as WTF-8. `stringmethods.py _convert_idx_params
-/// _convert_idx_params` → `unwrap_start_stop`: each bound runs through
-/// `adapt_lower_bound(_eval_slice_index(...))`, so a non-index bound raises a
-/// TypeError and a bound is coerced via `__index__`.
-///
-/// `unicodeobject.py _unwrap_and_compute_idx_params` then converts the
-/// two code-point bounds to byte offsets: a `start` past the end becomes
-/// `end_index + 1` rather than being clamped, and `end` is only lowered when
-/// it is short of the end. `None` signals the resulting window is inverted,
-/// for which the match is always `False` — even for an empty needle, which is
-/// why `'abc'.startswith('', 5, 10)` and `''.endswith('', 1, 0)` are `False`.
-fn wtf8_cp_to_byte(s: &Wtf8, cp_index: usize) -> usize {
-    let mut bytes = 0usize;
-    let mut n = 0usize;
-    for cp in s.code_points() {
-        if n == cp_index {
-            break;
-        }
-        bytes += cp.len_wtf8();
-        n += 1;
-    }
-    bytes
+/// `descr_startswith` for the arms that run a user slot, build an error, or
+/// walk a tuple.  `dont_look_inside` for the reason `argument.py` keeps
+/// `ArgErr.getmsg` out of `_match_signature`: the message and the generic
+/// `__index__` conversion pull the whole attribute-lookup and codec surface
+/// into the graph, and the descent's blocker scan is whole-body, so a
+/// runtime branch does not keep them out.
+#[majit_macros::dont_look_inside]
+fn str_descr_startswith_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_method_startswith(args)
 }
 
-fn str_slice_window(
-    recv_slot: usize,
-    start_slot: Option<usize>,
-    end_slot: Option<usize>,
-) -> Result<Option<Wtf8Buf>, crate::PyError> {
-    let obj = pyre_object::gc_roots::shadow_stack_get(recv_slot);
-    // Copy before `__index__`. The window is then taken from the owned
-    // snapshot, not a slice into a receiver that may have moved.
-    let s = unsafe { pyre_object::w_str_get_wtf8(obj) }.to_wtf8_buf();
-    let char_len = unsafe { pyre_object::w_str_len(obj) } as i64;
-    // `None` bounds mean "not provided" (start -> 0, end -> len).
-    let start = if let Some(slot) = start_slot {
-        let bound = pyre_object::gc_roots::shadow_stack_get(slot);
-        if !unsafe { pyre_object::is_none(bound) } {
-            crate::sliceobject::adapt_lower_bound(char_len, bound)?
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-    let end = if let Some(slot) = end_slot {
-        let bound = pyre_object::gc_roots::shadow_stack_get(slot);
-        if !unsafe { pyre_object::is_none(bound) } {
-            crate::sliceobject::adapt_lower_bound(char_len, bound)?
-        } else {
-            char_len
-        }
-    } else {
-        char_len
-    };
-    let bytes = s.as_bytes();
-    let mut end_index = bytes.len();
-    if end < char_len {
-        end_index = wtf8_cp_to_byte(&s, end as usize);
-    }
-    let mut start_index = 0usize;
-    if start > 0 {
-        start_index = if start > char_len {
-            end_index + 1
-        } else {
-            wtf8_cp_to_byte(&s, start as usize)
-        };
-    }
-    if start_index > end_index {
-        return Ok(None);
-    }
-    Ok(Some(
-        unsafe { Wtf8::from_bytes_unchecked(&bytes[start_index..end_index]) }.to_wtf8_buf(),
-    ))
-}
-
-fn str_prefix_match(
-    s: &Wtf8,
-    needle: PyObjectRef,
-    method: &str,
-    start: bool,
-) -> Result<bool, crate::PyError> {
-    let h = s.as_bytes();
-    // WTF-8 is self-synchronizing, so a byte-level prefix/suffix match
-    // coincides with a code-point-level one.
-    let test = |p: &Wtf8| {
-        let p = p.as_bytes();
-        if start {
-            h.starts_with(p)
-        } else {
-            h.ends_with(p)
-        }
-    };
-    if unsafe { pyre_object::is_str(needle) } {
-        let p = unsafe { pyre_object::w_str_get_wtf8(needle) };
-        return Ok(test(p));
-    }
-    if unsafe { pyre_object::is_tuple(needle) } {
-        let n = unsafe { pyre_object::w_tuple_len(needle) };
-        for i in 0..n as i64 {
-            let item =
-                unsafe { pyre_object::w_tuple_getitem(needle, i) }.expect("index is in range");
-            if !unsafe { pyre_object::is_str(item) } {
-                return Err(crate::PyError::type_error(format!(
-                    "tuple for {method} must only contain str, not {}",
-                    arg_type_name(item)
-                )));
-            }
-            let p = unsafe { pyre_object::w_str_get_wtf8(item) };
-            if test(p) {
-                return Ok(true);
-            }
-        }
-        return Ok(false);
-    }
-    Err(crate::PyError::type_error(format!(
-        "{method} first arg must be str or a tuple of str, not {}",
-        arg_type_name(needle)
-    )))
-}
-
-/// Type-check a `startswith`/`endswith` argument (a str, or a tuple whose
-/// items are all str) without running the match. Used on the out-of-range
-/// window path, where the result is `False` but a bad argument type still
-/// raises the same `TypeError` as the in-range path.
-fn validate_prefix_arg(needle: PyObjectRef, method: &str) -> Result<(), crate::PyError> {
-    if unsafe { pyre_object::is_str(needle) } {
-        return Ok(());
-    }
-    if unsafe { pyre_object::is_tuple(needle) } {
-        let n = unsafe { pyre_object::w_tuple_len(needle) };
-        for i in 0..n as i64 {
-            let item =
-                unsafe { pyre_object::w_tuple_getitem(needle, i) }.expect("index is in range");
-            if !unsafe { pyre_object::is_str(item) } {
-                return Err(crate::PyError::type_error(format!(
-                    "tuple for {method} must only contain str, not {}",
-                    arg_type_name(item)
-                )));
-            }
-        }
-        return Ok(());
-    }
-    Err(crate::PyError::type_error(format!(
-        "{method} first arg must be str or a tuple of str, not {}",
-        arg_type_name(needle)
-    )))
+/// `descr_endswith`'s residual.  See [`str_descr_startswith_residual`].
+#[majit_macros::dont_look_inside]
+fn str_descr_endswith_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_method_endswith(args)
 }
 
 pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

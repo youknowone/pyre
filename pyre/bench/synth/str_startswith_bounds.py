@@ -1,15 +1,28 @@
-# pyre-check: max-pypy-ratio=17
+# pyre-check: max-pypy-ratio=8
 # startswith/endswith convert their code-point bounds to byte offsets: a
 # start past the end is not clamped, it inverts the window, so the match is
 # False even for an empty prefix. A start exactly at the end still yields a
 # valid empty window and matches. Shifting zero left never allocates, however
 # large the count. A warmup loop exercises the bounded prefix path.
+#
+# The bound varies per iteration so the match is executed rather than
+# constant-folded: `rstring.py startswith` is `@jit.elidable`, and over
+# constant operands both pypy and pyre fold the call away, leaving the loop
+# measuring nothing but its own counter.
+#
+# The count is what keeps the ratio gate armed -- under it pypy's
+# execution-only time subtracts to the floor, check.py declines both bounds
+# on a clamped baseline, and the recorded ceiling goes unapplied. It is
+# bounded from above too: cpython runs this loop interpreted, and a fixture
+# whose cpython reference exceeds its 5s timeout loses the cpython/pypy
+# output cross-check.
 def warm(n):
     acc = 0
     for i in range(n):
-        if "abcdef".startswith("cd", 2, 4):
+        start = i % 3
+        if "abcdef".startswith("cd", start, 4):
             acc += 1
-        if "abcdef".endswith("ef", 0, 6):
+        if "abcdef".endswith("ef", start, 6):
             acc += 1
         acc += 0 << (i % 8)
     return acc
@@ -23,7 +36,7 @@ def m(label, fn):
 
 
 def main():
-    print("warm", warm(450000))
+    print("warm", warm(8_000_000))
     # a start past the end inverts the window: False even for an empty prefix
     m("sw_empty_oor", lambda: "abc".startswith("", 5, 10))
     m("ew_empty_oor", lambda: "abc".endswith("", 5, 10))

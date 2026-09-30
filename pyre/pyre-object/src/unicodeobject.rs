@@ -1405,9 +1405,13 @@ pub fn rstring_endswith(u_self: &Wtf8, suffix: &Wtf8, start: i64, end: i64) -> b
 /// The walk lives here — not in a `&Wtf8` callee — so CodeWriter sees
 /// only `PyObjectRef` arguments.
 ///
+/// `@jit.elidable` with `_canraise` false — `EF_ELIDABLE_CANNOT_RAISE`: the
+/// walk only reads two payloads over an already-bounded window, so the
+/// optimizer may fold the call away instead of guarding it for an exception.
+///
 /// # Safety
 /// Both arguments must be live `W_UnicodeObject`s.
-#[majit_macros::elidable]
+#[majit_macros::elidable_cannot_raise]
 pub unsafe fn startswith(s1: PyObjectRef, s2: PyObjectRef, start: i64, end: i64) -> bool {
     // Walk is spelled here (not delegated to the `&Wtf8` helper) so
     // Charon's body for this Ptr-shaped function contains the
@@ -1435,9 +1439,11 @@ pub unsafe fn startswith(s1: PyObjectRef, s2: PyObjectRef, start: i64, end: i64)
 
 /// `unicodeobject.py _endswith` / `rstring.py endswith`.
 ///
+/// `EF_ELIDABLE_CANNOT_RAISE`, for the reason [`startswith`] gives.
+///
 /// # Safety
 /// Both arguments must be live `W_UnicodeObject`s.
-#[majit_macros::elidable]
+#[majit_macros::elidable_cannot_raise]
 pub unsafe fn endswith(s1: PyObjectRef, s2: PyObjectRef, start: i64, end: i64) -> bool {
     let u_self = unsafe { w_str_get_wtf8(s1) };
     let suffix = unsafe { w_str_get_wtf8(s2) };
@@ -1465,12 +1471,12 @@ pub unsafe fn endswith(s1: PyObjectRef, s2: PyObjectRef, start: i64, end: i64) -
 /// byte walks; WTF-8 is self-synchronizing, so a byte prefix/suffix match is
 /// the code-point match.  The walker pins both operands as exact `str`
 /// before this call, so a tuple needle or a non-str stays on the residual.
-#[majit_macros::elidable]
+#[majit_macros::elidable_cannot_raise]
 pub extern "C" fn jit_str_startswith(s: PyObjectRef, prefix: PyObjectRef) -> i64 {
     unsafe { i64::from(startswith(s, prefix, 0, i64::MAX)) }
 }
 
-#[majit_macros::elidable]
+#[majit_macros::elidable_cannot_raise]
 pub extern "C" fn jit_str_endswith(s: PyObjectRef, suffix: PyObjectRef) -> i64 {
     unsafe { i64::from(endswith(s, suffix, 0, i64::MAX)) }
 }
