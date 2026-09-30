@@ -8,23 +8,47 @@
 use pyre_object::*;
 
 mod interp_bufferedio;
-pub use interp_bufferedio::W_BufferedReader;
+pub use interp_bufferedio::{
+    BUFFEREDREADER_USER_TYPE, W_BUFFEREDREADER_USER_GC_TYPE_ID_CELL,
+    W_BUFFEREDREADER_USER_PYRE_CLASS_DESCRIPTOR, W_BufferedReader, W_BufferedReaderUser,
+};
 mod buffered_writer;
-pub use buffered_writer::W_BufferedWriter;
+pub use buffered_writer::{
+    BUFFEREDWRITER_USER_TYPE, W_BUFFEREDWRITER_USER_GC_TYPE_ID_CELL,
+    W_BUFFEREDWRITER_USER_PYRE_CLASS_DESCRIPTOR, W_BufferedWriter, W_BufferedWriterUser,
+};
 mod buffered_rwpair;
-pub use buffered_rwpair::W_BufferedRWPair;
+pub use buffered_rwpair::{
+    BUFFEREDRWPAIR_USER_TYPE, W_BUFFEREDRWPAIR_USER_GC_TYPE_ID_CELL,
+    W_BUFFEREDRWPAIR_USER_PYRE_CLASS_DESCRIPTOR, W_BufferedRWPair, W_BufferedRWPairUser,
+};
 mod buffered_random;
-pub use buffered_random::W_BufferedRandom;
+pub use buffered_random::{
+    BUFFEREDRANDOM_USER_TYPE, W_BUFFEREDRANDOM_USER_GC_TYPE_ID_CELL,
+    W_BUFFEREDRANDOM_USER_PYRE_CLASS_DESCRIPTOR, W_BufferedRandom, W_BufferedRandomUser,
+};
 mod interp_bytesio;
-pub use interp_bytesio::W_BytesIO;
+pub use interp_bytesio::{
+    BYTESIO_USER_TYPE, W_BYTESIO_USER_GC_TYPE_ID_CELL, W_BYTESIO_USER_PYRE_CLASS_DESCRIPTOR,
+    W_BytesIO, W_BytesIOUser,
+};
 mod interp_stringio;
-pub use interp_stringio::W_StringIO;
+pub use interp_stringio::{
+    STRINGIO_USER_TYPE, W_STRINGIO_USER_GC_TYPE_ID_CELL, W_STRINGIO_USER_PYRE_CLASS_DESCRIPTOR,
+    W_StringIO, W_StringIOUser,
+};
 mod interp_textio;
-pub use interp_textio::W_TextIOWrapper;
+pub use interp_textio::{
+    TEXTIOWRAPPER_USER_TYPE, W_TEXTIOWRAPPER_USER_GC_TYPE_ID_CELL,
+    W_TEXTIOWRAPPER_USER_PYRE_CLASS_DESCRIPTOR, W_TextIOWrapper, W_TextIOWrapperUser,
+};
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub(crate) mod interp_win32consoleio;
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-pub use interp_win32consoleio::W_WinConsoleIO;
+pub use interp_win32consoleio::{
+    W_WINCONSOLEIO_USER_GC_TYPE_ID_CELL, W_WINCONSOLEIO_USER_PYRE_CLASS_DESCRIPTOR, W_WinConsoleIO,
+    W_WinConsoleIOUser, WINCONSOLEIO_USER_TYPE,
+};
 
 pub fn text_io_wrapper_type() -> PyObjectRef {
     interp_textio::type_object()
@@ -41,9 +65,8 @@ pub(crate) fn is_stringio(obj: PyObjectRef) -> bool {
 }
 
 /// Address of `interp_iobase.py W_IOBase.w_dict` when `obj` is one of the
-/// typed IO payloads. Subclass instances keep the base typeptr
-/// (`store_subclass_tag` writes `w_class` only), so the typeptr check
-/// covers them.
+/// typed IO payloads. `from_obj` with `user_layout` accepts both the
+/// base and the `_getusercls` typeptr.
 ///
 /// # Safety
 /// `obj` is null or a live object. The returned pointer is the field of

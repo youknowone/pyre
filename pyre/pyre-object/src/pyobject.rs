@@ -965,9 +965,9 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // user layouts, and `__pypy__.Bufferable`).
     // 168 is `interp__weakref.py` `W_Weakref`, an object subclass.
     // 169-195 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
-    // 196-204 append deque, Struct, GenericAlias, big-int, weakref,
-    // staticmethod, classmethod, module and `_thread._local` user layouts
-    // without moving the closed block above.
+    // 196-211 append deque, Struct, GenericAlias, big-int, weakref,
+    // staticmethod, classmethod, module, `_thread._local` and typed `_io`
+    // user layouts without moving the closed block above.
     (158, Some(1)),
     (159, Some(34)),
     (160, Some(8)),
@@ -1016,22 +1016,31 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (202, Some(21)),  // ClassMethodUser
     (203, Some(36)),  // ModuleUser
     (204, Some(133)), // W_LocalUser
+    (205, Some(151)), // W_BytesIOUser
+    (206, Some(152)), // W_StringIOUser
+    (207, Some(128)), // W_BufferedReaderUser
+    (208, Some(129)), // W_BufferedWriterUser
+    (209, Some(130)), // W_BufferedRWPairUser
+    (210, Some(131)), // W_BufferedRandomUser
+    (211, Some(132)), // W_TextIOWrapperUser
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail, after the `_getusercls` layouts (158-204).
-    (205, Some(0)),
-    // Native-only type IDs 206 and 207 represent `posix.DirEntry` and
+    // posix / console tail, after the `_getusercls` layouts (158-211).
+    (212, Some(0)),
+    // Native-only type IDs 213 and 214 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (206, Some(0)),
+    (213, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (207, Some(0)),
+    (214, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (208, Some(0)),
-    // The classes `pyre-module` registers follow, numbered by `build_gc` in
-    // the order the module hooks list them; `pyre-interpreter` appends them.
+    (215, Some(0)),
+    #[cfg(windows)]
+    (216, Some(215)), // W_WinConsoleIOUser
+                      // The classes `pyre-module` registers follow, numbered by `build_gc` in
+                      // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
 
 /// Compute subclass IDs from the active hierarchy and write every

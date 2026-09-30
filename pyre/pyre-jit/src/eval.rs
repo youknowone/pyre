@@ -4513,8 +4513,45 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut pytype_to_tid,
         &pyre_interpreter::module::thread::W_LOCAL_USER_PYRE_CLASS_DESCRIPTOR,
     );
+    // Typed `_io` payloads (`typedef.py` `_getusercls`). Parents are the
+    // builtin tids already registered above (151, 152, 128-132).
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_BYTESIO_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_STRINGIO_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_BUFFEREDREADER_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_BUFFEREDWRITER_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_BUFFEREDRWPAIR_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_BUFFEREDRANDOM_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_TEXTIOWRAPPER_USER_PYRE_CLASS_DESCRIPTOR,
+    );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 205),
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 212),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,
@@ -4558,6 +4595,12 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut pytype_to_tid,
         <pyre_interpreter::module::_io::W_WinConsoleIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_WINCONSOLEIO_USER_PYRE_CLASS_DESCRIPTOR,
     );
     // `instancemethod` is unconditional and last, so the posix and console
     // ids above stay put and only the module boundary moves.

@@ -1199,32 +1199,41 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(196, &crate::module::_collections::DEQUE_USER_TYPE),
         subclass_range_alias(197, &crate::module::r#struct::STRUCT_USER_TYPE),
         subclass_range_alias(204, &crate::module::thread::LOCAL_USER_TYPE),
+        subclass_range_alias(205, &crate::module::_io::BYTESIO_USER_TYPE),
+        subclass_range_alias(206, &crate::module::_io::STRINGIO_USER_TYPE),
+        subclass_range_alias(207, &crate::module::_io::BUFFEREDREADER_USER_TYPE),
+        subclass_range_alias(208, &crate::module::_io::BUFFEREDWRITER_USER_TYPE),
+        subclass_range_alias(209, &crate::module::_io::BUFFEREDRWPAIR_USER_TYPE),
+        subclass_range_alias(210, &crate::module::_io::BUFFEREDRANDOM_USER_TYPE),
+        subclass_range_alias(211, &crate::module::_io::TEXTIOWRAPPER_USER_TYPE),
         // `_sre.SRE_Template` is the last unconditional interpreter class
-        // after the `_getusercls` layouts (158-204). Posix and the Windows
+        // after the `_getusercls` layouts (158-211). Posix and the Windows
         // console follow it.
-        subclass_range_alias(205, typed::<pyre_object::interp_sre::W_SRE_Template>()),
-        // Native-only posix aliases 206 and 207 preserve `build_gc`'s rclass
+        subclass_range_alias(212, typed::<pyre_object::interp_sre::W_SRE_Template>()),
+        // Native-only posix aliases 213 and 214 preserve `build_gc`'s rclass
         // registration order after `_sre.SRE_Template`.
         // `scandir` has no seam on wasm32, so neither type exists there.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(206, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(213, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(207, typed::<crate::module::posix::W_ScandirIterator>()),
+        subclass_range_alias(214, typed::<crate::module::posix::W_ScandirIterator>()),
         // PEP 528's raw console stream closes the interpreter's classes on
         // Windows.  It is subclassable and therefore participates in the same
         // rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(208, typed::<crate::module::_io::W_WinConsoleIO>()),
+        subclass_range_alias(215, typed::<crate::module::_io::W_WinConsoleIO>()),
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        subclass_range_alias(216, &crate::module::_io::WINCONSOLEIO_USER_TYPE),
         // Registered after every platform-gated interpreter class.
-        // `build_gc`: SRE_Template is tid 205, then posix 206/207, then
-        // WinConsoleIO, then InstanceMethod.
+        // `build_gc`: SRE_Template is tid 212, then posix 213/214, then
+        // WinConsoleIO 215 and its user layout 216, then InstanceMethod.
         subclass_range_alias(
             if cfg!(target_arch = "wasm32") {
-                206
+                213
             } else if WINDOWS_CONSOLE_IO {
-                209
+                217
             } else {
-                208
+                215
             },
             typed::<pyre_object::instancemethod::InstanceMethod>(),
         ),
@@ -1243,11 +1252,11 @@ const WINDOWS_CONSOLE_IO: bool = cfg!(all(windows, feature = "host_env", not(fea
 /// not depend on which modules are linked; the module classes follow in the
 /// order [`module_gc_types`] lists them.
 pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
-    207
+    214
 } else if WINDOWS_CONSOLE_IO {
-    210
+    218
 } else {
-    209
+    216
 };
 
 /// The GC classes of builtin modules, in `build_gc` order: those of this
@@ -1289,21 +1298,21 @@ pub fn module_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRan
 /// other module class is a direct `object` subclass.
 pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
     let hierarchy = pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY;
-    // On Windows the table ends with `_WindowsConsoleIO`; drop it where this
-    // crate compiles the class out.
+    // On Windows the table ends with `_WindowsConsoleIO` and its user
+    // layout; drop both where this crate compiles the class out.
     let core = if cfg!(windows) && !WINDOWS_CONSOLE_IO {
-        &hierarchy[..hierarchy.len() - 1]
+        &hierarchy[..hierarchy.len() - 2]
     } else {
         hierarchy
     };
     let mut active = core.to_vec();
     // Registered after the platform tail, before the module classes.
     let instancemethod_id = if cfg!(target_arch = "wasm32") {
-        206
+        213
     } else if WINDOWS_CONSOLE_IO {
-        209
+        217
     } else {
-        208
+        215
     };
     active.push((instancemethod_id, Some(0)));
     let module_types = module_gc_types();

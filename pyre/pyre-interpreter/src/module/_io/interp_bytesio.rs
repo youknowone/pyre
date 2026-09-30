@@ -6,7 +6,7 @@ const AT_END: i64 = -1;
 
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // BytesIO heap spec.
-#[crate::pyre_class("_io.BytesIO", cpython_heaptype, weakrefable)]
+#[crate::pyre_class("_io.BytesIO", cpython_heaptype, user_layout, weakrefable)]
 pub struct W_BytesIO {
     // rpython/rlib/rStringIO.py:16-23 splits immutable strings between an
     // append-optimized builder and a mutable character list. A bytearray is
@@ -279,19 +279,30 @@ impl W_BytesIO {
 )]
 impl W_BytesIO {
     #[staticmethod]
-    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
+    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        crate::typedef::check_user_subclass(type_object(), cls)?;
         let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
         let buffer = pyre_object::bytearrayobject::w_bytearray_new(0);
         let _ = pyre_object::gc_roots::pin_root(buffer);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let obj = W_BytesIO::allocate_stable(W_BytesIO {
-            buffer: pyre_object::gc_roots::shadow_stack_get(slot),
-            ..W_BytesIO::default()
-        });
+        let obj = W_BytesIO::allocate_instance(
+            W_BytesIO {
+                buffer: pyre_object::gc_roots::shadow_stack_get(slot),
+                ..W_BytesIO::default()
+            },
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        );
         // interp_bytesio.py needs_finalizer: only a subclass needs finalization; line
         // 70 also opts this in-memory stream out of the autoflusher.
+        let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
         let needs_finalizer = !cls.is_null() && !std::ptr::eq(cls, type_object());
-        super::tag_io_instance_without_autoflusher(obj, cls, needs_finalizer)
+        Ok(super::tag_io_instance_without_autoflusher(
+            obj,
+            cls,
+            needs_finalizer,
+        ))
     }
 
     fn __init__(

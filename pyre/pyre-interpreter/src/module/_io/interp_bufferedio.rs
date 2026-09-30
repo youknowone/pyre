@@ -80,7 +80,7 @@ pub(super) fn raw_readinto_size(
 
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // BufferedReader heap spec.
-#[crate::pyre_class("_io.BufferedReader", cpython_heaptype, weakrefable)]
+#[crate::pyre_class("_io.BufferedReader", cpython_heaptype, user_layout, weakrefable)]
 pub struct W_BufferedReader {
     state: i64,
     w_raw: PyObjectRef,
@@ -623,9 +623,19 @@ impl W_BufferedReader {
 )]
 impl W_BufferedReader {
     #[staticmethod]
-    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
-        let obj = W_BufferedReader::allocate_stable(W_BufferedReader::default());
-        super::tag_io_instance(obj, cls)
+    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        crate::typedef::check_user_subclass(type_object(), cls)?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        let obj = W_BufferedReader::allocate_instance(
+            W_BufferedReader::default(),
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        );
+        Ok(super::tag_io_instance(
+            obj,
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        ))
     }
 
     fn __init__(

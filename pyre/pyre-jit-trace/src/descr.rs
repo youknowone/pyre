@@ -5189,6 +5189,130 @@ static W_LOCAL_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     )
 });
 
+static W_BYTESIO_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_BytesIOUser>(),
+        pyre_interpreter::module::_io::W_BYTESIO_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::BYTESIO_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BytesIOUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BytesIOUser, storage),
+        "W_BytesIOUser",
+        "module::_io::W_BytesIOUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF80,
+    )
+});
+
+static W_STRINGIO_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_StringIOUser>(),
+        pyre_interpreter::module::_io::W_STRINGIO_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::STRINGIO_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_StringIOUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_StringIOUser, storage),
+        "W_StringIOUser",
+        "module::_io::W_StringIOUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF90,
+    )
+});
+
+static W_BUFFEREDREADER_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_BufferedReaderUser>(),
+        pyre_interpreter::module::_io::W_BUFFEREDREADER_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::BUFFEREDREADER_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedReaderUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedReaderUser, storage),
+        "W_BufferedReaderUser",
+        "module::_io::W_BufferedReaderUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFA0,
+    )
+});
+
+static W_BUFFEREDWRITER_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_BufferedWriterUser>(),
+        pyre_interpreter::module::_io::W_BUFFEREDWRITER_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::BUFFEREDWRITER_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedWriterUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedWriterUser, storage),
+        "W_BufferedWriterUser",
+        "module::_io::W_BufferedWriterUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFB0,
+    )
+});
+
+static W_BUFFEREDRWPAIR_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_BufferedRWPairUser>(),
+        pyre_interpreter::module::_io::W_BUFFEREDRWPAIR_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::BUFFEREDRWPAIR_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedRWPairUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedRWPairUser, storage),
+        "W_BufferedRWPairUser",
+        "module::_io::W_BufferedRWPairUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFC0,
+    )
+});
+
+static W_BUFFEREDRANDOM_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_BufferedRandomUser>(),
+        pyre_interpreter::module::_io::W_BUFFEREDRANDOM_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::BUFFEREDRANDOM_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedRandomUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedRandomUser, storage),
+        "W_BufferedRandomUser",
+        "module::_io::W_BufferedRandomUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFD0,
+    )
+});
+
+static W_TEXTIOWRAPPER_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_TextIOWrapperUser>(),
+        pyre_interpreter::module::_io::W_TEXTIOWRAPPER_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::TEXTIOWRAPPER_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_TextIOWrapperUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_TextIOWrapperUser, storage),
+        "W_TextIOWrapperUser",
+        "module::_io::W_TextIOWrapperUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFE0,
+    )
+});
+
+unsafe fn winconsoleio_user_mapdict_descr(
+    obj: pyre_object::PyObjectRef,
+    field: usize,
+) -> Option<DescrRef> {
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    {
+        if unsafe {
+            pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::WINCONSOLEIO_USER_TYPE)
+        } {
+            return Some(field_descr_from_group(
+                &W_WINCONSOLEIO_USER_DESCR_GROUP,
+                field,
+            ));
+        }
+    }
+    let _ = (obj, field);
+    None
+}
+
+#[cfg(all(windows, not(feature = "sandbox")))]
+static W_WINCONSOLEIO_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_WinConsoleIOUser>(),
+        pyre_interpreter::module::_io::W_WINCONSOLEIO_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::WINCONSOLEIO_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_WinConsoleIOUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_WinConsoleIOUser, storage),
+        "W_WinConsoleIOUser",
+        "module::_io::W_WinConsoleIOUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFF0,
+    )
+});
+
 struct ModuleUserLayoutGroup {
     /// `ob_type` of a `typedef.py` `_getusercls` instance.
     pytype: usize,
@@ -5411,6 +5535,48 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         pyre_object::py_type_check(obj, &pyre_interpreter::module::thread::LOCAL_USER_TYPE)
     } {
         field_descr_from_group(&W_LOCAL_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::BYTESIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_BYTESIO_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::STRINGIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STRINGIO_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDREADER_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDREADER_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDWRITER_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDWRITER_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDRWPAIR_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDRWPAIR_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDRANDOM_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDRANDOM_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::TEXTIOWRAPPER_USER_TYPE)
+    } {
+        field_descr_from_group(&W_TEXTIOWRAPPER_USER_DESCR_GROUP, 0)
+    } else if let Some(descr) = unsafe { winconsoleio_user_mapdict_descr(obj, 0) } {
+        descr
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 0) } {
         descr
     } else {
@@ -5541,6 +5707,48 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         pyre_object::py_type_check(obj, &pyre_interpreter::module::thread::LOCAL_USER_TYPE)
     } {
         field_descr_from_group(&W_LOCAL_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::BYTESIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_BYTESIO_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::STRINGIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STRINGIO_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDREADER_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDREADER_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDWRITER_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDWRITER_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDRWPAIR_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDRWPAIR_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDRANDOM_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDRANDOM_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::TEXTIOWRAPPER_USER_TYPE)
+    } {
+        field_descr_from_group(&W_TEXTIOWRAPPER_USER_DESCR_GROUP, 1)
+    } else if let Some(descr) = unsafe { winconsoleio_user_mapdict_descr(obj, 1) } {
+        descr
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 1) } {
         descr
     } else {
@@ -7556,6 +7764,39 @@ mod tests {
             0x6100_0F70
         );
         assert_eq!(
+            W_BYTESIO_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F80
+        );
+        assert_eq!(
+            W_STRINGIO_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F90
+        );
+        assert_eq!(
+            W_BUFFEREDREADER_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FA0
+        );
+        assert_eq!(
+            W_BUFFEREDWRITER_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FB0
+        );
+        assert_eq!(
+            W_BUFFEREDRWPAIR_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FC0
+        );
+        assert_eq!(
+            W_BUFFEREDRANDOM_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FD0
+        );
+        assert_eq!(
+            W_TEXTIOWRAPPER_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FE0
+        );
+        #[cfg(all(windows, not(feature = "sandbox")))]
+        assert_eq!(
+            W_WINCONSOLEIO_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FF0
+        );
+        assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
             Type::Ref
         );
@@ -9569,6 +9810,31 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("module::thread::W_LocalUser", || {
         LazyLock::force(&W_LOCAL_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_BytesIOUser", || {
+        LazyLock::force(&W_BYTESIO_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_StringIOUser", || {
+        LazyLock::force(&W_STRINGIO_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_BufferedReaderUser", || {
+        LazyLock::force(&W_BUFFEREDREADER_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_BufferedWriterUser", || {
+        LazyLock::force(&W_BUFFEREDWRITER_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_BufferedRWPairUser", || {
+        LazyLock::force(&W_BUFFEREDRWPAIR_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_BufferedRandomUser", || {
+        LazyLock::force(&W_BUFFEREDRANDOM_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_TextIOWrapperUser", || {
+        LazyLock::force(&W_TEXTIOWRAPPER_USER_DESCR_GROUP);
+    }),
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    ("module::_io::W_WinConsoleIOUser", || {
+        LazyLock::force(&W_WINCONSOLEIO_USER_DESCR_GROUP);
     }),
     ("tupleobject::W_TupleObject", || {
         LazyLock::force(&W_TUPLE_DESCR_GROUP);

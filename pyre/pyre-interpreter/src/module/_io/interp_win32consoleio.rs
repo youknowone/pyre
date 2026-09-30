@@ -7,7 +7,7 @@ use rustpython_host_env::{io as host_io, nt as host_nt};
 const SMALLBUF: usize = 4;
 const BUFMAX: usize = 32 * 1024 * 1024;
 
-#[crate::pyre_class("_io._WindowsConsoleIO", weakrefable)]
+#[crate::pyre_class("_io._WindowsConsoleIO", user_layout, weakrefable)]
 pub struct W_WinConsoleIO {
     // PyPy `W_WinConsoleIO.__init__`: all state belongs to the raw stream.
     // In particular the incomplete UTF-8 character is not a process-global or
@@ -150,9 +150,19 @@ impl W_WinConsoleIO {
 #[crate::pyre_methods(base = super::raw_iobase_type(), weakrefable)]
 impl W_WinConsoleIO {
     #[staticmethod]
-    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
-        let obj = W_WinConsoleIO::allocate_stable(W_WinConsoleIO::default());
-        super::tag_io_instance(obj, cls)
+    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        crate::typedef::check_user_subclass(type_object(), cls)?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        let obj = W_WinConsoleIO::allocate_instance(
+            W_WinConsoleIO::default(),
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        );
+        Ok(super::tag_io_instance(
+            obj,
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        ))
     }
 
     fn __init__(

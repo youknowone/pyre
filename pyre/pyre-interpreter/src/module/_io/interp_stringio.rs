@@ -5,7 +5,7 @@ use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // StringIO heap spec.
-#[crate::pyre_class("_io.StringIO", cpython_heaptype, weakrefable)]
+#[crate::pyre_class("_io.StringIO", cpython_heaptype, user_layout, weakrefable)]
 pub struct W_StringIO {
     // interp_stringio.py stores UnicodeIO.data as a list of r_int32.
     // `array('w')` is the existing GC object whose raw payload is a mutable
@@ -252,19 +252,30 @@ impl W_StringIO {
 #[crate::pyre_methods(base = super::text_iobase_type(), weakrefable, doc = "In-memory text stream")]
 impl W_StringIO {
     #[staticmethod]
-    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
+    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        crate::typedef::check_user_subclass(type_object(), cls)?;
         let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
         let buffer = pyre_object::interp_array::w_array_new(b'w', 4);
         let _ = pyre_object::gc_roots::pin_root(buffer);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let obj = W_StringIO::allocate_stable(W_StringIO {
-            buffer: pyre_object::gc_roots::shadow_stack_get(slot),
-            ..W_StringIO::default()
-        });
+        let obj = W_StringIO::allocate_instance(
+            W_StringIO {
+                buffer: pyre_object::gc_roots::shadow_stack_get(slot),
+                ..W_StringIO::default()
+            },
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        );
         // interp_stringio.py:465-467: only a subclass needs finalization;
         // W_TextIOBase's default autoflusher membership is retained.
+        let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
         let needs_finalizer = !cls.is_null() && !std::ptr::eq(cls, type_object());
-        super::tag_io_instance_with_finalizer(obj, cls, needs_finalizer)
+        Ok(super::tag_io_instance_with_finalizer(
+            obj,
+            cls,
+            needs_finalizer,
+        ))
     }
 
     fn __init__(
