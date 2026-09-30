@@ -5528,8 +5528,10 @@ where
                 }
                 // SAFETY: `array_addr` is the array data pointer held in the
                 // ref register and `index_value` selects an element. itemsize
-                // is 8, so this reads one f64 as raw bits.
-                let concrete = unsafe { *(item_addr as *const i64) };
+                // is 8, so this reads one f64 as raw bits. `read_unaligned`
+                // matches `bh_getarrayitem_gc_f` / `read_float_at_mem`, which
+                // load `FLOATSTORAGE` without assuming natural alignment.
+                let concrete = unsafe { core::ptr::read_unaligned(item_addr as *const i64) };
                 // `opimpl_getarrayitem_gc_f_pure`: a const array and a const
                 // index bypass the heapcache and fold to `wrap_constant`.
                 // The plain read stays recorded; `GetarrayitemGcPureF` is what

@@ -174,12 +174,16 @@ pub use jitcode::{
     BC_GOTO, EmbeddedJitCodeTable, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, RuntimeBhDescr,
     RuntimeDescrTable, init_global_build_descr_pool, insns, live_slots_for_state_field_jit,
 };
+#[cfg(all(not(target_arch = "wasm32"), feature = "gc_box"))]
+pub use jitdriver::install_jitframe_gc;
+#[cfg(target_arch = "wasm32")]
+pub use jitdriver::install_jitframe_gc;
 pub use jitdriver::{
     BackEdgeWarmth, DeclarativeJitDriver, FlatEntryContract, FunctionEntryRunner, JitDriver,
     JitDriverStaticData, MultiFrameBlackholeResult, PendingAbortBlackhole,
     SingleFrameBlackholeResult, TraceContinuationSuspendGuard, bridge_fuel_take,
     current_state_field_fvc_epoch, drive_multi_frame_blackhole, drive_single_frame_blackhole,
-    install_jitframe_gc, no_bridge_enabled, spdiag_enabled,
+    no_bridge_enabled, spdiag_enabled,
 };
 // The warm-entry stage probe, which an embedder drives from its own harness —
 // the split has to be read through the frontend's own door, so the counts are
