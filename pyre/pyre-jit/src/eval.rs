@@ -4158,7 +4158,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // mapdict storage. The raw element buffer is released by the same
     // `W_ArrayBase.__del__` destructor as the base tid.
     let array_tid = <pyre_object::interp_array::W_Array as pyre_object::lltype::GcType>::type_id();
-    debug_assert_eq!(array_tid, 99);
+    debug_assert_eq!(array_tid, 94);
     let array_user_tid = gc.register_type(
         TypeInfo::object_subclass_with_custom_trace(
             pyre_object::interp_array::W_ARRAY_USER_OBJECT_SIZE,
