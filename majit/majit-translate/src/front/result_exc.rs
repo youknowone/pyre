@@ -885,9 +885,11 @@ fn has_tail_forwarded_call_result(graph: &FunctionGraph) -> bool {
 /// that raise. A return that is already `T` (a rewritten ctor, a retyped
 /// tail-forward) is left in place. An unrecognised `Ref` is left too:
 /// exploding an arbitrary reference would read a discriminant off a value
-/// that is not this `Result`. A phi is a shell only when every predecessor
-/// is one; a mix with the scalar payload is left, because that payload has
-/// no discriminant.
+/// that is not this `Result`. A copy, a cast, or a block argument is the
+/// same value, so the class is the fixed point of those forwards. A cycle
+/// adds no class of its own: a loop of shells stays a shell, and a mix
+/// with the scalar payload is left, because that payload has no
+/// discriminant.
 pub(crate) fn unwrap_returned_scalar_result_shells(
     graph: &mut FunctionGraph,
     result_owner: &str,
@@ -910,7 +912,7 @@ pub(crate) fn unwrap_returned_scalar_result_shells(
             let Some(var) = link.args[0].as_variable() else {
                 continue;
             };
-            match classify_return_var(graph, var, ok_ty, 0) {
+            match classify_return_var(graph, var, ok_ty) {
                 ReturnClass::Shell => shells.push((bi, ei)),
                 ReturnClass::Payload | ReturnClass::Other => {}
             }
@@ -948,32 +950,100 @@ fn scalar_result_kind(ty: &ValueType) -> Option<char> {
     }
 }
 
-fn classify_return_var(
+/// Class of `var` as a returned `Result` shell.
+///
+/// A `same_as`, a `__cast_instance_intrinsic`, or a block argument
+/// forwards one value. The equations live only for this call. A cycle
+/// adds no class: every value that enters has to agree, and a cycle
+/// nothing enters is left alone.
+fn classify_return_var(graph: &FunctionGraph, var: &Variable, ok_ty: &ValueType) -> ReturnClass {
+    let mut vars = vec![var.clone()];
+    let mut eqns = vec![ReturnEqn::Other];
+    let mut index = 0;
+    while index < vars.len() {
+        let current = vars[index].clone();
+        eqns[index] = return_eqn(graph, &current, ok_ty, &mut vars, &mut eqns);
+        index += 1;
+    }
+    let mut class = vec![ReturnMeet::Bot; vars.len()];
+    // Each var moves at most twice (bottom, one class, conflict) and a
+    // pass carries a class one hop, so this bound settles a monotone
+    // system. An unsettled system is not split.
+    let limit = vars.len().saturating_mul(3).saturating_add(1);
+    let mut settled = false;
+    for _ in 0..limit {
+        let mut changed = false;
+        for (i, eqn) in eqns.iter().enumerate() {
+            let next = eval_return_eqn(eqn, &class);
+            if next != class[i] {
+                class[i] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            settled = true;
+            break;
+        }
+    }
+    if !settled {
+        return ReturnClass::Other;
+    }
+    // `vars[0]` is the var this call was asked about.
+    match class[0] {
+        ReturnMeet::Shell => ReturnClass::Shell,
+        ReturnMeet::Payload => ReturnClass::Payload,
+        ReturnMeet::Bot | ReturnMeet::Other => ReturnClass::Other,
+    }
+}
+
+enum ReturnEqn {
+    Shell,
+    Payload,
+    Other,
+    Forward(usize),
+    Phi(Vec<usize>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReturnMeet {
+    Bot,
+    Shell,
+    Payload,
+    Other,
+}
+
+fn intern_return_var(vars: &mut Vec<Variable>, eqns: &mut Vec<ReturnEqn>, var: Variable) -> usize {
+    if let Some(index) = vars.iter().position(|seen| seen == &var) {
+        return index;
+    }
+    vars.push(var);
+    eqns.push(ReturnEqn::Other);
+    vars.len() - 1
+}
+
+fn return_eqn(
     graph: &FunctionGraph,
     var: &Variable,
     ok_ty: &ValueType,
-    depth: u32,
-) -> ReturnClass {
-    if depth > 12 {
-        return ReturnClass::Other;
-    }
+    vars: &mut Vec<Variable>,
+    eqns: &mut Vec<ReturnEqn>,
+) -> ReturnEqn {
     if let Some(kind) = producer_kind(graph, var) {
         return match kind {
-            ProducerKind::Shell => ReturnClass::Shell,
+            ProducerKind::Shell => ReturnEqn::Shell,
             ProducerKind::Typed(ty) if scalar_result_kind(&ty) == scalar_result_kind(ok_ty) => {
-                ReturnClass::Payload
+                ReturnEqn::Payload
             }
             ProducerKind::Same(inner) | ProducerKind::Cast(inner) => {
-                classify_return_var(graph, &inner, ok_ty, depth + 1)
+                ReturnEqn::Forward(intern_return_var(vars, eqns, inner))
             }
-            ProducerKind::Typed(_) => ReturnClass::Other,
+            ProducerKind::Typed(_) => ReturnEqn::Other,
         };
     }
     let Some((block, slot)) = inputarg_slot(graph, var) else {
-        return ReturnClass::Other;
+        return ReturnEqn::Other;
     };
-    let mut saw_shell = false;
-    let mut saw_payload = false;
+    let mut srcs = Vec::new();
     let mut saw = false;
     for pred in &graph.blocks {
         for link in &pred.exits {
@@ -981,26 +1051,44 @@ fn classify_return_var(
                 continue;
             }
             let Some(arg) = link.args.get(slot) else {
-                return ReturnClass::Other;
+                return ReturnEqn::Other;
             };
             let Some(src) = arg.as_variable() else {
-                return ReturnClass::Other;
+                return ReturnEqn::Other;
             };
             saw = true;
-            match classify_return_var(graph, src, ok_ty, depth + 1) {
-                ReturnClass::Payload => saw_payload = true,
-                ReturnClass::Shell => saw_shell = true,
-                ReturnClass::Other => return ReturnClass::Other,
-            }
+            srcs.push(intern_return_var(vars, eqns, src.clone()));
         }
     }
     if !saw {
-        return ReturnClass::Other;
+        ReturnEqn::Other
+    } else {
+        ReturnEqn::Phi(srcs)
     }
-    match (saw_shell, saw_payload) {
-        (true, false) => ReturnClass::Shell,
-        (false, true) => ReturnClass::Payload,
-        (true, true) | (false, false) => ReturnClass::Other,
+}
+
+fn meet_return(left: ReturnMeet, right: ReturnMeet) -> ReturnMeet {
+    match (left, right) {
+        (ReturnMeet::Bot, other) | (other, ReturnMeet::Bot) => other,
+        (ReturnMeet::Shell, ReturnMeet::Shell) => ReturnMeet::Shell,
+        (ReturnMeet::Payload, ReturnMeet::Payload) => ReturnMeet::Payload,
+        _ => ReturnMeet::Other,
+    }
+}
+
+fn eval_return_eqn(eqn: &ReturnEqn, class: &[ReturnMeet]) -> ReturnMeet {
+    match eqn {
+        ReturnEqn::Shell => ReturnMeet::Shell,
+        ReturnEqn::Payload => ReturnMeet::Payload,
+        ReturnEqn::Other => ReturnMeet::Other,
+        ReturnEqn::Forward(index) => class[*index],
+        ReturnEqn::Phi(srcs) => {
+            let mut acc = ReturnMeet::Bot;
+            for index in srcs {
+                acc = meet_return(acc, class[*index]);
+            }
+            acc
+        }
     }
 }
 
@@ -6617,11 +6705,11 @@ mod unwrap_returned_scalar_shell_tests {
         }
     }
 
-    fn push_some_shell(graph: &mut FunctionGraph) -> Variable {
+    fn push_some_shell_in(graph: &mut FunctionGraph, block: BlockId) -> Variable {
         let base = graph.alloc_value_var();
         graph
             .push_op_var(
-                graph.startblock,
+                block,
                 OpKind::FieldRead {
                     base,
                     field: FieldDescriptor::new(
@@ -6634,6 +6722,54 @@ mod unwrap_returned_scalar_shell_tests {
                 true,
             )
             .expect("some payload")
+    }
+
+    fn push_some_shell(graph: &mut FunctionGraph) -> Variable {
+        let block = graph.startblock;
+        push_some_shell_in(graph, block)
+    }
+
+    fn push_same_as(graph: &mut FunctionGraph, block: BlockId, operand: Variable) -> Variable {
+        graph
+            .push_op_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand,
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("same_as")
+    }
+
+    fn unwrap_i64(graph: &mut FunctionGraph) {
+        unwrap_returned_scalar_result_shells(
+            graph,
+            "core::result::Result<i64,PyError>",
+            "core::result::Result<i64,PyError>::Ok",
+            "core::result::Result<i64,PyError>::Err",
+            &ValueType::Int,
+            &ValueType::Ref(None),
+            carrier(),
+        )
+        .expect("unwrap");
+    }
+
+    fn assert_unwrapped_ok_i64(graph: &FunctionGraph) {
+        let returns = return_vars(graph);
+        assert_eq!(returns.len(), 1);
+        match producer(graph, &returns[0]) {
+            Some(OpKind::FieldRead { field, ty, .. }) => {
+                assert_eq!(field.name, "__pos_0");
+                assert_eq!(
+                    field.owner_root.as_deref(),
+                    Some("core::result::Result<i64,PyError>::Ok")
+                );
+                assert_eq!(ty, &ValueType::Int);
+            }
+            other => panic!("ok return producer {other:?}"),
+        }
     }
 
     fn return_vars(graph: &FunctionGraph) -> Vec<Variable> {
@@ -6795,6 +6931,164 @@ mod unwrap_returned_scalar_shell_tests {
         )
         .expect("unwrap");
         assert_eq!(return_vars(&graph), vec![value]);
+    }
+
+    #[test]
+    fn a_long_copy_chain_of_a_shell_is_unwrapped() {
+        let mut graph = FunctionGraph::new("long_shell_chain");
+        let mut value = push_some_shell(&mut graph);
+        for _ in 0..16 {
+            let block = graph.startblock;
+            value = push_same_as(&mut graph, block, value);
+        }
+        graph.set_return(graph.startblock, Some(value));
+        unwrap_i64(&mut graph);
+        assert_unwrapped_ok_i64(&graph);
+    }
+
+    #[test]
+    fn a_long_copy_chain_of_a_payload_stays() {
+        let mut graph = FunctionGraph::new("long_payload_chain");
+        let mut value = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(9), true)
+            .expect("const");
+        for _ in 0..16 {
+            let block = graph.startblock;
+            value = push_same_as(&mut graph, block, value);
+        }
+        graph.set_return(graph.startblock, Some(value.clone()));
+        unwrap_i64(&mut graph);
+        assert_eq!(return_vars(&graph), vec![value]);
+    }
+
+    #[test]
+    fn a_loop_carrying_a_shell_is_unwrapped() {
+        let mut graph = FunctionGraph::new("shell_loop");
+        let entry = graph.startblock;
+        let shell = push_some_shell(&mut graph);
+        let (header, header_in) = graph.create_block_with_arg_vars(1);
+        let carried = header_in[0].clone();
+        graph.set_goto(entry, header, vec![shell]);
+        let (ret_bb, ret_in) = graph.create_block_with_arg_vars(1);
+        let cond = graph
+            .push_op_var(header, OpKind::ConstBool(true), true)
+            .expect("cond");
+        graph.set_branch(
+            header,
+            cond,
+            ret_bb,
+            vec![carried.clone()],
+            header,
+            vec![carried],
+        );
+        graph.set_return(ret_bb, Some(ret_in[0].clone()));
+        unwrap_i64(&mut graph);
+        assert_unwrapped_ok_i64(&graph);
+    }
+
+    /// The latch block only forwards the header. The shell enters at the
+    /// header, so both block arguments are that shell.
+    #[test]
+    fn a_shell_forwarded_around_two_blocks_is_unwrapped() {
+        let mut graph = FunctionGraph::new("two_block_shell");
+        let entry = graph.startblock;
+        let shell = push_some_shell(&mut graph);
+        let (header, header_in) = graph.create_block_with_arg_vars(1);
+        let (latch, latch_in) = graph.create_block_with_arg_vars(1);
+        let (ret_bb, ret_in) = graph.create_block_with_arg_vars(1);
+        let carried = header_in[0].clone();
+        let latched = latch_in[0].clone();
+        graph.set_goto(entry, header, vec![shell]);
+        graph.set_goto(latch, header, vec![latched]);
+        let cond = graph
+            .push_op_var(header, OpKind::ConstBool(false), true)
+            .expect("cond");
+        graph.set_branch(
+            header,
+            cond,
+            ret_bb,
+            vec![carried.clone()],
+            latch,
+            vec![carried],
+        );
+        graph.set_return(ret_bb, Some(ret_in[0].clone()));
+        unwrap_i64(&mut graph);
+        assert_unwrapped_ok_i64(&graph);
+    }
+
+    #[test]
+    fn a_loop_mixing_a_shell_with_the_payload_stays() {
+        let mut graph = FunctionGraph::new("mixed_loop");
+        let entry = graph.startblock;
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(3), true)
+            .expect("payload");
+        let (header, header_in) = graph.create_block_with_arg_vars(1);
+        let carried = header_in[0].clone();
+        graph.set_goto(entry, header, vec![payload]);
+        let shell = push_some_shell_in(&mut graph, header);
+        let (ret_bb, ret_in) = graph.create_block_with_arg_vars(1);
+        let returned = ret_in[0].clone();
+        let cond = graph
+            .push_op_var(header, OpKind::ConstBool(true), true)
+            .expect("cond");
+        graph.set_branch(
+            header,
+            cond,
+            ret_bb,
+            vec![carried.clone()],
+            header,
+            vec![shell],
+        );
+        graph.set_return(ret_bb, Some(returned.clone()));
+        unwrap_i64(&mut graph);
+        assert_eq!(return_vars(&graph), vec![returned]);
+    }
+
+    #[test]
+    fn a_payload_and_a_shell_entering_one_cycle_stay() {
+        let mut graph = FunctionGraph::new("crossed_cycle");
+        let entry = graph.startblock;
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(4), true)
+            .expect("payload");
+        let (shell_bb, _) = graph.create_block_with_arg_vars(0);
+        let shell = push_some_shell_in(&mut graph, shell_bb);
+        let (a_bb, a_in) = graph.create_block_with_arg_vars(1);
+        let (b_bb, b_in) = graph.create_block_with_arg_vars(1);
+        let (ret_bb, ret_in) = graph.create_block_with_arg_vars(1);
+        let a = a_in[0].clone();
+        let b = b_in[0].clone();
+        let returned = ret_in[0].clone();
+        graph.set_goto(entry, a_bb, vec![payload]);
+        graph.set_goto(shell_bb, b_bb, vec![shell]);
+        let cond = graph
+            .push_op_var(a_bb, OpKind::ConstBool(true), true)
+            .expect("cond");
+        graph.set_branch(a_bb, cond, ret_bb, vec![a.clone()], b_bb, vec![a]);
+        graph.set_goto(b_bb, a_bb, vec![b]);
+        graph.set_return(ret_bb, Some(returned.clone()));
+        unwrap_i64(&mut graph);
+        assert_eq!(return_vars(&graph), vec![returned]);
+    }
+
+    #[test]
+    fn a_cycle_nothing_enters_stays() {
+        let mut graph = FunctionGraph::new("pure_cycle");
+        let (a_bb, a_in) = graph.create_block_with_arg_vars(1);
+        let (b_bb, b_in) = graph.create_block_with_arg_vars(1);
+        let (ret_bb, ret_in) = graph.create_block_with_arg_vars(1);
+        let a = a_in[0].clone();
+        let b = b_in[0].clone();
+        let returned = ret_in[0].clone();
+        let cond = graph
+            .push_op_var(a_bb, OpKind::ConstBool(true), true)
+            .expect("cond");
+        graph.set_branch(a_bb, cond, ret_bb, vec![a.clone()], b_bb, vec![a]);
+        graph.set_goto(b_bb, a_bb, vec![b]);
+        graph.set_return(ret_bb, Some(returned.clone()));
+        unwrap_i64(&mut graph);
+        assert_eq!(return_vars(&graph), vec![returned]);
     }
 }
 
