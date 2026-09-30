@@ -250,8 +250,14 @@ fn adopt_rooted_ref(
     obj: pyre_object::PyObjectRef,
 ) {
     let _ = roots.pin_root(obj);
+    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if let Some(entry) = slots.get_mut(index) {
-        *entry = Some(pyre_object::gc_roots::shadow_stack_len() - 1);
+        *entry = Some(slot);
+    }
+    // A missing parameter is `Null`. Refresh only rewrites an existing
+    // `Ref`, so the hole has to become one before the slots are re-read.
+    if let Some(concrete) = concretes.get_mut(index) {
+        *concrete = ConcreteValue::Ref(pyre_object::gc_roots::shadow_stack_get(slot));
     }
     refresh_rooted_refs(concretes, slots);
     refresh_varkw_concretes(varkw, varkw_slots);
