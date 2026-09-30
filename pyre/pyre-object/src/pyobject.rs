@@ -840,13 +840,14 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (156, Some(0)),
     (157, Some(0)),
-    // 158-195 are `typedef.py` `_getusercls` layouts
-    // (int/str/tuple/float/complex/bytes/bytearray/list/set/array/weakref user,
+    // 158-167 and 169-195 are `typedef.py` `_getusercls` layouts
+    // (int/str/tuple/float/complex/bytes/bytearray/list/set/array,
     // plus enumerate/map/filter/zip/reversed/super/property, the itertools
     // user layouts, and `__pypy__.Bufferable`).
+    // 168 is `interp__weakref.py` `W_Weakref`, an object subclass.
     // 169-195 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
-    // 196-199 append deque, Struct, GenericAlias and big-int user layouts
-    // without moving the closed block above.
+    // 196-200 append deque, Struct, GenericAlias, big-int and weakref user
+    // layouts without moving the closed block above.
     (158, Some(1)),
     (159, Some(34)),
     (160, Some(8)),
@@ -857,7 +858,7 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (165, Some(7)),
     (166, Some(30)),
     (167, Some(94)),
-    (168, Some(0)),
+    (168, Some(0)), // W_Weakref
     (169, Some(111)),
     (170, Some(91)),
     (171, Some(90)),
@@ -890,20 +891,21 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (197, Some(119)), // _struct.Struct
     (198, Some(87)),  // types.GenericAlias
     (199, Some(35)),  // W_LongObject
+    (200, Some(168)), // W_WeakrefUser
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail, after the `_getusercls` layouts (158-199).
-    (200, Some(0)),
-    // Native-only type IDs 201 and 202 represent `posix.DirEntry` and
+    // posix / console tail, after the `_getusercls` layouts (158-200).
+    (201, Some(0)),
+    // Native-only type IDs 202 and 203 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (201, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
     (202, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (203, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (203, Some(0)),
+    (204, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1466,7 +1468,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(166, &crate::setobject::SET_USER_TYPE),
         subclass_range_alias(166, &crate::setobject::FROZENSET_USER_TYPE),
         subclass_range_alias(167, &crate::interp_array::ARRAY_USER_TYPE),
-        subclass_range_alias(168, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE),
+        subclass_range_alias(168, &crate::weakref::WEAKREF_LAYOUT_TYPE),
         subclass_range_alias(169, &crate::functional::ENUMERATE_USER_TYPE),
         subclass_range_alias(170, &crate::functional::MAP_USER_TYPE),
         subclass_range_alias(171, &crate::functional::FILTER_USER_TYPE),
@@ -1498,6 +1500,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(194, &crate::interp_itertools::CHAIN_USER_TYPE),
         subclass_range_alias(198, &crate::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE),
         subclass_range_alias(199, &LONG_USER_TYPE),
+        subclass_range_alias(200, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),

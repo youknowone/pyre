@@ -4223,30 +4223,20 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::interp_array::ARRAY_USER_TYPE as *const _ as usize,
         array_user_tid,
     );
-    // `W_WeakrefUser` (`typedef.py` `_getusercls`). Subclass instances are
-    // traced as a weakref plus its mapdict storage. `W_Weakref`'s own GC
-    // class is the tail `with_gc_ptrs` layout, registered after the module
-    // classes, so it is not an rclass and cannot parent a tid in this block.
-    // The user layout is an rclass child of object; the trace still walks
-    // `W_WEAKREF_LAYOUT_GC_PTR_OFFSETS`.
+    // `interp__weakref.py W_Weakref` is a closed rclass, an object subclass.
+    // `register_pyre_class` uses `TypeInfo::object_subclass_with_gc_ptrs`
+    // with this payload's `ptr_offsets` and stamps the descriptor's
+    // `gc_type_id`. `typedef.py` `_getusercls` (`W_WeakrefUser`) parents
+    // on this tid from the appended block.
     debug_assert_eq!(object_tid, 0);
-    let weakref_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-        pyre_object::weakref::W_WEAKREF_USER_OBJECT_SIZE,
-        object_tid,
-        weakref_user_object_custom_trace,
-    ));
-    debug_assert_eq!(
-        weakref_user_tid,
-        pyre_object::weakref::W_WEAKREF_USER_GC_TYPE_ID
-    );
-    majit_gc::GcAllocator::register_vtable_for_type(
+    let weakref_tid = register_pyre_class(
         &mut gc,
-        &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE as *const _ as usize,
-        weakref_user_tid,
+        &mut pytype_to_tid,
+        <pyre_object::weakref::W_Weakref as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    pytype_to_tid.insert(
-        &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE as *const _ as usize,
-        weakref_user_tid,
+    debug_assert_eq!(
+        weakref_tid,
+        pyre_object::weakref::W_WEAKREF_LAYOUT_GC_TYPE_ID
     );
 
     // `#[pyre_class(..., user_layout)]` (`typedef.py` `_getusercls`).
@@ -4391,7 +4381,8 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BUFFERABLE_USER_PYRE_CLASS_DESCRIPTOR,
     );
     // Appended `_getusercls` layouts. Parents are the builtin tids already
-    // registered above (deque 110, Struct 119, GenericAlias 87, long 35).
+    // registered above (deque 110, Struct 119, GenericAlias 87, long 35,
+    // weakref 168).
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
@@ -4425,8 +4416,29 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::pyobject::LONG_USER_TYPE as *const _ as usize,
         long_user_tid,
     );
+    // `W_WeakrefUser` (`typedef.py` `_getusercls`). Subclass instances are
+    // traced as a weakref plus its mapdict storage. The trace walks
+    // `W_WEAKREF_LAYOUT_GC_PTR_OFFSETS`.
+    let weakref_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::weakref::W_WEAKREF_USER_OBJECT_SIZE,
+        weakref_tid,
+        weakref_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        weakref_user_tid,
+        pyre_object::weakref::W_WEAKREF_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE as *const _ as usize,
+        weakref_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE as *const _ as usize,
+        weakref_user_tid,
+    );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 200),
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 201),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,
@@ -4659,27 +4671,6 @@ fn build_gc() -> Box<MiniMarkGC> {
     pyre_object::gc_hook::register_pyre_class_offsets(
         lifeline_descr.pytype_ptr as usize,
         lifeline_descr.ptr_offsets,
-    );
-    // `interp__weakref.py W_Weakref` exact builtin payload. Like the
-    // lifeline above, its allocation is selected by its translated GC layout;
-    // Python class identity remains in the header's `w_class`. Append it after
-    // the lifeline so the already-published lifeline tid stays stable.
-    // Subclass `__dict__` / `__slots__` are `W_WeakrefUser`'s mapdict storage
-    // (tid 177), not a tail on this payload.
-    let weakref_descr =
-        <pyre_object::weakref::W_Weakref as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-    let weakref_object_tid = gc.register_type(TypeInfo::with_gc_ptrs(
-        weakref_descr.object_size,
-        weakref_descr.ptr_offsets.to_vec(),
-    ));
-    if weakref_descr.gc_type_id.is_unassigned() {
-        weakref_descr.gc_type_id.set(weakref_object_tid);
-    } else {
-        debug_assert_eq!(weakref_descr.gc_type_id.get(), weakref_object_tid);
-    }
-    pyre_object::gc_hook::register_pyre_class_offsets(
-        weakref_descr.pytype_ptr as usize,
-        weakref_descr.ptr_offsets,
     );
 
     // `rstr.STR` and `rstr.UNICODE` are varsize GC leaves. Register them at the
@@ -17185,6 +17176,24 @@ mod tests {
             assert!(!pyre_object::pyobject::ll_issubclass(
                 &FLOAT_TYPE,
                 &INT_TYPE
+            ));
+        }
+    }
+
+    /// `rclass.py` `ll_issubclass`: `typedef.py` `_getusercls(W_Weakref)` is a
+    /// subclass of `interp__weakref.py` `W_Weakref`, and the base is not a
+    /// subclass of that user layout.
+    #[test]
+    fn weakref_user_subclass_range_follows_layout() {
+        let _ = driver_pair();
+        unsafe {
+            assert!(pyre_object::pyobject::ll_issubclass(
+                &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE,
+                &pyre_object::weakref::WEAKREF_LAYOUT_TYPE,
+            ));
+            assert!(!pyre_object::pyobject::ll_issubclass(
+                &pyre_object::weakref::WEAKREF_LAYOUT_TYPE,
+                &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE,
             ));
         }
     }
