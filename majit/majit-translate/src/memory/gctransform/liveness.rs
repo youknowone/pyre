@@ -638,6 +638,12 @@ struct HelperBodyFact {
     calls: Vec<HelperCallFact>,
     /// Bare locals whose single assignment is a pin call or a slot read.
     pin_result_locals: HashSet<u64>,
+    /// Per-block indices into [`Self::calls`]. Empty means the tests' single
+    /// block: every call runs, then the function returns.
+    block_calls: Vec<Vec<usize>>,
+    /// Normal successors only (`Call.target`, not `on_unwind`). Empty when
+    /// [`Self::block_calls`] is empty.
+    successors: Vec<Vec<usize>>,
 }
 
 struct PinAssignIndex {
@@ -729,17 +735,113 @@ fn param_positions_reaching(
         .collect()
 }
 
-fn direct_pinned_params(body: &HelperBodyFact) -> HashSet<usize> {
+fn call_pins_params(
+    call: &HelperCallFact,
+    body: &HelperBodyFact,
+    nested: &HashMap<u64, PinHelperSummary>,
+) -> HashSet<usize> {
     let mut out = HashSet::new();
-    for call in &body.calls {
-        if !is_pin_fn(&call.callee_name) {
-            continue;
-        }
+    if is_pin_fn(&call.callee_name) {
         for seeds in &call.arg_locals {
             out.extend(param_positions_reaching(seeds, &body.defs, body.arg_count));
         }
+        return out;
+    }
+    let Some(summary) = nested.get(&call.callee) else {
+        return out;
+    };
+    for &position in &summary.pinned_params {
+        let Some(seeds) = call.arg_locals.get(position) else {
+            continue;
+        };
+        out.extend(param_positions_reaching(seeds, &body.defs, body.arg_count));
     }
     out
+}
+
+fn block_layout(body: &HelperBodyFact) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    if body.block_calls.is_empty() {
+        return (vec![(0..body.calls.len()).collect()], vec![Vec::new()]);
+    }
+    (body.block_calls.clone(), body.successors.clone())
+}
+
+/// Parameter positions pinned on every normal path from entry to a return.
+/// A pin that lives on only one arm of a switch, or after an early return,
+/// is not in the set: the caller scan would otherwise treat the helper as
+/// bracketing a use that the skipped arm never rooted.
+fn must_pinned_params(
+    body: &HelperBodyFact,
+    nested: &HashMap<u64, PinHelperSummary>,
+) -> HashSet<usize> {
+    let (block_calls, successors) = block_layout(body);
+    let n = block_calls.len();
+    if n == 0 {
+        return HashSet::new();
+    }
+    let block_pins: Vec<HashSet<usize>> = block_calls
+        .iter()
+        .map(|idxs| {
+            let mut pins = HashSet::new();
+            for &i in idxs {
+                if let Some(call) = body.calls.get(i) {
+                    pins.extend(call_pins_params(call, body, nested));
+                }
+            }
+            pins
+        })
+        .collect();
+    // Forward must: join is intersection, transfer is union with this block's
+    // pins. Entry has nothing yet.
+    let mut in_set: Vec<Option<HashSet<usize>>> = vec![None; n];
+    in_set[0] = Some(HashSet::new());
+    let mut work: Vec<usize> = vec![0];
+    while let Some(b) = work.pop() {
+        let mut out = in_set[b].clone().unwrap_or_default();
+        out.extend(&block_pins[b]);
+        for &s in successors.get(b).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if s >= n {
+                continue;
+            }
+            match &in_set[s] {
+                None => {
+                    in_set[s] = Some(out.clone());
+                    work.push(s);
+                }
+                Some(have) => {
+                    let joined: HashSet<usize> = have.intersection(&out).copied().collect();
+                    if joined != *have {
+                        in_set[s] = Some(joined);
+                        work.push(s);
+                    }
+                }
+            }
+        }
+    }
+    let mut exits = Vec::new();
+    for b in 0..n {
+        if successors.get(b).map(|s| s.is_empty()).unwrap_or(true) && in_set[b].is_some() {
+            exits.push(b);
+        }
+    }
+    if exits.is_empty() {
+        return HashSet::new();
+    }
+    let mut must = {
+        let mut out = in_set[exits[0]].clone().unwrap_or_default();
+        out.extend(&block_pins[exits[0]]);
+        out
+    };
+    for &b in &exits[1..] {
+        let mut out = in_set[b].clone().unwrap_or_default();
+        out.extend(&block_pins[b]);
+        must = must.intersection(&out).copied().collect();
+    }
+    must
+}
+
+fn direct_pinned_params(body: &HelperBodyFact) -> HashSet<usize> {
+    must_pinned_params(body, &HashMap::new())
 }
 
 /// Local 0 holds a pin result or a slot read, following single-assignment
@@ -808,45 +910,23 @@ fn summarize_pin_helpers(bodies: &HashMap<u64, HelperBodyFact>) -> HashMap<u64, 
         })
         .collect();
 
-    // Monotonic: each round only adds parameter positions, and a helper has
-    // finitely many. A cycle cannot invent a pin that no body performs.
+    // Nested helpers contribute only on paths that always call them. Each
+    // round may add a must-pin, and a helper has finitely many parameters.
     loop {
-        let mut extras: Vec<(u64, HashSet<usize>)> = Vec::new();
+        let mut changed = false;
         for &id in &helpers {
-            let body = &bodies[&id];
-            let have = summaries[&id].pinned_params.clone();
-            let mut extra = HashSet::new();
-            for call in &body.calls {
-                let Some(positions) = summaries
-                    .get(&call.callee)
-                    .map(|summary| summary.pinned_params.clone())
-                else {
-                    continue;
-                };
-                for position in positions {
-                    let Some(seeds) = call.arg_locals.get(position) else {
-                        continue;
-                    };
-                    for reached in param_positions_reaching(seeds, &body.defs, body.arg_count) {
-                        if !have.contains(&reached) {
-                            extra.insert(reached);
-                        }
-                    }
-                }
-            }
-            if !extra.is_empty() {
-                extras.push((id, extra));
-            }
-        }
-        if extras.is_empty() {
-            break;
-        }
-        for (id, extra) in extras {
-            summaries
+            let next = must_pinned_params(&bodies[&id], &summaries);
+            let have = &mut summaries
                 .get_mut(&id)
                 .expect("helper id is in the summary map")
-                .pinned_params
-                .extend(extra);
+                .pinned_params;
+            if next != *have {
+                *have = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
     summaries
@@ -913,7 +993,18 @@ fn helper_body_fact(
     let mut has_push_roots = false;
     let mut calls = Vec::new();
     let mut pin_result_locals = HashSet::new();
-    for term in &terms {
+    let n = terms.len();
+    let mut block_calls = vec![Vec::new(); n];
+    let mut succ = vec![Vec::new(); n];
+    for (b, term) in terms.iter().enumerate() {
+        if let Some(t) = term {
+            succ[b] = match t {
+                TermKind::Call { target, .. }
+                | TermKind::Assert { target, .. }
+                | TermKind::Drop { target, .. } => vec![*target as usize],
+                other => successors(other).into_iter().map(|s| s as usize).collect(),
+            };
+        }
         let Some(TermKind::Call { call, .. }) = term else {
             continue;
         };
@@ -936,6 +1027,7 @@ fn helper_body_fact(
             use_operand(arg, &mut seed);
             arg_locals.push(seed.into_iter().collect());
         }
+        block_calls[b].push(calls.len());
         calls.push(HelperCallFact {
             callee,
             callee_name,
@@ -948,6 +1040,8 @@ fn helper_body_fact(
         defs: index.defs,
         calls,
         pin_result_locals,
+        block_calls,
+        successors: succ,
     })
 }
 
@@ -2120,11 +2214,35 @@ mod tests {
                     arg_locals,
                 })
                 .collect(),
+            block_calls: Vec::new(),
+            successors: Vec::new(),
         }
     }
 
     fn summary_of(bodies: HashMap<u64, HelperBodyFact>, id: u64) -> Option<PinHelperSummary> {
         summarize_pin_helpers(&bodies).remove(&id)
+    }
+
+    /// A pin on only one arm is not a must-pin: the caller scan would
+    /// otherwise treat the skipped arm as bracketed.
+    #[test]
+    fn a_helper_that_pins_on_one_arm_names_no_parameter() {
+        let mut body = helper_fact(
+            1,
+            false,
+            vec![("pyre_object::gc_roots::pin_root", 9, vec![vec![1]])],
+        );
+        // block 0 switches to a pin arm and a bare return.
+        body.block_calls = vec![Vec::new(), vec![0], Vec::new()];
+        body.successors = vec![vec![1, 2], Vec::new(), Vec::new()];
+        let bodies = HashMap::from([(1, body)]);
+        assert_eq!(
+            summary_of(bodies, 1),
+            Some(PinHelperSummary {
+                pinned_params: HashSet::new(),
+                returns_pinned: false,
+            })
+        );
     }
 
     /// `pin_root(param)` — parameter local 1 is argument position 0.
