@@ -1594,25 +1594,50 @@ fn str_unwrap_and_compute_idx_params(
             end = crate::sliceobject::adapt_lower_bound(length, bound)?;
         }
     }
+    let byte_len = unsafe { pyre_object::w_str_byte_len(recv()) } as i64;
+    let start_byte = if start > 0 && start <= length {
+        unsafe { pyre_object::w_str_index_to_byte(recv(), start as usize) as i64 }
+    } else {
+        0
+    };
+    let end_byte = if end < length {
+        unsafe { pyre_object::w_str_index_to_byte(recv(), end as usize) as i64 }
+    } else {
+        0
+    };
+    Ok(prefix_byte_window(
+        length, byte_len, start, end, start_byte, end_byte,
+    ))
+}
+
+/// The byte window of `_unwrap_and_compute_idx_params` once `start` and
+/// `end` are code points. `start_byte` and `end_byte` are `_index_to_byte`
+/// for a bound that sits strictly inside the string; the other arms do not
+/// read them. A `start` past the end becomes `end_index + 1`, and `end` is
+/// lowered only when it is short of the end, so the window inverts instead
+/// of emptying.
+#[inline(always)]
+fn prefix_byte_window(
+    length: i64,
+    byte_len: i64,
+    start: i64,
+    end: i64,
+    start_byte: i64,
+    end_byte: i64,
+) -> (i64, i64) {
     let mut start_index = 0i64;
-    // `as_bytes()` first so the length is an `Rvalue::Len`: `Wtf8::len` is an
-    // un-lowered method leaf that would stop the graph.
-    let mut end_index = unsafe { pyre_object::w_str_get_wtf8(recv()) }
-        .as_bytes()
-        .len() as i64;
+    let mut end_index = byte_len;
     if start > 0 {
         start_index = if start > length {
             end_index + 1
         } else {
-            let byte = unsafe { pyre_object::w_str_index_to_byte(recv(), start as usize) };
-            byte as i64
+            start_byte
         };
     }
     if end < length {
-        let byte = unsafe { pyre_object::w_str_index_to_byte(recv(), end as usize) };
-        end_index = byte as i64;
+        end_index = end_byte;
     }
-    Ok((start_index, end_index))
+    (start_index, end_index)
 }
 
 /// `unicodeobject.py _startswith` / `_endswith` for one `str` needle whose
@@ -1730,12 +1755,17 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// that reach the match without running a user slot, returning the receiver,
 /// the needle and the two byte offsets.
 ///
-/// Each condition is one upstream branch, not a shortcut: `int`/absent bounds
-/// are `getindex_w`'s `isinstance_w(w_int)` arm, a `str` needle is
-/// `descr_startswith`'s non-tuple arm, and an ascii receiver is
-/// `_index_to_byte`'s `is_ascii()` arm, for which the byte offset *is* the
-/// code point index.  `None` hands the call to the residual, which runs the
-/// same method over every arm.
+/// Bounds are converted before the needle is inspected, as
+/// `descr_startswith` does. `int` or an absent/`None` bound is
+/// `getindex_w`'s `isinstance_w(w_int)` arm plus `adapt_lower_bound`; the
+/// `__index__` arm stays on the residual because that call is a whole-body
+/// blocker. The byte window is [`prefix_byte_window`]. `_index_to_byte` is
+/// needed only for a bound strictly inside the string, and its `is_ascii()`
+/// arm is the identity. A non-ASCII receiver with such a bound is declined:
+/// the other arm builds the `rutf8` table through `dont_look_inside`, which
+/// the same whole-body scan would pull into this graph. A default window
+/// never calls `_index_to_byte` — `start` stays 0 and `end` stays
+/// `len(_utf8)` — so it is traced for every encoding.
 ///
 /// Nothing here can collect, so no argument needs rooting — which is what
 /// lets the descent reach [`str_prefix_match_one`]'s `@jit.elidable` match
@@ -1748,49 +1778,46 @@ fn str_idx_params_unrooted(args: &[PyObjectRef]) -> Option<(PyObjectRef, PyObjec
         return None;
     }
     let w_self = args[0];
-    let w_needle = args[1];
-    if !unsafe {
-        pyre_object::is_str(w_self)
-            && pyre_object::is_str(w_needle)
-            && pyre_object::w_str_is_ascii(w_self)
-    } {
+    if unsafe { !pyre_object::is_str(w_self) } {
         return None;
     }
-    // ascii: the code point count and the byte length are the same number.
-    let length = unsafe { pyre_object::w_str_get_wtf8(w_self) }
-        .as_bytes()
-        .len() as i64;
-    let mut start = 0i64;
-    if args.len() >= 3 {
-        let bound = args[2];
-        if !unsafe { pyre_object::is_none(bound) } {
-            if !unsafe { pyre_object::is_int(bound) } {
-                return None;
-            }
-            let index = unsafe { pyre_object::w_int_get_value(bound) };
-            start = crate::sliceobject::adapt_bound(length, index);
-        }
+    let length = unsafe { pyre_object::w_str_len(w_self) } as i64;
+    let byte_len = unsafe { pyre_object::w_str_byte_len(w_self) } as i64;
+    let start = str_traced_codepoint_bound(args, 2, 0, length)?;
+    let end = str_traced_codepoint_bound(args, 3, length, length)?;
+    let needs_index = (start > 0 && start <= length) || end < length;
+    if needs_index && unsafe { !pyre_object::w_str_is_ascii(w_self) } {
+        return None;
     }
-    let mut end = length;
-    if args.len() >= 4 {
-        let bound = args[3];
-        if !unsafe { pyre_object::is_none(bound) } {
-            if !unsafe { pyre_object::is_int(bound) } {
-                return None;
-            }
-            let index = unsafe { pyre_object::w_int_get_value(bound) };
-            end = crate::sliceobject::adapt_bound(length, index);
-        }
-    }
-    let mut start_index = 0i64;
-    let mut end_index = length;
-    if start > 0 {
-        start_index = if start > length { end_index + 1 } else { start };
-    }
-    if end < length {
-        end_index = end;
+    let (start_index, end_index) = prefix_byte_window(length, byte_len, start, end, start, end);
+    let w_needle = args[1];
+    if unsafe { !pyre_object::is_str(w_needle) } {
+        return None;
     }
     Some((w_self, w_needle, start_index, end_index))
+}
+
+/// One bound of [`str_idx_params_unrooted`]: absent or `None` is `default`,
+/// `getindex_w`'s `is_int` arm is `w_int_get_value` plus `adapt_bound`, and
+/// anything else declines so the residual runs `__index__`.
+fn str_traced_codepoint_bound(
+    args: &[PyObjectRef],
+    index: usize,
+    default: i64,
+    length: i64,
+) -> Option<i64> {
+    if args.len() <= index {
+        return Some(default);
+    }
+    let bound = args[index];
+    if unsafe { pyre_object::is_none(bound) } {
+        return Some(default);
+    }
+    if unsafe { !pyre_object::is_int(bound) } {
+        return None;
+    }
+    let index = unsafe { pyre_object::w_int_get_value(bound) };
+    Some(crate::sliceobject::adapt_bound(length, index))
 }
 
 /// `BuiltinCode.func` PBC member for `str.startswith` — the wrapper
