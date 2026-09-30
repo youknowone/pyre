@@ -140,6 +140,46 @@ mod heap_prof {
 #[global_allocator]
 static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
 
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+mod residual_sig_call;
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+fn direct_sig_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
+    use majit_backend_wasm::{FuncSigVal, residual_target_sig};
+    if func_ptr == 0 || args.len() > 7 {
+        return None;
+    }
+    let sig = residual_target_sig(func_ptr as i64)?;
+    if sig.params.len() != args.len() || sig.has_f32() {
+        return None;
+    }
+    if !sig.params.is_empty() && sig.params.iter().all(|p| *p == FuncSigVal::F64) {
+        return residual_sig_call::call_uniform_f64(func_ptr, args, sig.result);
+    }
+    let mut mask = 0u16;
+    for (i, param) in sig.params.iter().enumerate() {
+        match param {
+            FuncSigVal::I32 => mask |= 1 << i,
+            FuncSigVal::I64 => {}
+            FuncSigVal::F64 | FuncSigVal::F32 => return None,
+        }
+    }
+    residual_sig_call::call_int_sig(func_ptr, args, mask, sig.result)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+fn blackhole_residual_call(
+    func_ptr: usize,
+    args: &[i64],
+    classes: &[majit_backend::call_stub::ArgClass],
+    result: char,
+) -> Option<i64> {
+    if let Some(value) = direct_sig_call(func_ptr, args) {
+        return Some(value);
+    }
+    majit_backend_wasm::residual_host_call(func_ptr, args, classes, result)
+}
+
 // Host clock for the native-host (`wasm-host`) build.
 //
 // wasm32 has neither a `SystemTime` nor an `Instant`: both panic rather than
@@ -815,10 +855,10 @@ fn install_wasm_print_hook() {
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 fn run_python_impl(source: &str) -> String {
     install_panic_hook();
-    // The descr class list is not the callee's wasm type. The host reads the
-    // function table and performs the call.
+    // A published table type is `call_indirect` inside the guest. Anything else
+    // uses the word stub or `jit_call_host`.
     #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-    majit_backend_wasm::install_residual_host_call();
+    majit_backend::call_stub::set_residual_host_call(Some(blackhole_residual_call));
     // Optional-module rclass aliases must be installed before the collector
     // is built: `init_jit_hooks` / `build_gc` snapshots the alias census.
     pyre_module::register();
