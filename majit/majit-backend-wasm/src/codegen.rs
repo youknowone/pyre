@@ -8622,7 +8622,13 @@ fn build_function(
                     sink.call_indirect(0, type_idx);
                     if has_result {
                         if *result_ty == Some(ValType::I32) {
-                            sink.i64_extend_i32_u();
+                            // A signed `i32` result is `lltype.Signed`. A ref
+                            // result is a pointer and stays zero-extended.
+                            if op.opcode == OpCode::CondCallValueI {
+                                sink.i64_extend_i32_s();
+                            } else {
+                                sink.i64_extend_i32_u();
+                            }
                         }
                         sink.local_set(value_types.local(vi));
                     } else if result_ty.is_some() {
