@@ -6413,11 +6413,12 @@ fn walker_write_const_bool_result<Sym: WalkSym>(
 /// performs, so a `def` in a loop body virtualizes away instead of allocating a
 /// `Function` per iteration.
 ///
-/// Everything the constructor stores is loop-invariant when the operands are
-/// constants. `globals` is the frame's `get_w_globals()` result (the
-/// `LoadImportGlobals` lowering) and the specialization applies only when that
-/// operand is a constant; otherwise it declines to the residual. `code` comes
-/// from a `LOAD_CONST`, and the remaining slots are derived from them:
+/// Everything the constructor stores is loop-invariant when `code` is a
+/// constant and `globals` is the frame's `get_w_globals()` result (the
+/// `LoadImportGlobals` lowering). That read is a recorded getfield, so a
+/// non-constant globals operand is pinned to its concrete dict with
+/// `GuardValue` before the constructor is emitted. `code` comes from a
+/// `LOAD_CONST`, and the remaining slots are derived from them:
 ///
 /// * `name` — `function.py:51 self.name = code.co_name`, a pointer into the
 ///   `Box::into_raw`'d `CodeObject`, which is never rewritten in place nor
@@ -6434,18 +6435,18 @@ fn walker_write_const_bool_result<Sym: WalkSym>(
 ///   default-module build, which mint a fresh object per call and so cannot be
 ///   baked — those decline to the residual.
 ///
-/// Soundness rests on one guard beyond the constant operands: the module
-/// dict's `version?` is pinned, so rebinding `globals['__builtins__']` runs
-/// `mutated()` and revokes the loop, exactly as it does for a shadowing insert
-/// under the LOAD_GLOBAL cell fold.  Nothing watches the code object's
-/// `co_name` / `co_qualname` because neither is mutable in place —
-/// `code.replace()` clones first and yields a different code object, which is a
-/// different constant.
+/// Soundness rests on two pins: `GuardValue` on a non-constant globals
+/// operand, so another namespace deopts, and the module dict's `version?`,
+/// so rebinding `globals['__builtins__']` runs `mutated()` and revokes the
+/// loop, exactly as it does for a shadowing insert under the LOAD_GLOBAL
+/// cell fold.  Nothing watches the code object's `co_name` / `co_qualname`
+/// because neither is mutable in place — `code.replace()` clones first and
+/// yields a different code object, which is a different constant.
 ///
 /// Declines (each falls through to the residual, which stays correct): a
-/// non-constant operand, a non-`PyCode` or bodyless code object, globals that
-/// are not a module dict, an unbakeable `__builtins__`, and any baked pointer
-/// the collector may relocate.
+/// non-constant `code` operand, a globals operand with no concrete module
+/// dict, a non-`PyCode` or bodyless code object, an unbakeable
+/// `__builtins__`, and any baked pointer the collector may relocate.
 pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -6456,8 +6457,8 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     if r_args.len() != 2 {
         return Ok(None);
     }
-    let (globals_op, code_op) = (r_args[0], r_args[1]);
-    if !globals_op.is_constant() || !code_op.is_constant() {
+    let (globals_live, code_op) = (r_args[0], r_args[1]);
+    if !code_op.is_constant() {
         return Ok(None);
     }
     let Some(w_code) = walker_concrete_ref_object(ctx, code_op) else {
@@ -6490,7 +6491,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     if w_qualname.is_null() {
         return Ok(None);
     }
-    let Some(w_globals) = walker_concrete_ref_object(ctx, globals_op) else {
+    let Some(w_globals) = walker_concrete_ref_object(ctx, globals_live) else {
         return Ok(None);
     };
     // Restrict to a module namespace before probing it directly, so the slot
@@ -6518,9 +6519,26 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     // movability does not decide the fold.
 
     // commit to the fold: emit IR (no further declines)
-    // The only mutable input: `globals['__builtins__']` may be rebound after
-    // this function is built, and a later iteration must then see the new
-    // mapping.  Pinning the namespace `version?` revokes the loop instead.
+    // `get_w_globals` records a getfield. Pin that box to the dict this
+    // iteration built the function from, then use the constant below.
+    let globals_op = if globals_live.is_constant() {
+        globals_live
+    } else {
+        let expected = ctx.trace_ctx.const_ref(w_globals as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardValue,
+            &[globals_live, expected],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(globals_live, expected);
+        expected
+    };
+    // `globals['__builtins__']` may be rebound after this function is built,
+    // and a later iteration must then see the new mapping.  Pinning the
+    // namespace `version?` revokes the loop instead.
     walker_pin_namespace_version(ctx, op_pc, w_globals)?;
     let header_w_class = ctx
         .trace_ctx
