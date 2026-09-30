@@ -460,7 +460,8 @@ fn arg_slot(idx: usize, rooted: bool) -> proc_macro2::TokenStream {
 /// in the user's typed coordinate space, not in `PyObjectRef` space.
 ///
 /// With `rooted`, the second result re-reads a bound object from its slot
-/// once every conversion has run.
+/// once every conversion has run.  A `#[default]` object is not in that
+/// slice: the binding pins the word it produced, and the re-read loads the pin.
 fn unwrap_arg(
     idx: usize,
     pt: &PatType,
@@ -479,29 +480,67 @@ fn unwrap_arg(
 
     let slot = arg_slot(idx, rooted);
     let unwrap = unwrap_expr(ty, &slot, idx)?;
-    let reread = match arg_read(ty) {
-        ArgRead::Ref if rooted => {
-            let value = if option_inner(unwrap_type_group(ty)).is_some() {
-                quote! { ::std::option::Option::Some(#slot) }
-            } else {
-                quote! { #slot }
-            };
-            Some(quote! {
-                let #ident = if #idx < args.len() && !args[#idx].is_null() { #value } else { #ident };
-            })
-        }
-        // The whole slice is the native copy; rebuild it from the slots.
-        ArgRead::WholeSlice if rooted => Some(quote! {
-            let mut __pyre_live_args: ::std::vec::Vec<::pyre_object::PyObjectRef> =
-                ::std::vec::Vec::with_capacity(args.len());
-            let mut __pyre_live_i = 0usize;
-            while __pyre_live_i < args.len() {
-                __pyre_live_args.push(__pyre_arg_roots.get(__pyre_arg_base + __pyre_live_i));
-                __pyre_live_i += 1;
+    let default = arg_default(pt)?;
+    let read = arg_read(ty);
+    // A defaulted object is not an `args` slot.  Pin that word before the
+    // later conversions collect, and reload it afterwards.
+    let pin_defaulted_ref = rooted && default.is_some() && read == ArgRead::Ref;
+    let (pin_stmt, reread) = if pin_defaulted_ref {
+        let slot_ident = format_ident!("__pyre_{}_slot", ident);
+        let is_option = option_inner(unwrap_type_group(ty)).is_some();
+        let (presence, word, reread_value) = if is_option {
+            let some_ident = format_ident!("__pyre_{}_some", ident);
+            (
+                quote! { let #some_ident = #ident.is_some(); },
+                quote! { #ident.unwrap_or(::pyre_object::PY_NULL) },
+                quote! {
+                    if #some_ident {
+                        ::std::option::Option::Some(__pyre_arg_roots.get(#slot_ident))
+                    } else {
+                        ::std::option::Option::None
+                    }
+                },
+            )
+        } else {
+            (
+                quote! {},
+                quote! { #ident },
+                quote! { __pyre_arg_roots.get(#slot_ident) },
+            )
+        };
+        (
+            quote! {
+                #presence
+                let #slot_ident = __pyre_arg_roots.pin_roots(&[#word]);
+            },
+            Some(quote! { let #ident = #reread_value; }),
+        )
+    } else {
+        let reread = match read {
+            ArgRead::Ref if rooted => {
+                let value = if option_inner(unwrap_type_group(ty)).is_some() {
+                    quote! { ::std::option::Option::Some(#slot) }
+                } else {
+                    quote! { #slot }
+                };
+                Some(quote! {
+                    let #ident = if #idx < args.len() && !args[#idx].is_null() { #value } else { #ident };
+                })
             }
-            let #ident: &[::pyre_object::PyObjectRef] = &__pyre_live_args;
-        }),
-        _ => None,
+            // The whole slice is the native copy; rebuild it from the slots.
+            ArgRead::WholeSlice if rooted => Some(quote! {
+                let mut __pyre_live_args: ::std::vec::Vec<::pyre_object::PyObjectRef> =
+                    ::std::vec::Vec::with_capacity(args.len());
+                let mut __pyre_live_i = 0usize;
+                while __pyre_live_i < args.len() {
+                    __pyre_live_args.push(__pyre_arg_roots.get(__pyre_arg_base + __pyre_live_i));
+                    __pyre_live_i += 1;
+                }
+                let #ident: &[::pyre_object::PyObjectRef] = &__pyre_live_args;
+            }),
+            _ => None,
+        };
+        (quote! {}, reread)
     };
     // A `&[PyObjectRef]` whole-slice parameter binds the entire `args`
     // slice — it has no per-slot index to bounds-check.  Other slice
@@ -521,7 +560,7 @@ fn unwrap_arg(
     // `None` for an out-of-range or PY_NULL slot, so the slot is optional and
     // gets no missing-argument guard.
     let is_optional = option_inner(ty).is_some();
-    let expr = match arg_default(pt)? {
+    let expr = match default {
         // `bind_kwargs_to_signature` pads `args` to the parameter count
         // with PY_NULL, so the default only applies when the slot is both
         // present and non-null.
@@ -569,7 +608,14 @@ fn unwrap_arg(
     } else {
         quote! { #ty }
     };
-    Ok((quote! { let #ident: #binding_ty = #expr; }, reread, ident))
+    Ok((
+        quote! {
+            let #ident: #binding_ty = #expr;
+            #pin_stmt
+        },
+        reread,
+        ident,
+    ))
 }
 
 /// Substitute typed-receiver aliases in a fn signature with the rust
