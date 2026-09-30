@@ -6910,12 +6910,12 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     // Gate: EXACT list, non-negative int index in bounds, object-, int-,
     // float- or ascii-storage.  A bool index (`is_int` accepts `W_BoolObject`)
     // is fine:
-    // bool shares int's `intval`, so it unboxes through its own &BOOL_TYPE
-    // guard below.  A list SUBCLASS instance shares `ob_type == &LIST_TYPE`
+    // bool shares int's `intval`, so the walk unboxes it through `&BOOL_TYPE`.
+    // A list SUBCLASS instance shares `ob_type == &LIST_TYPE`
     // but retags `w_class` and may override `__getitem__`; `is_exact_list`
     // excludes it so it falls to the generic residual (which honours the
     // override) instead of this direct-storage load.
-    let (sid, index, concrete_len) = unsafe {
+    let (sid, index) = unsafe {
         if !pyre_object::is_exact_list(list_obj) || !pyre_object::is_int(key_obj) {
             return Ok(None);
         }
@@ -6923,8 +6923,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         if index < 0 {
             return Ok(None);
         }
-        let concrete_len = pyre_object::w_list_len(list_obj);
-        if index as usize >= concrete_len {
+        if index as usize >= pyre_object::w_list_len(list_obj) {
             return Ok(None);
         }
         let sid = if pyre_object::w_list_uses_int_storage(list_obj) {
@@ -6939,160 +6938,17 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
             // Empty-strategy list: no concrete element to read.
             return Ok(None);
         };
-        (sid, index, concrete_len)
+        (sid, index)
     };
 
-    // Authentic boxed result from the same may-force path the generic leg uses.
-    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+    // Walk `w_list_getitem_inner`. A missing body or an unfinished walk
+    // leaves the generic residual.
+    let Some(boxed) = try_walker_orthodox_list_getitem(
+        ctx, op_pc, list_op, key_op, list_obj, key_obj, sid, index,
+    )?
+    else {
         return Ok(None);
     };
-
-    // emit the specialized IR (walker-native)
-    // Exact `w_class` first: it implies the LIST vtable, so the GuardClass
-    // below is skipped. A list subclass shares `ob_type == &LIST_TYPE` but
-    // retags `w_class` and may override `__getitem__`.
-    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        list_op,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
-    )?;
-    if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
-        let type_const = ctx.trace_ctx.const_int(list_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(list_op, list_type_addr);
-
-    // guard_value(strategy == sid): getfield strategy + GuardValue + replace_box.
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        list_op,
-        crate::descr::list_strategy_descr(),
-    );
-    let sid_const = ctx.trace_ctx.const_int(sid);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, sid_const);
-
-    // Unbox the index operand (guard_class + getfield intval).  bool shares
-    // int's `intval`, so a bool index guards its own &BOOL_TYPE.
-    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
-    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
-    ctx.trace_ctx
-        .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
-
-    // Object storage keeps the inline `length` field (rlist.py); the typed
-    // storages read their own items-array length field.
-    let len_descr = match sid {
-        0 => crate::descr::list_length_descr(),
-        1 => crate::descr::list_int_items_len_descr(),
-        2 => crate::descr::list_float_items_len_descr(),
-        _ => crate::descr::list_ascii_items_len_descr(),
-    };
-    let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
-    walker_emit_index_bounds_guards(ctx, op_pc, raw_index, index, lenbox, concrete_len)?;
-
-    // Element load.  Object storage reads the boxed Ref directly from the
-    // `Ptr(GcArray(OBJECTPTR))` items block (no unbox/rebox).  Int/float
-    // storage read the raw typed array and rebox; the raw element is stamped
-    // with the true value from the authentic may-force result (the in-array
-    // sanity load is skipped when `items_ptr` is not trace-time concrete) so
-    // the `wrapint` / `wrapfloat` box's cached field matches a later unbox.
-    let result_obj = boxed_result_i64 as pyre_object::PyObjectRef;
-    let default_concrete = majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize));
-    let (boxed, boxed_concrete) = match sid {
-        0 => {
-            let items_block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                list_op,
-                crate::descr::list_items_descr(),
-            );
-            (
-                crate::state::trace_items_block_getitem_value(
-                    ctx.trace_ctx,
-                    items_block,
-                    raw_index,
-                ),
-                default_concrete,
-            )
-        }
-        1 => {
-            let block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                list_op,
-                crate::descr::list_int_items_block_descr(),
-            );
-            let raw = crate::state::trace_int_block_getitem_value(ctx.trace_ctx, block, raw_index);
-            let elem = unsafe { pyre_object::w_int_get_value(result_obj) };
-            ctx.trace_ctx
-                .set_opref_concrete(raw, majit_ir::Value::Int(elem));
-            (
-                walker_box_int(ctx, op_pc, raw, elem)?,
-                box_int_concrete(elem, boxed_result_i64),
-            )
-        }
-        2 => {
-            let block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                list_op,
-                crate::descr::list_float_items_block_descr(),
-            );
-            let raw =
-                crate::state::trace_float_block_getitem_value(ctx.trace_ctx, block, raw_index);
-            let elem = unsafe { pyre_object::w_float_get_value(result_obj) };
-            ctx.trace_ctx
-                .set_opref_concrete(raw, majit_ir::Value::Float(elem));
-            (
-                crate::state::wrapfloat(ctx.trace_ctx, raw),
-                default_concrete,
-            )
-        }
-        // `AsciiListStrategy.getitem` (listobject.py).  The erased
-        // `[rpython str]` block is the same `ItemsBlock` the object strategy
-        // uses, so the element load is the same `getarrayitem_gc_r` -- but
-        // what it yields is the shared immutable `_utf8` payload, not a
-        // `W_UnicodeObject`, and `wrap` still has to box it.
-        // `w_str_from_storage` is that `wrap`: it allocates the header and
-        // shares the payload, the way `space.newutf8(stringval,
-        // len(stringval))` does upstream.
-        //
-        // The call is recorded NON-elidable deliberately.  Two `L[i]` reads
-        // of the same pair hand back two distinct wrappers upstream too, so
-        // letting the optimizer share one between two sites would answer `is`
-        // differently from the interpreter that recorded the trace.  Its
-        // effect carries empty write sets: the only memory it writes is the
-        // header it just allocated, which no earlier load can alias, so the
-        // loads above stay cached across it.
-        _ => {
-            let block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                list_op,
-                crate::descr::list_ascii_items_block_descr(),
-            );
-            let storage =
-                crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, raw_index);
-            let wrap: extern "C" fn(i64) -> i64 =
-                pyre_object::unicodeobject::__majit_call_target_w_str_from_storage;
-            (
-                ctx.trace_ctx.call_ref_typed_with_effect(
-                    wrap as *const (),
-                    &[storage],
-                    &[majit_ir::Type::Ref],
-                    majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
-                ),
-                default_concrete,
-            )
-        }
-    };
-    ctx.trace_ctx.set_opref_concrete(boxed, boxed_concrete);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
 }
