@@ -12802,7 +12802,8 @@ mod tests {
         // A function with FieldRead/FieldWrite → bitsets populated.
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("accessor");
-        let base_var = graph.alloc_value_var();
+        // The call passes `Type::Ref`, so `getkind` reads a GcRef concretetype.
+        let base_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
         graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
@@ -12861,7 +12862,8 @@ mod tests {
     fn declared_cannot_raise_retains_write_effects() {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("opaque_writer");
-        let base_var = graph.alloc_value_var();
+        // The call passes `Type::Ref`, so `getkind` reads a GcRef concretetype.
+        let base_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
         graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
@@ -13188,7 +13190,8 @@ mod tests {
         // RPython effectinfo.py:181-186: ignore writes for elidable.
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("pure_writer");
-        let base_var = graph.alloc_value_var();
+        // The call passes `Type::Ref`, so `getkind` reads a GcRef concretetype.
+        let base_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
         graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
@@ -13248,7 +13251,8 @@ mod tests {
             vec![("slot".to_string(), "i64".to_string())],
         );
         let mut graph = FunctionGraph::new("pure_cache");
-        let base_var = graph.alloc_value_var();
+        // The call passes `Type::Ref`, so `getkind` reads a GcRef concretetype.
+        let base_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
         graph.push_inputarg_var(graph.startblock, base_var.clone());
         graph.push_op_var(
             graph.startblock,
@@ -13647,7 +13651,8 @@ mod tests {
         // if there's no corresponding write ("struct") for that field.
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("rw_same_field");
-        let base_var = graph.alloc_value_var();
+        // The call passes `Type::Ref`, so `getkind` reads a GcRef concretetype.
+        let base_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
         graph.push_inputarg_var(graph.startblock, base_var.clone());
         let field = crate::model::FieldDescriptor::new("x", Some("Point".into()));
         // Both read AND write the same field "x"
