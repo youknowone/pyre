@@ -19148,12 +19148,15 @@ impl<M: Clone> MetaInterp<M> {
         // `registers_*` holds the box. The `*_values` mirror is
         // `box.getref_base()` when the reader stamped a concrete, and
         // the guard's rooted address when only the applying half has one.
-        fn virtual_box_bits(ctx: &crate::TraceCtx, opref: OpRef, root: Option<i64>) -> i64 {
+        // A virtual the reader built without an allocator has no object
+        // yet: its mirror stays `None`. A null mirror would be read as a
+        // known constant and folded into a residual call's argument.
+        fn virtual_box_bits(ctx: &crate::TraceCtx, opref: OpRef, root: Option<i64>) -> Option<i64> {
             match ctx.concrete_of_opref(opref) {
-                Some(majit_ir::Value::Ref(gcref)) => gcref.0 as i64,
-                Some(majit_ir::Value::Int(value)) => value,
-                Some(majit_ir::Value::Float(value)) => value.to_bits() as i64,
-                _ => root.unwrap_or(0),
+                Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as i64),
+                Some(majit_ir::Value::Int(value)) => Some(value),
+                Some(majit_ir::Value::Float(value)) => Some(value.to_bits() as i64),
+                _ => root,
             }
         }
         // `rebuild_from_resumedata` reads `metainterp.staticdata` directly.
@@ -19226,7 +19229,7 @@ impl<M: Clone> MetaInterp<M> {
             // `resume.py` `_callback_r` → `next_ref` → `decode_box`.
             // `TAGVIRTUAL` is `getvirtual_ptr` into the register, before
             // the guard capture reads `registers_r[index]`.
-            let mut pending: Vec<(majit_ir::Type, usize, OpRef, i64)> =
+            let mut pending: Vec<(majit_ir::Type, usize, OpRef, Option<i64>)> =
                 Vec::with_capacity(order.len());
             let mut virtuals: Vec<(majit_ir::Type, usize, usize)> = Vec::new();
             for (slot, value) in order.into_iter().zip(section.values.iter()) {
@@ -19239,7 +19242,7 @@ impl<M: Clone> MetaInterp<M> {
                 else {
                     continue;
                 };
-                pending.push((bank, index, opref, bits));
+                pending.push((bank, index, opref, Some(bits)));
             }
             if !virtuals.is_empty() {
                 let Some(ctx) = tracing.as_deref_mut() else {
@@ -19282,15 +19285,15 @@ impl<M: Clone> MetaInterp<M> {
                 match bank {
                     majit_ir::Type::Int if index < frame.int_regs.len() => {
                         frame.int_regs[index] = Some(opref);
-                        frame.int_values[index] = Some(bits);
+                        frame.int_values[index] = bits;
                     }
                     majit_ir::Type::Ref if index < frame.ref_regs.len() => {
                         frame.ref_regs[index] = Some(opref);
-                        frame.ref_values[index] = Some(bits);
+                        frame.ref_values[index] = bits;
                     }
                     majit_ir::Type::Float if index < frame.float_regs.len() => {
                         frame.float_regs[index] = Some(opref);
-                        frame.float_values[index] = Some(bits);
+                        frame.float_values[index] = bits;
                     }
                     _ => {}
                 }

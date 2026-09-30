@@ -10748,21 +10748,32 @@ impl<S: JitState> JitDriver<S> {
             // macro mainloop bridge is single-frame, so the root frame's
             // dispatch JitCode is the only coordinate needed.
             //
-            // The frame's `pc` word stores the dispatch-JitCode position, so it
-            // is the liveness coordinate for this single-frame macro bridge.
+            // The frame's `pc` word is a position in the frame's OWN
+            // jitcode (`resume.py` `rebuild_from_resumedata` pairs each
+            // section's `jitcode_pos` with its `pc`; `consume_boxes` reads
+            // the live set from that jitcode). A frame resumed inside a
+            // runtime-registered jitcode carries a pc the portal jitcode
+            // cannot decode, and reading it there yields empty banks: every
+            // register of that frame then resumes unset. The dispatch
+            // jitcode is only the fallback for a section without an index.
             let bridge_liveness = self.meta.staticdata.liveness_info.snapshot_arc();
-            let bridge_reg_indices = self.dispatch_jitcode().and_then(|jc| {
-                bfm.frames.first().map(|frame| {
-                    let Ok(pc) = usize::try_from(frame.pc) else {
-                        return crate::resume::FrameLivenessRegIndices::default();
-                    };
-                    crate::resume::read_frame_liveness_reg_indices(
-                        jc,
-                        pc,
-                        self.meta.staticdata.op_live as u8,
-                        &bridge_liveness,
-                    )
-                })
+            let bridge_reg_indices = bfm.frames.first().and_then(|frame| {
+                let Ok(pc) = usize::try_from(frame.pc) else {
+                    return Some(crate::resume::FrameLivenessRegIndices::default());
+                };
+                let jc = usize::try_from(frame.jitcode_index)
+                    .ok()
+                    .and_then(|pos| {
+                        S::resolve_resume_jitcode(pos)
+                            .or_else(|| self.meta.staticdata.jitcodes.get(pos).cloned())
+                    })
+                    .or_else(|| self.dispatch_jitcode().cloned())?;
+                Some(crate::resume::read_frame_liveness_reg_indices(
+                    &jc,
+                    pc,
+                    self.meta.staticdata.op_live as u8,
+                    &bridge_liveness,
+                ))
             });
             // Both `self.sym` (set above via `self.sym = Some(sym)`) and
             // `self.meta.tracing` (set by `start_retrace_from_guard`) must be

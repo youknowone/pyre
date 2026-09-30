@@ -10305,6 +10305,15 @@ fn seed_bridge_standing_exception_from_current(
 }
 
 impl JitState for PyreJitState {
+    /// The unified runtime registry seats runtime Python bodies and
+    /// materializes frozen bodies on demand (`ensure_build_time_jitcode_at`);
+    /// the driver's own `jitcodes` vector holds a skeleton at those indices.
+    fn resolve_resume_jitcode(
+        index: usize,
+    ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+        ensure_build_time_jitcode_at(index).map(|payload| std::sync::Arc::clone(&payload.jitcode))
+    }
+
     type Meta = PyreMeta;
     type Sym = PyreSym;
     type Env = PyreEnv;
