@@ -3044,10 +3044,12 @@ pub fn translate_op(
                     // classes onto one `ClassDesc`.  Exception: the fixed
                     // aggregate-kind placeholder tags named by id atom
                     // (`Tuple` for tuples / unresolved ADTs, `Array`,
-                    // `Closure` — see `front::mir::aggregate_ctor_name`) are
-                    // not variant names; they name ONE universal placeholder
-                    // each (no enum ambiguity), and the construction-side
-                    // FieldWrite chain shares the same tag as `owner_root`
+                    // `Closure` — see `front::mir::aggregate_ctor_name` —
+                    // and `MutRef`, the one-field GC cell for a `&mut` GC
+                    // reference) are not variant names; they name ONE
+                    // universal placeholder each (no enum ambiguity), and the
+                    // construction-side FieldWrite chain shares the same tag
+                    // as `owner_root`
                     // with the field-projection side (which resolves it
                     // through `getuniqueclassdef_for_struct_root` →
                     // `intern_class_by_qualname`).  Minting a fresh Arc per
@@ -3068,9 +3070,12 @@ pub fn translate_op(
                         // Without this a suffixed tuple falls to the fresh-Arc
                         // branch below and mints a distinct `Tuple<f64,f64>`
                         // per site → `commonbase` None → UnionError at a join.
+                        // `MutRef<T>` is the one-field GC cell for a `&mut`
+                        // GC reference: one universal placeholder per pointee
+                        // shape, interned under that same suffixed qualname.
                         if matches!(
                             majit_ir::descr::strip_instantiation_suffix(name),
-                            "Tuple" | "Array" | "Closure"
+                            "Tuple" | "Array" | "Closure" | "MutRef"
                         ) {
                             call_registry.bookkeeper().intern_class_by_qualname(name)
                         } else {
@@ -4152,7 +4157,10 @@ pub(crate) fn derive_subject_inputcells(
                         .struct_fields
                         .borrow()
                         .as_ref()
-                        .is_some_and(|reg| reg.fields.contains_key(root));
+                        .is_some_and(|reg| reg.fields.contains_key(root))
+                        // A `MutRef<T>` cell is a synthetic one-field class with no
+                        // struct-field rows, interned by qualname like its constructor.
+                        || majit_ir::descr::strip_instantiation_suffix(root) == "MutRef";
                     if known {
                         // A `&FixedObjectArray` receiver models as its
                         // `_items` element list, not the wrapping struct
@@ -7713,6 +7721,133 @@ mod tests {
             &empty_call_registry(),
         )
         .expect_err("a Rust aggregate ctor carries no call operands");
+    }
+
+    /// Two graphs that construct the same `MutRef<T>` cell share one class
+    /// host. The cell is one placeholder per pointee shape, so a callee's
+    /// field read and every caller's constructor resolve the same classdef.
+    #[test]
+    fn mut_ref_cell_graphs_share_one_class_host() {
+        let name = "MutRef<*mut PyObject>";
+        let registry = empty_call_registry();
+        let host_of = |label: &str| {
+            let mut graph = LegacyGraph::new(label);
+            let vars = mint_vars(&mut graph, 4);
+            let startblock = Block {
+                id: graph.startblock,
+                inputargs: block_inputargs(&vars, &[1]),
+                operations: vec![SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: OpKind::Call {
+                        target: crate::model::CallTarget::synthetic_transparent_struct_ctor(
+                            Vec::new(),
+                            name,
+                        ),
+                        args: crate::model::call_args(vec![]),
+                        result_ty: ValueType::Ref(Some(name.to_string())),
+                    },
+                }],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(
+                    vec![LinkArg::Value(vars[2].clone())],
+                    graph.returnblock,
+                )],
+                framestate: None,
+                dead: false,
+            };
+            let returnblock = Block {
+                id: graph.returnblock,
+                inputargs: block_inputargs(&vars, &[3]),
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![],
+                framestate: None,
+                dead: false,
+            };
+            graph.blocks = vec![startblock, returnblock];
+            let output = function_graph_to_flowspace(&graph, &registry)
+                .expect("MutRef construction must adapt");
+            let flowspace_graph = output.graph.borrow();
+            let startblock = flowspace_graph.startblock.borrow();
+            let op = startblock
+                .operations
+                .iter()
+                .find(|op| op.opname == "simple_call")
+                .expect("MutRef ctor lowers to instantiate");
+            let Hlvalue::Constant(Constant {
+                value: ConstValue::HostObject(class),
+                ..
+            }) = &op.args[1]
+            else {
+                panic!("instantiate's class argument must be a HostObject");
+            };
+            assert_eq!(class.qualname(), name);
+            class.clone()
+        };
+        assert_eq!(host_of("mut_ref_caller_a"), host_of("mut_ref_caller_b"));
+    }
+
+    /// A `MutRef<T>` parameter has no struct-field rows, but its input cell
+    /// must still be the constructor's interned class — the same host
+    /// `SyntheticTransparentCtor` registers through `intern_class_by_qualname`.
+    #[test]
+    fn mut_ref_input_cell_seeds_constructor_class_host() {
+        let name = "MutRef<*mut PyObject>";
+        let registry = empty_call_registry();
+        let bk = registry.bookkeeper().clone();
+        bk.set_struct_fields(Rc::new(crate::front::StructFieldRegistry::default()));
+
+        let mut graph = LegacyGraph::new("mut_ref_callee");
+        let entry = graph.startblock;
+        let cell = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cell".to_string(),
+                    ty: ValueType::Ref(Some(name.to_string())),
+                    class_root: Some(name.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, cell);
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("MutRef input must seed a classdef");
+        let SomeValue::Instance(inst) = &cells[0] else {
+            panic!("MutRef input must be SomeInstance, got {:?}", cells[0]);
+        };
+        let classdef = inst
+            .classdef
+            .as_ref()
+            .expect("MutRef input cell must carry a classdef");
+        let seeded = classdef.borrow().classdesc.borrow().pyobj.clone();
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut ctor_graph = LegacyGraph::new("mut_ref_ctor");
+        let vars = mint_vars(&mut ctor_graph, 2);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::synthetic_transparent_struct_ctor(
+                    Vec::new(),
+                    name,
+                ),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some(name.to_string())),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &registry).expect("MutRef ctor must lower");
+        let Hlvalue::Constant(Constant {
+            value: ConstValue::HostObject(ctor_host),
+            ..
+        }) = &translated[0].args[1]
+        else {
+            panic!("instantiate's class argument must be a HostObject");
+        };
+        assert_eq!(ctor_host.qualname(), name);
+        assert_eq!(&seeded, ctor_host);
     }
 
     #[test]
