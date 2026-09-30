@@ -1410,16 +1410,13 @@ unsafe fn integer_divmod_pair(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResul
             fields.push(bigint_result(r.translated_alias()));
             return Ok(w_tuple_new(fields.take()));
         }
-        let mut q = va / vb;
-        let mut r = va % vb;
-        if r != 0 && (r ^ vb) < 0 {
-            q -= 1;
-            r += vb;
-        }
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(w_int_new(q));
-        fields.push(w_int_new(r));
-        return Ok(w_tuple_new(fields.take()));
+        // intobject.py `_divmod`: `z = ovfcheck(x // y)`, `m = x % y`, then
+        // `space.newtuple2(space.newint(z), space.newint(m))`.
+        let z = ll_int_py_div(va, vb);
+        let m = ll_int_py_mod(va, vb);
+        let mut w_z = w_int_new(z);
+        let w_m = pyre_object::with_roots!(w_z => w_int_new(m));
+        return Ok(pyre_object::makespecialisedtuple2(w_z, w_m));
     }
 
     // `_make_descr_binop(_divmod, _int_divmod)`: a machine-int divisor is

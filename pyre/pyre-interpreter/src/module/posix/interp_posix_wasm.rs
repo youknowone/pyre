@@ -1141,10 +1141,8 @@ fn validate_utime_args(
         Ok(())
     };
     let validate_nanoseconds = |w_value: PyObjectRef| -> Result<(), crate::PyError> {
-        let w_split = crate::builtins::builtin_divmod(&[
-            w_value,
-            pyre_object::w_int_new(1_000_000_000),
-        ])?;
+        let w_split =
+            crate::baseobjspace::divmod(w_value, pyre_object::w_int_new(1_000_000_000))?;
         let (Some(w_seconds), Some(w_remainder)) = (unsafe {
             (
                 pyre_object::w_tuple_getitem(w_split, 0),

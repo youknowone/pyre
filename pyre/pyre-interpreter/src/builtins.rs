@@ -4145,7 +4145,15 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         make_module_builtin_function("round", builtin_round)
     });
     crate::module_ns_get_or_insert_with(ns, "divmod", || {
-        make_module_builtin_function("divmod", builtin_divmod)
+        // operation.py `divmod(space, w_x, w_y)` — two positional-only
+        // arguments, so any keyword is rejected with "takes no keyword
+        // arguments".
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "divmod",
+            __majit_wrap_builtin_divmod,
+            2,
+            crate::gateway::Signature::new(vec!["x", "y"], None, None, 0, 2),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "pow", || {
         make_module_builtin_function("pow", __majit_wrap_builtin_pow)
@@ -25087,28 +25095,30 @@ pub fn is_builtin_divmod_function(callable: PyObjectRef) -> bool {
         }
         crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
-            builtin_divmod as crate::gateway::BuiltinCodeFn,
+            __majit_wrap_builtin_divmod as crate::gateway::BuiltinCodeFn,
         )
     }
 }
 
-/// `divmod(a, b)` — pypy/interpreter/baseobjspace.py divmod row.
-pub(crate) fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "divmod() takes no keyword arguments",
-        ));
-    }
+/// Manual interp2app gateway for operation.py `divmod(space, w_x, w_y)`,
+/// which returns `space.divmod(w_x, w_y)`.  The Signature binds the keyword
+/// form at the call site, so `args` is positional only.
+pub fn __majit_wrap_builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 2 {
-        // `_PyArg_CheckPositional` names the function bare and parenthesis-free
-        // once it declares two or more arguments.
-        return Err(crate::PyError::type_error(format!(
-            "divmod expected 2 arguments, got {}",
-            args.len()
-        )));
+        return Err(divmod_arity_error(args.len()));
     }
     crate::baseobjspace::divmod(args[0], args[1])
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_builtin_divmod_target,
+    __majit_wrap_builtin_divmod
+);
+
+/// `_PyArg_CheckPositional` names the function bare and parenthesis-free once
+/// it declares two or more arguments.
+fn divmod_arity_error(given: usize) -> crate::PyError {
+    crate::PyError::type_error(format!("divmod expected 2 arguments, got {given}"))
 }
 
 /// `operation.py pow` — `space.pow(w_base, w_exp, w_mod)` with
@@ -26613,7 +26623,7 @@ mod tests {
         let _g = crate::module::_weakref::interp__weakref::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_int_new(5), PY_NULL);
-        let result = builtin_divmod(&[proxy, w_int_new(3)]).unwrap();
+        let result = __majit_wrap_builtin_divmod(&[proxy, w_int_new(3)]).unwrap();
         assert_eq!(
             unsafe { w_int_get_value(w_tuple_getitem(result, 0).unwrap()) },
             1
@@ -26676,7 +26686,7 @@ mod tests {
         });
         let lhs = pyre_object::objectobject::w_instance_new(user_type);
         let dead_proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_none(), PY_NULL);
-        let result = builtin_divmod(&[lhs, dead_proxy]).unwrap();
+        let result = __majit_wrap_builtin_divmod(&[lhs, dead_proxy]).unwrap();
         assert_eq!(
             unsafe { w_int_get_value(w_tuple_getitem(result, 0).unwrap()) },
             41

@@ -14735,28 +14735,22 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     walker_emit_jit_int_str_padded(ctx, op.pc, value, boxed_result, pad, dst)
 }
 
-/// `divmod(a, b)` on two exact `W_IntObject` operands: emit the inline pair
-/// shape the meta-tracer produces upstream (intobject.py `_divmod` →
-/// `space.newtuple2(space.newint(z), space.newint(m))`) instead of the opaque
-/// `bh_call_fn(divmod_builtin, NULL, a, b)` residual.
+/// `space.divmod(w_x, w_y)`, the body operation.py `divmod` returns.
+const DIVMOD_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::divmod",
+    commit_label: "divmod_commit",
+    call_site_label: "divmod_call_site",
+    decline_tag: "DIVMOD-SUBWALK",
+};
+
+/// `divmod(a, b)`: operation.py `divmod(space, w_x, w_y)` is
+/// `space.divmod(w_x, w_y)`, so after pinning the builtin's identity the call
+/// descends that body with the recorded operands.  Its own class tests and
+/// override probes select the `_divmod` / `_int_divmod` arm.
 ///
-/// The divmod row rejects a zero divisor before dispatching, so the trace
-/// carries the same domain guards the `//` / `%` specialization emits, then
-/// runs the two `OS_INT_PY_DIV` / `OS_INT_PY_MOD` elidable calls over one
-/// guarded operand pair.  The result is the virtual `Cls_ii` specialised
-/// tuple, so a `q, r = divmod(...)` site pairs with
-/// [`try_walker_specialize_unpack`] and the tuple never materializes.
-///
-/// The exact `w_class` guard is required because an `int` SUBCLASS shares
-/// `ob_type == &INT_TYPE` but may override `__divmod__`; it side-exits to the
-/// generic residual.
-///
-/// Returns `None` (fall through to the generic residual, SAFE) for any other
-/// shape: wrong arity, a bound receiver, a non-`divmod` callable, an operand
-/// that is not an exact `int` (long / float / bool / subclass), a tagged
-/// immediate, a zero divisor, or the `INT_MIN // -1` pair that escapes to a
-/// bigint result.
-pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
+/// Admission is the policy [`try_walker_orthodox_descent`] documents: only an
+/// exact builtin numeric operand, whose arms call no Python code.
+pub(crate) fn try_walker_orthodox_builtin_divmod<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
@@ -14768,48 +14762,43 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
         return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(lhs_obj),
-        ConcreteValue::Ref(rhs_obj),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
+        (arg_concretes[0], arg_concretes[1])
     else {
         return Ok(None);
     };
     // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
     // prepends as arg0 — not a plain `divmod(a, b)` call.
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || lhs_obj.is_null()
-        || rhs_obj.is_null()
-    {
+    if concrete_callable.is_null() || !null_or_self.is_null() {
         return Ok(None);
     }
     if !pyre_interpreter::builtins::is_builtin_divmod_function(concrete_callable) {
         return Ok(None);
     }
-    // A tagged immediate has no real header for the `w_class` / unbox guards
-    // and this emit is not tag-aware, so decline it to the residual.
-    if pyre_object::tagged_int::CAN_BE_TAGGED
-        && (pyre_object::tagged_int::is_tagged_int(lhs_obj)
-            || pyre_object::tagged_int::is_tagged_int(rhs_obj))
-    {
-        return Ok(None);
+    let mut operands = [(OpRef::NONE, std::ptr::null_mut()); 2];
+    for (slot, &operand) in operands.iter_mut().zip(&r_args[2..]) {
+        let Some(obj) = walker_concrete_ref_object(ctx, operand) else {
+            return Ok(None);
+        };
+        // SAFETY: `obj` is a live concrete `PyObjectRef` from the walker
+        // shadow.
+        let admitted = unsafe {
+            pyre_object::is_exact_builtin_instance(obj)
+                && (pyre_object::is_int(obj)
+                    || pyre_object::is_bool(obj)
+                    || pyre_object::is_float(obj)
+                    || pyre_object::is_long(obj))
+        };
+        if !admitted {
+            return Ok(None);
+        }
+        *slot = (operand, obj);
     }
-    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-    let is_exact_int = |o: pyre_object::PyObjectRef| unsafe {
-        std::ptr::eq((*o).ob_type, &pyre_object::pyobject::INT_TYPE)
-            && std::ptr::eq((*o).w_class, int_typeobj)
-    };
-    if !is_exact_int(lhs_obj) || !is_exact_int(rhs_obj) {
-        // `_make_descr_binop(_divmod, _int_divmod)` (longobject.py) keeps a
-        // dedicated long/int arm; every other operand shape stays generic.
+    // `_make_descr_binop(_divmod, _int_divmod)`: the body's `_int_divmod`
+    // calls `rbigint.int_divmod`, whose two-result return has no word-ABI
+    // address yet, so that arm stays the explicit `tuple2` emit.
+    let (lhs_obj, rhs_obj) = (operands[0].1, operands[1].1);
+    if unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_int(rhs_obj) } {
         return spec_gate(SpecFold::BuiltinDivmodLongInt, || {
             try_walker_specialize_builtin_divmod_long_int(
                 ctx,
@@ -14822,52 +14811,32 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
             )
         });
     }
-    let (la, rb) = unsafe {
-        (
-            pyre_object::w_int_get_value(lhs_obj),
-            pyre_object::w_int_get_value(rhs_obj),
-        )
-    };
-    // A zero divisor raises ZeroDivisionError and `INT_MIN // -1` escapes to
-    // the bigint pair; both are outside the guarded domain the emit below
-    // covers, so decline rather than record a guard the recorded operands
-    // already fail.
-    if rb == 0 || (la == i64::MIN && rb == -1) {
-        return Ok(None);
-    }
-
-    // emit the specialized IR (walker-native)
     walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], concrete_callable)?;
-    let (lhs_op, rhs_op) = (r_args[2], r_args[3]);
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    // `GuardClass` before the `w_class` read: it is the guard that proves the
-    // operand is a real heap header rather than a tagged immediate, so it has
-    // to precede any `getfield` off that header.
-    walker_guard_class(ctx, op.pc, lhs_op, int_type_addr)?;
-    walker_guard_class(ctx, op.pc, rhs_op, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op.pc, lhs_op, int_typeobj)?;
-    walker_guard_exact_w_class(ctx, op.pc, rhs_op, int_typeobj)?;
-    let lhs_raw = walker_unbox_int_typed(
-        ctx,
-        op.pc,
-        lhs_op,
-        int_type_addr,
-        crate::descr::int_intval_descr(),
-    )?;
-    let rhs_raw = walker_unbox_int_typed(
-        ctx,
-        op.pc,
-        rhs_op,
-        int_type_addr,
-        crate::descr::int_intval_descr(),
-    )?;
-    walker_emit_int_div_domain_guards(ctx, op.pc, lhs_raw, rhs_raw, la, rb)?;
-    let (div_raw, div_value) = walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, true);
-    let (mod_raw, mod_value) = walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, false);
-    let tuple =
-        walker_emit_specialised_tuple_ii(ctx, op.pc, div_raw, mod_raw, div_value, mod_value)?;
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', tuple)?;
-    Ok(Some(()))
+    let outcome =
+        try_walker_orthodox_descent(ctx, op.pc, &[], &operands, &[], dst, 'r', &DIVMOD_DESCENT)?;
+    Ok(outcome.map(|_| ()))
+}
+
+/// Pin a builtin's identity before folding its call away. `LOAD_GLOBAL divmod`
+/// is usually already a constant via the namespace cell fold, in which case the
+/// guard is unnecessary; a rebound global takes the side exit.
+fn walker_guard_builtin_callable_identity<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    callable_op: OpRef,
+    concrete_callable: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    if callable_op.is_constant() {
+        return Ok(());
+    }
+    let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(callable_op, expected);
+    Ok(())
 }
 
 /// One element of a concrete `W_SpecialisedTupleObject_oo`, or `None` when the
@@ -14893,28 +14862,6 @@ fn walker_specialised_tuple_oo_item(
         pyre_object::specialisedtupleobject::w_specialised_tuple_oo_getvalue(tuple, index)
     };
     (!item.is_null()).then_some(item)
-}
-
-/// Pin a builtin's identity before folding its call away. `LOAD_GLOBAL divmod`
-/// is usually already a constant via the namespace cell fold, in which case the
-/// guard is unnecessary; a rebound global takes the side exit.
-fn walker_guard_builtin_callable_identity<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    callable_op: OpRef,
-    concrete_callable: pyre_object::PyObjectRef,
-) -> Result<(), DispatchError> {
-    if callable_op.is_constant() {
-        return Ok(());
-    }
-    let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(callable_op, expected);
-    Ok(())
 }
 
 /// `divmod(W_LongObject, W_IntObject)` — `longobject.py _int_divmod`.
