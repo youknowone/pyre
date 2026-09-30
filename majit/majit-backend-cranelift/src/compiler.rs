@@ -8545,11 +8545,13 @@ fn opcode_is_vector(opcode: OpCode) -> bool {
 /// Guards whose failure stub consumes a pending exception.
 ///
 /// `assembler.py patch_jump_for_descr` rewrites every guard branch,
-/// `guard_no_exception` included. That guard is a load of the exc-value
-/// global, and a merged failure edge is the same parameter-less jump as any
-/// other guard; the guard's own miss still stages through `emit_guard_exit`.
-/// `guard_exception` and `guard_not_forced` consume the pending exception
-/// inside the exit stub, which that jump does not replay.
+/// `guard_no_exception` included, so a trace that contains it stays
+/// eligible. `guard_exception` and `guard_not_forced` consume the pending
+/// exception inside the exit stub, which a parameter-less merge jump does
+/// not replay. `collect_merged_bridges` leaves a `GuardNoException` source
+/// on `emit_guard_exit`. Only a `GuardNoOverflow` source splices when the
+/// owner or the bridge contains that guard, or a `DebugMergePoint` /
+/// `JitDebug` ConstPtr that is absent from the gc table.
 fn merge_excluded_guard(opcode: OpCode) -> bool {
     matches!(
         opcode,
@@ -8838,6 +8840,26 @@ fn constptr_stays_inline(opcode: OpCode) -> bool {
     matches!(opcode, OpCode::DebugMergePoint | OpCode::JitDebug)
 }
 
+fn operand_is_live_constptr(arg: &majit_ir::operand::Operand) -> bool {
+    match arg.const_value() {
+        Some(majit_ir::Value::Ref(gcref)) => !gcref.is_null(),
+        _ => false,
+    }
+}
+
+/// `DebugMergePoint` / `JitDebug` carry a ConstPtr that `rewrite.rewrite`
+/// and `emit_op` never enter in the gc table. `refresh_retained_constptrs`
+/// would refuse the merge. Skipping those ops lets it proceed.
+fn has_inline_constptr(ops: &[Op]) -> bool {
+    ops.iter().any(|op| {
+        constptr_stays_inline(op.opcode)
+            && ((0..op.num_args()).any(|i| operand_is_live_constptr(&op.arg(i)))
+                || op
+                    .getfailargs()
+                    .is_some_and(|fail_args| fail_args.iter().any(operand_is_live_constptr)))
+    })
+}
+
 /// Re-read every non-null reference constant of `ops` from `table`, the
 /// `GcTable` the compile of these ops filled: `remove_constptr` and the
 /// fail-arg `_gcref_index` put each such constant there, keyed by the address
@@ -8883,8 +8905,9 @@ fn guard_shape_refuses_merge(op: &Op) -> bool {
     }
     // A non-identity `rd_locs` is the normal layout `apply_resident_failarg_locs`
     // publishes. The merged exit honours that table; it does not refuse it.
-    // `guard_no_exception` is eligible: `patch_jump_for_descr` rewrites it,
-    // and its miss still stages through `emit_guard_exit`.
+    // `GuardNoException` does not refuse the trace (`patch_jump_for_descr`).
+    // `collect_merged_bridges` leaves that source on `emit_guard_exit`, and
+    // splices a bridge that contains it only from a `GuardNoOverflow` source.
     merge_excluded_guard(op.opcode)
 }
 
@@ -9032,6 +9055,14 @@ fn collect_merged_bridges(
     owner_ops: &[Op],
     owner: &JitCellToken,
 ) -> Option<Vec<MergedBridgePiece>> {
+    // `guard_must_save_exception` used to make `merge_source_eligible` and
+    // `ops_refuse_merge` drop every trace that contains `GuardNoException`.
+    // The overflow bridge stays spliced (`assembler.py patch_jump_for_descr`):
+    // its source is `GuardNoOverflow` and its body contains `GuardNoException`.
+    let owner_has_noexc = owner_ops
+        .iter()
+        .any(|op| op.opcode == OpCode::GuardNoException);
+    let owner_has_inline_constptr = has_inline_constptr(owner_ops);
     let mut pieces = Vec::new();
     for (op_idx, op) in owner_ops.iter().enumerate() {
         if !op.opcode.is_guard() {
@@ -9056,6 +9087,31 @@ fn collect_merged_bridges(
         let Some(bridge_src) = bridge.merge_source.as_ref() else {
             continue;
         };
+        // `emit_guard_exit` on a merge target jumps to the bridge and returns
+        // before the fail-arg stores. The separate entry stores those args,
+        // then `emit_attached_bridge_dispatch` runs before
+        // `_store_and_reset_exception`, so `prepare_resume_from_failure`
+        // still sees the pending cell. A `GuardNoException` source always
+        // stays on that entry. Any other source whose owner or bridge body
+        // contains `GuardNoException` stays there too. A trace whose
+        // `DebugMergePoint` / `JitDebug` ConstPtr is absent from the gc
+        // table used to fail `refresh_retained_constptrs`; splicing any
+        // bridge but `GuardNoOverflow` there resumes on a NULL object.
+        // `GuardNoOverflow` is the overflow edge and still splices.
+        let bridge_has_noexc = bridge_src
+            .ops
+            .iter()
+            .any(|bridge_op| bridge_op.opcode == OpCode::GuardNoException);
+        let only_overflow = owner_has_noexc
+            || bridge_has_noexc
+            || owner_has_inline_constptr
+            || has_inline_constptr(&bridge_src.ops);
+        if op.opcode == OpCode::GuardNoException {
+            continue;
+        }
+        if only_overflow && op.opcode != OpCode::GuardNoOverflow {
+            continue;
+        }
         let bridge_ops = snapshot_ops(&bridge_src.ops);
         refresh_retained_constptrs(&bridge_ops, bridge.gc_table.as_deref())?;
         pieces.push(MergedBridgePiece {
@@ -25650,8 +25706,11 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 1), 100);
     }
 
+    /// The bridge body contains `GuardNoException` and the source is
+    /// `GuardFalse`, so `collect_merged_bridges` leaves the edge on
+    /// `emit_guard_exit`. The separate bridge still runs.
     #[test]
-    fn guard_no_exception_bridge_merges_into_the_loop() {
+    fn guard_no_exception_inside_bridge_stays_separate() {
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(16);
         let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
@@ -25664,7 +25723,6 @@ mod tests {
                 OpRef::NONE.raw(),
                 label.clone(),
             ),
-            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
                 &[OpRef::input_arg_int(0), OpRef::const_int(1)],
@@ -25704,9 +25762,8 @@ mod tests {
             .unwrap()
             .entry_code_ptr
             .load(Ordering::Acquire);
-        // `guard_no_exception` in the bridge used to refuse the splice
-        // (`merge_excluded_guard`). The miss still stages through
-        // `emit_guard_exit`; the hit is `patch_jump_for_descr`'s local jump.
+        // Source is `GuardFalse`. `GuardNoException` in the bridge body keeps
+        // this edge on `emit_guard_exit`.
         let bridge_ops = vec![
             mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
             mk_op(
@@ -25734,7 +25791,7 @@ mod tests {
             .unwrap()
             .entry_code_ptr
             .load(Ordering::Acquire);
-        assert_ne!(entry_before, entry_after);
+        assert_eq!(entry_before, entry_after);
         assert!(fail_descr_bridge_ref(as_fd(&odd_descr)).is_some());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert!(Arc::ptr_eq(
@@ -25742,6 +25799,386 @@ mod tests {
             &exit_descr
         ));
         assert_eq!(backend.get_int_value(&frame, 0), 108);
+    }
+
+    /// A loop that contains `GuardNoException` leaves every failure edge
+    /// except `GuardNoOverflow` on `emit_guard_exit`. The `GuardNoException`
+    /// source and a later `GuardFalse` bridge both keep `entry_code_ptr`.
+    /// Execution still reaches the exit through the separate bridge.
+    #[test]
+    fn guard_no_exception_source_bridge_stays_separate() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(17);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exc_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let hot_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let noexc = Op::with_descr(OpCode::GuardNoException, &[], exc_descr.clone());
+        noexc.pos().set(OpRef::void_op(12));
+        noexc.set_fail_arg_types(vec![Type::Int]);
+        noexc.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            OpRc::new(noexc),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(3)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_descr.clone(),
+            ),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                11,
+                hot_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9207);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let entry_loop = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let exc_bridge = vec![mk_op_with_descr(
+            OpCode::Jump,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+            label.clone(),
+        )];
+        backend
+            .compile_bridge(
+                as_fd(&exc_descr),
+                &[InputArg::new_int_rc(0)],
+                &exc_bridge,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after_exc = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_eq!(entry_loop, entry_after_exc);
+        assert!(fail_descr_bridge_ref(as_fd(&exc_descr)).is_some());
+        let hot_bridge = vec![
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label,
+            ),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&hot_descr),
+                &[InputArg::new_int_rc(0)],
+                &hot_bridge,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after_hot = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_eq!(entry_after_exc, entry_after_hot);
+        assert!(fail_descr_bridge_ref(as_fd(&hot_descr)).is_some());
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&frame),
+            &exit_descr
+        ));
+        assert_eq!(backend.get_int_value(&frame, 0), 3);
+    }
+
+    /// A loop that contains `GuardNoException` still splices a
+    /// `GuardNoOverflow` source. `IntAddOvf` sits immediately before the
+    /// guard so `last_ovf_flag` is set and the merge jump is emitted.
+    #[test]
+    fn guard_no_overflow_bridge_merges_on_a_no_exception_loop() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(18);
+        let ovf_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let ovf = Op::with_descr(OpCode::GuardNoOverflow, &[], ovf_descr.clone());
+        ovf.pos().set(OpRef::void_op(11));
+        ovf.set_fail_arg_types(vec![Type::Int]);
+        ovf.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntAddOvf,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                2,
+            ),
+            OpRc::new(ovf),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9208);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let bridge_ops = vec![
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label,
+            ),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&ovf_descr),
+                &[InputArg::new_int_rc(0)],
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_ne!(entry_before, entry_after);
+        assert!(fail_descr_bridge_ref(as_fd(&ovf_descr)).is_some());
+        let frame = backend.execute_token(&token, &[Value::Int(10)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 11);
+    }
+
+    /// The owner has no `GuardNoException`. The bridge body does, and a
+    /// `DebugMergePoint` ConstPtr is absent from the gc table. The source
+    /// is `GuardNoOverflow`, so the overflow edge still splices.
+    /// `IntAddOvf` sits immediately before the guard so `last_ovf_flag` is set.
+    #[test]
+    fn guard_no_overflow_bridge_merges_when_bridge_has_no_exception() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(19);
+        let ovf_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let ovf = Op::with_descr(OpCode::GuardNoOverflow, &[], ovf_descr.clone());
+        ovf.pos().set(OpRef::void_op(11));
+        ovf.set_fail_arg_types(vec![Type::Int]);
+        ovf.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
+        let debug = Op::new(
+            OpCode::DebugMergePoint,
+            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                majit_ir::GcRef(0x3e5d_f0dc),
+            ))],
+        );
+        debug.pos().set(OpRef::void_op(12));
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            OpRc::new(debug),
+            mk_op(
+                OpCode::IntAddOvf,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                2,
+            ),
+            OpRc::new(ovf),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9209);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let bridge_ops = vec![
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label,
+            ),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&ovf_descr),
+                &[InputArg::new_int_rc(0)],
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_ne!(entry_before, entry_after);
+        assert!(fail_descr_bridge_ref(as_fd(&ovf_descr)).is_some());
+        let frame = backend.execute_token(&token, &[Value::Int(10)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 11);
+    }
+
+    /// A `DebugMergePoint` ConstPtr is absent from the gc table, so a
+    /// non-overflow bridge stays on `emit_guard_exit`. The separate bridge
+    /// still runs.
+    #[test]
+    fn debug_merge_point_keeps_non_overflow_bridge_separate() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(23);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let hot_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let debug = Op::new(
+            OpCode::DebugMergePoint,
+            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                majit_ir::GcRef(0x3e5d_f0dc),
+            ))],
+        );
+        debug.pos().set(OpRef::void_op(12));
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            OpRc::new(debug),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(3)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_descr.clone(),
+            ),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                11,
+                hot_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9210);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
+                1,
+            ),
+            mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), label),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&hot_descr),
+                &[InputArg::new_int_rc(0)],
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_eq!(entry_before, entry_after);
+        assert!(fail_descr_bridge_ref(as_fd(&hot_descr)).is_some());
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&frame),
+            &exit_descr
+        ));
+        assert_eq!(backend.get_int_value(&frame, 0), 12);
     }
 
     /// A bridge stitched by `patch_jump_for_descr` is the steady-state path.
