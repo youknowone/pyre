@@ -51,6 +51,16 @@ def plain(label, base, make, iterate):
     )
 
 
+def weakref_only(label, base, make):
+    class S(base):
+        __slots__ = ("__weakref__",)
+
+    x = make(S)
+    alive = weakref.ref(x)() is x
+    dic = exc_name(lambda: object.__getattribute__(x, "__dict__"))
+    print("weakref_slots", label, type(x).__name__, isinstance(x, base), alive, dic)
+
+
 def slots(label, base, make):
     class S(base):
         __slots__ = ("a",)
@@ -141,6 +151,7 @@ cases = [
 for label, base, make, iterate in cases:
     plain(label, base, make, iterate)
     slots(label, base, make)
+    weakref_only(label, base, make)
     finalizer(label, base, make)
 
 print("OK")

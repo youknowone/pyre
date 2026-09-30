@@ -79,6 +79,20 @@ def check(base, args):
     assert total == 3 * N * (N - 1) // 2, (base, total)
 
 
+def check_weakref_only(base, args):
+    # typedef.py _getusercls mixes MapdictWeakrefSupport even when the
+    # subclass has no __dict__. Types whose typedef is already weakrefable
+    # reject a second __weakref__ slot.
+    try:
+        WeakOnly = type("W" + base.__name__, (base,), {"__slots__": ("__weakref__",)})
+    except TypeError:
+        return
+    x = WeakOnly(*args)
+    assert weakref.ref(x)() is x, base
+    assert not hasattr(x, "__dict__"), base
+
+
 for base, args in BASES:
     check(base, args)
+    check_weakref_only(base, args)
 print("OK")

@@ -6371,7 +6371,12 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
 ///     return lifeline
 /// ```
 pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
-    if unsafe { has_mapdict_storage(self_ref) } {
+    // `_getusercls` mixes `MapdictWeakrefSupport` whenever
+    // `not typedef.weakrefable`, independent of `hasdict`. A slots-only
+    // user layout (`class S(list): __slots__ = ('__weakref__',)`) still
+    // carries the mixin, so the lifeline lives in the `"weakref"` SPECIAL
+    // slot the custom GC trace walks.
+    if unsafe { has_mapdict_layout(self_ref) } {
         unsafe { instance_get_weakref_slot(self_ref) }
     } else {
         WEAKREF_TABLE
@@ -6391,7 +6396,7 @@ pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
 ///     self._get_mapdict_map().write(self, "weakref", SPECIAL, weakreflifeline)
 /// ```
 pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
-    if unsafe { has_mapdict_storage(self_ref) } {
+    if unsafe { has_mapdict_layout(self_ref) } {
         let flag = unsafe { instance_set_weakref_slot(self_ref, weakreflifeline) };
         debug_assert!(flag, "write to the weakref SPECIAL slot failed");
     } else {
@@ -6406,7 +6411,7 @@ pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
 ///     self._get_mapdict_map().write(self, "weakref", SPECIAL, None)
 /// ```
 pub fn delweakref(self_ref: PyObjectRef) {
-    if unsafe { has_mapdict_storage(self_ref) } {
+    if unsafe { has_mapdict_layout(self_ref) } {
         unsafe { instance_del_weakref_slot(self_ref) };
     } else {
         WEAKREF_TABLE.lock().remove(&(self_ref as usize));
@@ -7277,6 +7282,13 @@ mod tests {
             assert!(has_mapdict_layout(obj));
             assert!(!has_mapdict_storage(obj));
             instance_walk_boxed_storage(obj, &mut |_| {});
+
+            let lifeline = pyre_object::w_instance_new(pyre_object::PY_NULL);
+            setweakref(obj, lifeline);
+            assert_eq!(instance_get_weakref_slot(obj), Some(lifeline));
+            assert!(WEAKREF_TABLE.lock().get(&(obj as usize)).is_none());
+            delweakref(obj);
+            assert_eq!(instance_get_weakref_slot(obj), None);
         }
     }
 
