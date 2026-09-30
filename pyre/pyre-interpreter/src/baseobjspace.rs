@@ -16309,10 +16309,9 @@ pub fn unpackiterable_portal(
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::pin_roots(&[w_iterator, items, greenkey]);
     let items_slot = root_base + 1;
-    let greenkey_slot = root_base + 2;
     loop {
         unpackiterable_driver.jit_merge_point(
-            pyre_object::gc_roots::shadow_stack_get(greenkey_slot),
+            pyre_object::gc_roots::shadow_stack_get(root_base + 2),
             pyre_object::gc_roots::shadow_stack_get(root_base),
             pyre_object::gc_roots::shadow_stack_get(items_slot),
         );
