@@ -642,6 +642,9 @@ pub struct AssemblerARM64<'a> {
     /// `_build_malloc_slowpath('fixed')` and used by both fixed-size and
     /// varsize-frame nursery probes.
     malloc_slowpath_fixed: usize,
+    /// Back-edge label, bound after `LoopPins`. `ll_loop_code` stays on
+    /// the entry so a bridge executes the pin moves.
+    pending_loop_hot: Option<DynamicLabel>,
 }
 
 /// How many `movz`/`movk` words `codebuilder.py gen_load_int` emits.
@@ -870,6 +873,7 @@ impl<'a> AssemblerARM64<'a> {
             gcref_table: Vec::new(),
             float_pool: Vec::new(),
             malloc_slowpath_fixed,
+            pending_loop_hot: None,
         }
     }
 
@@ -2283,7 +2287,22 @@ impl<'a> AssemblerARM64<'a> {
 
         // ── Emit code from regalloc decisions ──
         for ra_op in &ra_ops {
+            if let RegAllocOp::LoopPins { moves } = ra_op {
+                for (src, dst) in moves {
+                    self.regalloc_mov(src, dst);
+                }
+                if let Some(hot) = self.pending_loop_hot.take() {
+                    dynasm!(self.mc ; =>hot);
+                }
+                continue;
+            }
+            if let Some(hot) = self.pending_loop_hot.take() {
+                dynasm!(self.mc ; =>hot);
+            }
             match ra_op {
+                RegAllocOp::LoopPins { .. } => {
+                    continue;
+                }
                 RegAllocOp::Skip => {
                     // Dead operation — skip.
                     continue;
@@ -3534,6 +3553,8 @@ impl<'a> AssemblerARM64<'a> {
                     );
                 }
                 dynasm!(self.mc ; =>label);
+                let hot = self.mc.new_dynamic_label();
+                self.pending_loop_hot = Some(hot);
                 if let Some(descr) = label_descr {
                     let stored_arglocs = arglocs
                         .iter()
@@ -3549,7 +3570,7 @@ impl<'a> AssemblerARM64<'a> {
                     descr.set_target_arglocs(stored_arglocs);
                     descr.set_ll_loop_code(self.mc.offset().0);
                     if let Some(id) = loop_target_id(op) {
-                        self.target_tokens_currently_compiling.insert(id, label);
+                        self.target_tokens_currently_compiling.insert(id, hot);
                     }
                     if let Some(descr_ref) = op.getdescr() {
                         self.compiled_target_tokens.push(descr_ref.clone());

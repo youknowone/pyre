@@ -1987,7 +1987,14 @@ fn bound_is_none_or_exact_int(w: PyObjectRef) -> bool {
     if w.is_null() {
         return true;
     }
-    unsafe { pyre_object::is_none(w) || pyre_object::is_exact_type(w, &pyre_object::INT_TYPE) }
+    // `W_LongObject` carries the `int` class, so `is_exact_type(INT)` is
+    // true while the payload at `intval` is a bigint pointer.
+    // `w_int_get_value` would read that pointer. A long takes the slow arm,
+    // which converts through the slice index.
+    unsafe {
+        pyre_object::is_none(w)
+            || (pyre_object::is_exact_type(w, &pyre_object::INT_TYPE) && !pyre_object::is_long(w))
+    }
 }
 
 /// An omitted bound is `None`, the `w_start=None, w_end=None` defaults of

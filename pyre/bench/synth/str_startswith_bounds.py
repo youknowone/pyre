@@ -58,6 +58,12 @@ def main():
     m("ew_bounded", lambda: "abcdef".endswith("cd", 2, 4))
     m("sw_neg_start", lambda: "abcdef".startswith("ef", -2))
     m("ew_neg_end", lambda: "abcdef".endswith("cd", 0, -2))
+    # a long is the int class with a bigint payload; the bound goes through
+    # the slice-index conversion, not a machine-int unbox
+    m("sw_neg_long", lambda: "abc".startswith("a", -(10**100)))
+    m("sw_pos_long", lambda: "abc".startswith("a", 10**100))
+    m("ew_neg_long", lambda: "abc".endswith("c", 0, -(10**100)))
+    m("ew_pos_long", lambda: "abc".endswith("c", 0, 10**100))
     m("sw_no_bounds", lambda: "abc".startswith("ab"))
     m("sw_unicode", lambda: "éèx".startswith("", 5, 10))
     m("sw_unicode_ok", lambda: "éèx".startswith("è", 1, 2))

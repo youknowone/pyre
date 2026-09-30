@@ -91,12 +91,18 @@ fn build_time_fnaddr_bindings() -> Vec<(String, i64)> {
 pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
     let correspondence = &*FNADDR_CORRESPONDENCE;
 
-    // An empty correspondence still leaves symbolic shell fnaddrs to resolve
-    // by path below.
+    // An empty correspondence still leaves symbolic shell fnaddrs and
+    // symbolic `constants_i` entries to resolve by path below. Shells
+    // without a body keep the previous early return.
     if correspondence.is_empty()
-        && !jitcodes
-            .iter()
-            .any(|jc| majit_jitcode::codewriter::call::is_symbolic_fnaddr(jc.fnaddr))
+        && !jitcodes.iter().any(|jc| {
+            majit_jitcode::codewriter::call::is_symbolic_fnaddr(jc.fnaddr)
+                || jc.try_body().is_some_and(|body| {
+                    body.constants_i
+                        .iter()
+                        .any(|c| majit_jitcode::codewriter::call::is_symbolic_fnaddr(*c))
+                })
+        })
     {
         return;
     }

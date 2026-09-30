@@ -1733,6 +1733,10 @@ pub enum RegAllocOp {
     },
     /// Register move: src → dst (from spill/reload/register-register moves)
     Move { src: Loc, dst: Loc },
+    /// Materialise loop constants after the label entry and before the
+    /// back-edge target. `ll_loop_code` stays on the entry so a bridge
+    /// runs these moves; the in-trace jump lands after them.
+    LoopPins { moves: Vec<(Loc, Loc)> },
     /// Skip (dead operation, no-op)
     Skip,
 }
@@ -1807,6 +1811,9 @@ pub struct RegAlloc<'a> {
     /// loop label, which still reads the values the loop trace loaded.
     pinned_ints: [Option<i64>; 2],
     compiling_bridge: bool,
+    /// Pin moves for the label just considered. Flushed after the label
+    /// op, not with `spill_moves`, so they sit after `ll_loop_code`.
+    loop_pin_moves: Vec<(Loc, Loc)>,
 }
 
 fn is_math_sqrt_call(op: &Op) -> bool {
@@ -1849,6 +1856,7 @@ impl<'a> RegAlloc<'a> {
             pinned_float: None,
             pinned_ints: [None, None],
             compiling_bridge: false,
+            loop_pin_moves: Vec::new(),
         }
     }
 
@@ -6337,6 +6345,7 @@ impl<'a> RegAlloc<'a> {
         }
         self.pin_loop_consts(i);
         self.perform(i, locs, None, output);
+        self.finish_loop_pins(output);
     }
 
     fn consider_label_j2(
@@ -6408,14 +6417,36 @@ impl<'a> RegAlloc<'a> {
         }
         self.pin_loop_consts(i);
         self.perform(i, locs, None, output);
+        self.finish_loop_pins(output);
     }
 
-    /// Park the first float immediate of the loop body in `d8` and emit
-    /// its load before the label. Later uses of the same bits read `d8`
-    /// instead of a per-iteration literal load.
+    /// Park the first float immediate of the hot loop in `d8`. The load
+    /// is `LoopPins`, emitted after the label entry. Later uses of the
+    /// same bits read `d8` instead of a per-iteration literal load.
     fn pin_loop_consts(&mut self, label_index: usize) {
+        if self.compiling_bridge {
+            return;
+        }
+        let Some(hot) = self
+            .operations
+            .iter()
+            .rposition(|op| op.opcode == OpCode::Label)
+        else {
+            return;
+        };
+        if label_index != hot {
+            return;
+        }
         self.pin_loop_float_const(label_index);
         self.pin_loop_int_consts(label_index);
+    }
+
+    fn finish_loop_pins(&mut self, output: &mut Vec<RegAllocOp>) {
+        if self.loop_pin_moves.is_empty() {
+            return;
+        }
+        let moves = std::mem::take(&mut self.loop_pin_moves);
+        output.push(RegAllocOp::LoopPins { moves });
     }
 
     fn pin_loop_float_const(&mut self, label_index: usize) {
@@ -6425,7 +6456,7 @@ impl<'a> RegAlloc<'a> {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            if self.compiling_bridge || self.pinned_float.is_some() {
+            if self.pinned_float.is_some() {
                 return;
             }
             let Some(bits) = self.operations.iter().skip(label_index + 1).find_map(|op| {
@@ -6450,16 +6481,17 @@ impl<'a> RegAlloc<'a> {
                 return;
             };
             self.pinned_float = Some(bits);
-            self.xrm.spill_moves.push((
+            self.loop_pin_moves.push((
                 Loc::immed_float(bits),
                 Loc::Reg(crate::aarch64::registers::D8),
             ));
         }
     }
 
-    /// Park up to two wide integer immediates in `x21`/`x22` before the
-    /// label. A compare bound and the eval-breaker address otherwise
-    /// rebuild with `movz`/`movk` or a literal load on every iteration.
+    /// Park up to two wide integer immediates in `x21`/`x22`. The loads
+    /// are `LoopPins`, emitted after the label entry. A compare bound and
+    /// the eval-breaker address otherwise rebuild with `movz`/`movk` or a
+    /// literal load on every iteration.
     fn pin_loop_int_consts(&mut self, label_index: usize) {
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -6467,21 +6499,37 @@ impl<'a> RegAlloc<'a> {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            if self.compiling_bridge || self.pinned_ints[0].is_some() {
+            if self.pinned_ints[0].is_some() {
                 return;
             }
-            // The trace often has a preamble label and then the hot label.
-            // Pinning at the first label spends x21/x22 on guards that run
-            // once. The back-edge label is the body that runs every iteration.
-            let Some(hot) = self
-                .operations
-                .iter()
-                .rposition(|op| op.opcode == OpCode::Label)
-            else {
-                return;
-            };
-            if label_index != hot {
-                return;
+            // `emit_guard_subclass` and the class compares require
+            // `Loc::Immed`. A class pointer is a wide constant, and pinning
+            // it makes those emitters panic.
+            let mut forbidden: Vec<i64> = Vec::new();
+            for op in self.operations.iter().skip(label_index + 1) {
+                if op.opcode == OpCode::Label {
+                    break;
+                }
+                if !matches!(
+                    op.opcode,
+                    OpCode::GuardSubclass
+                        | OpCode::GuardClass
+                        | OpCode::GuardNonnullClass
+                        | OpCode::GuardException
+                        | OpCode::GuardValue
+                ) {
+                    continue;
+                }
+                for arg in op.getarglist() {
+                    let r = arg.to_opref();
+                    if r.is_constant() && !matches!(r.ty(), Some(Type::Float)) {
+                        forbidden.push(const_bits_or_panic(
+                            r,
+                            &self.constants,
+                            "pin_loop_int_consts",
+                        ));
+                    }
+                }
             }
             let mut found: [Option<i64>; 2] = [None, None];
             let mut n = 0usize;
@@ -6489,13 +6537,25 @@ impl<'a> RegAlloc<'a> {
                 if op.opcode == OpCode::Label {
                     break;
                 }
+                if matches!(
+                    op.opcode,
+                    OpCode::GuardSubclass
+                        | OpCode::GuardClass
+                        | OpCode::GuardNonnullClass
+                        | OpCode::GuardException
+                        | OpCode::GuardValue
+                ) {
+                    continue;
+                }
                 for arg in op.getarglist() {
                     let r = arg.to_opref();
                     if !r.is_constant() || matches!(r.ty(), Some(Type::Float)) {
                         continue;
                     }
                     let bits = const_bits_or_panic(r, &self.constants, "pin_loop_int_consts");
-                    if crate::aarch64::assembler::imm_mov_count(bits) < 2 {
+                    if forbidden.contains(&bits)
+                        || crate::aarch64::assembler::imm_mov_count(bits) < 2
+                    {
                         continue;
                     }
                     if found[..n].contains(&Some(bits)) {
@@ -6518,8 +6578,10 @@ impl<'a> RegAlloc<'a> {
             for i in 0..n {
                 let bits = found[i].unwrap();
                 self.pinned_ints[i] = Some(bits);
-                self.rm
-                    .spill_moves
+                // x21/x22 are outside `all_regs`. Jump remap scratches x16,
+                // and the literal load writes the destination, so a pin is
+                // only read.
+                self.loop_pin_moves
                     .push((Loc::immed(bits), Loc::Reg(regs[i])));
             }
         }
