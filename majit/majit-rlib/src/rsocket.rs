@@ -6,6 +6,7 @@
 use crate::rffi::{INT, SIGNED};
 
 /// `CSocketError`. `errno` is the code `last_error` read.
+#[derive(Debug)]
 pub struct CSocketError {
     pub errno: i32,
 }
@@ -151,6 +152,33 @@ pub fn inet_ntoa(packed: &[u8]) -> Result<String, RSocketError> {
         .into_owned())
 }
 
+/// `gethostname`. The buffer is 1024 bytes. The result stops at the first NUL.
+#[cfg(unix)]
+pub fn gethostname() -> Result<Vec<u8>, CSocketError> {
+    let mut buf = [0u8; 1024];
+    let res = unsafe { crate::_rsocket_rffi::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if res < 0 {
+        return Err(last_error());
+    }
+    let end = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
+    Ok(buf[..end].to_vec())
+}
+
+/// `sethostname`. `hostname` is the raw byte count passed to the syscall.
+#[cfg(unix)]
+pub fn sethostname(hostname: &[u8]) -> Result<(), CSocketError> {
+    let ptr = if hostname.is_empty() {
+        c"".as_ptr()
+    } else {
+        hostname.as_ptr().cast()
+    };
+    let res = unsafe { crate::_rsocket_rffi::sethostname(ptr, hostname.len()) };
+    if res < 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
@@ -251,5 +279,15 @@ mod tests {
             inet_ntoa(&[1, 2, 3]).expect_err("short").message,
             "packed IP wrong length for inet_ntoa"
         );
+    }
+
+    #[test]
+    fn gethostname_matches_libc() {
+        let ours = gethostname().expect("gethostname");
+        let mut buf = [0u8; 1024];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(rc, 0);
+        let end = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
+        assert_eq!(ours, buf[..end]);
     }
 }

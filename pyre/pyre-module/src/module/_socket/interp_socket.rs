@@ -1320,6 +1320,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
         pyre_interpreter::make_builtin_function_with_arity(
             "gethostname",
             |_| {
+                #[cfg(unix)]
+                let name = {
+                    use std::os::unix::ffi::OsStringExt;
+                    let bytes = majit_rlib::rsocket::gethostname().map_err(|error| {
+                        pyre_interpreter::PyError::os_error_with_errno(error.errno, "gethostname")
+                    })?;
+                    std::ffi::OsString::from_vec(bytes)
+                };
+                #[cfg(windows)]
                 let name = rffi::hostname().map_err(|e| {
                     pyre_interpreter::PyError::os_error_with_errno(
                         e.raw_os_error().unwrap_or(0),
@@ -1374,9 +1383,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     // `interp_func.py:412` audits the argument as it was
                     // passed, after the conversion and before the syscall.
                     pyre_interpreter::module::sys::vm::audit("socket.sethostname", &[w_name])?;
-                    rffi::sethostname(&name).map_err(|e| {
+                    majit_rlib::rsocket::sethostname(&name).map_err(|error| {
+                        let e = std::io::Error::from_raw_os_error(error.errno);
                         pyre_interpreter::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
+                            error.errno,
                             format!("sethostname: {e}"),
                         )
                     })?;

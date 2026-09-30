@@ -241,32 +241,17 @@ pub fn gai_strerror(code: libc::c_int) -> String {
 #[cfg(unix)]
 pub fn hostname() -> std::io::Result<std::ffi::OsString> {
     use std::os::unix::ffi::OsStringExt;
-    let mut buf = [0u8; 256];
-    if unsafe {
-        majit_rlib::_rsocket_rffi::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len())
-    } != 0
-    {
-        return Err(std::io::Error::from_raw_os_error(
-            majit_rlib::rposix::get_saved_errno(),
-        ));
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    Ok(std::ffi::OsString::from_vec(buf[..end].to_vec()))
+    majit_rlib::rsocket::gethostname()
+        .map(std::ffi::OsString::from_vec)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.errno))
 }
 
 /// `sethostname`. The name is the raw bytes the caller already encoded.
+/// The syscall is `rsocket.sethostname`.
 #[cfg(unix)]
 pub fn sethostname(name: &[u8]) -> std::io::Result<()> {
-    let rc = unsafe {
-        majit_rlib::_rsocket_rffi::sethostname(name.as_ptr() as *const libc::c_char, name.len())
-    };
-    if rc != 0 {
-        Err(std::io::Error::from_raw_os_error(
-            majit_rlib::rposix::get_saved_errno(),
-        ))
-    } else {
-        Ok(())
-    }
+    majit_rlib::rsocket::sethostname(name)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.errno))
 }
 #[cfg(all(windows, feature = "host_env"))]
 pub fn hostname() -> std::io::Result<std::ffi::OsString> {
