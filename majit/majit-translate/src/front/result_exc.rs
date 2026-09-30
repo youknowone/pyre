@@ -897,7 +897,6 @@ pub(crate) fn unwrap_returned_scalar_result_shells(
     err_owner: &str,
     ok_ty: &ValueType,
     err_ty: &ValueType,
-    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<(), String> {
     if scalar_result_kind(ok_ty).is_none() {
         return Ok(());
@@ -912,7 +911,7 @@ pub(crate) fn unwrap_returned_scalar_result_shells(
             let Some(var) = link.args[0].as_variable() else {
                 continue;
             };
-            match classify_return_var(graph, var, ok_ty) {
+            match classify_return_var(graph, var, result_owner, ok_ty) {
                 ReturnClass::Shell => shells.push((bi, ei)),
                 ReturnClass::Payload | ReturnClass::Other => {}
             }
@@ -928,7 +927,6 @@ pub(crate) fn unwrap_returned_scalar_result_shells(
             err_owner,
             ok_ty,
             err_ty,
-            spec,
         )?;
     }
     Ok(())
@@ -956,13 +954,18 @@ fn scalar_result_kind(ty: &ValueType) -> Option<char> {
 /// forwards one value. The equations live only for this call. A cycle
 /// adds no class: every value that enters has to agree, and a cycle
 /// nothing enters is left alone.
-fn classify_return_var(graph: &FunctionGraph, var: &Variable, ok_ty: &ValueType) -> ReturnClass {
+fn classify_return_var(
+    graph: &FunctionGraph,
+    var: &Variable,
+    result_owner: &str,
+    ok_ty: &ValueType,
+) -> ReturnClass {
     let mut vars = vec![var.clone()];
     let mut eqns = vec![ReturnEqn::Other];
     let mut index = 0;
     while index < vars.len() {
         let current = vars[index].clone();
-        eqns[index] = return_eqn(graph, &current, ok_ty, &mut vars, &mut eqns);
+        eqns[index] = return_eqn(graph, &current, result_owner, ok_ty, &mut vars, &mut eqns);
         index += 1;
     }
     let mut class = vec![ReturnMeet::Bot; vars.len()];
@@ -1024,11 +1027,12 @@ fn intern_return_var(vars: &mut Vec<Variable>, eqns: &mut Vec<ReturnEqn>, var: V
 fn return_eqn(
     graph: &FunctionGraph,
     var: &Variable,
+    result_owner: &str,
     ok_ty: &ValueType,
     vars: &mut Vec<Variable>,
     eqns: &mut Vec<ReturnEqn>,
 ) -> ReturnEqn {
-    if let Some(kind) = producer_kind(graph, var) {
+    if let Some(kind) = producer_kind(graph, var, result_owner) {
         return match kind {
             ProducerKind::Shell => ReturnEqn::Shell,
             ProducerKind::Typed(ty) if scalar_result_kind(&ty) == scalar_result_kind(ok_ty) => {
@@ -1099,7 +1103,33 @@ enum ProducerKind {
     Cast(Variable),
 }
 
-fn producer_kind(graph: &FunctionGraph, var: &Variable) -> Option<ProducerKind> {
+/// `Option<P>::Some` whose payload is this function's `Result`.
+///
+/// `P` is `result_owner`, or the instantiation tail of that owner
+/// (`Result<i64,PyError>` under `core::result::Result<i64,PyError>`).
+/// A `Some` whose payload only contains the text `Result<` — a tuple,
+/// a `Vec` — is not this shell.
+fn option_some_payload_is_result(owner: &str, result_owner: &str) -> bool {
+    let Some(head) = owner.strip_suffix("::Some") else {
+        return false;
+    };
+    let Some(open) = head.rfind("Option<") else {
+        return false;
+    };
+    if open > 0 && !head[..open].ends_with("::") {
+        return false;
+    }
+    let Some(payload) = head[open + "Option<".len()..].strip_suffix('>') else {
+        return false;
+    };
+    payload == result_owner || (payload.starts_with("Result<") && result_owner.ends_with(payload))
+}
+
+fn producer_kind(
+    graph: &FunctionGraph,
+    var: &Variable,
+    result_owner: &str,
+) -> Option<ProducerKind> {
     for block in &graph.blocks {
         for op in &block.operations {
             if op.result.as_ref() != Some(var) {
@@ -1110,7 +1140,7 @@ fn producer_kind(graph: &FunctionGraph, var: &Variable) -> Option<ProducerKind> 
                     if field.name == "__pos_0"
                         && matches!(ty, ValueType::Ref(_))
                         && field.owner_root.as_deref().is_some_and(|owner| {
-                            owner.ends_with("::Some") && owner.contains("Result<")
+                            option_some_payload_is_result(owner, result_owner)
                         }) =>
                 {
                     ProducerKind::Shell
@@ -1163,9 +1193,6 @@ fn split_result_shell_return(
     err_owner: &str,
     ok_ty: &ValueType,
     err_ty: &ValueType,
-    // `error_carrier_edges` reads this spec after the front returns.
-    // The raise below stores the carrier itself.
-    #[allow(unused_variables)] spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<(), String> {
     let (split, split_inputs) = graph.create_block_with_arg_vars(1);
     let shell = split_inputs[0].clone();
@@ -6763,15 +6790,6 @@ mod unwrap_returned_scalar_shell_tests {
     use super::*;
     use crate::model::FieldDescriptor;
 
-    fn carrier() -> crate::ErrorCarrierSpec<'static> {
-        crate::ErrorCarrierSpec {
-            carrier_path: "pyre_interpreter::error::PyError",
-            carrier_wrappers: &[],
-            to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
-            from_exc_object: Some(("PyError", "from_exc_object")),
-        }
-    }
-
     fn push_some_shell_in(graph: &mut FunctionGraph, block: BlockId) -> Variable {
         let base = graph.alloc_value_var();
         graph
@@ -6818,7 +6836,6 @@ mod unwrap_returned_scalar_shell_tests {
             "core::result::Result<i64,PyError>::Err",
             &ValueType::Int,
             &ValueType::Ref(None),
-            carrier(),
         )
         .expect("unwrap");
     }
@@ -6876,7 +6893,6 @@ mod unwrap_returned_scalar_shell_tests {
             "core::result::Result<i64,PyError>::Err",
             &ValueType::Int,
             &ValueType::Ref(None),
-            carrier(),
         )
         .expect("unwrap");
 
@@ -6940,7 +6956,6 @@ mod unwrap_returned_scalar_shell_tests {
             "core::result::Result<PyObjectRef,PyError>::Err",
             &ValueType::Ref(None),
             &ValueType::Ref(None),
-            carrier(),
         )
         .expect("unwrap");
         assert_eq!(return_vars(&graph), vec![shell]);
@@ -6966,7 +6981,6 @@ mod unwrap_returned_scalar_shell_tests {
             "core::result::Result<i64,PyError>::Err",
             &ValueType::Int,
             &ValueType::Ref(None),
-            carrier(),
         )
         .expect("unwrap");
         assert_eq!(return_vars(&graph), vec![payload]);
@@ -6994,7 +7008,38 @@ mod unwrap_returned_scalar_shell_tests {
             "core::result::Result<i64,PyError>::Err",
             &ValueType::Int,
             &ValueType::Ref(None),
-            carrier(),
+        )
+        .expect("unwrap");
+        assert_eq!(return_vars(&graph), vec![value]);
+    }
+
+    #[test]
+    fn a_some_of_a_tuple_that_contains_result_stays() {
+        let mut graph = FunctionGraph::new("ret_tuple_some");
+        let base = graph.alloc_value_var();
+        let value = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("Option<(i64, Result<u8,PyError>)>::Some".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("tuple some");
+        graph.set_return(graph.startblock, Some(value.clone()));
+        unwrap_returned_scalar_result_shells(
+            &mut graph,
+            "core::result::Result<i64,PyError>",
+            "core::result::Result<i64,PyError>::Ok",
+            "core::result::Result<i64,PyError>::Err",
+            &ValueType::Int,
+            &ValueType::Ref(None),
         )
         .expect("unwrap");
         assert_eq!(return_vars(&graph), vec![value]);

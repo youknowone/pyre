@@ -4670,7 +4670,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &err_owner,
                 &ok_ty,
                 &err_ty,
-                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
         }
