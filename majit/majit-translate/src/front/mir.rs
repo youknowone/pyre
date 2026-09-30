@@ -41723,6 +41723,13 @@ fn is_typed_items_block_base_accessor(name: &str) -> bool {
     path_ends_with_segments(name, "rlist::typed_items_block_items_base")
 }
 
+/// A call to an accessor whose body brick 1 collapses to its receiver: the
+/// translated result is the block argument itself (`l.ll_items()` is
+/// `l.items`).
+pub(crate) fn items_block_accessor_returns_its_block(name: &str) -> bool {
+    is_object_items_block_base_accessor(name) || is_typed_items_block_base_accessor(name)
+}
+
 /// Scalar storage adapters for PyPy's `GcArray(Signed|Float)` list items.
 /// These spell the physical header offset locally because their empty Rust
 /// arrays need a non-null zero-length-slice address; for every live element

@@ -1083,9 +1083,9 @@ fn is_ptr_add_path(segments: &[String]) -> bool {
 }
 
 /// Operand of a pointer-arithmetic Call that produced `var`, if any.
-/// The front's `items_block_items_base` accessor aliases to its receiver;
-/// a leftover `ptr::add` / `wrapping_add` of that receiver still names
-/// the array header in arg 0.
+/// The front's `items_block_items_base` accessor aliases to its receiver,
+/// so a call to it names the array header in arg 0; so does a leftover
+/// `ptr::add` / `wrapping_add` of that receiver.
 fn ptr_arith_base_operand(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -1103,7 +1103,12 @@ fn ptr_arith_base_operand(
             else {
                 continue;
             };
-            if args.len() == 2 && is_ptr_add_path(segments) {
+            if (args.len() == 2 && is_ptr_add_path(segments))
+                || (args.len() == 1
+                    && crate::front::mir::items_block_accessor_returns_its_block(
+                        &segments.join("::"),
+                    ))
+            {
                 return args.first()?.as_variable().cloned();
             }
         }
@@ -18057,6 +18062,17 @@ mod tests {
     /// (`IR_IMMUTABLE_ARRAY`) makes the element read `getarrayitem_gc_*_pure`.
     #[test]
     fn getarrayitem_from_star_field_is_pure() {
+        assert_star_field_item_read_is_pure(false);
+    }
+
+    /// `w_tuple_getitem_known` reads `items_block_items_base(t.wrappeditems)[i]`:
+    /// the accessor returns its block, so the read keeps the `[*]` origin.
+    #[test]
+    fn getarrayitem_through_items_base_accessor_of_star_field_is_pure() {
+        assert_star_field_item_read_is_pure(true);
+    }
+
+    fn assert_star_field_item_read_is_pure(through_accessor: bool) {
         use crate::call::CallControl;
         use crate::model::{FieldDescriptor, ImmutableRank};
 
@@ -18101,10 +18117,29 @@ mod tests {
                 true,
             )
             .unwrap();
+        let base = if through_accessor {
+            graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Call {
+                        target: CallTarget::function_path([
+                            "pyre_object",
+                            "object_array",
+                            "items_block_items_base",
+                        ]),
+                        args: vec![crate::model::LinkArg::from(arr)],
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .unwrap()
+        } else {
+            arr
+        };
         graph.push_op_var(
             graph.startblock,
             OpKind::ArrayRead {
-                base: arr,
+                base,
                 index,
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,

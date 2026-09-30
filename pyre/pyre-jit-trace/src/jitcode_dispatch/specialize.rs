@@ -6682,7 +6682,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     //     load must NOT be taken for it.
     // A failing gate falls to the generic residual.  The paired runtime
     // `guard_class(&TUPLE_TYPE)` + exact `w_class` guard (in
-    // `try_walker_specialize_subscr_tuple`) deopt any later non-canonical
+    // `try_walker_orthodox_subscr_tuple_item`) deopt any later non-canonical
     // tuple or subclass instance flowing in.
     let tuple_canonical = unsafe {
         std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::TUPLE_TYPE)
@@ -6691,13 +6691,9 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
                 pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
             )
     };
-    // Serve the arity-2 specialisations from the real reader.  The canonical
-    // layout is deliberately NOT routed here: its items are an array, so the
-    // descent inlines the whole reader at every subscript, and inside a
-    // recursive bridge that overruns the bridge's trace budget --
-    // `selfrec_bridge_nontail_promote` loses a bridge to `abrt_bridge` and runs
-    // 2.4x slower.  `try_walker_specialize_subscr_tuple` keeps that arm.
-    if specialised_pair_kind(unsafe { (*list_obj).ob_type }).is_some() {
+    // Serve the canonical layout and the arity-2 specialisations from the
+    // real reader.
+    if tuple_canonical || specialised_pair_kind(unsafe { (*list_obj).ob_type }).is_some() {
         if let Some(hit) = spec_gate(SpecFold::SubscrTupleDescent, || {
             try_walker_orthodox_subscr_tuple_item(
                 ctx, op_pc, list_op, key_op, list_obj, key_obj, dst, dst_bank,
@@ -6710,14 +6706,6 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     if tuple_canonical && unsafe { pyre_object::is_slice(key_obj) } {
         return spec_gate(SpecFold::SubscrTupleSlice2, || {
             try_walker_specialize_subscr_tuple_slice2(
-                ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
-            )
-        });
-    }
-
-    if tuple_canonical {
-        return spec_gate(SpecFold::SubscrTuple, || {
-            try_walker_specialize_subscr_tuple(
                 ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
             )
         });
@@ -7174,198 +7162,6 @@ pub(crate) fn try_walker_specialize_subscr_tuple_slice2<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    list_op: OpRef,
-    key_op: OpRef,
-    tuple_obj: pyre_object::PyObjectRef,
-    key_obj: pyre_object::PyObjectRef,
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    // Gate: non-negative int index in bounds.  `w_tuple_len` reads the
-    // GcArray header of `wrappeditems` (no inline length field).
-    let (index, concrete_len) = unsafe {
-        if !pyre_object::is_int(key_obj) {
-            return Ok(None);
-        }
-        let index = pyre_object::w_int_get_value(key_obj);
-        // Negative index is `w_tuple_getitem`'s adjust (`index + len`).
-        // The positive arm below is the constant-index fold; the negative
-        // arm records the reader so `wrappeditems[*]` loads as
-        // `getarrayitem_gc_pure_r` and a loop-invariant `c[-1]` hoists.
-        if index < 0 {
-            return try_walker_orthodox_canonical_tuple_getitem(
-                ctx, op_pc, list_op, key_op, tuple_obj, key_obj, dst, dst_bank,
-            );
-        }
-        let concrete_len = pyre_object::w_tuple_len(tuple_obj);
-        if index as usize >= concrete_len {
-            return Ok(None);
-        }
-        (index, concrete_len)
-    };
-
-    // Authentic boxed result from the same may-force path the generic leg uses.
-    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
-        return Ok(None);
-    };
-
-    // emit the specialized IR (walker-native)
-    let tuple_type_addr = &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64;
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        list_op,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
-    )?;
-    if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
-        let type_const = ctx.trace_ctx.const_int(tuple_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(list_op, tuple_type_addr);
-
-    // Unbox the index operand (guard_class + getfield intval).  bool shares
-    // int's `intval`, so a bool index guards its own &BOOL_TYPE.
-    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
-    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
-    ctx.trace_ctx
-        .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
-
-    // getfield(wrappeditems): Ptr(GcArray(OBJECTPTR)) body.
-    let items_block = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        list_op,
-        crate::descr::tuple_wrappeditems_descr(),
-    );
-
-    // Bounds length: arraylen_gc against the wrappeditems GcArray header
-    // (no inline length cache).  NON-pure: an out-of-range index must
-    // still deopt.
-    let lenbox = crate::state::opimpl_arraylen_gc(
-        ctx.trace_ctx,
-        items_block,
-        crate::state::pyobject_gcarray_descr(),
-    );
-    walker_emit_index_bounds_guards(ctx, op_pc, raw_index, index, lenbox, concrete_len)?;
-
-    // PURE element load.  Object storage reads the boxed Ref directly from
-    // the immutable `Ptr(GcArray(OBJECTPTR))` body (no unbox/rebox).
-    let boxed =
-        crate::state::trace_items_block_getitem_value_pure(ctx.trace_ctx, items_block, raw_index);
-    ctx.trace_ctx.set_opref_concrete(
-        boxed,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
-    );
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-    Ok(Some(()))
-}
-
-/// Descend `w_tuple_getitem` for a canonical tuple and a negative int key.
-/// The positive constant-index arm stays in [`try_walker_specialize_subscr_tuple`].
-/// An out-of-range key stays on the generic residual so the raising path
-/// is not what this loop records.
-fn try_walker_orthodox_canonical_tuple_getitem<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    seq_op: OpRef,
-    key_op: OpRef,
-    seq_obj: pyre_object::PyObjectRef,
-    key_obj: pyre_object::PyObjectRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if dst_bank != 'r' {
-        return Ok(None);
-    }
-    let raw_key = unsafe { pyre_object::w_int_get_value(key_obj) };
-    let len = unsafe { pyre_object::tupleobject::w_tuple_len(seq_obj) } as i64;
-    let index = raw_key + len;
-    if index < 0 || index >= len {
-        return Ok(None);
-    }
-    let Some(jc_arc) = crate::jitcode_runtime::tuple_getitem_jitcode() else {
-        return Ok(None);
-    };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
-    };
-
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let tuple_type_addr = &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64;
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        seq_op,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
-    )?;
-    if !seq_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(seq_op) {
-        let type_const = ctx.trace_ctx.const_int(tuple_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[seq_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(seq_op, tuple_type_addr);
-    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
-    let key_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
-    ctx.trace_ctx
-        .set_opref_concrete(key_index, majit_ir::Value::Int(raw_key));
-    ctx.trace_ctx.set_opref_concrete(
-        seq_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
-    );
-    let walk = run_orthodox_helper_subwalk(
-        ctx,
-        op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "canonical_tuple_neg_getitem_commit",
-        "w_tuple_getitem_call_site",
-        &[key_index],
-        &[ConcreteValue::Int(raw_key)],
-        &[seq_op],
-        &[ConcreteValue::Ref(seq_obj)],
-        &[],
-    );
-    let (walk_outcome, _) = match walk {
-        Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] CANONICAL-TUPLE-NEG-SUBWALK pc={pc}");
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-    Ok(Some(()))
-}
-
 /// Descend `w_tuple_getitem`'s compiled body for a tuple subscript whose
 /// receiver class and item index are both known at trace time, instead of
 /// re-emitting that body's length test and field reads by hand.
@@ -7393,10 +7189,11 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    // Arity-2 specialisations only -- see the caller for why the canonical
-    // layout keeps its own arm.
+    // The canonical layout, whose caller has already checked the exact class,
+    // and the arity-2 specialisations.
     let spec_type = unsafe { (*seq_obj).ob_type };
-    if specialised_pair_kind(spec_type).is_none() {
+    let canonical = std::ptr::eq(spec_type, &pyre_object::pyobject::TUPLE_TYPE);
+    if !canonical && specialised_pair_kind(spec_type).is_none() {
         return Ok(None);
     }
     // Exact int keys only: a slice, a bool or an int subclass reaches a
@@ -7432,23 +7229,36 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    // Only a specialisation carries its own `ob_type`, so the class guard below
-    // is the whole precondition: a tuple subclass keeps `&TUPLE_TYPE` and can
-    // never reach these arms, and each specialisation's length is 2 by
-    // construction.
+    // A specialisation carries its own `ob_type`, so its class guard is the
+    // whole precondition, and its length is 2 by construction.  The canonical
+    // layout also pins the exact class, since a subclass instance may
+    // override `__getitem__`.
+    if canonical {
+        walker_guard_exact_w_class(
+            ctx,
+            op_pc,
+            seq_op,
+            pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
+        )?;
+    }
     walker_guard_specialised_pair_class(ctx, op_pc, seq_op, spec_type)?;
 
-    // Freeze the key: the two slots are separate fields, so the callee's
-    // `match idx` folds to one of them only against a constant.
     let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
     let key_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
     ctx.trace_ctx
         .set_opref_concrete(key_index, majit_ir::Value::Int(raw_key));
-    let index_arg = ctx.trace_ctx.const_int(raw_key);
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[key_index, index_arg])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(key_index, index_arg);
+    let index_arg = if canonical {
+        key_index
+    } else {
+        // Freeze the key: the two slots are separate fields, so the callee's
+        // `match idx` folds to one of them only against a constant.
+        let index_arg = ctx.trace_ctx.const_int(raw_key);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[key_index, index_arg])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(key_index, index_arg);
+        index_arg
+    };
     ctx.trace_ctx.set_opref_concrete(
         seq_op,
         majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
