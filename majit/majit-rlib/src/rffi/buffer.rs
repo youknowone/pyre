@@ -683,3 +683,59 @@ unsafe fn raw_free(ptr: *mut u8) {
     let layout = std::alloc::Layout::from_size_align(header + payload, align).unwrap();
     unsafe { std::alloc::dealloc(base, layout) }
 }
+
+/// Fixed-size `lltype.malloc(STRUCT, flavor='raw')`.
+///
+/// `support.py build_ll_0_raw_malloc_fixedsize` bakes the STRUCT into a
+/// zero-argument `_ll_0_raw_malloc_fixedsize` (and `_zero` when `zero=True`).
+/// The size here is a constant argument; alignment stays inside `raw_malloc`.
+#[inline(never)]
+pub fn ll_raw_malloc_fixedsize(size: usize) -> usize {
+    unsafe { raw_malloc(size) as usize }
+}
+
+/// `zero=True` form of [`ll_raw_malloc_fixedsize`]. The block is cleared
+/// for `size` bytes. A zero-size request still returns a distinct block
+/// and writes nothing.
+#[inline(never)]
+pub fn ll_raw_malloc_fixedsize_zero(size: usize) -> usize {
+    let ptr = unsafe { raw_malloc(size) };
+    if size > 0 {
+        unsafe { ptr.write_bytes(0, size) };
+    }
+    ptr as usize
+}
+
+/// `lltype.free(ptr, flavor='raw')`. `jtransform.py rewrite_op_free`
+/// residualizes this as `raw_free`; the call cannot raise.
+#[inline(never)]
+#[majit_macros::oopspec("raw_free(ptr)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_raw_free(ptr: usize) {
+    unsafe { raw_free(ptr as *mut u8) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ll_raw_free, ll_raw_malloc_fixedsize, ll_raw_malloc_fixedsize_zero};
+
+    #[test]
+    fn fixedsize_roundtrip_zero_clears_and_free() {
+        let ptr = ll_raw_malloc_fixedsize(8);
+        assert_ne!(ptr, 0);
+        unsafe {
+            let p = ptr as *mut u8;
+            p.write(0x5A);
+            assert_eq!(p.read(), 0x5A);
+        }
+        ll_raw_free(ptr);
+
+        let zeroed = ll_raw_malloc_fixedsize_zero(8);
+        assert_ne!(zeroed, 0);
+        unsafe {
+            let bytes = std::slice::from_raw_parts(zeroed as *const u8, 8);
+            assert!(bytes.iter().all(|b| *b == 0));
+        }
+        ll_raw_free(zeroed);
+    }
+}

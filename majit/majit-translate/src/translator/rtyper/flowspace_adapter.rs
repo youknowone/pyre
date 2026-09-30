@@ -3340,6 +3340,8 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::NewArrayClear { .. } => "NewArrayClear",
         OpKind::NewListClear { .. } => "NewListClear",
         OpKind::New { .. } => "New",
+        OpKind::RawMalloc { .. } => "RawMalloc",
+        OpKind::RawFree { .. } => "RawFree",
         OpKind::NewWithVtable { .. } => "NewWithVtable",
         // Catch-all for variants pyre may add without bumping this
         // table — surfaces as `<unknown>` in the fail-loud message

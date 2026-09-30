@@ -4580,8 +4580,131 @@ impl<'a> Transformer<'a> {
                     },
                 }])
             }
+            OpKind::RawMalloc { .. } => {
+                let (owner, zero) = match &op.kind {
+                    OpKind::RawMalloc { owner, zero } => (owner.clone(), *zero),
+                    _ => unreachable!("RawMalloc arm"),
+                };
+                self.rewrite_op_raw_malloc(op, graph_name, graph, &owner, zero)
+            }
+            OpKind::RawFree { .. } => {
+                let ptr = match &op.kind {
+                    OpKind::RawFree { ptr } => ptr.clone(),
+                    _ => unreachable!("RawFree arm"),
+                };
+                self.rewrite_op_raw_free(graph, graph_name, ptr)
+            }
             _ => RewriteResult::Keep,
         }
+    }
+
+    /// `jtransform.py _rewrite_raw_malloc`: flavor raw of a fixed-size
+    /// struct is a residual direct call of `raw_malloc_fixedsize` (the
+    /// `_zero` helper when `zero=True`). `support.py
+    /// build_ll_0_raw_malloc_fixedsize` closes the STRUCT into a
+    /// zero-argument specialization; the size here is a constant
+    /// argument of `ll_raw_malloc_fixedsize`.
+    fn rewrite_op_raw_malloc(
+        &mut self,
+        op: &SpaceOperation,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+        owner: &str,
+        zero: bool,
+    ) -> RewriteResult {
+        let size = {
+            let cc = self.callcontrol.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "raw malloc of {owner} has no CallControl; size comes from CallControl::struct_layout_for"
+                )
+            });
+            cc.struct_layout_for(owner)
+                .map(|layout| layout.size)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "raw malloc of {owner} has no StructLayout; size comes from CallControl::struct_layout_for"
+                    )
+                })
+        };
+        assert!(
+            op.result.is_some(),
+            "raw malloc of {owner} has no result variable"
+        );
+        let leaf = if zero {
+            "ll_raw_malloc_fixedsize_zero"
+        } else {
+            "ll_raw_malloc_fixedsize"
+        };
+        let target = CallTarget::function_path(["majit_rlib", "rffi", leaf]);
+        let size_var = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let call = SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![LinkArg::Value(size_var.clone())],
+                result_ty: ValueType::Int,
+            },
+        };
+        let rewritten = self._handle_oopspec_call(
+            graph,
+            &call,
+            &target,
+            &[size_var.clone()],
+            &ValueType::Int,
+            graph_name,
+            OopSpecIndex::None,
+            None,
+            None,
+        );
+        match rewritten {
+            RewriteResult::Replace(mut ops) => {
+                ops.insert(
+                    0,
+                    SpaceOperation {
+                        result: Some(size_var),
+                        kind: OpKind::ConstInt(size as i64),
+                    },
+                );
+                RewriteResult::Replace(ops)
+            }
+            RewriteResult::Identity(_) | RewriteResult::Keep => {
+                panic!("raw malloc residual of {owner} did not rewrite to a direct call")
+            }
+        }
+    }
+
+    /// `jtransform.py rewrite_op_free` builds `raw_free` and always goes
+    /// through `_handle_oopspec_call` with `OS_RAW_FREE` and
+    /// `EF_CANNOT_RAISE`.
+    fn rewrite_op_raw_free(
+        &mut self,
+        graph: &mut FunctionGraph,
+        graph_name: &str,
+        ptr: crate::flowspace::model::Variable,
+    ) -> RewriteResult {
+        let target = CallTarget::function_path(["majit_rlib", "rffi", "ll_raw_free"]);
+        let call = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![LinkArg::Value(ptr.clone())],
+                result_ty: ValueType::Void,
+            },
+        };
+        self._handle_oopspec_call(
+            graph,
+            &call,
+            &target,
+            &[ptr],
+            &ValueType::Void,
+            graph_name,
+            OopSpecIndex::RawFree,
+            Some(ExtraEffect::CannotRaise),
+            None,
+        )
     }
 
     /// RPython: `Transformer.make_three_lists(vars)` (jtransform.py).
@@ -10948,7 +11071,11 @@ fn remap_op(
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
-        | OpKind::NewWithVtable { .. } => op.kind.clone(),
+        | OpKind::NewWithVtable { .. }
+        | OpKind::RawMalloc { .. } => op.kind.clone(),
+        OpKind::RawFree { ptr } => OpKind::RawFree {
+            ptr: remap_value(ptr, aliases),
+        },
         OpKind::RawLoad {
             base,
             offset,
@@ -12095,6 +12222,7 @@ mod tests {
                     field_type: majit_ir::value::Type::Int,
                     rank: None,
                 }],
+                host: None,
             },
         );
         let field = FieldDescriptor::new("count", Some(owner.into())).with_taken_by_address(true);
@@ -12136,6 +12264,7 @@ mod tests {
                             rank: None,
                         },
                     ],
+                    host: None,
                 },
             );
             let storage = if gc {
@@ -12325,6 +12454,7 @@ mod tests {
                         rank: None,
                     },
                 ],
+                host: None,
             },
         );
         cc.set_struct_storage(&[crate::StructStorageDescriptor::raw(owner)]);
@@ -12515,6 +12645,7 @@ mod tests {
                         rank: None,
                     },
                 ],
+                host: None,
             },
         );
 
@@ -16830,6 +16961,7 @@ mod tests {
                 align: 4,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![],
+                host: None,
             },
         );
         let rewritten = Transformer::new(&GraphTransformConfig::default())

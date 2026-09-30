@@ -3230,6 +3230,8 @@ impl AssemblerEncode for Assembler {
                 OpKind::NewList { .. } => "NewList",
                 OpKind::GetSlice { .. } => "GetSlice",
                 OpKind::New { .. } => "New",
+                OpKind::RawMalloc { .. } => "RawMalloc",
+                OpKind::RawFree { .. } => "RawFree",
                 OpKind::NewWithVtable { .. } => "NewWithVtable",
                 OpKind::NewArray { .. } => "NewArray",
                 OpKind::NewArrayClear { .. } => "NewArrayClear",
@@ -5587,6 +5589,19 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::LoadStatic { segments, .. } => {
             panic!("unresolved LoadStatic reached JitCode assembly: {segments:?}")
         }
+        // `jtransform.py _rewrite_raw_malloc` rewrites a fixed-size raw
+        // malloc to a residual direct call before assembly.
+        OpKind::RawMalloc { .. } => {
+            panic!(
+                "raw malloc reached JitCode assembly; jtransform.py _rewrite_raw_malloc rewrites it first"
+            )
+        }
+        // `jtransform.py rewrite_op_free` rewrites raw free before assembly.
+        OpKind::RawFree { .. } => {
+            panic!(
+                "raw free reached JitCode assembly; jtransform.py rewrite_op_free rewrites it first"
+            )
+        }
     }
 }
 
@@ -5647,6 +5662,7 @@ mod tests {
                         rank: None,
                     },
                 ],
+                host: None,
             },
         );
 
@@ -6043,6 +6059,7 @@ mod tests {
                         rank: None,
                     },
                 ],
+                host: None,
             },
         );
 
@@ -6110,6 +6127,7 @@ mod tests {
                     field_type: majit_ir::value::Type::Int,
                     rank: None,
                 }],
+                host: None,
             },
         );
 
@@ -7937,6 +7955,214 @@ mod tests {
             "Int-bank FieldRead must not emit getfield_gc, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// `Tuple<i64>` is one signed word. `jtransform.py _rewrite_raw_malloc`
+    /// passes that size as a constant; `int_copy` is in `USE_C_FORM`, so
+    /// the byte-sized 8 is an inline `c` immediate rather than a pool slot.
+    fn raw_tuple_i64_layout() -> crate::call::StructLayout {
+        use crate::call::StructFieldLayout;
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        crate::call::StructLayout {
+            size: 8,
+            align: 8,
+            gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            fields: vec![StructFieldLayout {
+                name: "f".into(),
+                offset: 0,
+                size: 8,
+                flag: ArrayFlag::Signed,
+                field_type: Type::Int,
+                rank: None,
+            }],
+            host: None,
+        }
+    }
+
+    fn assemble_raw_malloc_roundtrip(zero: bool) -> (JitCodeBody, Assembler) {
+        use crate::call::CallControl;
+        use crate::flatten::flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+
+        const MALLOC: i64 = 0x1111_0001;
+        const ZERO: i64 = 0x2222_0002;
+        const FREE: i64 = 0x3333_0003;
+        let owner = "Tuple<i64>";
+        let mut cc = CallControl::new();
+        let sid = majit_ir::descr::struct_id_for_name(owner).expect("Tuple<i64> shape id");
+        cc.set_struct_layout(sid, raw_tuple_i64_layout());
+        cc.register_function_fnaddr(
+            crate::parse::CallPath::from_segments([
+                "majit_rlib",
+                "rffi",
+                "ll_raw_malloc_fixedsize",
+            ]),
+            MALLOC,
+        );
+        cc.register_function_fnaddr(
+            crate::parse::CallPath::from_segments([
+                "majit_rlib",
+                "rffi",
+                "ll_raw_malloc_fixedsize_zero",
+            ]),
+            ZERO,
+        );
+        cc.register_function_fnaddr(
+            crate::parse::CallPath::from_segments(["majit_rlib", "rffi", "ll_raw_free"]),
+            FREE,
+        );
+
+        let mut graph = FunctionGraph::new("raw_fixedsize");
+        let x = push_input_var(&mut graph, "x", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&x, crate::model::ConcreteType::Signed);
+        let field = FieldDescriptor::new("f", Some(owner.into()));
+        let p = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::RawMalloc {
+                    owner: owner.into(),
+                    zero,
+                },
+                true,
+            )
+            .expect("raw malloc result");
+        let _ = graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: p.clone(),
+                field: field.clone(),
+                value: LinkArg::Value(x),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let y = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: p.clone(),
+                    field,
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("field read result");
+        let _ = graph.push_op_var(graph.startblock, OpKind::RawFree { ptr: p }, false);
+        graph.set_return(graph.startblock, Some(y.clone()));
+        FunctionGraph::set_concretetype_of_inline(&y, crate::model::ConcreteType::Signed);
+
+        let config = GraphTransformConfig::default();
+        let mut rewritten = {
+            let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+            transformer.transform(&graph).graph
+        };
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        (body, asm)
+    }
+
+    fn assert_raw_malloc_assembly(
+        body: &JitCodeBody,
+        asm: &Assembler,
+        malloc_addr: i64,
+        absent: i64,
+    ) {
+        const FREE: i64 = 0x3333_0003;
+        let keys: Vec<&String> = asm.insns.keys().collect();
+        assert!(
+            keys.iter()
+                .any(|k| k.as_str() == "residual_call_ir_i/iIRd>i"),
+            "malloc residual missing, got {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.as_str() == "setfield_raw_i/iid"),
+            "setfield_raw_i missing, got {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.as_str() == "getfield_raw_i/id>i"),
+            "getfield_raw_i missing, got {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.as_str() == "residual_call_ir_v/iIRd"),
+            "raw_free residual missing, got {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.starts_with("live/")),
+            "can-raise malloc must emit live/, got {keys:?}"
+        );
+        assert!(
+            body.constants_i.contains(&malloc_addr),
+            "helper address {malloc_addr:#x} missing from {:?}",
+            body.constants_i
+        );
+        assert!(
+            body.constants_i.contains(&FREE),
+            "ll_raw_free address missing from {:?}",
+            body.constants_i
+        );
+        assert!(
+            !body.constants_i.contains(&absent),
+            "other helper {absent:#x} leaked into {:?}",
+            body.constants_i
+        );
+        // `assembler.py` `USE_C_FORM`: `int_copy` of a byte-sized constant
+        // is `int_copy/c>i`, so the struct size 8 is the inline immediate.
+        let size_op = *asm
+            .insns
+            .get("int_copy/c>i")
+            .expect("size ConstInt(8) assembles as int_copy/c>i");
+        assert!(
+            body.code.windows(2).any(|w| w[0] == size_op && w[1] == 8),
+            "struct size 8 is not the int_copy short immediate, code {:?}",
+            body.code
+        );
+
+        let mut malloc_calls = 0;
+        let mut free_calls = 0;
+        for descr in asm.snapshot_descrs() {
+            let crate::jitcode::BhDescr::Call { calldescr } = descr else {
+                continue;
+            };
+            match calldescr.extra_info.oopspecindex {
+                majit_ir::descr::OopSpecIndex::None
+                    if calldescr.extra_info.extraeffect
+                        == majit_ir::descr::ExtraEffect::CanRaise =>
+                {
+                    assert!(calldescr.extra_info.check_can_raise(false));
+                    malloc_calls += 1;
+                }
+                majit_ir::descr::OopSpecIndex::RawFree => {
+                    assert_eq!(
+                        calldescr.extra_info.extraeffect,
+                        majit_ir::descr::ExtraEffect::CannotRaise
+                    );
+                    assert!(!calldescr.extra_info.check_can_raise(false));
+                    free_calls += 1;
+                }
+                other => panic!("unexpected residual oopspec {other:?}"),
+            }
+        }
+        assert_eq!(malloc_calls, 1, "one fixed-size malloc residual");
+        assert_eq!(free_calls, 1, "one raw_free residual");
+    }
+
+    #[test]
+    fn raw_malloc_fixedsize_assembles_residual_setfield_getfield_and_raw_free() {
+        let (body, asm) = assemble_raw_malloc_roundtrip(false);
+        assert_raw_malloc_assembly(&body, &asm, 0x1111_0001, 0x2222_0002);
+    }
+
+    #[test]
+    fn raw_malloc_fixedsize_zero_assembles_the_zero_helper() {
+        let (body, asm) = assemble_raw_malloc_roundtrip(true);
+        assert_raw_malloc_assembly(&body, &asm, 0x2222_0002, 0x1111_0001);
     }
 
     /// `promote_gc_field_bases` rehomes a Signed GC FieldRead base so

@@ -2742,6 +2742,8 @@ pub struct StructLayout {
     /// Per-field layout: (field_name, offset, size, type).
     /// RPython: `symbolic.get_field_token(STRUCT, name, tsc) → (offset, size)`.
     pub fields: Vec<StructFieldLayout>,
+    /// Host field offsets and tag. `None` on a heuristic layout.
+    pub host: Option<crate::front::host_layout::HostLayout>,
 }
 
 /// Single field within a `StructLayout`.
@@ -2948,6 +2950,7 @@ impl StructLayout {
             align,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
             fields: layout_fields,
+            host: None,
         }
     }
 
@@ -3443,6 +3446,11 @@ impl CallControl {
         name: &str,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::GcKind> {
         Some(self.struct_layout_for(name)?.gckind)
+    }
+
+    /// Host layout of `owner`, when Charon recorded one.
+    pub fn host_layout_for(&self, owner: &str) -> Option<crate::front::host_layout::HostLayout> {
+        self.struct_layout_for(owner)?.host.clone()
     }
 
     /// Byte offset of the first item of a length-prefixed array whose length
@@ -8397,9 +8405,10 @@ impl CallControl {
                         // `NewArrayClear` is `new_array_clear`
                         // (jtransform.py), and `NewListClear` allocates
                         // a GcStruct plus a cleared items array
-                        // (pyjitpl.py opimpl_newlist_clear). This graph model carries no
-                        // `flavor='raw'` allocation, so there is no flavour test
-                        // to make — every allocation op here is a GC one.
+                        // (pyjitpl.py opimpl_newlist_clear). `RawMalloc` /
+                        // `RawFree` are `flavor='raw'` (`jtransform.py
+                        // _rewrite_raw_malloc` / `rewrite_op_free`) and do
+                        // not collect, so they stay on the fallthrough.
                         OpKind::New { .. }
                         | OpKind::NewWithVtable { .. }
                         | OpKind::NewArray { .. }
@@ -10712,6 +10721,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // varsize allocation, same class.
         OpKind::New { .. }
         | OpKind::NewWithVtable { .. }
+        | OpKind::RawMalloc { .. }
         | OpKind::NewArray { .. }
         | OpKind::NewArrayClear { .. }
         | OpKind::NewListClear { .. } => RaiseClass::MemoryErrorOnly,
@@ -10720,7 +10730,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
             RaiseClass::No
         }
         // RPython LL: raw_load, raw_store → cannot raise
-        OpKind::RawLoad { .. } | OpKind::RawStore { .. } => RaiseClass::No,
+        OpKind::RawLoad { .. } | OpKind::RawStore { .. } | OpKind::RawFree { .. } => RaiseClass::No,
         // RPython LL: getinteriorfield_gc, setinteriorfield_gc → cannot raise
         OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => RaiseClass::No,
         // RPython LL: int_add, int_sub, int_lt, int_and, etc → cannot raise
@@ -15910,6 +15920,33 @@ mod tests {
         assert_eq!(write_fields(&m), vec![0]);
     }
 
+    #[test]
+    fn host_layout_for_returns_the_registered_host_layout() {
+        let sid = majit_ir::descr::StructId::from_canonical("HostLayoutOwner");
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            "HostLayoutOwner".to_string(),
+            Some(sid),
+        )]));
+        let host = crate::front::host_layout::HostLayout {
+            size: 4,
+            align: 1,
+            variant_field_offsets: vec![vec![0]],
+            tag: None,
+        };
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size: 4,
+                align: 1,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![],
+                host: Some(host.clone()),
+            },
+        );
+        assert_eq!(cc.host_layout_for("HostLayoutOwner").as_ref(), Some(&host));
+    }
+
     /// A layout registered after the first mint has to be visible on the
     /// next call. The first call has no `struct_layouts` row, so the offset
     /// source is the accumulator; `set_struct_layout` then makes the same
@@ -15947,6 +15984,7 @@ mod tests {
                     field_type: majit_ir::value::Type::Int,
                     rank: None,
                 }],
+                host: None,
             },
         );
         let before = majit_ir::descr::field_mint_census_snapshot();
