@@ -5243,22 +5243,20 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // Python, so it is inside the released scope too.
                 let result = (|| -> Result<isize, pyre_interpreter::PyError> {
                     let buf = buffer.as_bytes();
-                    let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                    let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
-                    // `pack_inet_addr` runs Python for a host that is not a plain
-                    // ASCII `str`, so the socket is read back from its slot
-                    // rather than from the native argument slice, which is
-                    // only current at entry.
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                    // `getdict_native` can collect; `sendmsg` reads `_family`
+                    // / `_proto` from the live pin, and `pack_inet_addr` runs
+                    // Python, so every later use reloads the same slot.
+                    let family =
+                        socket_get_attr_i64(obj_roots.get(obj_base), "_family") as libc::c_int;
+                    let proto =
+                        socket_get_attr_i64(obj_roots.get(obj_base), "_proto") as libc::c_int;
                     let (storage, slen) = pack_inet_addr(
                         "sendto",
                         family,
                         proto,
                         args_roots.get(args_base + addr_index),
                     )?;
-                    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                    socket_wait_writable(obj, fd)?;
+                    socket_wait_writable(obj_roots.get(obj_base), fd)?;
                     loop {
                         let (r, errno) = socket_call(|| {
                             rffi::sendto(
@@ -5275,7 +5273,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         }
                         if !rffi::error_is_interrupted(errno) {
                             return Err(socket_io_err_for_operation(
-                                obj,
+                                obj_roots.get(obj_base),
                                 std::io::Error::from_raw_os_error(errno),
                             ));
                         }
