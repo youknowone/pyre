@@ -14,8 +14,7 @@ use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::executioncontext::ActionFlagOps;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{
-    PyError, PyResult, StepResult, decode_instruction_forward_packed,
-    decode_instruction_forward_pc, execute_opcode_step,
+    PyError, PyResult, StepResult, decode_instruction_forward_dispatch, execute_opcode_step,
 };
 use pyre_interpreter::{locals_w, locals_w_mut};
 use pyre_object::gc_roots;
@@ -302,6 +301,19 @@ impl FrameView {
     #[inline]
     fn reload(frame: *mut PyFrame) -> *mut PyFrame {
         gc_roots::reload_top_root(frame as pyre_object::PyObjectRef) as *mut PyFrame
+    }
+
+    /// Same top-root read as [`Self::reload`], through a slot resolved once
+    /// for this activation. `gc_enter_roots_frame` does that once per
+    /// function; repeating `LocalKey::with` on every opcode is not part of
+    /// `PyFrame.dispatch`.
+    #[inline]
+    fn reload_entered(
+        slot: majit_gc::shadow_stack::ShadowStackSlot,
+        frame: *mut PyFrame,
+    ) -> *mut PyFrame {
+        let _ = frame;
+        unsafe { majit_gc::shadow_stack::slot_top_ref(slot).0 as *mut PyFrame }
     }
 }
 
@@ -10578,8 +10590,11 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
 fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
-    // The caller's root is the top of the shadow stack and names this frame;
-    // every reload below goes through that root (`FrameView::reload`).
+    // The caller's root is the top of the shadow stack and names this frame.
+    // `gc_enter_roots_frame` resolves the root stack once per function, but a
+    // pointer live across `jit_merge_point` must be a green or the red frame
+    // (`split_before_jit_merge_point`). The slot is bound after the marker;
+    // this entry check still pays `LocalKey::with` once.
     debug_assert!(
         std::ptr::eq(
             FrameView::reload(frame as *mut PyFrame) as *const PyFrame,
@@ -10625,12 +10640,15 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
 
     // The one frame binding the whole dispatch loop reads through. Seeded from
     // the parameter here — the parameter itself is not read inside the loop —
-    // and re-seeded through `FrameView::reload(f)` after every collection
-    // point. At the jit_merge_point split only greens and reds may stay live
+    // and re-seeded after every collection point. Before `jit_merge_point`
+    // that read is `FrameView::reload` (`top_ref`); after the marker it is
+    // `FrameView::reload_entered` on a slot bound in that same iteration.
+    // At the split only greens and reds may stay live
     // (`split_before_jit_merge_point` links exactly those), and `f` is the
     // marker's red, so chaining every reload through `f` keeps the split
     // legal; a fresh `frame as *mut PyFrame` cast inside the loop would be
     // value-numbered into one definition that crosses the split as neither.
+    // The slot itself must not be one of those live values.
     let mut f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
     // `PyFrame.dispatch` receives `ec` once per activation (`interp_jit.py`).
     // The thread-local slot stays on that context for the activation, so the
@@ -10684,6 +10702,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             unsafe { &mut *f },
             marker_ec,
         );
+        // `gc_enter_roots_frame` resolves the root stack once per function.
+        // Bound here, after the marker, so the pointer is not live across
+        // `split_before_jit_merge_point`. Reloads earlier in this iteration
+        // still go through `FrameView::reload`.
+        let root_slot = majit_gc::shadow_stack::shadow_stack_slot();
         // `f` is the marker's red `frame` — the one frame value declared
         // live across the split, as PyFrame.dispatch's `self` is upstream.
         // The marker does not collect.
@@ -10710,8 +10733,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             return Ok(w_none());
         }
 
-        let opcode_pc = decode_instruction_forward_pc(code, pc);
-        let packed_instruction = decode_instruction_forward_packed(code, pc);
+        // `dispatch_bytecode` reads `co_code` once. One walk yields the
+        // opcode pc and the packed opcode/oparg.
+        let (opcode_pc, packed_instruction) = decode_instruction_forward_dispatch(code, pc);
         if opcode_pc == usize::MAX || packed_instruction == u64::MAX {
             return Err(pyre_interpreter::pycode::BytecodeCorruption.into());
         }
@@ -10770,7 +10794,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             if unsafe { &mut *f }.take_failed_attr_before_opcode() {
                 unsafe { (*ec_ptr).run_failed_attr_finalizers() };
             }
-            f = FrameView::reload(f);
+            f = FrameView::reload_entered(root_slot, f);
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
             // A fired breaker stores `-1` into the action ticker
             // (`fire_action_ticker`), so the no-tracer arm's
@@ -10784,14 +10808,14 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                     // bytecode_trace at this opcode.  In particular, an
                     // asynchronously injected exception must be catchable by
                     // the target frame's surrounding try/except.
-                    f = FrameView::reload(f);
+                    f = FrameView::reload_entered(root_slot, f);
                     let mut next_instr = unsafe { &*f }.next_instr();
                     if pyre_interpreter::eval::handle_exception(
                         unsafe { &mut *f },
                         &mut err,
                         &mut next_instr,
                     ) {
-                        f = FrameView::reload(f);
+                        f = FrameView::reload_entered(root_slot, f);
                         unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                         continue;
                     }
@@ -10799,7 +10823,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 }
                 // bytecode_trace may allocate (tracer callback) → the frame may
                 // have moved; re-seed before reading it again.
-                f = FrameView::reload(f);
+                f = FrameView::reload_entered(root_slot, f);
                 // A trace callback may perform a debugger line-jump by
                 // setting `frame.f_lineno` (`fset_f_lineno` → `last_instr
                 // = best_addr`).  The opcode for this iteration was
@@ -10840,7 +10864,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                         // the current opcode so the frame's try/except can catch
                         // it. `frame.last_instr` was set to `pc` above, so
                         // `handle_exception` finds the covering handler.
-                        f = FrameView::reload(f);
+                        f = FrameView::reload_entered(root_slot, f);
                         let mut next_instr = unsafe { &*f }.next_instr();
                         if pyre_interpreter::eval::handle_exception(
                             unsafe { &mut *f },
@@ -10849,7 +10873,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                         ) {
                             // handle_exception may allocate; re-seed before the
                             // final frame write.
-                            f = FrameView::reload(f);
+                            f = FrameView::reload_entered(root_slot, f);
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
@@ -10861,7 +10885,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // The ec block above may have run bytecode_trace / perform_actions
         // (collection points) on a fall-through path; re-seed before the
         // opcode dispatch.
-        f = FrameView::reload(f);
+        f = FrameView::reload_entered(root_slot, f);
         let mut next_instr = unsafe { &*f }.next_instr();
         let step_result =
             execute_opcode_step(unsafe { &mut *f }, code, instruction, op_arg, next_instr);
@@ -10884,7 +10908,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) => {
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer for the compile path.
-                f = FrameView::reload(f);
+                f = FrameView::reload_entered(root_slot, f);
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py maybe_compile_and_run  allow-line-citation
                 // Same activation `ec` as the merge point above.
@@ -10905,7 +10929,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 ) {
                     // maybe_compile_and_run compiles and may allocate → re-seed
                     // before handle_exception reads the frame.
-                    f = FrameView::reload(f);
+                    f = FrameView::reload_entered(root_slot, f);
                     let loop_result = take_pending_loop_exit(marker_ec);
                     // warmspot.py handle_jitexception: an
                     // `ExitFrameWithExceptionRef` from a direct compiled-code
@@ -10927,7 +10951,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                             &mut next_instr,
                         ) {
                             // handle_exception may allocate → re-seed.
-                            f = FrameView::reload(f);
+                            f = FrameView::reload_entered(root_slot, f);
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
@@ -10949,21 +10973,21 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 // generator keeps its frame alive after leaving the portal,
                 // so force precisely this exit.  Ordinary Return deliberately
                 // remains lazy through FORCE_TOKEN + GUARD_NOT_FORCED_2.
-                f = FrameView::reload(f);
+                f = FrameView::reload_entered(root_slot, f);
                 let _ = majit_metainterp::jit::hint_force_virtualizable(unsafe { &mut *f });
                 return Ok(result);
             }
             Err(mut err) => {
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer.
-                f = FrameView::reload(f);
+                f = FrameView::reload_entered(root_slot, f);
                 if pyre_interpreter::eval::handle_exception(
                     unsafe { &mut *f },
                     &mut err,
                     &mut next_instr,
                 ) {
                     // handle_exception may allocate → re-seed before the write.
-                    f = FrameView::reload(f);
+                    f = FrameView::reload_entered(root_slot, f);
                     unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                     continue;
                 }
@@ -11089,6 +11113,34 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     true
 }
 
+/// `warmstate.py` `maybe_compile_and_run` looks the cell up and ticks.
+/// The shape walk and `liveness_for` are not on that path. Run them only
+/// once the counter has reached `bound_reached`.
+fn backedge_frame_may_trace(frame: &PyFrame, loop_header_pc: usize) -> bool {
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
+        pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
+        return false;
+    }
+    backedge_vsd_matches(frame, loop_header_pc)
+}
+
+/// A compiled-loop exit can rewind `next_instr` while the vable stack depth
+/// is still the outer count. `warmstate.py` `maybe_compile_and_run` enters
+/// `EnterJitAssembler` with the red frame as it stands; this check is the
+/// pyre stand-in for `MIFrame.pc` plus `ResumeDataDirectReader`, which keep
+/// one depth per bytecode offset. Valid loops pass.
+fn backedge_vsd_matches(frame: &PyFrame, loop_header_pc: usize) -> bool {
+    if let Some(expected_vsd) =
+        pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, loop_header_pc)
+    {
+        if frame.valuestackdepth != expected_vsd {
+            return false;
+        }
+    }
+    true
+}
+
 /// RPython warmstate.py maybe_compile_and_run.
 ///
 /// Entry point to the JIT. Called at can_enter_jit (back-edge).
@@ -11116,31 +11168,7 @@ fn maybe_compile_and_run(
         return None;
     }
 
-    // Not every back-edge reaching this helper passed `eval_with_jit_inner`'s
-    // classification: `portal_runner_dispatch` enters `eval_loop_jit` for a
-    // frame forced through the portal, and that route exists precisely for a
-    // callee with no compiled loop (`compile_tmp_callback` bakes
-    // `portal_runner_adr` as the callee body, and the `!is_resolved`
-    // CALL_ASSEMBLER force leg calls the same shim).  The classification is
-    // cached per code object, so consulting it here is a pointer-keyed
-    // lookup rather than the constant-tree plus whole-bytecode walk that
-    // used to run on every back-edge.
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
-        pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
-        return None;
-    }
-    if let Some(expected_vsd) =
-        pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, loop_header_pc)
-    {
-        if frame.valuestackdepth != expected_vsd {
-            // A pyre super-instruction compiled-loop exit can rewind next_instr to the header
-            // while retaining an over-counted vable stack depth. Valid Python loops have one depth per bytecode offset,
-            // so this never permanently interprets a traceable loop; PyPy's MIFrame.pc JitCode-offset
-            // plus ResumeDataDirectReader exact-resume invariant structurally preclude it.
-            return None;
-        }
-    }
+
     // warmstate.py: `cell.flags & JC_TRACING` → skip this key only.
     // A live session on another key or driver must not suppress enter
     // or the counter tick here.
@@ -11164,6 +11192,7 @@ fn maybe_compile_and_run(
     // a cell the warmstate dropped from a token something revoked.
     static GEN_ENTRY_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *GEN_ENTRY_DIAG.get_or_init(|| std::env::var_os("PYRE_GEN_ENTRY_DIAG").is_some()) {
+        let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
         let runnable = driver.has_runnable_compiled_loop(green_key);
         let meta = driver.get_compiled_meta(green_key).is_some();
         let last = driver.last_compiled_key();
@@ -11205,8 +11234,15 @@ fn maybe_compile_and_run(
     // read this door's own mark and decline with `AlreadyTracing`, so the
     // trace this door just decided on never starts and the counter it reset
     // never re-arms the location.
+    // `warmstate.py maybe_compile_and_run` looks up the cell and ticks.
+    // The frame-shape walk and `liveness_for` are not on that path: they
+    // run only once the counter has reached `bound_reached`, or when a
+    // compiled token is about to be entered.
     match driver.maybe_compile_and_run_step(green_key, (frame.pycode as usize, loop_header_pc)) {
         (majit_metainterp::warmstate::HotResult::StartTracing, _) => {
+            if !backedge_frame_may_trace(frame, loop_header_pc) {
+                return None;
+            }
             if driver
                 .meta_interp()
                 .is_tracing_key((frame.pycode as usize, loop_header_pc))
@@ -11216,6 +11252,9 @@ fn maybe_compile_and_run(
             bound_reached(frame, green_key, loop_header_pc, driver, info, env)
         }
         (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
+            if !backedge_vsd_matches(frame, loop_header_pc) {
+                return None;
+            }
             execute_assembler(frame, compiled_key, loop_header_pc, driver, info, env)
         }
         (majit_metainterp::warmstate::HotResult::NotHot, _) => None,

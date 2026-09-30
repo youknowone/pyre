@@ -2086,11 +2086,11 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         freevars.len(),
     ));
 
-    let locations = rustpython_compiler_core::marshal::linetable_to_locations(
-        &linetable,
-        first_line.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-        instructions.len(),
-    );
+    // `offset2lineno` walks `co_lnotab` when a line is asked for. The expanded
+    // rows are rebuilt by `code_locations` on that first reader; building them
+    // here only to drop them in `release_code_locations` repeats the walk for
+    // every code object import unmarshals.
+    let locations = Vec::new().into_boxed_slice();
     let code = crate::CodeObject {
         instructions,
         locations,
@@ -3018,11 +3018,9 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         ));
         code.localspluskinds = localspluskinds.into_boxed_slice();
     }
-    code.locations = rustpython_compiler_core::marshal::linetable_to_locations(
-        &code.linetable,
-        firstlineno_raw,
-        code.instructions.len(),
-    );
+    // Same deferral as the marshal reader: `offset2lineno` does not expand
+    // the line table until a reader asks. `code_locations` rebuilds it.
+    code.locations = Vec::new().into_boxed_slice();
 
     let mut result = box_code_object_with_firstlineno(code, firstlineno_raw);
     let w_name = match name_slot {
@@ -3852,14 +3850,12 @@ enum CodeLocations {
 
 /// Rows released from `CodeObject.locations`, keyed by code object address.
 ///
-/// `locations` is not serialized: `marshal.rs:265,951` expand it out of
-/// `linetable` while reading a code object, so a loaded code object carries the
-/// same line information twice — compressed at about 1.5 bytes per instruction
-/// and expanded at 32, since `SourceLocation` is a pair of `NonZeroUsize`.
-/// Nothing but a traceback, a debugger line jump and the `co_positions` /
-/// `co_lines` getters ever reads the expanded form, so [`w_code_new`] releases
-/// it and [`code_locations`] rebuilds it on the first reader — the
-/// realize-once treatment `co_consts_w` and `co_names_w` already get.
+/// `locations` is not serialized. `offset2lineno` walks the line table when a
+/// line is asked for, so marshal and `code.replace` leave the expanded array
+/// empty. [`code_locations`] rebuilds it on the first reader — the
+/// realize-once treatment `co_consts_w` and `co_names_w` already get. A reader
+/// is a traceback, a debugger line jump, or the `co_positions` / `co_lines`
+/// getters.
 ///
 /// Decoded rows are leaked because the `CodeObject` describing them is itself
 /// never released: `pycode_destructor` frees the side tables and leaves
@@ -3900,13 +3896,16 @@ fn release_code_locations(code_ptr: *mut crate::CodeObject, firstlineno_raw: i32
         return;
     };
     let code = unsafe { &mut *code_ptr };
-    // A code object with no instructions has no rows to decode, and one that
-    // holds no array has nothing to release.
-    if code.instructions.is_empty() || code.locations.is_empty() {
+    // No instructions means there is no line table to rebuild. An empty
+    // `locations` array is the deferred state: the marshal reader and
+    // `code.replace` leave it empty, and `offset2lineno` expands on demand.
+    if code.instructions.is_empty() {
         return;
     }
     entry.insert(CodeLocations::Deferred(firstlineno_raw));
-    code.locations = Vec::new().into_boxed_slice();
+    if !code.locations.is_empty() {
+        code.locations = Vec::new().into_boxed_slice();
+    }
 }
 
 /// Correct the first line number a released array is decoded against, leaving a
@@ -5208,6 +5207,24 @@ mod tests {
         // `code.replace` rejects one, `CodeType(...)` stores it.
         assert_eq!(code_addr2line(&blank, -8, -1), -8);
         assert_eq!(code_addr2line(&blank, 0, -1), 0);
+    }
+
+    /// Marshal and `code.replace` leave `locations` empty. The rows come back
+    /// from `linetable` on the first reader, matching the table the compiler
+    /// expanded up front.
+    #[test]
+    fn deferred_locations_rebuild_from_the_line_table() {
+        let mut code = compile_exec("a = 1\nb = 2\n").expect("compile failed");
+        let expanded = code.locations.to_vec();
+        assert!(!expanded.is_empty());
+        code.locations = Vec::new().into_boxed_slice();
+        let firstlineno = code.first_line_number.map_or(1, |line| line.get()) as i32;
+        release_code_locations(&mut code, firstlineno);
+        assert!(code.locations.is_empty());
+        assert_eq!(code_locations(&code), expanded.as_slice());
+        code_locations_cache()
+            .lock()
+            .remove(&(&code as *const crate::CodeObject as usize));
     }
 
     /// The entry payload is peeked, not consumed: `advance` moves by the

@@ -1122,6 +1122,23 @@ pub fn top_ref() -> GcRef {
     })
 }
 
+/// Top root from a slot resolved once for this function.
+///
+/// `gc_enter_roots_frame` resolves the root stack once per function; later
+/// reads use that pointer. `top_ref` pays `LocalKey::with` on every call.
+///
+/// # Safety
+///
+/// `slot` must come from [`shadow_stack_slot`] on this thread, and the stack
+/// must be non-empty.
+#[inline]
+pub unsafe fn slot_top_ref(slot: ShadowStackSlot) -> GcRef {
+    let ss = unsafe { &*slot.0 };
+    let len = ss.len();
+    debug_assert!(len > 0, "shadow stack empty");
+    ss.get(len - 1)
+}
+
 /// Get a GcRef at `index` through a previously resolved [`ShadowStackSlot`].
 ///
 /// # Safety
