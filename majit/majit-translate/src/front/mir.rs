@@ -13139,8 +13139,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// `true` when the `AggregateKind::Adt` head constructs a
-    /// `core::ops::range::Range` whose element type is a word-sized integer
-    /// (`i64` / `isize` / `u64` / `usize`) — the `for _ in a..b` int-range
+    /// `core::ops::range::Range` whose element type is an integer that fits a
+    /// machine word (anything but `i128` / `u128`) — the `for _ in a..b` int-range
     /// shape `front::range_iter` diverts to the orthodox `range()` builtin.
     /// The element is read from the head's `generics.types[0]` (present even
     /// when the bounds are literal consts); a non-int element, a non-object
@@ -13182,10 +13182,10 @@ impl<'a> Lowering<'a> {
         };
         matches!(
             int.get("Signed").and_then(serde_json::Value::as_str),
-            Some("I64" | "Isize")
+            Some("I8" | "I16" | "I32" | "I64" | "Isize")
         ) || matches!(
             int.get("Unsigned").and_then(serde_json::Value::as_str),
-            Some("U64" | "Usize")
+            Some("U8" | "U16" | "U32" | "U64" | "Usize")
         )
     }
 
