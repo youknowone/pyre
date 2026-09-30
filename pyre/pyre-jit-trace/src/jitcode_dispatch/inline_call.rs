@@ -2902,6 +2902,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // `function.py` `_immutable_fields_ = ['code?', ...]`. The assembler
+    // token and this frame's pycode come from the function's code. A
+    // `GuardValue` on the function object does not watch that field, so
+    // `f.__code__ = ...` would keep entering the old body. The `?` marker
+    // invalidates the trace instead.
+    walker_pin_function_code(ctx, op.pc, callable)?;
+
     // Build the callee PyFrame inline (Branch A): a single positional
     // local, no cells, constant code / globals.
     let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
