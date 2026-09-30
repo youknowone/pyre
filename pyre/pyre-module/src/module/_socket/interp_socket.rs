@@ -4473,8 +4473,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         rustpython_host_env::socket::socket_from_share_data(&data)
                     }
                     .map_err(socket_io_err)?;
+                    // `before_external_block` lets another thread collect.
                     socket_init_state(
-                        obj,
+                        init_roots.get(init_base),
                         shared.raw,
                         shared.family,
                         shared.socket_type,

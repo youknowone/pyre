@@ -9331,8 +9331,9 @@ impl MiniMarkGC {
     /// `pyre_object::listobject`'s `W_ListObject` — `object_insert`,
     /// `object_remove` and `object_drain` each shift items with a bare
     /// `ptr::copy`. `object_reverse` follows `rlist.py ll_reverse` and
-    /// stores through `ll_setitem_fast` (`setarrayitem_gc`), which marks
-    /// the destination card itself. `object_splice` is not on this list —
+    /// stores through `ll_list_obj_setitem_fast` (`setarrayitem_gc`): the
+    /// host setter (`items_block_set_ref`) records the whole `ItemsBlock`
+    /// in the generic remembered set. `object_splice` is not on this list —
     /// it already calls `list_write_barrier` before its copies.
     ///
     /// Upstream reaches this barrier from those operations through
