@@ -2483,6 +2483,45 @@ impl<S: JitState> JitDriver<S> {
         self.blackhole_allocator = Some(Box::new(allocator));
     }
 
+    /// The allocator a reader materializes virtuals through
+    /// (`ResumeDataBoxReader.allocate_with_vtable` is
+    /// `execute_new_with_vtable`: the box holds the object it allocated).
+    pub fn blackhole_allocator(&self) -> Option<&dyn crate::resume::BlackholeAllocator> {
+        self.blackhole_allocator
+            .as_deref()
+            .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator)
+    }
+
+    /// `MetaInterp::rebuild_portal_framestack_from_resumedata` with this
+    /// driver's allocator, so a virtual the register rebuild materializes
+    /// is allocated like one a frame value names.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rebuild_portal_framestack_from_resumedata(
+        &mut self,
+        mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
+        frames: &[majit_ir::resumedata::RebuiltFrame],
+        fail_values: &[i64],
+        fail_types: &[majit_ir::Type],
+        materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
+        resume_liveness: &[u8],
+        resume_op_live: u8,
+    ) -> bool {
+        let allocator = self
+            .blackhole_allocator
+            .as_deref()
+            .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator);
+        self.meta.rebuild_portal_framestack_from_resumedata(
+            mainjitcode,
+            frames,
+            fail_values,
+            fail_types,
+            materialized,
+            resume_liveness,
+            resume_op_live,
+            allocator,
+        )
+    }
+
     /// Pre-register the per-driver green / red schema with the embedded
     /// `JitDriverStaticData::vars`.  The macro-emitted install path
     /// (`#[jit_interp]` codegen) calls this before
@@ -5860,7 +5899,7 @@ impl<S: JitState> JitDriver<S> {
         }
         // No blackhole runs before this entry, so its replay is the one that
         // owes the guard's deferred writes to the heap.
-        if !self.start_bridge_tracing(descr_arc, state, env, raw_values, target_pc, true, &[]) {
+        if !self.start_bridge_tracing(descr_arc, state, env, raw_values, target_pc, true) {
             return None;
         }
         // From here the trace session is LIVE, so a decline has to tear it
@@ -10376,9 +10415,6 @@ impl<S: JitState> JitDriver<S> {
         // entry no direct reader preceded, so the replay must apply each write
         // as `execute_and_record` does as well as record it.
         execute_replay: bool,
-        // The objects the direct reader allocated for the guard's virtuals,
-        // by virtual number, when one preceded this entry; empty otherwise.
-        direct_virtuals: &[i64],
     ) -> bool {
         // Same close as `force_start_tracing`: bridge codegen reads
         // `type_info_group` (`gctypelayout.py encode_type_shapes_now`).
@@ -10801,7 +10837,6 @@ impl<S: JitState> JitDriver<S> {
                 .tracing
                 .as_mut()
                 .expect("bridge: tracing context must be live");
-            ctx.set_bridge_direct_virtuals(direct_virtuals.to_vec());
             if let Some(idx) = bridge_reg_indices {
                 ctx.set_bridge_reg_indices(idx);
             }
@@ -13019,7 +13054,6 @@ mod tests {
             &fail_values,
             0,
             false,
-            &[],
         );
         assert!(!started);
         assert!(!driver.meta.is_tracing());
@@ -13092,7 +13126,7 @@ mod tests {
         let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
         let descr = failure.descr_arc.clone().unwrap();
         let mut state = BridgeState;
-        assert!(driver.start_bridge_tracing(&descr, &mut state, &(), &fail_values, 0, false, &[]));
+        assert!(driver.start_bridge_tracing(&descr, &mut state, &(), &fail_values, 0, false));
         assert_eq!(driver.meta.active_jitdriver_sd, Some(source_driver));
         assert_eq!(
             driver

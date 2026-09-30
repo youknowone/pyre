@@ -262,6 +262,7 @@ two-phase-never-a-subject	pyre_interpreter::call::metaclass_call_override
 two-phase-never-a-subject	pyre_interpreter::call::prepare_user_call
 two-phase-never-a-subject	pyre_interpreter::call::register_eval_override
 two-phase-never-a-subject	pyre_interpreter::call::register_genentry_merge_hook
+two-phase-never-a-subject	pyre_interpreter::call::register_set_jit_param_enable_opts_hook
 two-phase-never-a-subject	pyre_interpreter::call::register_set_jit_param_hook
 two-phase-never-a-subject	pyre_interpreter::call::register_set_jit_param_string_hook
 two-phase-never-a-subject	pyre_interpreter::call::register_unpack_merge_hook

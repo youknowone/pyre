@@ -252,8 +252,14 @@ impl<'a> BridgeVirtualCache<'a> {
         }
     }
 
+    /// The applying reader's object wins: it is the one the `NEW` carries,
+    /// read through the root the collector maintains. Only a recording-only
+    /// reader answers from the address a later decode parked.
     pub fn get_concrete_ptr(&self, i: usize) -> Option<majit_ir::GcRef> {
-        self.concrete_ptr_cache.get(i).copied().flatten()
+        match self.concrete_roots.get(i) {
+            Some(0) | None => self.concrete_ptr_cache.get(i).copied().flatten(),
+            Some(address) => Some(majit_ir::GcRef(*address as usize)),
+        }
     }
 
     pub fn set_concrete_ptr(&mut self, i: usize, v: majit_ir::GcRef) {
@@ -543,21 +549,6 @@ fn apply_setarrayitem(
     true
 }
 
-/// The recording-only reader's `allocate`: the object already exists,
-/// allocated by the direct reader that ran ahead of this bridge, so the
-/// `NEW` recorded for virtual `vidx` is stamped with that object instead of
-/// allocating a second one. `ResumeDataBoxReader.allocate_with_vtable` is
-/// `execute_new_with_vtable`, whose box holds the allocated object; this
-/// keeps that box/object pairing across pyre's split readers.
-fn stamp_direct_virtual(ctx: &mut crate::TraceCtx, vidx: usize, new_op: OpRef) {
-    if let Some(address) = ctx.bridge_direct_virtual(vidx) {
-        ctx.set_opref_concrete(
-            new_op,
-            majit_ir::Value::Ref(majit_ir::GcRef(address as usize)),
-        );
-    }
-}
-
 pub fn materialize_bridge_virtual(
     ctx: &mut crate::TraceCtx,
     vidx: usize,
@@ -706,8 +697,6 @@ pub fn materialize_bridge_virtual(
                 }
                 cache.set_concrete_root(vidx, ptr);
                 ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
-            } else {
-                stamp_direct_virtual(ctx, vidx, new_op);
             }
             // resume.py self.setfields(decoder, struct)
             if !setfields(
@@ -777,8 +766,6 @@ pub fn materialize_bridge_virtual(
                 // because `walk_active_trace_refs` walks `recorder.ops()`, so
                 // a concrete parked there is forwarded when the object moves.
                 ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
-            } else {
-                stamp_direct_virtual(ctx, vidx, new_op);
             }
             // resume.py self.setfields(decoder, struct)
             if !setfields(
@@ -850,8 +837,6 @@ pub fn materialize_bridge_virtual(
                 }
                 cache.set_concrete_root(vidx, ptr);
                 ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
-            } else {
-                stamp_direct_virtual(ctx, vidx, new_op);
             }
             // resume.py:656-670 element loop: dispatch by arraydescr kind
             // NB. the check for the kind of array elements is moved out of the loop

@@ -44,8 +44,17 @@ fn record_bridge_handler_entry_traceback<Sym: WalkSym>(
     // recorders journal their own attach, so a walk that is later discarded
     // does not leave the node behind for the metainterp's own delivery to
     // record on top of.
-    let emit_runtime = !record_prepend_application_traceback(wc, exc, exc_concrete, position)?;
-    record_inline_application_traceback(wc, exc, &mut exc_concrete, position, true, emit_runtime);
+    let node = record_prepend_application_traceback(wc, exc, exc_concrete, position)?;
+    let emit_runtime = node.is_none();
+    record_inline_application_traceback(
+        wc,
+        exc,
+        &mut exc_concrete,
+        position,
+        true,
+        emit_runtime,
+        node,
+    );
     record_top_level_application_traceback(
         wc,
         exc,
@@ -53,6 +62,7 @@ fn record_bridge_handler_entry_traceback<Sym: WalkSym>(
         position,
         true,
         emit_runtime,
+        node,
     );
     Ok(())
 }
@@ -781,6 +791,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                         position,
                         true,
                         false,
+                        None,
                     );
                 }
                 fbw_publish_exit_last_instr(&mut wc, position);

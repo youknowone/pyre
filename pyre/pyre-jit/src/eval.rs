@@ -13209,6 +13209,23 @@ fn bh_setarrayitem_float_from_descr(
 
 /// resume.py allocate_with_vtable(descr) → exec_new_with_vtable(cpu, descr).
 /// llmodel.py: bh_new_with_vtable uses sizedescr.get_vtable().
+/// `bh_new_with_vtable` writes the type at `OB_TYPE_OFFSET`; a pyre object
+/// also carries `PyObject.w_class`, which the interpreter's constructors set
+/// from the type. Seed it the same way so a materialized virtual is the
+/// object the trace's `NEW_WITH_VTABLE` models (its `w_class` folds to the
+/// type's instantiate pointer).
+fn seed_w_class(ptr: i64, descr: &dyn majit_ir::SizeDescr) {
+    if ptr == 0 {
+        return;
+    }
+    if let Some(w_class) = descr.w_class_obj() {
+        unsafe {
+            let pyobj = ptr as *mut pyre_object::PyObject;
+            (*pyobj).w_class = w_class as pyre_object::pyobject::PyObjectRef;
+        }
+    }
+}
+
 fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     let size = descr.size();
     let vtable = descr.vtable();
@@ -13228,7 +13245,9 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
         is_gc_managed: descr.is_gc_managed(),
     };
     let (driver, _) = driver_pair();
-    driver.meta_interp().backend().bh_new_with_vtable(&bh_descr) as usize
+    let ptr = driver.meta_interp().backend().bh_new_with_vtable(&bh_descr);
+    seed_w_class(ptr, descr);
+    ptr as usize
 }
 
 /// resume.py getvirtual_ptr parity.
@@ -14163,7 +14182,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     meta: &crate::jit::state::PyreMeta,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
-) -> Option<(Vec<Value>, usize, usize, Vec<(usize, usize)>, Vec<i64>)> {
+) -> Option<(Vec<Value>, usize, usize, Vec<(usize, usize)>)> {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit] exit-layout trace_id={} fail_idx={} source_op={:?} rd_numb={} recovery={} resume_layout={}",
@@ -14265,23 +14284,6 @@ pub(crate) fn decode_and_restore_guard_failure(
             &mut pending_virtuals_cache,
         )
     };
-    // The objects this reader allocated, by virtual number, for the bridge
-    // tracer's recording reader to stamp on the `NEW` it records for each
-    // (`ResumeDataBoxReader.allocate_with_vtable` returns the allocated
-    // object on its box). Only ref virtuals are objects; the rest stay 0.
-    let direct_virtuals: Vec<i64> = {
-        let count = exit_layout
-            .storage
-            .as_deref()
-            .map_or(0, |storage| storage.rd_virtuals.len());
-        (0..count)
-            .map(|vidx| match pending_virtuals_cache.get(&vidx) {
-                Some(Value::Ref(gcref)) => gcref.0 as i64,
-                _ => 0,
-            })
-            .collect()
-    };
-
     // virtualizable.py write_from_resume_data_partial: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
@@ -14373,13 +14375,7 @@ pub(crate) fn decode_and_restore_guard_failure(
             .iter()
             .map(|f| (f.code as usize, f.py_pc))
             .collect();
-        Some((
-            typed,
-            resume_pc,
-            resumed_frames.len(),
-            coords,
-            direct_virtuals,
-        ))
+        Some((typed, resume_pc, resumed_frames.len(), coords))
     } else {
         None
     }
@@ -15394,7 +15390,9 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                     is_gc_managed: sd.is_gc_managed(),
                 };
                 let (driver, _) = driver_pair();
-                driver.meta_interp().backend().bh_new_with_vtable(&bh_descr)
+                let ptr = driver.meta_interp().backend().bh_new_with_vtable(&bh_descr);
+                seed_w_class(ptr, sd);
+                ptr
             }
         }
     }

@@ -3602,7 +3602,6 @@ impl<M: Clone> MetaInterp<M> {
                 ia.set_value(Value::Ref(r));
             }
         }
-        trace_ctx.walk_bridge_direct_virtual_refs(&mut visitor);
         // pyjitpl.py — `initialize_virtualizable` /
         // `force_start_tracing` / `setup_tracing` snapshot inputarg
         // constants into `initial_inputarg_consts`. Each is an inline-const
@@ -18782,13 +18781,13 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             if handled {
-                let vable = self.unwrap_standard_virtualizable();
-                let frame = self.framestack.current_mut();
-                if frame.jitcode.code[frame.last_opcode_position]
-                    != crate::jitcode::insns::BC_RERAISE
-                {
-                    record_application_traceback(excvalue, vable, frame);
-                }
+                // No node for the catching frame here: the executor that
+                // enters the handler records it, reading `get_traceback()`
+                // off the live exception first and attaching after
+                // (`record_bridge_handler_entry_traceback`).  A node
+                // attached ahead of that read makes the read answer this
+                // frame's own node, at a coordinate the rebuilt frame does
+                // not carry yet.
                 return Err(FinishframeExceptionSignal::ChangeFrame);
             }
             {
@@ -19023,14 +19022,17 @@ impl<M: Clone> MetaInterp<M> {
     /// `resume.py` `rebuild_from_resumedata` for a bridge that already
     /// decoded its sections. `newframe(jitcodes[jitcode_pos])` per section,
     /// then `consume_boxes` into that frame's registers.
+    #[allow(clippy::too_many_arguments)]
     pub fn rebuild_portal_framestack_from_resumedata(
         &mut self,
         mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
         frames: &[majit_ir::resumedata::RebuiltFrame],
         fail_values: &[i64],
+        fail_types: &[majit_ir::Type],
         materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
         resume_liveness: &[u8],
         resume_op_live: u8,
+        allocator: Option<&dyn crate::resume::BlackholeAllocator>,
     ) -> bool {
         // `rebuild_from_resumedata`: `jitcode = staticdata.jitcodes[jitcode_pos]`,
         // then `newframe(jitcode)` and `setup_resume_at_op(pc)`. Each section
@@ -19090,9 +19092,11 @@ impl<M: Clone> MetaInterp<M> {
         self.consume_portal_resume_boxes(
             frames,
             fail_values,
+            fail_types,
             materialized,
             resume_liveness,
             resume_op_live,
+            allocator,
         )
     }
 
@@ -19109,13 +19113,16 @@ impl<M: Clone> MetaInterp<M> {
     /// A liveness/section length mismatch is a pyre guard: the bridge is
     /// not built and the caller aborts to blackhole. Upstream has no
     /// length check and always consumes.
+    #[allow(clippy::too_many_arguments)]
     fn consume_portal_resume_boxes(
         &mut self,
         frames: &[majit_ir::resumedata::RebuiltFrame],
         fail_values: &[i64],
+        fail_types: &[majit_ir::Type],
         materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
         resume_liveness: &[u8],
         resume_op_live: u8,
+        allocator: Option<&dyn crate::resume::BlackholeAllocator>,
     ) -> bool {
         // `getvirtual_ptr` records into the active trace. Take it out so
         // the frame borrow below does not alias `self.tracing`.
@@ -19126,34 +19133,38 @@ impl<M: Clone> MetaInterp<M> {
         let ok = self.consume_portal_resume_registers(
             frames,
             fail_values,
+            fail_types,
             materialized,
             resume_liveness,
             resume_op_live,
             tracing.as_mut(),
             resume_owned.as_ref(),
+            allocator,
         );
         self.tracing = tracing;
         ok
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn consume_portal_resume_registers(
         &mut self,
         frames: &[majit_ir::resumedata::RebuiltFrame],
         fail_values: &[i64],
+        fail_types: &[majit_ir::Type],
         materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
         resume_liveness: &[u8],
         resume_op_live: u8,
         mut tracing: Option<&mut crate::TraceCtx>,
         resume_data: Option<&crate::jit_state::ResumeDataResult>,
+        allocator: Option<&dyn crate::resume::BlackholeAllocator>,
     ) -> bool {
         // `registers_*` holds the box. The `*_values` mirror is
         // `box.getref_base()` when the reader stamped a concrete, and
         // the guard's rooted address when only the applying half has one.
-        // A virtual the recording reader built carries the object the
-        // direct reader allocated for it (`bridge_direct_virtual`); one
-        // it has no object for keeps `None` rather than a null mirror,
-        // which would be read as a known constant and folded into a
-        // residual call's argument.
+        // A virtual the reader allocated carries that object; one it has
+        // no object for keeps `None` rather than a null mirror, which
+        // would be read as a known constant and folded into a residual
+        // call's argument.
         fn virtual_box_bits(ctx: &crate::TraceCtx, opref: OpRef, root: Option<i64>) -> Option<i64> {
             match ctx.concrete_of_opref(opref) {
                 Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as i64),
@@ -19256,10 +19267,20 @@ impl<M: Clone> MetaInterp<M> {
                         .storage
                         .as_ref()
                         .map(|storage| storage.rd_virtuals());
-                    let mut cache = crate::BridgeVirtualCache::new(
-                        rd_virtuals.map_or(0, |entries| entries.len()),
-                        crate::default_bridge_array_descr,
-                    );
+                    let virtual_count = rd_virtuals.map_or(0, |entries| entries.len());
+                    let mut cache = match allocator {
+                        Some(allocator) => crate::BridgeVirtualCache::executing(
+                            virtual_count,
+                            crate::default_bridge_array_descr,
+                            allocator,
+                            fail_values,
+                            fail_types,
+                        ),
+                        None => crate::BridgeVirtualCache::new(
+                            virtual_count,
+                            crate::default_bridge_array_descr,
+                        ),
+                    };
                     for (bank, index, vidx) in virtuals {
                         let opref = crate::materialize_bridge_virtual(
                             ctx,
@@ -23381,7 +23402,16 @@ mod portal_resume_rebuild_tests {
         let jitcode = rvmprof_jitcode();
         install(&mut meta, jitcode.clone());
         let frames = [section(majit_ir::resumedata::NO_JITCODE_PC, vec![])];
-        let ok = meta.rebuild_portal_framestack_from_resumedata(jitcode, &frames, &[], &[], &[], 0);
+        let ok = meta.rebuild_portal_framestack_from_resumedata(
+            jitcode,
+            &frames,
+            &[],
+            &[],
+            &[],
+            &[],
+            0,
+            None,
+        );
         assert!(!ok);
         assert!(meta.framestack.frames.is_empty());
     }
@@ -23396,7 +23426,16 @@ mod portal_resume_rebuild_tests {
             pc: 0,
             values: vec![],
         }];
-        let _ = meta.rebuild_portal_framestack_from_resumedata(jitcode, &frames, &[], &[], &[], 0);
+        let _ = meta.rebuild_portal_framestack_from_resumedata(
+            jitcode,
+            &frames,
+            &[],
+            &[],
+            &[],
+            &[],
+            0,
+            None,
+        );
     }
 
     #[test]
@@ -23427,8 +23466,10 @@ mod portal_resume_rebuild_tests {
             &frames,
             &[],
             &[],
+            &[],
             &liveness_two_ints(),
             BC_LIVE,
+            None,
         );
         assert!(ok);
         assert_eq!(meta.framestack.frames.len(), 1);

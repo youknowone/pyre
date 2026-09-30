@@ -4324,6 +4324,31 @@ fn descr_field_name(descr: &DescrRef) -> &str {
         .unwrap_or("<unnamed>")
 }
 
+/// `_opimpl_getfield_gc_any_pureornot` ref arm: the cached box and the
+/// live field are different objects. `gc_current_object_address` repairs
+/// a forwarding stub; it does not repair a nursery slot that was reused,
+/// nor a store that missed `setfield` / `invalidate_caches`.
+fn ref_heapcache_hit_is_stale(ctx: &TraceCtx, obj: OpRef, descr: &DescrRef, cached: OpRef) -> bool {
+    let Some(majit_ir::Value::Ref(cached_ref)) = ctx.box_value(cached) else {
+        return false;
+    };
+    if cached_ref == majit_ir::GcRef::NO_CONCRETE {
+        return false;
+    }
+    let Some(struct_ptr) = concrete_gc_ptr(ctx, obj) else {
+        return false;
+    };
+    let struct_ptr = majit_gc::gc_current_object_address(struct_ptr as usize) as i64;
+    let Some(majit_ir::Value::Ref(loaded)) =
+        ctx.field_sanity_load(struct_ptr, descr, majit_ir::Type::Ref)
+    else {
+        return false;
+    };
+    let loaded_now = majit_gc::gc_current_object_address(loaded.0);
+    let cached_now = majit_gc::gc_current_object_address(cached_ref.0);
+    loaded_now != cached_now
+}
+
 fn concrete_gc_ptr(ctx: &TraceCtx, obj: OpRef) -> Option<i64> {
     let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) else {
         return None;
@@ -9087,6 +9112,16 @@ fn bridge_decode_box(
         }
         RebuiltValue::Virtual(vidx) => {
             let opref = materialize_bridge_virtual(ctx, *vidx, rd_virtuals, resume_data, cache);
+            // The applying reader allocated the object at the `NEW` it
+            // recorded and stamped it there; that object is the box's value.
+            // Allocating another here would give the walk a second object
+            // for one box.
+            if cache.allocator().is_some()
+                && let Some(value) = ctx.concrete_of_opref(opref)
+                && value.get_type() == expected_kind
+            {
+                return (opref, value);
+            }
             if expected_kind == Type::Int {
                 let value = materialize_concrete_virtual_int(
                     *vidx,
@@ -10672,12 +10707,26 @@ impl JitState for PyreJitState {
         // virtual number, holding both symbolic OpRef (for trace ops) and
         // concrete GcRef (for shadow values / continue_tracing). RPython's
         // VirtualCache stores both in one object; pyre unifies them here.
-        let mut virtuals_cache = BridgeVirtualCache::new(
-            rd_virtuals.map_or(0, |v| v.len()),
-            crate::descr::make_array_descr,
-        );
+        //
+        // `ResumeDataBoxReader.allocate_with_vtable` is
+        // `execute_new_with_vtable`: the `NEW` this walk records carries the
+        // object it allocates, so the box and the object this walk executes
+        // on are one pair. The applying half of the cache is that allocation
+        // (`materialize_bridge_virtual` stamps the object on the `NEW`); the
+        // deferred-store replay stays governed by `executing` above.
         let (driver, _) = crate::driver::driver_pair();
         let backend = driver.meta_interp().backend();
+        let virtual_count = rd_virtuals.map_or(0, |v| v.len());
+        let mut virtuals_cache = match driver.blackhole_allocator() {
+            Some(allocator) => BridgeVirtualCache::executing(
+                virtual_count,
+                crate::descr::make_array_descr,
+                allocator,
+                fail_values,
+                fail_types,
+            ),
+            None => BridgeVirtualCache::new(virtual_count, crate::descr::make_array_descr),
+        };
 
         // resume.py decode_box parity — unified via bridge_decode_box.
         // Each call returns (OpRef, Value), eliminating the separate

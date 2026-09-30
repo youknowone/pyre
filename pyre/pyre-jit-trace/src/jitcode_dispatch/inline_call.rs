@@ -4577,6 +4577,20 @@ fn walker_ec_enter(
     vref
 }
 
+/// The box this walk holds for the frame at `frame_ptr`: the virtual of a
+/// `virtual_ref` pair still open (an inlined caller), else the portal
+/// virtualizable.  `None` when the walk has no box for it.
+fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
+    if let Some(virtual_box) = ctx.virtualref_virtual_for_object_ptr(frame_ptr) {
+        return Some(virtual_box);
+    }
+    let vable = ctx.standard_virtualizable_box()?;
+    match ctx.standard_virtualizable_concrete()? {
+        majit_ir::Value::Ref(gc) if gc.as_usize() == frame_ptr => Some(vable),
+        _ => None,
+    }
+}
+
 /// `executioncontext.py ExecutionContext.leave`'s frame-chain half, at
 /// the return from an inlined call.
 ///
@@ -4701,6 +4715,27 @@ pub(crate) fn walker_ec_leave(
             // `f_back = frame.f_backref()` with the parens.
             let f_back = (*concrete_frame).get_f_back();
             if !f_back.is_null() {
+                // `f_back.mark_as_escaped()` is traced: the store lands in
+                // the trace and in the heapcache, on the box this walk holds
+                // for the caller frame — the pair its `enter` pushed, or the
+                // portal virtualizable.  Left to the concrete side alone, a
+                // caller frame the bridge rebuilt keeps `flags` cached at
+                // its rebuilt value while the object already carries the
+                // bit, and the next read of it trips the cache-hit check.
+                if let Some(f_back_box) = caller_frame_box_for(ctx, f_back as usize) {
+                    let flags_descr = crate::descr::pyframe_flags_descr();
+                    let live_flags =
+                        crate::state::opimpl_getfield_gc_i(ctx, f_back_box, flags_descr.clone());
+                    let escaped_bit =
+                        ctx.const_int(i64::from(pyre_interpreter::PyFrame::FLAG_ESCAPED));
+                    let new_flags = ctx.record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[f_back_box, new_flags],
+                        flags_descr.clone(),
+                    );
+                    ctx.heapcache_setfield_cached(f_back_box, flags_descr.index(), new_flags);
+                }
                 (*f_back).mark_as_escaped();
             }
             // `frame_vref()` — force the leaving frame's own vref so it
@@ -9806,8 +9841,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // frame never surfaces an error the interpreter's
                 // `handle_exception` could record a node from.  Emit the node
                 // at runtime as well as applying it for the recording pass.
-                let emit_runtime =
-                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
+                let node = record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
+                let emit_runtime = node.is_none();
                 record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,
@@ -9816,6 +9851,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     op.pc,
                     true,
                     emit_runtime,
+                    node,
                 );
                 record_top_level_application_traceback(
                     ctx,
@@ -9824,6 +9860,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     op.pc,
                     true,
                     emit_runtime,
+                    node,
                 );
                 ctx.set_last_exc_value(exc, exc_concrete);
                 Ok(Some((DispatchOutcome::Continue, target)))
@@ -16849,8 +16886,8 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 // frame never surfaces an error the interpreter's
                 // `handle_exception` could record a node from.  Emit the node
                 // at runtime as well as applying it for the recording pass.
-                let emit_runtime =
-                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
+                let node = record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
+                let emit_runtime = node.is_none();
                 record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,
@@ -16859,6 +16896,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                     op.pc,
                     true,
                     emit_runtime,
+                    node,
                 );
                 record_top_level_application_traceback(
                     ctx,
@@ -16867,6 +16905,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                     op.pc,
                     true,
                     emit_runtime,
+                    node,
                 );
                 // `finishframe_exception` hands the handler the exception
                 // the callee raised, concrete shadow included, so a
@@ -17334,8 +17373,8 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 // frame never surfaces an error the interpreter's
                 // `handle_exception` could record a node from.  Emit the node
                 // at runtime as well as applying it for the recording pass.
-                let emit_runtime =
-                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
+                let node = record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
+                let emit_runtime = node.is_none();
                 record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,
@@ -17344,6 +17383,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                     op.pc,
                     true,
                     emit_runtime,
+                    node,
                 );
                 record_top_level_application_traceback(
                     ctx,
@@ -17352,6 +17392,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                     op.pc,
                     true,
                     emit_runtime,
+                    node,
                 );
                 // `finishframe_exception` hands the handler the exception
                 // the callee raised, concrete shadow included, so a
@@ -17571,8 +17612,8 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 // frame never surfaces an error the interpreter's
                 // `handle_exception` could record a node from.  Emit the node
                 // at runtime as well as applying it for the recording pass.
-                let emit_runtime =
-                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
+                let node = record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
+                let emit_runtime = node.is_none();
                 record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,
@@ -17581,6 +17622,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                     op.pc,
                     true,
                     emit_runtime,
+                    node,
                 );
                 record_top_level_application_traceback(
                     ctx,
@@ -17589,6 +17631,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                     op.pc,
                     true,
                     emit_runtime,
+                    node,
                 );
                 // `finishframe_exception` hands the handler the exception
                 // the callee raised, concrete shadow included, so a
