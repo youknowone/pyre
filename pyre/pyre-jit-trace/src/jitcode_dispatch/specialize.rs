@@ -8475,15 +8475,14 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
     }
 }
 
-/// Exact `list[int]` for a declined/admitted getitem helper: the storage
-/// load `try_walker_specialize_subscr` records, without a residual
-/// `call_descr` (inline_call has none).  Fannkuch's `p[i]`/`q[q0]`
-/// otherwise stay `CallMayForce`.
+/// Exact `list[int]` when an inlined getitem helper declines. Walks
+/// `w_list_getitem_inner`. An unfinished walk leaves the inline site on
+/// its residual.
 pub(crate) fn try_emit_list_int_getitem<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
-    dst: usize,
+    _dst: usize,
     dst_bank: char,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     if r_args.len() != 2 || dst_bank != 'r' {
@@ -8527,101 +8526,12 @@ pub(crate) fn try_emit_list_int_getitem<Sym: WalkSym>(
     } else {
         return Ok(None);
     };
-    if let Some(boxed) = try_walker_orthodox_list_getitem(
+    let Some(boxed) = try_walker_orthodox_list_getitem(
         ctx, op_pc, r_args[0], r_args[1], list_obj, key_obj, sid, index,
-    )? {
-        return Ok(Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }));
-    }
-    let Some(elem_obj) = (unsafe { pyre_object::w_list_getitem(list_obj, index) }) else {
+    )?
+    else {
         return Ok(None);
     };
-    let list_op = r_args[0];
-    let key_op = r_args[1];
-    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, list_op, list_type_addr)?;
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        list_op,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
-    )?;
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        list_op,
-        crate::descr::list_strategy_descr(),
-    );
-    let sid_const = ctx.trace_ctx.const_int(sid);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, sid_const);
-    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
-    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
-    ctx.trace_ctx
-        .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
-    let len_descr = match sid {
-        0 => crate::descr::list_length_descr(),
-        1 => crate::descr::list_int_items_len_descr(),
-        2 => crate::descr::list_float_items_len_descr(),
-        _ => return Ok(None),
-    };
-    let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
-    walker_emit_index_bounds_guards(ctx, op_pc, raw_index, index, lenbox, concrete_len)?;
-    let (boxed, boxed_concrete) = match sid {
-        0 => {
-            let items_block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                list_op,
-                crate::descr::list_items_descr(),
-            );
-            (
-                crate::state::trace_items_block_getitem_value(
-                    ctx.trace_ctx,
-                    items_block,
-                    raw_index,
-                ),
-                majit_ir::Value::Ref(majit_ir::GcRef(elem_obj as usize)),
-            )
-        }
-        1 => {
-            let block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                list_op,
-                crate::descr::list_int_items_block_descr(),
-            );
-            let raw = crate::state::trace_int_block_getitem_value(ctx.trace_ctx, block, raw_index);
-            let elem = unsafe { pyre_object::w_int_get_value(elem_obj) };
-            ctx.trace_ctx
-                .set_opref_concrete(raw, majit_ir::Value::Int(elem));
-            (
-                walker_box_int(ctx, op_pc, raw, elem)?,
-                box_int_concrete(elem, elem_obj as i64),
-            )
-        }
-        2 => {
-            let block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                list_op,
-                crate::descr::list_float_items_block_descr(),
-            );
-            let raw =
-                crate::state::trace_float_block_getitem_value(ctx.trace_ctx, block, raw_index);
-            let elem = unsafe { pyre_object::w_float_get_value(elem_obj) };
-            ctx.trace_ctx
-                .set_opref_concrete(raw, majit_ir::Value::Float(elem));
-            (
-                crate::state::wrapfloat(ctx.trace_ctx, raw),
-                majit_ir::Value::Ref(majit_ir::GcRef(elem_obj as usize)),
-            )
-        }
-        _ => return Ok(None),
-    };
-    ctx.trace_ctx.set_opref_concrete(boxed, boxed_concrete);
-    let _ = dst;
     Ok(Some(DispatchOutcome::SubReturn {
         result: Some(boxed),
     }))
