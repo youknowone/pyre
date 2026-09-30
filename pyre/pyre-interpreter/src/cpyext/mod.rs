@@ -45,6 +45,7 @@ pub mod number;
 pub mod object;
 pub mod osmodule;
 pub mod pyerrors;
+pub mod pyfile;
 pub mod pymem;
 pub mod pyobject;
 pub mod pystate;
@@ -947,6 +948,7 @@ pub fn ensure_linked() {
     lock::ensure_linked();
     unicodewriter::ensure_linked();
     pyerrors::ensure_linked();
+    pyfile::ensure_linked();
     pymem::ensure_linked();
     setobject::ensure_linked();
     sliceobject::ensure_linked();

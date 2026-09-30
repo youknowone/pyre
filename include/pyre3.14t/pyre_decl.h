@@ -510,6 +510,12 @@ PyAPI_FUNC(void) _PyErr_ChainExceptions1(PyObject *);
 PyAPI_FUNC(void) _PyPyre_WriteUnraisable(PyObject *, PyObject *);
 PyAPI_FUNC(void) _Py_FatalErrorFunc(const char *, const char *);
 
+/* cpyext/pyfile.rs */
+PyAPI_FUNC(PyObject *) PyFile_FromFd(int, const char *, const char *, int, const char *, const char *, const char *, int);
+PyAPI_FUNC(PyObject *) PyFile_GetLine(PyObject *, int);
+PyAPI_FUNC(int) PyFile_WriteObject(PyObject *, PyObject *, int);
+PyAPI_FUNC(int) PyFile_WriteString(const char *, PyObject *);
+
 /* cpyext/pymem.rs */
 PyAPI_FUNC(void *) PyMem_Calloc(size_t, size_t);
 PyAPI_FUNC(void) PyMem_Free(void *);

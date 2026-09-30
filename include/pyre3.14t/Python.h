@@ -97,6 +97,7 @@
 #include "code.h"
 #include "funcobject.h"
 #include "frameobject.h"
+#include "fileobject.h"
 #include "traceback.h"
 #include "import.h"
 #include "modsupport.h"
