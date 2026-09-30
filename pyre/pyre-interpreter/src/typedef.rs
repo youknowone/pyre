@@ -530,26 +530,30 @@ pub fn init_typeobjects() {
             )) as usize,
         );
 
-        // array.array — interp_array.py, bases=(object,)
-        let array_type = pyre_object::with_roots!(int_type, object_type => new_typeobject_with_base_and_layout(
-            "array.array",
-            crate::module::array::init_array_type,
-            object_type,
-            &pyre_object::interp_array::ARRAY_TYPE as *const PyType,
-        ));
-        // CPython 3.14 Modules/arraymodule.c:array_modexec uses
-        // PyType_FromModuleAndSpec; array_spec carries IMMUTABLETYPE.
-        mark_cpython_heap_type(array_type, true);
-        unsafe {
-            pyre_object::w_type_set_typedef_buffer(
-                array_type,
-                Some(pyre_object::TypeDefBuffer::ReadWrite),
+        // array.array — interp_array.py, bases=(object,). The module installs
+        // the type; without it the entry stays out of the registry.
+        if let Some(hooks) = crate::importing::optional_module_hooks() {
+            let init_array_type = hooks.init_array_type;
+            let array_type = pyre_object::with_roots!(int_type, object_type => new_typeobject_with_base_and_layout(
+                "array.array",
+                init_array_type,
+                object_type,
+                &pyre_object::interp_array::ARRAY_TYPE as *const PyType,
+            ));
+            // CPython 3.14 Modules/arraymodule.c:array_modexec uses
+            // PyType_FromModuleAndSpec; array_spec carries IMMUTABLETYPE.
+            mark_cpython_heap_type(array_type, true);
+            unsafe {
+                pyre_object::w_type_set_typedef_buffer(
+                    array_type,
+                    Some(pyre_object::TypeDefBuffer::ReadWrite),
+                );
+            }
+            reg.insert(
+                &pyre_object::interp_array::ARRAY_TYPE as *const PyType as usize,
+                array_type as usize,
             );
         }
-        reg.insert(
-            &pyre_object::interp_array::ARRAY_TYPE as *const PyType as usize,
-            array_type as usize,
-        );
 
         // bool — boolobject.py, bases=(int,)
         // Layout = BOOL_TYPE (not INT_TYPE: different struct size).
@@ -2008,7 +2012,6 @@ pub fn init_typeobjects() {
             (&pyre_object::pyobject::TUPLE_TYPE, b'S'),
             (&pyre_object::functional::RANGE_TYPE, b'S'),
             (&pyre_object::memoryview::MEMORYVIEW_TYPE, b'S'),
-            (&pyre_object::interp_array::ARRAY_TYPE, b'S'),
         ] {
             let w_typeobject = *reg
                 .get(&(pytype as *const PyType as usize))
@@ -2016,6 +2019,17 @@ pub fn init_typeobjects() {
                 as PyObjectRef;
             unsafe {
                 pyre_object::typeobject::w_type_set_flag_map_or_seq(w_typeobject, flag);
+            }
+        }
+        // Registered only with the `array` module.
+        if let Some(&w_typeobject_addr) = reg.get(&(
+            &pyre_object::interp_array::ARRAY_TYPE as *const PyType as usize
+        )) {
+            unsafe {
+                pyre_object::typeobject::w_type_set_flag_map_or_seq(
+                    w_typeobject_addr as PyObjectRef,
+                    b'S',
+                );
             }
         }
         // typeobject.py TypeCache.build: `w_type.flag_sequence_bug_compat =
@@ -35207,11 +35221,6 @@ mod tests {
                 "object",
                 crate::typedef::w_object(),
                 STATIC_BUILTIN | IMMUTABLETYPE,
-            ),
-            (
-                "array.array",
-                crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
-                HEAPTYPE | IMMUTABLETYPE,
             ),
             (
                 "itertools.count",

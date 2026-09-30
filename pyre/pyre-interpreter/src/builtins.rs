@@ -672,7 +672,7 @@ pub(crate) fn w_memoryview_new_with_flags(
 /// Python `super().__buffer__(flags)` reaches the base slot directly; it must
 /// not redispatch to the concrete subclass's Python `__buffer__`, which would
 /// recurse back into the method that called `super()`.
-pub(crate) fn w_memoryview_new_native_with_flags(
+pub fn w_memoryview_new_native_with_flags(
     w_obj: PyObjectRef,
     flags: i32,
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -2401,7 +2401,7 @@ pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 /// exporter, then release the memoryview itself.  The native
 /// `bf_releasebuffer` reached by [`memoryview_release`] performs the single
 /// matching export decrement.
-pub(crate) fn buffer_exporter_release_view(
+pub fn buffer_exporter_release_view(
     exporter: PyObjectRef,
     view: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -12554,7 +12554,7 @@ fn getindex_w_for_base(w_base: PyObjectRef) -> Result<u32, crate::PyError> {
 ///
 /// Return w_obj.__index__() as i64. On overflow, clamp to i64::MAX
 /// (w_exception=None path).
-pub(crate) fn getindex_w(mut w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
+pub fn getindex_w(mut w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
     unsafe {
         if is_int(w_obj) {
             return Ok(w_int_get_value(w_obj));

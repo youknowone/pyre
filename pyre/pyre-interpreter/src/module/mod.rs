@@ -21,14 +21,12 @@ pub mod _structseq;
 pub mod _suggestions;
 pub mod _symtable;
 pub mod _template;
-pub mod _tokenize;
 pub mod _types;
 pub mod _typing;
 pub mod _warnings;
 pub mod _weakref;
 #[cfg(windows)]
 pub mod _winreg;
-pub mod array;
 pub mod atexit;
 pub mod errno;
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]

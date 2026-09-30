@@ -43,7 +43,7 @@ pub fn adapt_lower_bound(size: i64, w_index: PyObjectRef) -> Result<i64, crate::
 /// converts its optional start/stop: `[1, 2].index(2, None)` is a TypeError
 /// even though `[1, 2][None:]` is not.  The message drops the `or None` the
 /// slicing form offers.
-pub(crate) fn eval_slice_index_not_none(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
+pub fn eval_slice_index_not_none(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
     // `_PyIndex_Check` gates the substituted message and is a type test, so a
     // bound that has `__index__` is converted exactly once, by
     // `eval_slice_index`.  Probing with a conversion instead would run a user

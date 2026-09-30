@@ -8,10 +8,12 @@
 //! into element bytes, the bound methods, the `__new__` constructor, and
 //! the module-level `_array_reconstructor` unpickler.
 
-use crate::baseobjspace::{float_w, int_w, uint_w};
-use crate::objspace::descroperation::{CompareOp, compare};
-use crate::{PyError, PyErrorKind, PyResult, make_builtin_function_with_arity, module_ns_store};
 use majit_rlib::rbigint::RBigInt as BigInt;
+use pyre_interpreter::baseobjspace::{float_w, int_w, uint_w};
+use pyre_interpreter::objspace::descroperation::{CompareOp, compare};
+use pyre_interpreter::{
+    PyError, PyErrorKind, PyResult, make_builtin_function_with_arity, module_ns_store,
+};
 use pyre_object::interp_array as arr;
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
@@ -47,7 +49,7 @@ fn pack_into(typecode: u8, w: PyObjectRef, out: &mut Bytes) -> Result<usize, PyE
         if unsafe { pyre_object::is_int(w) || pyre_object::pyobject::is_long(w) } {
             return int_w(w);
         }
-        int_w(crate::baseobjspace::space_index(w)?)
+        int_w(pyre_interpreter::baseobjspace::space_index(w)?)
     }
     let n = match typecode {
         b'b' => {
@@ -98,7 +100,7 @@ fn pack_into(typecode: u8, w: PyObjectRef, out: &mut Bytes) -> Result<usize, PyE
             let v = if unsafe { pyre_object::is_int(w) || pyre_object::pyobject::is_long(w) } {
                 uint_w(w)
             } else {
-                uint_w(crate::baseobjspace::space_index(w)?)
+                uint_w(pyre_interpreter::baseobjspace::space_index(w)?)
             }
             .map_err(|error| {
                 if error.kind == PyErrorKind::ValueError {
@@ -329,11 +331,13 @@ fn array_extend_iterable(
     // a no-op under a live export, and iterator side effects precede the first
     // per-item resize check.
     let w_iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let w_iter = crate::baseobjspace::iter(w_iterable)?;
+    let w_iter = pyre_interpreter::baseobjspace::iter(w_iterable)?;
     let iter_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_iter);
     loop {
-        match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+        match pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(
+            iter_slot,
+        )) {
             Ok(w_item) => {
                 let obj = pyre_object::gc_roots::shadow_stack_get(base);
                 array_append_value(obj, w_item)?;
@@ -378,7 +382,7 @@ fn array_frombytes(obj: PyObjectRef, bytes: &[u8]) -> Result<(), PyError> {
 
 /// `array.__new__(cls, typecode, [initializer])` — `interp_array.py w_array`.
 fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
     if pos.len() < 2 {
         return Err(PyError::type_error(
             "array() takes at least 1 argument (0 given)",
@@ -399,7 +403,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     let _pos_roots = pyre_object::gc_roots::push_roots();
     let pos_base = pyre_object::gc_roots::pin_roots(pos);
     let cls = pyre_object::gc_roots::shadow_stack_get(pos_base);
-    let canonical = crate::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
+    let canonical = pyre_interpreter::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
         .map_or(PY_NULL, |ty| ty.as_ptr());
     // PyPy's interp2app gateway leaves keywords available to a subtype's
     // overridden __init__.  The exact array type (and a subtype inheriting
@@ -408,15 +412,15 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     let init_matches = std::ptr::eq(cls, canonical)
         || unsafe {
             match (
-                crate::baseobjspace::lookup_in_type(cls, "__init__"),
-                crate::baseobjspace::lookup_in_type(canonical, "__init__"),
+                pyre_interpreter::baseobjspace::lookup_in_type(cls, "__init__"),
+                pyre_interpreter::baseobjspace::lookup_in_type(canonical, "__init__"),
             ) {
                 (Some(sub), Some(base)) => std::ptr::eq(sub, base),
                 (None, None) => true,
                 _ => false,
             }
         };
-    if init_matches && crate::builtins::has_real_kwargs(kwargs) {
+    if init_matches && pyre_interpreter::builtins::has_real_kwargs(kwargs) {
         return Err(PyError::type_error(
             "array.array() takes no keyword arguments",
         ));
@@ -426,7 +430,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     if !unsafe { pyre_object::is_str(w_typecode) } {
         return Err(PyError::type_error(format!(
             "array() argument 1 must be a unicode character, not {}",
-            crate::baseobjspace::object_functionstr_type_name(w_typecode)
+            pyre_interpreter::baseobjspace::object_functionstr_type_name(w_typecode)
         )));
     }
     // Measured in code points on the raw buffer: a lone surrogate is one
@@ -447,7 +451,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
         PyError::value_error("bad typecode (must be b, B, u, w, h, H, i, I, l, L, q, Q, f or d)")
     })?;
     if typecode == b'u' {
-        crate::warn::warn_deprecation(
+        pyre_interpreter::warn::warn_deprecation(
             "The 'u' type code is deprecated and will be removed in Python 3.16",
         )?;
     }
@@ -510,7 +514,7 @@ fn array_fromunicode(obj: PyObjectRef, w_str: PyObjectRef) -> Result<(), PyError
     if !unsafe { pyre_object::is_str(w_str) } {
         return Err(PyError::type_error(format!(
             "fromunicode() argument must be str, not {}",
-            crate::type_methods::clinic_arg_type_name(w_str)
+            pyre_interpreter::type_methods::clinic_arg_type_name(w_str)
         )));
     }
     if !matches!(unsafe { arr::w_array_typecode(obj) }, b'u' | b'w') {
@@ -555,7 +559,7 @@ fn index_in_range(obj: PyObjectRef, w_index: PyObjectRef, what: &str) -> Result<
     let w_index = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if unsafe {
         !pyre_object::pyobject::is_int_or_long(w_index)
-            && crate::baseobjspace::lookup(w_index, "__index__").is_none()
+            && pyre_interpreter::baseobjspace::lookup(w_index, "__index__").is_none()
     } {
         // PyPy `ObjSpace.decode_index4` enters `getindex_w` only after the
         // slice branch.  [3.14-spec] `arraymodule.c::array_subscr` and
@@ -563,7 +567,7 @@ fn index_in_range(obj: PyObjectRef, w_index: PyObjectRef, what: &str) -> Result<
         // with no index slot; an existing slot's own failure still escapes.
         return Err(PyError::type_error("array indices must be integers"));
     }
-    let w_indexed = crate::baseobjspace::space_index(w_index)?;
+    let w_indexed = pyre_interpreter::baseobjspace::space_index(w_index)?;
     let mut i = match int_w(w_indexed) {
         Ok(i) => i,
         Err(error) if error.kind == PyErrorKind::OverflowError => {
@@ -573,9 +577,10 @@ fn index_in_range(obj: PyObjectRef, w_index: PyObjectRef, what: &str) -> Result<
             // exception class selected by the array subscription boundary.
             return Err(PyError::new(
                 PyErrorKind::IndexError,
-                format!("cannot fit '{}' into an index-sized integer", unsafe {
-                    crate::baseobjspace::object_functionstr_type_name(w_index)
-                }),
+                format!(
+                    "cannot fit '{}' into an index-sized integer",
+                    pyre_interpreter::baseobjspace::object_functionstr_type_name(w_index)
+                ),
             ));
         }
         Err(error) => return Err(error),
@@ -603,13 +608,13 @@ fn array_slice_indices(
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj, key]);
     let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let (start, stop, step) = crate::sliceobject::slice_unpack(
+    let (start, stop, step) = pyre_interpreter::sliceobject::slice_unpack(
         unsafe { pyre_object::sliceobject::w_slice_get_start(key) },
         unsafe { pyre_object::sliceobject::w_slice_get_stop(key) },
         unsafe { pyre_object::sliceobject::w_slice_get_step(key) },
     )?;
     let len = unsafe { arr::w_array_len(pyre_object::gc_roots::shadow_stack_get(base)) } as i64;
-    Ok(crate::sliceobject::slice_adjust_indices(
+    Ok(pyre_interpreter::sliceobject::slice_adjust_indices(
         start, stop, step, len,
     ))
 }
@@ -658,7 +663,7 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
         if !unsafe { arr::is_array(w_value) } {
             return Err(PyError::type_error(format!(
                 "can only assign array (not \"{}\") to array slice",
-                crate::error::type_name_of(w_value)
+                pyre_interpreter::error::type_name_of(w_value)
             )));
         }
         let tc = unsafe { arr::w_array_typecode(obj) };
@@ -835,7 +840,7 @@ fn require_array_receiver(
         return Err(PyError::type_error(message));
     };
     if !unsafe { arr::is_array(receiver) } {
-        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let received = pyre_interpreter::baseobjspace::object_functionstr_type_name(receiver);
         let message = if method_descriptor {
             format!(
                 "descriptor '{name}' for 'array.array' objects doesn't apply to a '{received}' object"
@@ -869,7 +874,7 @@ fn check_arity_range(
 
 fn array_append_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "append", true)?;
-    crate::type_methods::reject_kwargs_of(Some("array"), args, "append")?;
+    pyre_interpreter::type_methods::reject_kwargs_of(Some("array"), args, "append")?;
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
             "array.append() takes exactly one argument ({} given)",
@@ -883,13 +888,13 @@ fn array_append_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_extend_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "extend", true)?;
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
     let positional_given = if positional.is_empty() {
         0
     } else {
         positional.len() - 1
     };
-    let supplied = positional_given + crate::builtins::real_kwarg_count(kwargs);
+    let supplied = positional_given + pyre_interpreter::builtins::real_kwarg_count(kwargs);
     // [3.14-spec] CPython v3.14.6 `array_array_extend`'s positional-only
     // clinic gateway checks the required positional count before diagnosing
     // its blank keyword slot; PyPy's interp2app gateway reports its own owner.
@@ -915,8 +920,8 @@ fn array_extend_method(args: &[PyObjectRef]) -> PyResult {
 /// Py_ssize_t overflow wording, so keep PyPy's gateway-before-body ordering
 /// while applying the 3.14 observable contract.
 fn array_ssize_index_w(w_index: PyObjectRef) -> Result<i64, PyError> {
-    let w_index = crate::baseobjspace::space_index(w_index)?;
-    crate::baseobjspace::int_w(w_index).map_err(|error| {
+    let w_index = pyre_interpreter::baseobjspace::space_index(w_index)?;
+    pyre_interpreter::baseobjspace::int_w(w_index).map_err(|error| {
         if error.kind == PyErrorKind::OverflowError
             && error.message_text() == "int too large to convert to int"
         {
@@ -929,8 +934,8 @@ fn array_ssize_index_w(w_index: PyObjectRef) -> Result<i64, PyError> {
 
 fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "insert", true)?;
-    crate::type_methods::reject_kwargs_of(Some("array"), args, "insert")?;
-    crate::type_methods::arity_exact_unpack(args, "insert", 2)?;
+    pyre_interpreter::type_methods::reject_kwargs_of(Some("array"), args, "insert")?;
+    pyre_interpreter::type_methods::arity_exact_unpack(args, "insert", 2)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     // `@unwrap_spec(idx=int)` runs before PyPy's `descr_insert` reads len.
@@ -1002,8 +1007,8 @@ fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "pop", true)?;
-    crate::type_methods::reject_kwargs_of(Some("array"), args, "pop")?;
-    crate::type_methods::arity_at_most(args, "pop", 1)?;
+    pyre_interpreter::type_methods::reject_kwargs_of(Some("array"), args, "pop")?;
+    pyre_interpreter::type_methods::arity_at_most(args, "pop", 1)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     // `@unwrap_spec(i=int)` runs before PyPy's `descr_pop`, including for an
@@ -1044,7 +1049,7 @@ fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_remove_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "remove", true)?;
-    crate::type_methods::reject_kwargs_of(Some("array"), args, "remove")?;
+    pyre_interpreter::type_methods::reject_kwargs_of(Some("array"), args, "remove")?;
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
             "array.remove() takes exactly one argument ({} given)",
@@ -1110,7 +1115,7 @@ fn array_index_count(obj: PyObjectRef, w_value: PyObjectRef, count: bool) -> Res
         let _elem_roots = pyre_object::gc_roots::push_roots();
         let w_item = pyre_object::gc_roots::pin_root(w_item);
         let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
-        if crate::baseobjspace::eq_w(w_item, w_value)? {
+        if pyre_interpreter::baseobjspace::eq_w(w_item, w_value)? {
             if count {
                 cnt += 1;
             } else {
@@ -1131,8 +1136,8 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
     // PyArg_UnpackTuple gateway reports the bare method name at the arity
     // boundary.  Reject the trailing kwargs marker before it can be mistaken
     // for `start` or `stop`.
-    crate::type_methods::reject_kwargs_of(Some("array"), args, "index")?;
-    crate::type_methods::arity_between(args, "index", 1, 3)?;
+    pyre_interpreter::type_methods::reject_kwargs_of(Some("array"), args, "index")?;
+    pyre_interpreter::type_methods::arity_between(args, "index", 1, 3)?;
     // Optional start/stop, unwrapped via __index__, clamped like descr_index.
     // PyPy's interp2app gateway unwraps both bounds before `descr_index` reads
     // `self.len`.  Their `__index__` is user code: it can resize the array and
@@ -1141,9 +1146,9 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     let mut start = if args.len() >= 3 {
-        crate::sliceobject::eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(
-            base + 2,
-        ))?
+        pyre_interpreter::sliceobject::eval_slice_index_not_none(
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+        )?
     } else {
         0
     };
@@ -1153,9 +1158,9 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
     // Measured on 3.14.2, an `array('i', [1, 2, 3])` whose needle extends it
     // by two 7s answers `index()` 3; pypy3 7.3.20 raises ValueError.
     let mut stop = if args.len() >= 4 {
-        crate::sliceobject::eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(
-            base + 3,
-        ))?
+        pyre_interpreter::sliceobject::eval_slice_index_not_none(
+            pyre_object::gc_roots::shadow_stack_get(base + 3),
+        )?
     } else {
         i64::MAX
     };
@@ -1188,7 +1193,7 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
         let _elem_roots = pyre_object::gc_roots::push_roots();
         let w_item = pyre_object::gc_roots::pin_root(w_item);
         let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
-        if crate::baseobjspace::eq_w(w_item, w_value)? {
+        if pyre_interpreter::baseobjspace::eq_w(w_item, w_value)? {
             return Ok(pyre_object::w_int_new(i));
         }
         i += 1;
@@ -1207,19 +1212,19 @@ fn array_clear_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_release_buffer(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "__release_buffer__", false)?;
-    crate::builtins::buffer_exporter_release_view(args[0], args[1])
+    pyre_interpreter::builtins::buffer_exporter_release_view(args[0], args[1])
 }
 
 fn array_buffer(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "__buffer__", false)?;
     let mut obj = args[0];
-    let flags = pyre_object::with_roots!(obj => crate::baseobjspace::c_int_w(args[1]))?;
-    crate::builtins::w_memoryview_new_native_with_flags(obj, flags)
+    let flags = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::c_int_w(args[1]))?;
+    pyre_interpreter::builtins::w_memoryview_new_native_with_flags(obj, flags)
 }
 
 fn array_count_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "count", true)?;
-    crate::type_methods::reject_kwargs_of(Some("array"), args, "count")?;
+    pyre_interpreter::type_methods::reject_kwargs_of(Some("array"), args, "count")?;
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
             "array.count() takes exactly one argument ({} given)",
@@ -1275,7 +1280,7 @@ fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_fromlist_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "fromlist", true)?;
-    crate::type_methods::reject_kwargs_of(Some("array"), args, "fromlist")?;
+    pyre_interpreter::type_methods::reject_kwargs_of(Some("array"), args, "fromlist")?;
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
             "array.fromlist() takes exactly one argument ({} given)",
@@ -1403,10 +1408,10 @@ fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
     // acquisition rather than narrowing the public method to bytes and
     // bytearray.
     let source = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(source)? else {
+    let Some(buffer) = pyre_interpreter::baseobjspace::simple_buffer_bytes(source)? else {
         return Err(PyError::type_error(format!(
             "a bytes-like object is required, not '{}'",
-            crate::type_methods::arg_type_name(source)
+            pyre_interpreter::type_methods::arg_type_name(source)
         )));
     };
     // [3.14-spec] `arraymodule.c::frombytes` rejects a typed Py_buffer even
@@ -1430,9 +1435,9 @@ fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
-    let result = crate::baseobjspace::call_method(obj, name, args);
+    let result = pyre_interpreter::baseobjspace::call_method(obj, name, args);
     if result.is_null() {
-        Err(crate::call::take_call_error()
+        Err(pyre_interpreter::call::take_call_error()
             .unwrap_or_else(|| PyError::runtime_error("method call failed")))
     } else {
         Ok(result)
@@ -1517,7 +1522,7 @@ fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
         // `str_decode_utf_32_helper` port so BOM consumption, surrogate
         // rejection, error spans, and byte-order-specific codec names stay
         // identical to the public codec rather than growing a second loop.
-        let (decoded, _, _) = crate::type_methods::decode_utf16_32_helper(
+        let (decoded, _, _) = pyre_interpreter::type_methods::decode_utf16_32_helper(
             bytes, true, None, "utf-32", "strict", true,
         )?;
         return Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(decoded));
@@ -1618,11 +1623,13 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
     // the TypeDef's module-qualified registration name.  In particular the
     // builtin TypeDef is registered as `array.array` but formats as `array`,
     // while a subclass keeps its live (and assignable) `__name__`.
-    let w_type = crate::typedef::r#type(current_obj())
+    let w_type = pyre_interpreter::typedef::r#type(current_obj())
         .expect("an array instance must have a Python type object");
     let class_name = unsafe {
-        crate::baseobjspace::str_utf8_w(pyre_object::w_type_get_name_obj(w_type.as_ptr()))?
-            .to_string()
+        pyre_interpreter::baseobjspace::str_utf8_w(pyre_object::w_type_get_name_obj(
+            w_type.as_ptr(),
+        ))?
+        .to_string()
     };
     let tc = unsafe { arr::w_array_typecode(current_obj()) } as char;
     let len = unsafe { arr::w_array_len(current_obj()) };
@@ -1639,7 +1646,7 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
         // failure from `array_array_tounicode_impl`, including the structured
         // UTF-32 error for `w`.
         let s = array_tounicode_method(&[current_obj()])?;
-        out.push_wtf8(&unsafe { crate::display::py_repr_wtf8(s)? });
+        out.push_wtf8(&unsafe { pyre_interpreter::display::py_repr_wtf8(s)? });
         out.push_str(")");
         return Ok(out);
     }
@@ -1649,7 +1656,7 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
             out.push_str(", ");
         }
         let w_item = array_w_getitem(current_obj(), i, false)?;
-        out.push_wtf8(&unsafe { crate::display::py_repr_wtf8(w_item)? });
+        out.push_wtf8(&unsafe { pyre_interpreter::display::py_repr_wtf8(w_item)? });
     }
     out.push_str("])");
     Ok(out)
@@ -1694,13 +1701,13 @@ fn array_richcompare(mut a: PyObjectRef, mut b: PyObjectRef, op: u8) -> PyResult
         match op {
             0 => {
                 let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
-                if !pyre_object::with_roots!(a, b => crate::baseobjspace::is_true(r))? {
+                if !pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
                     return Ok(pyre_object::w_bool_from(false));
                 }
             }
             1 => {
                 let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Ne))?;
-                if pyre_object::with_roots!(a, b => crate::baseobjspace::is_true(r))? {
+                if pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
                     return Ok(pyre_object::w_bool_from(true));
                 }
             }
@@ -1711,11 +1718,12 @@ fn array_richcompare(mut a: PyObjectRef, mut b: PyObjectRef, op: u8) -> PyResult
                     CompareOp::Gt
                 };
                 let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, cmp))?;
-                if pyre_object::with_roots!(a, b, ea, eb => crate::baseobjspace::is_true(r))? {
+                if pyre_object::with_roots!(a, b, ea, eb => pyre_interpreter::baseobjspace::is_true(r))?
+                {
                     return Ok(pyre_object::w_bool_from(true));
                 }
                 let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
-                if !pyre_object::with_roots!(a, b => crate::baseobjspace::is_true(r))? {
+                if !pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
                     return Ok(pyre_object::w_bool_from(false));
                 }
             }
@@ -1726,11 +1734,12 @@ fn array_richcompare(mut a: PyObjectRef, mut b: PyObjectRef, op: u8) -> PyResult
                     CompareOp::Ge
                 };
                 let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, cmp))?;
-                if !pyre_object::with_roots!(a, b, ea, eb => crate::baseobjspace::is_true(r))? {
+                if !pyre_object::with_roots!(a, b, ea, eb => pyre_interpreter::baseobjspace::is_true(r))?
+                {
                     return Ok(pyre_object::w_bool_from(false));
                 }
                 let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
-                if !pyre_object::with_roots!(a, b => crate::baseobjspace::is_true(r))? {
+                if !pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
                     return Ok(pyre_object::w_bool_from(true));
                 }
             }
@@ -1789,7 +1798,7 @@ fn array_add_method(args: &[PyObjectRef]) -> PyResult {
     if !unsafe { arr::is_array(b) } {
         return Err(PyError::type_error(format!(
             "can only append array (not \"{}\") to array",
-            crate::error::type_name_of(b)
+            pyre_interpreter::error::type_name_of(b)
         )));
     }
     let tc = unsafe { arr::w_array_typecode(a) };
@@ -1815,7 +1824,7 @@ fn array_iadd_method(args: &[PyObjectRef]) -> PyResult {
     if !unsafe { arr::is_array(b) } {
         return Err(PyError::type_error(format!(
             "can only extend array with array (not \"{}\")",
-            crate::error::type_name_of(b)
+            pyre_interpreter::error::type_name_of(b)
         )));
     }
     if unsafe { arr::w_array_typecode(b) } != unsafe { arr::w_array_typecode(a) } {
@@ -1841,7 +1850,7 @@ fn array_repeat_bytes(obj: PyObjectRef, count: i64) -> PyResult {
         .ok_or_else(|| PyError::memory_error(""))?;
     // The count came from Python, so the buffer is reserved fallibly: an
     // infallible reservation ends the process where `_mul_helper` raises.
-    let mut out = crate::builtins::try_vec_with_capacity::<u8>(total)?;
+    let mut out = pyre_interpreter::builtins::try_vec_with_capacity::<u8>(total)?;
     // `array_repeat` copies only for `oldbytes > 0`; without that, repeating an
     // empty array runs the count as a loop trip and never comes back.
     if !src.is_empty() {
@@ -1857,13 +1866,13 @@ fn array_repeat_bytes(obj: PyObjectRef, count: i64) -> PyResult {
 /// was handed: an operand with no `__index__` at all is refused as a repeat,
 /// naming its own type, rather than by the conversion behind that check.
 fn array_repeat_count(w_count: PyObjectRef) -> Result<i64, PyError> {
-    if unsafe { crate::baseobjspace::lookup(w_count, "__index__") }.is_none() {
+    if unsafe { pyre_interpreter::baseobjspace::lookup(w_count, "__index__") }.is_none() {
         return Err(PyError::type_error(format!(
             "can't multiply sequence by non-int of type '{}'",
-            crate::type_methods::arg_type_name(w_count)
+            pyre_interpreter::type_methods::arg_type_name(w_count)
         )));
     }
-    crate::builtins::getindex_w(w_count)
+    pyre_interpreter::builtins::getindex_w(w_count)
 }
 
 fn array_rmul_method(args: &[PyObjectRef]) -> PyResult {
@@ -1902,7 +1911,7 @@ fn array_imul_method(args: &[PyObjectRef]) -> PyResult {
         .ok_or_else(|| PyError::memory_error(""))?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
     vec.try_reserve_exact(extra)
-        .map_err(|_| crate::builtins::reservation_failed())?;
+        .map_err(|_| pyre_interpreter::builtins::reservation_failed())?;
     if !src.is_empty() {
         for _ in 1..count {
             vec.extend_from_slice(&src);
@@ -1953,18 +1962,19 @@ fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__reduce_ex__")?;
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
-    let protocol =
-        crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(obj_slot + 1))?;
+    let protocol = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+        obj_slot + 1,
+    ))?;
     let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(
-        crate::typedef::r#type(obj()).map_or(PY_NULL, |p| p.as_ptr()),
+        pyre_interpreter::typedef::r#type(obj()).map_or(PY_NULL, |p| p.as_ptr()),
     );
     let typecode = unsafe { arr::w_array_typecode(obj()) };
     let tc = typecode as char;
     let typecode_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&tc.to_string()));
-    let w_dict = crate::baseobjspace::findattr_result(obj(), "__dict__")?
+    let w_dict = pyre_interpreter::baseobjspace::findattr_result(obj(), "__dict__")?
         .unwrap_or_else(pyre_object::w_none);
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_dict);
@@ -1986,9 +1996,10 @@ fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
         ]));
     }
 
-    let module = crate::importing::get_sys_module("array")
+    let module = pyre_interpreter::importing::get_sys_module("array")
         .ok_or_else(|| PyError::runtime_error("array module not initialized"))?;
-    let reconstructor = crate::baseobjspace::getattr_str(module, "_array_reconstructor")?;
+    let reconstructor =
+        pyre_interpreter::baseobjspace::getattr_str(module, "_array_reconstructor")?;
     let reconstructor_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(reconstructor);
     let w_bytes = array_tobytes_method(&[obj()])?;
@@ -2075,12 +2086,13 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     if !unsafe { pyre_object::is_type(w_cls) } {
         return Err(PyError::type_error(format!(
             "_array_reconstructor() argument 1 must be type, not {}",
-            crate::type_methods::clinic_arg_type_name(w_cls)
+            pyre_interpreter::type_methods::clinic_arg_type_name(w_cls)
         )));
     }
-    let array_type = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
+    let array_type =
+        pyre_interpreter::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
     if !pyre_object::with_roots!(w_cls, w_typecode, w_mformat_arg, w_bytes =>
-        crate::baseobjspace::issubclass(w_cls, array_type))?
+        pyre_interpreter::baseobjspace::issubclass(w_cls, array_type))?
     {
         return Err(PyError::type_error(format!(
             "{} is not a subtype of array.array",
@@ -2090,7 +2102,7 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     if !unsafe { pyre_object::is_str(w_typecode) } {
         return Err(PyError::type_error(format!(
             "_array_reconstructor() argument 2 must be a unicode character, not {}",
-            crate::type_methods::clinic_arg_type_name(w_typecode)
+            pyre_interpreter::type_methods::clinic_arg_type_name(w_typecode)
         )));
     }
     let typecode_bytes =
@@ -2104,9 +2116,9 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     // The `int` converter takes `PyNumber_Index`, which names the type it
     // could not convert.
     let w_mformat = pyre_object::with_roots!(w_cls, w_typecode, w_bytes =>
-        crate::baseobjspace::space_index(w_mformat_arg))?;
+        pyre_interpreter::baseobjspace::space_index(w_mformat_arg))?;
     let mformat = pyre_object::with_roots!(w_cls, w_typecode, w_bytes =>
-        crate::baseobjspace::int_w(w_mformat))?;
+        pyre_interpreter::baseobjspace::int_w(w_mformat))?;
     if !(0..=21).contains(&mformat) {
         return Err(PyError::value_error(
             "third argument must be a valid machine format code.",
@@ -2115,7 +2127,7 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     if !unsafe { pyre_object::bytesobject::is_bytes_like(w_bytes) } {
         return Err(PyError::type_error(format!(
             "fourth argument should be bytes, not {}",
-            crate::error::type_name_of(w_bytes)
+            pyre_interpreter::error::type_name_of(w_bytes)
         )));
     }
     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) }.to_vec();
@@ -2271,7 +2283,7 @@ pub fn init_array_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            crate::typedef::make_new_descr(array_descr_new),
+            pyre_interpreter::typedef::make_new_descr(array_descr_new),
         )
     };
     let m = |ns: PyObjectRef, name: &'static str, f: fn(&[PyObjectRef]) -> PyResult, arity: u16| {
@@ -2307,14 +2319,14 @@ pub fn init_array_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "append",
-            crate::make_builtin_function("append", array_append_method),
+            pyre_interpreter::make_builtin_function("append", array_append_method),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "extend",
-            crate::make_builtin_function("extend", array_extend_method),
+            pyre_interpreter::make_builtin_function("extend", array_extend_method),
         )
     };
     // `insert` uses the PyArg_UnpackTuple arity wording and the fixed
@@ -2323,7 +2335,7 @@ pub fn init_array_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "insert",
-            crate::make_builtin_function("insert", array_insert_method),
+            pyre_interpreter::make_builtin_function("insert", array_insert_method),
         )
     };
     // `remove` owns its CPython 3.14 fixed-owner keyword/arity gateway.
@@ -2331,7 +2343,7 @@ pub fn init_array_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "remove",
-            crate::make_builtin_function("remove", array_remove_method),
+            pyre_interpreter::make_builtin_function("remove", array_remove_method),
         )
     };
     // `index` accepts optional start/stop.
@@ -2339,7 +2351,7 @@ pub fn init_array_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "index",
-            crate::make_builtin_function("index", array_index_method),
+            pyre_interpreter::make_builtin_function("index", array_index_method),
         )
     };
     // `count` owns its CPython 3.14 fixed-owner keyword/arity gateway.
@@ -2347,7 +2359,7 @@ pub fn init_array_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "count",
-            crate::make_builtin_function("count", array_count_method),
+            pyre_interpreter::make_builtin_function("count", array_count_method),
         )
     };
     m(ns, "clear", array_clear_method, 1);
@@ -2360,7 +2372,7 @@ pub fn init_array_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "fromlist",
-            crate::make_builtin_function("fromlist", array_fromlist_method),
+            pyre_interpreter::make_builtin_function("fromlist", array_fromlist_method),
         )
     };
     m(ns, "tobytes", array_tobytes_method, 1);
@@ -2378,9 +2390,9 @@ pub fn init_array_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+            pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
                 "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
+                pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem,
             )),
         )
     };
@@ -2389,7 +2401,7 @@ pub fn init_array_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "pop",
-            crate::make_builtin_function("pop", array_pop_method),
+            pyre_interpreter::make_builtin_function("pop", array_pop_method),
         )
     };
     // typecode / itemsize read-only properties.
@@ -2402,7 +2414,7 @@ pub fn init_array_type(ns: PyObjectRef) {
                     "typecode",
                     |args| {
                         let obj = require_array_receiver(args, "typecode", true)?;
-                        let tc = unsafe { arr::w_array_typecode(obj) } as char;
+                        let tc = arr::w_array_typecode(obj) as char;
                         Ok(pyre_object::w_str_new_managed(&tc.to_string()))
                     },
                     1,
@@ -2422,9 +2434,7 @@ pub fn init_array_type(ns: PyObjectRef) {
                     "itemsize",
                     |args| {
                         let obj = require_array_receiver(args, "itemsize", true)?;
-                        Ok(pyre_object::w_int_new(
-                            unsafe { arr::w_array_itemsize(obj) } as i64,
-                        ))
+                        Ok(pyre_object::w_int_new(arr::w_array_itemsize(obj) as i64))
                     },
                     1,
                 ),
@@ -2438,21 +2448,21 @@ pub fn init_array_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__weakref__",
-            crate::typedef::make_weakref_descr(PY_NULL),
+            pyre_interpreter::typedef::make_weakref_descr(PY_NULL),
         )
     };
 }
 
 /// `array` module init — `moduledef.py interpleveldefs`.
-pub fn init_array_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
-    let type_obj = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
+pub fn init_array_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let type_obj = pyre_interpreter::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
     module_ns_store(ns, "array", type_obj);
     module_ns_store(ns, "ArrayType", type_obj);
     module_ns_store(ns, "typecodes", pyre_object::w_str_new(arr::TYPECODES));
     module_ns_store(
         ns,
         "_array_reconstructor",
-        crate::make_builtin_function("_array_reconstructor", array_reconstructor),
+        pyre_interpreter::make_builtin_function("_array_reconstructor", array_reconstructor),
     );
     Ok(())
 }
@@ -2463,18 +2473,20 @@ pub fn init_array_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyEr
 /// module during a cycle.
 pub fn startup_array_module(
     _module: pyre_object::PyObjectRef,
-    execution_context: *const crate::PyExecutionContext,
-) -> Result<(), crate::PyError> {
-    let abc_module = crate::importing::importhook(
+    execution_context: *const pyre_interpreter::PyExecutionContext,
+) -> Result<(), pyre_interpreter::PyError> {
+    let abc_module = pyre_interpreter::importing::importhook(
         rustpython_wtf8::Wtf8::new("_collections_abc"),
         pyre_object::PY_NULL,
         pyre_object::w_tuple_new(vec![pyre_object::w_str_new("MutableSequence")]),
         0,
         execution_context,
     )?;
-    let mutable_sequence = crate::baseobjspace::getattr_str(abc_module, "MutableSequence")?;
-    let register = crate::baseobjspace::getattr_str(mutable_sequence, "register")?;
-    let array_type = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
-    crate::call::call_function_impl_result(register, &[array_type])?;
+    let mutable_sequence =
+        pyre_interpreter::baseobjspace::getattr_str(abc_module, "MutableSequence")?;
+    let register = pyre_interpreter::baseobjspace::getattr_str(mutable_sequence, "register")?;
+    let array_type =
+        pyre_interpreter::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
+    pyre_interpreter::call::call_function_impl_result(register, &[array_type])?;
     Ok(())
 }

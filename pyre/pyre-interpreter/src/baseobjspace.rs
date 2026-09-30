@@ -10139,7 +10139,7 @@ impl SimpleBufferBytes {
     /// `Py_buffer.itemsize` / `BufferView.getitemsize` captured with the
     /// export.  Consumers such as `array.frombytes` distinguish a byte buffer
     /// from a typed exporter even though both expose the same raw byte run.
-    pub(crate) fn itemsize(&self) -> i64 {
+    pub fn itemsize(&self) -> i64 {
         self.itemsize
     }
 
@@ -18233,15 +18233,18 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     None
                 }
             } else if pyre_object::interp_array::is_array(seq) {
-                if idx < pyre_object::interp_array::w_array_len(seq) as isize {
+                // `array.array` is not installed without the module, so this
+                // guard cannot be true.
+                if let Some(hooks) = crate::importing::optional_module_hooks()
+                    && idx < pyre_object::interp_array::w_array_len(seq) as isize
+                {
                     // [3.14-spec] `arrayiter_next` at v3.14.6 advances its
                     // cursor as part of the getitem argument, even when an
                     // invalid unicode value makes that getitem raise.
                     (*iter_ptr).index += 1;
-                    return crate::module::array::array_w_getitem(seq, idx as usize, false);
-                } else {
-                    None
+                    return (hooks.array_w_getitem)(seq, idx as usize, false);
                 }
+                None
             } else {
                 // Generic sequence-protocol object: fetch lazily through
                 // `space.getitem`.  `iterobject.c iter_iternext` treats BOTH

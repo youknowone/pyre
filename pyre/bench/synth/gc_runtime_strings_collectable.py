@@ -1,5 +1,5 @@
 # pyre-check: no-cpython
-# pyre-check: requires-modules=unicodedata
+# pyre-check: requires-modules=unicodedata,array
 
 import array
 import contextvars

@@ -1230,7 +1230,6 @@ pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
 /// crate's modules, then those the installed module hooks register.
 pub fn module_gc_types() -> Vec<crate::importing::ModuleGcType> {
     let mut types = Vec::new();
-    crate::module::_tokenize::gc_types(&mut types);
     crate::module::_functools::gc_types(&mut types);
     if let Some(hooks) = crate::importing::optional_module_hooks() {
         types.extend((hooks.gc_types)());

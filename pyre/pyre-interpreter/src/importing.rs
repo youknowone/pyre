@@ -587,6 +587,13 @@ pub struct OptionalModuleHooks {
     /// `interp_gc.py _run_finalizers`, with the enable/disable bracket the
     /// module keeps around `UserDelAction._run_finalizers`.
     pub gc_run_finalizers_now: fn(),
+    /// `interp_array.py` type setup. `array.array` is installed only when
+    /// this runs; without the module the type is absent.
+    pub init_array_type: fn(PyObjectRef),
+    /// `interp_array.py W_Array.w_getitem`: box one live array element.
+    pub array_w_getitem: fn(PyObjectRef, usize, bool) -> crate::PyResult,
+    /// `interp_array.py descr_repr`, shared with `display::py_repr_wtf8`.
+    pub array_repr_wtf8: fn(PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError>,
 }
 
 static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();
@@ -794,7 +801,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_structseq);
     pyre_install_module!(_suggestions);
     pyre_install_module!(_symtable);
-    pyre_install_module!(_tokenize);
     pyre_install_module!(_typing);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     pyre_install_module!(faulthandler);
@@ -851,11 +857,11 @@ pub fn install_builtin_modules() {
 
     // Host-access modules — arbitrary FFI (`_ctypes`), real signals.
     // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp`, `errno`, `_stat`,
-    // `_pypy_generic_alias`, `gc`, `_pickle`, `_random`, and the Windows host
-    // modules other than `winreg` live in `pyre-module`.  None of the host
-    // ones belong to the mediated ll_os/ll_time surface, so the sandbox
-    // interpreter omits them entirely: `import _ctypes` then raises
-    // ModuleNotFoundError, as in a build whose syscall code is absent.
+    // `_pypy_generic_alias`, `_pickle`, `_random`, `_tokenize`, `array`, `gc`,
+    // and the Windows host modules other than `winreg` live in `pyre-module`.
+    // None of the host ones belong to the mediated ll_os/ll_time surface, so
+    // the sandbox interpreter omits them entirely: `import _ctypes` then
+    // raises ModuleNotFoundError, as in a build whose syscall code is absent.
     #[cfg(not(feature = "sandbox"))]
     {
         // `_signal` is a bootstrap module upstream: it is built on every
@@ -876,11 +882,6 @@ pub fn install_builtin_modules() {
     // ImportError` cannot recover from.  Leaving them unregistered lets the
     // pure-Python fallback take over: `_datetime` -> `_pydatetime`,
     // `_decimal` -> `_pydecimal`, `_asyncio` -> pure-Python asyncio.
-    register_builtin_module_with_startup(
-        "array",
-        crate::module::array::init_array_module,
-        crate::module::array::startup_array_module,
-    );
     register_builtin_module("_types", crate::module::_types::init);
     register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);

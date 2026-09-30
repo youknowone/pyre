@@ -55,6 +55,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_bz2", module::bz2::init);
     pyre_interpreter::importing::register_builtin_module("_pickle", module::_pickle::init);
     pyre_interpreter::importing::register_builtin_module("_random", module::_random::init);
+    pyre_interpreter::importing::register_builtin_module("_tokenize", module::_tokenize::init);
     pyre_interpreter::importing::register_builtin_module("_csv", module::_csv::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_cn", module::_codecs_cn::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_hk", module::_codecs_hk::init);
@@ -106,6 +107,11 @@ pub fn install_optional_modules() {
     );
     pyre_interpreter::importing::register_builtin_module("_queue", module::_queue::init);
     pyre_interpreter::importing::register_builtin_module("gc", module::gc::init);
+    pyre_interpreter::importing::register_builtin_module_with_startup(
+        "array",
+        module::array::init_array_module,
+        module::array::startup_array_module,
+    );
     #[cfg(all(not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_socket", module::_socket::init);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
@@ -369,6 +375,9 @@ pub fn register() {
             math_builtin_name: module::math::interp_math::math_builtin_name,
             gc_initialize: hook_gc_initialize,
             gc_run_finalizers_now: module::gc::interp_gc::run_finalizers_now,
+            init_array_type: module::array::init_array_type,
+            array_w_getitem: module::array::array_w_getitem,
+            array_repr_wtf8: module::array::array_repr_wtf8,
         },
     );
 }
@@ -432,6 +441,7 @@ unsafe fn hook_libffi_cif_shape(
 /// `pyre_interpreter::MODULE_FIRST_TYPE_ID`.
 fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
     let mut types = Vec::new();
+    module::_tokenize::gc_types(&mut types);
     module::unicodedata::gc_types(&mut types);
     module::_json::gc_types(&mut types);
     module::_hashlib::gc_types(&mut types);
