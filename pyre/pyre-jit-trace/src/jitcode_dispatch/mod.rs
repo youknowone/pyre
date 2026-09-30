@@ -15297,13 +15297,8 @@ fn handle<Sym: WalkSym>(
                             Value::Ref(majit_ir::GcRef(callee_code)),
                         ];
                         let red_types = [Type::Ref, Type::Ref];
-<<<<<<< HEAD
-                        if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
-                            &callee_key,
-=======
                         let token = driver.get_or_make_portal_assembler_token_arc(
-                            callee_key,
->>>>>>> e36c7cbc9a4 (metainterp: no sticky bridge decline, jitcounter.tick decides; walker: a bridge resumed inside a loop-bearing callee reaches the callee's loop header)
+                            &callee_key,
                             &greenboxes,
                             &red_types,
                         );
