@@ -248,6 +248,7 @@ pub(crate) fn build_propagate_exception_path(
         ; str x17, [x16]
         ; mov x0, x29
         ; ldp x19, x20, [sp, #16]
+        ; ldr d8, [sp, #56]
         ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
         ; ret
     );
@@ -1443,6 +1444,10 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; stp x29, x30, [sp, -(CALL_FRAME_SIZE as i32)]!
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
+            // d8 is outside all_vfp_regs. A loop parks one float immediate
+            // there so the body does not reload it. The byte at [sp,#56]
+            // sits above the thread-local slot.
+            ; str d8, [sp, #56]
             // assembler.py:1128-1129: spill the thread-local base the entry
             // received in x1, then take the jitframe out of x0.
             ; str x1, [sp, #SAVED_THREADLOCAL_OFS]
@@ -1496,6 +1501,7 @@ impl<'a> AssemblerARM64<'a> {
                 ; mov x0, x29
                 ; ldp x19, x20, [sp, #16]
                 ; ldp x21, x22, [sp, #32]
+                ; ldr d8, [sp, #56]
                 ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
                 ; ret
                 ; =>continue_label
@@ -1515,6 +1521,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mov x0, x29
             ; ldp x19, x20, [sp, #16]   // restore callee-saved regs
+            ; ldr d8, [sp, #56]
             ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
             ; ret
         );

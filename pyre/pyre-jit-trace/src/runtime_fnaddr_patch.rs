@@ -126,6 +126,16 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
             for c in jc.body_mut().constants_i.iter_mut() {
                 if let Some(&runtime) = correspondence.get(c) {
                     *c = runtime;
+                } else if majit_jitcode::codewriter::call::is_symbolic_fnaddr(*c) {
+                    // Same path resolution as the shell `fnaddr` above. A
+                    // `dont_look_inside` residual that never had a build
+                    // address stays a symbolic hash in `constants_i`, and the
+                    // descent scan treats that hash as an un-lowered helper.
+                    if let Some(path) = symbolic_fnaddr_path(*c) {
+                        if let Some(runtime) = runtime_fnaddr_by_path(path) {
+                            *c = runtime;
+                        }
+                    }
                 }
             }
         }
