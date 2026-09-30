@@ -86,8 +86,8 @@ use majit_charon_reader::ullbc::TyRef;
 
 use crate::flowspace::model::Variable;
 use crate::model::{
-    BlockId, CallFuncPtr, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind,
-    SpaceOperation, ValueType,
+    BlockId, CallFuncPtr, CallTarget, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg,
+    OpKind, SpaceOperation, ValueType,
 };
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
@@ -1718,6 +1718,19 @@ pub(crate) struct ForeignFromSite {
     pub op_idx: usize,
     pub argument: Variable,
     pub error_ty: String,
+    /// Set when `argument` is `Err(e)` stored in `Break` and `From<E>::from`
+    /// must receive `e`.
+    pub shell: Option<PeeledBreakShell>,
+}
+
+/// `e` inside a `Break` payload of type `Result<Infallible, E>`.
+///
+/// `err_owner` is the `Err` variant written for that shell. `payload_ty` is
+/// `ResultBranchPayloads.err`, the bank of `e`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeeledBreakShell {
+    pub err_owner: String,
+    pub payload_ty: ValueType,
 }
 
 enum ResidualPayload {
@@ -1727,7 +1740,10 @@ enum ResidualPayload {
     /// [`FromResidualConversion`] already replaced the argument.
     Converted(Variable),
     /// Suffixed owner whose error argument is not the carrier.
-    Foreign { error_ty: String },
+    Foreign {
+        error_ty: String,
+        shell: Option<PeeledBreakShell>,
+    },
 }
 
 /// Error-argument spelling of a suffixed `::Break` or `::Err` owner, when
@@ -1860,10 +1876,133 @@ fn from_residual_carrier(
 ) -> Result<Variable, String> {
     match residual_payload(graph, arg, carrier_path)? {
         ResidualPayload::Direct(var) | ResidualPayload::Converted(var) => Ok(var),
-        ResidualPayload::Foreign { error_ty } => Err(format!(
+        ResidualPayload::Foreign { error_ty, .. } => Err(format!(
             "from_residual would raise {error_ty} without From::from"
         )),
     }
+}
+
+/// `Try::branch` puts `Result<Infallible, E>` in `Break`. The branch
+/// expansion stores `Err(e)` there when `e`'s bank differs from that
+/// residual `Result`, and stores `e` itself when the banks match.
+/// `From<E>::from` takes `e`.
+///
+/// `Some` only for a `Break` read whose type argument actually peeled and
+/// whose `Result::branch` stamp records two different banks. Equal banks,
+/// a missing stamp, and an `Err` payload (already `e`) stay `None`.
+fn peeled_break_shell(
+    graph: &FunctionGraph,
+    base: &Variable,
+    owner: &str,
+) -> Option<PeeledBreakShell> {
+    let (head, variant) = owner.rsplit_once("::")?;
+    if variant != "Break" {
+        return None;
+    }
+    let open = head.find('<')?;
+    if !head.ends_with('>') {
+        return None;
+    }
+    let args = split_top_level(&head[open + 1..head.len() - 1]);
+    let break_arg = args.first()?;
+    if peel_infallible_result(break_arg) == *break_arg {
+        return None;
+    }
+    let (err_ty, break_ty, receiver_root) = branch_shell_banks(graph, base)?;
+    if err_ty == break_ty {
+        return None;
+    }
+    let root = receiver_root.unwrap_or_else(|| "core::result::Result".to_string());
+    Some(PeeledBreakShell {
+        err_owner: format!("{root}::Err"),
+        payload_ty: err_ty,
+    })
+}
+
+/// Banks stamped on the `Result::branch` that produced `var`.
+///
+/// Follows `same_as`, a recast, and block-argument hops. Every path has
+/// to name the same banks. The visited list lives only for this walk.
+fn branch_shell_banks(
+    graph: &FunctionGraph,
+    root: &Variable,
+) -> Option<(ValueType, ValueType, Option<String>)> {
+    let mut seen = Vec::new();
+    let mut stack = vec![root.clone()];
+    let mut found: Option<(ValueType, ValueType, Option<String>)> = None;
+    while let Some(var) = stack.pop() {
+        if seen.iter().any(|seen_var| seen_var == &var) {
+            continue;
+        }
+        seen.push(var.clone());
+        if let Some(kind) = producing_op(graph, &var) {
+            match kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::Method {
+                            name,
+                            receiver_root,
+                            branch_payloads,
+                            ..
+                        },
+                    ..
+                } if name == "branch" => {
+                    if !receiver_root.as_deref().unwrap_or("").ends_with("Result") {
+                        return None;
+                    }
+                    let Some(payloads) = branch_payloads.as_ref() else {
+                        return None;
+                    };
+                    let (Some(err), Some(brk)) = (payloads.err.clone(), payloads.break_ty.clone())
+                    else {
+                        return None;
+                    };
+                    let banks = (err, brk, receiver_root.clone());
+                    if let Some(prev) = &found
+                        && prev != &banks
+                    {
+                        return None;
+                    }
+                    found = Some(banks);
+                    continue;
+                }
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    stack.push(operand.clone());
+                    continue;
+                }
+                OpKind::Call { args, .. }
+                    if is_recast_narrow(kind)
+                        && let Some(src) = args.first().and_then(LinkArg::as_variable) =>
+                {
+                    stack.push(src.clone());
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        let mut fed = false;
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            let Some(pos) = block.inputargs.iter().position(|arg| arg == &var) else {
+                continue;
+            };
+            for pred in &graph.blocks {
+                for link in &pred.exits {
+                    if link.target.0 != bi {
+                        continue;
+                    }
+                    let Some(LinkArg::Value(src)) = link.args.get(pos) else {
+                        return None;
+                    };
+                    fed = true;
+                    stack.push(src.clone());
+                }
+            }
+        }
+        if !fed {
+            return None;
+        }
+    }
+    found
 }
 
 fn residual_payload(
@@ -1877,7 +2016,7 @@ fn residual_payload(
             return Err("from_residual argument has no producer".to_string());
         };
         match kind {
-            OpKind::FieldRead { field, .. }
+            OpKind::FieldRead { base, field, .. }
                 if field.name == "__pos_0"
                     && field.owner_root.as_deref().is_some_and(|owner| {
                         owner_is_result_variant(owner, "Err") || owner.ends_with("::Break")
@@ -1888,7 +2027,11 @@ fn residual_payload(
                     .as_deref()
                     .and_then(|owner| foreign_residual_type(owner, carrier_path))
                 {
-                    return Ok(ResidualPayload::Foreign { error_ty });
+                    let shell = field
+                        .owner_root
+                        .as_deref()
+                        .and_then(|owner| peeled_break_shell(graph, base, owner));
+                    return Ok(ResidualPayload::Foreign { error_ty, shell });
                 }
                 return Ok(ResidualPayload::Direct(current));
             }
@@ -1944,7 +2087,7 @@ pub(crate) fn foreign_from_residual_sites(
             let Ok(payload) = residual_payload(graph, &argument, spec.carrier_path) else {
                 continue;
             };
-            let ResidualPayload::Foreign { error_ty } = payload else {
+            let ResidualPayload::Foreign { error_ty, shell } = payload else {
                 continue;
             };
             sites.push(ForeignFromSite {
@@ -1952,6 +2095,7 @@ pub(crate) fn foreign_from_residual_sites(
                 op_idx: oi,
                 argument,
                 error_ty,
+                shell,
             });
         }
     }
@@ -1960,6 +2104,10 @@ pub(crate) fn foreign_from_residual_sites(
 
 /// Insert each resolved `From::from` immediately before its
 /// `from_residual` and retarget that call at the conversion's result.
+///
+/// A peeled `Break` whose banks differ contributes `Err.__pos_0` (`e`),
+/// not the `Result<Infallible, E>` shell. A void `From` parameter still
+/// passes nothing.
 pub(crate) fn apply_foreign_from_residuals(
     graph: &mut FunctionGraph,
     sites: &[ForeignFromSite],
@@ -1983,13 +2131,30 @@ pub(crate) fn apply_foreign_from_residuals(
         let site = &sites[idx];
         let conv = &conversions[idx];
         let produced = graph.alloc_value_var();
-        let args = if conv.pass_payload {
+        let shell = site.shell.clone().filter(|_| conv.pass_payload);
+        let args = if let Some(shell) = shell {
+            let inner = graph.alloc_value_var();
+            graph.blocks[site.block].operations.insert(
+                site.op_idx,
+                SpaceOperation {
+                    result: Some(inner.clone()),
+                    kind: OpKind::FieldRead {
+                        base: site.argument.clone(),
+                        field: FieldDescriptor::new("__pos_0", Some(shell.err_owner)),
+                        ty: shell.payload_ty,
+                        pure: true,
+                    },
+                },
+            );
+            crate::model::call_args(vec![inner])
+        } else if conv.pass_payload {
             crate::model::call_args(vec![site.argument.clone()])
         } else {
             Vec::new()
         };
+        let from_at = site.op_idx + usize::from(site.shell.is_some() && conv.pass_payload);
         graph.blocks[site.block].operations.insert(
-            site.op_idx,
+            from_at,
             SpaceOperation {
                 result: Some(produced.clone()),
                 kind: OpKind::Call {
@@ -2002,8 +2167,7 @@ pub(crate) fn apply_foreign_from_residuals(
                 },
             },
         );
-        let OpKind::Call { args, .. } =
-            &mut graph.blocks[site.block].operations[site.op_idx + 1].kind
+        let OpKind::Call { args, .. } = &mut graph.blocks[site.block].operations[from_at + 1].kind
         else {
             return Err(format!(
                 "{}: from_residual op moved while inserting From::from",
@@ -6838,5 +7002,206 @@ mod from_residual_conversion_tests {
             assert_eq!(segments, &from_segments());
             assert_eq!(args.is_empty(), !pass_payload);
         }
+    }
+
+    fn graph_with_break_shell(
+        err_ty: ValueType,
+        break_ty: ValueType,
+        owner: &str,
+        split: bool,
+    ) -> (FunctionGraph, Variable) {
+        let mut graph = FunctionGraph::new("break_shell");
+        let entry = graph.startblock;
+        let operand = graph.alloc_value_var();
+        graph.blocks[entry.0].inputargs = vec![operand.clone()];
+        let branch = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("core::result::Result".into()))
+                        .with_branch_payloads(crate::model::ResultBranchPayloads {
+                            ok: Some(ValueType::Int),
+                            err: Some(err_ty),
+                            continue_ty: Some(ValueType::Int),
+                            break_ty: Some(break_ty),
+                        }),
+                    args: crate::model::call_args(vec![operand]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("branch");
+        let (block, base) = if split {
+            let (arm, arm_inputs) = graph.create_block_with_arg_vars(1);
+            graph.set_goto(entry, arm, vec![branch]);
+            (arm, arm_inputs[0].clone())
+        } else {
+            (entry, branch)
+        };
+        let payload = graph
+            .push_op_var(
+                block,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("__pos_0", Some(owner.to_string())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("payload");
+        let residual = graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::method("from_residual", Some("FromResidual".into())),
+                    args: crate::model::call_args(vec![payload.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(block, Some(residual));
+        (graph, payload)
+    }
+
+    fn from_impl_args(graph: &FunctionGraph) -> Vec<LinkArg> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments == &from_segments() => Some(args.clone()),
+                _ => None,
+            })
+            .expect("From::from")
+    }
+
+    fn pos0_reads(graph: &FunctionGraph) -> Vec<(Variable, String, ValueType, Variable)> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead {
+                    base, field, ty, ..
+                } if field.name == "__pos_0" => Some((
+                    op.result.clone().expect("read result"),
+                    field.owner_root.clone().unwrap_or_default(),
+                    ty.clone(),
+                    base.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn apply_one(graph: &mut FunctionGraph, pass_payload: bool) -> Vec<ForeignFromSite> {
+        let sites = foreign_from_residual_sites(graph, spec());
+        assert_eq!(sites.len(), 1);
+        apply_foreign_from_residuals(
+            graph,
+            &sites,
+            &[FromResidualConversion {
+                segments: from_segments(),
+                pass_payload,
+            }],
+        )
+        .expect("splice");
+        sites
+    }
+
+    #[test]
+    fn foreign_residual_break_shell_passes_err_payload() {
+        for owner in [
+            "ControlFlow<Result<Infallible,MyErr>,i64>::Break",
+            "ControlFlow<Result<??scalar,MyErr>,i64>::Break",
+        ] {
+            for split in [false, true] {
+                for pass_payload in [true, false] {
+                    let (mut graph, payload) =
+                        graph_with_break_shell(ValueType::Int, ValueType::Ref(None), owner, split);
+                    let sites = apply_one(&mut graph, pass_payload);
+                    assert_eq!(sites[0].error_ty, "MyErr", "{owner} split={split}");
+                    let shell = sites[0].shell.as_ref().expect("banks differ");
+                    assert_eq!(shell.err_owner, "core::result::Result::Err");
+                    assert_eq!(shell.payload_ty, ValueType::Int);
+                    let args = from_impl_args(&graph);
+                    let reads = pos0_reads(&graph);
+                    if pass_payload {
+                        assert_eq!(args.len(), 1, "{owner} split={split}");
+                        let inner = args[0].as_variable().expect("inner");
+                        let (result, err_owner, ty, base) = reads
+                            .iter()
+                            .find(|(result, _, _, _)| result == inner)
+                            .expect("From::from reads Err.__pos_0");
+                        assert_eq!(err_owner, "core::result::Result::Err");
+                        assert_eq!(*ty, ValueType::Int);
+                        assert_eq!(base, &payload);
+                        assert_eq!(result, inner);
+                    } else {
+                        assert!(args.is_empty(), "{owner} split={split}");
+                        assert!(
+                            reads
+                                .iter()
+                                .all(|(_, read_owner, _, _)| !read_owner.ends_with("::Err")),
+                            "void From does not read Err.__pos_0"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_residual_equal_banks_keep_the_break_payload() {
+        for split in [false, true] {
+            let (mut graph, payload) = graph_with_break_shell(
+                ValueType::Ref(None),
+                ValueType::Ref(None),
+                "ControlFlow<Result<Infallible,MyErr>,i64>::Break",
+                split,
+            );
+            let sites = apply_one(&mut graph, true);
+            assert!(sites[0].shell.is_none(), "equal banks store e itself");
+            assert_eq!(
+                from_impl_args(&graph),
+                crate::model::call_args(vec![payload])
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_residual_unproven_shell_keeps_the_break_read() {
+        let (mut graph, residual) =
+            from_residual_tail("ControlFlow<Result<Infallible,MyErr>,i64>::Break");
+        let _ = residual;
+        let sites = apply_one(&mut graph, true);
+        assert!(sites[0].shell.is_none(), "no branch stamp");
+        let reads = pos0_reads(&graph);
+        assert_eq!(reads.len(), 1);
+        assert_eq!(
+            from_impl_args(&graph),
+            crate::model::call_args(vec![reads[0].0.clone()])
+        );
+    }
+
+    #[test]
+    fn foreign_residual_err_variant_is_already_the_payload() {
+        let (mut graph, _) = from_residual_tail("Result<Infallible,MyErr>::Err");
+        let sites = apply_one(&mut graph, true);
+        assert_eq!(sites[0].error_ty, "MyErr");
+        assert!(sites[0].shell.is_none());
+        let reads = pos0_reads(&graph);
+        assert_eq!(reads.len(), 1);
+        assert!(reads[0].1.ends_with("::Err"));
+        assert_eq!(
+            from_impl_args(&graph),
+            crate::model::call_args(vec![reads[0].0.clone()])
+        );
     }
 }
