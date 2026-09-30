@@ -248,6 +248,7 @@ pub(crate) fn build_propagate_exception_path(
         ; str x17, [x16]
         ; mov x0, x29
         ; ldp x19, x20, [sp, #16]
+        ; ldp x21, x22, [sp, #32]
         ; ldr d8, [sp, #56]
         ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
         ; ret
@@ -644,7 +645,7 @@ pub struct AssemblerARM64<'a> {
 }
 
 /// How many `movz`/`movk` words `codebuilder.py gen_load_int` emits.
-fn imm_mov_count(val: i64) -> u32 {
+pub(crate) fn imm_mov_count(val: i64) -> u32 {
     if val < 0 {
         if val >= -65536 {
             return 1;
@@ -1444,6 +1445,9 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; stp x29, x30, [sp, -(CALL_FRAME_SIZE as i32)]!
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
+            // x21/x22 are outside all_regs. A loop parks wide integer
+            // immediates there. The overflow return already reloads this pair.
+            ; stp x21, x22, [sp, #32]
             // d8 is outside all_vfp_regs. A loop parks one float immediate
             // there so the body does not reload it. The byte at [sp,#56]
             // sits above the thread-local slot.
@@ -1521,6 +1525,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mov x0, x29
             ; ldp x19, x20, [sp, #16]   // restore callee-saved regs
+            ; ldp x21, x22, [sp, #32]
             ; ldr d8, [sp, #56]
             ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
             ; ret

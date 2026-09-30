@@ -1802,6 +1802,11 @@ pub struct RegAlloc<'a> {
     /// allocator and a bridge that jumps back to the label leave it alone.
     /// The load is emitted once, in front of the label.
     pinned_float: Option<i64>,
+    /// Wide integer immediates parked in `x21` then `x22` (outside
+    /// `all_regs`). A bridge must not rewrite them: it jumps back to the
+    /// loop label, which still reads the values the loop trace loaded.
+    pinned_ints: [Option<i64>; 2],
+    compiling_bridge: bool,
 }
 
 fn is_math_sqrt_call(op: &Op) -> bool {
@@ -1842,6 +1847,8 @@ impl<'a> RegAlloc<'a> {
             faillocs_arena: Vec::new(),
             arglocs_arena: Vec::new(),
             pinned_float: None,
+            pinned_ints: [None, None],
+            compiling_bridge: false,
         }
     }
 
@@ -1979,6 +1986,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py prepare_bridge
     pub fn prepare_bridge(&mut self, arglocs: &[Loc]) {
+        self.compiling_bridge = true;
         self._prepare();
         let inputargs = self.inputargs;
         self._update_bindings(arglocs, inputargs);
@@ -2154,6 +2162,9 @@ impl<'a> RegAlloc<'a> {
         if let Some(loc) = self.pinned_float_loc(v, tp) {
             return loc;
         }
+        if let Some(loc) = self.pinned_int_loc(v, tp) {
+            return loc;
+        }
         if tp == Type::Float {
             self.xrm.loc(
                 v,
@@ -2210,7 +2221,7 @@ impl<'a> RegAlloc<'a> {
         need_lower_byte: bool,
     ) -> Loc {
         if selected_reg.is_none()
-            && let Some(loc) = self.pinned_float_loc(v, tp)
+            && let Some(loc) = self.pinned_float_loc(v, tp).or_else(|| self.pinned_int_loc(v, tp))
         {
             return loc;
         }
@@ -6319,7 +6330,7 @@ impl<'a> RegAlloc<'a> {
                 }
             }
         }
-        self.pin_loop_float_const(i);
+        self.pin_loop_consts(i);
         self.perform(i, locs, None, output);
     }
 
@@ -6390,13 +6401,18 @@ impl<'a> RegAlloc<'a> {
                 }
             }
         }
-        self.pin_loop_float_const(i);
+        self.pin_loop_consts(i);
         self.perform(i, locs, None, output);
     }
 
     /// Park the first float immediate of the loop body in `d8` and emit
     /// its load before the label. Later uses of the same bits read `d8`
     /// instead of a per-iteration literal load.
+    fn pin_loop_consts(&mut self, label_index: usize) {
+        self.pin_loop_float_const(label_index);
+        self.pin_loop_int_consts(label_index);
+    }
+
     fn pin_loop_float_const(&mut self, label_index: usize) {
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -6404,7 +6420,7 @@ impl<'a> RegAlloc<'a> {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            if self.pinned_float.is_some() {
+            if self.compiling_bridge || self.pinned_float.is_some() {
                 return;
             }
             let Some(bits) = self.operations.iter().skip(label_index + 1).find_map(|op| {
@@ -6432,6 +6448,99 @@ impl<'a> RegAlloc<'a> {
             self.xrm
                 .spill_moves
                 .push((Loc::immed_float(bits), Loc::Reg(crate::aarch64::registers::D8)));
+        }
+    }
+
+    /// Park up to two wide integer immediates in `x21`/`x22` before the
+    /// label. A compare bound and the eval-breaker address otherwise
+    /// rebuild with `movz`/`movk` or a literal load on every iteration.
+    fn pin_loop_int_consts(&mut self, label_index: usize) {
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = label_index;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if self.compiling_bridge || self.pinned_ints[0].is_some() {
+                return;
+            }
+            // The trace often has a preamble label and then the hot label.
+            // Pinning at the first label spends x21/x22 on guards that run
+            // once. The back-edge label is the body that runs every iteration.
+            let Some(hot) = self
+                .operations
+                .iter()
+                .rposition(|op| op.opcode == OpCode::Label)
+            else {
+                return;
+            };
+            if label_index != hot {
+                return;
+            }
+            let mut found: [Option<i64>; 2] = [None, None];
+            let mut n = 0usize;
+            for op in self.operations.iter().skip(label_index + 1) {
+                if op.opcode == OpCode::Label {
+                    break;
+                }
+                for arg in op.getarglist() {
+                    let r = arg.to_opref();
+                    if !r.is_constant() || matches!(r.ty(), Some(Type::Float)) {
+                        continue;
+                    }
+                    let bits = const_bits_or_panic(r, &self.constants, "pin_loop_int_consts");
+                    if crate::aarch64::assembler::imm_mov_count(bits) < 2 {
+                        continue;
+                    }
+                    if found[..n].contains(&Some(bits)) {
+                        continue;
+                    }
+                    found[n] = Some(bits);
+                    n += 1;
+                    if n == 2 {
+                        break;
+                    }
+                }
+                if n == 2 {
+                    break;
+                }
+            }
+            let regs = [
+                crate::aarch64::registers::X21,
+                crate::aarch64::registers::X22,
+            ];
+            for i in 0..n {
+                let bits = found[i].unwrap();
+                self.pinned_ints[i] = Some(bits);
+                self.rm
+                    .spill_moves
+                    .push((Loc::immed(bits), Loc::Reg(regs[i])));
+            }
+        }
+    }
+
+    fn pinned_int_loc(&self, v: OpRef, tp: Type) -> Option<Loc> {
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (v, tp);
+            None
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if tp == Type::Float || !v.is_constant() {
+                return None;
+            }
+            let val = const_bits_or_panic(v, &self.constants, "pinned_int_loc");
+            let regs = [
+                crate::aarch64::registers::X21,
+                crate::aarch64::registers::X22,
+            ];
+            for (bits, reg) in self.pinned_ints.iter().zip(regs) {
+                if *bits == Some(val) {
+                    return Some(Loc::Reg(reg));
+                }
+            }
+            None
         }
     }
 
