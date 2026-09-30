@@ -545,6 +545,13 @@ mod winsock {
         pub tv_usec: std::ffi::c_long,
     }
 
+    /// `struct sockaddr` (`sockaddr`). `sa_family` is `ADDRESS_FAMILY`.
+    #[repr(C)]
+    pub struct sockaddr {
+        pub sa_family: u16,
+        pub sa_data: [i8; 14],
+    }
+
     pub type fd_set_p = *mut fd_set;
 
     /// `_rsocket_rffi.geterrno` on Windows (`rwin32.GetLastError_saved`).
@@ -643,6 +650,24 @@ mod winsock {
     crate::rffi::llexternal!(
         pub select = "select",
         [INT, fd_set_p, fd_set_p, fd_set_p, *mut timeval],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    // `socketgetsockname` / `socketgetsockopt` (`external`, `save_err=SAVE_ERR`).
+    // The descriptor is `lltype.Unsigned` (`socketfd_type` on Windows).
+    crate::rffi::llexternal!(
+        pub socketgetsockname = "getsockname",
+        [usize, *mut sockaddr, *mut INT],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub socketgetsockopt = "getsockopt",
+        [usize, INT, INT, *mut core::ffi::c_void, *mut INT],
         INT,
         compilation_info = ECI,
         calling_conv = "win",

@@ -3288,42 +3288,26 @@ fn socket_init_state(
     Ok(())
 }
 
-/// `rsocket.py get_socket_family` — the family of an existing fd,
-/// read from `getsockname`'s returned `sa_family`.
+/// `rsocket.py get_socket_family` — `sa_family` from `getsockname`.
+/// `CSocketError.errno` is the socket OSError.
 #[cfg(any(unix, windows))]
 fn socket_detect_family(fd: rffi::Socket) -> Result<libc::c_int, pyre_interpreter::PyError> {
-    let mut addr: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-    let res =
-        unsafe { rffi::getsockname(fd, &mut addr as *mut _ as *mut rffi::sockaddr, &mut len) };
-    if res != 0 {
-        return Err(socket_last_error());
-    }
-    Ok(addr.ss_family as libc::c_int)
+    majit_rlib::rsocket::get_socket_family(fd)
+        .map(|family| family as libc::c_int)
+        .map_err(|error| socket_io_err(std::io::Error::from_raw_os_error(error.errno)))
 }
 
-/// `rsocket.py getsockopt_int` — a single int socket option.
+/// `rsocket.py getsockopt_int` — one `int` socket option.
+/// `CSocketError.errno` is the socket OSError.
 #[cfg(any(unix, windows))]
 fn socket_getsockopt_int(
     fd: rffi::Socket,
     level: libc::c_int,
     option: libc::c_int,
 ) -> Result<libc::c_int, pyre_interpreter::PyError> {
-    let mut val: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as rffi::SockLen;
-    let res = unsafe {
-        rffi::getsockopt(
-            fd,
-            level,
-            option,
-            &mut val as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if res != 0 {
-        return Err(socket_last_error());
-    }
-    Ok(val)
+    majit_rlib::rsocket::getsockopt_int(fd, level, option)
+        .map(|value| value as libc::c_int)
+        .map_err(|error| socket_io_err(std::io::Error::from_raw_os_error(error.errno)))
 }
 
 /// `interp_socket.py get_so_protocol` — the protocol of an existing

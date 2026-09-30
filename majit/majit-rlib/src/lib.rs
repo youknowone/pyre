@@ -28,6 +28,8 @@ pub mod rmmap;
 #[cfg(unix)]
 pub mod rpoll;
 pub mod rposix;
+#[cfg(any(unix, windows))]
+pub mod rsocket;
 #[cfg(unix)]
 pub mod rtermios;
 pub mod rthread;
