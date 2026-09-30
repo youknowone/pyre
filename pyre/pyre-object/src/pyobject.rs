@@ -1399,8 +1399,6 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(165, &LIST_USER_TYPE),
         subclass_range_alias(166, &crate::setobject::SET_USER_TYPE),
         subclass_range_alias(166, &crate::setobject::FROZENSET_USER_TYPE),
-        subclass_range_alias(166, &crate::setobject::SET_USER_TYPE),
-        subclass_range_alias(166, &crate::setobject::FROZENSET_USER_TYPE),
         subclass_range_alias(167, &crate::interp_array::ARRAY_USER_TYPE),
         subclass_range_alias(168, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE),
         subclass_range_alias(169, &crate::functional::ENUMERATE_USER_TYPE),
