@@ -478,6 +478,58 @@ pub fn recv(fd: INT, buf: &mut [u8], flags: INT) -> Result<usize, CSocketError> 
     Ok(read as usize)
 }
 
+/// `sendto`. `addr` is the `sockaddr` bytes, and its length is `addrlen`.
+/// A negative return is `CSocketError`.
+#[cfg(unix)]
+pub fn sendto(fd: INT, buf: &[u8], flags: INT, addr: &[u8]) -> Result<isize, CSocketError> {
+    let sent = unsafe {
+        crate::_rsocket_rffi::sendto(
+            fd,
+            buf.as_ptr().cast(),
+            buf.len(),
+            flags,
+            addr.as_ptr().cast(),
+            addr.len() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        return Err(last_error());
+    }
+    Ok(sent as isize)
+}
+
+/// `recvfrom`. The address bytes are a `sockaddr_storage`. `addrlen` is the
+/// length the call wrote. A negative return is `CSocketError`.
+#[cfg(unix)]
+pub fn recvfrom(
+    fd: INT,
+    buf: &mut [u8],
+    flags: INT,
+) -> Result<(usize, Vec<u8>, i32), CSocketError> {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut addrlen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let read = unsafe {
+        crate::_rsocket_rffi::recvfrom(
+            fd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            flags,
+            (&raw mut storage).cast(),
+            &raw mut addrlen,
+        )
+    };
+    if read < 0 {
+        return Err(last_error());
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&raw const storage).cast::<u8>(),
+            std::mem::size_of::<libc::sockaddr_storage>(),
+        )
+    };
+    Ok((read as usize, bytes.to_vec(), addrlen as i32))
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
@@ -823,6 +875,64 @@ mod tests {
         let mut bad = [0u8; 1];
         assert_eq!(send(-1, b"x", 0).expect_err("send").errno, libc::EBADF);
         assert_eq!(recv(-1, &mut bad, 0).expect_err("recv").errno, libc::EBADF);
+        close(a).expect("close a");
+        close(b).expect("close b");
+    }
+
+    fn udp_bound() -> (INT, Vec<u8>) {
+        unsafe {
+            let fd = crate::_rsocket_rffi::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            assert!(fd >= 0, "socket errno {}", crate::rposix::get_saved_errno());
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let bytes = std::slice::from_raw_parts(
+                (&raw const addr).cast::<u8>(),
+                std::mem::size_of::<libc::sockaddr_in>(),
+            );
+            bind(fd, bytes).expect("bind");
+            let (stored, nlen) = getsockname(fd).expect("getsockname");
+            assert!(nlen > 0);
+            (fd, stored[..nlen as usize].to_vec())
+        }
+    }
+
+    #[test]
+    fn sendto_and_recvfrom_round_trip() {
+        let (a, a_addr) = udp_bound();
+        let (b, b_addr) = udp_bound();
+        unsafe {
+            let tv = libc::timeval {
+                tv_sec: 2,
+                tv_usec: 0,
+            };
+            assert_eq!(
+                libc::setsockopt(
+                    b,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    (&raw const tv).cast(),
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                ),
+                0
+            );
+        }
+        assert_eq!(sendto(a, b"ping", 0, &b_addr).expect("sendto"), 4);
+        let mut buf = [0u8; 8];
+        let (n, from, from_len) = recvfrom(b, &mut buf, 0).expect("recvfrom");
+        assert_eq!(n, 4);
+        assert_eq!(&buf[..4], b"ping");
+        assert_eq!(from.len(), std::mem::size_of::<libc::sockaddr_storage>());
+        assert_eq!(from_len as usize, a_addr.len());
+        assert_eq!(&from[..a_addr.len()], a_addr.as_slice());
+        assert_eq!(
+            sendto(-1, b"x", 0, &b_addr).expect_err("sendto").errno,
+            libc::EBADF
+        );
+        assert_eq!(
+            recvfrom(-1, &mut buf, 0).expect_err("recvfrom").errno,
+            libc::EBADF
+        );
         close(a).expect("close a");
         close(b).expect("close b");
     }

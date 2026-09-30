@@ -2811,27 +2811,14 @@ fn rsocket_os_error(error: majit_rlib::rsocket::CSocketError) -> pyre_interprete
     socket_io_err(std::io::Error::from_raw_os_error(error.errno))
 }
 
-/// Run a socket call and return the failure code it reported.
-///
-/// Unix `llexternal`s already release the interpreter and store `errno`, so
-/// this only reads that slot. WinSock never writes the C runtime's `errno`;
-/// the release stays here and the code comes from `rffi::last_error_code`.
-/// `recvmsg` / `sendmsg` are separate C helpers and do not come through here:
-/// they still use `call_external_function`, which reads the live `errno`
-/// inside the released window.
-#[cfg(any(unix, windows))]
+/// Release the interpreter around a WinSock call and return the code
+/// `last_error_code` reported. WinSock does not write the C runtime's `errno`.
+/// `recvmsg` and `sendmsg` stay on `call_external_function`.
+#[cfg(windows)]
 fn socket_call<R>(f: impl FnOnce() -> R) -> (R, i32) {
-    #[cfg(windows)]
-    {
-        let _blocked = pyre_interpreter::module::thread::before_external_block();
-        let result = f();
-        (result, rffi::last_error_code())
-    }
-    #[cfg(not(windows))]
-    {
-        let result = f();
-        (result, majit_rlib::rposix::get_saved_errno())
-    }
+    let _blocked = pyre_interpreter::module::thread::before_external_block();
+    let result = f();
+    (result, rffi::last_error_code())
 }
 
 /// `socket_io_err_for_operation` for a caller holding the code itself.
@@ -4254,6 +4241,33 @@ fn connect_sockaddr(
     majit_rlib::rsocket::connect(fd, bytes).map_err(|error| error.errno)
 }
 
+/// `recvfrom`, retrying `EINTR`. The address is a `sockaddr_storage`.
+#[cfg(unix)]
+fn recvfrom_socket(
+    obj: pyre_object::PyObjectRef,
+    fd: rffi::Socket,
+    buf: &mut [u8],
+    flags: libc::c_int,
+) -> Result<(usize, rffi::sockaddr_storage, rffi::SockLen), pyre_interpreter::PyError> {
+    loop {
+        match majit_rlib::rsocket::recvfrom(fd, buf, flags) {
+            Ok((read, bytes, addrlen)) => {
+                let (storage, slen) = storage_from_rsocket(&bytes, addrlen);
+                return Ok((read, storage, slen));
+            }
+            Err(error) if rffi::error_is_interrupted(error.errno) => {
+                pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+            }
+            Err(error) => {
+                return Err(socket_io_err_for_operation(
+                    obj,
+                    std::io::Error::from_raw_os_error(error.errno),
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(any(unix, windows))]
 fn unpack_inet_addr(
     storage: &rffi::sockaddr_storage,
@@ -5376,6 +5390,18 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     )?;
                     socket_wait_writable(obj_roots.get(obj_base), fd)?;
                     loop {
+                        #[cfg(unix)]
+                        let (r, errno) = {
+                            let bytes = std::slice::from_raw_parts(
+                                &storage as *const _ as *const u8,
+                                slen as usize,
+                            );
+                            match majit_rlib::rsocket::sendto(fd, buf, flags, bytes) {
+                                Ok(sent) => (sent, 0),
+                                Err(error) => (-1, error.errno),
+                            }
+                        };
+                        #[cfg(windows)]
                         let (r, errno) = socket_call(|| {
                             rffi::sendto(
                                 fd,
@@ -5445,34 +5471,40 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     0
                 };
                 let mut buf = pyre_interpreter::builtins::try_vec_zeroed(n)?;
-                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
-                let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
                 pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
-                let got = loop {
-                    let (r, errno) = socket_call(|| {
-                        rffi::recvfrom(
-                            fd,
-                            buf.as_mut_ptr() as *mut libc::c_void,
-                            n,
-                            flags,
-                            &mut storage as *mut _ as *mut rffi::sockaddr,
-                            &mut slen,
-                        )
-                    });
-                    if r >= 0 {
-                        break r;
-                    }
-                    if !rffi::error_is_interrupted(errno) {
-                        return Err(socket_io_err_for_operation(
-                            obj,
-                            std::io::Error::from_raw_os_error(errno),
-                        ));
-                    }
-                    // EINTR: deliver a pending signal, then retry
-                    // (`converted_error` eintr_retry).
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                #[cfg(unix)]
+                let (got, storage, slen) = recvfrom_socket(obj, fd, &mut buf, flags)?;
+                #[cfg(windows)]
+                let (got, storage, slen) = {
+                    let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
+                    let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+                    let got = loop {
+                        let (r, errno) = socket_call(|| {
+                            rffi::recvfrom(
+                                fd,
+                                buf.as_mut_ptr() as *mut libc::c_void,
+                                n,
+                                flags,
+                                &mut storage as *mut _ as *mut rffi::sockaddr,
+                                &mut slen,
+                            )
+                        });
+                        if r >= 0 {
+                            break r;
+                        }
+                        if !rffi::error_is_interrupted(errno) {
+                            return Err(socket_io_err_for_operation(
+                                obj,
+                                std::io::Error::from_raw_os_error(errno),
+                            ));
+                        }
+                        // EINTR: deliver a pending signal, then retry
+                        // (`converted_error` eintr_retry).
+                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                    };
+                    (got as usize, storage, slen)
                 };
-                buf.truncate(got as usize);
+                buf.truncate(got);
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
                 fields.push(pyre_object::bytesobject::w_bytes_from_bytes(&buf));
                 fields.push(unpack_inet_addr(&storage, slen));
@@ -5604,32 +5636,39 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     0
                 };
                 let fd = socket_fd(_roots.get(args_base))?;
-                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
-                let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
                 socket_wait_readable(_roots.get(args_base), fd)?;
-                let got = loop {
-                    let (r, errno) = socket_call(|| {
-                        rffi::recvfrom(
-                            fd,
-                            slot.as_mut_ptr() as *mut libc::c_void,
-                            nbytes,
-                            flags,
-                            &mut storage as *mut _ as *mut rffi::sockaddr,
-                            &mut slen,
-                        )
-                    });
-                    if r >= 0 {
-                        break r;
-                    }
-                    if !rffi::error_is_interrupted(errno) {
-                        return Err(socket_io_err_for_operation(
-                            _roots.get(args_base),
-                            std::io::Error::from_raw_os_error(errno),
-                        ));
-                    }
-                    // EINTR: deliver a pending signal, then retry
-                    // (`converted_error` eintr_retry).
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                #[cfg(unix)]
+                let (got, storage, slen) =
+                    recvfrom_socket(_roots.get(args_base), fd, &mut slot[..nbytes], flags)?;
+                #[cfg(windows)]
+                let (got, storage, slen) = {
+                    let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
+                    let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+                    let got = loop {
+                        let (r, errno) = socket_call(|| {
+                            rffi::recvfrom(
+                                fd,
+                                slot.as_mut_ptr() as *mut libc::c_void,
+                                nbytes,
+                                flags,
+                                &mut storage as *mut _ as *mut rffi::sockaddr,
+                                &mut slen,
+                            )
+                        });
+                        if r >= 0 {
+                            break r;
+                        }
+                        if !rffi::error_is_interrupted(errno) {
+                            return Err(socket_io_err_for_operation(
+                                _roots.get(args_base),
+                                std::io::Error::from_raw_os_error(errno),
+                            ));
+                        }
+                        // EINTR: deliver a pending signal, then retry
+                        // (`converted_error` eintr_retry).
+                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                    };
+                    (got as usize, storage, slen)
                 };
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
                 fields.push(pyre_object::w_int_new(got as i64));
