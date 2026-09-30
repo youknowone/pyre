@@ -187,6 +187,17 @@ impl Default for QuasiImmutField {
     }
 }
 
+/// Swap out the installed instance and invalidate it. Callers already hold
+/// the field lock.
+macro_rules! unlink_and_invalidate {
+    ($field:expr) => {{
+        let qmut_ptr = $field.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !qmut_ptr.is_null() {
+            unsafe { Arc::from_raw(qmut_ptr) }.invalidate();
+        }
+    }};
+}
+
 impl QuasiImmutField {
     pub const fn new() -> Self {
         Self {
@@ -273,7 +284,7 @@ impl QuasiImmutField {
     /// against the old value in between.
     pub fn invalidate_then_store<F: FnOnce()>(&self, store: F) {
         let _guard = self.lock();
-        self.invalidate_locked();
+        unlink_and_invalidate!(self);
         store();
     }
 
@@ -300,16 +311,9 @@ impl QuasiImmutField {
         if current != expected {
             return Err(current);
         }
-        self.invalidate_locked();
+        unlink_and_invalidate!(self);
         atomic.store(value, Ordering::Release);
         Ok(())
-    }
-
-    fn invalidate_locked(&self) {
-        let qmut_ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !qmut_ptr.is_null() {
-            unsafe { Arc::from_raw(qmut_ptr) }.invalidate();
-        }
     }
 
     /// Unlink the instance and hand the field's reference to the caller, who
