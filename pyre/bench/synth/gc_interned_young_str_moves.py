@@ -10,6 +10,7 @@
 # Each round interns fresh strings, churns the nursery so at least one minor
 # collection runs, and re-interns equal values built from new characters.
 #
+# pyre-check: requires-modules=gc
 # Self-checking because pypy3 (3.11) does not keep this identity:
 # `ObjSpace.interned_strings` is a weak-value dictionary there, and the same
 # loop loses every entry of some rounds with the JIT on or off.  CPython 3.14
