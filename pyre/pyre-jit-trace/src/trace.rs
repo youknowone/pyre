@@ -4246,7 +4246,8 @@ fn publish_terminal_raise_coordinate(
 /// this leg sits in the middle of: one binary, one env var, no layout variable
 /// — the same shape as the `PYRE_ANCHOR_STRICT` probe.
 fn walk_abort_leg_enabled() -> bool {
-    std::env::var_os("PYRE_WALKABORT_OFF").is_none()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_WALKABORT_OFF").is_none())
 }
 
 fn try_adopt_blackhole(

@@ -18656,7 +18656,18 @@ impl<M: Clone> MetaInterp<M> {
                     .as_mut()
                     .expect("trace still active")
                     .const_ref(exception_value),
-                Some(guard_op) => guard_op,
+                Some(guard_op) => {
+                    // `op.setref_base(val)`: the guard op carries the
+                    // exception object it was recorded on.
+                    self.tracing
+                        .as_mut()
+                        .expect("trace still active")
+                        .set_opref_concrete(
+                            guard_op,
+                            majit_ir::Value::Ref(majit_ir::GcRef(exception_value as usize)),
+                        );
+                    guard_op
+                }
                 None => OpRef::NONE,
             };
             self.last_exc_box = Some(last_exc_box);
