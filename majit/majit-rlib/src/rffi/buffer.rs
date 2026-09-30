@@ -652,22 +652,29 @@ unsafe fn raw_free(ptr: *mut u8) {
     unsafe { libc::free(ptr.cast()) }
 }
 
-/// wasm32-unknown-unknown does not link `libc`. The size sits in front of the
-/// payload so [`raw_free`] can hand the block back to the global allocator.
+/// Header bytes in front of the payload, and the alignment of that payload.
+///
+/// C `malloc` aligns for `max_align_t` (16). A `usize` header on wasm32 is
+/// only 4 bytes, so an 8-byte-aligned struct would otherwise be misaligned.
+/// [`raw_free`] subtracts the same width and rebuilds the same layout.
+#[cfg(target_arch = "wasm32")]
+const RAW_MALLOC_ALIGN: usize = 16;
+
+/// wasm32-unknown-unknown does not link `libc`. The size sits in a 16-byte
+/// header in front of the payload so [`raw_free`] can hand the block back to
+/// the global allocator. The payload is aligned to [`RAW_MALLOC_ALIGN`].
 #[cfg(target_arch = "wasm32")]
 unsafe fn raw_malloc(size: usize) -> *mut u8 {
     let payload = size.max(1);
-    let header = core::mem::size_of::<usize>();
-    let align = core::mem::align_of::<usize>();
-    let total = header + payload;
-    let layout = std::alloc::Layout::from_size_align(total, align).unwrap();
+    let total = RAW_MALLOC_ALIGN + payload;
+    let layout = std::alloc::Layout::from_size_align(total, RAW_MALLOC_ALIGN).unwrap();
     let base = unsafe { std::alloc::alloc(layout) };
     if base.is_null() {
         std::alloc::handle_alloc_error(layout);
     }
     unsafe {
         base.cast::<usize>().write(payload);
-        base.add(header)
+        base.add(RAW_MALLOC_ALIGN)
     }
 }
 
@@ -676,11 +683,10 @@ unsafe fn raw_free(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
-    let header = core::mem::size_of::<usize>();
-    let base = unsafe { ptr.sub(header) };
+    let base = unsafe { ptr.sub(RAW_MALLOC_ALIGN) };
     let payload = unsafe { base.cast::<usize>().read() };
-    let align = core::mem::align_of::<usize>();
-    let layout = std::alloc::Layout::from_size_align(header + payload, align).unwrap();
+    let layout =
+        std::alloc::Layout::from_size_align(RAW_MALLOC_ALIGN + payload, RAW_MALLOC_ALIGN).unwrap();
     unsafe { std::alloc::dealloc(base, layout) }
 }
 
@@ -689,30 +695,35 @@ unsafe fn raw_free(ptr: *mut u8) {
 /// `support.py build_ll_0_raw_malloc_fixedsize` bakes the STRUCT into a
 /// zero-argument `_ll_0_raw_malloc_fixedsize` (and `_zero` when `zero=True`).
 /// The size here is a constant argument; alignment stays inside `raw_malloc`.
+///
+/// `size` and the address are `i64` words (`extern "C"`). A `usize` parameter
+/// is i32 on wasm32, and `call_indirect` requires this signature.
 #[inline(never)]
-pub fn ll_raw_malloc_fixedsize(size: usize) -> usize {
-    unsafe { raw_malloc(size) as usize }
+pub extern "C" fn ll_raw_malloc_fixedsize(size: i64) -> i64 {
+    unsafe { raw_malloc(size as usize) as usize as i64 }
 }
 
 /// `zero=True` form of [`ll_raw_malloc_fixedsize`]. The block is cleared
 /// for `size` bytes. A zero-size request still returns a distinct block
-/// and writes nothing.
+/// and writes nothing. Same word ABI as [`ll_raw_malloc_fixedsize`].
 #[inline(never)]
-pub fn ll_raw_malloc_fixedsize_zero(size: usize) -> usize {
-    let ptr = unsafe { raw_malloc(size) };
-    if size > 0 {
-        unsafe { ptr.write_bytes(0, size) };
+pub extern "C" fn ll_raw_malloc_fixedsize_zero(size: i64) -> i64 {
+    let bytes = size as usize;
+    let ptr = unsafe { raw_malloc(bytes) };
+    if bytes > 0 {
+        unsafe { ptr.write_bytes(0, bytes) };
     }
-    ptr as usize
+    ptr as usize as i64
 }
 
 /// `lltype.free(ptr, flavor='raw')`. `jtransform.py rewrite_op_free`
 /// residualizes this as `raw_free`; the call cannot raise.
+/// `ptr` is an `i64` word; the body casts it to `usize`.
 #[inline(never)]
 #[majit_macros::oopspec("raw_free(ptr)")]
 #[majit_macros::dont_look_inside_cannot_raise]
-pub fn ll_raw_free(ptr: usize) {
-    unsafe { raw_free(ptr as *mut u8) }
+pub extern "C" fn ll_raw_free(ptr: i64) {
+    unsafe { raw_free(ptr as usize as *mut u8) }
 }
 
 #[cfg(test)]
@@ -723,6 +734,7 @@ mod tests {
     fn fixedsize_roundtrip_zero_clears_and_free() {
         let ptr = ll_raw_malloc_fixedsize(8);
         assert_ne!(ptr, 0);
+        assert_eq!((ptr as usize) & 15, 0);
         unsafe {
             let p = ptr as *mut u8;
             p.write(0x5A);
@@ -732,10 +744,24 @@ mod tests {
 
         let zeroed = ll_raw_malloc_fixedsize_zero(8);
         assert_ne!(zeroed, 0);
+        assert_eq!((zeroed as usize) & 15, 0);
         unsafe {
             let bytes = std::slice::from_raw_parts(zeroed as *const u8, 8);
             assert!(bytes.iter().all(|b| *b == 0));
         }
         ll_raw_free(zeroed);
+
+        // Not a multiple of 16. `malloc` (and the wasm32 16-byte header)
+        // still returns a 16-byte-aligned payload.
+        let odd = ll_raw_malloc_fixedsize(1);
+        assert_ne!(odd, 0);
+        assert_eq!((odd as usize) & 15, 0);
+        unsafe {
+            let p = odd as *mut u8;
+            p.write(0x11);
+            assert_eq!(p.read(), 0x11);
+        }
+        ll_raw_free(odd);
+        ll_raw_free(0);
     }
 }

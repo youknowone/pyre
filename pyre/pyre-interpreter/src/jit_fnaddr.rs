@@ -3649,19 +3649,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `jtransform.py _rewrite_raw_malloc` residualizes the malloc as a direct
     // call of `ll_raw_malloc_fixedsize` (the `_zero` helper when `zero=True`).
     // `jtransform.py rewrite_op_free` residualizes `ll_raw_free` as `raw_free`.
-    pa1(
+    // The helpers are word-ABI `extern "C"` (`i64` in, `i64` or void out).
+    // `usize` is i32 on wasm32, and `call_indirect` requires this signature.
+    cpa1(
         &mut entries,
         "majit_rlib::rffi::ll_raw_malloc_fixedsize",
         "majit_rlib::ll_raw_malloc_fixedsize",
         majit_rlib::rffi::ll_raw_malloc_fixedsize,
     );
-    pa1(
+    cpa1(
         &mut entries,
         "majit_rlib::rffi::ll_raw_malloc_fixedsize_zero",
         "majit_rlib::ll_raw_malloc_fixedsize_zero",
         majit_rlib::rffi::ll_raw_malloc_fixedsize_zero,
     );
-    pa1(
+    cpa1(
         &mut entries,
         "majit_rlib::rffi::ll_raw_free",
         "majit_rlib::ll_raw_free",
