@@ -11,9 +11,16 @@ import gc
 import mmap
 import weakref
 import zlib
-import _cffi_backend
 import _lsprof
 import _random
+
+try:
+    import _cffi_backend
+except ImportError:
+    _cffi_backend = None
+
+COMPRESS_TYPE = type(zlib.compressobj())
+DECOMPRESS_TYPE = type(zlib.decompressobj())
 
 
 def exc_name(fn):
@@ -53,12 +60,30 @@ def ffi_ok(x):
     return x.sizeof("int")
 
 
+def make_compress(cls):
+    if cls is COMPRESS_TYPE:
+        return zlib.compressobj()
+    return cls()
+
+
+def make_decompress(cls):
+    if cls is DECOMPRESS_TYPE:
+        return zlib.decompressobj()
+    return cls()
+
+
 def check(label, base, make, method):
     exact = make(base)
     print("exact-set", label, exc_name(lambda: setattr(exact, "attr", 1)))
 
-    class S(base):
-        pass
+    try:
+        class S(base):
+            pass
+    except TypeError as e:
+        print("plain", label, "not-base", type(e).__name__)
+        print("slots", label, "not-base")
+        print("del", label, "not-base")
+        return
 
     x = make(S)
     setattr(x, "attr", 1)
@@ -119,10 +144,11 @@ def check(label, base, make, method):
     print("del", label, ref() is None, seen)
 
 
-check("compress", type(zlib.compressobj()), lambda cls: cls(), compress_ok)
-check("decompress", type(zlib.decompressobj()), lambda cls: cls(), decompress_ok)
+check("compress", COMPRESS_TYPE, make_compress, compress_ok)
+check("decompress", DECOMPRESS_TYPE, make_decompress, decompress_ok)
 check("mmap", mmap.mmap, lambda cls: cls(-1, 16), mmap_ok)
 check("random", _random.Random, lambda cls: cls(1), random_ok)
 check("profiler", _lsprof.Profiler, lambda cls: cls(), profiler_ok)
-check("ffi", _cffi_backend.FFI, lambda cls: cls(), ffi_ok)
+if _cffi_backend is not None:
+    check("ffi", _cffi_backend.FFI, lambda cls: cls(), ffi_ok)
 print("OK")
