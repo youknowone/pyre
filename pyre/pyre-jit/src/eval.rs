@@ -10632,6 +10632,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // legal; a fresh `frame as *mut PyFrame` cast inside the loop would be
     // value-numbered into one definition that crosses the split as neither.
     let mut f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+    // `PyFrame.dispatch` receives `ec` once per activation (`interp_jit.py`).
+    // The thread-local slot stays on that context for the activation, so the
+    // per-opcode `getexecutioncontext` read is not part of the dispatch loop.
+    // Re-read only after `perform_actions`, which can run signal Python.
+    let mut marker_ec = pyre_interpreter::call::getexecutioncontext();
 
     loop {
         // Frame may move at a collection point. Collection now happens inside
@@ -10643,11 +10648,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // The signal/MemoryError handler search uses `last_instr`. Point it
         // at this opcode before `perform_actions`, same as `eval_loop`.
         unsafe { &mut *f }.last_instr = pc as isize;
-        // One EC read for the marker's red `ec` and the ticker. A fired
-        // breaker stores `-1` (`fire_action_ticker`); service it before
+        // A fired breaker stores `-1` (`fire_action_ticker`); service it before
         // `jit_merge_point` so a compiled back-edge does not re-enter on the
         // still-armed guard.
-        let marker_ec = pyre_interpreter::call::getexecutioncontext();
         let pre_ec = marker_ec as *mut PyExecutionContext;
         if !pre_ec.is_null() && unsafe { (*pre_ec).actionflag.get_ticker() } < 0 {
             if let Err(mut err) = unsafe { (*pre_ec).perform_actions(f) } {
@@ -10665,6 +10668,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 return Err(err);
             }
             f = FrameView::reload(f);
+            marker_ec = pyre_interpreter::call::getexecutioncontext();
         }
 
         // interp_jit.py:85-87 — source-level marker declaration.  Its
@@ -10883,7 +10887,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 f = FrameView::reload(f);
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py maybe_compile_and_run  allow-line-citation
-                let marker_ec = pyre_interpreter::call::getexecutioncontext();
+                // Same activation `ec` as the merge point above.
                 if marker_ec.is_null() {
                     // No execution context means there is nowhere to publish a
                     // compiled-loop exit.  Keep interpreting instead of

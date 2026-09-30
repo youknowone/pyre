@@ -4641,6 +4641,15 @@ pub fn appleveldef_install(
 /// `import _io` (`app_io.py`).  pyre installs app files eagerly from the
 /// module initializer, before the module object exists, so a name the source
 /// needs from its own module is bound up front instead.
+fn applevel_source_hash(source: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in source.as_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 pub fn appleveldef_install_seeded(
     mut ns: impl AppleveldefNamespace,
     source: &str,
@@ -4649,14 +4658,38 @@ pub fn appleveldef_install_seeded(
     names: &[&str],
     seed: &[(&str, PyObjectRef)],
 ) -> Result<(), crate::PyError> {
-    let code = compile_source_with_filename(source, Mode::Exec, filename)
-        .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
     let ctx = crate::call::getexecutioncontext();
     if ctx.is_null() {
         panic!("appleveldef `{filename}`: no execution context at module init");
     }
-    let w_app_globals = unsafe { (*ctx).fresh_module_globals() };
+    // `gateway.py ApplevelClass` / `mixedmodule.py MixedModule._cleanup_`
+    // compile the app file at translation. The source is linked into this
+    // binary, so the marshalled code is that image (`interp_imp.frozen_cache_load`,
+    // `importing.py _validate_timestamp_pyc`): binary mtime plus the source
+    // bytes. A hit does not parse.
+    let cache_key = format!("applevel.{modname}.{filename}");
+    let stamp = crate::module::imp::interp_imp::FrozenSourceStamp {
+        mtime_ns: applevel_source_hash(source),
+        size: source.len() as u64,
+    };
+    let loaded = crate::module::imp::interp_imp::frozen_cache_load(&cache_key, stamp);
     let _root = pyre_object::gc_roots::push_roots();
+    let code_slot = pyre_object::gc_roots::shadow_stack_len();
+    if let Some(w_code) = loaded {
+        unsafe { crate::pycode::set_hidden_applevel_unit(w_code) };
+        let _ = pyre_object::gc_roots::pin_root(w_code);
+    } else {
+        let code = compile_source_with_filename(source, Mode::Exec, filename)
+            .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
+        let w_code = crate::pycode::box_code_object_with_hidden_applevel(code, true);
+        let _ = pyre_object::gc_roots::pin_root(w_code);
+        crate::module::imp::interp_imp::frozen_cache_store(
+            &cache_key,
+            stamp,
+            pyre_object::gc_roots::shadow_stack_get(code_slot),
+        );
+    }
+    let w_app_globals = unsafe { (*ctx).fresh_module_globals() };
     let globals_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_app_globals);
     // `gateway.py build_applevel_dict` binds the owning module's name into the
@@ -4685,16 +4718,11 @@ pub fn appleveldef_install_seeded(
             )
         };
     }
-    // `gateway.py ApplevelClass.hidden_applevel = True`, which
-    // `build_applevel_dict` passes to `space.exec_` and the compiler carries as
-    // `CompileInfo`; every code object of the unit is then built with it
-    // (`assemble.py make_code`), so the flag set here reaches the nested
-    // functions this source defines.
-    //
-    // Every source installed here is a native module's body — the module is
-    // built in, and what it holds is an extension module on CPython — so none
-    // of these frames are the running program's.
-    let w_code = crate::pycode::box_code_object_with_hidden_applevel(code, true);
+    // `gateway.py ApplevelClass.hidden_applevel = True` is already on `w_code`
+    // (compile path via `box_code_object_with_hidden_applevel`, cache path via
+    // `set_hidden_applevel_unit`). Every source installed here is a native
+    // module's body, so none of these frames are the running program's.
+    let w_code = pyre_object::gc_roots::shadow_stack_get(code_slot);
     let w_app_globals = pyre_object::gc_roots::shadow_stack_get(globals_slot);
     let mut frame = crate::pyframe::createframe_obj(w_code as *const (), w_app_globals, ctx, None)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: createframe — {e:?}"));
@@ -4738,30 +4766,14 @@ fn load_source_module(
     // sees.
     let path_bytes = crate::gateway::fsencode_os_str(pathname.as_os_str());
     let path_text = crate::gateway::fsdecode_filename_wtf8(&path_bytes);
-    let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
-        let mut message = rustpython_wtf8::Wtf8Buf::from_string("cannot read '".to_string());
-        message.push_wtf8(&path_text);
-        message.push_str(&format!("': {e}"));
-        crate::PyError::new(crate::PyErrorKind::ImportError, message)
-    })?;
-
     let (pathname_str, filename_bytes) = crate::pycode::split_code_filename_bytes(path_bytes, None);
-    // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
-    // bad declaration is the tokenizer's SyntaxError, not an ImportError.
-    // [3.14-spec] CPython 3.14 `SourceFileLoader.exec_module` rejects an
-    // embedded NUL here with `source_as_string`'s unlocated "source code
-    // string" error.  The real pypy3 loader accepts it; pyre takes the 3.14
-    // observable while its command-line file path retains PyPy's located
-    // tokenizer boundary through `decode_file_source_bytes`.
-    let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
-
-    let roots = pyre_object::gc_roots::push_roots();
     // The two importlib bootstrap sources and `zipimport` are imported by the
     // native importer before `SourceFileLoader` exists, so they never reach the
     // `.pyc` cache and otherwise recompile on every startup.
     // `_frozen_importlib._cached_compile` (which `zipimport`'s moduledef also
-    // goes through): reload a marshalled, source-validated code object when the
-    // cache holds one for this binary, recompiling only on a miss.
+    // goes through): reload a marshalled code object when this binary and the
+    // source file's mtime and size match, recompiling only on a miss. A hit
+    // does not read the source. PyPy's frozen image does not either.
     // Startup loads the bootstrap sources under their frozen names; a source
     // copy still loads the public submodule names. Both share one cache entry.
     // `zipimport` stays keyed by its own name.
@@ -4773,20 +4785,39 @@ fn load_source_module(
         "zipimport" => Some(modulename),
         _ => None,
     };
-    let (w_code, store) = match cache_key
-        .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, &source))
-    {
-        Some(w_code) => (w_code, false),
-        None => {
-            let code = parse_source_module(&path_text, &source).map_err(|error| match error {
-                crate::syntax_warnings::SourceCompileError::Compile(error) => {
-                    crate::compile_err_to_syntax_error(error, &source, Mode::Exec)
-                }
-                crate::syntax_warnings::SourceCompileError::Warning(error) => error,
-            })?;
-            (crate::box_code_object(code), cache_key.is_some())
-        }
+    #[cfg(not(feature = "sandbox"))]
+    let cached = cache_key.and_then(|key| {
+        let stamp = crate::module::imp::interp_imp::frozen_source_stamp(pathname)?;
+        crate::module::imp::interp_imp::frozen_cache_load(key, stamp)
+    });
+    #[cfg(feature = "sandbox")]
+    let cached: Option<PyObjectRef> = None;
+    let (w_code, store) = if let Some(w_code) = cached {
+        (w_code, false)
+    } else {
+        let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
+            let mut message = rustpython_wtf8::Wtf8Buf::from_string("cannot read '".to_string());
+            message.push_wtf8(&path_text);
+            message.push_str(&format!("': {e}"));
+            crate::PyError::new(crate::PyErrorKind::ImportError, message)
+        })?;
+        // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
+        // bad declaration is the tokenizer's SyntaxError, not an ImportError.
+        // [3.14-spec] CPython 3.14 `SourceFileLoader.exec_module` rejects an
+        // embedded NUL here with `source_as_string`'s unlocated "source code
+        // string" error.  The real pypy3 loader accepts it; pyre takes the 3.14
+        // observable while its command-line file path retains PyPy's located
+        // tokenizer boundary through `decode_file_source_bytes`.
+        let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
+        let code = parse_source_module(&path_text, &source).map_err(|error| match error {
+            crate::syntax_warnings::SourceCompileError::Compile(error) => {
+                crate::compile_err_to_syntax_error(error, &source, Mode::Exec)
+            }
+            crate::syntax_warnings::SourceCompileError::Warning(error) => error,
+        })?;
+        (crate::box_code_object(code), cache_key.is_some())
     };
+    let roots = pyre_object::gc_roots::push_roots();
     // Root before `update_code_filenames` / later allocations can collect.
     // `set_compilation_unit_filename_bytes` walks nested codes and may
     // allocate; the pin is the shadow-stack livevar `gctransform` keeps
@@ -4799,7 +4830,10 @@ fn load_source_module(
         crate::pycode::set_compilation_unit_filename_bytes(roots.get(code_slot), filename_bytes)
     };
     if let (true, Some(key)) = (store, cache_key) {
-        crate::module::imp::interp_imp::frozen_cache_store(key, &source, roots.get(code_slot));
+        #[cfg(not(feature = "sandbox"))]
+        if let Some(stamp) = crate::module::imp::interp_imp::frozen_source_stamp(pathname) {
+            crate::module::imp::interp_imp::frozen_cache_store(key, stamp, roots.get(code_slot));
+        }
     }
 
     // Create a fresh namespace for the module, seeded with builtins.

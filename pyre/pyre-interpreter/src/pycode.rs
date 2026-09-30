@@ -1524,6 +1524,24 @@ unsafe fn box_code_constant_inheriting_unit(
 /// the code constructor and `replace`, whose filename changes only the object
 /// being built and leaves nested constants on the name they compiled under.
 pub unsafe fn set_compilation_unit_filename_bytes(w_code: PyObjectRef, bytes: Option<Vec<u8>>) {
+    let pycode = unsafe { &*(w_code as *const PyCode) };
+    if let Some(bytes) = bytes.as_ref()
+        && !pycode.code_ptr.is_null()
+    {
+        let same = if pycode.filename_bytes.is_null() {
+            unsafe { &*(pycode.code_ptr as *const crate::CodeObject) }
+                .source_path
+                .as_bytes()
+                == bytes.as_slice()
+        } else {
+            unsafe { &*pycode.filename_bytes }.as_slice() == bytes.as_slice()
+        };
+        // Nested codes compiled with this path already spell it. Rewriting
+        // each one allocated a fresh filename copy per code object.
+        if same {
+            return;
+        }
+    }
     let old_filename = unsafe { code_filename_bytes(w_code) };
     if let Some(bytes) = bytes.as_ref() {
         let pycode = unsafe { &*(w_code as *const PyCode) };
@@ -3539,6 +3557,25 @@ pub unsafe fn w_code_set_hidden_applevel(obj: PyObjectRef, hidden_applevel: bool
     }
 }
 
+/// `assemble.py make_code` stamps `compile_info.hidden_applevel` on every
+/// code object one compilation produces. Marshal rebuilds those wrappers
+/// with the default `False`, so a cached unit sets the flag on the graph
+/// `box_code_object` already published in `co_consts_w`.
+///
+/// # Safety
+/// `w_code` must be a `PyCode`.
+pub unsafe fn set_hidden_applevel_unit(w_code: PyObjectRef) {
+    let pycode = unsafe { &*(w_code as *const PyCode) };
+    if !pycode.co_consts_w.is_null() {
+        for &nested in unsafe { (&*pycode.co_consts_w).as_slice() } {
+            if !nested.is_null() && unsafe { is_code(nested) } {
+                unsafe { set_hidden_applevel_unit(nested) };
+            }
+        }
+    }
+    unsafe { w_code_set_hidden_applevel(w_code, true) };
+}
+
 /// Extract the opaque code pointer from a known PyCode.
 ///
 /// # Safety
@@ -3580,6 +3617,21 @@ fn fix_code_filenames(code: &mut crate::CodeObject, oldname: &str, newname: &str
 pub unsafe fn fix_co_filename(w_code: PyObjectRef, newname: &[u8]) {
     let code_ptr = unsafe { w_code_get_ptr(w_code) } as *mut crate::CodeObject;
     if code_ptr.is_null() {
+        return;
+    }
+    // `importing.py update_code_filenames` stores `pathname` on every nested
+    // code whose filename still equals the root's. When the root already
+    // spells that path, the walk would write the same bytes back.
+    let pycode = unsafe { &*(w_code as *const PyCode) };
+    let already = if pycode.filename_bytes.is_null() {
+        unsafe { &*(pycode.code_ptr as *const crate::CodeObject) }
+            .source_path
+            .as_bytes()
+            == newname
+    } else {
+        unsafe { &*pycode.filename_bytes }.as_slice() == newname
+    };
+    if already {
         return;
     }
     let old_filename = unsafe { code_filename_bytes(w_code) };
