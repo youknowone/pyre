@@ -23,8 +23,7 @@ const fn native_is_bigendian() -> bool {
 /// (registered in the exc-class registry under its qualified name) carrying
 /// `msg`.
 ///
-/// `dont_look_inside` so `lookup_exc_class` stays off the wrapper hot graph
-/// (`unicodeobject.py descr_startswith` / `str_prefix_match_slow`).
+/// `dont_look_inside` so `lookup_exc_class` stays off the wrapper hot graph.
 #[majit_macros::dont_look_inside]
 fn struct_error(msg: impl Into<String>) -> crate::PyError {
     let msg = msg.into();
@@ -638,7 +637,8 @@ fn pack_string_bytes(out: &mut Vec<u8>, data: &[u8], count: usize) {
 /// building `struct.error` on this graph.
 ///
 /// Spelled as a macro so the generated `descr_pack` wrapper contains the
-/// walk, the way `rstring_prefix_eq` sits inside `descr_startswith`.
+/// walk rather than a call to a standalone `&[u8]` leaf, which is never a
+/// CodeWriter candidate.
 macro_rules! simple_int_format {
     ($format:expr) => {{
         let bytes = $format.as_bytes();

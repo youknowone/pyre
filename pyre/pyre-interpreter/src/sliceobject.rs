@@ -94,13 +94,18 @@ pub fn adapt_start_stop(size: i64, start: i64, end: i64) -> (i64, i64) {
 
 /// The negative-index normalization `adapt_lower_bound` applies once the
 /// bound has already been converted to an `i64`.
-fn adapt_bound(size: i64, index: i64) -> i64 {
+///
+/// Spelled as a plain add rather than `saturating_add`: `index` is negative
+/// here and `size` is a length, so the sum stays inside the word — it can
+/// only move an out-of-word `i64::MIN` upwards — and the saturating form is
+/// an unregistered foreign leaf that stops the enclosing graph, the same
+/// reason `type_methods.rs args_given` avoids `saturating_sub`.
+pub(crate) fn adapt_bound(size: i64, index: i64) -> i64 {
     if index >= 0 {
         return index;
     }
-    // An out-of-word index arrives clamped to `i64::MIN`, so fold by `size`
-    // without overflowing before flooring at 0.
-    index.saturating_add(size).max(0)
+    let folded = index + size;
+    if folded < 0 { 0 } else { folded }
 }
 
 /// sliceobject.py `unwrap_start_stop(space, size, w_start, w_end)`.
