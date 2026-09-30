@@ -708,8 +708,9 @@ pub fn complete_struct_or_union(
             } else {
                 let w_fld =
                     super::ctypestruct::new_cfield(descr.w_ftype, byteoffset, bs_flag, -1, fflags);
-                append(w_fld);
-                record(fname, w_fld);
+                let fld_slot = roots.pin_roots(&[w_fld]);
+                append(roots.get(fld_slot));
+                record(fname, roots.get(fld_slot));
             }
             if ftype.size >= 0 {
                 byteoffset += ftype.size;
@@ -816,8 +817,9 @@ pub fn complete_struct_or_union(
                         fbitsize,
                         fflags,
                     );
-                    append(w_fld);
-                    record(fname, w_fld);
+                    let fld_slot = roots.pin_roots(&[w_fld]);
+                    append(roots.get(fld_slot));
+                    record(fname, roots.get(fld_slot));
                 }
             }
         }

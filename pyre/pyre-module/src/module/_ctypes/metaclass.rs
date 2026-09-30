@@ -2187,7 +2187,7 @@ fn array_init(args: &[PyObjectRef]) -> PyResult {
             "__init__ requires self",
         ));
     }
-    let mut obj = args[0];
+    let obj = args[0];
     let (pos, _kw) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
     let npos = pos.len();
     let roots = pyre_object::gc_roots::push_roots();
@@ -2195,17 +2195,13 @@ fn array_init(args: &[PyObjectRef]) -> PyResult {
     let obj_slot = roots.publish(&[obj]);
     roots.normalize(pos_base, npos + 1);
     let meta = array_meta(roots.get(obj_slot))?;
-    let mut pos_buf = vec![pyre_object::PY_NULL; npos];
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    obj = roots.get(obj_slot);
-    drop(roots);
-    if pos_buf.len() > meta.length {
+    if npos > meta.length {
         return Err(pyre_interpreter::PyError::index_error(
             "too many initializers",
         ));
     }
-    for (i, &val) in pos_buf.iter().enumerate() {
-        pyre_object::with_roots!(obj => array_set_index(obj, &meta, i, val))?;
+    for i in 0..npos {
+        array_set_index(roots.get(obj_slot), &meta, i, roots.get(pos_base + i))?;
     }
     Ok(pyre_object::w_none())
 }

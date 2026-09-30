@@ -3351,14 +3351,18 @@ fn call_with_kwargs_in_ctx_impl(
     // and keyword-name strings before the callee frame owns these values.
     let _call_roots = pyre_object::gc_roots::push_roots();
     let nargs = pos_args.len();
+    let nkwargs = kwargs.len();
     let call_root_base = pyre_object::gc_roots::shadow_stack_len();
-    let callable = pyre_object::gc_roots::pin_root(callable);
-    // One pin of the slice, not one pin per element: the element loop roots
-    // temporaries and leaves `pos_args` itself unpinned across later calls.
-    let _pos_base = pyre_object::gc_roots::pin_roots(pos_args);
+    // Publish the whole live set, then one normalize. `pin_root` /
+    // `pin_roots` query after the first write and would leave later
+    // slices invisible to that safepoint.
+    let _ = pyre_object::gc_roots::publish_roots(&[callable]);
+    let _ = pyre_object::gc_roots::publish_roots(pos_args);
     for (_, value) in kwargs {
-        let _ = pyre_object::gc_roots::pin_root(*value);
+        let _ = pyre_object::gc_roots::publish_roots(&[*value]);
     }
+    pyre_object::gc_roots::normalize_roots(call_root_base, 1 + nargs + nkwargs);
+    let callable = pyre_object::gc_roots::shadow_stack_get(call_root_base);
     let current_callable = || pyre_object::gc_roots::shadow_stack_get(call_root_base);
     let current_pos_arg =
         |index: usize| pyre_object::gc_roots::shadow_stack_get(call_root_base + 1 + index);

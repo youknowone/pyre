@@ -1228,13 +1228,15 @@ fn call_python_callback(
             n_args,
         )));
     }
-    let converted = argtypes
-        .into_iter()
-        .enumerate()
-        .map(|(i, ty)| {
-            callback_argument(ty, pyre_object::gc_roots::shadow_stack_get(args_base + i))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let converted_base = pyre_object::gc_roots::shadow_stack_len();
+    for (i, ty) in argtypes.into_iter().enumerate() {
+        let converted =
+            callback_argument(ty, pyre_object::gc_roots::shadow_stack_get(args_base + i))?;
+        let _ = pyre_object::gc_roots::publish_roots(&[converted]);
+    }
+    pyre_object::gc_roots::normalize_roots(converted_base, n_args);
+    let mut converted = vec![pyre_object::PY_NULL; n_args];
+    pyre_object::gc_roots::shadow_stack_copy_range(converted_base, &mut converted);
     let result = pyre_interpreter::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(callable_slot),
         &converted,
