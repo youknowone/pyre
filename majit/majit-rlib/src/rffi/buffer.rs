@@ -654,26 +654,37 @@ unsafe fn raw_free(ptr: *mut u8) {
 
 /// Header bytes in front of the payload, and the alignment of that payload.
 ///
-/// C `malloc` aligns for `max_align_t` (16). A `usize` header on wasm32 is
-/// only 4 bytes, so an 8-byte-aligned struct would otherwise be misaligned.
-/// [`raw_free`] subtracts the same width and rebuilds the same layout.
-#[cfg(target_arch = "wasm32")]
+/// C `malloc` aligns for `max_align_t` (16). `GCTransformer` registers
+/// `ll_raw_malloc_fixedsize` as one `Signed`; `llmemory.raw_malloc` asks
+/// the C allocator for that many bytes. wasm32 has no libc, and a `usize`
+/// header there is 4 bytes, so the block uses this 16-byte header instead.
+#[cfg(any(target_arch = "wasm32", test))]
 const RAW_MALLOC_ALIGN: usize = 16;
 
-/// wasm32-unknown-unknown does not link `libc`. The size sits in a 16-byte
-/// header in front of the payload so [`raw_free`] can hand the block back to
-/// the global allocator. The payload is aligned to [`RAW_MALLOC_ALIGN`].
+/// 16-byte header plus `size` payload bytes. `Layout::from_size_align`
+/// rejects a size that is not a multiple of the alignment, so the total is
+/// rounded up. [`raw_free`] rebuilds this same layout from the stored size.
+#[cfg(any(target_arch = "wasm32", test))]
+fn raw_malloc_layout(size: usize) -> std::alloc::Layout {
+    let payload = size.max(1);
+    let total = RAW_MALLOC_ALIGN
+        .checked_add(payload)
+        .and_then(|n| n.checked_next_multiple_of(RAW_MALLOC_ALIGN))
+        .expect("raw malloc size overflow");
+    std::alloc::Layout::from_size_align(total, RAW_MALLOC_ALIGN).unwrap()
+}
+
+/// wasm32-unknown-unknown does not link `libc`. The requested size sits in
+/// the header so [`raw_free`] can rebuild the [`raw_malloc_layout`].
 #[cfg(target_arch = "wasm32")]
 unsafe fn raw_malloc(size: usize) -> *mut u8 {
-    let payload = size.max(1);
-    let total = RAW_MALLOC_ALIGN + payload;
-    let layout = std::alloc::Layout::from_size_align(total, RAW_MALLOC_ALIGN).unwrap();
+    let layout = raw_malloc_layout(size);
     let base = unsafe { std::alloc::alloc(layout) };
     if base.is_null() {
         std::alloc::handle_alloc_error(layout);
     }
     unsafe {
-        base.cast::<usize>().write(payload);
+        base.cast::<usize>().write(size);
         base.add(RAW_MALLOC_ALIGN)
     }
 }
@@ -684,9 +695,8 @@ unsafe fn raw_free(ptr: *mut u8) {
         return;
     }
     let base = unsafe { ptr.sub(RAW_MALLOC_ALIGN) };
-    let payload = unsafe { base.cast::<usize>().read() };
-    let layout =
-        std::alloc::Layout::from_size_align(RAW_MALLOC_ALIGN + payload, RAW_MALLOC_ALIGN).unwrap();
+    let size = unsafe { base.cast::<usize>().read() };
+    let layout = raw_malloc_layout(size);
     unsafe { std::alloc::dealloc(base, layout) }
 }
 
@@ -695,6 +705,7 @@ unsafe fn raw_free(ptr: *mut u8) {
 /// `support.py build_ll_0_raw_malloc_fixedsize` bakes the STRUCT into a
 /// zero-argument `_ll_0_raw_malloc_fixedsize` (and `_zero` when `zero=True`).
 /// The size here is a constant argument; alignment stays inside `raw_malloc`.
+/// `GCTransformer` publishes the helper as one `Signed`.
 ///
 /// `size` and the address are `i64` words (`extern "C"`). A `usize` parameter
 /// is i32 on wasm32, and `call_indirect` requires this signature.
@@ -763,5 +774,15 @@ mod tests {
         }
         ll_raw_free(odd);
         ll_raw_free(0);
+    }
+
+    #[test]
+    fn wasm_raw_block_is_16_aligned_for_any_size() {
+        for size in [0_usize, 1, 7, 8, 15, 16, 17, 24, 32, 48] {
+            let layout = super::raw_malloc_layout(size);
+            assert_eq!(layout.align(), super::RAW_MALLOC_ALIGN);
+            assert_eq!(layout.size() % super::RAW_MALLOC_ALIGN, 0);
+            assert!(layout.size() >= super::RAW_MALLOC_ALIGN + size.max(1));
+        }
     }
 }
