@@ -5426,11 +5426,11 @@ pub(crate) fn try_dispatch_binary_special(
         // address.  The caller roots its own copies across the call.
         let _roots = pyre_object::gc_roots::push_roots();
         let operands = pyre_object::gc_roots::pin_roots(&[lhs, rhs]);
-        let (w_left_src, mut w_left_impl) =
-            match lookup_where_with_method_cache(w_typ1.as_ptr(), dunder) {
-                Some((src, imp)) => (Some(src), Some(imp)),
-                None => (None, None),
-            };
+        let w_left = lookup_where_with_method_cache(w_typ1.as_ptr(), dunder);
+        let mut w_left_impl = match w_left {
+            Some((_, imp)) => Some(imp),
+            None => None,
+        };
         // Which slot the forward call's first operand is read from.  Upstream
         // swaps the two values; swapping the *index* keeps the pinned copies
         // authoritative across a collection.
@@ -5439,15 +5439,15 @@ pub(crate) fn try_dispatch_binary_special(
         // descroperation.py:652 — same type means the reflected method is
         // never considered.
         if w_typ1 != w_typ2 {
-            let (w_right_src, wri) = match lookup_where_with_method_cache(w_typ2.as_ptr(), rdunder)
-            {
-                Some((src, imp)) => (Some(src), Some(imp)),
-                None => (None, None),
+            let w_right = lookup_where_with_method_cache(w_typ2.as_ptr(), rdunder);
+            w_right_impl = match w_right {
+                Some((_, imp)) => Some(imp),
+                None => None,
             };
-            w_right_impl = wri;
             // descroperation.py:662 — both `__op__` and `__rop__` are
             // found, in different MRO classes.
-            if let (Some(rsrc), Some(lsrc)) = (w_right_src, w_left_src)
+            if let Some((rsrc, _)) = w_right
+                && let Some((lsrc, _)) = w_left
                 && !std::ptr::eq(lsrc, rsrc)
             {
                 // descroperation.py:667-670.
