@@ -8622,9 +8622,15 @@ fn build_function(
                     sink.call_indirect(0, type_idx);
                     if has_result {
                         if *result_ty == Some(ValType::I32) {
-                            // A signed `i32` result is `lltype.Signed`. A ref
-                            // result is a pointer and stays zero-extended.
-                            if op.opcode == OpCode::CondCallValueI {
+                            // `get_call_descr` records result signedness.
+                            // Unsigned ints and refs zero-extend.
+                            let signed = op.opcode == OpCode::CondCallValueI
+                                && op.getdescr().is_some_and(|descr| {
+                                    descr
+                                        .as_call_descr()
+                                        .is_some_and(|cd| cd.is_result_signed())
+                                });
+                            if signed {
                                 sink.i64_extend_i32_s();
                             } else {
                                 sink.i64_extend_i32_u();

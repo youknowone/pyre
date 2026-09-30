@@ -10108,9 +10108,10 @@ fn cond_call_value_i32_result_extends_by_kind() {
 
     let encoded =
         majit_backend_wasm::encode_func_sig(&[], Some(majit_backend_wasm::FuncSigVal::I32));
-    for (opcode, extend_s) in [
-        (OpCode::CondCallValueI, true),
-        (OpCode::CondCallValueR, false),
+    for (opcode, result_signed, extend_s) in [
+        (OpCode::CondCallValueI, true, true),
+        (OpCode::CondCallValueI, false, false),
+        (OpCode::CondCallValueR, false, false),
     ] {
         with_table_sig(0x100, Some(encoded), || {
             let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
@@ -10132,7 +10133,7 @@ fn cond_call_value_i32_result_extends_by_kind() {
                 } else {
                     Type::Ref
                 },
-                false,
+                result_signed,
                 4,
                 EffectInfo::default(),
             )));
@@ -10147,10 +10148,16 @@ fn cond_call_value_i32_result_extends_by_kind() {
                 _ => {}
             });
             if extend_s {
-                assert!(signed >= 1, "{opcode:?} must sign-extend an i32 result");
+                assert!(
+                    signed >= 1,
+                    "{opcode:?} signed={result_signed} must sign-extend"
+                );
             } else {
-                assert!(unsigned >= 1, "{opcode:?} must zero-extend an i32 result");
-                assert_eq!(signed, 0, "{opcode:?} must not sign-extend a ref");
+                assert!(
+                    unsigned >= 1,
+                    "{opcode:?} signed={result_signed} must zero-extend"
+                );
+                assert_eq!(signed, 0);
             }
         });
     }
