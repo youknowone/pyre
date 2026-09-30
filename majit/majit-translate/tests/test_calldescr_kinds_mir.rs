@@ -120,13 +120,12 @@ fn sizehint_deref_loads_an_int_word() {
         .and_then(majit_translate::model::LinkArg::as_variable)
         .cloned()
         .expect("sizehint_state_value returns the loaded word");
-    match defining_op(&graph, &ret) {
-        Some(OpKind::RawLoad {
+    match root_op(&graph, &ret) {
+        Some(OpKind::ArrayRead {
             item_ty: ValueType::Int,
-            itemsize: 8,
-            is_item_signed: true,
+            array_type_id: Some(array_type_id),
             ..
-        }) => {}
+        }) if array_type_id == "[i64]" => {}
         other => {
             let kinds: Vec<String> = ops(&graph)
                 .map(|op| {
@@ -134,7 +133,7 @@ fn sizehint_deref_loads_an_int_word() {
                     rendered.chars().take(90).collect()
                 })
                 .collect();
-            panic!("*const i64 deref must raw_load an i64, got {other:?}; ops {kinds:?}")
+            panic!("*const i64 deref must be a GcArray(Signed) read, got {other:?}; ops {kinds:?}")
         }
     }
 

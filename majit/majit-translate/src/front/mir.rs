@@ -11920,16 +11920,71 @@ impl<'a> Lowering<'a> {
                 // `atomic_ref_place` and are excluded. A call result is not
                 // that alias: it is recorded on `scalar_address_locals`.
                 // `&raw const *p` of an address is not recorded as an alias.
+                //
+                // A `TypedItemsBlock` word is `GcArray(Signed|Float)`
+                // `getarrayitem`, the same op [`Self::typed_items_elem_ptr_add`]
+                // emits for `.add(idx)`. That arm binds the element on
+                // `index_elem_alias`, so the following `*p` is the element
+                // already read. `raw_load` is the post-rtyper spelling
+                // (`rewrite_op_raw_load`); emitting it here makes
+                // `flowspace_adapter::translate_op` reject the subject.
+                // A deref with no `.add` (`sizehint_state_value`) is that
+                // array at index 0.
                 let scalar_address = matches!(
                     inner.kind,
                     PlaceKind::Local(local)
                         if self.scalar_address_locals.contains(&(local as usize))
                 );
+                let deref_local = match &inner.kind {
+                    PlaceKind::Local(local) => Some(*local as usize),
+                    _ => None,
+                };
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "Deref"
+                    && let Some(local) = deref_local
+                    && !self.index_elem_alias.contains_key(&local)
+                    && let Some((item_ty, array_type_id)) =
+                        raw_ptr_typed_items_element(&inner.ty, self.llbc)
+                    && base_traces_to_typed_items_block_accessor(self.body, local, self.llbc)
+                {
+                    let ptr = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let base = self
+                        .narrow_value_to_instance_root(bb_id, ptr.into(), &array_type_id)
+                        .as_variable()
+                        .expect("a materialized typed-items base stays a Variable")
+                        .clone();
+                    let index = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(index.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    let loaded = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(loaded.clone()),
+                        kind: OpKind::ArrayRead {
+                            base,
+                            index,
+                            item_ty,
+                            array_type_id: Some(array_type_id.clone()),
+                            nolength: crate::front::typestr::nolength_from_array_type_id(Some(
+                                array_type_id.as_str(),
+                            )),
+                            pure: false,
+                        },
+                    });
+                    return Ok(loaded);
+                }
                 if let ProjectionElem::Atom(name) = &elem
                     && name == "Deref"
                     && (tyref_is_raw_pointer(&inner.ty, self.llbc) || scalar_address)
                     && !matches!(inner.kind, PlaceKind::Local(local)
-                        if self.atomic_ref_place.contains_key(&(local as usize)))
+                        if self.atomic_ref_place.contains_key(&(local as usize))
+                            || self.index_elem_alias.contains_key(&(local as usize)))
                     && tyref_is_primitive_scalar(&place_ty, self.llbc)
                     && let Some((item_ty, itemsize, is_item_signed)) =
                         self.raw_word_descr(&place_ty)
@@ -62325,6 +62380,82 @@ mod tests {
             unwrap_residuals, 0,
             "checked conversion Result::unwrap must become a discriminant guard"
         );
+        for name in [
+            "pyre_object::listobject::range_state_value",
+            "pyre_object::listobject::range_list_length",
+            "pyre_object::listobject::range_list_start_step",
+            "pyre_object::listobject::sizehint_state_value",
+        ] {
+            let lowered = super::lower_function(&llbc, name).unwrap_or_else(|err| {
+                panic!("lower {name}: {err:?}");
+            });
+            let raw_loads: Vec<_> = lowered
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter(|op| matches!(op.kind, OpKind::RawLoad { .. }))
+                .collect();
+            assert!(
+                raw_loads.is_empty(),
+                "{name}: a TypedItemsBlock word is getarrayitem, not raw_load: {raw_loads:?}"
+            );
+            if name.ends_with("sizehint_state_value") {
+                let ret = lowered
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.exits)
+                    .find(|link| link.target == lowered.returnblock)
+                    .and_then(|link| link.args.first())
+                    .and_then(crate::model::LinkArg::as_variable)
+                    .cloned()
+                    .expect("sizehint_state_value returns the loaded word");
+                let mut current = ret;
+                let mut producer = None;
+                for _ in 0..32 {
+                    if let Some(op) = lowered.blocks.iter().find_map(|block| {
+                        block.operations.iter().find_map(|op| {
+                            (op.result.as_ref() == Some(&current)).then_some(&op.kind)
+                        })
+                    }) {
+                        producer = Some(op);
+                        break;
+                    }
+                    let mut next = None;
+                    for block in &lowered.blocks {
+                        let Some(slot) = block.inputargs.iter().position(|arg| arg == &current)
+                        else {
+                            continue;
+                        };
+                        for pred in &lowered.blocks {
+                            for exit in &pred.exits {
+                                if exit.target == block.id
+                                    && let Some(src) =
+                                        exit.args.get(slot).and_then(|arg| arg.as_variable())
+                                    && src != &current
+                                {
+                                    next = Some(src.clone());
+                                }
+                            }
+                        }
+                    }
+                    match next {
+                        Some(src) => current = src,
+                        None => break,
+                    }
+                }
+                assert!(
+                    matches!(
+                        producer,
+                        Some(OpKind::ArrayRead {
+                            item_ty: ValueType::Int,
+                            array_type_id: Some(array_type_id),
+                            ..
+                        }) if array_type_id == "[i64]"
+                    ),
+                    "{name}: returned word must be the index-0 Signed read, got {producer:?}"
+                );
+            }
+        }
     }
 
     /// `complex_val` returns the RPython spelling of an optional pair.  The
