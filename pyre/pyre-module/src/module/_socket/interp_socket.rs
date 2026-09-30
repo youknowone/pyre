@@ -1820,23 +1820,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
             pyre_interpreter::make_builtin_function_with_arity(
                 "if_nameindex",
                 |_| {
-                    // Names are copied out before `if_freenameindex`. The
-                    // array itself is libc storage, not a Python object.
-                    let interfaces = unsafe {
-                        let head = majit_rlib::_rsocket_rffi::if_nameindex();
-                        if head.is_null() {
-                            return Err(socket_last_error());
-                        }
-                        let mut interfaces = Vec::new();
-                        let mut p = head;
-                        while (*p).if_index != 0 && !(*p).if_name.is_null() {
-                            let name = std::ffi::CStr::from_ptr((*p).if_name).to_bytes().to_vec();
-                            interfaces.push(((*p).if_index, name));
-                            p = p.add(1);
-                        }
-                        majit_rlib::_rsocket_rffi::if_freenameindex(head);
-                        interfaces
-                    };
+                    let interfaces = majit_rlib::rsocket::if_nameindex().map_err(|error| {
+                        socket_io_err(std::io::Error::from_raw_os_error(error.errno))
+                    })?;
                     let mut result_w = pyre_object::gc_roots::RootedItems::new();
                     for (index, name) in interfaces {
                         let pair = {

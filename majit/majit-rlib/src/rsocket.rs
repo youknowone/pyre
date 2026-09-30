@@ -202,6 +202,28 @@ pub fn getservbyport(port: i32, proto: Option<&std::ffi::CStr>) -> Result<String
         .into_owned())
 }
 
+/// `if_nameindex`. Names are copied out before `if_freenameindex`.
+#[cfg(unix)]
+pub fn if_nameindex() -> Result<Vec<(u32, Vec<u8>)>, CSocketError> {
+    let head = unsafe { crate::_rsocket_rffi::if_nameindex() };
+    if head.is_null() {
+        return Err(last_error());
+    }
+    let mut out = Vec::new();
+    unsafe {
+        let mut entry = head;
+        while (*entry).if_index != 0 && !(*entry).if_name.is_null() {
+            let name = std::ffi::CStr::from_ptr((*entry).if_name)
+                .to_bytes()
+                .to_vec();
+            out.push(((*entry).if_index, name));
+            entry = entry.add(1);
+        }
+        crate::_rsocket_rffi::if_freenameindex(head);
+    }
+    Ok(out)
+}
+
 /// `getprotobyname`. The number is `p_proto`.
 #[cfg(unix)]
 pub fn getprotobyname(name: &std::ffi::CStr) -> Result<i64, RSocketError> {
@@ -356,6 +378,16 @@ mod tests {
                 .expect_err("missing service")
                 .message,
             "service/proto not found"
+        );
+    }
+
+    #[test]
+    fn if_nameindex_copies_names() {
+        let list = if_nameindex().expect("if_nameindex");
+        assert!(!list.is_empty());
+        assert!(
+            list.iter()
+                .all(|(_, name)| !name.is_empty() && !name.contains(&0))
         );
     }
 }
