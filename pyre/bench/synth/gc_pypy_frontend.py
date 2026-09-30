@@ -1,12 +1,13 @@
 # pyre-check: requires-modules=gc
 # pyre-check: no-cpython
-# pyre-check: jitstats-band=guard_failures=8
+# pyre-check: jitstats-band=guard_failures=8,bridges_compiled=1
 # The `<module>` list comprehension over gc.get_rpy_roots() is hot in pyre
 # (about 22.5k roots; pypy3 has 638) and its GuardClass fails once per root
 # type change. The roots list differs by platform, so guard_failures is
 # deterministic per runner but spread by up to 8 across runners (470 windows,
 # 473 macos, 481 ubuntu, measured before the MutableCell roots were wrapped
-# as GcRef). Only about 16k of the 22.5k roots are
+# as GcRef). A second type crossing eagerness compiles one extra bridge:
+# ubuntu wasm reads 1, darwin wasm and native read 2. Only about 16k of the 22.5k roots are
 # distinct objects: several off-GC side-table walkers report the same type,
 # str or descriptor, where pypy3 reaches those objects through the heap.
 import gc
