@@ -6426,37 +6426,59 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     socket_set_attr(w_self, "_quickack", pyre_object::w_int_new(flag as i64));
                     return Ok(pyre_object::w_none());
                 }
-                let r = {
+                #[cfg(unix)]
+                {
                     if pyre_object::is_int(val) {
                         let v = pyre_object::w_int_get_value(val) as libc::c_int;
-                        rffi::setsockopt(
-                            fd,
-                            level,
-                            name,
-                            &v as *const _ as *const libc::c_void,
-                            core::mem::size_of::<libc::c_int>() as rffi::SockLen,
-                        )
+                        majit_rlib::rsocket::setsockopt(fd, level, name, &v.to_ne_bytes())
+                            .map_err(rsocket_os_error)?;
                     } else if pyre_object::bytesobject::is_bytes_like(val) {
                         // Copied before the call: `setsockopt` releases the
                         // interpreter, and the bytes object can move.
                         let data = pyre_object::bytesobject::bytes_like_data(val).to_vec();
-                        rffi::setsockopt(
-                            fd,
-                            level,
-                            name,
-                            data.as_ptr() as *const libc::c_void,
-                            data.len() as rffi::SockLen,
-                        )
+                        majit_rlib::rsocket::setsockopt(fd, level, name, &data)
+                            .map_err(rsocket_os_error)?;
                     } else {
                         return Err(pyre_interpreter::PyError::type_error(
                             "setsockopt: value must be int or bytes-like",
                         ));
                     }
-                };
-                if r != 0 {
-                    return Err(socket_last_error());
+                    return Ok(pyre_object::w_none());
                 }
-                Ok(pyre_object::w_none())
+                #[cfg(windows)]
+                {
+                    let r = {
+                        if pyre_object::is_int(val) {
+                            let v = pyre_object::w_int_get_value(val) as libc::c_int;
+                            rffi::setsockopt(
+                                fd,
+                                level,
+                                name,
+                                &v as *const _ as *const libc::c_void,
+                                core::mem::size_of::<libc::c_int>() as rffi::SockLen,
+                            )
+                        } else if pyre_object::bytesobject::is_bytes_like(val) {
+                            // Copied before the call: `setsockopt` releases the
+                            // interpreter, and the bytes object can move.
+                            let data = pyre_object::bytesobject::bytes_like_data(val).to_vec();
+                            rffi::setsockopt(
+                                fd,
+                                level,
+                                name,
+                                data.as_ptr() as *const libc::c_void,
+                                data.len() as rffi::SockLen,
+                            )
+                        } else {
+                            return Err(pyre_interpreter::PyError::type_error(
+                                "setsockopt: value must be int or bytes-like",
+                            ));
+                        }
+                    };
+                    if r != 0 {
+                        return Err(socket_last_error());
+                    }
+                    Ok(pyre_object::w_none())
+                }
             }),
         )
     };
@@ -6502,21 +6524,29 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                             "_quickack",
                         )));
                     }
-                    let mut v: libc::c_int = 0;
-                    let mut sz = core::mem::size_of::<libc::c_int>() as rffi::SockLen;
-                    let r = {
-                        rffi::getsockopt(
-                            fd,
-                            level,
-                            name,
-                            &mut v as *mut _ as *mut libc::c_void,
-                            &mut sz,
-                        )
-                    };
-                    if r != 0 {
-                        return Err(socket_last_error());
+                    #[cfg(unix)]
+                    {
+                        let v = socket_getsockopt_int(fd, level, name)?;
+                        return Ok(pyre_object::w_int_new(v as i64));
                     }
-                    Ok(pyre_object::w_int_new(v as i64))
+                    #[cfg(windows)]
+                    {
+                        let mut v: libc::c_int = 0;
+                        let mut sz = core::mem::size_of::<libc::c_int>() as rffi::SockLen;
+                        let r = {
+                            rffi::getsockopt(
+                                fd,
+                                level,
+                                name,
+                                &mut v as *mut _ as *mut libc::c_void,
+                                &mut sz,
+                            )
+                        };
+                        if r != 0 {
+                            return Err(socket_last_error());
+                        }
+                        Ok(pyre_object::w_int_new(v as i64))
+                    }
                 } else {
                     if !(0..=1024).contains(&buflen) {
                         return Err(pyre_interpreter::PyError::os_error(
@@ -6524,22 +6554,31 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     let buflen = buflen as usize;
-                    let mut buf = vec![0u8; buflen];
-                    let mut sz = buflen as rffi::SockLen;
-                    let r = {
-                        rffi::getsockopt(
-                            fd,
-                            level,
-                            name,
-                            buf.as_mut_ptr() as *mut libc::c_void,
-                            &mut sz,
-                        )
-                    };
-                    if r != 0 {
-                        return Err(socket_last_error());
+                    #[cfg(unix)]
+                    {
+                        let buf = majit_rlib::rsocket::getsockopt(fd, level, name, buflen)
+                            .map_err(rsocket_os_error)?;
+                        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf));
                     }
-                    buf.truncate(sz as usize);
-                    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
+                    #[cfg(windows)]
+                    {
+                        let mut buf = vec![0u8; buflen];
+                        let mut sz = buflen as rffi::SockLen;
+                        let r = {
+                            rffi::getsockopt(
+                                fd,
+                                level,
+                                name,
+                                buf.as_mut_ptr() as *mut libc::c_void,
+                                &mut sz,
+                            )
+                        };
+                        if r != 0 {
+                            return Err(socket_last_error());
+                        }
+                        buf.truncate(sz as usize);
+                        Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
+                    }
                 }
             }),
         )

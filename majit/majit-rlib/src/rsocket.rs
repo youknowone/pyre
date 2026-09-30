@@ -530,6 +530,50 @@ pub fn recvfrom(
     Ok((read as usize, bytes.to_vec(), addrlen as i32))
 }
 
+/// `getsockopt`. The returned bytes are the prefix the call wrote.
+#[cfg(unix)]
+pub fn getsockopt(
+    fd: INT,
+    level: INT,
+    option: INT,
+    maxlen: usize,
+) -> Result<Vec<u8>, CSocketError> {
+    let mut buf = vec![0u8; maxlen];
+    let mut size = maxlen as libc::socklen_t;
+    let res = unsafe {
+        crate::_rsocket_rffi::socketgetsockopt(
+            fd,
+            level,
+            option,
+            buf.as_mut_ptr().cast(),
+            &raw mut size,
+        )
+    };
+    if res < 0 {
+        return Err(last_error());
+    }
+    buf.truncate(size as usize);
+    Ok(buf)
+}
+
+/// `setsockopt`. `value` is the option bytes, and its length is `optlen`.
+#[cfg(unix)]
+pub fn setsockopt(fd: INT, level: INT, option: INT, value: &[u8]) -> Result<(), CSocketError> {
+    let res = unsafe {
+        crate::_rsocket_rffi::socketsetsockopt(
+            fd,
+            level,
+            option,
+            value.as_ptr().cast(),
+            value.len() as libc::socklen_t,
+        )
+    };
+    if res < 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
@@ -935,5 +979,36 @@ mod tests {
         );
         close(a).expect("close a");
         close(b).expect("close b");
+    }
+
+    #[test]
+    fn setsockopt_and_getsockopt_round_trip() {
+        unsafe {
+            let fd = crate::_rsocket_rffi::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket errno {}", crate::rposix::get_saved_errno());
+            let on = 1i32.to_ne_bytes();
+            setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &on).expect("setsockopt");
+            let reuse = getsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 4).expect("reuse");
+            assert_eq!(reuse.len(), 4);
+            assert_ne!(i32::from_ne_bytes(reuse.try_into().unwrap()), 0);
+            let ty = getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, 4).expect("type");
+            assert_eq!(
+                i32::from_ne_bytes(ty.try_into().unwrap()),
+                libc::SOCK_STREAM
+            );
+            assert_eq!(
+                setsockopt(-1, libc::SOL_SOCKET, libc::SO_REUSEADDR, &on)
+                    .expect_err("setsockopt")
+                    .errno,
+                libc::EBADF
+            );
+            assert_eq!(
+                getsockopt(-1, libc::SOL_SOCKET, libc::SO_TYPE, 4)
+                    .expect_err("getsockopt")
+                    .errno,
+                libc::EBADF
+            );
+            close(fd).expect("close");
+        }
     }
 }
