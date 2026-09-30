@@ -3258,9 +3258,17 @@ pub fn install_residual_host_call() {
 /// for targets whose real signature is not the uniform word ABI. Keep that
 /// platform adaptation here until those calls carry exact typed signatures.
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
-pub fn residual_host_call(func_ptr: usize, args: &[i64]) -> i64 {
+pub fn residual_host_call(
+    func_ptr: usize,
+    args: &[i64],
+    classes: &[majit_backend::call_stub::ArgClass],
+    result: char,
+) -> Option<i64> {
     use codegen::{CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_NARGS_OFS, CALL_RESULT_OFS, MAX_CALL_ARGS};
 
+    if stub_matches_table(func_ptr, classes, result) {
+        return None;
+    }
     assert!(
         args.len() <= MAX_CALL_ARGS,
         "residual_host_call: arity {} exceeds {MAX_CALL_ARGS}",
@@ -3274,8 +3282,43 @@ pub fn residual_host_call(func_ptr: usize, args: &[i64]) -> i64 {
             (base.add(CALL_ARGS_OFS as usize + i * 8) as *mut i64).write_unaligned(arg);
         }
         jit_call_host(base as u32);
-        (base.add(CALL_RESULT_OFS as usize) as *const i64).read_unaligned()
+        Some((base.add(CALL_RESULT_OFS as usize) as *const i64).read_unaligned())
     }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "host-import"))]
+fn stub_matches_table(
+    func_ptr: usize,
+    classes: &[majit_backend::call_stub::ArgClass],
+    result: char,
+) -> bool {
+    use func_sig::FuncSigVal;
+    use majit_backend::call_stub::ArgClass;
+
+    let Some(sig) = residual_target_sig(func_ptr as i64) else {
+        return false;
+    };
+    if sig.has_f32() || sig.params.len() != classes.len() {
+        return false;
+    }
+    for (param, class) in sig.params.iter().zip(classes) {
+        let expect = match class {
+            ArgClass::Int => FuncSigVal::I64,
+            ArgClass::Ref => FuncSigVal::I32,
+            ArgClass::Float => FuncSigVal::F64,
+        };
+        if *param != expect {
+            return false;
+        }
+    }
+    let expect_result = match result {
+        'v' => None,
+        'r' => Some(FuncSigVal::I32),
+        'f' => Some(FuncSigVal::F64),
+        'i' | 'L' => Some(FuncSigVal::I64),
+        _ => return false,
+    };
+    sig.result == expect_result
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]

@@ -902,9 +902,6 @@ macro_rules! define_call_sig_stubs {
                 $(
                     [$(ArgClass::$class),*] => {
                         unsafe fn stub(func: usize, args: &[i64]) -> i64 {
-                            if let Some(result) = wasm_residual_host_call(func, args) {
-                                return result;
-                            }
                             unsafe { invoke_stub!(func, args, i64 $(, $class)*) }
                         }
                         stub
@@ -922,9 +919,6 @@ macro_rules! define_call_sig_stubs {
                 $(
                     [$(ArgClass::$class),*] => {
                         unsafe fn stub(func: usize, args: &[i64]) -> i64 {
-                            if let Some(result) = wasm_residual_host_call(func, args) {
-                                return result;
-                            }
                             let v: i32 = unsafe { invoke_stub!(func, args, i32 $(, $class)*) };
                             v as u32 as i64
                         }
@@ -940,9 +934,6 @@ macro_rules! define_call_sig_stubs {
                 $(
                     [$(ArgClass::$class),*] => {
                         unsafe fn stub(func: usize, args: &[i64]) -> f64 {
-                            if let Some(bits) = wasm_residual_host_call(func, args) {
-                                return f64::from_bits(bits as u64);
-                            }
                             unsafe { invoke_stub!(func, args, f64 $(, $class)*) }
                         }
                         stub
@@ -957,9 +948,6 @@ macro_rules! define_call_sig_stubs {
                 $(
                     [$(ArgClass::$class),*] => {
                         unsafe fn stub(func: usize, args: &[i64]) {
-                            if wasm_residual_host_call(func, args).is_some() {
-                                return;
-                            }
                             unsafe { invoke_stub!(func, args, () $(, $class)*) }
                         }
                         stub
@@ -1007,8 +995,13 @@ call_sig_table!(define_call_sig_stubs);
 /// wasm32 `call_indirect` type-checks the callee. The descr class list is not
 /// that type: published targets are widening `i64` shims, raw pointers are
 /// `i32`. The host reads the table signature. Native keeps the stub.
-fn wasm_residual_host_call(func: usize, args: &[i64]) -> Option<i64> {
-    residual_host_call().map(|hook| hook(func, args))
+fn wasm_residual_host_call(
+    func: usize,
+    args: &[i64],
+    classes: &[ArgClass],
+    result: char,
+) -> Option<i64> {
+    residual_host_call().and_then(|hook| hook(func, args, classes, result))
 }
 
 pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
@@ -1017,7 +1010,7 @@ pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
         args.len(),
         "bh_call dispatch: class sequence and positional arg list length differ"
     );
-    if let Some(result) = wasm_residual_host_call(func, args) {
+    if let Some(result) = wasm_residual_host_call(func, args, classes, 'i') {
         return result;
     }
     unsafe { (lookup_stub_i(classes))(func, args) }
@@ -1037,7 +1030,7 @@ pub unsafe fn bh_call_r_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
     );
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(result) = wasm_residual_host_call(func, args) {
+        if let Some(result) = wasm_residual_host_call(func, args, classes, 'r') {
             return result;
         }
         unsafe { (lookup_stub_ptr(classes))(func, args) }
@@ -1064,7 +1057,7 @@ pub unsafe fn bh_call_v_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
         args.len(),
         "bh_call dispatch: class sequence and positional arg list length differ"
     );
-    if wasm_residual_host_call(func, args).is_some() {
+    if wasm_residual_host_call(func, args, classes, 'v').is_some() {
         return;
     }
     unsafe { (lookup_stub_v(classes))(func, args) }
@@ -1086,7 +1079,7 @@ pub unsafe fn bh_call_f_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
         args.len(),
         "bh_call dispatch: class sequence and positional arg list length differ"
     );
-    if let Some(bits) = wasm_residual_host_call(func, args) {
+    if let Some(bits) = wasm_residual_host_call(func, args, classes, 'f') {
         return f64::from_bits(bits as u64);
     }
     unsafe { (lookup_stub_f(classes))(func, args) }
@@ -1290,7 +1283,14 @@ pub unsafe fn bh_call_i_with_descr(
 ) -> i64 {
     if residual_host_call().is_some() {
         let collected = collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
-        if let Some(result) = wasm_residual_host_call(func, collected.args()) {
+        let result_type = if calldescr.void_word_abi {
+            'i'
+        } else {
+            calldescr.result_type
+        };
+        if let Some(result) =
+            wasm_residual_host_call(func, collected.args(), collected.classes(), result_type)
+        {
             return result;
         }
     }
@@ -1310,7 +1310,12 @@ pub unsafe fn bh_call_f_with_descr(
 ) -> f64 {
     if residual_host_call().is_some() {
         let collected = collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
-        if let Some(bits) = wasm_residual_host_call(func, collected.args()) {
+        if let Some(bits) = wasm_residual_host_call(
+            func,
+            collected.args(),
+            collected.classes(),
+            calldescr.result_type,
+        ) {
             return f64::from_bits(bits as u64);
         }
     }
@@ -1330,7 +1335,14 @@ pub unsafe fn bh_call_v_with_descr(
 ) {
     if residual_host_call().is_some() {
         let collected = collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
-        if wasm_residual_host_call(func, collected.args()).is_some() {
+        let result_type = if calldescr.void_word_abi { 'i' } else { 'v' };
+        if wasm_residual_host_call(func, collected.args(), collected.classes(), result_type)
+            .is_some()
+        {
+            return;
+        }
+        if calldescr.void_word_abi {
+            let _ = unsafe { call_stub_for(calldescr).call_i(func, args_i, args_r, args_f) };
             return;
         }
     }
@@ -1585,7 +1597,10 @@ pub unsafe fn bh_call_v_by_classes(
 /// cannot reuse the uniform-`i64` transmute that the SysV/AAPCS C ABI tolerates
 /// on native backends. `None` (the default on dynasm/cranelift) keeps the
 /// direct transmute path.
-pub type ResidualHostCallFn = fn(func_ptr: usize, args: &[i64]) -> i64;
+/// `None` means the callee's wasm type matches the stub, so the caller uses it.
+/// `Some` is the host result when the types differ.
+pub type ResidualHostCallFn =
+    fn(func_ptr: usize, args: &[i64], classes: &[ArgClass], result: char) -> Option<i64>;
 
 thread_local! {
     static RESIDUAL_HOST_CALL: std::cell::Cell<Option<ResidualHostCallFn>> =
@@ -1760,10 +1775,11 @@ mod tests {
             }
         }
         let _clear = Clear;
-        set_residual_host_call(Some(|func, args| {
+        set_residual_host_call(Some(|func, args, _classes, result| {
             assert_eq!(func, 7);
             assert_eq!(args, &[1, 5, 2, 6, 3, 7, 4, 8]);
-            42
+            assert_eq!(result, 'i');
+            Some(42)
         }));
         let descr = BhCallDescr::from_arg_classes(
             "iriririr".to_string(),
