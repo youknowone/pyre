@@ -7606,6 +7606,62 @@ fn emit_attached_loop_dispatch(
 /// running cold code, so it is cold too.  Run that to a fixpoint.  Coldness is
 /// a layout and register-allocation hint only, so this changes placement and
 /// spill preference, never behaviour.
+///
+/// `keep_hot` blocks are merged bridge entries (`patch_jump_for_descr`).
+/// That edge is the bridge trace itself, and a cold guard exit must not
+/// drag it into the recovery section.
+fn propagate_cold_blocks(func: &mut Function, keep_hot: &[cranelift_codegen::ir::Block]) {
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+    let entry = func.layout.entry_block();
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    loop {
+        let mut changed = false;
+        for &block in &blocks {
+            if Some(block) == entry || func.layout.is_cold(block) || keep_hot.contains(&block) {
+                continue;
+            }
+            // No predecessor at all means unreachable, not cold: leave it to
+            // the layout pass rather than claim a verdict about a block
+            // nothing branches to.
+            let mut reached = false;
+            let mut only_from_cold = true;
+            for pred in cfg.pred_iter(block) {
+                reached = true;
+                if !func.layout.is_cold(pred.block) {
+                    only_from_cold = false;
+                    break;
+                }
+            }
+            if reached && only_from_cold {
+                func.layout.set_cold(block);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Guard-failure block. A spliced bridge is the edge `patch_jump_for_descr`
+/// rewrites, so that block stays in the trace instead of the cold recovery
+/// section. `propagate_cold_blocks` would otherwise follow the cold exit
+/// into the bridge.
+fn mark_exit_cold(
+    builder: &mut FunctionBuilder,
+    exit_block: cranelift_codegen::ir::Block,
+    source_op_index: usize,
+    merge_targets: &[(usize, cranelift_codegen::ir::Block)],
+) {
+    if merge_targets
+        .iter()
+        .any(|(source_op, _)| *source_op == source_op_index)
+    {
+        return;
+    }
+    builder.set_cold_block(exit_block);
+}
+
 /// Byte offset from the jitframe base to a `jf_frame` slot index.
 ///
 /// Ref-root homes sit at `max_output_slots + root_slot`. Demoted non-ref
@@ -7785,39 +7841,6 @@ fn overlay_rd_locs_on_dense(frame: &[i64], rd_locs: &[u16], dense_len: usize) ->
         }
     }
     outputs
-}
-
-fn propagate_cold_blocks(func: &mut Function) {
-    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
-    let entry = func.layout.entry_block();
-    let blocks: Vec<Block> = func.layout.blocks().collect();
-    loop {
-        let mut changed = false;
-        for &block in &blocks {
-            if Some(block) == entry || func.layout.is_cold(block) {
-                continue;
-            }
-            // No predecessor at all means unreachable, not cold: leave it to
-            // the layout pass rather than claim a verdict about a block
-            // nothing branches to.
-            let mut reached = false;
-            let mut only_from_cold = true;
-            for pred in cfg.pred_iter(block) {
-                reached = true;
-                if !func.layout.is_cold(pred.block) {
-                    only_from_cold = false;
-                    break;
-                }
-            }
-            if reached && only_from_cold {
-                func.layout.set_cold(block);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
 }
 
 /// Ops whose non-exiting emission stores `JF_FRAME_ITEM0_OFS + j*8`.
@@ -8519,10 +8542,26 @@ fn opcode_is_vector(opcode: OpCode) -> bool {
         )
 }
 
+/// Guards whose failure stub consumes a pending exception.
+///
+/// `assembler.py patch_jump_for_descr` rewrites every guard branch,
+/// `guard_no_exception` included, so a trace that contains it stays
+/// eligible. `guard_exception` and `guard_not_forced` consume the pending
+/// exception inside the exit stub, which a parameter-less merge jump does
+/// not replay. `collect_merged_bridges` leaves a `GuardNoException` source
+/// on `emit_guard_exit`. Only a `GuardNoOverflow` source splices when the
+/// owner or the bridge contains that guard, or a `DebugMergePoint` /
+/// `JitDebug` ConstPtr that is absent from the gc table.
+fn merge_excluded_guard(opcode: OpCode) -> bool {
+    matches!(
+        opcode,
+        OpCode::GuardException | OpCode::GuardNotForced | OpCode::GuardNotForced2
+    )
+}
+
 fn opcode_excluded_from_merge(opcode: OpCode) -> bool {
     opcode_is_vector(opcode)
-        || guard_must_save_exception(opcode)
-        || matches!(opcode, OpCode::GuardNotForced2)
+        || merge_excluded_guard(opcode)
         || opcode.is_call_may_force()
         || opcode.is_call_assembler()
         || opcode.is_call_release_gil()
@@ -8534,14 +8573,13 @@ fn opcode_excluded_from_merge(opcode: OpCode) -> bool {
 /// Exclusions, any one of which keeps today's separate functions:
 /// - `constants_nonempty`: the codegen pool `CraneliftBackend::constants`
 ///   (`set_constants` / `set_constants_pool`) held a value for this compile
-/// - `GUARD_NOT_FORCED` / `GUARD_NOT_FORCED_2`
+/// - `GUARD_EXCEPTION` / `GUARD_NOT_FORCED` / `GUARD_NOT_FORCED_2`
+///   (`merge_excluded_guard`). `GUARD_NO_EXCEPTION` stays eligible.
 /// - any `CALL_MAY_FORCE_*` (`OpCode::is_call_may_force`),
 ///   `CALL_ASSEMBLER_*` (`OpCode::is_call_assembler`),
 ///   `CALL_RELEASE_GIL_*` (`OpCode::is_call_release_gil`)
 /// - any vector opcode (`opcode_is_vector`: `is_vec_producing_opcode` and
 ///   the other `Vec*` opcodes the emitter matches)
-/// - a guard whose `must_save_exception` is true (`guard_must_save_exception`,
-///   the predicate `collect_guards` stores and `emit_guard_exit` branches on)
 fn merge_source_eligible(constants_nonempty: bool, ops: &[OpRc]) -> bool {
     if constants_nonempty {
         return false;
@@ -8795,6 +8833,33 @@ fn member_input_map(entry_args: &[OpRef], next_raw: &mut u32) -> Vec<(OpRef, OpR
         .collect()
 }
 
+/// `rewrite.rewrite` drops `DEBUG_MERGE_POINT` before `emit_op`, and
+/// `emit_op` keeps a `JIT_DEBUG` ConstPtr inline. Neither address is entered
+/// in the gc table.
+fn constptr_stays_inline(opcode: OpCode) -> bool {
+    matches!(opcode, OpCode::DebugMergePoint | OpCode::JitDebug)
+}
+
+fn operand_is_live_constptr(arg: &majit_ir::operand::Operand) -> bool {
+    match arg.const_value() {
+        Some(majit_ir::Value::Ref(gcref)) => !gcref.is_null(),
+        _ => false,
+    }
+}
+
+/// `DebugMergePoint` / `JitDebug` carry a ConstPtr that `rewrite.rewrite`
+/// and `emit_op` never enter in the gc table. `refresh_retained_constptrs`
+/// would refuse the merge. Skipping those ops lets it proceed.
+fn has_inline_constptr(ops: &[Op]) -> bool {
+    ops.iter().any(|op| {
+        constptr_stays_inline(op.opcode)
+            && ((0..op.num_args()).any(|i| operand_is_live_constptr(&op.arg(i)))
+                || op
+                    .getfailargs()
+                    .is_some_and(|fail_args| fail_args.iter().any(operand_is_live_constptr)))
+    })
+}
+
 /// Re-read every non-null reference constant of `ops` from `table`, the
 /// `GcTable` the compile of these ops filled: `remove_constptr` and the
 /// fail-arg `_gcref_index` put each such constant there, keyed by the address
@@ -8816,6 +8881,9 @@ fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> 
         )))
     };
     for op in ops {
+        if constptr_stays_inline(op.opcode) {
+            continue;
+        }
         for i in 0..op.num_args() {
             let fresh = refresh(&op.arg(i))?;
             op.args_slice_mut()[i] = fresh;
@@ -8837,8 +8905,10 @@ fn guard_shape_refuses_merge(op: &Op) -> bool {
     }
     // A non-identity `rd_locs` is the normal layout `apply_resident_failarg_locs`
     // publishes. The merged exit honours that table; it does not refuse it.
-    guard_must_save_exception(op.opcode)
-        || matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2)
+    // `GuardNoException` does not refuse the trace (`patch_jump_for_descr`).
+    // `collect_merged_bridges` leaves that source on `emit_guard_exit`, and
+    // splices a bridge that contains it only from a `GuardNoOverflow` source.
+    merge_excluded_guard(op.opcode)
 }
 
 /// The rewritten op index of each segment's source guard, aligned with
@@ -8985,6 +9055,14 @@ fn collect_merged_bridges(
     owner_ops: &[Op],
     owner: &JitCellToken,
 ) -> Option<Vec<MergedBridgePiece>> {
+    // `guard_must_save_exception` used to make `merge_source_eligible` and
+    // `ops_refuse_merge` drop every trace that contains `GuardNoException`.
+    // The overflow bridge stays spliced (`assembler.py patch_jump_for_descr`):
+    // its source is `GuardNoOverflow` and its body contains `GuardNoException`.
+    let owner_has_noexc = owner_ops
+        .iter()
+        .any(|op| op.opcode == OpCode::GuardNoException);
+    let owner_has_inline_constptr = has_inline_constptr(owner_ops);
     let mut pieces = Vec::new();
     for (op_idx, op) in owner_ops.iter().enumerate() {
         if !op.opcode.is_guard() {
@@ -9009,6 +9087,31 @@ fn collect_merged_bridges(
         let Some(bridge_src) = bridge.merge_source.as_ref() else {
             continue;
         };
+        // `emit_guard_exit` on a merge target jumps to the bridge and returns
+        // before the fail-arg stores. The separate entry stores those args,
+        // then `emit_attached_bridge_dispatch` runs before
+        // `_store_and_reset_exception`, so `prepare_resume_from_failure`
+        // still sees the pending cell. A `GuardNoException` source always
+        // stays on that entry. Any other source whose owner or bridge body
+        // contains `GuardNoException` stays there too. A trace whose
+        // `DebugMergePoint` / `JitDebug` ConstPtr is absent from the gc
+        // table used to fail `refresh_retained_constptrs`; splicing any
+        // bridge but `GuardNoOverflow` there resumes on a NULL object.
+        // `GuardNoOverflow` is the overflow edge and still splices.
+        let bridge_has_noexc = bridge_src
+            .ops
+            .iter()
+            .any(|bridge_op| bridge_op.opcode == OpCode::GuardNoException);
+        let only_overflow = owner_has_noexc
+            || bridge_has_noexc
+            || owner_has_inline_constptr
+            || has_inline_constptr(&bridge_src.ops);
+        if op.opcode == OpCode::GuardNoException {
+            continue;
+        }
+        if only_overflow && op.opcode != OpCode::GuardNoOverflow {
+            continue;
+        }
         let bridge_ops = snapshot_ops(&bridge_src.ops);
         refresh_retained_constptrs(&bridge_ops, bridge.gc_table.as_deref())?;
         pieces.push(MergedBridgePiece {
@@ -12405,7 +12508,25 @@ impl CraneliftBackend {
         // RPython's linear emission where body label is immediately after
         // the function prologue and preamble code is deferred to the end.
         // Tracks whether the current op-emission phase is in preamble.
-        let mut preamble_phase = label_blocks.len() >= 2;
+        //
+        // A LABEL an in-function JUMP targets is re-entered (`closing_jump`
+        // / `patch_jump_for_descr`), so it is a loop header and stays hot.
+        // The once-only preamble is the first LABEL only when nothing in
+        // this function jumps to it. `label_arity` is the table the JUMP
+        // emitter uses.
+        let first_label_reentered = label_blocks.first().is_some_and(|(label_idx, _)| {
+            let Some(label_descr) = ops[*label_idx].getdescr() else {
+                return false;
+            };
+            let label_id = majit_ir::descr_identity(&label_descr);
+            ops.iter().any(|op| {
+                jump_is_local(op, &label_arity)
+                    && op
+                        .getdescr()
+                        .is_some_and(|descr| majit_ir::descr_identity(&descr) == label_id)
+            })
+        });
+        let mut preamble_phase = label_blocks.len() >= 2 && !first_label_reentered;
         if preamble_phase && let Some(&(_, first_label_block)) = label_blocks.first() {
             builder.set_cold_block(first_label_block);
         }
@@ -13397,7 +13518,12 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                     );
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -13448,7 +13574,12 @@ impl CraneliftBackend {
 
                     let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -13497,7 +13628,12 @@ impl CraneliftBackend {
                     // — pre-fetch the classptr immediate from the constant pool.
                     let expected_classptr_imm = lookup_const_i64(&constants, op.arg(1).to_opref());
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -13547,7 +13683,12 @@ impl CraneliftBackend {
                     let expected_classptr_imm = lookup_const_i64(&constants, op.arg(1).to_opref());
                     let zero = builder.ins().iconst(ptr_type, 0);
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let class_check_block = builder.create_block();
                     let cont_block = builder.create_block();
                     if preamble_phase {
@@ -13614,7 +13755,12 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let has_exc = builder.ins().icmp(IntCC::NotEqual, exc_val, zero);
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -13675,7 +13821,12 @@ impl CraneliftBackend {
                     // CMP exc_type, expected
                     let mismatch = builder.ins().icmp(IntCC::NotEqual, exc_type, expected_type);
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -13740,7 +13891,12 @@ impl CraneliftBackend {
                     guard_idx += 1;
                     let ovf = last_ovf_flag.take().unwrap();
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -13782,7 +13938,12 @@ impl CraneliftBackend {
                         .take()
                         .expect("GuardOverflow without preceding overflow op");
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -13836,7 +13997,12 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_forced = builder.ins().icmp(IntCC::NotEqual, jf_descr, zero);
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -13972,7 +14138,12 @@ impl CraneliftBackend {
                         let is_invalidated = builder.ins().icmp(IntCC::NotEqual, flag_val, zero);
 
                         let exit_block = builder.create_block();
-                        builder.set_cold_block(exit_block);
+                        mark_exit_cold(
+                            &mut builder,
+                            exit_block,
+                            info.source_op_index,
+                            &merge_targets,
+                        );
                         let cont_block = builder.create_block();
                         if preamble_phase {
                             builder.set_cold_block(cont_block);
@@ -14022,7 +14193,12 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -14118,7 +14294,12 @@ impl CraneliftBackend {
                         .ins()
                         .icmp(IntCC::NotEqual, actual_tid, expected_tid);
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -14238,7 +14419,12 @@ impl CraneliftBackend {
                     let fail = builder.ins().icmp(IntCC::Equal, masked, zero_i8);
 
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -14407,7 +14593,12 @@ impl CraneliftBackend {
                         .icmp(IntCC::UnsignedGreaterThanOrEqual, sub, limit);
 
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -17508,7 +17699,12 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -17550,7 +17746,12 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_true = builder.ins().icmp(IntCC::NotEqual, cond, zero);
                     let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
+                    mark_exit_cold(
+                        &mut builder,
+                        exit_block,
+                        info.source_op_index,
+                        &merge_targets,
+                    );
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -18675,7 +18876,9 @@ impl CraneliftBackend {
         failure_recovery.emit(&mut builder, ptr_type, call_conv);
         builder.finalize(frontend_config);
         self.func_ctx = func_ctx;
-        propagate_cold_blocks(&mut func);
+        let merge_entry_blocks: Vec<cranelift_codegen::ir::Block> =
+            merge_start_blocks.iter().map(|(_, block)| *block).collect();
+        propagate_cold_blocks(&mut func, &merge_entry_blocks);
 
         // Compile
         let mut ctx = Context::for_function(func);
@@ -25503,8 +25706,11 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 1), 100);
     }
 
+    /// The bridge body contains `GuardNoException` and the source is
+    /// `GuardFalse`, so `collect_merged_bridges` leaves the edge on
+    /// `emit_guard_exit`. The separate bridge still runs.
     #[test]
-    fn must_save_exception_guard_skips_merged_entry() {
+    fn guard_no_exception_inside_bridge_stays_separate() {
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(16);
         let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
@@ -25517,7 +25723,6 @@ mod tests {
                 OpRef::NONE.raw(),
                 label.clone(),
             ),
-            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
                 &[OpRef::input_arg_int(0), OpRef::const_int(1)],
@@ -25557,7 +25762,10 @@ mod tests {
             .unwrap()
             .entry_code_ptr
             .load(Ordering::Acquire);
+        // Source is `GuardFalse`. `GuardNoException` in the bridge body keeps
+        // this edge on `emit_guard_exit`.
         let bridge_ops = vec![
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
                 &[OpRef::input_arg_int(0), OpRef::const_int(10)],
@@ -25591,6 +25799,555 @@ mod tests {
             &exit_descr
         ));
         assert_eq!(backend.get_int_value(&frame, 0), 108);
+    }
+
+    /// A loop that contains `GuardNoException` leaves every failure edge
+    /// except `GuardNoOverflow` on `emit_guard_exit`. The `GuardNoException`
+    /// source and a later `GuardFalse` bridge both keep `entry_code_ptr`.
+    /// Execution still reaches the exit through the separate bridge.
+    #[test]
+    fn guard_no_exception_source_bridge_stays_separate() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(17);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exc_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let hot_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let noexc = Op::with_descr(OpCode::GuardNoException, &[], exc_descr.clone());
+        noexc.pos().set(OpRef::void_op(12));
+        noexc.set_fail_arg_types(vec![Type::Int]);
+        noexc.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            OpRc::new(noexc),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(3)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_descr.clone(),
+            ),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                11,
+                hot_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9207);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let entry_loop = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let exc_bridge = vec![mk_op_with_descr(
+            OpCode::Jump,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+            label.clone(),
+        )];
+        backend
+            .compile_bridge(
+                as_fd(&exc_descr),
+                &[InputArg::new_int_rc(0)],
+                &exc_bridge,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after_exc = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_eq!(entry_loop, entry_after_exc);
+        assert!(fail_descr_bridge_ref(as_fd(&exc_descr)).is_some());
+        let hot_bridge = vec![
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label,
+            ),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&hot_descr),
+                &[InputArg::new_int_rc(0)],
+                &hot_bridge,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after_hot = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_eq!(entry_after_exc, entry_after_hot);
+        assert!(fail_descr_bridge_ref(as_fd(&hot_descr)).is_some());
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&frame),
+            &exit_descr
+        ));
+        assert_eq!(backend.get_int_value(&frame, 0), 3);
+    }
+
+    /// A loop that contains `GuardNoException` still splices a
+    /// `GuardNoOverflow` source. `IntAddOvf` sits immediately before the
+    /// guard so `last_ovf_flag` is set and the merge jump is emitted.
+    #[test]
+    fn guard_no_overflow_bridge_merges_on_a_no_exception_loop() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(18);
+        let ovf_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let ovf = Op::with_descr(OpCode::GuardNoOverflow, &[], ovf_descr.clone());
+        ovf.pos().set(OpRef::void_op(11));
+        ovf.set_fail_arg_types(vec![Type::Int]);
+        ovf.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntAddOvf,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                2,
+            ),
+            OpRc::new(ovf),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9208);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let bridge_ops = vec![
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label,
+            ),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&ovf_descr),
+                &[InputArg::new_int_rc(0)],
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_ne!(entry_before, entry_after);
+        assert!(fail_descr_bridge_ref(as_fd(&ovf_descr)).is_some());
+        let frame = backend.execute_token(&token, &[Value::Int(10)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 11);
+    }
+
+    /// The owner has no `GuardNoException`. The bridge body does, and a
+    /// `DebugMergePoint` ConstPtr is absent from the gc table. The source
+    /// is `GuardNoOverflow`, so the overflow edge still splices.
+    /// `IntAddOvf` sits immediately before the guard so `last_ovf_flag` is set.
+    #[test]
+    fn guard_no_overflow_bridge_merges_when_bridge_has_no_exception() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(19);
+        let ovf_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let ovf = Op::with_descr(OpCode::GuardNoOverflow, &[], ovf_descr.clone());
+        ovf.pos().set(OpRef::void_op(11));
+        ovf.set_fail_arg_types(vec![Type::Int]);
+        ovf.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
+        let debug = Op::new(
+            OpCode::DebugMergePoint,
+            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                majit_ir::GcRef(0x3e5d_f0dc),
+            ))],
+        );
+        debug.pos().set(OpRef::void_op(12));
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            OpRc::new(debug),
+            mk_op(
+                OpCode::IntAddOvf,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                2,
+            ),
+            OpRc::new(ovf),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9209);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let bridge_ops = vec![
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label,
+            ),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&ovf_descr),
+                &[InputArg::new_int_rc(0)],
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_ne!(entry_before, entry_after);
+        assert!(fail_descr_bridge_ref(as_fd(&ovf_descr)).is_some());
+        let frame = backend.execute_token(&token, &[Value::Int(10)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 11);
+    }
+
+    /// A `DebugMergePoint` ConstPtr is absent from the gc table, so a
+    /// non-overflow bridge stays on `emit_guard_exit`. The separate bridge
+    /// still runs.
+    #[test]
+    fn debug_merge_point_keeps_non_overflow_bridge_separate() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(23);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let hot_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let debug = Op::new(
+            OpCode::DebugMergePoint,
+            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                majit_ir::GcRef(0x3e5d_f0dc),
+            ))],
+        );
+        debug.pos().set(OpRef::void_op(12));
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            OpRc::new(debug),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(3)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_descr.clone(),
+            ),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                11,
+                hot_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9210);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
+                1,
+            ),
+            mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), label),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&hot_descr),
+                &[InputArg::new_int_rc(0)],
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_eq!(entry_before, entry_after);
+        assert!(fail_descr_bridge_ref(as_fd(&hot_descr)).is_some());
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&frame),
+            &exit_descr
+        ));
+        assert_eq!(backend.get_int_value(&frame, 0), 12);
+    }
+
+    /// A bridge stitched by `patch_jump_for_descr` is the steady-state path.
+    /// Its blocks, and the loop header it jumps back to, stay out of the
+    /// cold recovery section.
+    #[test]
+    fn merged_bridge_and_reentered_header_stay_hot() {
+        let mut backend = CraneliftBackend::new();
+        let outer = make_label_descr(21);
+        let inner = make_label_descr(22);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let hot_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                outer.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(7071)],
+                1,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(100)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_descr,
+            ),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                inner.clone(),
+            ),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                11,
+                hot_descr.clone(),
+            ),
+            mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), inner),
+        ];
+        let token = JitCellToken::new(9211);
+        token.record_target_token(outer.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(9091)],
+                1,
+            ),
+            mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), outer),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&hot_descr),
+                &[InputArg::new_int_rc(0)],
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_ne!(entry_before, entry_after);
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            clif.contains("7071") && clif.contains("9091"),
+            "merged function must contain the header add and the bridge add:\n{clif}"
+        );
+        assert!(
+            !iconst_sits_in_cold_block(&clif, 7071),
+            "re-entered loop header was compiled cold:\n{clif}"
+        );
+        assert!(
+            !iconst_sits_in_cold_block(&clif, 9091),
+            "spliced bridge was compiled cold:\n{clif}"
+        );
+    }
+
+    fn iconst_sits_in_cold_block(clif: &str, value: i64) -> bool {
+        let needle = format!("{value}");
+        let mut cold = false;
+        let mut saw = false;
+        for line in clif.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("block") && trimmed.ends_with(':') {
+                cold = trimmed.contains("cold");
+            }
+            if trimmed
+                .split(|c: char| !c.is_ascii_digit() && c != '-')
+                .any(|tok| tok == needle)
+            {
+                saw = true;
+                if cold {
+                    return true;
+                }
+            }
+        }
+        assert!(saw, "iconst {value} missing from clif");
+        false
+    }
+
+    #[test]
+    fn guard_exception_still_refuses_merge() {
+        let noexc = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
+        assert!(!guard_shape_refuses_merge(&noexc));
+        assert!(merge_source_eligible(false, &[noexc]));
+
+        let exc = mk_op(
+            OpCode::GuardException,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        assert!(guard_shape_refuses_merge(&exc));
+        assert!(!merge_source_eligible(false, &[exc]));
+
+        let forced = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        assert!(guard_shape_refuses_merge(&forced));
+        assert!(!merge_source_eligible(false, &[forced]));
+    }
+
+    #[test]
+    fn debug_merge_point_constptr_does_not_refuse_refresh() {
+        let ptr = majit_ir::GcRef(0x3e5d_f0dc);
+        let dbg = Op::new(
+            OpCode::DebugMergePoint,
+            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                ptr,
+            ))],
+        );
+        assert!(refresh_retained_constptrs(std::slice::from_ref(&dbg), None).is_some());
+
+        let jit_debug = Op::new(
+            OpCode::JitDebug,
+            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                ptr,
+            ))],
+        );
+        assert!(refresh_retained_constptrs(std::slice::from_ref(&jit_debug), None).is_some());
+
+        let used = Op::new(
+            OpCode::SameAsR,
+            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                ptr,
+            ))],
+        );
+        assert!(refresh_retained_constptrs(std::slice::from_ref(&used), None).is_none());
     }
 
     #[test]
