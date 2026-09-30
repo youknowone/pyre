@@ -1540,7 +1540,9 @@ fn unavail(site: &'static str) -> InlineCallerFrameDecline {
 /// The returning case stays declined for the traceback: delivering the
 /// inlined callee's raise to such a handler drops the catching frame's
 /// traceback node, so `exception_traceback_frame_lineno` reports the raising
-/// frame twice.
+/// frame twice. A handler whose exit the bounded scan cannot prove
+/// (`Unproven`: a `switch`, an exhausted budget, an undecodable path) may be
+/// that returning handler, so it takes the same decline.
 pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     after_residual_call_resume: Option<usize>,
     caller_jitcode: &[u8],
@@ -1558,12 +1560,12 @@ pub(crate) fn decline_inline_caller_frame_for_catch_marker(
         return Ok(());
     };
     match crate::jitcode_dispatch::exc_handler_shape(caller_jitcode, catch_target) {
-        crate::jitcode_dispatch::ExcHandlerShape::Returns => {
+        crate::jitcode_dispatch::ExcHandlerShape::Returns
+        | crate::jitcode_dispatch::ExcHandlerShape::Unproven => {
             Err(InlineCallerFrameDecline::TryBlockCatchMarker)
         }
         crate::jitcode_dispatch::ExcHandlerShape::Rejoins
-        | crate::jitcode_dispatch::ExcHandlerShape::Reraise
-        | crate::jitcode_dispatch::ExcHandlerShape::Unproven => Ok(()),
+        | crate::jitcode_dispatch::ExcHandlerShape::Reraise => Ok(()),
     }
 }
 
