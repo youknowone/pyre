@@ -647,6 +647,25 @@ pub struct AssemblerARM64<'a> {
     pending_loop_hot: Option<DynamicLabel>,
 }
 
+/// imm8 for `fmov Dd, #imm`, or `None` when `bits` is outside that set.
+/// `expand(imm8) = sign | (0x3fc or 0x400) | ((imm8 & 0x3f) << 48)`.
+fn fmov64_imm8(bits: u64) -> Option<u8> {
+    if bits & ((1 << 48) - 1) != 0 {
+        return None;
+    }
+    let sign = (bits >> 63) as u8;
+    let top = bits & !((0x3f_u64) << 48) & !(1_u64 << 63);
+    let b = if top == 0x3fc0_0000_0000_0000 {
+        1u8
+    } else if top == 0x4000_0000_0000_0000 {
+        0
+    } else {
+        return None;
+    };
+    let payload = ((bits >> 48) & 0x3f) as u8;
+    Some((sign << 7) | (b << 6) | payload)
+}
+
 /// How many `movz`/`movk` words `codebuilder.py gen_load_int` emits.
 pub(crate) fn imm_mov_count(val: i64) -> u32 {
     if val < 0 {
@@ -899,9 +918,19 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// PC-relative load of a float immediate. The pool is emitted after the
-    /// recovery stubs (`emit_float_literal_pool`).
+    /// Materialise a float immediate. `+0.0` is `fmov Dd, xzr`. Values in
+    /// the 8-bit fmov-immediate set (`±m/16 * 2^e`) are one `fmov`. Anything
+    /// else is a PC-relative pool load (`emit_float_literal_pool`).
     fn emit_ldr_float_literal(&mut self, dst: u8, bits: u64) {
+        if bits == 0 {
+            dynasm!(self.mc ; .arch aarch64 ; fmov D(dst), xzr);
+            return;
+        }
+        if let Some(imm8) = fmov64_imm8(bits) {
+            let word = 0x1E60_1000 | (u32::from(imm8) << 13) | u32::from(dst);
+            dynasm!(self.mc ; .arch aarch64 ; .u32 word);
+            return;
+        }
         let slot = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; ldr D(dst), =>slot);
         self.float_pool.push((slot, bits));
@@ -6238,8 +6267,7 @@ impl<'a> AssemblerARM64<'a> {
         // Immediate args after remap (each targets a distinct ABI reg).
         for (abi_idx, val, is_float) in immed_args {
             if is_float {
-                self.emit_mov_imm64(15, val);
-                dynasm!(self.mc ; .arch aarch64 ; fmov D(abi_idx), X(15));
+                self.emit_ldr_float_literal(abi_idx, val as u64);
             } else {
                 self.emit_mov_imm64(abi_idx as u32, val);
             }
