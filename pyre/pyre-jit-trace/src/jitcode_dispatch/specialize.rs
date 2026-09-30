@@ -15058,6 +15058,49 @@ fn try_walker_specialize_builtin_divmod_long_int<Sym: WalkSym>(
 /// declines it (`OrthodoxSubWalkTraceUnsupported`) and the method-call form
 /// records the append as a residual call instead of baking the hash as a code
 /// address and branching to garbage.
+fn list_append_resume_declines(error: &DispatchError) -> bool {
+    matches!(
+        error,
+        DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
+            | DispatchError::GuardResumeCoordinateUnavailable { .. }
+            | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
+            | DispatchError::GuardSnapshotVableUntyped { .. }
+    )
+}
+
+fn rollback_list_append_attempt<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+    promoted_empty: bool,
+    list: pyre_object::PyObjectRef,
+) {
+    ctx.trace_ctx.cut_trace(pre_fold_pos);
+    ctx.trace_ctx.heap_cache_mut().reset();
+    if promoted_empty {
+        fbw_append_promote_journal_rollback_last(list);
+    }
+}
+
+/// `Ok(false)` rolls the attempt back to the residual.  A resume coordinate
+/// the inlined callee cannot name is that decline; anything else still aborts
+/// the walk.
+fn list_append_capture_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+    promoted_empty: bool,
+    list: pyre_object::PyObjectRef,
+) -> Result<bool, DispatchError> {
+    match walker_capture_snapshot_for_last_guard(ctx, op_pc) {
+        Ok(()) => Ok(true),
+        Err(error) if list_append_resume_declines(&error) => {
+            rollback_list_append_attempt(ctx, pre_fold_pos, promoted_empty, list);
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -15120,14 +15163,17 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     let value_op = r_args[2];
 
     // Pin the callable to `list.append`: guard_class METHOD + guard_value on
-    // the stable function slot (these guards resume via the full-body path at
-    // `op.pc`, ignoring the call-site fields set below).
+    // the stable function slot.  `list_append_capture_guard` uses
+    // `walker_capture_snapshot_for_last_guard`, so an inlined callee resumes
+    // at its Python CALL and a top frame resumes at this op.
     let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
     if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
         let type_const = ctx.trace_ctx.const_int(method_type_addr);
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        if !list_append_capture_guard(ctx, op.pc, pre_fold_pos, promoted_empty, inner_self)? {
+            return Ok(None);
+        }
     }
     ctx.trace_ctx
         .heap_cache_mut()
@@ -15140,7 +15186,9 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     let func_const = ctx.trace_ctx.const_ref(inner_func as i64);
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[func_ref, func_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    if !list_append_capture_guard(ctx, op.pc, pre_fold_pos, promoted_empty, inner_self)? {
+        return Ok(None);
+    }
     ctx.trace_ctx
         .heap_cache_mut()
         .replace_box(func_ref, func_const);
@@ -15157,15 +15205,11 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     );
     match commit_result {
         Ok(()) => {}
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error) if list_append_resume_declines(&error) => {
             if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
+                eprintln!("[decline-why] LIST-APPEND-SUBWALK {}", error.variant_name());
             }
-            ctx.trace_ctx.cut_trace(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            if promoted_empty {
-                fbw_append_promote_journal_rollback_last(inner_self);
-            }
+            rollback_list_append_attempt(ctx, pre_fold_pos, promoted_empty, inner_self);
             return Ok(None);
         }
         Err(error) => return Err(error),
@@ -16432,15 +16476,11 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     );
     match commit_result {
         Ok(()) => {}
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error) if list_append_resume_declines(&error) => {
             if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
+                eprintln!("[decline-why] LIST-APPEND-SUBWALK {}", error.variant_name());
             }
-            ctx.trace_ctx.cut_trace(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            if promoted_empty {
-                fbw_append_promote_journal_rollback_last(list);
-            }
+            rollback_list_append_attempt(ctx, pre_fold_pos, promoted_empty, list);
             return Ok(None);
         }
         Err(error) => return Err(error),
