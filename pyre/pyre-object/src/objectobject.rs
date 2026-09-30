@@ -69,14 +69,11 @@ pub const W_OBJECT_OBJECT_SIZE: usize = std::mem::size_of::<W_ObjectObject>();
 /// traces the off-heap `storage` value slots, so a collection keeps an
 /// instance's attribute values reachable and reclaims dead instances.
 ///
-/// This GC header id is a separate axis from the class-identity
-/// preorder id `INSTANCE_TYPE` carries for `subclass_range`
-/// (`gctypelayout` `get_type_id`/`fixedsize` vs `rclass`
-/// `OBJECT.subclassrange_{min,max}`): the collector reads the header id
-/// to find size + custom trace, while isinstance reads the `ob_type`
-/// vtable. `INSTANCE_TYPE` therefore stays mapped to `object_tid`
-/// (`OBJECT_GC_TYPE_ID = 0`) and this id is reachable only through the
-/// GC header stamped by [`w_instance_new`].
+/// This id is both the GC header `w_instance_new` stamps and the
+/// `subclass_range` of `INSTANCE_TYPE`. The collector reads the header
+/// for size + custom trace; `ll_issubclass` reads the vtable range.
+/// The two agree: `INSTANCE_TYPE` is this id, a child of `W_ROOT_TYPE`
+/// (`W_Root`), not the rclass root.
 pub const W_OBJECT_OBJECT_GC_TYPE_ID: u32 = 53;
 
 /// Allocate a new instance of a user-defined class.
@@ -122,8 +119,10 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
 /// Allocate a `W_ObjectObject` through the GC. The header is stamped
 /// with [`W_OBJECT_OBJECT_GC_TYPE_ID`] so `object_object_custom_trace`
 /// roots the `storage` value slots and dead instances are reclaimed.
-/// Falls back to the leaking `lltype::malloc` `Box` when no GC hook is
-/// installed (single-crate tests / pre-init snapshot tools).
+/// When no GC hook is installed (single-crate tests / pre-init snapshot
+/// tools) the same header id is stamped on a leaking allocation.
+/// `lltype::malloc` still writes id 0, which would disagree with the
+/// `INSTANCE_TYPE` vtable.
 ///
 /// PRE-EXISTING-ADAPTATION: PyPy instances live in the movable nursery
 /// (`rclass`/`gctypelayout` standard `GcStruct`). Pyre allocates them
@@ -199,7 +198,7 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier(raw);
         raw as PyObjectRef
     } else {
-        crate::lltype::malloc(value) as PyObjectRef
+        majit_gc::header::alloc_with_gc_header(value, W_OBJECT_OBJECT_GC_TYPE_ID) as PyObjectRef
     }
 }
 
@@ -231,6 +230,9 @@ mod tests {
         let obj = w_instance_new(fake_type);
         unsafe {
             assert!(is_instance(obj));
+            assert!(std::ptr::eq((*obj).ob_type, &INSTANCE_TYPE));
+            let hdr = majit_gc::header::header_of(obj as usize);
+            assert_eq!((*hdr).type_id(), W_OBJECT_OBJECT_GC_TYPE_ID);
             assert!(!is_int(obj));
             assert!(!crate::typeobject::is_type(obj));
             assert_eq!(w_instance_get_type(obj), fake_type);

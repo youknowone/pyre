@@ -651,13 +651,15 @@ impl<T: FieldDescrGroup> FieldDescrGroup for LazyLock<T> {
     }
 }
 
-/// GC type id for the `rclass.OBJECT` root — pyre's static `INSTANCE_TYPE`
-/// PyType (`name = "object"`). All `PyObject`-layout subclasses chain
-/// their `parent` field to this id so `assign_inheritance_ids`
-/// (normalizecalls.py) emits a `subclassrange_{min,max}` covering
-/// every descendant. `GUARD_SUBCLASS(obj, &INSTANCE_TYPE)` then succeeds
-/// for any `is_object` instance via `int_between(root.min, obj_typeid.min,
-/// root.max)` (rclass.py `ll_issubclass`).
+/// GC type id for the `rclass.OBJECT` root (`W_Root`, `baseobjspace.py`).
+/// The vtable is `W_ROOT_TYPE`: never an app-level type, never stamped
+/// into `ob_type`. Every interp class chains its parent to this id so
+/// `assign_inheritance_ids` (normalizecalls.py) emits a
+/// `subclassrange_{min,max}` covering every descendant.
+/// `GUARD_SUBCLASS(obj, &W_ROOT_TYPE)` succeeds for any rclass instance
+/// via `int_between(root.min, obj_typeid.min, root.max)`
+/// (`rclass.py` `ll_issubclass`). `INSTANCE_TYPE` (`W_ObjectObject`) is
+/// a child of this root, at `W_OBJECT_OBJECT_GC_TYPE_ID`.
 pub const OBJECT_GC_TYPE_ID: u32 = 0;
 // `W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID` live in `pyre-object`
 // alongside the `W_IntObject` / `W_FloatObject` structs they describe,
@@ -802,9 +804,9 @@ pub use pyre_object::typeobject::W_TYPE_GC_TYPE_ID;
 // `W_UNICODE_GC_TYPE_ID` / `W_LONG_GC_TYPE_ID` / `W_MODULE_GC_TYPE_ID`
 // live alongside their structs in
 // `pyre-object::{unicodeobject, longobject, module}`. Re-exported
-// for the JIT registration site. `W_ObjectObject` shares
-// `OBJECT_GC_TYPE_ID` with the `object` root (see comment on the
-// struct) so it has no separate id.
+// for the JIT registration site. `W_ObjectObject` is
+// `W_OBJECT_OBJECT_GC_TYPE_ID`, a child of the rclass root, with
+// vtable `INSTANCE_TYPE`.
 pub use pyre_object::longobject::W_LONG_GC_TYPE_ID;
 pub use pyre_object::module::W_MODULE_GC_TYPE_ID;
 // `W_DICT_PROXY_GC_TYPE_ID` lives in `pyre-object::dictproxyobject`

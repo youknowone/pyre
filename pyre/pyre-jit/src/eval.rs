@@ -1907,18 +1907,17 @@ fn build_gc() -> Box<MiniMarkGC> {
         taggedpointers: pyre_object::tagged_int::CAN_BE_TAGGED,
         ..majit_gc::collector::GcConfig::default()
     });
-    // rclass.OBJECT root (rclass.py). pyre's static
-    // `INSTANCE_TYPE` is the `name = "object"` PyType — every
-    // other `PyObject`-layout class chains its `parent` field to
-    // this id so `assign_inheritance_ids` (normalizecalls.py)
-    // produces a `subclassrange_{min,max}` covering every
-    // descendant. The size is `sizeof(PyObject)` because instances tagged
-    // with `&INSTANCE_TYPE` (i.e. user `object()` calls) carry only this
-    // header. RPython's OBJECT has only `typeptr`; pyre's augmented header
-    // also keeps the app-level class in `w_class`. Register that managed edge
-    // on the root so every ordinary offset-traced subclass inherits it
-    // through its embedded PyObject header, matching GcStruct `super` field
-    // tracing.
+    // rclass.OBJECT root (`W_Root`, `baseobjspace.py`). The vtable is
+    // `W_ROOT_TYPE`: no app-level type, never stamped into `ob_type`.
+    // Every other interp class chains its `parent` to this id so
+    // `assign_inheritance_ids` (normalizecalls.py) produces a
+    // `subclassrange_{min,max}` covering every descendant. The size is
+    // `sizeof(PyObject)` so a subclass inherits the header edge through
+    // its embedded `PyObject`. RPython's OBJECT has only `typeptr`; pyre's
+    // header also keeps the app-level class in `w_class`. Register that
+    // managed edge on the root so every ordinary offset-traced subclass
+    // inherits it, matching GcStruct `super` field tracing. `INSTANCE_TYPE`
+    // (`W_ObjectObject`) is a later child, not this id.
     let object_tid = gc.register_type(
         TypeInfo::object_with_gc_ptrs(
             std::mem::size_of::<pyre_object::PyObject>(),
@@ -2100,9 +2099,10 @@ fn build_gc() -> Box<MiniMarkGC> {
     // llsupport/gc.py get_typeid_from_classptr_if_gcremovetypeptr vtable→typeid mapping. RPython derives the
     // typeid arithmetically from gc_get_type_info_group; pyre keeps an
     // explicit table because every PyType is a static global
-    // unrelated to the GC's internal layout. The OBJECT root and
+    // unrelated to the GC's internal layout. `W_ROOT_TYPE` and
     // INT/FLOAT are wired up first so subsequent foreign-pytype
     // entries can resolve their parents through the same map.
+    // `INSTANCE_TYPE` is bound later, at `W_OBJECT_OBJECT_GC_TYPE_ID`.
     let mut pytype_to_tid: HashMap<usize, u32> = HashMap::new();
     // Helper for `#[pyre_class]`-emitted types: register the GC
     // payload + vtable + `pytype_to_tid` entry in one call.  Asserts
@@ -2249,11 +2249,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         };
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
-        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+        &pyre_object::pyobject::W_ROOT_TYPE as *const _ as usize,
         object_tid,
     );
     pytype_to_tid.insert(
-        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+        &pyre_object::pyobject::W_ROOT_TYPE as *const _ as usize,
         object_tid,
     );
     majit_gc::GcAllocator::register_vtable_for_type(
@@ -3036,16 +3036,10 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE as *const _ as usize,
         w_pytraceback_tid,
     );
-    // W_ObjectObject's PyType (`INSTANCE_TYPE`) stays bound to
-    // `object_tid` (`OBJECT_GC_TYPE_ID = 0`) in `pytype_to_tid`:
-    // it is the `object` root, and giving the *vtable* a separate
-    // preorder id would corrupt the `subclass_range` hierarchy
-    // (disjoint sub-ranges for one root, breaking `object ⊇ int` —
-    // see eval::tests::test_subclass_range_preorder_bounds). The
-    // dedicated `W_OBJECT_OBJECT_GC_TYPE_ID` registered above is a GC
-    // *header* id (size + custom trace), an independent axis that
-    // the collector reads off the header `w_instance_new` stamps;
-    // it is deliberately absent from `pytype_to_tid`.
+    // `W_ROOT_TYPE` owns `object_tid` and is already in `pytype_to_tid`,
+    // so a foreign parent of `&W_ROOT_TYPE` resolves to the rclass root.
+    // `INSTANCE_TYPE` is bound below at `W_OBJECT_OBJECT_GC_TYPE_ID`.
+    // Nothing in the foreign lists parents on `W_ObjectObject`.
     // Walk every remaining built-in PyType and register one
     // `TypeInfo::object_subclass` per class, mirroring how
     // `assign_inheritance_ids` (normalizecalls.py) walks
@@ -3236,11 +3230,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     // Register a dedicated GC type id — stamped into the GC header
     // by `w_instance_new` — so a collection traces those value
     // slots (and reclaims dead instances; the storage `Vec` itself
-    // forwards in place). `INSTANCE_TYPE` stays bound to `object_tid`
-    // (above) for isinstance / `subclass_range`: the GC header id
-    // (read by the collector for size + custom trace) and the
-    // vtable preorder id are independent axes, so this id is NOT
-    // inserted into `pytype_to_tid` and gets no `register_vtable`.
+    // forwards in place). Parent stays the rclass root. `INSTANCE_TYPE`
+    // is this id's vtable: header tid and `subclass_range` agree, and
+    // the range covers only `W_ObjectObject`, not every interp class.
     let w_object_object_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         pyre_object::objectobject::W_OBJECT_OBJECT_SIZE,
         object_tid,
@@ -3249,6 +3241,15 @@ fn build_gc() -> Box<MiniMarkGC> {
     debug_assert_eq!(
         w_object_object_tid,
         pyre_object::objectobject::W_OBJECT_OBJECT_GC_TYPE_ID,
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+        w_object_object_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+        w_object_object_tid,
     );
     // W_ComplexObject carries two f64s after the `PyObject` header.
     // A user subclass is `W_ComplexObjectUser` and traces its mapdict
@@ -17256,14 +17257,15 @@ mod tests {
     /// `build_gc` runs `assign_inheritance_ids_now`, the
     /// `(subclassrange_min, subclassrange_max)` for each registered
     /// PyType must satisfy `int_between(cls.min, subcls.min, cls.max)`
-    /// for every (cls, subcls) pair where `subcls` Python-inherits from
-    /// `cls`. This test exercises the `assign_inheritance_ids`
+    /// for every (cls, subcls) pair where `subcls` inherits from `cls`.
+    /// This test exercises the `assign_inheritance_ids`
     /// (normalizecalls.py) preorder walk by verifying:
-    ///   1. `INSTANCE_TYPE` (root `object`) range contains every other
-    ///      PyType's range.
-    ///   2. `INT_TYPE` range contains `BOOL_TYPE` range
-    ///      (`bool.__bases__ == (int,)`).
-    ///   3. Sibling classes (`INT_TYPE` vs `FLOAT_TYPE`, `STR_TYPE` vs
+    ///   1. `W_ROOT_TYPE` (`W_Root`) contains every other PyType's range.
+    ///   2. `INSTANCE_TYPE` (`W_ObjectObject`) does not contain `INT_TYPE`
+    ///      or `LIST_TYPE`.
+    ///   3. `INT_TYPE` contains `BOOL_TYPE` (`W_BoolObject` inherits from
+    ///      `W_IntObject`).
+    ///   4. Sibling classes (`INT_TYPE` vs `FLOAT_TYPE`, `STR_TYPE` vs
     ///      `LIST_TYPE`) are disjoint.
     #[test]
     fn test_subclass_range_preorder_bounds() {
@@ -17282,45 +17284,70 @@ mod tests {
         };
         let disjoint = |a: (i64, i64), b: (i64, i64)| a.1 <= b.0 || b.1 <= a.0;
 
-        let object_r = range(&pyre_object::pyobject::INSTANCE_TYPE);
+        let root_r = range(&pyre_object::pyobject::W_ROOT_TYPE);
+        let instance_r = range(&pyre_object::pyobject::INSTANCE_TYPE);
         let int_r = range(&pyre_object::pyobject::INT_TYPE);
         let float_r = range(&pyre_object::pyobject::FLOAT_TYPE);
         let bool_r = range(&pyre_object::pyobject::BOOL_TYPE);
         let str_r = range(&pyre_object::pyobject::STR_TYPE);
         let list_r = range(&pyre_object::pyobject::LIST_TYPE);
         let none_r = range(&pyre_object::pyobject::NONE_TYPE);
+        let code_r = range(&pyre_interpreter::pycode::CODE_TYPE);
 
-        // (1) object encompasses every descendant.
-        assert!(contains(object_r, int_r), "object ⊇ int");
-        assert!(contains(object_r, float_r), "object ⊇ float");
-        assert!(contains(object_r, bool_r), "object ⊇ bool");
-        assert!(contains(object_r, str_r), "object ⊇ str");
-        assert!(contains(object_r, list_r), "object ⊇ list");
-        assert!(contains(object_r, none_r), "object ⊇ NoneType");
+        // (1) W_Root encompasses every descendant, including W_ObjectObject.
+        assert!(contains(root_r, int_r), "W_Root ⊇ int");
+        assert!(contains(root_r, float_r), "W_Root ⊇ float");
+        assert!(contains(root_r, bool_r), "W_Root ⊇ bool");
+        assert!(contains(root_r, str_r), "W_Root ⊇ str");
+        assert!(contains(root_r, list_r), "W_Root ⊇ list");
+        assert!(contains(root_r, none_r), "W_Root ⊇ NoneType");
+        assert!(contains(root_r, instance_r), "W_Root ⊇ W_ObjectObject");
+        assert!(contains(root_r, code_r), "W_Root ⊇ PyCode");
 
-        // (2) int ⊇ bool (PyPy: W_BoolObject inherits from W_IntObject).
+        // (2) W_ObjectObject is one child, not the root of int or list.
+        assert!(
+            !contains(instance_r, int_r),
+            "W_ObjectObject does not contain int"
+        );
+        assert!(
+            !contains(instance_r, list_r),
+            "W_ObjectObject does not contain list"
+        );
+        assert!(disjoint(instance_r, int_r), "W_ObjectObject ⊥ int");
+        assert!(disjoint(instance_r, list_r), "W_ObjectObject ⊥ list");
+
+        // (3) int ⊇ bool (W_BoolObject inherits from W_IntObject).
         assert!(contains(int_r, bool_r), "int ⊇ bool");
 
-        // (3) Disjoint siblings.
+        // (4) Disjoint siblings.
         assert!(disjoint(int_r, float_r), "int ⊥ float");
         assert!(disjoint(int_r, str_r), "int ⊥ str");
         assert!(disjoint(float_r, str_r), "float ⊥ str");
         assert!(disjoint(str_r, list_r), "str ⊥ list");
         assert!(disjoint(float_r, bool_r), "float ⊥ bool");
 
-        // (4) rclass.py:340-346 parity: subclassrange_{min,max} assigned
-        // directly on the PyType (OBJECT_VTABLE) struct, not only in
-        // the GC's TypeInfo table. ll_issubclass reads them from the
-        // typeptr without a GC indirection.
-        use pyre_object::pyobject::{BOOL_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INT_TYPE};
+        // (5) subclassrange_{min,max} live on the PyType (OBJECT_VTABLE),
+        // not only in the GC's TypeInfo table. ll_issubclass reads them
+        // from the typeptr without a GC indirection.
+        use pyre_object::pyobject::{
+            BOOL_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INT_TYPE, LIST_TYPE, W_ROOT_TYPE,
+        };
         use std::sync::atomic::Ordering;
         assert_eq!(
+            W_ROOT_TYPE.subclassrange_min.load(Ordering::Relaxed),
+            root_r.0
+        );
+        assert_eq!(
+            W_ROOT_TYPE.subclassrange_max.load(Ordering::Relaxed),
+            root_r.1
+        );
+        assert_eq!(
             INSTANCE_TYPE.subclassrange_min.load(Ordering::Relaxed),
-            object_r.0
+            instance_r.0
         );
         assert_eq!(
             INSTANCE_TYPE.subclassrange_max.load(Ordering::Relaxed),
-            object_r.1
+            instance_r.1
         );
         assert_eq!(INT_TYPE.subclassrange_min.load(Ordering::Relaxed), int_r.0);
         assert_eq!(INT_TYPE.subclassrange_max.load(Ordering::Relaxed), int_r.1);
@@ -17341,11 +17368,27 @@ mod tests {
             float_r.1
         );
 
-        // (5) ll_issubclass direct PyType reads match GC callback.
+        // (6) ll_issubclass direct PyType reads match the GC ranges.
         unsafe {
-            assert!(pyre_object::pyobject::ll_issubclass(&BOOL_TYPE, &INT_TYPE));
+            assert!(pyre_object::pyobject::ll_issubclass(
+                &INSTANCE_TYPE,
+                &W_ROOT_TYPE
+            ));
             assert!(pyre_object::pyobject::ll_issubclass(
                 &INT_TYPE,
+                &W_ROOT_TYPE
+            ));
+            assert!(pyre_object::pyobject::ll_issubclass(
+                &pyre_interpreter::pycode::CODE_TYPE,
+                &W_ROOT_TYPE
+            ));
+            assert!(pyre_object::pyobject::ll_issubclass(&BOOL_TYPE, &INT_TYPE));
+            assert!(!pyre_object::pyobject::ll_issubclass(
+                &INT_TYPE,
+                &INSTANCE_TYPE
+            ));
+            assert!(!pyre_object::pyobject::ll_issubclass(
+                &LIST_TYPE,
                 &INSTANCE_TYPE
             ));
             assert!(!pyre_object::pyobject::ll_issubclass(

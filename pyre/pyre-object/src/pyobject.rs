@@ -578,6 +578,13 @@ pub static TYPE_TYPE: PyType = new_pytype_with_weakref(
     "type",
     std::mem::offset_of!(crate::typeobject::W_TypeObject, lifeline),
 );
+/// `W_Root` (`baseobjspace.py`). The rclass root has no app-level type
+/// and no instances: `instantiate` stays null, `user_subclass` stays
+/// null, and nothing stamps this vtable into `ob_type`.
+pub static W_ROOT_TYPE: PyType = new_pytype("W_Root");
+/// `W_ObjectObject` (`objectobject.py`). App-level `object`, one child
+/// of `W_ROOT_TYPE`. Carriers still share this vtable; it is not the
+/// rclass root.
 pub static INSTANCE_TYPE: PyType = new_pytype_with_mapdict_mixin(
     "object",
     std::mem::offset_of!(crate::objectobject::W_ObjectObject, map),
@@ -709,10 +716,10 @@ pub fn ll_issubclass_const(subcls: &PyType, minid: i64, maxid: i64) -> bool {
 /// rclass.py `ll_isinstance(obj, cls)`.
 ///
 /// RPython-level type check: reads `obj.typeptr` (= `ob_type`) and checks
-/// subclass ranges. This checks the **RPython class** (W_IntObject,
-/// W_ListObject, etc.), NOT the Python-level class. All user-defined
-/// instances share `INSTANCE_TYPE` as their RPython class, just as
-/// RPython groups them under W_ObjectObject's vtable.
+/// subclass ranges. This checks the **RPython class** (`W_IntObject`,
+/// `W_ListObject`, ...), NOT the Python-level class. The rclass root is
+/// `W_ROOT_TYPE` (`W_Root`). Carriers share `INSTANCE_TYPE`
+/// (`W_ObjectObject`), a child of that root.
 ///
 /// For Python-level `isinstance()`, use `issubtype_w` (MRO walk on
 /// `w_class`), not this function.
@@ -1214,6 +1221,11 @@ mod subclass_range_publication_tests {
             ensure_object_subclass_ranges_initialized();
             ensure_object_subclass_ranges_initialized();
             assert!(unsafe { ll_issubclass(&BOOL_TYPE, &INT_TYPE) });
+            assert!(unsafe { ll_issubclass(&INSTANCE_TYPE, &W_ROOT_TYPE) });
+            assert!(unsafe { ll_issubclass(&INT_TYPE, &W_ROOT_TYPE) });
+            assert!(unsafe { ll_issubclass(&LIST_TYPE, &W_ROOT_TYPE) });
+            assert!(!unsafe { ll_issubclass(&INT_TYPE, &INSTANCE_TYPE) });
+            assert!(!unsafe { ll_issubclass(&LIST_TYPE, &INSTANCE_TYPE) });
         } else {
             // Omit one interpreter-only class that nothing else parents on:
             // the last such id. That is the posix tail here, the Windows
@@ -1242,7 +1254,12 @@ mod subclass_range_publication_tests {
                     EXTRA_ALIAS.subclassrange_max.load(Ordering::Relaxed),
                     (hierarchy.len() * 2 - 1) as i64,
                 );
-                assert!(unsafe { ll_issubclass(&INSTANCE_TYPE, &EXTRA_ALIAS) });
+                assert!(unsafe { ll_issubclass(&W_ROOT_TYPE, &EXTRA_ALIAS) });
+                assert!(unsafe { ll_issubclass(&INSTANCE_TYPE, &W_ROOT_TYPE) });
+                assert!(unsafe { ll_issubclass(&INT_TYPE, &W_ROOT_TYPE) });
+                assert!(unsafe { ll_issubclass(&LIST_TYPE, &W_ROOT_TYPE) });
+                assert!(!unsafe { ll_issubclass(&INT_TYPE, &INSTANCE_TYPE) });
+                assert!(!unsafe { ll_issubclass(&LIST_TYPE, &INSTANCE_TYPE) });
                 assert!(ll_issubclass_const(
                     &EXTRA_ALIAS,
                     0,
@@ -1292,48 +1309,50 @@ mod subclass_range_publication_tests {
 /// resolves to `int_between(cls.min, subcls.min, cls.max)` per
 /// rclass.py `ll_issubclass`.
 ///
-/// `INSTANCE_TYPE` (the `name = "object"` root) is intentionally
-/// absent: it is registered separately as the `rclass.OBJECT` root
-/// with no parent. `INT_TYPE` and `FLOAT_TYPE` are also absent: they
-/// get their own ids (`W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID`)
-/// because the JIT backend allocates W_IntObject / W_FloatObject
-/// through NewWithVtable and needs the correct payload size.
+/// `W_ROOT_TYPE` (`W_Root`) is intentionally absent: it is registered
+/// separately as the `rclass.OBJECT` root with no parent. Every parent
+/// below that means "child of the rclass root" names `W_ROOT_TYPE`.
+/// Nothing here is a child of `W_ObjectObject`. `INSTANCE_TYPE` is also
+/// absent: its payload is `W_ObjectObject`, registered at
+/// `W_OBJECT_OBJECT_GC_TYPE_ID`. `INT_TYPE` and `FLOAT_TYPE` are absent
+/// for the same reason (`W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID`):
+/// NewWithVtable needs the real payload size.
 pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
     static PYTYPES: &[(&PyType, &PyType)] = &[
         // bool inherits from int (objectobject.py W_BoolObject.typedef).
         (&BOOL_TYPE, &INT_TYPE),
-        (&STR_TYPE, &INSTANCE_TYPE),
-        (&LIST_TYPE, &INSTANCE_TYPE),
-        (&TUPLE_TYPE, &INSTANCE_TYPE),
-        (&DICT_TYPE, &INSTANCE_TYPE),
+        (&STR_TYPE, &W_ROOT_TYPE),
+        (&LIST_TYPE, &W_ROOT_TYPE),
+        (&TUPLE_TYPE, &W_ROOT_TYPE),
+        (&DICT_TYPE, &W_ROOT_TYPE),
         // longobject.py W_LongObject — Python 3 unifies long under int,
         // but pyre carries a separate static for the BigInt-backed flavour.
-        (&LONG_TYPE, &INSTANCE_TYPE),
-        (&NONE_TYPE, &INSTANCE_TYPE),
-        (&NOTIMPLEMENTED_TYPE, &INSTANCE_TYPE),
-        (&ELLIPSIS_TYPE, &INSTANCE_TYPE),
-        (&MODULE_TYPE, &INSTANCE_TYPE),
-        (&MAPPING_PROXY_TYPE, &INSTANCE_TYPE),
-        (&TYPE_TYPE, &INSTANCE_TYPE),
-        (&crate::descriptor::SUPER_TYPE, &INSTANCE_TYPE),
-        (&crate::bytearrayobject::BYTEARRAY_TYPE, &INSTANCE_TYPE),
-        (&crate::bytesobject::BYTES_TYPE, &INSTANCE_TYPE),
-        (&crate::generator::GENERATOR_TYPE, &INSTANCE_TYPE),
-        (&crate::_pypy_generic_alias::UNION_TYPE, &INSTANCE_TYPE),
-        (&crate::functional::RANGE_ITER_TYPE, &INSTANCE_TYPE),
-        (&crate::iterobject::SEQ_ITER_TYPE, &INSTANCE_TYPE),
-        (&crate::nestedscope::CELL_TYPE, &INSTANCE_TYPE),
-        (&crate::function::METHOD_TYPE, &INSTANCE_TYPE),
-        (&crate::descriptor::PROPERTY_TYPE, &INSTANCE_TYPE),
-        (&crate::function::STATICMETHOD_TYPE, &INSTANCE_TYPE),
-        (&crate::function::CLASSMETHOD_TYPE, &INSTANCE_TYPE),
+        (&LONG_TYPE, &W_ROOT_TYPE),
+        (&NONE_TYPE, &W_ROOT_TYPE),
+        (&NOTIMPLEMENTED_TYPE, &W_ROOT_TYPE),
+        (&ELLIPSIS_TYPE, &W_ROOT_TYPE),
+        (&MODULE_TYPE, &W_ROOT_TYPE),
+        (&MAPPING_PROXY_TYPE, &W_ROOT_TYPE),
+        (&TYPE_TYPE, &W_ROOT_TYPE),
+        (&crate::descriptor::SUPER_TYPE, &W_ROOT_TYPE),
+        (&crate::bytearrayobject::BYTEARRAY_TYPE, &W_ROOT_TYPE),
+        (&crate::bytesobject::BYTES_TYPE, &W_ROOT_TYPE),
+        (&crate::generator::GENERATOR_TYPE, &W_ROOT_TYPE),
+        (&crate::_pypy_generic_alias::UNION_TYPE, &W_ROOT_TYPE),
+        (&crate::functional::RANGE_ITER_TYPE, &W_ROOT_TYPE),
+        (&crate::iterobject::SEQ_ITER_TYPE, &W_ROOT_TYPE),
+        (&crate::nestedscope::CELL_TYPE, &W_ROOT_TYPE),
+        (&crate::function::METHOD_TYPE, &W_ROOT_TYPE),
+        (&crate::descriptor::PROPERTY_TYPE, &W_ROOT_TYPE),
+        (&crate::function::STATICMETHOD_TYPE, &W_ROOT_TYPE),
+        (&crate::function::CLASSMETHOD_TYPE, &W_ROOT_TYPE),
         // Exception hierarchy: per-kind PyType statics chain to
         // `EXCEPTION_TYPE` (the BaseException root) so backend
         // `GuardClass` at `OB_TYPE_OFFSET` discriminates subclasses.
         // Order is topological — parent must register before child for
         // the `all_foreign_pytypes` loop in `pyre-jit/src/eval.rs` that
         // looks up `parent_tid` via `pytype_to_tid`.
-        (&crate::interp_exceptions::EXCEPTION_TYPE, &INSTANCE_TYPE),
+        (&crate::interp_exceptions::EXCEPTION_TYPE, &W_ROOT_TYPE),
         (
             &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
             &crate::interp_exceptions::EXCEPTION_TYPE,
@@ -1484,18 +1503,18 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
             &crate::interp_exceptions::EXC_SYSTEM_EXIT_TYPE,
             &crate::interp_exceptions::EXCEPTION_TYPE,
         ),
-        (&crate::sliceobject::SLICE_TYPE, &INSTANCE_TYPE),
-        (&crate::setobject::SET_TYPE, &INSTANCE_TYPE),
-        (&crate::setobject::FROZENSET_TYPE, &INSTANCE_TYPE),
-        (&crate::typedef::MEMBER_TYPE, &INSTANCE_TYPE),
+        (&crate::sliceobject::SLICE_TYPE, &W_ROOT_TYPE),
+        (&crate::setobject::SET_TYPE, &W_ROOT_TYPE),
+        (&crate::setobject::FROZENSET_TYPE, &W_ROOT_TYPE),
+        (&crate::typedef::MEMBER_TYPE, &W_ROOT_TYPE),
         // `pypy/objspace/std/dictmultiobject.py:449/459/469` —
         // dict_keys / dict_values / dict_items.  The three Python
         // visible types share the `W_DictViewObject` payload but each
         // gets a distinct W_TypeObject so `type(d.keys()) is
         // dict_keys` parity holds.
-        (&crate::dictmultiobject::DICT_KEYS_TYPE, &INSTANCE_TYPE),
-        (&crate::dictmultiobject::DICT_VALUES_TYPE, &INSTANCE_TYPE),
-        (&crate::dictmultiobject::DICT_ITEMS_TYPE, &INSTANCE_TYPE),
+        (&crate::dictmultiobject::DICT_KEYS_TYPE, &W_ROOT_TYPE),
+        (&crate::dictmultiobject::DICT_VALUES_TYPE, &W_ROOT_TYPE),
+        (&crate::dictmultiobject::DICT_ITEMS_TYPE, &W_ROOT_TYPE),
         // `pypy/interpreter/typedef.py GetSetProperty.typedef`.
         // Registered in the foreign-pytype loop so the `instantiate`
         // back-pointer is set before the first GetSetProperty
@@ -1503,7 +1522,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         // it for the W_TypeObject side, but the static PyType also
         // needs the foreign-loop entry to seed pytype_to_tid for the
         // GC vtable lookup).
-        (&crate::typedef::GETSET_DESCRIPTOR_TYPE, &INSTANCE_TYPE),
+        (&crate::typedef::GETSET_DESCRIPTOR_TYPE, &W_ROOT_TYPE),
         // Appended at the TAIL: inserting mid-list would shift the
         // positionally-assigned type ids of every following entry,
         // silently breaking GuardClass / pytype_to_tid lookups.  The
@@ -1534,7 +1553,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
     }
 
     vec![
-        subclass_range_alias(0, &INSTANCE_TYPE),
+        subclass_range_alias(0, &W_ROOT_TYPE),
         subclass_range_alias(1, &INT_TYPE),
         subclass_range_alias(2, &FLOAT_TYPE),
         subclass_range_alias(5, &BOOL_TYPE),
@@ -1683,6 +1702,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(49, &crate::celldict::OBJECT_MUTABLE_CELL_TYPE),
         subclass_range_alias(50, &crate::celldict::INT_MUTABLE_CELL_TYPE),
         subclass_range_alias(52, &crate::weakref::GC_WEAKREF_BOX_TYPE),
+        subclass_range_alias(53, &INSTANCE_TYPE),
         subclass_range_alias(54, &COMPLEX_TYPE),
         subclass_range_alias(56, &crate::interp_exceptions::EXC_EXCEPTION_TYPE),
         subclass_range_alias(57, &crate::interp_exceptions::EXC_SYSTEM_EXIT_TYPE),

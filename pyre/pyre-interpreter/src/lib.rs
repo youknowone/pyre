@@ -1082,10 +1082,10 @@ pub fn all_foreign_pytypes() -> &'static [(
         &pyre_object::pyobject::PyType,
         &pyre_object::pyobject::PyType,
     )] = &[
-        (&crate::pycode::CODE_TYPE, &pyre_object::INSTANCE_TYPE),
+        (&crate::pycode::CODE_TYPE, &pyre_object::W_ROOT_TYPE),
         (
             &crate::pytraceback::PYTRACEBACK_TYPE,
-            &pyre_object::INSTANCE_TYPE,
+            &pyre_object::W_ROOT_TYPE,
         ),
     ];
     PYTYPES
