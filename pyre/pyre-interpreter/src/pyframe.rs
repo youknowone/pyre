@@ -415,14 +415,16 @@ pub mod frame_locals_proxy {
         ///
         /// `@jit.unroll_safe` for the same reason as [`PyFrame::fast2locals`]
         /// and [`PyFrame::frame_locals_proxy_snapshot`]: the scan is bounded by
-        /// `locals_plus_names`, i.e. the code object's varnames plus cellvars
-        /// plus freevars, which is green.  Without it `contains_loop` declines
-        /// the graph, and then a `fr.f_locals["x"]` in a traced body is one
-        /// residual call -- the array read behind it never reaches the
-        /// virtualizable lowering, so it answers from memory instead of from
-        /// the shadow the compiled loop is writing.  What the body does per
-        /// candidate is not what the hint is about: `hash_w_strict` and `eq_w`
-        /// can run application code, but they are calls, not the loop bound.
+        /// the code object's varnames, pure cellvars and freevars, which is
+        /// green.  The loops index those arrays in place, the way
+        /// [`PyFrame::fast2locals`] does, so the bound does not collect a
+        /// `Vec`.  Without the hint `contains_loop` declines the graph, and
+        /// then a `fr.f_locals["x"]` in a traced body is one residual call --
+        /// the array read behind it never reaches the virtualizable lowering,
+        /// so it answers from memory instead of from the shadow the compiled
+        /// loop is writing.  What the body does per candidate is not what the
+        /// hint is about: `hash_w_strict` and `eq_w` can run application code,
+        /// but they are calls, not the loop bound.
         #[majit_macros::unroll_safe]
         fn locals_plus_value(
             &self,
@@ -437,54 +439,91 @@ pub mod frame_locals_proxy {
             let candidate_slot = key_slot + 1;
             let _ = roots.pin_root(pyre_object::PY_NULL);
             // No force here; see [`Self::force_locals`] on the read direction.
-            // Hashing runs before the scan, so an unhashable key is a
-            // `TypeError` even for a frame with no locals to compare against.
-            let key_hash = crate::baseobjspace::hash_w_strict(roots.get(key_slot))?;
+            // An exact `str` is decided by WTF-8 bytes, so its hash is not
+            // read and cannot fail.  Every other key is hashed before the
+            // scan, including a frame with no locals, so an unhashable key
+            // is still a `TypeError`.
             let exact_str_key = unsafe {
                 pyre_object::pyobject::is_exact_type(
                     roots.get(key_slot),
                     &pyre_object::pyobject::STR_TYPE,
                 )
             };
+            let key_hash = if exact_str_key {
+                0
+            } else {
+                crate::baseobjspace::hash_w_strict(roots.get(key_slot))?
+            };
             // `code` addresses the compiler code object, which lives outside
             // the GC heap and so stays valid across those collections.
+            // Same slot order as [`locals_plus_names`]: varnames, then the
+            // pure-cellvar band, then freevars.  Positional indexing rather
+            // than that `Vec` because this graph is `unroll_safe`: a
+            // collected `Vec` puts the iterator and the allocation on the
+            // descent's blocker frontier (`fast2locals`).
             let code = self.frame().code();
-            for (index, name, cell_slot) in locals_plus_names(code) {
-                let same = if exact_str_key {
-                    // The interned-name pointer comparison the scan opens
-                    // with, widened to every equal `str`: comparing WTF-8
-                    // bytes decides an exact `str` key outright, so it needs
-                    // neither the hash nor a candidate allocation.
-                    unsafe { pyre_object::w_str_get_wtf8(roots.get(key_slot)) }.as_bytes()
-                        == name.as_bytes()
-                } else {
-                    roots.set(candidate_slot, pyre_object::w_str_new_managed(name));
-                    // A name whose hash differs is never compared: a key that
-                    // claims equality with a name it does not hash like reads
-                    // as absent rather than as that name's slot.
-                    crate::baseobjspace::hash_w_strict(roots.get(candidate_slot))? == key_hash
-                        && crate::baseobjspace::eq_w(
-                            roots.get(candidate_slot),
-                            roots.get(key_slot),
-                        )?
-                };
-                if !same {
-                    continue;
-                }
-                let frame = self.frame();
-                if index >= locals_w!(frame).len() {
-                    continue;
-                }
-                let slot = locals_w!(frame)[index];
-                let value = if cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) }
-                {
-                    unsafe { pyre_object::w_cell_get(slot) }
-                } else {
-                    slot
-                };
-                if !value.is_null() {
-                    return Ok(Some(value));
-                }
+            let nvar = code.varnames.len();
+            // The name borrow ends before `self.frame()`.  `locals_w!` stays
+            // in this function so the virtualizable array getfield and the
+            // access share a basic block.
+            macro_rules! consider_local {
+                ($index:expr, $name:expr, $is_cell:expr) => {{
+                    let same = {
+                        let name: &str = $name;
+                        if exact_str_key {
+                            // Comparing WTF-8 bytes decides an exact `str`
+                            // key outright, so it needs neither the hash nor
+                            // a candidate allocation.
+                            unsafe { pyre_object::w_str_get_wtf8(roots.get(key_slot)) }.as_bytes()
+                                == name.as_bytes()
+                        } else {
+                            roots.set(candidate_slot, pyre_object::w_str_new_managed(name));
+                            // A name whose hash differs is never compared: a
+                            // key that claims equality with a name it does
+                            // not hash like reads as absent rather than as
+                            // that name's slot.
+                            crate::baseobjspace::hash_w_strict(roots.get(candidate_slot))?
+                                == key_hash
+                                && crate::baseobjspace::eq_w(
+                                    roots.get(candidate_slot),
+                                    roots.get(key_slot),
+                                )?
+                        }
+                    };
+                    if same {
+                        let frame = self.frame();
+                        if $index < locals_w!(frame).len() {
+                            let slot = locals_w!(frame)[$index];
+                            let value = if $is_cell
+                                && !slot.is_null()
+                                && unsafe { pyre_object::is_cell(slot) }
+                            {
+                                unsafe { pyre_object::w_cell_get(slot) }
+                            } else {
+                                slot
+                            };
+                            if !value.is_null() {
+                                return Ok(Some(value));
+                            }
+                        }
+                    }
+                }};
+            }
+            for index in 0..nvar {
+                let is_cell = super::cell_slot(code, index);
+                consider_local!(index, code.varnames[index].as_str(), is_cell);
+            }
+            let npure = super::npure_cellvars(code);
+            for i in 0..npure {
+                consider_local!(
+                    nvar + i,
+                    code.cellvars[super::nth_pure_cellvar_index(code, i)].as_str(),
+                    true
+                );
+            }
+            let nfree = code.freevars.len();
+            for i in 0..nfree {
+                consider_local!(nvar + npure + i, code.freevars[i].as_str(), true);
             }
             Ok(None)
         }
