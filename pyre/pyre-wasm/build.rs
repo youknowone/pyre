@@ -3,8 +3,10 @@
 //!
 //! Integer mixes cover arity 0..=7 and every i32/i64 mask, with result tags
 //! void / i32 / i64 / f64. Uniform f64 covers arity 1..=4 and result tags
-//! void / i64 / f64. An i32 argument is truncated; an i32 result is
-//! zero-extended; an f64 result is returned as bits.
+//! void / i64 / f64. Signatures that contain an f64 and an integer cover
+//! arity 1..=5 and the same four result tags. An i32 argument is truncated;
+//! an i32 result is zero-extended; an f64 argument is `f64::from_bits` and
+//! an f64 result is returned as bits.
 
 use std::fmt::Write as _;
 
@@ -40,8 +42,16 @@ fn generate() -> String {
             emit_f64(&mut out, arity, tag);
         }
     }
+    for arity in 1..=5 {
+        for_each_f64_mix(arity, &mut |code| {
+            for tag in 0..4 {
+                emit_mix(&mut out, arity, code, tag);
+            }
+        });
+    }
     emit_int_dispatch(&mut out);
     emit_f64_dispatch(&mut out);
+    emit_mix_dispatch(&mut out);
     out
 }
 
@@ -51,6 +61,55 @@ fn emit_int(out: &mut String, arity: usize, mask: u16, tag: u8) {
     let _ = writeln!(
         out,
         "unsafe fn c_{arity}_{mask}_{tag}(slot: usize, args: &[i64]) -> i64 {{\n    \
+         let f: extern \"C\" fn({params}){ret} = fn_from_slot(slot);\n    \
+         {body}\n}}\n",
+        ret = ret_ty(tag),
+        body = call_body(tag, &format!("f({args})")),
+    );
+}
+
+/// Digits match `FuncSigVal` param bits: 0 = i32, 1 = i64, 3 = f64.
+fn for_each_f64_mix(arity: usize, emit: &mut dyn FnMut(u32)) {
+    fn walk(arity: usize, pos: usize, code: u32, seen_f64: bool, emit: &mut dyn FnMut(u32)) {
+        if pos == arity {
+            if seen_f64 {
+                emit(code);
+            }
+            return;
+        }
+        for digit in [0u32, 1, 3] {
+            walk(
+                arity,
+                pos + 1,
+                code | (digit << (2 * pos)),
+                seen_f64 || digit == 3,
+                emit,
+            );
+        }
+    }
+    walk(arity, 0, 0, false, emit);
+}
+
+fn emit_mix(out: &mut String, arity: usize, code: u32, tag: u8) {
+    let params = (0..arity)
+        .map(|i| match (code >> (2 * i)) & 0b11 {
+            0 => "i32",
+            1 => "i64",
+            _ => "f64",
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let args = (0..arity)
+        .map(|i| match (code >> (2 * i)) & 0b11 {
+            0 => format!("args[{i}] as i32"),
+            1 => format!("args[{i}]"),
+            _ => format!("f64::from_bits(args[{i}] as u64)"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        out,
+        "unsafe fn m_{arity}_{code}_{tag}(slot: usize, args: &[i64]) -> i64 {{\n    \
          let f: extern \"C\" fn({params}){ret} = fn_from_slot(slot);\n    \
          {body}\n}}\n",
         ret = ret_ty(tag),
@@ -168,6 +227,37 @@ fn emit_f64_dispatch(out: &mut String) {
                 "            ({arity}, {tag}) => f_{arity}_{tag}(slot, args),"
             );
         }
+    }
+    out.push_str("            _ => return None,\n        }\n    })\n}\n");
+}
+
+fn emit_mix_dispatch(out: &mut String) {
+    out.push_str(
+        "pub fn call_mixed_sig(\n    \
+         slot: usize,\n    \
+         args: &[i64],\n    \
+         code: u32,\n    \
+         result: Option<FuncSigVal>,\n\
+         ) -> Option<i64> {\n    \
+         let tag = match result {\n        \
+         None => 0,\n        \
+         Some(FuncSigVal::I32) => 1,\n        \
+         Some(FuncSigVal::I64) => 2,\n        \
+         Some(FuncSigVal::F64) => 3,\n        \
+         Some(FuncSigVal::F32) => return None,\n    \
+         };\n    \
+         Some(unsafe {\n        \
+         match (args.len(), code, tag) {\n",
+    );
+    for arity in 1..=5 {
+        for_each_f64_mix(arity, &mut |code| {
+            for tag in 0..4 {
+                let _ = writeln!(
+                    out,
+                    "            ({arity}, {code}, {tag}) => m_{arity}_{code}_{tag}(slot, args),"
+                );
+            }
+        });
     }
     out.push_str("            _ => return None,\n        }\n    })\n}\n");
 }

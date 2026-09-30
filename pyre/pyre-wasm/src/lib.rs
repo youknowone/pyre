@@ -141,8 +141,10 @@ mod heap_prof {
 static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
 
 // One `extern "C"` trampoline per published table type. An i32 argument is
-// truncated, an i32 result is zero-extended, and an f64 result comes back
-// as bits. `build.rs` writes the bodies.
+// truncated, an i32 result is zero-extended, an f64 argument is
+// `f64::from_bits`, and an f64 result comes back as bits. `build.rs` writes
+// the bodies. Integer mixes go through arity 7; a signature that contains
+// an f64 goes through arity 5.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 #[allow(unused_variables, clippy::missing_safety_doc)]
 mod residual_sig_call {
@@ -160,7 +162,25 @@ fn direct_sig_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
         return None;
     }
     if !sig.params.is_empty() && sig.params.iter().all(|p| *p == FuncSigVal::F64) {
-        return residual_sig_call::call_uniform_f64(func_ptr, args, sig.result);
+        if let Some(value) = residual_sig_call::call_uniform_f64(func_ptr, args, sig.result) {
+            return Some(value);
+        }
+    }
+    if sig.params.iter().any(|p| *p == FuncSigVal::F64) {
+        if args.is_empty() || args.len() > 5 {
+            return None;
+        }
+        let mut code = 0u32;
+        for (i, param) in sig.params.iter().enumerate() {
+            let digit = match param {
+                FuncSigVal::I32 => 0,
+                FuncSigVal::I64 => 1,
+                FuncSigVal::F64 => 3,
+                FuncSigVal::F32 => return None,
+            };
+            code |= digit << (2 * i);
+        }
+        return residual_sig_call::call_mixed_sig(func_ptr, args, code, sig.result);
     }
     let mut mask = 0u16;
     for (i, param) in sig.params.iter().enumerate() {
