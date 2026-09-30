@@ -475,6 +475,21 @@ pub extern "C" fn jit_bigint_int_divmod(
     }
 }
 
+/// `rbigint.divmod` (`@jit.elidable`) with both halves in one `tuple2`,
+/// the two-rbigint counterpart of [`jit_bigint_int_divmod`].
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_divmod(
+    a: *const BigInt,
+    b: *const BigInt,
+) -> pyre_object::longobject::JitBigIntPairResult {
+    unsafe {
+        let (div, modulo) = (&*a).divmod(&*b).expect("division by zero");
+        pyre_object::longobject::encode_jit_bigint_pair_result(
+            pyre_object::longobject::alloc_bigint_pair_nursery_collecting(div, modulo),
+        )
+    }
+}
+
 /// `rbigint.divmod`'s floored modulus projection.
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_mod_floor(

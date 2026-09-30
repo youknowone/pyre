@@ -1343,6 +1343,8 @@ const SINGLE_GRAPHS: &[&str] = &[
     "long_add",
     "long_lshift",
     "int_lshift",
+    "long_int_divmod",
+    "integer_divmod_pair",
 ];
 
 /// Every graph name the assertions below look up.
@@ -1853,6 +1855,9 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         ),
         ("long_rshift", "jit_bigint_shr", "bigint_rshift"),
         ("long_bitxor", "jit_bigint_xor", "xor"),
+        ("long_int_divmod", "jit_bigint_int_divmod", "int_divmod"),
+        ("integer_divmod_pair", "jit_bigint_int_divmod", "int_divmod"),
+        ("integer_divmod_pair", "jit_bigint_divmod", "divmod"),
     ] {
         let caller = program
             .functions

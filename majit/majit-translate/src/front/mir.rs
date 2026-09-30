@@ -17616,6 +17616,18 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_rbigint_divmod_pair(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    first_arg_ty.as_ref(),
+                    second_arg_ty.as_ref(),
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_usize_try_from(
                     mir_bb,
                     &reg.kind,
@@ -27668,6 +27680,148 @@ impl<'a> Lowering<'a> {
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
     )]
+    /// `rbigint.int_divmod` / `rbigint.divmod` return `(div, mod)`.  Both are
+    /// `@jit.elidable`; RPython lowers the call to one residual returning the
+    /// `tuple2` GcStruct and reads its two items.  `RBigIntPair` is that
+    /// struct, so the call becomes the pair residual plus two pure item reads
+    /// packed back into the source-level `(RBigInt, RBigInt)`.  The Rust
+    /// `Result` around it is always `Ok` here -- the residual raises instead
+    /// -- so the destination binds to the tuple the way
+    /// [`Self::try_lower_usize_try_from`] binds an always-`Ok` payload.
+    fn try_lower_rbigint_divmod_pair(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        second_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [receiver, divisor] = args else {
+            return Ok(false);
+        };
+        if !segments.iter().any(|s| s == "rbigint")
+            || !first_arg_ty.is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+        {
+            return Ok(false);
+        }
+        let Some(second_arg_ty) = second_arg_ty else {
+            return Ok(false);
+        };
+        let int_divisor = if self.tyref_literal_int_atom(second_arg_ty) == Some("I64") {
+            true
+        } else if tyref_is_rbigint(second_arg_ty, self.llbc) {
+            false
+        } else {
+            return Ok(false);
+        };
+        let Some(residual) = segments.last().and_then(|leaf| {
+            crate::front::rbigint_call::divmod_pair_residual_for_method(leaf, int_divisor)
+        }) else {
+            return Ok(false);
+        };
+        if !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc) {
+            return Ok(false);
+        }
+        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        let suffix = tyref_tuple_suffix(&success_ty, self.llbc);
+        if suffix.is_empty() {
+            return Ok(false);
+        }
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        let tuple_owner = format!("Tuple{suffix}");
+        let bb_id = self.block_id[mir_bb];
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(result.clone()),
+                kind,
+            });
+            result
+        };
+        let pair = push_op(
+            &mut self.graph,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![receiver.clone(), divisor.clone()]),
+                result_ty: ValueType::Ref(Some("RBigIntPair".to_string())),
+            },
+        );
+        let pair = push_op(
+            &mut self.graph,
+            crate::model::cast_instance_call("RBigIntPair", pair),
+        );
+        let mut items = Vec::with_capacity(2);
+        for field in ["item0", "item1"] {
+            let item = push_op(
+                &mut self.graph,
+                OpKind::FieldRead {
+                    base: pair.clone(),
+                    field: FieldDescriptor::new(field.to_string(), Some("RBigIntPair".to_string())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+            );
+            items.push(push_op(
+                &mut self.graph,
+                crate::model::cast_instance_call("RBigInt", item),
+            ));
+        }
+        let ctor = AggregateCtor {
+            target: CallTarget::synthetic_transparent_ctor(tuple_owner.clone()),
+            result_owner: tuple_owner.clone(),
+            owner_id: None,
+            owner_path: Vec::new(),
+            ctor_name: tuple_owner,
+            fields: (0..2)
+                .map(|i| AggregateField {
+                    name: format!("__pos_{i}"),
+                    void: false,
+                    narrow_root: None,
+                })
+                .collect(),
+        };
+        let payload = emit_aggregate_ctor(&mut self.graph, bb_id, &ctor, &items);
+        if self.multi_assigned_locals.contains(&dest_local) {
+            let disc = push_op(&mut self.graph, OpKind::ConstInt(0));
+            let payload_owner =
+                Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+            self.emit_tagged_pair_aggregate(
+                mir_bb,
+                &owner,
+                &payload_owner,
+                disc,
+                payload,
+                dest_local,
+                target,
+            )?;
+            return Ok(true);
+        }
+        self.const_discriminant_locals.insert(dest_local, 0);
+        self.local_var[dest_local] = Some(payload);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     fn try_lower_usize_try_from(
         &mut self,
         mir_bb: usize,
