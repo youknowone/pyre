@@ -1432,6 +1432,9 @@ pub fn scan(
                 term_pin_args[b] = args_only;
                 term_pin_names[b] = name.clone();
                 pinned.retain(|local| gc_locals.contains_key(local));
+                if pinned.is_empty() && !helper.pinned_params.is_empty() {
+                    opaque_reason.get_or_insert("pin-names-nothing");
+                }
                 term_pins[b] = pinned;
                 continue;
             }
