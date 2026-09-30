@@ -771,8 +771,7 @@ impl W_ListObject {
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let value = crate::gc_roots::shadow_stack_get(root_base + 1);
         let list = &mut *(obj as *mut W_ListObject);
-        let base = items_block_items_base(list.items);
-        *base.add(list.length_relaxed()) = value;
+        items_block_set_ref(list.items, list.length_relaxed(), value);
         list.set_length_relaxed(list.length_relaxed() + 1);
     }
 
@@ -803,7 +802,7 @@ impl W_ListObject {
         let base = items_block_items_base(list.items);
         let p = base.add(index);
         std::ptr::copy(p, p.add(1), list.length_relaxed() - index);
-        *p = value;
+        items_block_set_ref(list.items, index, value);
         list.set_length_relaxed(list.length_relaxed() + 1);
     }
 
@@ -931,9 +930,12 @@ impl W_ListObject {
         if len2 > 0 {
             let obj = crate::gc_roots::shadow_stack_get(obj_slot);
             let list = &mut *(obj as *mut W_ListObject);
-            let base = items_block_items_base(list.items);
             for i in 0..len2 {
-                *base.add(s + i) = crate::gc_roots::shadow_stack_get(save + i);
+                items_block_set_ref(
+                    list.items,
+                    s + i,
+                    crate::gc_roots::shadow_stack_get(save + i),
+                );
             }
         }
     }
