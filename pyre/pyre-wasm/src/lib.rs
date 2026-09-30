@@ -140,8 +140,14 @@ mod heap_prof {
 #[global_allocator]
 static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
 
+// One `extern "C"` trampoline per published table type. An i32 argument is
+// truncated, an i32 result is zero-extended, and an f64 result comes back
+// as bits. `build.rs` writes the bodies.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-mod residual_sig_call;
+#[allow(unused_variables, clippy::missing_safety_doc)]
+mod residual_sig_call {
+    include!(concat!(env!("OUT_DIR"), "/residual_sig_call.rs"));
+}
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 fn direct_sig_call(func_ptr: usize, args: &[i64]) -> Option<i64> {

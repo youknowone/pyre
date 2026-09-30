@@ -23,9 +23,6 @@ use majit_jitcode::jitcode::{BhCallDescr, BhCallStub};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArgClass {
     Int,
-    /// GCREF. Staged wrappers pass it as an `i64` word, including on wasm32.
-    /// A callee whose table type is a real `i32` pointer is host-reflected.
-    Ref,
     Float,
 }
 
@@ -48,12 +45,8 @@ pub enum ArgClass {
 /// deopt that first runs it; widening the arms here means raising it there in
 /// the same change (`majit-translate` cannot call into `majit-backend`, so the
 /// bound is stated on both sides rather than shared).
-#[cfg(not(target_arch = "wasm32"))]
 macro_rules! invoke_ty {
     (Int) => {
-        i64
-    };
-    (Ref) => {
         i64
     };
     (Float) => {
@@ -61,38 +54,8 @@ macro_rules! invoke_ty {
     };
 }
 
-#[cfg(target_arch = "wasm32")]
-macro_rules! invoke_ty {
-    (Int) => {
-        i64
-    };
-    (Ref) => {
-        i64
-    };
-    (Float) => {
-        f64
-    };
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 macro_rules! invoke_arg {
     (Int, $a:ident, $i:tt) => {
-        $a[$i]
-    };
-    (Ref, $a:ident, $i:tt) => {
-        $a[$i]
-    };
-    (Float, $a:ident, $i:tt) => {
-        f64::from_bits($a[$i] as u64)
-    };
-}
-
-#[cfg(target_arch = "wasm32")]
-macro_rules! invoke_arg {
-    (Int, $a:ident, $i:tt) => {
-        $a[$i]
-    };
-    (Ref, $a:ident, $i:tt) => {
         $a[$i]
     };
     (Float, $a:ident, $i:tt) => {
@@ -379,506 +342,6 @@ macro_rules! call_sig_table {
         FFFIF { Float, Float, Float, Int, Float }
         FFFFI { Float, Float, Float, Float, Int }
         FFFFF { Float, Float, Float, Float, Float }
-        R { Ref }
-        RI { Ref, Int }
-        IR { Int, Ref }
-        RR { Ref, Ref }
-        FR { Float, Ref }
-        RF { Ref, Float }
-        RII { Ref, Int, Int }
-        IRI { Int, Ref, Int }
-        RRI { Ref, Ref, Int }
-        FRI { Float, Ref, Int }
-        RFI { Ref, Float, Int }
-        IIR { Int, Int, Ref }
-        RIR { Ref, Int, Ref }
-        FIR { Float, Int, Ref }
-        IRR { Int, Ref, Ref }
-        RRR { Ref, Ref, Ref }
-        FRR { Float, Ref, Ref }
-        IFR { Int, Float, Ref }
-        RFR { Ref, Float, Ref }
-        FFR { Float, Float, Ref }
-        RIF { Ref, Int, Float }
-        IRF { Int, Ref, Float }
-        RRF { Ref, Ref, Float }
-        FRF { Float, Ref, Float }
-        RFF { Ref, Float, Float }
-        RIII { Ref, Int, Int, Int }
-        IRII { Int, Ref, Int, Int }
-        RRII { Ref, Ref, Int, Int }
-        FRII { Float, Ref, Int, Int }
-        RFII { Ref, Float, Int, Int }
-        IIRI { Int, Int, Ref, Int }
-        RIRI { Ref, Int, Ref, Int }
-        FIRI { Float, Int, Ref, Int }
-        IRRI { Int, Ref, Ref, Int }
-        RRRI { Ref, Ref, Ref, Int }
-        FRRI { Float, Ref, Ref, Int }
-        IFRI { Int, Float, Ref, Int }
-        RFRI { Ref, Float, Ref, Int }
-        FFRI { Float, Float, Ref, Int }
-        RIFI { Ref, Int, Float, Int }
-        IRFI { Int, Ref, Float, Int }
-        RRFI { Ref, Ref, Float, Int }
-        FRFI { Float, Ref, Float, Int }
-        RFFI { Ref, Float, Float, Int }
-        IIIR { Int, Int, Int, Ref }
-        RIIR { Ref, Int, Int, Ref }
-        FIIR { Float, Int, Int, Ref }
-        IRIR { Int, Ref, Int, Ref }
-        RRIR { Ref, Ref, Int, Ref }
-        FRIR { Float, Ref, Int, Ref }
-        IFIR { Int, Float, Int, Ref }
-        RFIR { Ref, Float, Int, Ref }
-        FFIR { Float, Float, Int, Ref }
-        IIRR { Int, Int, Ref, Ref }
-        RIRR { Ref, Int, Ref, Ref }
-        FIRR { Float, Int, Ref, Ref }
-        IRRR { Int, Ref, Ref, Ref }
-        RRRR { Ref, Ref, Ref, Ref }
-        FRRR { Float, Ref, Ref, Ref }
-        IFRR { Int, Float, Ref, Ref }
-        RFRR { Ref, Float, Ref, Ref }
-        FFRR { Float, Float, Ref, Ref }
-        IIFR { Int, Int, Float, Ref }
-        RIFR { Ref, Int, Float, Ref }
-        FIFR { Float, Int, Float, Ref }
-        IRFR { Int, Ref, Float, Ref }
-        RRFR { Ref, Ref, Float, Ref }
-        FRFR { Float, Ref, Float, Ref }
-        IFFR { Int, Float, Float, Ref }
-        RFFR { Ref, Float, Float, Ref }
-        FFFR { Float, Float, Float, Ref }
-        RIIF { Ref, Int, Int, Float }
-        IRIF { Int, Ref, Int, Float }
-        RRIF { Ref, Ref, Int, Float }
-        FRIF { Float, Ref, Int, Float }
-        RFIF { Ref, Float, Int, Float }
-        IIRF { Int, Int, Ref, Float }
-        RIRF { Ref, Int, Ref, Float }
-        FIRF { Float, Int, Ref, Float }
-        IRRF { Int, Ref, Ref, Float }
-        RRRF { Ref, Ref, Ref, Float }
-        FRRF { Float, Ref, Ref, Float }
-        IFRF { Int, Float, Ref, Float }
-        RFRF { Ref, Float, Ref, Float }
-        FFRF { Float, Float, Ref, Float }
-        RIFF { Ref, Int, Float, Float }
-        IRFF { Int, Ref, Float, Float }
-        RRFF { Ref, Ref, Float, Float }
-        FRFF { Float, Ref, Float, Float }
-        RFFF { Ref, Float, Float, Float }
-        RIIII { Ref, Int, Int, Int, Int }
-        IRIII { Int, Ref, Int, Int, Int }
-        RRIII { Ref, Ref, Int, Int, Int }
-        FRIII { Float, Ref, Int, Int, Int }
-        RFIII { Ref, Float, Int, Int, Int }
-        IIRII { Int, Int, Ref, Int, Int }
-        RIRII { Ref, Int, Ref, Int, Int }
-        FIRII { Float, Int, Ref, Int, Int }
-        IRRII { Int, Ref, Ref, Int, Int }
-        RRRII { Ref, Ref, Ref, Int, Int }
-        FRRII { Float, Ref, Ref, Int, Int }
-        IFRII { Int, Float, Ref, Int, Int }
-        RFRII { Ref, Float, Ref, Int, Int }
-        FFRII { Float, Float, Ref, Int, Int }
-        RIFII { Ref, Int, Float, Int, Int }
-        IRFII { Int, Ref, Float, Int, Int }
-        RRFII { Ref, Ref, Float, Int, Int }
-        FRFII { Float, Ref, Float, Int, Int }
-        RFFII { Ref, Float, Float, Int, Int }
-        IIIRI { Int, Int, Int, Ref, Int }
-        RIIRI { Ref, Int, Int, Ref, Int }
-        FIIRI { Float, Int, Int, Ref, Int }
-        IRIRI { Int, Ref, Int, Ref, Int }
-        RRIRI { Ref, Ref, Int, Ref, Int }
-        FRIRI { Float, Ref, Int, Ref, Int }
-        IFIRI { Int, Float, Int, Ref, Int }
-        RFIRI { Ref, Float, Int, Ref, Int }
-        FFIRI { Float, Float, Int, Ref, Int }
-        IIRRI { Int, Int, Ref, Ref, Int }
-        RIRRI { Ref, Int, Ref, Ref, Int }
-        FIRRI { Float, Int, Ref, Ref, Int }
-        IRRRI { Int, Ref, Ref, Ref, Int }
-        RRRRI { Ref, Ref, Ref, Ref, Int }
-        FRRRI { Float, Ref, Ref, Ref, Int }
-        IFRRI { Int, Float, Ref, Ref, Int }
-        RFRRI { Ref, Float, Ref, Ref, Int }
-        FFRRI { Float, Float, Ref, Ref, Int }
-        IIFRI { Int, Int, Float, Ref, Int }
-        RIFRI { Ref, Int, Float, Ref, Int }
-        FIFRI { Float, Int, Float, Ref, Int }
-        IRFRI { Int, Ref, Float, Ref, Int }
-        RRFRI { Ref, Ref, Float, Ref, Int }
-        FRFRI { Float, Ref, Float, Ref, Int }
-        IFFRI { Int, Float, Float, Ref, Int }
-        RFFRI { Ref, Float, Float, Ref, Int }
-        FFFRI { Float, Float, Float, Ref, Int }
-        RIIFI { Ref, Int, Int, Float, Int }
-        IRIFI { Int, Ref, Int, Float, Int }
-        RRIFI { Ref, Ref, Int, Float, Int }
-        FRIFI { Float, Ref, Int, Float, Int }
-        RFIFI { Ref, Float, Int, Float, Int }
-        IIRFI { Int, Int, Ref, Float, Int }
-        RIRFI { Ref, Int, Ref, Float, Int }
-        FIRFI { Float, Int, Ref, Float, Int }
-        IRRFI { Int, Ref, Ref, Float, Int }
-        RRRFI { Ref, Ref, Ref, Float, Int }
-        FRRFI { Float, Ref, Ref, Float, Int }
-        IFRFI { Int, Float, Ref, Float, Int }
-        RFRFI { Ref, Float, Ref, Float, Int }
-        FFRFI { Float, Float, Ref, Float, Int }
-        RIFFI { Ref, Int, Float, Float, Int }
-        IRFFI { Int, Ref, Float, Float, Int }
-        RRFFI { Ref, Ref, Float, Float, Int }
-        FRFFI { Float, Ref, Float, Float, Int }
-        RFFFI { Ref, Float, Float, Float, Int }
-        IIIIR { Int, Int, Int, Int, Ref }
-        RIIIR { Ref, Int, Int, Int, Ref }
-        FIIIR { Float, Int, Int, Int, Ref }
-        IRIIR { Int, Ref, Int, Int, Ref }
-        RRIIR { Ref, Ref, Int, Int, Ref }
-        FRIIR { Float, Ref, Int, Int, Ref }
-        IFIIR { Int, Float, Int, Int, Ref }
-        RFIIR { Ref, Float, Int, Int, Ref }
-        FFIIR { Float, Float, Int, Int, Ref }
-        IIRIR { Int, Int, Ref, Int, Ref }
-        RIRIR { Ref, Int, Ref, Int, Ref }
-        FIRIR { Float, Int, Ref, Int, Ref }
-        IRRIR { Int, Ref, Ref, Int, Ref }
-        RRRIR { Ref, Ref, Ref, Int, Ref }
-        FRRIR { Float, Ref, Ref, Int, Ref }
-        IFRIR { Int, Float, Ref, Int, Ref }
-        RFRIR { Ref, Float, Ref, Int, Ref }
-        FFRIR { Float, Float, Ref, Int, Ref }
-        IIFIR { Int, Int, Float, Int, Ref }
-        RIFIR { Ref, Int, Float, Int, Ref }
-        FIFIR { Float, Int, Float, Int, Ref }
-        IRFIR { Int, Ref, Float, Int, Ref }
-        RRFIR { Ref, Ref, Float, Int, Ref }
-        FRFIR { Float, Ref, Float, Int, Ref }
-        IFFIR { Int, Float, Float, Int, Ref }
-        RFFIR { Ref, Float, Float, Int, Ref }
-        FFFIR { Float, Float, Float, Int, Ref }
-        IIIRR { Int, Int, Int, Ref, Ref }
-        RIIRR { Ref, Int, Int, Ref, Ref }
-        FIIRR { Float, Int, Int, Ref, Ref }
-        IRIRR { Int, Ref, Int, Ref, Ref }
-        RRIRR { Ref, Ref, Int, Ref, Ref }
-        FRIRR { Float, Ref, Int, Ref, Ref }
-        IFIRR { Int, Float, Int, Ref, Ref }
-        RFIRR { Ref, Float, Int, Ref, Ref }
-        FFIRR { Float, Float, Int, Ref, Ref }
-        IIRRR { Int, Int, Ref, Ref, Ref }
-        RIRRR { Ref, Int, Ref, Ref, Ref }
-        FIRRR { Float, Int, Ref, Ref, Ref }
-        IRRRR { Int, Ref, Ref, Ref, Ref }
-        RRRRR { Ref, Ref, Ref, Ref, Ref }
-        FRRRR { Float, Ref, Ref, Ref, Ref }
-        IFRRR { Int, Float, Ref, Ref, Ref }
-        RFRRR { Ref, Float, Ref, Ref, Ref }
-        FFRRR { Float, Float, Ref, Ref, Ref }
-        IIFRR { Int, Int, Float, Ref, Ref }
-        RIFRR { Ref, Int, Float, Ref, Ref }
-        FIFRR { Float, Int, Float, Ref, Ref }
-        IRFRR { Int, Ref, Float, Ref, Ref }
-        RRFRR { Ref, Ref, Float, Ref, Ref }
-        FRFRR { Float, Ref, Float, Ref, Ref }
-        IFFRR { Int, Float, Float, Ref, Ref }
-        RFFRR { Ref, Float, Float, Ref, Ref }
-        FFFRR { Float, Float, Float, Ref, Ref }
-        IIIFR { Int, Int, Int, Float, Ref }
-        RIIFR { Ref, Int, Int, Float, Ref }
-        FIIFR { Float, Int, Int, Float, Ref }
-        IRIFR { Int, Ref, Int, Float, Ref }
-        RRIFR { Ref, Ref, Int, Float, Ref }
-        FRIFR { Float, Ref, Int, Float, Ref }
-        IFIFR { Int, Float, Int, Float, Ref }
-        RFIFR { Ref, Float, Int, Float, Ref }
-        FFIFR { Float, Float, Int, Float, Ref }
-        IIRFR { Int, Int, Ref, Float, Ref }
-        RIRFR { Ref, Int, Ref, Float, Ref }
-        FIRFR { Float, Int, Ref, Float, Ref }
-        IRRFR { Int, Ref, Ref, Float, Ref }
-        RRRFR { Ref, Ref, Ref, Float, Ref }
-        FRRFR { Float, Ref, Ref, Float, Ref }
-        IFRFR { Int, Float, Ref, Float, Ref }
-        RFRFR { Ref, Float, Ref, Float, Ref }
-        FFRFR { Float, Float, Ref, Float, Ref }
-        IIFFR { Int, Int, Float, Float, Ref }
-        RIFFR { Ref, Int, Float, Float, Ref }
-        FIFFR { Float, Int, Float, Float, Ref }
-        IRFFR { Int, Ref, Float, Float, Ref }
-        RRFFR { Ref, Ref, Float, Float, Ref }
-        FRFFR { Float, Ref, Float, Float, Ref }
-        IFFFR { Int, Float, Float, Float, Ref }
-        RFFFR { Ref, Float, Float, Float, Ref }
-        FFFFR { Float, Float, Float, Float, Ref }
-        RIIIF { Ref, Int, Int, Int, Float }
-        IRIIF { Int, Ref, Int, Int, Float }
-        RRIIF { Ref, Ref, Int, Int, Float }
-        FRIIF { Float, Ref, Int, Int, Float }
-        RFIIF { Ref, Float, Int, Int, Float }
-        IIRIF { Int, Int, Ref, Int, Float }
-        RIRIF { Ref, Int, Ref, Int, Float }
-        FIRIF { Float, Int, Ref, Int, Float }
-        IRRIF { Int, Ref, Ref, Int, Float }
-        RRRIF { Ref, Ref, Ref, Int, Float }
-        FRRIF { Float, Ref, Ref, Int, Float }
-        IFRIF { Int, Float, Ref, Int, Float }
-        RFRIF { Ref, Float, Ref, Int, Float }
-        FFRIF { Float, Float, Ref, Int, Float }
-        RIFIF { Ref, Int, Float, Int, Float }
-        IRFIF { Int, Ref, Float, Int, Float }
-        RRFIF { Ref, Ref, Float, Int, Float }
-        FRFIF { Float, Ref, Float, Int, Float }
-        RFFIF { Ref, Float, Float, Int, Float }
-        IIIRF { Int, Int, Int, Ref, Float }
-        RIIRF { Ref, Int, Int, Ref, Float }
-        FIIRF { Float, Int, Int, Ref, Float }
-        IRIRF { Int, Ref, Int, Ref, Float }
-        RRIRF { Ref, Ref, Int, Ref, Float }
-        FRIRF { Float, Ref, Int, Ref, Float }
-        IFIRF { Int, Float, Int, Ref, Float }
-        RFIRF { Ref, Float, Int, Ref, Float }
-        FFIRF { Float, Float, Int, Ref, Float }
-        IIRRF { Int, Int, Ref, Ref, Float }
-        RIRRF { Ref, Int, Ref, Ref, Float }
-        FIRRF { Float, Int, Ref, Ref, Float }
-        IRRRF { Int, Ref, Ref, Ref, Float }
-        RRRRF { Ref, Ref, Ref, Ref, Float }
-        FRRRF { Float, Ref, Ref, Ref, Float }
-        IFRRF { Int, Float, Ref, Ref, Float }
-        RFRRF { Ref, Float, Ref, Ref, Float }
-        FFRRF { Float, Float, Ref, Ref, Float }
-        IIFRF { Int, Int, Float, Ref, Float }
-        RIFRF { Ref, Int, Float, Ref, Float }
-        FIFRF { Float, Int, Float, Ref, Float }
-        IRFRF { Int, Ref, Float, Ref, Float }
-        RRFRF { Ref, Ref, Float, Ref, Float }
-        FRFRF { Float, Ref, Float, Ref, Float }
-        IFFRF { Int, Float, Float, Ref, Float }
-        RFFRF { Ref, Float, Float, Ref, Float }
-        FFFRF { Float, Float, Float, Ref, Float }
-        RIIFF { Ref, Int, Int, Float, Float }
-        IRIFF { Int, Ref, Int, Float, Float }
-        RRIFF { Ref, Ref, Int, Float, Float }
-        FRIFF { Float, Ref, Int, Float, Float }
-        RFIFF { Ref, Float, Int, Float, Float }
-        IIRFF { Int, Int, Ref, Float, Float }
-        RIRFF { Ref, Int, Ref, Float, Float }
-        FIRFF { Float, Int, Ref, Float, Float }
-        IRRFF { Int, Ref, Ref, Float, Float }
-        RRRFF { Ref, Ref, Ref, Float, Float }
-        FRRFF { Float, Ref, Ref, Float, Float }
-        IFRFF { Int, Float, Ref, Float, Float }
-        RFRFF { Ref, Float, Ref, Float, Float }
-        FFRFF { Float, Float, Ref, Float, Float }
-        RIFFF { Ref, Int, Float, Float, Float }
-        IRFFF { Int, Ref, Float, Float, Float }
-        RRFFF { Ref, Ref, Float, Float, Float }
-        FRFFF { Float, Ref, Float, Float, Float }
-        RFFFF { Ref, Float, Float, Float, Float }
-        RIIIII { Ref, Int, Int, Int, Int, Int }
-        IRIIII { Int, Ref, Int, Int, Int, Int }
-        RRIIII { Ref, Ref, Int, Int, Int, Int }
-        IIRIII { Int, Int, Ref, Int, Int, Int }
-        RIRIII { Ref, Int, Ref, Int, Int, Int }
-        IRRIII { Int, Ref, Ref, Int, Int, Int }
-        RRRIII { Ref, Ref, Ref, Int, Int, Int }
-        IIIRII { Int, Int, Int, Ref, Int, Int }
-        RIIRII { Ref, Int, Int, Ref, Int, Int }
-        IRIRII { Int, Ref, Int, Ref, Int, Int }
-        RRIRII { Ref, Ref, Int, Ref, Int, Int }
-        IIRRII { Int, Int, Ref, Ref, Int, Int }
-        RIRRII { Ref, Int, Ref, Ref, Int, Int }
-        IRRRII { Int, Ref, Ref, Ref, Int, Int }
-        RRRRII { Ref, Ref, Ref, Ref, Int, Int }
-        IIIIRI { Int, Int, Int, Int, Ref, Int }
-        RIIIRI { Ref, Int, Int, Int, Ref, Int }
-        IRIIRI { Int, Ref, Int, Int, Ref, Int }
-        RRIIRI { Ref, Ref, Int, Int, Ref, Int }
-        IIRIRI { Int, Int, Ref, Int, Ref, Int }
-        RIRIRI { Ref, Int, Ref, Int, Ref, Int }
-        IRRIRI { Int, Ref, Ref, Int, Ref, Int }
-        RRRIRI { Ref, Ref, Ref, Int, Ref, Int }
-        IIIRRI { Int, Int, Int, Ref, Ref, Int }
-        RIIRRI { Ref, Int, Int, Ref, Ref, Int }
-        IRIRRI { Int, Ref, Int, Ref, Ref, Int }
-        RRIRRI { Ref, Ref, Int, Ref, Ref, Int }
-        IIRRRI { Int, Int, Ref, Ref, Ref, Int }
-        RIRRRI { Ref, Int, Ref, Ref, Ref, Int }
-        IRRRRI { Int, Ref, Ref, Ref, Ref, Int }
-        RRRRRI { Ref, Ref, Ref, Ref, Ref, Int }
-        IIIIIR { Int, Int, Int, Int, Int, Ref }
-        RIIIIR { Ref, Int, Int, Int, Int, Ref }
-        IRIIIR { Int, Ref, Int, Int, Int, Ref }
-        RRIIIR { Ref, Ref, Int, Int, Int, Ref }
-        IIRIIR { Int, Int, Ref, Int, Int, Ref }
-        RIRIIR { Ref, Int, Ref, Int, Int, Ref }
-        IRRIIR { Int, Ref, Ref, Int, Int, Ref }
-        RRRIIR { Ref, Ref, Ref, Int, Int, Ref }
-        IIIRIR { Int, Int, Int, Ref, Int, Ref }
-        RIIRIR { Ref, Int, Int, Ref, Int, Ref }
-        IRIRIR { Int, Ref, Int, Ref, Int, Ref }
-        RRIRIR { Ref, Ref, Int, Ref, Int, Ref }
-        IIRRIR { Int, Int, Ref, Ref, Int, Ref }
-        RIRRIR { Ref, Int, Ref, Ref, Int, Ref }
-        IRRRIR { Int, Ref, Ref, Ref, Int, Ref }
-        RRRRIR { Ref, Ref, Ref, Ref, Int, Ref }
-        IIIIRR { Int, Int, Int, Int, Ref, Ref }
-        RIIIRR { Ref, Int, Int, Int, Ref, Ref }
-        IRIIRR { Int, Ref, Int, Int, Ref, Ref }
-        RRIIRR { Ref, Ref, Int, Int, Ref, Ref }
-        IIRIRR { Int, Int, Ref, Int, Ref, Ref }
-        RIRIRR { Ref, Int, Ref, Int, Ref, Ref }
-        IRRIRR { Int, Ref, Ref, Int, Ref, Ref }
-        RRRIRR { Ref, Ref, Ref, Int, Ref, Ref }
-        IIIRRR { Int, Int, Int, Ref, Ref, Ref }
-        RIIRRR { Ref, Int, Int, Ref, Ref, Ref }
-        IRIRRR { Int, Ref, Int, Ref, Ref, Ref }
-        RRIRRR { Ref, Ref, Int, Ref, Ref, Ref }
-        IIRRRR { Int, Int, Ref, Ref, Ref, Ref }
-        RIRRRR { Ref, Int, Ref, Ref, Ref, Ref }
-        IRRRRR { Int, Ref, Ref, Ref, Ref, Ref }
-        RRRRRR { Ref, Ref, Ref, Ref, Ref, Ref }
-        RIIIIII { Ref, Int, Int, Int, Int, Int, Int }
-        IRIIIII { Int, Ref, Int, Int, Int, Int, Int }
-        RRIIIII { Ref, Ref, Int, Int, Int, Int, Int }
-        IIRIIII { Int, Int, Ref, Int, Int, Int, Int }
-        RIRIIII { Ref, Int, Ref, Int, Int, Int, Int }
-        IRRIIII { Int, Ref, Ref, Int, Int, Int, Int }
-        RRRIIII { Ref, Ref, Ref, Int, Int, Int, Int }
-        IIIRIII { Int, Int, Int, Ref, Int, Int, Int }
-        RIIRIII { Ref, Int, Int, Ref, Int, Int, Int }
-        IRIRIII { Int, Ref, Int, Ref, Int, Int, Int }
-        RRIRIII { Ref, Ref, Int, Ref, Int, Int, Int }
-        IIRRIII { Int, Int, Ref, Ref, Int, Int, Int }
-        RIRRIII { Ref, Int, Ref, Ref, Int, Int, Int }
-        IRRRIII { Int, Ref, Ref, Ref, Int, Int, Int }
-        RRRRIII { Ref, Ref, Ref, Ref, Int, Int, Int }
-        IIIIRII { Int, Int, Int, Int, Ref, Int, Int }
-        RIIIRII { Ref, Int, Int, Int, Ref, Int, Int }
-        IRIIRII { Int, Ref, Int, Int, Ref, Int, Int }
-        RRIIRII { Ref, Ref, Int, Int, Ref, Int, Int }
-        IIRIRII { Int, Int, Ref, Int, Ref, Int, Int }
-        RIRIRII { Ref, Int, Ref, Int, Ref, Int, Int }
-        IRRIRII { Int, Ref, Ref, Int, Ref, Int, Int }
-        RRRIRII { Ref, Ref, Ref, Int, Ref, Int, Int }
-        IIIRRII { Int, Int, Int, Ref, Ref, Int, Int }
-        RIIRRII { Ref, Int, Int, Ref, Ref, Int, Int }
-        IRIRRII { Int, Ref, Int, Ref, Ref, Int, Int }
-        RRIRRII { Ref, Ref, Int, Ref, Ref, Int, Int }
-        IIRRRII { Int, Int, Ref, Ref, Ref, Int, Int }
-        RIRRRII { Ref, Int, Ref, Ref, Ref, Int, Int }
-        IRRRRII { Int, Ref, Ref, Ref, Ref, Int, Int }
-        RRRRRII { Ref, Ref, Ref, Ref, Ref, Int, Int }
-        IIIIIRI { Int, Int, Int, Int, Int, Ref, Int }
-        RIIIIRI { Ref, Int, Int, Int, Int, Ref, Int }
-        IRIIIRI { Int, Ref, Int, Int, Int, Ref, Int }
-        RRIIIRI { Ref, Ref, Int, Int, Int, Ref, Int }
-        IIRIIRI { Int, Int, Ref, Int, Int, Ref, Int }
-        RIRIIRI { Ref, Int, Ref, Int, Int, Ref, Int }
-        IRRIIRI { Int, Ref, Ref, Int, Int, Ref, Int }
-        RRRIIRI { Ref, Ref, Ref, Int, Int, Ref, Int }
-        IIIRIRI { Int, Int, Int, Ref, Int, Ref, Int }
-        RIIRIRI { Ref, Int, Int, Ref, Int, Ref, Int }
-        IRIRIRI { Int, Ref, Int, Ref, Int, Ref, Int }
-        RRIRIRI { Ref, Ref, Int, Ref, Int, Ref, Int }
-        IIRRIRI { Int, Int, Ref, Ref, Int, Ref, Int }
-        RIRRIRI { Ref, Int, Ref, Ref, Int, Ref, Int }
-        IRRRIRI { Int, Ref, Ref, Ref, Int, Ref, Int }
-        RRRRIRI { Ref, Ref, Ref, Ref, Int, Ref, Int }
-        IIIIRRI { Int, Int, Int, Int, Ref, Ref, Int }
-        RIIIRRI { Ref, Int, Int, Int, Ref, Ref, Int }
-        IRIIRRI { Int, Ref, Int, Int, Ref, Ref, Int }
-        RRIIRRI { Ref, Ref, Int, Int, Ref, Ref, Int }
-        IIRIRRI { Int, Int, Ref, Int, Ref, Ref, Int }
-        RIRIRRI { Ref, Int, Ref, Int, Ref, Ref, Int }
-        IRRIRRI { Int, Ref, Ref, Int, Ref, Ref, Int }
-        RRRIRRI { Ref, Ref, Ref, Int, Ref, Ref, Int }
-        IIIRRRI { Int, Int, Int, Ref, Ref, Ref, Int }
-        RIIRRRI { Ref, Int, Int, Ref, Ref, Ref, Int }
-        IRIRRRI { Int, Ref, Int, Ref, Ref, Ref, Int }
-        RRIRRRI { Ref, Ref, Int, Ref, Ref, Ref, Int }
-        IIRRRRI { Int, Int, Ref, Ref, Ref, Ref, Int }
-        RIRRRRI { Ref, Int, Ref, Ref, Ref, Ref, Int }
-        IRRRRRI { Int, Ref, Ref, Ref, Ref, Ref, Int }
-        RRRRRRI { Ref, Ref, Ref, Ref, Ref, Ref, Int }
-        IIIIIIR { Int, Int, Int, Int, Int, Int, Ref }
-        RIIIIIR { Ref, Int, Int, Int, Int, Int, Ref }
-        IRIIIIR { Int, Ref, Int, Int, Int, Int, Ref }
-        RRIIIIR { Ref, Ref, Int, Int, Int, Int, Ref }
-        IIRIIIR { Int, Int, Ref, Int, Int, Int, Ref }
-        RIRIIIR { Ref, Int, Ref, Int, Int, Int, Ref }
-        IRRIIIR { Int, Ref, Ref, Int, Int, Int, Ref }
-        RRRIIIR { Ref, Ref, Ref, Int, Int, Int, Ref }
-        IIIRIIR { Int, Int, Int, Ref, Int, Int, Ref }
-        RIIRIIR { Ref, Int, Int, Ref, Int, Int, Ref }
-        IRIRIIR { Int, Ref, Int, Ref, Int, Int, Ref }
-        RRIRIIR { Ref, Ref, Int, Ref, Int, Int, Ref }
-        IIRRIIR { Int, Int, Ref, Ref, Int, Int, Ref }
-        RIRRIIR { Ref, Int, Ref, Ref, Int, Int, Ref }
-        IRRRIIR { Int, Ref, Ref, Ref, Int, Int, Ref }
-        RRRRIIR { Ref, Ref, Ref, Ref, Int, Int, Ref }
-        IIIIRIR { Int, Int, Int, Int, Ref, Int, Ref }
-        RIIIRIR { Ref, Int, Int, Int, Ref, Int, Ref }
-        IRIIRIR { Int, Ref, Int, Int, Ref, Int, Ref }
-        RRIIRIR { Ref, Ref, Int, Int, Ref, Int, Ref }
-        IIRIRIR { Int, Int, Ref, Int, Ref, Int, Ref }
-        RIRIRIR { Ref, Int, Ref, Int, Ref, Int, Ref }
-        IRRIRIR { Int, Ref, Ref, Int, Ref, Int, Ref }
-        RRRIRIR { Ref, Ref, Ref, Int, Ref, Int, Ref }
-        IIIRRIR { Int, Int, Int, Ref, Ref, Int, Ref }
-        RIIRRIR { Ref, Int, Int, Ref, Ref, Int, Ref }
-        IRIRRIR { Int, Ref, Int, Ref, Ref, Int, Ref }
-        RRIRRIR { Ref, Ref, Int, Ref, Ref, Int, Ref }
-        IIRRRIR { Int, Int, Ref, Ref, Ref, Int, Ref }
-        RIRRRIR { Ref, Int, Ref, Ref, Ref, Int, Ref }
-        IRRRRIR { Int, Ref, Ref, Ref, Ref, Int, Ref }
-        RRRRRIR { Ref, Ref, Ref, Ref, Ref, Int, Ref }
-        IIIIIRR { Int, Int, Int, Int, Int, Ref, Ref }
-        RIIIIRR { Ref, Int, Int, Int, Int, Ref, Ref }
-        IRIIIRR { Int, Ref, Int, Int, Int, Ref, Ref }
-        RRIIIRR { Ref, Ref, Int, Int, Int, Ref, Ref }
-        IIRIIRR { Int, Int, Ref, Int, Int, Ref, Ref }
-        RIRIIRR { Ref, Int, Ref, Int, Int, Ref, Ref }
-        IRRIIRR { Int, Ref, Ref, Int, Int, Ref, Ref }
-        RRRIIRR { Ref, Ref, Ref, Int, Int, Ref, Ref }
-        IIIRIRR { Int, Int, Int, Ref, Int, Ref, Ref }
-        RIIRIRR { Ref, Int, Int, Ref, Int, Ref, Ref }
-        IRIRIRR { Int, Ref, Int, Ref, Int, Ref, Ref }
-        RRIRIRR { Ref, Ref, Int, Ref, Int, Ref, Ref }
-        IIRRIRR { Int, Int, Ref, Ref, Int, Ref, Ref }
-        RIRRIRR { Ref, Int, Ref, Ref, Int, Ref, Ref }
-        IRRRIRR { Int, Ref, Ref, Ref, Int, Ref, Ref }
-        RRRRIRR { Ref, Ref, Ref, Ref, Int, Ref, Ref }
-        IIIIRRR { Int, Int, Int, Int, Ref, Ref, Ref }
-        RIIIRRR { Ref, Int, Int, Int, Ref, Ref, Ref }
-        IRIIRRR { Int, Ref, Int, Int, Ref, Ref, Ref }
-        RRIIRRR { Ref, Ref, Int, Int, Ref, Ref, Ref }
-        IIRIRRR { Int, Int, Ref, Int, Ref, Ref, Ref }
-        RIRIRRR { Ref, Int, Ref, Int, Ref, Ref, Ref }
-        IRRIRRR { Int, Ref, Ref, Int, Ref, Ref, Ref }
-        RRRIRRR { Ref, Ref, Ref, Int, Ref, Ref, Ref }
-        IIIRRRR { Int, Int, Int, Ref, Ref, Ref, Ref }
-        RIIRRRR { Ref, Int, Int, Ref, Ref, Ref, Ref }
-        IRIRRRR { Int, Ref, Int, Ref, Ref, Ref, Ref }
-        RRIRRRR { Ref, Ref, Int, Ref, Ref, Ref, Ref }
-        IIRRRRR { Int, Int, Ref, Ref, Ref, Ref, Ref }
-        RIRRRRR { Ref, Int, Ref, Ref, Ref, Ref, Ref }
-        IRRRRRR { Int, Ref, Ref, Ref, Ref, Ref, Ref }
-        RRRRRRR { Ref, Ref, Ref, Ref, Ref, Ref, Ref }
-        RRRRRRRR { Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref }
-        RRRRRRRRR { Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref }
-        RRRRRRRRRR { Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref }
-        RRRRRRRRRRR { Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref }
-        RRRRRRRRRRRR { Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref }
-        RRRRRRRRRRRRR { Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref }
-        RRRRRRRRRRRRRR { Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref }
-        RRRRRRRRRRRRRRR { Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref }
-        RRRRRRRRRRRRRRRR { Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref, Ref }
         I6 { Int, Int, Int, Int, Int, Int }
         I7 { Int, Int, Int, Int, Int, Int, Int }
         I8 { Int, Int, Int, Int, Int, Int, Int, Int }
@@ -957,6 +420,37 @@ fn unsupported_call_sig(classes: &[ArgClass]) -> ! {
 
 call_sig_table!(define_call_sig_stubs);
 
+/// The static stub table has every sequence through arity 5 and all-`Int`
+/// through [`MAX_HOST_CALL_ARITY`].
+pub fn call_stub_arm_exists(classes: &[ArgClass]) -> bool {
+    let n = classes.len();
+    n <= MAX_HOST_CALL_ARITY && (n <= 5 || !classes.contains(&ArgClass::Float))
+}
+
+fn wasm_residual_host_call(
+    func: usize,
+    args: &[i64],
+    classes: &[ArgClass],
+    result: char,
+) -> Option<i64> {
+    residual_host_call().and_then(|hook| hook(func, args, classes, result))
+}
+
+/// `llmodel.py bh_call_i` and `bh_call_r` share `lookup_stub_i`: both results
+/// are a machine word. `result` is `'i'` or `'r'`, the class the host hook
+/// compares with the table signature.
+unsafe fn dispatch_word_stub(func: usize, classes: &[ArgClass], args: &[i64], result: char) -> i64 {
+    assert_eq!(
+        classes.len(),
+        args.len(),
+        "bh_call dispatch: class sequence and positional arg list length differ"
+    );
+    if let Some(value) = wasm_residual_host_call(func, args, classes, result) {
+        return value;
+    }
+    unsafe { (lookup_stub_i(classes))(func, args) }
+}
+
 /// llmodel.py bh_call_i call_stub_i: ABI-correct dispatch in calldescr declaration
 /// order.
 ///
@@ -976,45 +470,8 @@ call_sig_table!(define_call_sig_stubs);
 /// wasm32 `call_indirect` type-checks the callee. The descr class list is not
 /// that type: published targets are widening `i64` shims, raw pointers are
 /// `i32`. The host reads the table signature. Native keeps the stub.
-/// The static stub table has every sequence through arity 5, all-`Int` and
-/// all-`Ref` through [`MAX_HOST_CALL_ARITY`], and mixed `Int`/`Ref` through
-/// arity 7. A float appears only through arity 5.
-pub fn call_stub_arm_exists(classes: &[ArgClass]) -> bool {
-    let n = classes.len();
-    if n > MAX_HOST_CALL_ARITY {
-        return false;
-    }
-    let has_float = classes.contains(&ArgClass::Float);
-    let has_ref = classes.contains(&ArgClass::Ref);
-    let has_int = classes.contains(&ArgClass::Int);
-    if has_float {
-        return n <= 5;
-    }
-    if has_ref && has_int {
-        return n <= 7;
-    }
-    true
-}
-
-fn wasm_residual_host_call(
-    func: usize,
-    args: &[i64],
-    classes: &[ArgClass],
-    result: char,
-) -> Option<i64> {
-    residual_host_call().and_then(|hook| hook(func, args, classes, result))
-}
-
 pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
-    assert_eq!(
-        classes.len(),
-        args.len(),
-        "bh_call dispatch: class sequence and positional arg list length differ"
-    );
-    if let Some(result) = wasm_residual_host_call(func, args, classes, 'i') {
-        return result;
-    }
-    unsafe { (lookup_stub_i(classes))(func, args) }
+    unsafe { dispatch_word_stub(func, classes, args, 'i') }
 }
 
 /// `llmodel.py bh_call_r`. The staged wrapper returns the pointer as an `i64`
@@ -1023,22 +480,7 @@ pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
 /// # Safety
 /// `func` must match `classes`, and its result must be a GCREF.
 pub unsafe fn bh_call_r_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
-    assert_eq!(
-        classes.len(),
-        args.len(),
-        "bh_call dispatch: class sequence and positional arg list length differ"
-    );
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(result) = wasm_residual_host_call(func, args, classes, 'r') {
-            return result;
-        }
-        unsafe { (lookup_stub_i(classes))(func, args) }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        unsafe { bh_call_i_dispatch(func, classes, args) }
-    }
+    unsafe { dispatch_word_stub(func, classes, args, 'r') }
 }
 
 /// llmodel.py bh_call_v: void-typed parallel of `bh_call_i_dispatch`.
@@ -1232,25 +674,13 @@ pub fn create_call_stub(arg_classes: &str, result_type: char) -> BhCallStub {
     }
 
     let classes = &classes_buf[..arity as usize];
-    let call_i = {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = result_type;
-            lookup_stub_i(classes)
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = result_type;
-            lookup_stub_i(classes)
-        }
-    };
     BhCallStub::new(
         slots,
         arity,
         expect_i,
         expect_r,
         expect_f,
-        call_i,
+        lookup_stub_i(classes),
         lookup_stub_f(classes),
         lookup_stub_v(classes),
     )
@@ -1524,8 +954,7 @@ pub fn collect_call_args_positional(
 ///
 /// `bh_call_*_dispatch` transmutes the funcptr to an `extern "C" fn` built
 /// from `arg_classes` declaration order, matching `descr.py create_call_stub`.
-/// On wasm32 a `r` parameter is `i32` and a `r` result is zero-extended back
-/// to the blackhole word; `i` stays `i64`.
+/// `'r'` shares the integer-register class with `'i'`.
 ///
 /// # Safety
 /// On the transmute path, `func` must match the ABI [`collect_call_args`]
@@ -1752,29 +1181,35 @@ mod tests {
         verify_result_type('\0', "r");
     }
 
+    /// Every sequence through arity 5, and all-`Int` through
+    /// [`MAX_HOST_CALL_ARITY`]. A float past arity 5 has no arm.
     #[test]
-    fn mixed_int_ref_past_arity_7_has_no_stub_arm() {
-        assert!(!call_stub_arm_exists(&[
+    fn call_stub_arm_exists_covers_arity_5_and_all_int() {
+        assert!(call_stub_arm_exists(&[]));
+        assert!(call_stub_arm_exists(&[ArgClass::Int; 5]));
+        assert!(call_stub_arm_exists(&[
+            ArgClass::Float,
             ArgClass::Int,
-            ArgClass::Ref,
+            ArgClass::Float,
             ArgClass::Int,
-            ArgClass::Ref,
-            ArgClass::Int,
-            ArgClass::Ref,
-            ArgClass::Int,
-            ArgClass::Ref,
+            ArgClass::Float,
         ]));
         assert!(call_stub_arm_exists(&[ArgClass::Int; 8]));
-        assert!(call_stub_arm_exists(&[ArgClass::Ref; 8]));
+        assert!(call_stub_arm_exists(&[ArgClass::Int; MAX_HOST_CALL_ARITY]));
         let collected =
             collect_call_args("iriririr", Some(&[1, 2, 3, 4]), Some(&[5, 6, 7, 8]), None);
         assert!(collected.classes().iter().all(|c| *c == ArgClass::Int));
         assert!(call_stub_arm_exists(collected.classes()));
         assert!(!call_stub_arm_exists(&[ArgClass::Float; 6]));
+        let mut past = [ArgClass::Int; 6];
+        past[3] = ArgClass::Float;
+        assert!(!call_stub_arm_exists(&past));
+        assert!(!call_stub_arm_exists(
+            &[ArgClass::Int; MAX_HOST_CALL_ARITY + 1]
+        ));
     }
 
-    /// Mixed `i`/`r` past arity 7 has no stub-table arm. The host hook must run
-    /// before that lookup.
+    /// The host hook runs before stub lookup and its `Some` result is the call.
     #[test]
     fn host_hook_dispatches_a_wide_mixed_signature_without_a_stub_arm() {
         struct Clear;

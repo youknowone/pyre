@@ -13013,238 +13013,13 @@ fn build_concrete_values(
     values
 }
 
-#[expect(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "The raw address is an internal JIT/GC handle validated by the descriptor and object-space boundary; making this orchestration API unsafe would incorrectly transfer collector invariants to every caller"
-)]
 pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
     assert!(
         !func_ptr.is_null(),
         "call_int_function: null function pointer"
     );
-    if args.len() <= MAX_HOST_CALL_ARITY && majit_backend::call_stub::residual_host_call().is_some()
-    {
-        let classes = [majit_backend::call_stub::ArgClass::Int; MAX_HOST_CALL_ARITY];
-        return unsafe {
-            majit_backend::call_stub::bh_call_i_dispatch(
-                func_ptr as usize,
-                &classes[..args.len()],
-                args,
-            )
-        };
-    }
-    unsafe {
-        match args {
-            [] => {
-                let func: extern "C" fn() -> i64 = std::mem::transmute(func_ptr);
-                func()
-            }
-            [a0] => {
-                let func: extern "C" fn(i64) -> i64 = std::mem::transmute(func_ptr);
-                func(*a0)
-            }
-            [a0, a1] => {
-                let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr);
-                func(*a0, *a1)
-            }
-            [a0, a1, a2] => {
-                let func: extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2)
-            }
-            [a0, a1, a2, a3] => {
-                let func: extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3)
-            }
-            [a0, a1, a2, a3, a4] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4)
-            }
-            [a0, a1, a2, a3, a4, a5] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5)
-            }
-            [a0, a1, a2, a3, a4, a5, a6] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10] => {
-                let func: extern "C" fn(
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) -> i64 = std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11] => {
-                let func: extern "C" fn(
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) -> i64 = std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12] => {
-                let func: extern "C" fn(
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) -> i64 = std::mem::transmute(func_ptr);
-                func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12,
-                )
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13] => {
-                let func: extern "C" fn(
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) -> i64 = std::mem::transmute(func_ptr);
-                func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
-                )
-            }
-            [
-                a0,
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8,
-                a9,
-                a10,
-                a11,
-                a12,
-                a13,
-                a14,
-            ] => {
-                let func: extern "C" fn(
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) -> i64 = std::mem::transmute(func_ptr);
-                func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
-                )
-            }
-            [
-                a0,
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8,
-                a9,
-                a10,
-                a11,
-                a12,
-                a13,
-                a14,
-                a15,
-            ] => {
-                let func: extern "C" fn(
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) -> i64 = std::mem::transmute(func_ptr);
-                func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
-                    *a15,
-                )
-            }
-            _ => panic!(
-                "unsupported JitCode int call arity {} (max {})",
-                args.len(),
-                MAX_HOST_CALL_ARITY
-            ),
-        }
-    }
+    // No descr: an empty type list is all machine words (`None` → Int).
+    call_int_function_typed(func_ptr, args, &[])
 }
 
 /// `bh_call_f` parity (`backend/model.py`, `llmodel.py`) for callers
@@ -13289,19 +13064,19 @@ pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]
 /// `bh_call_*_dispatch` table takes.
 ///
 /// This is `descr.py`'s `arg_classes = map(map_type_to_argclass, ARGS)`
-/// collapsed onto the two register classes the table can express: `Int` and
-/// `Ref` both travel in an integer register, `Float` in a floating-point one
-/// (`descr.py TYPE()`).
+/// collapsed onto the two register classes the table can express.
+/// `Type::Int` and `Type::Ref` share `ArgClass::Int`; `Type::Float` is
+/// `ArgClass::Float` (`descr.py TYPE()`).
 ///
 /// Returns the fixed-size buffer so the residual-call path stays
 /// allocation-free; callers slice it to `args.len()`.
 ///
-/// `arg_types` must cover every positional slot: a slot the descr does not
-/// describe is forwarded as a machine word, which is the very mis-placement
-/// this projection exists to prevent if the undescribed slot is a `Float`.
-/// Both callers (`executor::execute_pure_call` / `execute_residual_call`) take
-/// the argument list and the type list from the same calldescr, so the two
-/// agree by construction.
+/// A non-empty `arg_types` must cover every positional slot: a slot the descr
+/// does not describe is forwarded as a machine word, which is the very
+/// mis-placement this projection exists to prevent if the undescribed slot is
+/// a `Float`. An empty list is the no-descr seam, so every slot is a machine
+/// word. Typed callers take the argument list and the type list from the same
+/// calldescr, so the two agree by construction.
 #[allow(dead_code)] // descr.py process arg classes
 fn arg_classes_from_types(
     args_len: usize,
@@ -13311,8 +13086,11 @@ fn arg_classes_from_types(
         args_len <= MAX_HOST_CALL_ARITY,
         "unsupported JitCode typed call arity {args_len} (max {MAX_HOST_CALL_ARITY})"
     );
+    // An empty `arg_types` is the no-descr seam (`call_int_function`,
+    // `call_void_function`): every slot is a machine word. A non-empty list
+    // that stops short of `args_len` would send an undescribed Float as Int.
     debug_assert!(
-        arg_types.len() >= args_len,
+        arg_types.is_empty() || arg_types.len() >= args_len,
         "typed call: calldescr describes {} argument types for {args_len} positional \
          arguments; an undescribed Float slot would travel in an integer register",
         arg_types.len()
@@ -13321,7 +13099,7 @@ fn arg_classes_from_types(
     for (i, slot) in classes.iter_mut().enumerate().take(args_len) {
         *slot = match arg_types.get(i) {
             Some(Type::Float) => majit_backend::call_stub::ArgClass::Float,
-            Some(Type::Ref) | Some(Type::Int) | None => majit_backend::call_stub::ArgClass::Int,
+            Some(Type::Int | Type::Ref) | None => majit_backend::call_stub::ArgClass::Int,
             // `descr.py TYPE('v')` is `lltype.Void`, which upstream
             // never puts in `arg_classes` for a call it dispatches.
             Some(Type::Void) => panic!("typed call: void argument class at slot {i}"),
@@ -13389,227 +13167,13 @@ pub fn call_ref_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[T
     }
 }
 
-#[expect(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "The raw address is an internal JIT/GC handle validated by the descriptor and object-space boundary; making this orchestration API unsafe would incorrectly transfer collector invariants to every caller"
-)]
 pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
     assert!(
         !func_ptr.is_null(),
         "call_void_function: null function pointer"
     );
-    if args.len() <= MAX_HOST_CALL_ARITY && majit_backend::call_stub::residual_host_call().is_some()
-    {
-        let classes = [majit_backend::call_stub::ArgClass::Int; MAX_HOST_CALL_ARITY];
-        unsafe {
-            majit_backend::call_stub::bh_call_v_dispatch(
-                func_ptr as usize,
-                &classes[..args.len()],
-                args,
-            );
-        }
-        return;
-    }
-    unsafe {
-        match args {
-            [] => {
-                let func: extern "C" fn() = std::mem::transmute(func_ptr);
-                func()
-            }
-            [a0] => {
-                let func: extern "C" fn(i64) = std::mem::transmute(func_ptr);
-                func(*a0)
-            }
-            [a0, a1] => {
-                let func: extern "C" fn(i64, i64) = std::mem::transmute(func_ptr);
-                func(*a0, *a1)
-            }
-            [a0, a1, a2] => {
-                let func: extern "C" fn(i64, i64, i64) = std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2)
-            }
-            [a0, a1, a2, a3] => {
-                let func: extern "C" fn(i64, i64, i64, i64) = std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3)
-            }
-            [a0, a1, a2, a3, a4] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64) = std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4)
-            }
-            [a0, a1, a2, a3, a4, a5] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64, i64) =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5)
-            }
-            [a0, a1, a2, a3, a4, a5, a6] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10] => {
-                let func: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
-                    std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11] => {
-                let func: extern "C" fn(
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) = std::mem::transmute(func_ptr);
-                func(*a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11)
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12] => {
-                let func: extern "C" fn(
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) = std::mem::transmute(func_ptr);
-                func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12,
-                )
-            }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13] => {
-                let func: extern "C" fn(
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) = std::mem::transmute(func_ptr);
-                func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
-                )
-            }
-            [
-                a0,
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8,
-                a9,
-                a10,
-                a11,
-                a12,
-                a13,
-                a14,
-            ] => {
-                let func: extern "C" fn(
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) = std::mem::transmute(func_ptr);
-                func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
-                )
-            }
-            [
-                a0,
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8,
-                a9,
-                a10,
-                a11,
-                a12,
-                a13,
-                a14,
-                a15,
-            ] => {
-                let func: extern "C" fn(
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) = std::mem::transmute(func_ptr);
-                func(
-                    *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
-                    *a15,
-                )
-            }
-            _ => panic!(
-                "unsupported JitCode void call arity {} (max {})",
-                args.len(),
-                MAX_HOST_CALL_ARITY
-            ),
-        }
-    }
+    // No descr: an empty type list is all machine words (`None` → Int).
+    call_void_function_typed(func_ptr, args, &[])
 }
 
 /// `bh_call_v` parity (`llmodel.py`) for callers that hold the `CallDescr`.
