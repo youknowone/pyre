@@ -48,6 +48,26 @@ pub fn getsockopt_int(fd: Fd, level: INT, option: INT) -> Result<SIGNED, CSocket
     Ok(flag as SIGNED)
 }
 
+/// `ntohs` — `_c.ntohs` as a host integer.
+pub fn ntohs(x: crate::rffi::USHORT) -> i64 {
+    unsafe { crate::_rsocket_rffi::ntohs(x) as i64 }
+}
+
+/// `ntohl` — `_c.ntohl` as a host integer.
+pub fn ntohl(x: crate::rffi::UINT) -> i64 {
+    unsafe { crate::_rsocket_rffi::ntohl(x) as i64 }
+}
+
+/// `htons` — `_c.htons` as a host integer.
+pub fn htons(x: crate::rffi::USHORT) -> i64 {
+    unsafe { crate::_rsocket_rffi::htons(x) as i64 }
+}
+
+/// `htonl` — `_c.htonl` as a host integer.
+pub fn htonl(x: crate::rffi::UINT) -> i64 {
+    unsafe { crate::_rsocket_rffi::htonl(x) as i64 }
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
@@ -107,5 +127,13 @@ mod tests {
             let missing = getsockopt_int(-1, libc::SOL_SOCKET, libc::SO_TYPE).unwrap_err();
             assert_eq!(missing.errno, libc::EBADF);
         }
+    }
+
+    #[test]
+    fn network_byte_order_matches_libc() {
+        assert_eq!(htons(1), i64::from(libc::htons(1)));
+        assert_eq!(ntohs(0x0201), i64::from(libc::ntohs(0x0201)));
+        assert_eq!(htonl(0x0102_0304), i64::from(libc::htonl(0x0102_0304)));
+        assert_eq!(ntohl(0x0403_0201), i64::from(libc::ntohl(0x0403_0201)));
     }
 }

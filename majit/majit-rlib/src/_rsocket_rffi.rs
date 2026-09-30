@@ -18,7 +18,7 @@ unsafe extern "system" {
 
 #[cfg(unix)]
 mod posix {
-    use crate::rffi::{INT, RFFI_SAVE_ERRNO};
+    use crate::rffi::{INT, RFFI_SAVE_ERRNO, UINT, USHORT};
 
     // `_rsocket_rffi.eci` includes. Linux-only headers (`netpacket/packet.h`,
     // `linux/netlink.h`) stay out with the packet-socket slice.
@@ -213,6 +213,37 @@ mod posix {
         compilation_info = ECI,
         save_err = RFFI_SAVE_ERRNO,
         macro = libc::getsockopt
+    );
+    // `htons` / `ntohs` / `htonl` / `ntohl`. Darwin and OpenBSD publish
+    // these as macros; the libc crate exposes the same functions on every
+    // unix target.
+    crate::rffi::llexternal!(
+        pub htons = "htons",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        macro = libc::htons
+    );
+    crate::rffi::llexternal!(
+        pub ntohs = "ntohs",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        macro = libc::ntohs
+    );
+    crate::rffi::llexternal!(
+        pub htonl = "htonl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        macro = libc::htonl
+    );
+    crate::rffi::llexternal!(
+        pub ntohl = "ntohl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        macro = libc::ntohl
     );
     crate::rffi::llexternal!(
         pub socketsetsockopt = "setsockopt",
@@ -523,7 +554,7 @@ pub use posix::*;
 
 #[cfg(windows)]
 mod winsock {
-    use crate::rffi::{INT, RFFI_SAVE_WSALASTERROR};
+    use crate::rffi::{INT, RFFI_SAVE_WSALASTERROR, UINT, USHORT};
 
     /// WinSock `FD_SETSIZE`. `constants_w_defaults` uses 64 when the header
     /// does not override it, and the SDK default is 64.
@@ -672,6 +703,35 @@ mod winsock {
         compilation_info = ECI,
         calling_conv = "win",
         save_err = RFFI_SAVE_WSALASTERROR
+    );
+    // `htons` / `ntohs` / `htonl` / `ntohl` (`external`, not the Darwin macro).
+    crate::rffi::llexternal!(
+        pub htons = "htons",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub ntohs = "ntohs",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub htonl = "htonl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub ntohl = "ntohl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        calling_conv = "win"
     );
 }
 

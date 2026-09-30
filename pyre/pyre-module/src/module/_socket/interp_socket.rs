@@ -1071,7 +1071,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     ));
                 }
                 let x = c_uint_converter(args[0], 0xffff, "uint16_t")? as u16;
-                Ok(pyre_object::w_int_new(x.to_be() as i64))
+                #[cfg(any(unix, windows))]
+                let ordered = majit_rlib::rsocket::htons(x);
+                #[cfg(not(any(unix, windows)))]
+                let ordered = i64::from(x.to_be());
+                Ok(pyre_object::w_int_new(ordered))
             },
             1,
         ),
@@ -1088,7 +1092,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     ));
                 }
                 let x = c_uint_converter(args[0], 0xffff, "uint16_t")? as u16;
-                Ok(pyre_object::w_int_new(u16::from_be(x) as i64))
+                #[cfg(any(unix, windows))]
+                let ordered = majit_rlib::rsocket::ntohs(x);
+                #[cfg(not(any(unix, windows)))]
+                let ordered = i64::from(u16::from_be(x));
+                Ok(pyre_object::w_int_new(ordered))
             },
             1,
         ),
@@ -1105,7 +1113,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     ));
                 }
                 let x = c_uint_converter(args[0], 0xffff_ffff, "uint32_t")? as u32;
-                Ok(pyre_object::w_int_new(x.to_be() as i64))
+                #[cfg(any(unix, windows))]
+                let ordered = majit_rlib::rsocket::htonl(x);
+                #[cfg(not(any(unix, windows)))]
+                let ordered = i64::from(x.to_be());
+                Ok(pyre_object::w_int_new(ordered))
             },
             1,
         ),
@@ -1122,7 +1134,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     ));
                 }
                 let x = c_uint_converter(args[0], 0xffff_ffff, "uint32_t")? as u32;
-                Ok(pyre_object::w_int_new(u32::from_be(x) as i64))
+                #[cfg(any(unix, windows))]
+                let ordered = majit_rlib::rsocket::ntohl(x);
+                #[cfg(not(any(unix, windows)))]
+                let ordered = i64::from(u32::from_be(x));
+                Ok(pyre_object::w_int_new(ordered))
             },
             1,
         ),
