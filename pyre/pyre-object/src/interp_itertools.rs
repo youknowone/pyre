@@ -1597,6 +1597,7 @@ mod tests {
                 std::mem::offset_of!(W_TeeChainedListNode, ob.w_class),
                 std::mem::offset_of!(W_TeeChainedListNode, w_next),
                 std::mem::offset_of!(W_TeeChainedListNode, w_obj),
+                std::mem::offset_of!(W_TeeChainedListNode, lifeline),
             ]
         );
         assert_eq!(
@@ -1613,6 +1614,7 @@ mod tests {
                 std::mem::offset_of!(W_TeeIterable, ob.w_class),
                 std::mem::offset_of!(W_TeeIterable, w_iterator),
                 std::mem::offset_of!(W_TeeIterable, w_chained_list),
+                std::mem::offset_of!(W_TeeIterable, lifeline),
             ]
         );
         assert_eq!(
