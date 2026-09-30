@@ -1022,30 +1022,39 @@ fn result_map_of_some_builds_the_option_instead_of_a_fn_const() {
 fn return_producer<'a>(
     graph: &'a majit_translate::model::FunctionGraph,
     var: &majit_translate::flowspace::model::Variable,
-    depth: u32,
 ) -> Option<&'a OpKind> {
-    if depth > 8 {
-        return None;
-    }
-    let kind = graph.blocks.iter().find_map(|block| {
-        block
-            .operations
-            .iter()
-            .find_map(|op| (op.result.as_ref() == Some(var)).then_some(&op.kind))
-    })?;
-    match kind {
-        OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
-            return_producer(graph, operand, depth + 1)
+    let mut current = var.clone();
+    let mut seen = Vec::new();
+    loop {
+        if seen.iter().any(|found| found == &current) {
+            return None;
         }
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => args
-            .first()
-            .and_then(majit_translate::model::LinkArg::as_variable)
-            .and_then(|src| return_producer(graph, src, depth + 1)),
-        other => Some(other),
+        seen.push(current.clone());
+        let kind = graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find_map(|op| (op.result.as_ref() == Some(&current)).then_some(&op.kind))
+        })?;
+        match kind {
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                current = operand.clone();
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => {
+                let Some(src) = args
+                    .first()
+                    .and_then(majit_translate::model::LinkArg::as_variable)
+                else {
+                    return Some(kind);
+                };
+                current = src.clone();
+            }
+            other => return Some(other),
+        }
     }
 }
 
@@ -1068,7 +1077,7 @@ fn space_index_w_returns_ok_i64() {
             let LinkArg::Value(var) = &link.args[0] else {
                 panic!("return arg is a value");
             };
-            let Some(OpKind::FieldRead { field, ty, .. }) = return_producer(&g, var, 0) else {
+            let Some(OpKind::FieldRead { field, ty, .. }) = return_producer(&g, var) else {
                 panic!("return {var:?} is not a field read");
             };
             let owner = field.owner_root.as_deref().unwrap_or("");
@@ -1110,7 +1119,7 @@ fn lock_locked_returns_the_bool_word() {
             let LinkArg::Value(var) = &link.args[0] else {
                 panic!("return arg is a value");
             };
-            match return_producer(&g, var, 0) {
+            match return_producer(&g, var) {
                 Some(OpKind::RawLoad {
                     item_ty: ValueType::Int,
                     itemsize: 1,
@@ -1175,7 +1184,7 @@ fn getindex_w_index_from_residual_raises() {
             let LinkArg::Value(var) = &link.args[0] else {
                 panic!("return arg is a value");
             };
-            let Some(OpKind::FieldRead { field, ty, .. }) = return_producer(&g, var, 0) else {
+            let Some(OpKind::FieldRead { field, ty, .. }) = return_producer(&g, var) else {
                 panic!("return {var:?} is not the Ok payload");
             };
             let owner = field.owner_root.as_deref().unwrap_or("");
@@ -1213,7 +1222,7 @@ fn getindex_w_index_from_residual_raises() {
             let Some(arg) = args.first().and_then(LinkArg::as_variable) else {
                 continue;
             };
-            let Some(OpKind::FieldRead { field, .. }) = return_producer(&g, arg, 0) else {
+            let Some(OpKind::FieldRead { field, .. }) = return_producer(&g, arg) else {
                 continue;
             };
             if field.name == "__pos_0"
@@ -1295,7 +1304,7 @@ fn eval_loop_converts_bytecode_corruption_before_raising() {
                 target: CallTarget::FunctionPath { segments, .. },
                 args: from_args,
                 ..
-            }) = return_producer(&g, arg, 0)
+            }) = return_producer(&g, arg)
             else {
                 continue;
             };
