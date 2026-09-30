@@ -7873,6 +7873,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         callable_guard_op = function_op;
         callable_guard_value = bound.function;
     }
+    // Nursery-born `Function.__globals__` / `W_Code` must survive the
+    // allocations below (a specialised pair's `wrapint`, the kwargs dict)
+    // until they land in `WalkFrameState`, which `InlineFrameStateGuard`
+    // walks. `PyCode.frame_stores_global` has no frame field in this
+    // encoder, so that rare shape stays residual.
+    let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(callable) };
+    if unsafe {
+        pyre_interpreter::w_code_frame_stores_global(
+            w_code as pyre_object::PyObjectRef,
+            callee_globals_obj,
+        )
+    } {
+        return resolved_inline_decline(op.pc, line!());
+    }
+    let _inline_const_roots = pyre_object::gc_roots::push_roots();
+    let inline_globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(callee_globals_obj);
+    let inline_code_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
     if let Some(star) = star_args {
         // `space.fixedview(w_stararg)` -> `w_obj.tolist()`: the class guard
         // re-proves the layout the resolve picked the reads for, and an exact
@@ -7989,31 +8008,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             callee_arg_concretes[index] = ConcreteValue::Ref(value);
         }
     }
-
-    // `PyCode.frame_stores_global`: the common globals identity lives on the
-    // code object and needs no frame field.  A shared code object rebound to a
-    // different namespace creates `FrameDebugData.w_globals` in PyPy.  This
-    // custom inline-frame encoder does not yet put that rare debugdata object
-    // into resume data, so keep the call residual instead of compiling a
-    // frame whose `get_w_globals()` would silently read the first namespace.
-    let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(callable) };
-    if unsafe {
-        pyre_interpreter::w_code_frame_stores_global(
-            w_code as pyre_object::PyObjectRef,
-            callee_globals_obj,
-        )
-    } {
-        return resolved_inline_decline(op.pc, line!());
-    }
-
-    // Nursery-born `Function.__globals__` / `W_Code` must survive the guards
-    // below until they land in `WalkFrameState`, which
-    // `InlineFrameStateGuard` walks.
-    let _inline_const_roots = pyre_object::gc_roots::push_roots();
-    let inline_globals_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(callee_globals_obj);
-    let inline_code_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
 
     // Path-1 (#68): the inlined callee's promoted `pycode` static field and
     // its code-derived globals semantic constant.  The latter is no longer a
