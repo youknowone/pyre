@@ -10069,6 +10069,113 @@ fn cond_call_n_emits_predicate_and_direct_call() {
     assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
 }
 
+/// A COND_CALL whose table type uses an i32 pointer lowers with that type.
+#[test]
+fn cond_call_n_i32_arg_lowers_with_the_table_signature() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let encoded = majit_backend_wasm::encode_func_sig(&[majit_backend_wasm::FuncSigVal::I32], None);
+    with_table_sig(0x100, Some(encoded), || {
+        let inputargs = vec![
+            InputArg::from_type_rc(Type::Int, 0),
+            InputArg::from_type_rc(Type::Ref, 1),
+        ];
+        let call = make_op(
+            OpCode::CondCallN,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::const_int(0x100),
+                OpRef::input_arg_ref(1),
+            ],
+            OpRef::NONE,
+        );
+        call.setdescr(Arc::new(SimpleCallDescr::new(
+            0,
+            vec![Type::Ref],
+            Type::Void,
+            false,
+            0,
+            EffectInfo::default(),
+        )));
+        let ops = vec![
+            call,
+            Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+        ];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+        let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+        assert_eq!(indirect_calls.len(), 1);
+        assert_eq!(
+            function_type(&bytes, indirect_calls[0].0 as usize),
+            (vec![wasmparser::ValType::I32], vec![])
+        );
+    });
+}
+
+#[test]
+fn cond_call_value_i32_result_extends_by_kind() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let encoded =
+        majit_backend_wasm::encode_func_sig(&[], Some(majit_backend_wasm::FuncSigVal::I32));
+    for (opcode, result_signed, extend_s) in [
+        (OpCode::CondCallValueI, true, true),
+        (OpCode::CondCallValueI, false, false),
+        (OpCode::CondCallValueR, false, false),
+    ] {
+        with_table_sig(0x100, Some(encoded), || {
+            let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+            let result = if opcode == OpCode::CondCallValueI {
+                OpRef::int_op(1)
+            } else {
+                OpRef::ref_op(1)
+            };
+            let call = make_op(
+                opcode,
+                &[OpRef::input_arg_int(0), OpRef::const_int(0x100)],
+                result,
+            );
+            call.setdescr(Arc::new(SimpleCallDescr::new(
+                0,
+                vec![],
+                if opcode == OpCode::CondCallValueI {
+                    Type::Int
+                } else {
+                    Type::Ref
+                },
+                result_signed,
+                4,
+                EffectInfo::default(),
+            )));
+            let ops = vec![call, Op::new(OpCode::Finish, &[rb(result)])];
+            let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+            validate_wasm(&bytes);
+            let mut signed = 0;
+            let mut unsigned = 0;
+            count_operators(&bytes, |op| match op {
+                wasmparser::Operator::I64ExtendI32S => signed += 1,
+                wasmparser::Operator::I64ExtendI32U => unsigned += 1,
+                _ => {}
+            });
+            if extend_s {
+                assert!(
+                    signed >= 1,
+                    "{opcode:?} signed={result_signed} must sign-extend"
+                );
+            } else {
+                assert!(
+                    unsigned >= 1,
+                    "{opcode:?} signed={result_signed} must zero-extend"
+                );
+                assert_eq!(signed, 0);
+            }
+        });
+    }
+}
+
 #[test]
 fn cond_call_without_call_descr_is_unsupported() {
     let inputargs = vec![

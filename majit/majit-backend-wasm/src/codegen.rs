@@ -3673,6 +3673,27 @@ fn conditional_call_true_void_arity(
         .map(|(arity, _)| arity)
 }
 
+/// Mixed `i32`/`i64`/`f64` signature of a `COND_CALL`, when the uniform word
+/// families do not already cover it. The callee sits at arg 1.
+fn conditional_call_typed_sig(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<TypedResidualSig> {
+    if !matches!(
+        op.opcode,
+        OpCode::CondCallN | OpCode::CondCallValueI | OpCode::CondCallValueR
+    ) {
+        return None;
+    }
+    if conditional_call_i64_arity(op, constants).is_some()
+        || conditional_call_true_void_arity(op, constants).is_some()
+    {
+        return None;
+    }
+    let expected = expected_direct_wasm_sig_at(op, constants, 1)?;
+    residual_callee_direct_emit_sig_at(op, constants, 1, &expected)
+}
+
 /// If `op` is a residual CALL whose ABI is uniformly i64 (all Int/Ref args and
 /// an Int/Ref result), return its argument count — eligible for a direct
 /// `call_indirect` of type `(i64×n) -> i64`. `None` keeps the `jit_call`
@@ -3947,6 +3968,7 @@ fn has_trampoline_calls(
                 && residual_call_typed_sig(op, constants).is_none()
                 && residual_call_void_true_arity(op, constants).is_none()
                 && conditional_call_true_void_arity(op, constants).is_none()
+                && conditional_call_typed_sig(op, constants).is_none()
         }
         // `CallMallocNursery*` and `CondCallGcWb*` are covered by
         // `direct_helper_i64_arity`, so their direct-family arms do not touch
@@ -5425,6 +5447,7 @@ pub(crate) fn build_wasm_module_reporting_shortage(
     let mut typed_residual_sigs = Vec::new();
     for op in analysis_ops {
         if let Some(sig) = residual_call_typed_sig(op, constants)
+            .or_else(|| conditional_call_typed_sig(op, constants))
             && !typed_residual_sigs.contains(&sig)
         {
             typed_residual_sigs.push(sig);
@@ -8411,8 +8434,9 @@ fn build_function(
                 // x86/assembler.py `genop_discard_cond_call`: TEST cond; JZ
                 // skip; CALL. The predicate is arg 0, the callee is arg 1, and
                 // the rest are the call's own arguments. The call descr's
-                // word or true-void ABI is a direct `call_indirect`. A descr
-                // that does not establish that signature declines the trace.
+                // word, true-void, or table signature is a direct
+                // `call_indirect`. A descr the table does not confirm
+                // declines the trace.
                 //
                 // `do_conditional_call` asserts the callee forces no virtual or
                 // virtualizable, so unlike the CALL arm this needs no force
@@ -8459,6 +8483,35 @@ fn build_function(
                     sink.i32_wrap_i64();
                     emit_push_site(&mut sink, &site_gcmap, op_idx);
                     sink.call_indirect(0, base + nargs as u32);
+                } else if let Some((sig, &type_idx)) = conditional_call_typed_sig(op, constants)
+                    .and_then(|sig| {
+                        typed_residual_type_indices
+                            .get(&sig)
+                            .map(|type_idx| (sig, type_idx))
+                    })
+                {
+                    let (params, result_ty) = &sig;
+                    for (arg, ty) in call_args.iter().zip(params) {
+                        match *ty {
+                            ValType::F64 => {
+                                emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
+                            }
+                            ValType::I32 => {
+                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                                sink.i32_wrap_i64();
+                            }
+                            _ => {
+                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                            }
+                        }
+                    }
+                    emit_resolve(&mut sink, constants, value_types, func);
+                    sink.i32_wrap_i64();
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
+                    sink.call_indirect(0, type_idx);
+                    if result_ty.is_some() {
+                        sink.drop();
+                    }
                 } else {
                     return Err(BackendError::Unsupported(
                         "wasm codegen: COND_CALL has no direct residual signature".into(),
@@ -8549,6 +8602,52 @@ fn build_function(
                     if has_result {
                         sink.local_set(value_types.local(vi));
                     } else {
+                        sink.drop();
+                    }
+                } else if let Some((sig, &type_idx)) = conditional_call_typed_sig(op, constants)
+                    .and_then(|sig| {
+                        typed_residual_type_indices
+                            .get(&sig)
+                            .map(|type_idx| (sig, type_idx))
+                    })
+                {
+                    let (params, result_ty) = &sig;
+                    for (arg, ty) in call_args.iter().zip(params) {
+                        match *ty {
+                            ValType::F64 => {
+                                emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
+                            }
+                            ValType::I32 => {
+                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                                sink.i32_wrap_i64();
+                            }
+                            _ => {
+                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                            }
+                        }
+                    }
+                    emit_resolve(&mut sink, constants, value_types, func);
+                    sink.i32_wrap_i64();
+                    emit_push_site(&mut sink, &site_gcmap, op_idx);
+                    sink.call_indirect(0, type_idx);
+                    if has_result {
+                        if *result_ty == Some(ValType::I32) {
+                            // `get_call_descr` records result signedness.
+                            // Unsigned ints and refs zero-extend.
+                            let signed = op.opcode == OpCode::CondCallValueI
+                                && op.getdescr().is_some_and(|descr| {
+                                    descr
+                                        .as_call_descr()
+                                        .is_some_and(|cd| cd.is_result_signed())
+                                });
+                            if signed {
+                                sink.i64_extend_i32_s();
+                            } else {
+                                sink.i64_extend_i32_u();
+                            }
+                        }
+                        sink.local_set(value_types.local(vi));
+                    } else if result_ty.is_some() {
                         sink.drop();
                     }
                 } else {

@@ -10624,6 +10624,7 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
         Some(cond),
     );
     let ei = call_descr.get_extra_info().clone();
+    let arg_types = call_descr.arg_types().to_vec();
     assert!(
         !ei.check_forces_virtual_or_virtualizable(),
         "conditional_call target must not force virtualizable"
@@ -10658,7 +10659,11 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
             && !majit_jitcode::codewriter::call::is_symbolic_fnaddr(func_addr)
             && let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes)
         {
-            majit_metainterp::call_void_function(func_addr as *const (), &concrete_args);
+            majit_metainterp::call_void_function_typed(
+                func_addr as *const (),
+                &concrete_args,
+                &arg_types,
+            );
         }
     }
     if let Some(out) = cond_record_handle_exception(ctx, op, &ei)? {
@@ -10708,6 +10713,7 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
         Some(first),
     );
     let ei = call_descr.get_extra_info().clone();
+    let arg_types = call_descr.arg_types().to_vec();
     assert!(
         !ei.check_forces_virtual_or_virtualizable(),
         "conditional_call_value target must not force virtualizable"
@@ -10748,13 +10754,19 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
         {
             match dst_bank {
                 'i' => {
-                    let n =
-                        majit_metainterp::call_int_function(func_addr as *const (), &concrete_args);
+                    let n = majit_metainterp::call_int_function_typed(
+                        func_addr as *const (),
+                        &concrete_args,
+                        &arg_types,
+                    );
                     (recorded, ConcreteValue::Int(n))
                 }
                 'r' => {
-                    let p =
-                        majit_metainterp::call_ref_function(func_addr as *const (), &concrete_args);
+                    let p = majit_metainterp::call_ref_function_typed(
+                        func_addr as *const (),
+                        &concrete_args,
+                        &arg_types,
+                    );
                     (
                         recorded,
                         ConcreteValue::Ref(p as usize as pyre_object::PyObjectRef),

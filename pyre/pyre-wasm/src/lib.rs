@@ -140,76 +140,44 @@ mod heap_prof {
 #[global_allocator]
 static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
 
-// Residual-call host trampoline for the native-host (`wasm-host`) build.
-//
-// wasm32 `call_indirect` type-checks every call. The recording / blackhole
-// path reads the callee's wasm type from the function table
-// (`residual_target_sig`, the same encoding `env.jit_func_sig` gives the
-// compiler) and calls that slot with a trampoline of that exact type.
-// A missing table type, an arity mismatch, an f32, or a shape with no
-// trampoline falls through to `majit_host.jit_call_host`, which reflects
-// the signature in the host. A published slot keeps the type it read.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 mod residual_sig_call;
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-mod residual_host {
-    use std::cell::RefCell;
-
-    use majit_backend_wasm::{FuncSigVal, decode_func_sig, encode_func_sig, residual_target_sig};
-
-    fn cached_sig(slot: usize) -> Option<majit_backend_wasm::WasmSig> {
-        thread_local! {
-            static CACHE: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
-        }
-        let cached = CACHE.with(|c| c.borrow().get(slot).copied().unwrap_or(0));
-        if let Some(sig) = decode_func_sig(cached) {
-            return Some(sig);
-        }
-        let sig = residual_target_sig(slot as i64)?;
-        let bits = encode_func_sig(&sig.params, sig.result);
-        if bits != 0 {
-            CACHE.with(|c| {
-                let mut cache = c.borrow_mut();
-                if cache.len() <= slot {
-                    cache.resize(slot + 1, 0);
-                }
-                cache[slot] = bits;
-            });
-        }
-        Some(sig)
+fn direct_sig_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
+    use majit_backend_wasm::{FuncSigVal, residual_target_sig};
+    if func_ptr == 0 || args.len() > 7 {
+        return None;
     }
-
-    /// Call `func_ptr` when the table publishes a matching wasm type.
-    fn direct_sig_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
-        if func_ptr == 0 || args.len() > 7 {
-            return None;
-        }
-        let sig = cached_sig(func_ptr)?;
-        if sig.params.len() != args.len() || sig.has_f32() {
-            return None;
-        }
-        if !sig.params.is_empty() && sig.params.iter().all(|p| *p == FuncSigVal::F64) {
-            return super::residual_sig_call::call_uniform_f64(func_ptr, args, sig.result);
-        }
-        let mut mask = 0u16;
-        for (i, param) in sig.params.iter().enumerate() {
-            match param {
-                FuncSigVal::I32 => mask |= 1 << i,
-                FuncSigVal::I64 => {}
-                FuncSigVal::F64 | FuncSigVal::F32 => return None,
-            }
-        }
-        super::residual_sig_call::call_int_sig(func_ptr, args, mask, sig.result)
+    let sig = residual_target_sig(func_ptr as i64)?;
+    if sig.params.len() != args.len() || sig.has_f32() {
+        return None;
     }
-
-    /// Install the trampoline on the current thread. Idempotent.
-    pub fn install() {
-        majit_backend::call_stub::set_residual_host_call(Some(|func_ptr, args| {
-            direct_sig_call(func_ptr, args)
-                .unwrap_or_else(|| majit_backend_wasm::residual_host_call(func_ptr, args))
-        }));
+    if !sig.params.is_empty() && sig.params.iter().all(|p| *p == FuncSigVal::F64) {
+        return residual_sig_call::call_uniform_f64(func_ptr, args, sig.result);
     }
+    let mut mask = 0u16;
+    for (i, param) in sig.params.iter().enumerate() {
+        match param {
+            FuncSigVal::I32 => mask |= 1 << i,
+            FuncSigVal::I64 => {}
+            FuncSigVal::F64 | FuncSigVal::F32 => return None,
+        }
+    }
+    residual_sig_call::call_int_sig(func_ptr, args, mask, sig.result)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+fn blackhole_residual_call(
+    func_ptr: usize,
+    args: &[i64],
+    classes: &[majit_backend::call_stub::ArgClass],
+    result: char,
+) -> Option<i64> {
+    if let Some(value) = direct_sig_call(func_ptr, args) {
+        return Some(value);
+    }
+    majit_backend_wasm::residual_host_call(func_ptr, args, classes, result)
 }
 
 // Host clock for the native-host (`wasm-host`) build.
@@ -887,8 +855,10 @@ fn install_wasm_print_hook() {
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 fn run_python_impl(source: &str) -> String {
     install_panic_hook();
+    // A published table type is `call_indirect` inside the guest. Anything else
+    // uses the word stub or `jit_call_host`.
     #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-    residual_host::install();
+    majit_backend::call_stub::set_residual_host_call(Some(blackhole_residual_call));
     // Optional-module rclass aliases must be installed before the collector
     // is built: `init_jit_hooks` / `build_gc` snapshots the alias census.
     pyre_module::register();

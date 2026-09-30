@@ -3213,27 +3213,15 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         // `result_class` name the ABI of `fnaddr` ITSELF, because
         // `collect_call_args` walks the string to place the per-kind argument
         // lists back into declaration positions. The trampoline above is a
-        // WIDENING shim, not the helper: every parameter is declared `i64` and
+        // widening shim, not the helper: every parameter is declared `i64` and
         // an `f64` one is reconstructed in the body with `f64::from_bits`
         // (`helper_arg_from_i64`). `inline_helper_arg_classes` reports the
-        // SOURCE kind, so it says `'f'` where the ABI is an integer register,
-        // and the two consumers of `fnaddr` then disagree in opposite
-        // directions:
-        //
-        // * `collect_call_args` -> `dispatch_classes_body!` transmutes an `'f'`
-        //   to a real `f64` parameter, so the caller writes xmm0/d0 while the
-        //   trampoline reads rdi/x0;
-        // * `collect_call_args_positional` (the `residual_host_call` hook)
-        //   passes every argument as raw `i64` bits, which the trampoline DOES
-        //   want, and then reads a float result back out of an `i64` return —
-        //   which the `-> f64` trace target this stages does not give it.
-        //
-        // Upstream cannot split this way: `call.py get_jitcode_calldescr`
-        // derives both `fnaddr` (`getfunctionptr(graph)`) and the calldescr's
-        // classes from the same `FUNC`. Until the trampoline's signature and
-        // the class string come from one place here too, a Float in either
-        // position is refused rather than described wrongly. The wrapper is
-        // still emitted: the residual-call path reaches it through
+        // source kind, so it says `'f'` where the ABI is an integer register.
+        // `collect_call_args` then passes a real `f64`, while the trampoline
+        // reads an integer register. A float result has the same split: the
+        // staged trace target returns `f64` and `bh_call_i` reads an integer
+        // return. A Float in either position leaves `fnaddr` at 0. The wrapper
+        // is still emitted: the residual-call path reaches it through
         // `RuntimeBhDescr::Call`, independently of `fnaddr`.
         Some((wrapper, _target, arg_classes, result_class))
             if arg_classes.contains('f') || *result_class == 'f' =>
