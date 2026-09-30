@@ -12950,6 +12950,17 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
         !func_ptr.is_null(),
         "call_int_function: null function pointer"
     );
+    if args.len() <= MAX_HOST_CALL_ARITY && majit_backend::call_stub::residual_host_call().is_some()
+    {
+        let classes = [majit_backend::call_stub::ArgClass::Int; MAX_HOST_CALL_ARITY];
+        return unsafe {
+            majit_backend::call_stub::bh_call_i_dispatch(
+                func_ptr as usize,
+                &classes[..args.len()],
+                args,
+            )
+        };
+    }
     unsafe {
         match args {
             [] => {
@@ -13238,14 +13249,7 @@ fn arg_classes_from_types(
     for (i, slot) in classes.iter_mut().enumerate().take(args_len) {
         *slot = match arg_types.get(i) {
             Some(Type::Float) => majit_backend::call_stub::ArgClass::Float,
-            Some(Type::Ref) => {
-                if cfg!(target_arch = "wasm32") {
-                    majit_backend::call_stub::ArgClass::Ref
-                } else {
-                    majit_backend::call_stub::ArgClass::Int
-                }
-            }
-            Some(Type::Int) | None => majit_backend::call_stub::ArgClass::Int,
+            Some(Type::Ref) | Some(Type::Int) | None => majit_backend::call_stub::ArgClass::Int,
             // `descr.py TYPE('v')` is `lltype.Void`, which upstream
             // never puts in `arg_classes` for a call it dispatches.
             Some(Type::Void) => panic!("typed call: void argument class at slot {i}"),
@@ -13322,6 +13326,18 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
         !func_ptr.is_null(),
         "call_void_function: null function pointer"
     );
+    if args.len() <= MAX_HOST_CALL_ARITY && majit_backend::call_stub::residual_host_call().is_some()
+    {
+        let classes = [majit_backend::call_stub::ArgClass::Int; MAX_HOST_CALL_ARITY];
+        unsafe {
+            majit_backend::call_stub::bh_call_v_dispatch(
+                func_ptr as usize,
+                &classes[..args.len()],
+                args,
+            );
+        }
+        return;
+    }
     unsafe {
         match args {
             [] => {
