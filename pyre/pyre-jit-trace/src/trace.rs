@@ -4257,15 +4257,27 @@ fn try_adopt_blackhole(
     commit_leg: WalkEndCommitLeg,
     crossed_inline_subwalk: bool,
 ) -> bool {
-    try_adopt_multi_frame_blackhole(flush_committed, ctx, cf_addr, live_root_addr, commit_leg)
-        || try_adopt_single_frame_blackhole(
+    // A multi-frame image is the whole handoff. `try_adopt_multi_frame_blackhole`
+    // takes it, and a decline there must not fall through: the single-frame
+    // arm treats a missing image on an effectful too-long leg as a lost latch
+    // and aborts the process.
+    if crate::jitcode_dispatch::multi_frame_blackhole_is_latched() {
+        return try_adopt_multi_frame_blackhole(
             flush_committed,
             ctx,
             cf_addr,
             live_root_addr,
             commit_leg,
-            crossed_inline_subwalk,
-        )
+        );
+    }
+    try_adopt_single_frame_blackhole(
+        flush_committed,
+        ctx,
+        cf_addr,
+        live_root_addr,
+        commit_leg,
+        crossed_inline_subwalk,
+    )
 }
 
 fn blackhole_terminal_error(error: &crate::jitcode_dispatch::DispatchError) -> bool {

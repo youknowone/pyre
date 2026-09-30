@@ -4094,7 +4094,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         let exc = ctx.trace_ctx.const_ref(raised);
         let exc_concrete = crate::state::ConcreteValue::Ref(raised as pyre_object::PyObjectRef);
         ctx.set_last_exc_value(exc, exc_concrete);
-        walker_record_guard_exception(ctx, op.pc);
+        walker_record_guard_exception(ctx, op.pc)?;
         return Ok(Some((
             DispatchOutcome::SubRaise { exc, exc_concrete },
             op.next_pc,
@@ -4276,7 +4276,7 @@ fn dispatch_recursive_call<Sym: WalkSym>(
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     if raised {
-        walker_record_guard_exception(ctx, op.pc);
+        walker_record_guard_exception(ctx, op.pc)?;
         let exc = ctx
             .last_exc_value()
             .expect("recursive_call raise seeds last_exc_value");
@@ -9493,13 +9493,13 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
 pub(crate) fn walker_record_guard_exception<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
-) {
+) -> Result<(), DispatchError> {
     let exc_obj = match ctx.last_exc_value_concrete() {
         ConcreteValue::Ref(p) if !p.is_null() => p,
         _ => {
             ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-            let _ = walker_capture_snapshot_for_last_guard(ctx, pc);
-            return;
+            walker_capture_snapshot_for_last_guard(ctx, pc)?;
+            return Ok(());
         }
     };
     let class_of_last_exc_is_const = ctx.fbw_mode.class_of_last_exc_is_const;
@@ -9518,7 +9518,7 @@ pub(crate) fn walker_record_guard_exception<Sym: WalkSym>(
     let guard_op = ctx
         .trace_ctx
         .record_guard(OpCode::GuardException, &[exc_type_const], 0);
-    let _ = walker_capture_snapshot_for_last_guard(ctx, pc);
+    walker_capture_snapshot_for_last_guard(ctx, pc)?;
     // `op.setref_base(val)` supplies the recording-time shadow without
     // changing the guard result's live replay identity.
     ctx.trace_ctx.set_opref_concrete(
@@ -9532,6 +9532,7 @@ pub(crate) fn walker_record_guard_exception<Sym: WalkSym>(
     };
     ctx.set_last_exc_value_op(exc_box);
     ctx.fbw_mode.class_of_last_exc_is_const = true;
+    Ok(())
 }
 
 fn clear_walk_exception<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
@@ -9715,7 +9716,7 @@ fn direct_libffi_call<Sym: WalkSym>(
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
     if ei.check_can_raise(false) {
         if resid_raised {
-            walker_record_guard_exception(ctx, pc);
+            walker_record_guard_exception(ctx, pc)?;
             let exc = ctx
                 .last_exc_value()
                 .expect("resid_raised implies last_exc_value seeded by the Err branch");
@@ -9985,7 +9986,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
     // `store_final_boxes_in_guard` finds a populated `rd_resume_position`.
     if ei.check_can_raise(false) {
         if resid_raised {
-            walker_record_guard_exception(ctx, pc);
+            walker_record_guard_exception(ctx, pc)?;
             let exc = ctx
                 .last_exc_value()
                 .expect("resid_raised implies last_exc_value seeded by the Err branch");
