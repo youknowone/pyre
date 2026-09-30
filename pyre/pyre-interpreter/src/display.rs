@@ -795,12 +795,12 @@ pub(crate) unsafe fn exc_user_dunder_obj(
 }
 
 /// Dispatch a user-defined `__repr__` / `__str__` override on a
-/// `types.ModuleType` subclass. A module instance keeps `ob_type` at the
-/// canonical module type and carries its Python class in `w_class`, so the
-/// `ob_type`-keyed formatting in `py_repr` / `py_str` would otherwise bypass a
-/// subclass override. Returns `None` when the method resolves to the base
-/// `module` registration or `object` (no override); a raising override
-/// propagates and a non-string result raises `TypeError`.
+/// `types.ModuleType` subclass. `layout_base` of `MODULE_USER_TYPE` is
+/// `MODULE_TYPE`, so the formatting in `py_repr` / `py_str` reaches this
+/// helper for a subclass as well as an exact module. The subclass carries
+/// its Python class in `w_class`. Returns `None` when the method resolves
+/// to the base `module` registration or `object` (no override); a raising
+/// override propagates and a non-string result raises `TypeError`.
 unsafe fn module_user_dunder_obj(
     obj: PyObjectRef,
     name: &str,

@@ -6247,8 +6247,12 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
     //
     // Reading through `getdict` instead would materialise the
     // `("dict", SPECIAL)` wrapper and change the instance's map — see
-    // [`setdictvalue`].
-    if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) } {
+    // [`setdictvalue`]. A typedef that already owns `__dict__` is not a
+    // `MapdictDictSupport` (`typedef.py` `_getusercls`).
+    if unsafe {
+        crate::objspace::std::mapdict::has_mapdict_storage(obj)
+            && !crate::objspace::std::mapdict::typedef_owns_dict(obj)
+    } {
         return unsafe {
             crate::objspace::std::mapdict::instance_node_getdictvalue_checked(
                 obj,
@@ -15018,8 +15022,13 @@ pub fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> Result<
     // adds an attribute to the instance's map — a shape change that must only
     // happen when app-level code actually asks for `__dict__`. A `NoDict`
     // terminator answers `false` here (`write_terminator`), which is the
-    // AttributeError signal the caller expects.
-    if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) } {
+    // AttributeError signal the caller expects. A typedef that already owns
+    // `__dict__` is not a `MapdictDictSupport` (`typedef.py` `_getusercls`);
+    // its ordinary attributes go through `getdict` below.
+    if unsafe {
+        crate::objspace::std::mapdict::has_mapdict_storage(obj)
+            && !crate::objspace::std::mapdict::typedef_owns_dict(obj)
+    } {
         return Ok(unsafe {
             crate::objspace::std::mapdict::instance_node_setdictvalue(
                 obj,

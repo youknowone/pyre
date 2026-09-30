@@ -599,6 +599,8 @@ unsafe fn property_destructor(obj_addr: usize) {
 /// # Safety
 ///
 /// As [`property_destructor`], for a `StaticMethod` payload.
+/// `StaticMethodUser` is a `StaticMethod` prefix, so the same cast covers
+/// that layout.
 unsafe fn staticmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::StaticMethod;
     unsafe { (*m).w_function_watchers.reclaim() };
@@ -609,6 +611,8 @@ unsafe fn staticmethod_destructor(obj_addr: usize) {
 /// # Safety
 ///
 /// As [`property_destructor`], for a `ClassMethod` payload.
+/// `ClassMethodUser` is a `ClassMethod` prefix, so the same cast covers
+/// that layout.
 unsafe fn classmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::ClassMethod;
     unsafe { (*m).w_function_watchers.reclaim() };
@@ -1013,6 +1017,23 @@ unsafe fn long_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     f(&mut long.base.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !long.base.value.is_null() {
         f(std::ptr::addr_of_mut!(long.base.value) as *mut majit_ir::GcRef);
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
+/// `ModuleUser` (`typedef.py` `_getusercls`). The base module's inline
+/// edges (`W_MODULE_GC_PTR_OFFSETS`) plus mapdict `storage`.
+unsafe fn module_user_object_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    for offset in pyre_object::module::W_MODULE_GC_PTR_OFFSETS {
+        f((obj_addr + offset) as *mut majit_ir::GcRef);
     }
     unsafe {
         pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
@@ -4438,7 +4459,49 @@ fn build_gc() -> Box<MiniMarkGC> {
         weakref_user_tid,
     );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 201),
+    // `StaticMethodUser` / `ClassMethodUser` (`typedef.py` `_getusercls`).
+    // Parents are the builtin tids already registered above (20, 21).
+    // `QuasiImmutField` reclamation is the base destructor: the user struct
+    // is that payload as a prefix.
+    let staticmethod_user_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::function::W_STATICMETHOD_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    debug_assert_eq!(staticmethod_user_tid, 201);
+    gc.types
+        .set_destructor(staticmethod_user_tid, staticmethod_destructor);
+    let classmethod_user_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::function::W_CLASSMETHOD_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    debug_assert_eq!(classmethod_user_tid, 202);
+    gc.types
+        .set_destructor(classmethod_user_tid, classmethod_destructor);
+    // `ModuleUser` (`typedef.py` `_getusercls`). Subclass instances are
+    // traced as a module plus its mapdict storage. The trace walks
+    // `W_MODULE_GC_PTR_OFFSETS`. The typed `w_dict` stays the namespace.
+    let module_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::module::W_MODULE_USER_OBJECT_SIZE,
+        w_module_tid,
+        module_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        module_user_tid,
+        pyre_object::module::W_MODULE_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::MODULE_USER_TYPE as *const _ as usize,
+        module_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::MODULE_USER_TYPE as *const _ as usize,
+        module_user_tid,
+    );
+
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 204),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,

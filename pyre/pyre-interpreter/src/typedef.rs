@@ -903,9 +903,17 @@ pub fn init_typeobjects() {
             member_desc_type as usize,
         );
 
-        // staticmethod — PyPy: function.py StaticMethod, bases=(object,)
-        let staticmethod_type =
-            pyre_object::with_roots!(object_type => new_typeobject_with_base("staticmethod", init_staticmethod_type, object_type));
+        // staticmethod — PyPy: function.py StaticMethod, bases=(object,).
+        // `StaticMethod.getdict` owns `w_dict`, so the layout carrier is
+        // `STATICMETHOD_TYPE`. `typeobject.py` `W_TypeObject.__init__` then
+        // builds a `NoDictTerminator` (`hasdict and not typedef.hasdict` is
+        // false) and `_getusercls` keeps `__slots__` on the map.
+        let staticmethod_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+            "staticmethod",
+            init_staticmethod_type,
+            object_type,
+            &pyre_object::function::STATICMETHOD_TYPE,
+        ));
         unsafe {
             pyre_object::w_type_set_text_signature(staticmethod_type, "(function, /)");
         }
@@ -914,9 +922,15 @@ pub fn init_typeobjects() {
             staticmethod_type as usize,
         );
 
-        // classmethod — PyPy: function.py ClassMethod, bases=(object,)
-        let classmethod_type =
-            pyre_object::with_roots!(object_type => new_typeobject_with_base("classmethod", init_classmethod_type, object_type));
+        // classmethod — PyPy: function.py ClassMethod, bases=(object,).
+        // Same carrier split as `StaticMethod`: `ClassMethod.getdict` owns
+        // `w_dict`, and the user layout's map is not that dictionary.
+        let classmethod_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+            "classmethod",
+            init_classmethod_type,
+            object_type,
+            &pyre_object::function::CLASSMETHOD_TYPE,
+        ));
         unsafe {
             pyre_object::w_type_set_text_signature(classmethod_type, "(function, /)");
         }
@@ -3720,19 +3734,20 @@ macro_rules! make_maketrans_descr {
     }};
 }
 
-/// `moduleobject.c module_new` — allocate an anonymous `Module`
-/// (empty name, fresh dict).  The name is seeded by `__init__`, so
-/// `__new__` ignores its arguments.  A subclass instance is retagged
-/// with the actual class.
+/// `module.py` `Module.descr_module__new__`: allocate an anonymous `Module`
+/// (empty name, fresh dict). The name is seeded by `__init__`, so `__new__`
+/// ignores its arguments. An exact module keeps the base layout. A subtype
+/// is `typedef.py` `_getusercls` (`ModuleUser`): the typed `w_dict` stays
+/// the namespace and mapdict holds `__slots__`.
 fn module_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let w_module = pyre_object::w_module_new_managed("");
-    if let Some(cls) = args.first().copied()
-        && !cls.is_null()
-    {
-        tag_subclass_instance(w_module, cls);
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    let module_type = gettypeobject(&pyre_object::MODULE_TYPE);
+    if cls.is_null() || std::ptr::eq(cls, module_type) {
+        let w_module = pyre_object::w_module_new_managed("");
+        pyre_object::gc_hook::maybe_register_finalizer(w_module);
+        return Ok(w_module);
     }
-    // module.py:Module.descr_module__new__ allocates through
-    // `space.allocate_instance(Module, w_subtype)`.
+    let w_module = pyre_object::w_module_user_new(cls);
     pyre_object::gc_hook::maybe_register_finalizer(w_module);
     Ok(w_module)
 }
@@ -18488,19 +18503,36 @@ fn staticmethod_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, cra
     Ok(obj)
 }
 
-/// function.py `StaticMethod.descr_staticmethod__new__` / CPython
-/// 3.14 `sm_new`: allocate first with a None callable; `__init__` installs
-/// the user argument and copies presentation attributes.
+/// `function.py` `StaticMethod.descr_staticmethod__new__`: allocate through
+/// `allocate_instance`. An exact instance is the base layout; a subclass is
+/// `typedef.py` `_getusercls` (`StaticMethodUser`). `__init__` installs the
+/// callable.
 fn staticmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
     let cls = args.first().copied().unwrap_or(PY_NULL);
     let staticmethod_type = gettypeobject(&pyre_object::function::STATICMETHOD_TYPE);
     check_user_subclass(staticmethod_type, cls)?;
-    let sm = pyre_object::function::w_staticmethod_new(w_none());
-    if !std::ptr::eq(cls, staticmethod_type) {
-        tag_subclass_instance(sm, cls);
+    let obj = pyre_object::function::StaticMethod::allocate_instance(
+        pyre_object::function::StaticMethod {
+            ob: pyre_object::PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_function: w_none(),
+            w_dict: PY_NULL,
+            w_function_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
+        },
+        cls,
+    );
+    // `allocate_instance` enqueues `maybe_register_finalizer` for a
+    // subclass (`objspace.py`). The exact layout returns from
+    // `allocate_stable` before that call.
+    if std::ptr::eq(
+        unsafe { (*obj).ob_type },
+        &pyre_object::function::STATICMETHOD_TYPE,
+    ) {
+        pyre_object::gc_hook::maybe_register_finalizer(obj);
     }
-    pyre_object::gc_hook::maybe_register_finalizer(sm);
-    Ok(sm)
+    Ok(obj)
 }
 
 /// function.py `StaticMethod.descr_init`, adjusted to CPython 3.14:
@@ -19025,19 +19057,36 @@ fn classmethod_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crat
     Ok(obj)
 }
 
-/// function.py `ClassMethod.descr_classmethod__new__` / CPython
-/// 3.14 `cm_new`: allocate the requested subtype with a temporary None
-/// callable; `__init__` installs the actual callable.
+/// `function.py` `ClassMethod.descr_classmethod__new__`: allocate through
+/// `allocate_instance`. An exact instance is the base layout; a subclass is
+/// `typedef.py` `_getusercls` (`ClassMethodUser`). `__init__` installs the
+/// callable.
 fn classmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
     let cls = args.first().copied().unwrap_or(PY_NULL);
     let classmethod_type = gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE);
     check_user_subclass(classmethod_type, cls)?;
-    let cm = pyre_object::function::w_classmethod_new(w_none());
-    if !std::ptr::eq(cls, classmethod_type) {
-        tag_subclass_instance(cm, cls);
+    let obj = pyre_object::function::ClassMethod::allocate_instance(
+        pyre_object::function::ClassMethod {
+            ob: pyre_object::PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_function: w_none(),
+            w_dict: PY_NULL,
+            w_function_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
+        },
+        cls,
+    );
+    // `allocate_instance` enqueues `maybe_register_finalizer` for a
+    // subclass (`objspace.py`). The exact layout returns from
+    // `allocate_stable` before that call.
+    if std::ptr::eq(
+        unsafe { (*obj).ob_type },
+        &pyre_object::function::CLASSMETHOD_TYPE,
+    ) {
+        pyre_object::gc_hook::maybe_register_finalizer(obj);
     }
-    pyre_object::gc_hook::maybe_register_finalizer(cm);
-    Ok(cm)
+    Ok(obj)
 }
 
 /// function.py `ClassMethod.descr_init`, adjusted to CPython 3.14's

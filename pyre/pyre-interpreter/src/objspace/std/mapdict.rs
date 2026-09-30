@@ -569,6 +569,30 @@ pub unsafe fn has_mapdict_storage(obj: PyObjectRef) -> bool {
         && unsafe { pyre_object::w_type_get_hasdict(w_class) }
 }
 
+/// Whether `obj`'s class typedef owns the instance dictionary.
+///
+/// `typedef.py` `_getusercls` mixes `MapdictDictSupport` in only when
+/// `not typedef.hasdict`. `type_terminator_or_create` reads that fact
+/// with `w_type_get_typedef_hasdict` on the class from
+/// `w_instance_get_type`. Ordinary attributes then go through the class's
+/// own `getdict`; the map is not that dictionary.
+///
+/// # Safety
+/// `obj` must be null or a live object. Null, a tagged int, or a
+/// `w_class` that is not a type answers false.
+#[inline]
+pub unsafe fn typedef_owns_dict(obj: PyObjectRef) -> bool {
+    if obj.is_null()
+        || (pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj))
+    {
+        return false;
+    }
+    let w_type = unsafe { pyre_object::w_instance_get_type(obj) };
+    !w_type.is_null()
+        && unsafe { pyre_object::is_type(w_type) }
+        && unsafe { pyre_object::w_type_get_typedef_hasdict(w_type) }
+}
+
 /// Fetch `w_type`'s instance terminator, lazily creating and storing it on the
 /// type if absent (covering types built before the eager install site).
 ///
@@ -1827,6 +1851,9 @@ pub unsafe fn class_attr_fast_path(
     w_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef)> {
+    if unsafe { typedef_owns_dict(w_obj) } {
+        return None;
+    }
     let map = unsafe { mapdict_map_or_null(w_obj) };
     if map.is_null() {
         return None;
@@ -2044,6 +2071,11 @@ unsafe fn getattr_resolves_nowhere(
     w_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, MapRef)> {
+    // A typedef-owned `__dict__` is invisible to the map (`typedef.py`
+    // `_getusercls` without `MapdictDictSupport`).
+    if unsafe { typedef_owns_dict(w_obj) } {
+        return None;
+    }
     // mapdict.py:1495 `if map is not None:` — also filters non-instances.
     let map = unsafe { mapdict_map_or_null(w_obj) };
     if map.is_null() {
@@ -6260,20 +6292,28 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
 ///     assert isinstance(lifeline, WeakrefLifeline)
 ///     return lifeline
 /// ```
+/// `Module.typedef` is weakrefable (`make_weakref_descr(Module)`), so
+/// `_getusercls` does not mix `MapdictWeakrefSupport`. `ModuleUser` keeps
+/// the lifeline in `WEAKREF_TABLE`, the same place an exact module uses.
+fn weakref_uses_table(self_ref: PyObjectRef) -> bool {
+    unsafe { pyre_object::is_module(self_ref) || !has_mapdict_layout(self_ref) }
+}
+
 pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
     // `_getusercls` mixes `MapdictWeakrefSupport` whenever
     // `not typedef.weakrefable`, independent of `hasdict`. A slots-only
     // user layout (`class S(list): __slots__ = ('__weakref__',)`) still
     // carries the mixin, so the lifeline lives in the `"weakref"` SPECIAL
-    // slot the custom GC trace walks.
-    if unsafe { has_mapdict_layout(self_ref) } {
-        unsafe { instance_get_weakref_slot(self_ref) }
-    } else {
+    // slot the custom GC trace walks. A weakrefable base such as `Module`
+    // keeps the table even after `_getusercls` adds mapdict storage.
+    if weakref_uses_table(self_ref) {
         WEAKREF_TABLE
             .lock()
             .get(&(self_ref as usize))
             .copied()
             .map(|value| value as PyObjectRef)
+    } else {
+        unsafe { instance_get_weakref_slot(self_ref) }
     }
 }
 
@@ -6286,11 +6326,11 @@ pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
 ///     self._get_mapdict_map().write(self, "weakref", SPECIAL, weakreflifeline)
 /// ```
 pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
-    if unsafe { has_mapdict_layout(self_ref) } {
+    if weakref_uses_table(self_ref) {
+        weakref_table_insert(self_ref, weakreflifeline);
+    } else {
         let flag = unsafe { instance_set_weakref_slot(self_ref, weakreflifeline) };
         debug_assert!(flag, "write to the weakref SPECIAL slot failed");
-    } else {
-        weakref_table_insert(self_ref, weakreflifeline);
     }
 }
 
@@ -6301,10 +6341,10 @@ pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
 ///     self._get_mapdict_map().write(self, "weakref", SPECIAL, None)
 /// ```
 pub fn delweakref(self_ref: PyObjectRef) {
-    if unsafe { has_mapdict_layout(self_ref) } {
-        unsafe { instance_del_weakref_slot(self_ref) };
-    } else {
+    if weakref_uses_table(self_ref) {
         WEAKREF_TABLE.lock().remove(&(self_ref as usize));
+    } else {
+        unsafe { instance_del_weakref_slot(self_ref) };
     }
 }
 

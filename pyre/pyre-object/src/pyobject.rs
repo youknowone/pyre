@@ -456,7 +456,13 @@ pub static LONG_USER_TYPE: PyType = new_user_pytype(
 pub static NONE_TYPE: PyType = new_pytype("NoneType");
 pub static NOTIMPLEMENTED_TYPE: PyType = new_pytype("NotImplementedType");
 pub static ELLIPSIS_TYPE: PyType = new_pytype("ellipsis");
-pub static MODULE_TYPE: PyType = new_pytype("module");
+pub static MODULE_TYPE: PyType = new_pytype_with_user_subclass("module", &MODULE_USER_TYPE);
+/// `ModuleUser` (`typedef.py` `_getusercls(Module)`).
+pub static MODULE_USER_TYPE: PyType = new_user_pytype(
+    "module",
+    &MODULE_TYPE,
+    std::mem::offset_of!(crate::module::ModuleUser, map),
+);
 pub static MAPPING_PROXY_TYPE: PyType = new_pytype("mappingproxy");
 pub static TYPE_TYPE: PyType = new_pytype("type");
 pub static INSTANCE_TYPE: PyType = new_pytype_with_mapdict_mixin(
@@ -846,8 +852,9 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // user layouts, and `__pypy__.Bufferable`).
     // 168 is `interp__weakref.py` `W_Weakref`, an object subclass.
     // 169-195 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
-    // 196-200 append deque, Struct, GenericAlias, big-int and weakref user
-    // layouts without moving the closed block above.
+    // 196-203 append deque, Struct, GenericAlias, big-int, weakref,
+    // staticmethod, classmethod and module user layouts without moving
+    // the closed block above.
     (158, Some(1)),
     (159, Some(34)),
     (160, Some(8)),
@@ -892,20 +899,23 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (198, Some(87)),  // types.GenericAlias
     (199, Some(35)),  // W_LongObject
     (200, Some(168)), // W_WeakrefUser
+    (201, Some(20)),  // StaticMethodUser
+    (202, Some(21)),  // ClassMethodUser
+    (203, Some(36)),  // ModuleUser
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail, after the `_getusercls` layouts (158-200).
-    (201, Some(0)),
-    // Native-only type IDs 202 and 203 represent `posix.DirEntry` and
+    // posix / console tail, after the `_getusercls` layouts (158-203).
+    (204, Some(0)),
+    // Native-only type IDs 205 and 206 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (202, Some(0)),
+    (205, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (203, Some(0)),
+    (206, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (204, Some(0)),
+    (207, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1501,6 +1511,9 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(198, &crate::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE),
         subclass_range_alias(199, &LONG_USER_TYPE),
         subclass_range_alias(200, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE),
+        subclass_range_alias(201, &crate::function::STATICMETHOD_USER_TYPE),
+        subclass_range_alias(202, &crate::function::CLASSMETHOD_USER_TYPE),
+        subclass_range_alias(203, &MODULE_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),

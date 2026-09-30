@@ -5118,6 +5118,45 @@ static W_LONG_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
     )
 });
 
+static W_STATICMETHOD_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::function::StaticMethodUser>(),
+        pyre_object::function::W_STATICMETHOD_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::function::STATICMETHOD_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::function::StaticMethodUser, map),
+        std::mem::offset_of!(pyre_object::function::StaticMethodUser, storage),
+        "StaticMethodUser",
+        "function::StaticMethodUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF40,
+    )
+});
+
+static W_CLASSMETHOD_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::function::ClassMethodUser>(),
+        pyre_object::function::W_CLASSMETHOD_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::function::CLASSMETHOD_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::function::ClassMethodUser, map),
+        std::mem::offset_of!(pyre_object::function::ClassMethodUser, storage),
+        "ClassMethodUser",
+        "function::ClassMethodUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF50,
+    )
+});
+
+static W_MODULE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::module::W_MODULE_USER_OBJECT_SIZE,
+        pyre_object::module::W_MODULE_USER_GC_TYPE_ID,
+        &pyre_object::pyobject::MODULE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::module::ModuleUser, map),
+        std::mem::offset_of!(pyre_object::module::ModuleUser, storage),
+        "ModuleUser",
+        "module::ModuleUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF60,
+    )
+});
+
 struct ModuleUserLayoutGroup {
     /// `ob_type` of a `typedef.py` `_getusercls` instance.
     pytype: usize,
@@ -5326,6 +5365,16 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_GENERIC_ALIAS_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::is_long(obj) } {
         field_descr_from_group(&W_LONG_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_object::function::STATICMETHOD_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STATICMETHOD_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_object::function::CLASSMETHOD_USER_TYPE)
+    } {
+        field_descr_from_group(&W_CLASSMETHOD_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::py_type_check(obj, &pyre_object::pyobject::MODULE_USER_TYPE) } {
+        field_descr_from_group(&W_MODULE_USER_DESCR_GROUP, 0)
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 0) } {
         descr
     } else {
@@ -5442,6 +5491,16 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_GENERIC_ALIAS_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::is_long(obj) } {
         field_descr_from_group(&W_LONG_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_object::function::STATICMETHOD_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STATICMETHOD_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_object::function::CLASSMETHOD_USER_TYPE)
+    } {
+        field_descr_from_group(&W_CLASSMETHOD_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::py_type_check(obj, &pyre_object::pyobject::MODULE_USER_TYPE) } {
+        field_descr_from_group(&W_MODULE_USER_DESCR_GROUP, 1)
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 1) } {
         descr
     } else {
@@ -7440,6 +7499,18 @@ mod tests {
             0x6100_0F20
         );
         assert_eq!(W_LONG_USER_DESCR_GROUP.field_descrs[0].index(), 0x6100_0F30);
+        assert_eq!(
+            W_STATICMETHOD_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F40
+        );
+        assert_eq!(
+            W_CLASSMETHOD_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F50
+        );
+        assert_eq!(
+            W_MODULE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F60
+        );
         assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
             Type::Ref
@@ -9442,6 +9513,15 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("longobject::W_LongObjectUser", || {
         LazyLock::force(&W_LONG_USER_DESCR_GROUP);
+    }),
+    ("function::StaticMethodUser", || {
+        LazyLock::force(&W_STATICMETHOD_USER_DESCR_GROUP);
+    }),
+    ("function::ClassMethodUser", || {
+        LazyLock::force(&W_CLASSMETHOD_USER_DESCR_GROUP);
+    }),
+    ("module::ModuleUser", || {
+        LazyLock::force(&W_MODULE_USER_DESCR_GROUP);
     }),
     ("tupleobject::W_TupleObject", || {
         LazyLock::force(&W_TUPLE_DESCR_GROUP);
