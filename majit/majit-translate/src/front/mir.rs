@@ -45828,17 +45828,12 @@ fn result_try_verify_break_arm(
     };
     let (residual_var, recast_indices) = peel_recast_chain_from(graph, e_block, &residual_result);
     let mut recognized = vec![pos0_idx, from_residual_idx];
-    if let Some(idx) =
-        crate::front::result_exc::pure_copy_index(ops, &payload_var, &residual_result).or_else(
-            || {
-                ops.iter().enumerate().find_map(|(i, op)| {
-                    let reads = crate::front::result_exc::op_operand_vars(&op.kind);
-                    (reads.len() == 1 && reads.first() == Some(&payload_var)).then_some(i)
-                })
-            },
-        )
+    if let OpKind::Call { args, .. } = &ops[from_residual_idx].kind
+        && let [LinkArg::Value(arg)] = args.as_slice()
+        && let Some(bridge) =
+            crate::front::result_exc::payload_bridge_indices(ops, arg, &payload_var, 1)
     {
-        recognized.push(idx);
+        recognized.extend(bridge);
     }
     recognized.extend(recast_indices);
     assert_block_pure_besides(graph, e_block, &recognized, "break arm", name)?;

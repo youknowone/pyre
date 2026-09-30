@@ -1291,6 +1291,77 @@ pub(crate) fn count_var_uses(graph: &FunctionGraph, var: &Variable) -> UseCounts
     UseCounts { op_uses, link_uses }
 }
 
+pub(crate) fn from_residual_arg_is_payload(
+    ops: &[SpaceOperation],
+    args: &[LinkArg],
+    payload: &Variable,
+) -> bool {
+    match args {
+        [LinkArg::Value(arg)] => payload_bridge_indices(ops, arg, payload, 1).is_some(),
+        _ => false,
+    }
+}
+
+/// Ops that carry `payload` to `arg` inside this block and that
+/// [`assert_block_pure_besides`] would still treat as side effects.
+///
+/// `same_as` and `__cast_instance_intrinsic` forward one value, for as
+/// long as the chain does not repeat a value. `max_other_ops` is how
+/// many other single-operand ops may sit on that chain. The `?` break
+/// arm allows one: `From::from` in front of `from_residual`
+/// ([`apply_foreign_from_residuals`]). A second such op is a custom
+/// handler. `None` when `arg` is not that chain.
+pub(crate) fn payload_bridge_indices(
+    ops: &[SpaceOperation],
+    arg: &Variable,
+    payload: &Variable,
+    max_other_ops: usize,
+) -> Option<Vec<usize>> {
+    let mut current = arg.clone();
+    let mut seen = Vec::new();
+    let mut others = 0usize;
+    let mut recognized = Vec::new();
+    loop {
+        if &current == payload {
+            return Some(recognized);
+        }
+        if seen.iter().any(|var| var == &current) {
+            return None;
+        }
+        seen.push(current.clone());
+        let (idx, kind) = ops
+            .iter()
+            .enumerate()
+            .find_map(|(i, op)| (op.result.as_ref() == Some(&current)).then_some((i, &op.kind)))?;
+        let reads = op_operand_vars(kind);
+        let [src] = reads.as_slice() else {
+            return None;
+        };
+        if is_payload_forward(kind) {
+            if !crate::inline::can_remove_op(kind) {
+                recognized.push(idx);
+            }
+        } else {
+            others += 1;
+            if others > max_other_ops {
+                return None;
+            }
+            if !crate::inline::can_remove_op(kind) {
+                recognized.push(idx);
+            }
+        }
+        current = src.clone();
+    }
+}
+
+/// `same_as` and a `__cast_instance_intrinsic` narrow alias their operand.
+fn is_payload_forward(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::UnaryOp { op, .. } if op == "same_as" => true,
+        other => is_recast_narrow(other),
+    }
+}
+
 /// Every `Variable` operand of an op kind.
 ///
 /// `count_var_uses` and the carrier-unused check in `collapse_pos0_read`
@@ -1300,32 +1371,6 @@ pub(crate) fn count_var_uses(graph: &FunctionGraph, var: &Variable) -> UseCounts
 /// a new `OpKind` variant is a compile error here until its operands are
 /// declared, keeping the pass fail-closed.  Producer / constant / marker
 /// kinds carry no operand `Variable` and return empty.
-pub(crate) fn from_residual_arg_is_payload(
-    ops: &[SpaceOperation],
-    args: &[LinkArg],
-    payload: &Variable,
-) -> bool {
-    match args {
-        [LinkArg::Value(arg)] if arg == payload => true,
-        [LinkArg::Value(arg)] => pure_copy_index(ops, payload, arg).is_some(),
-        _ => false,
-    }
-}
-
-pub(crate) fn pure_copy_index(
-    ops: &[SpaceOperation],
-    src: &Variable,
-    dst: &Variable,
-) -> Option<usize> {
-    ops.iter().enumerate().find_map(|(i, op)| {
-        if op.result.as_ref() != Some(dst) {
-            return None;
-        }
-        let reads = op_operand_vars(&op.kind);
-        (reads.len() == 1 && reads.first() == Some(src)).then_some(i)
-    })
-}
-
 pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
     let extend_all = |dst: &mut Vec<Variable>, lists: &[&Vec<Variable>]| {
         for list in lists {
@@ -5101,15 +5146,21 @@ fn verify_break_arm_is_reraise(
              custom `?` handler shapes are not supported yet"
         ));
     };
-    // Only the `__pos_0` read and the `from_residual` call may carry an
-    // effect; any other side-effecting op would be dropped by the rewrite.
+    // The `__pos_0` read, the `from_residual` call, and the copy chain
+    // between them are the reraise. [`payload_bridge_indices`] names the
+    // casts and the one `From::from` on that chain; anything else the
+    // rewrite would drop has to be removable.
+    let bridge = match &ops[from_residual_idx].kind {
+        OpKind::Call { args, .. } => match args.as_slice() {
+            [LinkArg::Value(arg)] => {
+                payload_bridge_indices(ops, arg, &payload_var, 1).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
     let mut recognized = vec![pos0_idx, from_residual_idx];
-    if let Some(idx) = ops.iter().enumerate().find_map(|(i, op)| {
-        let reads = op_operand_vars(&op.kind);
-        (reads.len() == 1 && reads.first() == Some(&payload_var) && i != pos0_idx).then_some(i)
-    }) {
-        recognized.push(idx);
-    }
+    recognized.extend(bridge);
     assert_block_pure_besides(graph, e_block, &recognized, "break arm", name)?;
     verify_forwards_to_returnblock_general(graph, e_block, &residual_result)
 }
@@ -7578,5 +7629,219 @@ mod from_residual_conversion_tests {
             from_impl_args(&graph),
             crate::model::call_args(vec![reads[0].0.clone()])
         );
+    }
+}
+
+#[cfg(test)]
+mod break_arm_copy_tests {
+    use super::*;
+    use crate::model::FieldDescriptor;
+
+    fn same_as(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        operand: Variable,
+    ) -> Variable {
+        graph
+            .push_op_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand,
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("same_as")
+    }
+
+    fn recast(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        operand: Variable,
+    ) -> Variable {
+        graph
+            .push_op_var(
+                block,
+                crate::model::cast_instance_call("Payload", operand),
+                true,
+            )
+            .expect("recast")
+    }
+
+    fn from_impl(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        operand: Variable,
+    ) -> Variable {
+        graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "pyre_interpreter",
+                        "error",
+                        "PyError",
+                        "<Impl#7>",
+                        "from",
+                    ]),
+                    args: crate::model::call_args(vec![operand]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("From::from")
+    }
+
+    fn field_read(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        base: Variable,
+    ) -> Variable {
+        graph
+            .push_op_var(
+                block,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("__pos_0", Some("Result::Err".into())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("field")
+    }
+
+    /// Break arm: `__pos_0`, then `build` from that payload to the
+    /// `from_residual` argument, then a return of the call.
+    fn break_arm(
+        build: impl FnOnce(&mut FunctionGraph, crate::model::BlockId, Variable) -> Variable,
+    ) -> Result<(), String> {
+        let mut graph = FunctionGraph::new("break_arm");
+        let cf_c = graph.alloc_value_var();
+        graph.blocks[graph.startblock.0].inputargs = vec![cf_c.clone()];
+        let (arm, inputs) = graph.create_block_with_arg_vars(1);
+        let cf_e = inputs[0].clone();
+        graph.set_goto(graph.startblock, arm, vec![cf_c.clone()]);
+        let payload = graph
+            .push_op_var(
+                arm,
+                OpKind::FieldRead {
+                    base: cf_e,
+                    field: FieldDescriptor::new("__pos_0", Some("ControlFlow::Break".into())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("payload");
+        let arg = build(&mut graph, arm, payload);
+        let residual = graph
+            .push_op_var(
+                arm,
+                OpKind::Call {
+                    target: CallTarget::method("from_residual", Some("FromResidual".into())),
+                    args: crate::model::call_args(vec![arg]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(arm, Some(residual));
+        let link = graph.blocks[graph.startblock.0].exits[0].clone();
+        verify_break_arm_is_reraise(&graph, &link, &cf_c, "break_arm")
+    }
+
+    #[test]
+    fn a_long_copy_chain_still_reraises() {
+        break_arm(|graph, arm, payload| {
+            let mut value = payload;
+            for _ in 0..8 {
+                value = same_as(graph, arm, value);
+            }
+            value
+        })
+        .expect("copies of the payload still reraise");
+    }
+
+    #[test]
+    fn a_recast_chain_still_reraises() {
+        break_arm(|graph, arm, payload| {
+            let once = recast(graph, arm, payload);
+            recast(graph, arm, once)
+        })
+        .expect("recasts of the payload still reraise");
+    }
+
+    #[test]
+    fn from_after_copies_still_reraises() {
+        break_arm(|graph, arm, payload| {
+            let mut value = payload;
+            for _ in 0..3 {
+                value = same_as(graph, arm, value);
+            }
+            from_impl(graph, arm, value)
+        })
+        .expect("From::from of a copied payload still reraises");
+    }
+
+    #[test]
+    fn copies_after_from_still_reraise() {
+        break_arm(|graph, arm, payload| {
+            let converted = from_impl(graph, arm, payload);
+            let mut value = converted;
+            for _ in 0..3 {
+                value = same_as(graph, arm, value);
+            }
+            value
+        })
+        .expect("copies of From::from still reraise");
+    }
+
+    #[test]
+    fn one_field_read_still_reraises() {
+        break_arm(|graph, arm, payload| field_read(graph, arm, payload))
+            .expect("one field read of the payload still reraises");
+    }
+
+    #[test]
+    fn a_field_read_and_from_are_not_a_reraise() {
+        let err = break_arm(|graph, arm, payload| {
+            let inner = field_read(graph, arm, payload);
+            from_impl(graph, arm, inner)
+        })
+        .expect_err("two non-copy ops are a custom handler");
+        assert!(err.contains("lacks the from_residual call"), "{err}");
+    }
+
+    #[test]
+    fn two_from_calls_are_not_a_reraise() {
+        let err = break_arm(|graph, arm, payload| {
+            let once = from_impl(graph, arm, payload);
+            from_impl(graph, arm, once)
+        })
+        .expect_err("a second From::from is a custom handler");
+        assert!(err.contains("lacks the from_residual call"), "{err}");
+    }
+
+    #[test]
+    fn an_unrelated_call_is_not_bypassed() {
+        let err = break_arm(|graph, arm, payload| {
+            let noise = graph.alloc_value_var();
+            graph
+                .push_op_var(
+                    arm,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["other"]),
+                        args: crate::model::call_args(vec![noise]),
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .expect("noise");
+            payload
+        })
+        .expect_err("a call beside the reraise is a side effect");
+        assert!(err.contains("side-effecting"), "{err}");
     }
 }
