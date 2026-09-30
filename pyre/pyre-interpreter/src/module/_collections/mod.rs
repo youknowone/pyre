@@ -74,7 +74,7 @@ pub mod deque_lock {
 /// protocols, with `maxlen` bounding).
 // CPython 3.14 Modules/_collectionsmodule.c:collections_exec ADD_TYPEs
 // deque_spec through a module heap type; the spec is immutable.
-#[crate::pyre_class("collections.deque", cpython_heaptype)]
+#[crate::pyre_class("collections.deque", cpython_heaptype, user_layout)]
 pub struct W_Deque {
     leftblock: PyObjectRef,
     rightblock: PyObjectRef,
@@ -86,11 +86,6 @@ pub struct W_Deque {
     /// `interp_deque.py W_Deque.lock`: `None` until observed, then a unique
     /// fieldless `Lock` identity; every mutation stores `None` again.
     lock: PyObjectRef,
-    /// PyPy `BaseUserClassMapdict` indexed storage for a deque subclass's
-    /// app-level `__slots__`.  The translated user layout owns these values;
-    /// pyre's fixed native payload keeps the equivalent object-resident list.
-    /// `PY_NULL` means no slot has been assigned yet.
-    w_slots: PyObjectRef,
 }
 
 // PyPy's deque block/endpoint transitions execute atomically under its GIL.
@@ -161,26 +156,10 @@ fn deque_len(self_obj: PyObjectRef) -> i64 {
     W_Deque::from_obj(self_obj).map(|d| d.len).unwrap_or(0)
 }
 
-/// Whether `obj` has PyPy's `W_Deque` layout, including a Python subclass.
+/// Whether `obj` has PyPy's `W_Deque` layout, including a Python subclass
+/// (`typedef.py` `_getusercls`).
 pub(crate) fn is_deque(obj: PyObjectRef) -> bool {
     W_Deque::from_obj(obj).is_some()
-}
-
-/// Read one app-level `__slots__` entry from a deque subclass.
-pub(crate) unsafe fn deque_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    let slots = unsafe { (*(obj as *const W_Deque)).w_slots };
-    unsafe { pyre_object::slots::slot_get(slots, index) }
-}
-
-/// Write one app-level `__slots__` entry on a deque subclass.
-pub(crate) unsafe fn deque_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    pyre_object::slot_set_direct!(obj, index, value, W_Deque, w_slots)
-}
-
-/// Clear one app-level `__slots__` entry on a deque subclass.
-pub(crate) unsafe fn deque_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    let slots = unsafe { (*(obj as *const W_Deque)).w_slots };
-    unsafe { pyre_object::slots::slot_del(slots, index) }
 }
 
 /// The prologue of `_find_or_count` (interp_deque.py): `lock =
@@ -1049,30 +1028,40 @@ impl W_Deque {
     // are accepted and ignored here — the type-call protocol forwards them
     // (and any keywords) to `__new__` as well.
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
+    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // Construction arguments are consumed/validated by `__init__`; accept
         // (and ignore) any positional or keyword args here via the whole-slice
         // catch-all so a subclass with its own `__init__` keyword parameters
         // does not trip an unknown-keyword error in `__new__`.
         let _ = _args;
+        // `objspace.py` `allocate_instance` validates the requested subtype.
+        // The builtin is the base layout; a subclass is `typedef.py`
+        // `_getusercls` (`interp_deque.py` `W_Deque.descr__new__`).
+        crate::typedef::check_user_subclass(type_object(), cls)?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        // `deque_block::new` allocates the block and its data list. The
+        // requested class stays rooted across that allocation. The block
+        // itself is `allocate_stable`, so the exact deque path can store it
+        // without a reload; a subclass `allocate_instance` pins it.
         let initial_block = deque_block::new(PY_NULL, PY_NULL);
-        // Stable (non-moving) allocation: mutators re-derive `self` across
-        // block allocations, just as the translated RPython object retains
-        // identity while its block chain grows.
-        W_Deque::allocate_stable(W_Deque {
-            ob: pyre_object::PyObject {
-                ob_type: std::ptr::null(),
-                w_class: std::ptr::null_mut(),
+        Ok(W_Deque::allocate_instance(
+            W_Deque {
+                ob: pyre_object::PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+                leftblock: initial_block,
+                rightblock: initial_block,
+                leftindex: CENTER + 1,
+                rightindex: CENTER,
+                len: 0,
+                maxlen: -1,
+                lock: PY_NULL,
             },
-            leftblock: initial_block,
-            rightblock: initial_block,
-            leftindex: CENTER + 1,
-            rightindex: CENTER,
-            len: 0,
-            maxlen: -1,
-            lock: PY_NULL,
-            w_slots: PY_NULL,
-        })
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        ))
     }
 
     // interp_deque.py:619-620 — exact classmethod binding preserves a deque
@@ -1683,4 +1672,63 @@ crate::py_module! {
         "app_defaultdict.py" => ["defaultdict"],
         "app_odict.py" => ["OrderedDict"],
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyre_object::PY_NULL;
+
+    #[test]
+    fn deque_subclass_instance_uses_user_typeptr() {
+        // A non-null subtype that is not the builtin type object takes
+        // `typedef.py` `_getusercls`. No live VM: the finalizer hook is unset.
+        static SUB: pyre_object::PyObject = pyre_object::PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        };
+        let sub = &SUB as *const pyre_object::PyObject as PyObjectRef;
+        let block = deque_block::new(PY_NULL, PY_NULL);
+        let obj = W_Deque::allocate_instance(
+            W_Deque {
+                ob: pyre_object::PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+                leftblock: block,
+                rightblock: block,
+                leftindex: super::CENTER + 1,
+                rightindex: super::CENTER,
+                len: 0,
+                maxlen: -1,
+                lock: PY_NULL,
+            },
+            sub,
+        );
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &DEQUE_USER_TYPE));
+            assert!(crate::objspace::std::mapdict::has_mapdict_layout(obj));
+        }
+        let exact_block = deque_block::new(PY_NULL, PY_NULL);
+        let exact = W_Deque::allocate_instance(
+            W_Deque {
+                ob: pyre_object::PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+                leftblock: exact_block,
+                rightblock: exact_block,
+                leftindex: super::CENTER + 1,
+                rightindex: super::CENTER,
+                len: 0,
+                maxlen: -1,
+                lock: PY_NULL,
+            },
+            PY_NULL,
+        );
+        unsafe {
+            assert!(std::ptr::eq((*exact).ob_type, &DEQUE_TYPE));
+            assert!(!crate::objspace::std::mapdict::has_mapdict_layout(exact));
+        }
+    }
 }

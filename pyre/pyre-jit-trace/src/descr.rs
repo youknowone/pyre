@@ -5066,6 +5066,58 @@ static W_BUFFERABLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock:
     )
 });
 
+static W_DEQUE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_collections::W_DequeUser>(),
+        pyre_interpreter::module::_collections::W_DEQUE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_collections::DEQUE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_collections::W_DequeUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_collections::W_DequeUser, storage),
+        "W_DequeUser",
+        "module::_collections::W_DequeUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF00,
+    )
+});
+
+static W_STRUCT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::r#struct::W_StructUser>(),
+        pyre_interpreter::module::r#struct::W_STRUCT_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::r#struct::STRUCT_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::r#struct::W_StructUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::r#struct::W_StructUser, storage),
+        "W_StructUser",
+        "module::struct::W_StructUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF10,
+    )
+});
+
+static W_GENERIC_ALIAS_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::_pypy_generic_alias::GenericAliasUser>(),
+        pyre_object::_pypy_generic_alias::W_GENERIC_ALIAS_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::_pypy_generic_alias::GenericAliasUser, map),
+        std::mem::offset_of!(pyre_object::_pypy_generic_alias::GenericAliasUser, storage),
+        "GenericAliasUser",
+        "_pypy_generic_alias::GenericAliasUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF20,
+    )
+});
+
+static W_LONG_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::longobject::W_LONG_USER_OBJECT_SIZE,
+        pyre_object::longobject::W_LONG_USER_GC_TYPE_ID,
+        &pyre_object::pyobject::LONG_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::longobject::W_LongObjectUser, map),
+        std::mem::offset_of!(pyre_object::longobject::W_LongObjectUser, storage),
+        "W_LongObjectUser",
+        "longobject::W_LongObjectUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF30,
+    )
+});
+
 struct ModuleUserLayoutGroup {
     /// `ob_type` of a `typedef.py` `_getusercls` instance.
     pytype: usize,
@@ -5254,6 +5306,26 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         )
     } {
         field_descr_from_group(&W_BUFFERABLE_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_collections::DEQUE_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_DEQUE_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::r#struct::STRUCT_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STRUCT_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_GENERIC_ALIAS_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::is_long(obj) } {
+        field_descr_from_group(&W_LONG_USER_DESCR_GROUP, 0)
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 0) } {
         descr
     } else {
@@ -5350,6 +5422,26 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         )
     } {
         field_descr_from_group(&W_BUFFERABLE_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_collections::DEQUE_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_DEQUE_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::r#struct::STRUCT_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STRUCT_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_GENERIC_ALIAS_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::is_long(obj) } {
+        field_descr_from_group(&W_LONG_USER_DESCR_GROUP, 1)
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 1) } {
         descr
     } else {
@@ -7335,6 +7427,19 @@ mod tests {
             W_BUFFERABLE_USER_DESCR_GROUP.field_descrs[0].index(),
             0x6100_0250
         );
+        assert_eq!(
+            W_DEQUE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F00
+        );
+        assert_eq!(
+            W_STRUCT_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F10
+        );
+        assert_eq!(
+            W_GENERIC_ALIAS_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F20
+        );
+        assert_eq!(W_LONG_USER_DESCR_GROUP.field_descrs[0].index(), 0x6100_0F30);
         assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
             Type::Ref
@@ -9326,6 +9431,18 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
             LazyLock::force(&W_BUFFERABLE_USER_DESCR_GROUP);
         },
     ),
+    ("module::_collections::W_DequeUser", || {
+        LazyLock::force(&W_DEQUE_USER_DESCR_GROUP);
+    }),
+    ("module::struct::W_StructUser", || {
+        LazyLock::force(&W_STRUCT_USER_DESCR_GROUP);
+    }),
+    ("_pypy_generic_alias::GenericAliasUser", || {
+        LazyLock::force(&W_GENERIC_ALIAS_USER_DESCR_GROUP);
+    }),
+    ("longobject::W_LongObjectUser", || {
+        LazyLock::force(&W_LONG_USER_DESCR_GROUP);
+    }),
     ("tupleobject::W_TupleObject", || {
         LazyLock::force(&W_TUPLE_DESCR_GROUP);
     }),

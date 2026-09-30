@@ -1004,6 +1004,24 @@ unsafe fn int_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     unsafe { pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f) };
 }
 
+/// `W_LongObjectUser` (`typedef.py` `_getusercls`). The base offset trace
+/// walks `w_class` and the immutable rbigint `value`; this hook does both,
+/// then mapdict `storage`. `value` is traced whenever it is non-null: the
+/// exact long's offset trace does not ask whether the collector owns it.
+unsafe fn long_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let long = unsafe { &mut *(obj_addr as *mut pyre_object::longobject::W_LongObjectUser) };
+    f(&mut long.base.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    if !long.base.value.is_null() {
+        f(std::ptr::addr_of_mut!(long.base.value) as *mut majit_ir::GcRef);
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
 /// Custom trace for `W_ModuleDictObject`
 /// (`dictmultiobject.py W_ModuleDictObject`).
 ///
@@ -4372,8 +4390,43 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut pytype_to_tid,
         &pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BUFFERABLE_USER_PYRE_CLASS_DESCRIPTOR,
     );
+    // Appended `_getusercls` layouts. Parents are the builtin tids already
+    // registered above (deque 110, Struct 119, GenericAlias 87, long 35).
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_collections::W_DEQUE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::r#struct::W_STRUCT_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::_pypy_generic_alias::W_GENERIC_ALIAS_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    let long_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::longobject::W_LONG_USER_OBJECT_SIZE,
+        w_long_tid,
+        long_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        long_user_tid,
+        pyre_object::longobject::W_LONG_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::LONG_USER_TYPE as *const _ as usize,
+        long_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::LONG_USER_TYPE as *const _ as usize,
+        long_user_tid,
+    );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 196),
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 200),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,

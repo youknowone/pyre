@@ -446,7 +446,13 @@ pub static TUPLE_USER_TYPE: PyType = new_user_pytype(
     std::mem::offset_of!(crate::tupleobject::W_TupleObjectUser, map),
 );
 pub static DICT_TYPE: PyType = new_pytype("dict");
-pub static LONG_TYPE: PyType = new_pytype("int");
+pub static LONG_TYPE: PyType = new_pytype_with_user_subclass("int", &LONG_USER_TYPE);
+/// `W_LongObjectUser` (`typedef.py` `_getusercls(W_LongObject)`).
+pub static LONG_USER_TYPE: PyType = new_user_pytype(
+    "int",
+    &LONG_TYPE,
+    std::mem::offset_of!(crate::longobject::W_LongObjectUser, map),
+);
 pub static NONE_TYPE: PyType = new_pytype("NoneType");
 pub static NOTIMPLEMENTED_TYPE: PyType = new_pytype("NotImplementedType");
 pub static ELLIPSIS_TYPE: PyType = new_pytype("ellipsis");
@@ -839,6 +845,8 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // plus enumerate/map/filter/zip/reversed/super/property, the itertools
     // user layouts, and `__pypy__.Bufferable`).
     // 169-195 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
+    // 196-199 append deque, Struct, GenericAlias and big-int user layouts
+    // without moving the closed block above.
     (158, Some(1)),
     (159, Some(34)),
     (160, Some(8)),
@@ -877,20 +885,25 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (193, Some(93)),
     (194, Some(95)),
     (195, Some(149)),
+    // Appended `_getusercls` layouts. Fixed ids 0-195 stay put.
+    (196, Some(110)), // collections.deque
+    (197, Some(119)), // _struct.Struct
+    (198, Some(87)),  // types.GenericAlias
+    (199, Some(35)),  // W_LongObject
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail, after the `_getusercls` layouts (158-195).
-    (196, Some(0)),
-    // Native-only type IDs 197 and 198 represent `posix.DirEntry` and
+    // posix / console tail, after the `_getusercls` layouts (158-199).
+    (200, Some(0)),
+    // Native-only type IDs 201 and 202 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (197, Some(0)),
+    (201, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (198, Some(0)),
+    (202, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (199, Some(0)),
+    (203, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1059,12 +1072,29 @@ mod subclass_range_publication_tests {
             ensure_object_subclass_ranges_initialized();
             assert!(unsafe { ll_issubclass(&BOOL_TYPE, &INT_TYPE) });
         } else {
-            // A full configuration can omit an interpreter-only tail class.
-            let hierarchy = &SUBCLASS_RANGE_HIERARCHY[..SUBCLASS_RANGE_HIERARCHY.len() - 1];
-            let omitted = SUBCLASS_RANGE_HIERARCHY.last().unwrap().0;
+            // Omit one interpreter-only class that nothing else parents on.
+            // On a native target that is the posix tail. On wasm32 the
+            // object-crate user layouts close the table, so the omitted id
+            // is `_struct.Struct`'s user layout in the middle.
+            let omitted_index = SUBCLASS_RANGE_HIERARCHY
+                .iter()
+                .rposition(|(id, _)| {
+                    object_aliases.iter().all(|alias| alias.type_id != *id)
+                        && SUBCLASS_RANGE_HIERARCHY
+                            .iter()
+                            .all(|(_, parent)| *parent != Some(*id))
+                })
+                .expect("an interpreter-only class with no children");
+            let omitted = SUBCLASS_RANGE_HIERARCHY[omitted_index].0;
             assert!(object_aliases.iter().all(|alias| alias.type_id != omitted));
+            let hierarchy: Vec<(u32, Option<u32>)> = SUBCLASS_RANGE_HIERARCHY
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != omitted_index)
+                .map(|(_, entry)| *entry)
+                .collect();
             let initialize_and_read = || {
-                initialize_subclass_ranges_from_hierarchy(hierarchy, &[&object_aliases, &extra]);
+                initialize_subclass_ranges_from_hierarchy(&hierarchy, &[&object_aliases, &extra]);
                 assert_eq!(
                     EXTRA_ALIAS.subclassrange_max.load(Ordering::Relaxed),
                     (hierarchy.len() * 2 - 1) as i64,
@@ -1466,6 +1496,8 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(192, &crate::interp_itertools::PAIRWISE_USER_TYPE),
         subclass_range_alias(193, &crate::interp_itertools::CYCLE_USER_TYPE),
         subclass_range_alias(194, &crate::interp_itertools::CHAIN_USER_TYPE),
+        subclass_range_alias(198, &crate::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE),
+        subclass_range_alias(199, &LONG_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
@@ -1684,7 +1716,7 @@ pub unsafe fn is_complex(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_long(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &LONG_TYPE) }
+    unsafe { py_type_check(obj, &LONG_TYPE) || py_type_check(obj, &LONG_USER_TYPE) }
 }
 
 #[inline]

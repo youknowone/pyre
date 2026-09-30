@@ -6423,6 +6423,30 @@ pub fn delweakref(self_ref: PyObjectRef) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn long_subclass_instance_uses_user_typeptr() {
+        let payload = majit_rlib::rbigint::RBigInt::from(10_i64)
+            .pow(&majit_rlib::rbigint::RBigInt::from(30_i64), None)
+            .expect("10**30");
+        let exact = pyre_object::longobject::w_long_new(payload);
+        let raw = unsafe { pyre_object::longobject::w_long_get_raw_value(exact) };
+        let user = pyre_object::longobject::w_long_subclass_from_raw(raw);
+        unsafe {
+            assert!(std::ptr::eq(
+                (*user).ob_type,
+                &pyre_object::pyobject::LONG_USER_TYPE
+            ));
+            assert!(has_mapdict_layout(user));
+            assert!(pyre_object::is_long(user));
+            assert!(std::ptr::eq(
+                (*exact).ob_type,
+                &pyre_object::pyobject::LONG_TYPE
+            ));
+            assert!(!has_mapdict_layout(exact));
+            assert!(pyre_object::is_long(exact));
+        }
+    }
+
     // Node names are WTF-8; the test fixtures spell them with plain UTF-8
     // string literals. `wn` borrows a `&Wtf8` view for the lookup/read/write
     // helpers, `wb` produces an owned `Wtf8Buf` for `new_plain_attribute`.

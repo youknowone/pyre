@@ -16,7 +16,7 @@ use pyre_macros::pyre_class;
 /// - `args`: tuple of the type arguments (`(int,)`) — `_args`
 /// - `parameters`: tuple of free type variables — `_parameters`
 /// - `unpacked`: set by `_make_starred` for `*Ts` unpacking — `__unpacked__`
-#[pyre_class("types.GenericAlias", static_name = "GENERIC_ALIAS")]
+#[pyre_class("types.GenericAlias", static_name = "GENERIC_ALIAS", user_layout)]
 pub struct GenericAlias {
     pub origin: PyObjectRef,
     pub args: PyObjectRef,
@@ -30,7 +30,8 @@ pub struct GenericAlias {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_generic_alias(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &GENERIC_ALIAS_TYPE)
+    // Exact alias and `typedef.py` `_getusercls` share the payload layout.
+    py_type_check(obj, &GENERIC_ALIAS_TYPE) || py_type_check(obj, &GENERIC_ALIAS_USER_TYPE)
 }
 
 /// Allocate a new GenericAlias.
@@ -42,6 +43,7 @@ pub fn w_generic_alias_new(
     origin: PyObjectRef,
     args: PyObjectRef,
     parameters: PyObjectRef,
+    w_subtype: PyObjectRef,
 ) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
@@ -49,34 +51,53 @@ pub fn w_generic_alias_new(
     let _ = crate::gc_roots::pin_root(origin);
     let _ = crate::gc_roots::pin_root(args);
     let _ = crate::gc_roots::pin_root(parameters);
-    // Allocate with empty pointer fields, then reload the GC-forwarded roots
-    // and install them.  Building the payload before `allocate` retained the
-    // pre-minor-collection addresses even though the shadow-stack slots were
-    // updated during the allocation.
-    // RPython allocates the alias as a GC object whose `_args` and
-    // `_parameters` fields are traced.  Use pyre's stable managed bridge:
-    // the legacy `allocate` path lives outside the collector, so a minor GC
-    // could move either tuple without forwarding these owning fields.
-    let obj = GenericAlias::allocate_stable(GenericAlias {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
-        },
-        origin: std::ptr::null_mut(),
-        args: std::ptr::null_mut(),
-        parameters: std::ptr::null_mut(),
-        unpacked: false,
-    });
-    unsafe {
-        (*(obj as *mut GenericAlias)).origin = crate::gc_roots::shadow_stack_get(save_point);
-        (*(obj as *mut GenericAlias)).args = crate::gc_roots::shadow_stack_get(save_point + 1);
-        (*(obj as *mut GenericAlias)).parameters =
-            crate::gc_roots::shadow_stack_get(save_point + 2);
-        // `allocate_stable` barriers the initially-empty payload.  Record the
-        // young pointers installed afterwards as well.
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    let _ = crate::gc_roots::pin_root(w_subtype);
+    let subtype = crate::gc_roots::shadow_stack_get(save_point + 3);
+    // Exact alias: `allocate_stable` does not reload payload `PyObjectRef`s,
+    // so the header is born with null fields and the shadow-stack words are
+    // installed afterwards. A subclass is `typedef.py` `_getusercls` via
+    // `objspace.py` `allocate_instance`, which pins those words itself.
+    if subtype.is_null()
+        || std::ptr::eq(
+            subtype,
+            crate::pyobject::get_instantiate(&GENERIC_ALIAS_TYPE),
+        )
+    {
+        let obj = GenericAlias::allocate_stable(GenericAlias {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            origin: std::ptr::null_mut(),
+            args: std::ptr::null_mut(),
+            parameters: std::ptr::null_mut(),
+            unpacked: false,
+        });
+        unsafe {
+            (*(obj as *mut GenericAlias)).origin = crate::gc_roots::shadow_stack_get(save_point);
+            (*(obj as *mut GenericAlias)).args = crate::gc_roots::shadow_stack_get(save_point + 1);
+            (*(obj as *mut GenericAlias)).parameters =
+                crate::gc_roots::shadow_stack_get(save_point + 2);
+            // `allocate_stable` barriers the initially-empty payload.  Record the
+            // young pointers installed afterwards as well.
+            crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        }
+        obj
+    } else {
+        GenericAlias::allocate_instance(
+            GenericAlias {
+                ob: PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+                origin: crate::gc_roots::shadow_stack_get(save_point),
+                args: crate::gc_roots::shadow_stack_get(save_point + 1),
+                parameters: crate::gc_roots::shadow_stack_get(save_point + 2),
+                unpacked: false,
+            },
+            crate::gc_roots::shadow_stack_get(save_point + 3),
+        )
     }
-    obj
 }
 
 /// `_origin` reader.
@@ -130,7 +151,7 @@ mod tests {
         let origin = w_int_new(1); // stand-in for `list`
         let args = w_tuple_new(vec![w_int_new(2)]); // stand-in for `(int,)`
         let params = w_tuple_new(vec![]);
-        let ga = w_generic_alias_new(origin, args, params);
+        let ga = w_generic_alias_new(origin, args, params, crate::PY_NULL);
         unsafe {
             assert!(is_generic_alias(ga));
             assert!(!is_int(ga));
@@ -144,7 +165,7 @@ mod tests {
         let origin = w_int_new(1);
         let args = w_tuple_new(vec![]);
         let params = w_tuple_new(vec![]);
-        let ga = w_generic_alias_new(origin, args, params);
+        let ga = w_generic_alias_new(origin, args, params, crate::PY_NULL);
         unsafe {
             w_generic_alias_set_unpacked(ga, true);
             assert!(w_generic_alias_get_unpacked(ga));

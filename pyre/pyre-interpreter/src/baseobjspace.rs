@@ -5933,11 +5933,12 @@ pub fn getdict(mut obj: PyObjectRef) -> PyResult {
 /// `__slots__` storage fallback for a native-layout subclass instance.
 ///
 /// A `W_Member` slot normally reads/writes the receiver's mapdict slot
-/// storage (`MapdictSlotsSupport`), which only a `W_ObjectObject` carries.
-/// Native subclasses with an object-resident `w_slots` field carry their
-/// PyPy-shaped indexed storage on the payload object itself. Other fixed Rust
-/// payloads still fall back to an exposed instance `__dict__` when their type
-/// has one. `None`/`false` means the receiver has no writable storage.
+/// storage (`MapdictSlotsSupport`). A `typedef.py` `_getusercls` layout,
+/// including a `collections.deque` subclass, carries that storage and is
+/// handled before this fallback. A `property` subclass's explicit `__doc__`
+/// slot lives in `W_Property.w_doc`. Other fixed payloads fall back to an
+/// exposed instance `__dict__` when their type has one. `None`/`false` means
+/// the receiver has no writable storage.
 pub(crate) fn native_slot_get(
     obj: PyObjectRef,
     name: &str,
@@ -5951,9 +5952,6 @@ pub(crate) fn native_slot_get(
     if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
         let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
         return Ok((!value.is_null()).then_some(value));
-    }
-    if crate::module::_collections::is_deque(obj) {
-        return Ok(unsafe { crate::module::_collections::deque_slot_get(obj, index as usize) });
     }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
@@ -5976,10 +5974,6 @@ pub(crate) fn native_slot_set(
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, value) };
         return Ok(true);
     }
-    if crate::module::_collections::is_deque(obj) {
-        unsafe { crate::module::_collections::deque_slot_set(obj, index as usize, value) };
-        return Ok(true);
-    }
     let w_dict = pyre_object::with_roots!(value => getdict(obj))?;
     if w_dict.is_null() {
         return Ok(false);
@@ -5996,9 +5990,6 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
         }
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, pyre_object::PY_NULL) };
         return Ok(true);
-    }
-    if crate::module::_collections::is_deque(obj) {
-        return Ok(unsafe { crate::module::_collections::deque_slot_del(obj, index as usize) });
     }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {

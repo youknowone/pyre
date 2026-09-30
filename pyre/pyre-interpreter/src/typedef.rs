@@ -3494,13 +3494,14 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // small-int cache so each has its own identity). Set w_class = cls so
     // type()/isinstance() see the subclass while preserving the underlying
     // int/long storage layout for arithmetic. A magnitude that overflows
-    // i64 is a W_LongObject; like PyPy's `W_LongObject(w_value.asbigint())`,
-    // the subtype wrapper shares the immutable rbigint payload.
+    // i64 is a `W_LongObjectUser` (`typedef.py` `_getusercls`); like PyPy's
+    // `space.allocate_instance(W_LongObject, w_inttype)` in `intobject.py`
+    // `_new_int`, the subtype wrapper shares the immutable rbigint payload.
     let obj = if unsafe { pyre_object::is_long(value) } {
         unsafe {
-            pyre_object::longobject::w_long_from_raw(pyre_object::longobject::w_long_get_raw_value(
-                value,
-            ))
+            pyre_object::longobject::w_long_subclass_from_raw(
+                pyre_object::longobject::w_long_get_raw_value(value),
+            )
         }
     } else {
         let int_val = unsafe { pyre_object::w_int_get_value(value) };

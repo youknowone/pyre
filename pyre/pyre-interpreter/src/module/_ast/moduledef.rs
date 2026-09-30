@@ -1163,6 +1163,7 @@ fn asdl_field_type(
         '*' => crate::_pypy_generic_alias::make_generic_alias(
             crate::typedef::gettypeobject(&pyre_object::LIST_TYPE),
             roots.get(base_slot),
+            pyre_object::PY_NULL,
         ),
         '?' => {
             crate::_pypy_generic_alias::create_union(roots.get(base_slot), pyre_object::w_none())

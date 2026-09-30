@@ -1353,7 +1353,7 @@ pub(crate) fn unpack_half(bits: u16) -> f64 {
 /// format string and precomputed size.
 // CPython 3.14 Modules/_struct.c:_struct_exec uses
 // PyType_FromModuleAndSpec; PyStructType carries IMMUTABLETYPE.
-#[crate::pyre_class("_struct.Struct", cpython_heaptype)]
+#[crate::pyre_class("_struct.Struct", cpython_heaptype, user_layout)]
 pub struct W_Struct {
     /// Format string object (`text_or_bytes_w` of the constructor arg),
     /// promoted by value before each pack/unpack.  `_immutable_fields_ =
@@ -1429,16 +1429,34 @@ impl W_Struct {
     /// `__init__`, so the allocator accepts and discards the trailing
     /// `__args__` instead of failing the gateway arity check.
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
-        W_Struct::allocate_stable(W_Struct {
-            ob: pyre_object::PyObject {
-                ob_type: std::ptr::null(),
-                w_class: std::ptr::null_mut(),
+    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        // Construction arguments are consumed/validated by `__init__`; accept
+        // (and ignore) any positional or keyword args here via the whole-slice
+        // catch-all so a subclass with its own `__init__` keyword parameters
+        // does not trip an unknown-keyword error in `__new__`.
+        let _ = _args;
+        // `objspace.py` `allocate_instance` validates the requested subtype.
+        // The builtin is the base layout; a subclass is `typedef.py`
+        // `_getusercls` (`interp_struct.py` `W_Struct.descr__new__`).
+        crate::typedef::check_user_subclass(type_object(), cls)?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        // `w_str_new` builds an immortal exact `str`. The requested class
+        // stays rooted across that allocation.
+        let format = w_str_new("");
+        Ok(W_Struct::allocate_instance(
+            W_Struct {
+                ob: pyre_object::PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+                format,
+                size: -1,
+                w_weakreflifeline: PY_NULL,
             },
-            format: w_str_new(""),
-            size: -1,
-            w_weakreflifeline: PY_NULL,
-        })
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        ))
     }
 
     /// `interp_struct.py descr__init__` — store the (normalized)
