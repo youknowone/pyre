@@ -313,6 +313,34 @@ pub fn sethostname(hostname: &[u8]) -> Result<(), CSocketError> {
     Ok(())
 }
 
+/// `dup`. The new descriptor has `FD_CLOEXEC` set.
+#[cfg(unix)]
+pub fn dup(fd: INT) -> Result<INT, CSocketError> {
+    let n = unsafe { crate::_rsocket_rffi::dup(fd) };
+    if n < 0 {
+        return Err(last_error());
+    }
+    unsafe {
+        crate::_rsocket_rffi::fcntl(n, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    Ok(n)
+}
+
+/// `socketpair`. Both descriptors have `FD_CLOEXEC` set.
+#[cfg(unix)]
+pub fn socketpair(family: INT, ty: INT, proto: INT) -> Result<(INT, INT), CSocketError> {
+    let mut fds = [0; 2];
+    let res = unsafe { crate::_rsocket_rffi::socketpair(family, ty, proto, fds.as_mut_ptr()) };
+    if res < 0 {
+        return Err(last_error());
+    }
+    unsafe {
+        crate::_rsocket_rffi::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+        crate::_rsocket_rffi::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    Ok((fds[0], fds[1]))
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
@@ -474,6 +502,29 @@ mod tests {
         match inet_pton(1234, c"1.2.3.4") {
             Err(PtonError::Family(code)) => assert_eq!(code, libc::EAFNOSUPPORT),
             other => panic!("family 1234 returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dup_and_socketpair_set_cloexec() {
+        unsafe {
+            let fd = crate::_rsocket_rffi::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket errno {}", crate::rposix::get_saved_errno());
+            let n = dup(fd).expect("dup");
+            assert_ne!(n, fd);
+            let flags = crate::_rsocket_rffi::fcntl(n, libc::F_GETFD, 0);
+            assert!(flags >= 0 && (flags & libc::FD_CLOEXEC) != 0);
+            assert_eq!(dup(-1).expect_err("bad fd").errno, libc::EBADF);
+            assert_eq!(crate::_rsocket_rffi::socketclose(fd), 0);
+            assert_eq!(crate::_rsocket_rffi::socketclose(n), 0);
+
+            let (a, b) = socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0).expect("pair");
+            assert_ne!(a, b);
+            for fd in [a, b] {
+                let flags = crate::_rsocket_rffi::fcntl(fd, libc::F_GETFD, 0);
+                assert!(flags >= 0 && (flags & libc::FD_CLOEXEC) != 0);
+                assert_eq!(crate::_rsocket_rffi::socketclose(fd), 0);
+            }
         }
     }
 }

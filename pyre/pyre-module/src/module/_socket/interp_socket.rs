@@ -2159,29 +2159,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 } else {
                     unsafe { pyre_object::w_int_get_value(args[2]) as libc::c_int }
                 };
-                let mut fds = [0 as libc::c_int; 2];
-                let r = unsafe {
-                    majit_rlib::_rsocket_rffi::socketpair(family, ty, proto, fds.as_mut_ptr())
-                };
-                if r != 0 {
-                    return Err(socket_last_error());
-                }
-                // `socketpair(inheritable=False)` — every socket pyre creates
-                // from the module starts with FD_CLOEXEC set.
-                unsafe {
-                    majit_rlib::_rsocket_rffi::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
-                    majit_rlib::_rsocket_rffi::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
-                }
+                let (fd0, fd1) = majit_rlib::rsocket::socketpair(family, ty, proto).map_err(
+                    |error| socket_io_err(std::io::Error::from_raw_os_error(error.errno)),
+                )?;
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
-                fields.push(socket_from_fd(fds[0], family, ty, proto)?);
-                fields.push(socket_from_fd(fds[1], family, ty, proto)?);
+                fields.push(socket_from_fd(fd0, family, ty, proto)?);
+                fields.push(socket_from_fd(fd1, family, ty, proto)?);
                 Ok(pyre_object::w_tuple_new(fields.take()))
             }),
         );
 
-        // dup(fd) → new fd.  Per `rsocket.py:dup()` the duplicated
-        // descriptor sets FD_CLOEXEC (rsocket goes through dup3+CLOEXEC
-        // on Linux; we use the portable fcntl path).
+        // dup(fd) → new fd. The duplicated descriptor has FD_CLOEXEC set.
         pyre_interpreter::module_ns_store(
             ns,
             "dup",
@@ -2199,13 +2187,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                         ));
                     }
                     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                    let n = unsafe { majit_rlib::_rsocket_rffi::dup(fd) };
-                    if n < 0 {
-                        return Err(socket_last_error());
-                    }
-                    unsafe {
-                        majit_rlib::_rsocket_rffi::fcntl(n, libc::F_SETFD, libc::FD_CLOEXEC);
-                    }
+                    let n = majit_rlib::rsocket::dup(fd).map_err(|error| {
+                        socket_io_err(std::io::Error::from_raw_os_error(error.errno))
+                    })?;
                     Ok(pyre_object::w_int_new(n as i64))
                 },
                 1,
@@ -2246,13 +2230,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 } else {
                     0
                 };
-                let new_fd = unsafe { majit_rlib::_rsocket_rffi::dup(fd) };
-                if new_fd < 0 {
-                    return Err(socket_last_error());
-                }
-                unsafe {
-                    majit_rlib::_rsocket_rffi::fcntl(new_fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                }
+                let new_fd = majit_rlib::rsocket::dup(fd).map_err(|error| {
+                    socket_io_err(std::io::Error::from_raw_os_error(error.errno))
+                })?;
                 socket_from_fd(new_fd, family, ty, proto)
             }),
         );
