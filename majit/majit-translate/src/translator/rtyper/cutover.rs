@@ -326,7 +326,7 @@ pub(crate) fn dual_gate_check_with_registry(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drive_subject(legacy_graph, call_registry, true)
     }));
-    let (graph, real_value_to_var, real_constants) = match result {
+    let (graph, mut real_value_to_var, mut real_constants) = match result {
         Ok(Ok((graph, value_to_var, _, constants, _))) => (graph, value_to_var, constants),
         Ok(Err(e)) => {
             unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources);
@@ -387,6 +387,20 @@ pub(crate) fn dual_gate_check_with_registry(
             "dual-gate compared set empty".to_string(),
         ));
     }
+    // `follow_link` records `links_followed` only for an edge the
+    // annotator walks (`annrpython.py`). Phase B still
+    // `setconcretetype`s an unfollowed return to `Void` after
+    // `force_return_var_annotation` seeds `s_ImpossibleValue`.
+    // Publishing that twin would replace the legacy walker's kind, and
+    // `func_result_kind` would then disagree with `history.getkind` of
+    // the live CFG edge. A followed return typed `Void` still diverges
+    // above and skips.
+    keep_legacy_return_when_unfollowed_void(
+        legacy_graph,
+        &mut real_value_to_var,
+        &mut real_constants,
+        excluded_legacy.as_ref(),
+    );
     Ok(DualGateOutcome::Match {
         real_value_to_var,
         real_constants,
@@ -4950,10 +4964,60 @@ pub(crate) fn dual_gate_outcome_from_cache(
             "two-phase compared set empty".to_string(),
         ));
     }
+    keep_legacy_return_when_unfollowed_void(
+        legacy,
+        &mut value_to_var,
+        &mut constants,
+        excluded_legacy.as_ref(),
+    );
     Ok(DualGateOutcome::Match {
         real_value_to_var: value_to_var,
         real_constants: constants,
     })
+}
+
+/// Drop an unfollowed return whose real concretetype is `Void` when the
+/// legacy cell already has a kind. See the call in
+/// [`dual_gate_check_with_registry`].
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn keep_legacy_return_when_unfollowed_void(
+    legacy: &LegacyGraph,
+    value_to_var: &mut LegacyToTyped,
+    constants: &mut HashMap<Variable, LowLevelType>,
+    excluded_legacy: Option<&HashSet<Variable>>,
+) {
+    let Some(excluded) = excluded_legacy else {
+        return;
+    };
+    let Some(ret) = legacy.block(legacy.returnblock).inputargs.first().cloned() else {
+        return;
+    };
+    if !excluded.contains(&ret) {
+        return;
+    }
+    let Some(typed) = value_to_var.get(&ret) else {
+        return;
+    };
+    let Some(ll) = typed.concretetype() else {
+        return;
+    };
+    let Ok(kind) = lowleveltype_to_concrete(&ll) else {
+        return;
+    };
+    if kind != crate::model::ConcreteType::Void {
+        return;
+    }
+    match LegacyGraph::concretetype_of(&ret) {
+        crate::model::ConcreteType::Void | crate::model::ConcreteType::Unknown => return,
+        crate::model::ConcreteType::Signed
+        | crate::model::ConcreteType::GcRef
+        | crate::model::ConcreteType::Float => {}
+    }
+    value_to_var.remove(&ret);
+    constants.remove(&ret);
 }
 
 #[cfg(test)]
@@ -8809,6 +8873,81 @@ mod tests {
                 ]))
                 .is_none(),
             "safepoint contains an Acquire load but is not a word-only reader"
+        );
+    }
+
+    /// An unfollowed return whose real twin is `Void` must not overwrite a
+    /// legacy `Signed` cell. A followed return, and a session that never
+    /// recorded `links_followed`, keeps the twin.
+    #[test]
+    fn unfollowed_void_return_keeps_the_legacy_kind() {
+        use crate::model::ConcreteType;
+
+        let legacy = LegacyGraph::new("unfollowed_void_return");
+        let ret = legacy.block(legacy.returnblock).inputargs[0].clone();
+        ret.set_concretetype(crate::model::concrete_to_canonical_lltype(
+            ConcreteType::Signed,
+        ));
+        let typed = Variable::new();
+        typed.set_concretetype(crate::model::concrete_to_canonical_lltype(
+            ConcreteType::Void,
+        ));
+        let mut value_to_var = LegacyToTyped::new();
+        value_to_var.insert(ret.clone(), typed);
+        let mut constants = HashMap::new();
+        constants.insert(ret.clone(), LowLevelType::Void);
+        let excluded = HashSet::from([ret.clone()]);
+        keep_legacy_return_when_unfollowed_void(
+            &legacy,
+            &mut value_to_var,
+            &mut constants,
+            Some(&excluded),
+        );
+        assert!(
+            !value_to_var.contains_key(&ret),
+            "unfollowed void twin stays out of the publish map"
+        );
+        assert!(!constants.contains_key(&ret));
+        assert_eq!(
+            LegacyGraph::concretetype_of(&ret),
+            ConcreteType::Signed,
+            "legacy kind is the CFG return `history.getkind` reads"
+        );
+
+        let typed = Variable::new();
+        typed.set_concretetype(crate::model::concrete_to_canonical_lltype(
+            ConcreteType::Void,
+        ));
+        let mut followed_map = LegacyToTyped::new();
+        followed_map.insert(ret.clone(), typed);
+        let mut followed_constants = HashMap::new();
+        keep_legacy_return_when_unfollowed_void(
+            &legacy,
+            &mut followed_map,
+            &mut followed_constants,
+            Some(&HashSet::new()),
+        );
+        assert!(
+            followed_map.contains_key(&ret),
+            "a followed return keeps its void twin"
+        );
+
+        let typed = Variable::new();
+        typed.set_concretetype(crate::model::concrete_to_canonical_lltype(
+            ConcreteType::Void,
+        ));
+        let mut unscoped = LegacyToTyped::new();
+        unscoped.insert(ret.clone(), typed);
+        let mut unscoped_constants = HashMap::new();
+        keep_legacy_return_when_unfollowed_void(
+            &legacy,
+            &mut unscoped,
+            &mut unscoped_constants,
+            None,
+        );
+        assert!(
+            unscoped.contains_key(&ret),
+            "no links_followed record leaves the twin in place"
         );
     }
 }
