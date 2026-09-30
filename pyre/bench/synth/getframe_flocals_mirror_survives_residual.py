@@ -3,11 +3,6 @@
 # ratio is not a measurement; the ceiling is fitted to the slowest of nine
 # local readings across the three backends plus headroom.
 #
-# Keep the trip count on the clamped side of that floor. At 90000 iterations
-# ubuntu cranelift measured pypy exec 0.005s, just over `EXEC_TIME_FLOOR_S`,
-# and applied this ceiling (29.2x > 12x). The ceiling was fitted while that
-# exec was clamped. 30000 scales the 0.005s back under the clamp.
-#
 # Folding `frame.f_locals` mirrors the virtualizable shadow into the live
 # `locals_cells_stack_w` array, because pyre answers the attribute with a 3.14
 # `FrameLocalsProxy` that reads that array lazily rather than copying out of it
@@ -36,4 +31,4 @@ def f(n):
     return bad
 
 
-print("mismatches:", f(30000))
+print("mismatches:", f(90000))

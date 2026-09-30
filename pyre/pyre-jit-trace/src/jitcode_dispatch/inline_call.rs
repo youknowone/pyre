@@ -6940,6 +6940,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // does not inherit that route's DeferredCall admission.
     let mut foriter_deferred_admit = false;
     let mut foriter_dirty_seeded_resume_admit = false;
+    // A handler-bearing `DeferredCall` body that `foriter_deferred_admit`
+    // refuses, but that a seeded frame can carry. See the assignment below.
+    let mut seeded_foriter_deferred = false;
     // The pcs handed to this callee's sub-walk, set by whichever admission
     // below admitted a body the scan could not prove clean everywhere.
     let mut inline_poison_pcs: Option<std::sync::Arc<[usize]>> = None;
@@ -7023,6 +7026,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     && loop_header_admitted
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !body_facts.has_exception_table;
+                // `perform_call` (`pyjitpl.py`) inlines this callee into the
+                // loop being traced and does not also publish it as its own
+                // portal. `foriter_deferred_admit` still refuses
+                // `has_exception_table`. A seeded frame (`try_multiframe` /
+                // `strict_seed`) is the resume coordinate `seeded_deferred`
+                // accepts below, so the same body must reach that admit:
+                // declining here residualizes the call, the callee crosses
+                // `increment_function_threshold` (`warmstate.py`), and
+                // `finish_and_compile` (`compile.py`) attaches a second entry
+                // bridge.
+                seeded_foriter_deferred = (try_multiframe || strict_seed)
+                    && entry_is_call_boundary
+                    && loop_header_admitted
+                    && !pyre_interpreter::code_has_for_iter(callee_code);
                 if !foriter_deferred_admit && fbw_inline_diag_enabled() {
                     eprintln!(
                         "[inline-foriter-deferred] pc={} boundary={entry_is_call_boundary} \
@@ -7178,7 +7195,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
         // A Dirty body is admitted only when the CALL boundary can seed its
         // own MIFrame. Non-call specializer entries remain residual.
-        if !legacy_admit && !poison_admit {
+        if !legacy_admit && !poison_admit && !seeded_foriter_deferred {
             return resolved_inline_decline(op.pc, line!());
         }
     }
@@ -7287,10 +7304,46 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let seeded_inline = try_multiframe || strict_seed;
     let seeded_deferred =
         seeded_inline && branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall);
+    // `perform_call` (`pyjitpl.py`) traces the taken path and pushes one
+    // MIFrame per admitted callee. `can_inline_callable` (`warmstate.py`)
+    // does not residualize that callee because an `except: raise` arm
+    // exists: the arm is a guard side exit. Refuse the walk only at
+    // `scan.poison`, which is that arm. The call inside the `try` stays
+    // on the traced path. A handler that returns keeps the callee
+    // residual, because its dirty ops are outside every reraise arm.
+    //
+    // A `FOR_ITER` in that callee is the structural abort the branchy gate
+    // exists to keep behind the decline: the walk raises, then
+    // `LoopBearingCalleeInlineUnsupported` fires inside the handler and the
+    // outer CALL is re-executed. `code_has_for_iter` leaves that body
+    // residual. An `except: raise` arm with no `for` still inlines.
+    let handler_reraise_admit = seeded_inline
+        && !branchy_poison_admit
+        && !pyre_interpreter::code_has_for_iter(callee_code)
+        && branchy_handler_scan.as_ref().is_some_and(|scan| {
+            scan.enforceable()
+                && scan.safety != CalleeReplaySafety::Dirty
+                && poison_confined_to_reraise_handlers(body.code, &scan.poison)
+        });
+    if handler_reraise_admit {
+        if let Some(scan) = branchy_handler_scan.as_ref() {
+            inline_poison_pcs = Some(scan.poison.clone().into());
+        }
+    }
+    if fbw_inline_diag_enabled() {
+        if let Some(scan) = branchy_handler_scan.as_ref() {
+            eprintln!(
+                "[inline-reraise-admit] pc={} admit={handler_reraise_admit} \
+                 seeded={seeded_inline} safety={:?} poison={:?}",
+                op.pc, scan.safety, scan.poison,
+            );
+        }
+    }
     if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean)
         && !foriter_dirty_seeded_resume_admit
         && !branchy_poison_admit
         && !seeded_deferred
+        && !handler_reraise_admit
     {
         crate::jitcode_dispatch::census_record(
             if branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall) {

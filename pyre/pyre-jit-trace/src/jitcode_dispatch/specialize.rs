@@ -6648,6 +6648,21 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         return Ok(None);
     };
 
+    // Exact `FrameLocalsProxy`: descend `__getitem__`. No fold row — the
+    // reader is the body (`fast2locals` / `locals_plus_value`, both
+    // `@jit.unroll_safe`). A non-exact proxy or a failed descent keeps
+    // the generic residual below.
+    if unsafe {
+        pyre_interpreter::pyframe::frame_locals_proxy::is_frame_locals_proxy(list_obj)
+            && walker_exact_builtin_class(list_obj).is_some()
+    } {
+        if let Some(hit) = try_walker_orthodox_frame_locals_getitem(
+            ctx, op_pc, list_op, key_op, list_obj, key_obj, dst, dst_bank,
+        )? {
+            return Ok(Some(hit));
+        }
+    }
+
     if let Some(hit) = walker_probe_exact_dict_hit(list_obj, key_obj)? {
         return walker_emit_exact_dict_hit(
             ctx, op_pc, list_op, key_op, list_obj, hit, dst, dst_bank,
@@ -9909,6 +9924,139 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
             .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
+/// Drop a speculative `FrameLocalsProxy.__getitem__` descent and let the
+/// generic residual record the subscript.
+///
+/// The hit arm returns. A miss raises, and a helper the walk cannot
+/// record (`LoopHeaderJdIndexUnresolved`, an unscannable op) would abort
+/// the portal if it propagated. Cut the trace back, drop the heap cache
+/// the helper filled, put the walker's exception slot back to what it held
+/// before the descent, and clear `take_call_error` so the residual path does
+/// not observe the miss.
+fn decline_frame_locals_getitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+    exc_before: (Option<OpRef>, ConcreteValue),
+) -> Result<Option<()>, DispatchError> {
+    ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+    ctx.trace_ctx.heap_cache_mut().reset();
+    ctx.restore_last_exc_value(exc_before.0, exc_before.1);
+    let _ = pyre_interpreter::call::take_call_error();
+    Ok(None)
+}
+
+/// Descend `FrameLocalsProxy::__getitem__` for an exact proxy and an exact
+/// `str` key.
+///
+/// `locals_plus_value` is `@jit.unroll_safe` and reads
+/// `locals_cells_stack_w` through the virtualizable, the same array
+/// `fast2locals` writes. A constant name becomes one `getarrayitem_vable_r`
+/// and the compare forwards. A `CallMayForce` reads memory and keeps the
+/// name's box live across `str(i)`. No fold row: the reader is the body.
+/// A missing jitcode, a non-str key, or a walk that does not return the
+/// value declines to the generic residual. `TraceTooLong` still propagates.
+fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq_op: OpRef,
+    key_op: OpRef,
+    seq_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if dst_bank != 'r' {
+        return Ok(None);
+    }
+    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
+    let exact_str = unsafe {
+        !str_typeobj.is_null()
+            && std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::STR_TYPE)
+            && std::ptr::eq((*key_obj).w_class, str_typeobj)
+    };
+    if !exact_str {
+        return Ok(None);
+    }
+    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode(
+        "pyframe::frame_locals_proxy::FrameLocalsProxy::__getitem__",
+    ) else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // The slot is session-wide: inside an `except` whose type expression
+    // reads the proxy, it holds the exception the match is about to test.
+    // `finish_inline_callee_return` clears it, so put it back after the walk.
+    let exc_before = (ctx.last_exc_value(), ctx.last_exc_value_concrete());
+    let pytype = <pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE;
+    let proxy_typeobj = pyre_object::pyobject::get_instantiate(unsafe { &*pytype });
+    walker_guard_class(ctx, op_pc, seq_op, pytype as i64)?;
+    walker_guard_exact_w_class(ctx, op_pc, seq_op, proxy_typeobj)?;
+    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, key_op, str_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, key_op, str_typeobj)?;
+    ctx.trace_ctx.set_opref_concrete(
+        seq_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        key_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(key_obj as usize)),
+    );
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "frame_locals_getitem_commit",
+        "frame_locals_getitem_call_site",
+        &[],
+        &[],
+        &[seq_op, key_op],
+        &[ConcreteValue::Ref(seq_obj), ConcreteValue::Ref(key_obj)],
+        &[],
+    );
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        // The explicit driver already published this helper in
+        // `exchange.pending` and is waiting to push it. Swallowing the
+        // suspend leaves that slot occupied; the next nested call then
+        // fails the pending-frame assert.
+        Err(error @ DispatchError::TraceTooLong { .. })
+        | Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
+        Err(error) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] FRAME-LOCALS-GETITEM-SUBWALK {error:?}");
+            }
+            return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+        }
+    };
+    let Some(result) = (match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result),
+        _ => None,
+    }) else {
+        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+    };
+    ctx.restore_last_exc_value(exc_before.0, exc_before.1);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
     Ok(Some(()))
 }
