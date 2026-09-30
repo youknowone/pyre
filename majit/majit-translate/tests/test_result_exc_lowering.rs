@@ -1123,3 +1123,111 @@ fn lock_locked_returns_the_bool_word() {
     }
     assert_eq!(returns, 1, "{path}");
 }
+
+/// `getindex_w_index` is `space_index(index)?` followed by a `match` on
+/// `int_w`. `Try::branch` is inlined, so the `?` misses the `branch()`
+/// diamond and `catch_and_rewrap` rebuilds the shell. The break arm still
+/// returned `Result::from_residual`. That call only raises; reminting it
+/// to `i64` makes the CFG return `void` while `FUNC.RESULT` is `i`
+/// (`func_result_kind`, `history.getkind`). The arm must raise the carrier.
+#[test]
+fn getindex_w_index_from_residual_raises() {
+    use majit_translate::model::{LinkArg, ValueType};
+    let path = "pyre_interpreter::baseobjspace::getindex_w_index";
+    let g = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower: {e}"));
+    let mut reachable = vec![false; g.blocks.len()];
+    let mut stack = vec![g.startblock.0];
+    while let Some(block) = stack.pop() {
+        if block >= reachable.len() || reachable[block] {
+            continue;
+        }
+        reachable[block] = true;
+        for link in &g.blocks[block].exits {
+            stack.push(link.target.0);
+        }
+    }
+    let mut ok_returns = 0usize;
+    let mut exc_materialisers = 0usize;
+    for (bi, block) in g.blocks.iter().enumerate() {
+        if !reachable[bi] {
+            continue;
+        }
+        for op in &block.operations {
+            if let OpKind::Call { target, .. } = &op.kind {
+                match target {
+                    CallTarget::Method { name, .. } if name == "from_residual" => {
+                        panic!("reachable from_residual still returns a value");
+                    }
+                    CallTarget::FunctionPath { segments, .. }
+                        if segments.last().map(String::as_str) == Some("pyerror_to_exc_object") =>
+                    {
+                        exc_materialisers += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for link in &block.exits {
+            if link.target != g.returnblock {
+                continue;
+            }
+            assert_eq!(link.args.len(), 1, "scalar return has one arg");
+            let LinkArg::Value(var) = &link.args[0] else {
+                panic!("return arg is a value");
+            };
+            let Some(OpKind::FieldRead { field, ty, .. }) = return_producer(&g, var, 0) else {
+                panic!("return {var:?} is not the Ok payload");
+            };
+            let owner = field.owner_root.as_deref().unwrap_or("");
+            assert_eq!(field.name, "__pos_0", "owner {owner}");
+            assert!(
+                owner.ends_with("::Ok") && owner.contains("Result<i64,PyError>"),
+                "return owner {owner}"
+            );
+            assert_eq!(ty, &ValueType::Int, "Ok payload ty {ty:?}");
+            ok_returns += 1;
+        }
+    }
+    assert_eq!(ok_returns, 1, "{path}");
+    assert_eq!(
+        exc_materialisers, 3,
+        "two int_w Err arms plus the from_residual reraise"
+    );
+    let mut raised_break_carrier = false;
+    for (bi, block) in g.blocks.iter().enumerate() {
+        if !reachable[bi] {
+            continue;
+        }
+        for op in &block.operations {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if segments.last().map(String::as_str) != Some("pyerror_to_exc_object") {
+                continue;
+            }
+            let Some(arg) = args.first().and_then(LinkArg::as_variable) else {
+                continue;
+            };
+            let Some(OpKind::FieldRead { field, .. }) = return_producer(&g, arg, 0) else {
+                continue;
+            };
+            if field.name == "__pos_0"
+                && field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(|owner| owner.ends_with("::Break"))
+            {
+                raised_break_carrier = true;
+            }
+        }
+    }
+    assert!(
+        raised_break_carrier,
+        "from_residual raises ControlFlow::Break's carrier"
+    );
+}

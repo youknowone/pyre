@@ -1662,6 +1662,154 @@ enum SiteOutcome {
     Fused,
 }
 
+fn producing_op<'a>(graph: &'a FunctionGraph, var: &Variable) -> Option<&'a OpKind> {
+    graph.blocks.iter().find_map(|block| {
+        block
+            .operations
+            .iter()
+            .find_map(|op| (op.result.as_ref() == Some(var)).then_some(&op.kind))
+    })
+}
+
+fn is_from_residual_call(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            ..
+        } if name == "from_residual"
+    )
+}
+
+fn block_reachable_from_start(graph: &FunctionGraph, block: usize) -> bool {
+    let mut seen = vec![false; graph.blocks.len()];
+    let mut stack = vec![graph.startblock.0];
+    while let Some(current) = stack.pop() {
+        if current >= seen.len() || seen[current] {
+            continue;
+        }
+        seen[current] = true;
+        if current == block {
+            return true;
+        }
+        for link in &graph.blocks[current].exits {
+            stack.push(link.target.0);
+        }
+    }
+    false
+}
+
+/// The value `Result::from_residual` is called with on a live `?` tail.
+///
+/// A diamond whose `branch()` call is still present never reaches here:
+/// [`verify_break_arm_is_reraise`] detaches that tail before this pass
+/// reraises.  What remains reads `ControlFlow::Break`'s `__pos_0`.
+/// `lower_result_branch_as_match` stores `Result::Err`'s `__pos_0` there
+/// when that payload and the `Break` payload have the same kind.  The
+/// carrier and the `Result` shell are both refs, so the read is the carrier.
+fn from_residual_carrier(graph: &FunctionGraph, arg: &Variable) -> Result<Variable, String> {
+    let mut current = arg.clone();
+    for _ in 0..8 {
+        let Some(kind) = producing_op(graph, &current) else {
+            return Err("from_residual argument has no producer".to_string());
+        };
+        match kind {
+            OpKind::FieldRead { field, .. }
+                if field.name == "__pos_0"
+                    && field.owner_root.as_deref().is_some_and(|owner| {
+                        owner_is_result_variant(owner, "Err") || owner.ends_with("::Break")
+                    }) =>
+            {
+                return Ok(current);
+            }
+            OpKind::Call { args, .. }
+                if is_recast_narrow(kind)
+                    && let Some(src) = args.first().and_then(LinkArg::as_variable) =>
+            {
+                current = src.clone();
+            }
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                current = operand.clone();
+            }
+            other => {
+                return Err(format!(
+                    "from_residual argument is not the `?` carrier ({})",
+                    truncated_kind(other)
+                ));
+            }
+        }
+    }
+    Err("from_residual argument chain is too deep".to_string())
+}
+
+fn from_residual_forwards_to_return(graph: &FunctionGraph, r: &Variable) -> bool {
+    let Some(block) = producer_block_index(graph, r) else {
+        return false;
+    };
+    let Some(kind) = producing_op(graph, r) else {
+        return false;
+    };
+    is_from_residual_call(kind) && forwards_to_returnblock(graph, block, r).is_ok()
+}
+
+/// `return Result::from_residual(residual)` raises.  `FromResidual::from_residual`
+/// for `Result` only builds `Err`, so reminting the call to `T` feeds a
+/// valueless normal edge into `returnblock` and `func_result_kind` sees
+/// `void` against the declared payload kind (`history.getkind`).
+/// `lower_result_exc_returns` already raises `return Err` the same way
+/// (`exceptiontransform.py` `create_exception_handling`).
+fn raise_returned_from_residual(
+    graph: &mut FunctionGraph,
+    r: &Variable,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Result<(), String> {
+    let name = graph.name.clone();
+    let Some(block) = producer_block_index(graph, r) else {
+        return Ok(());
+    };
+    // A `branch()` diamond detaches this tail.  Rewriting it first would
+    // make `verify_break_arm_is_reraise` miss the forward to `returnblock`.
+    if !block_reachable_from_start(graph, block) {
+        return Ok(());
+    }
+    if forwards_to_returnblock(graph, block, r).is_err() {
+        return Ok(());
+    }
+    let op_idx = graph.blocks[block]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(r))
+        .ok_or_else(|| format!("{name}: from_residual producer vanished"))?;
+    let residual = match &graph.blocks[block].operations[op_idx].kind {
+        OpKind::Call { args, .. } if args.len() == 1 => match &args[0] {
+            LinkArg::Value(arg) => arg.clone(),
+            _ => {
+                return Err(format!(
+                    "{name}: from_residual tail argument is not a value"
+                ));
+            }
+        },
+        _ => {
+            return Err(format!(
+                "{name}: tail-forwarded from_residual is not a one-argument call"
+            ));
+        }
+    };
+    let uses = count_var_uses(graph, r);
+    if uses.op_uses != 0 {
+        return Err(format!(
+            "{name}: from_residual result is read by an operation"
+        ));
+    }
+    let carrier =
+        from_residual_carrier(graph, &residual).map_err(|err| format!("{name}: {err}"))?;
+    graph.blocks[block].operations.remove(op_idx);
+    let block_id = crate::model::BlockId(block);
+    let v_exc = materialize_error_to_exc_object(graph, block_id, carrier, spec);
+    crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, v_exc);
+    Ok(())
+}
+
 /// Caller rule.  `results` are the result `Variable`s of calls to
 /// scoped callees (captured during lowering).  Each site is either a
 /// `?`-diamond — rewired into `ExitSwitch::LastException` exits — or a
@@ -1678,6 +1826,10 @@ pub(crate) fn rewire_result_exc_call_sites(
         rewrapped: 0,
         fused: 0,
     };
+    // `from_residual` tails are reraised after every other site.  Doing it
+    // in this loop would rewrite the break arm before a later `branch()`
+    // diamond reads it.
+    let mut deferred_from_residual: Vec<Variable> = Vec::new();
     for (r, suffix, payload_ty) in results {
         // Collection records every scoped Result call during body
         // lowering.  `simplify_lowered_graph` then folds
@@ -1704,6 +1856,10 @@ pub(crate) fn rewire_result_exc_call_sites(
                 &graph.name,
             );
             return Err(msg);
+        }
+        if from_residual_forwards_to_return(graph, r) {
+            deferred_from_residual.push(r.clone());
+            continue;
         }
         let site = rewire_one_call_site(
             graph,
@@ -1735,6 +1891,9 @@ pub(crate) fn rewire_result_exc_call_sites(
             SiteOutcome::Rewrapped => outcome.rewrapped += 1,
             SiteOutcome::Fused => outcome.fused += 1,
         }
+    }
+    for r in deferred_from_residual {
+        raise_returned_from_residual(graph, &r, spec)?;
     }
     Ok(outcome)
 }
