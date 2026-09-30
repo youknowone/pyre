@@ -877,34 +877,33 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         // a static type, so it survives the moves the object itself makes.
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let mut obj = pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
         // The formatting below is keyed on the payload layout, which a
         // `_getusercls` class shares with the builtin it was made from.
-        let tp = pyre_object::pyobject::layout_base((*obj).ob_type);
+        let tp = pyre_object::pyobject::layout_base((*obj()).ob_type);
         // A builtin leaf subclass keeps `ob_type` at the canonical storage
         // type but carries the Python class in `w_class`; dispatch its
         // `__repr__` override before the `ob_type`-keyed formatting below.
-        if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__repr__")? {
+        if let Some(r) = builtin_subclass_dunder_obj(obj(), tp, "__repr__")? {
             return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
         }
-        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         // A class object is an instance of its metaclass.  PyPy's
         // `space.repr` therefore resolves `__repr__` on that metaclass before
         // `type`'s native `<class ...>` representation.  This is observable
         // for EnumType and any user metaclass defining `__repr__`.
-        if let Some(result) = type_metaclass_dunder_obj(obj, "__repr__")? {
+        if let Some(result) = type_metaclass_dunder_obj(obj(), "__repr__")? {
             return Ok(pyre_object::w_str_get_wtf8(result).to_wtf8_buf());
         }
-        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let formatted = if let Some(s) = builtin_leaf_repr_string(obj, tp)? {
+        let formatted = if let Some(s) = builtin_leaf_repr_string(obj(), tp)? {
             s
-        } else if pyre_object::interp_array::is_array(obj)
+        } else if pyre_object::interp_array::is_array(obj())
             && let Some(hooks) = crate::importing::optional_module_hooks()
         {
-            return (hooks.array_repr_wtf8)(obj);
+            return (hooks.array_repr_wtf8)(obj());
         } else if std::ptr::eq(tp, &pyre_object::pyobject::LIST_TYPE as *const PyType) {
-            return list_repr(obj);
-        } else if pyre_object::is_tuple(obj) {
+            return list_repr(obj());
+        } else if pyre_object::is_tuple(obj()) {
             // `pyre_object::is_tuple` covers `TUPLE_TYPE` plus the
             // arity-2 specialisations (`SPECIALISED_TUPLE_{II,FF,OO}_TYPE`,
             // `pypy/objspace/std/specialisedtupleobject.py makespecialisedtuple`).
@@ -922,7 +921,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // `'pwd.struct_passwd(pw_name=..., ...)'` instead of the
             // bare tuple form.  Plain `tuple()` keeps the fast path
             // because its `w_class` is the canonical tuple type.
-            let w_class = (*obj).w_class;
+            let w_class = (*obj()).w_class;
             let tuple_class = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
             if !w_class.is_null() && !std::ptr::eq(w_class, tuple_class) {
                 // structseq instances are tuple subclasses with ob_type ==
@@ -939,44 +938,43 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 {
                     // The walk above allocates: re-read the receiver so the
                     // descriptor is handed the object at its current home.
-                    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                     // A raising override propagates; a non-string return is
                     // a TypeError like every other `__repr__` override.
-                    let r = crate::builtins::call_and_check(method, &[obj])?;
+                    let r = crate::builtins::call_and_check(method, &[obj()])?;
                     if pyre_object::is_str(r) {
                         return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
                     }
                     return Err(dunder_returned_non_string("__repr__", r));
                 }
             }
-            return tuple_repr(obj);
-        } else if unsafe { pyre_object::is_dict(obj) } {
-            return unsafe { dict_repr(obj) };
-        } else if pyre_object::sliceobject::is_slice(obj) {
+            return tuple_repr(obj());
+        } else if unsafe { pyre_object::is_dict(obj()) } {
+            return unsafe { dict_repr(obj()) };
+        } else if pyre_object::sliceobject::is_slice(obj()) {
             // `pypy/objspace/std/sliceobject.py descr_repr` —
             // `slice(%r, %r, %r)`.
             let mut out = Wtf8Buf::new();
             out.push_str("slice(");
             out.push_wtf8(&py_repr_wtf8(pyre_object::sliceobject::w_slice_get_start(
-                obj,
+                obj(),
             ))?);
             out.push_str(", ");
             out.push_wtf8(&py_repr_wtf8(pyre_object::sliceobject::w_slice_get_stop(
-                obj,
+                obj(),
             ))?);
             out.push_str(", ");
             out.push_wtf8(&py_repr_wtf8(pyre_object::sliceobject::w_slice_get_step(
-                obj,
+                obj(),
             ))?);
             out.push_str(")");
             return Ok(out);
-        } else if pyre_object::is_bytes_like(obj) {
+        } else if pyre_object::is_bytes_like(obj()) {
             // `bytesobject.py W_BytesObject.descr_repr` — ASCII-printable
             // bytes pass through, control/high bytes use `\xNN`, and the
             // outer quote prefers `'`, flipping to `"` when the data holds a
             // `'` but no `"`.
-            let data = pyre_object::bytes_like_data(obj).to_vec();
-            if pyre_object::bytearrayobject::is_bytearray(obj) {
+            let data = pyre_object::bytes_like_data(obj()).to_vec();
+            if pyre_object::bytearrayobject::is_bytearray(obj()) {
                 // `bytearrayobject.py W_BytearrayObject.descr_repr` differs
                 // from the bytes form: it chooses the same outer quote but
                 // always backslash-escapes an inner `'` (never `"`), so the
@@ -985,10 +983,10 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             } else {
                 bytes_repr_string(&data)
             }
-        } else if pyre_object::is_set_or_frozenset(obj) {
-            return set_repr_wtf8(obj);
+        } else if pyre_object::is_set_or_frozenset(obj()) {
+            return set_repr_wtf8(obj());
         } else if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
-            format_wtf8_repr(&pyre_object::w_str_get_wtf8(obj).to_wtf8_buf())
+            format_wtf8_repr(&pyre_object::w_str_get_wtf8(obj()).to_wtf8_buf())
         } else if std::ptr::eq(tp, &NONE_TYPE as *const PyType) {
             "None".to_string()
         } else if std::ptr::eq(
@@ -1000,27 +998,27 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             "Ellipsis".to_string()
         } else if std::ptr::eq(tp, &BUILTIN_CODE_TYPE as *const PyType) {
             // Raw BuiltinCode objects (Code-level, not normally user-visible)
-            let name = builtin_code_name(obj);
+            let name = builtin_code_name(obj());
             format!("<code {name}>")
         } else if std::ptr::eq(tp, &crate::function::SLOT_WRAPPER_TYPE as *const PyType) {
-            let name = function_get_name(obj);
-            let owner = crate::function::fget_func_objclass(obj)?;
+            let name = function_get_name(obj());
+            let owner = crate::function::fget_func_objclass(obj())?;
             let owner_name = pyre_object::w_type_get_name(owner);
             format!("<slot wrapper '{name}' of '{owner_name}' objects>")
         } else if std::ptr::eq(
             tp,
             &crate::function::METHOD_DESCRIPTOR_TYPE as *const PyType,
         ) {
-            let name = function_get_name(obj);
-            let owner = crate::function::fget_func_objclass(obj)?;
+            let name = function_get_name(obj());
+            let owner = crate::function::fget_func_objclass(obj())?;
             let owner_name = pyre_object::w_type_get_name(owner);
             format!("<method '{name}' of '{owner_name}' objects>")
         } else if std::ptr::eq(tp, &BUILTIN_FUNCTION_TYPE as *const PyType) {
             // function.py BuiltinFunction.descr_function_repr.  Same text
             // the `__repr__` this type registers in `typedef.rs` produces;
             // this native arm is the one `repr()` actually reaches.
-            let name = function_get_name(obj);
-            let w_self = crate::function::function_get_self_or_none(obj);
+            let name = function_get_name(obj());
+            let w_self = crate::function::function_get_self_or_none(obj());
             crate::function::builtin_function_repr_text(name, w_self)
         } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
             // function.py Function.descr_function_repr —
@@ -1031,21 +1029,18 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // must produce the same address-bearing text.
             // `format!` would render the WTF-8 qualname through `Display`,
             // which substitutes U+FFFD for a lone surrogate.
-            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let mut repr = Wtf8Buf::from_string("<function ".to_string());
-            repr.push_wtf8(&function_get_qualname(obj));
+            repr.push_wtf8(&function_get_qualname(obj()));
             // `function_get_qualname` can allocate the fallback string.
-            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            repr.push_str(&format!(" at {}>", repr_gc_addr(obj)));
+            repr.push_str(&format!(" at {}>", repr_gc_addr(obj())));
             return Ok(repr);
-        } else if unsafe { pyre_object::is_exception(obj) } {
+        } else if unsafe { pyre_object::is_exception(obj()) } {
             // A user subclass that overrides `__repr__` shadows the builtin
             // `W_BaseException.descr_repr`; dispatch it before the native
             // formatting below.
-            if let Some(r) = exc_user_dunder_obj(obj, "__repr__")? {
+            if let Some(r) = exc_user_dunder_obj(obj(), "__repr__")? {
                 return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
             }
-            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             // `pypy/module/exceptions/interp_exceptions.py descr_repr
             // W_BaseException.descr_repr` →
             //   lgt = len(self.args_w)
@@ -1068,7 +1063,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // reads.  Falls back to the `message` slot for exceptions
             // produced outside the constructor path (`gateway.rs` raise
             // sites that bypass `exc_constructor!`).
-            let class_name = if let Some(cls) = crate::typedef::r#type(obj) {
+            let class_name = if let Some(cls) = crate::typedef::r#type(obj()) {
                 // `w_type_get_name_obj` is the accessor the `__name__` getter
                 // reads, so the two answers cannot drift.  A class registered
                 // as `"termios.error"` is named `error` in the module
@@ -1081,7 +1076,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             } else {
                 Wtf8Buf::from_string(
                     pyre_object::interp_exceptions::exc_kind_name(
-                        pyre_object::w_exception_get_kind(obj),
+                        pyre_object::w_exception_get_kind(obj()),
                     )
                     .to_string(),
                 )
@@ -1089,8 +1084,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // The name object above is minted on its first read of a class, so
             // that read is a collection point and the receiver comes back off
             // the shadow stack.
-            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let args_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
+            let args_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj()) };
             let mut inner = Wtf8Buf::new();
             if !args_obj.is_null() && pyre_object::is_tuple(args_obj) {
                 // `w_exception_get_args` mints this tuple on every call.  Its
@@ -1129,15 +1123,23 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             out.push_str(")");
             return Ok(out);
         } else if std::ptr::eq(tp, &TYPE_TYPE as *const PyType) {
-            let name = crate::baseobjspace::type_repr_qualified_name(obj);
+            let name = crate::baseobjspace::type_repr_qualified_name(obj());
             return Ok(wtf8_format!("<class '", name, "'>"));
         } else if std::ptr::eq(tp, &pyre_object::UNION_TYPE as *const PyType) {
             // PyPy: UnionType.__repr__ → " | ".join([_repr_item(x) for x in self.__args__])
-            let args = pyre_object::w_union_get_args(obj);
+            let args = pyre_object::w_union_get_args(obj());
             let n = pyre_object::w_tuple_len(args);
+            // An argument's repr can move the args tuple; read each item back
+            // from the slot.
+            let _union_roots = pyre_object::gc_roots::push_roots();
+            let args_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(args);
             let mut parts = Vec::with_capacity(n);
             for i in 0..n {
-                if let Some(item) = pyre_object::w_tuple_getitem(args, i as i64) {
+                if let Some(item) = pyre_object::w_tuple_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(args_slot),
+                    i as i64,
+                ) {
                     // `_repr_item_union` (`_pypy_generic_alias.py`) —
                     // `type(None)` renders as `None`; a bare `None` may
                     // still reach here from direct construction paths.
@@ -1165,15 +1167,15 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             return Ok(joined);
         } else if std::ptr::eq(tp, &pyre_object::GENERIC_ALIAS_TYPE as *const PyType) {
             // GenericAlias.__repr__ (`_pypy_generic_alias.py`).
-            return crate::_pypy_generic_alias::repr(obj);
+            return crate::_pypy_generic_alias::repr(obj());
         } else if std::ptr::eq(tp, &MODULE_TYPE as *const PyType) {
             // A `types.ModuleType` subclass carries its class in `w_class`; a
             // subclass `__repr__` override wins over the native module
             // formatting.
-            if let Some(r) = module_user_dunder_obj(obj, "__repr__")? {
+            if let Some(r) = module_user_dunder_obj(obj(), "__repr__")? {
                 return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
             } else {
-                return crate::typedef::module_repr_string(obj);
+                return crate::typedef::module_repr_string(obj());
             }
         } else if std::ptr::eq(
             tp,
@@ -1181,21 +1183,21 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         ) {
             // `pypy/objspace/std/dictproxyobject.py descr_repr` →
             // `b"mappingproxy(%s)" % space.utf8_w(space.repr(self.w_mapping))`.
-            let inner = pyre_object::w_dict_proxy_get_mapping(obj);
+            let inner = pyre_object::w_dict_proxy_get_mapping(obj());
             let mut out = Wtf8Buf::new();
             out.push_str("mappingproxy(");
             out.push_wtf8(&py_repr_wtf8(inner)?);
             out.push_str(")");
             return Ok(out);
-        } else if pyre_object::typedef::is_getset_property(obj) {
+        } else if pyre_object::typedef::is_getset_property(obj()) {
             // CPython 3.14 `PyGetSetDescr_Type.tp_repr`.
-            crate::typedef::getset_descriptor_repr(obj)
-        } else if pyre_object::is_member(obj) {
+            crate::typedef::getset_descriptor_repr(obj())
+        } else if pyre_object::is_member(obj()) {
             // CPython 3.14 `PyMemberDescr_Type.tp_repr = member_repr`.
             // Member descriptors are native-layout objects with no `w_class`,
             // so the generic builtin-dunder fallback below cannot discover
             // their registered __repr__ method.
-            crate::typedef::member_descriptor_repr(obj)
+            crate::typedef::member_descriptor_repr(obj())
         } else if std::ptr::eq(
             tp,
             &pyre_object::dictmultiobject::DICT_KEYS_TYPE as *const PyType,
@@ -1210,16 +1212,16 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // the shared identity recursion set and emits `...` on re-entry.
             // This is distinct from the owning dict's `{...}` placeholder: a
             // dict may contain one of its own values/items views.
-            let Some(_guard) = ReprGuard::enter(obj) else {
+            let Some(_guard) = ReprGuard::enter(obj()) else {
                 return Ok(Wtf8Buf::from_string("...".to_string()));
             };
-            let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
+            let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj());
             let label = match kind {
                 pyre_object::dictmultiobject::DictViewKind::Keys => "dict_keys",
                 pyre_object::dictmultiobject::DictViewKind::Values => "dict_values",
                 pyre_object::dictmultiobject::DictViewKind::Items => "dict_items",
             };
-            let snapshot = crate::type_methods::dict_view_snapshot(obj);
+            let snapshot = crate::type_methods::dict_view_snapshot(obj());
             // The snapshot is a native Vec the collector does not walk, and an
             // item's `__repr__` runs Python.  Pin it and read each element back
             // from the shadow stack.
@@ -1237,7 +1239,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             }
             out.push_str("])");
             return Ok(out);
-        } else if pyre_object::is_w_range(obj) {
+        } else if pyre_object::is_w_range(obj()) {
             // `functional.py W_Range.descr_repr` —
             // `range(start, stop)`, with the step appended only when
             // it is not 1.  Bounds may be bignum, so render each wrapped
@@ -1245,7 +1247,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // `range_obj_to_bigint` of a machine int and each `repr` collect;
             // the fields come back off the shadow stack.
             let _range_roots = pyre_object::gc_roots::push_roots();
-            let (start, stop, step) = pyre_object::w_range_fields(obj);
+            let (start, stop, step) = pyre_object::w_range_fields(obj());
             let field_base = pyre_object::gc_roots::pin_roots(&[start, stop, step]);
             let step_is_one = pyre_object::range_obj_to_bigint(
                 pyre_object::gc_roots::shadow_stack_get(field_base + 2),
@@ -1268,42 +1270,38 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             }
             out.push_str(")");
             return Ok(out);
-        } else if pyre_object::interp_sre::is_sre_pattern(obj) {
+        } else if pyre_object::interp_sre::is_sre_pattern(obj()) {
             // `pypy/module/_sre/interp_sre.py W_SRE_Pattern.repr_w`.
-            return crate::module::_sre::interp_sre::sre_pattern_repr_str(obj);
-        } else if pyre_object::interp_sre::is_sre_match(obj) {
+            return crate::module::_sre::interp_sre::sre_pattern_repr_str(obj());
+        } else if pyre_object::interp_sre::is_sre_match(obj()) {
             // `pypy/module/_sre/interp_sre.py W_SRE_Match.repr_w`.
-            return crate::module::_sre::interp_sre::sre_match_repr_str(obj);
-        } else if pyre_object::memoryview::is_w_memoryview(obj) {
+            return crate::module::_sre::interp_sre::sre_match_repr_str(obj());
+        } else if pyre_object::memoryview::is_w_memoryview(obj()) {
             // `memoryobject.py descr_repr` — `<memory at 0x...>`, or
             // `<released memory at 0x...>` once the view is released.
-            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let label = if pyre_object::memoryview::w_memoryview_released(obj) {
+            let label = if pyre_object::memoryview::w_memoryview_released(obj()) {
                 "released memory"
             } else {
                 "memory"
             };
-            format!("<{label} at {}>", repr_gc_addr(obj))
+            format!("<{label} at {}>", repr_gc_addr(obj()))
         } else if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
             // Try __repr__ first, then __str__
-            if let Some(w) = try_call_dunder_wtf8(obj, "__repr__")? {
+            if let Some(w) = try_call_dunder_wtf8(obj(), "__repr__")? {
                 return Ok(w);
             }
-            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            if let Some(w) = try_call_dunder_wtf8(obj, "__str__")? {
+            if let Some(w) = try_call_dunder_wtf8(obj(), "__str__")? {
                 return Ok(w);
             }
-            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let name = crate::baseobjspace::getfulltypename(obj);
-            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let addr = repr_gc_addr(obj);
+            let name = crate::baseobjspace::getfulltypename(obj());
+            let addr = repr_gc_addr(obj());
             return Ok(wtf8_format!("<", name, format!(" object at {addr}>")));
         } else {
             // A builtin type carrying its own `__repr__` dict entry (e.g.
             // `_struct.Struct`) — dispatch it before the generic
             // `<name object at 0x...>` fallback.  Mirrors the tuple-subclass
             // path above.
-            let w_class = (*obj).w_class;
+            let w_class = (*obj()).w_class;
             if !w_class.is_null()
                 && let Some((src, method)) =
                     crate::baseobjspace::lookup_where_with_method_cache(w_class, "__repr__")
@@ -1312,17 +1310,14 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             {
                 // The walk above allocates: re-read the receiver so the
                 // descriptor is handed the object at its current home.
-                obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let r = crate::builtins::call_and_check(method, &[obj])?;
+                let r = crate::builtins::call_and_check(method, &[obj()])?;
                 if pyre_object::is_str(r) {
                     return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
                 }
                 return Err(dunder_returned_non_string("__repr__", r));
             }
-            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let name = crate::baseobjspace::getfulltypename(obj);
-            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let addr = repr_gc_addr(obj);
+            let name = crate::baseobjspace::getfulltypename(obj());
+            let addr = repr_gc_addr(obj());
             return Ok(wtf8_format!("<", name, format!(" object at {addr}>")));
         };
         Ok(Wtf8Buf::from_string(formatted))
@@ -1641,30 +1636,31 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     2,
                 )
                 .filter(|&f| !pyre_object::is_none(f));
+                let has_errno = w_errno.is_some();
+                let has_strerror = w_strerror.is_some();
+                let has_filename = w_filename.is_some();
                 let field_base = pyre_object::gc_roots::pin_roots(&[
                     w_errno.unwrap_or_else(pyre_object::w_none),
                     w_strerror.unwrap_or_else(pyre_object::w_none),
                     w_winerror,
                     w_filename.unwrap_or_else(pyre_object::w_none),
                 ]);
-                let w_errno = w_errno.map(|_| pyre_object::gc_roots::shadow_stack_get(field_base));
-                let w_strerror =
-                    w_strerror.map(|_| pyre_object::gc_roots::shadow_stack_get(field_base + 1));
                 let w_winerror = pyre_object::gc_roots::shadow_stack_get(field_base + 2);
-                let w_filename =
-                    w_filename.map(|_| pyre_object::gc_roots::shadow_stack_get(field_base + 3));
-                if !w_winerror.is_null() && (w_filename.is_some() || w_strerror.is_some()) {
+                if !w_winerror.is_null() && (has_filename || has_strerror) {
                     let mut out = Wtf8Buf::new();
                     out.push_str("[WinError ");
-                    out.push_wtf8(&py_str_wtf8(w_winerror)?);
+                    out.push_wtf8(&py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                        field_base + 2,
+                    ))?);
                     out.push_str("] ");
-                    out.push_wtf8(&py_str_wtf8(
-                        w_strerror.unwrap_or_else(pyre_object::w_none),
-                    )?);
-                    if let Some(fname) = w_filename {
-                        let fname = pyre_object::gc_roots::shadow_stack_get(field_base + 3);
+                    out.push_wtf8(&py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                        field_base + 1,
+                    ))?);
+                    if has_filename {
                         out.push_str(": ");
-                        out.push_wtf8(&py_repr_wtf8(fname)?);
+                        out.push_wtf8(&py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                            field_base + 3,
+                        ))?);
                         let w_filename2 = slot_or_arg(
                             pyre_object::interp_exceptions::w_exception_get_filename2(obj()),
                             4,
@@ -1677,7 +1673,7 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     }
                     return Ok(Some(out));
                 }
-                if let (Some(w_errno), Some(w_strerror)) = (w_errno, w_strerror) {
+                if has_errno && has_strerror {
                     let errno = py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(field_base))?;
                     let strerror =
                         py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(field_base + 1))?;
@@ -1686,22 +1682,24 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     out.push_wtf8(&errno);
                     out.push_str("] ");
                     out.push_wtf8(&strerror);
-                    if let Some(_fname) = w_filename {
-                        let fname = pyre_object::gc_roots::shadow_stack_get(field_base + 3);
+                    if has_filename {
                         let w_filename2 = slot_or_arg(
                             pyre_object::interp_exceptions::w_exception_get_filename2(obj()),
                             4,
                         )
                         .filter(|&f| !pyre_object::is_none(f));
-                        if let Some(fname2) = w_filename2 {
-                            out.push_str(": ");
-                            out.push_wtf8(&py_repr_wtf8(fname)?);
-                            out.push_str(" -> ");
-                            out.push_wtf8(&py_repr_wtf8(fname2)?);
-                            return Ok(Some(out));
-                        }
+                        let has_fname2 = w_filename2.is_some();
+                        let _fname2_roots = pyre_object::gc_roots::push_roots();
+                        let fname2_slot =
+                            _fname2_roots.pin_roots(&[w_filename2.unwrap_or(pyre_object::PY_NULL)]);
                         out.push_str(": ");
-                        out.push_wtf8(&py_repr_wtf8(fname)?);
+                        out.push_wtf8(&py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                            field_base + 3,
+                        ))?);
+                        if has_fname2 {
+                            out.push_str(" -> ");
+                            out.push_wtf8(&py_repr_wtf8(_fname2_roots.get(fname2_slot))?);
+                        }
                         return Ok(Some(out));
                     }
                     return Ok(Some(out));

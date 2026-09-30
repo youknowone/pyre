@@ -1949,9 +1949,15 @@ fn new_instance(mut w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObject
         );
         return Err(unpickling_error(&message));
     }
+    let nargs = args.len();
+    let roots = pyre_object::gc_roots::push_roots();
+    let args_base = roots.pin_roots(args);
     let w_new = pyre_object::with_roots!(w_cls => pyre_interpreter::baseobjspace::getattr_str(w_cls, "__new__"))?;
+    let mut reloaded_args = vec![pyre_object::PY_NULL; nargs];
+    pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut reloaded_args);
+    drop(roots);
     let mut call_args = vec![w_cls];
-    call_args.extend_from_slice(args);
+    call_args.extend_from_slice(&reloaded_args);
     call_fn(w_new, &call_args)
 }
 

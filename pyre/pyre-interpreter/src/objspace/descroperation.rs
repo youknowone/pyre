@@ -5467,12 +5467,34 @@ pub(crate) fn try_dispatch_binary_special(
                     && !crate::baseobjspace::flag_sequence_bug_compat(w_typ2.as_ptr()))
                     || issubtype_w(w_typ2.as_ptr(), w_typ1.as_ptr());
                 // descroperation.py:671-672.
-                if prefer_reverse
-                    && !p_abstract_issubclass_w(lsrc, rsrc)?
-                    && !p_abstract_issubclass_w(w_typ1.as_ptr(), rsrc)?
-                {
-                    swapped = true;
-                    std::mem::swap(&mut w_left_impl, &mut w_right_impl);
+                if prefer_reverse {
+                    let has_left_impl = w_left_impl.is_some();
+                    let has_right_impl = w_right_impl.is_some();
+                    let typ1 = w_typ1.as_ptr();
+                    let impl_base = pyre_object::gc_roots::pin_roots(&[
+                        lsrc,
+                        rsrc,
+                        typ1,
+                        w_left_impl.unwrap_or(pyre_object::PY_NULL),
+                        w_right_impl.unwrap_or(pyre_object::PY_NULL),
+                    ]);
+                    let derived_is_subclass = p_abstract_issubclass_w(
+                        pyre_object::gc_roots::shadow_stack_get(impl_base),
+                        pyre_object::gc_roots::shadow_stack_get(impl_base + 1),
+                    )?;
+                    let keep_order = derived_is_subclass
+                        || p_abstract_issubclass_w(
+                            pyre_object::gc_roots::shadow_stack_get(impl_base + 2),
+                            pyre_object::gc_roots::shadow_stack_get(impl_base + 1),
+                        )?;
+                    w_left_impl = has_left_impl
+                        .then(|| pyre_object::gc_roots::shadow_stack_get(impl_base + 3));
+                    w_right_impl = has_right_impl
+                        .then(|| pyre_object::gc_roots::shadow_stack_get(impl_base + 4));
+                    if !keep_order {
+                        swapped = true;
+                        std::mem::swap(&mut w_left_impl, &mut w_right_impl);
+                    }
                 }
             }
         }
@@ -5556,20 +5578,30 @@ fn try_dispatch_ternary_pow_special(
             && let (Some(exp_src), Some(base_src), Some(slot)) =
                 (w_exp_src, w_base_src, exp_impl_slot)
             && !std::ptr::eq(base_src, exp_src)
-            && !p_abstract_issubclass_w(base_src, exp_src)?
-            && !p_abstract_issubclass_w(w_base_type.as_ptr(), exp_src)?
         {
-            let exp_impl = pyre_object::gc_roots::shadow_stack_get(slot);
-            if let Some(result) = try_call_special(exp_impl, &[operand(1), operand(0), operand(2)])?
-            {
-                *base = operand(0);
-                *exp = operand(1);
-                *modulus = operand(2);
-                return Ok(Some(result));
+            let base_type = w_base_type.as_ptr();
+            let src_base = pyre_object::gc_roots::pin_roots(&[base_src, exp_src, base_type]);
+            let exp_now = || pyre_object::gc_roots::shadow_stack_get(src_base + 1);
+            if !p_abstract_issubclass_w(
+                pyre_object::gc_roots::shadow_stack_get(src_base),
+                exp_now(),
+            )? && !p_abstract_issubclass_w(
+                pyre_object::gc_roots::shadow_stack_get(src_base + 2),
+                exp_now(),
+            )? {
+                let exp_impl = pyre_object::gc_roots::shadow_stack_get(slot);
+                if let Some(result) =
+                    try_call_special(exp_impl, &[operand(1), operand(0), operand(2)])?
+                {
+                    *base = operand(0);
+                    *exp = operand(1);
+                    *modulus = operand(2);
+                    return Ok(Some(result));
+                }
+                // The subtype-first call clears the reflected method, including
+                // when it returns NotImplemented.
+                exp_impl_slot = None;
             }
-            // CPython clears `do_other` after the subtype-first call,
-            // including when it returns NotImplemented.
-            exp_impl_slot = None;
         }
 
         let mut result = None;

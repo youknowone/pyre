@@ -471,10 +471,17 @@ pub(crate) fn call_with_raw_kwargs(
     if !has_non_text_key {
         return None;
     }
-    if let Some(result) = pyre_object::with_roots!(callable, kwargs => call_type_with_raw_kwargs(callable, positional, kwargs)) {
+    let npos = positional.len();
+    let roots = pyre_object::gc_roots::push_roots();
+    let pos_base = roots.pin_roots(positional);
+    let mut pos_buf = vec![pyre_object::PY_NULL; npos];
+    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
+    if let Some(result) = pyre_object::with_roots!(callable, kwargs => call_type_with_raw_kwargs(callable, &pos_buf, kwargs))
+    {
         return Some(result);
     }
-    call_method_with_raw_kwargs(callable, positional, kwargs)
+    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
+    call_method_with_raw_kwargs(callable, &pos_buf, kwargs)
 }
 
 fn expr_context_type() -> PyObjectRef {

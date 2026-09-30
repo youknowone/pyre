@@ -1507,16 +1507,19 @@ impl W_Struct {
     ) -> Result<PyObjectRef, crate::PyError> {
         self.ensure_ready()?;
         let format = majit_metainterp::jit::promote_string(self.format);
-        let fmt = pyre_object::with_roots!(buffer => crate::baseobjspace::str_utf8_w(format))?;
+        let has_offset = offset.is_some();
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[format, buffer, offset.unwrap_or(pyre_object::PY_NULL)]);
+        let fmt = crate::baseobjspace::str_utf8_w(roots.get(base))?;
         // Coerce `offset` before borrowing the buffer: `space_index_w` may run
         // `__index__`, which can resize or free the backing store `readbuf`
         // hands back as a raw slice.
-        let offset = match offset {
-            Some(o) => {
-                pyre_object::with_roots!(buffer => unsafe { crate::builtins::space_index_w(o) })?
-            }
-            None => 0,
+        let offset = if has_offset {
+            unsafe { crate::builtins::space_index_w(roots.get(base + 2)) }?
+        } else {
+            0
         };
+        buffer = roots.get(base + 1);
         let buf = unsafe { readbuf(buffer)? };
         do_unpack_from(fmt, buf, offset)
     }
@@ -1901,14 +1904,20 @@ crate::py_module! {
             #[posonly] mut buffer: PyObjectRef,
             offset: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
-            let fmt = pyre_object::with_roots!(buffer => format_to_string(fmt_obj))?;
+            let has_offset = offset.is_some();
+            let roots = pyre_object::gc_roots::push_roots();
+            let base =
+                roots.pin_roots(&[fmt_obj, buffer, offset.unwrap_or(pyre_object::PY_NULL)]);
+            let fmt = format_to_string(roots.get(base))?;
             // Coerce `offset` before borrowing the buffer: `space_index_w` may
             // run `__index__`, which can resize or free the backing store
             // `readbuf` hands back as a raw slice.
-            let offset = match offset {
-                Some(o) => pyre_object::with_roots!(buffer => unsafe { crate::builtins::space_index_w(o) })?,
-                None => 0,
+            let offset = if has_offset {
+                unsafe { crate::builtins::space_index_w(roots.get(base + 2)) }?
+            } else {
+                0
             };
+            buffer = roots.get(base + 1);
             let buf = unsafe { readbuf(buffer)? };
             do_unpack_from(&fmt, buf, offset)
         }

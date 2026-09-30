@@ -29,22 +29,29 @@ pub fn mini_buffer_params(w_obj: PyObjectRef) -> Option<(*mut u8, usize)> {
 
 /// `cbuffer.py MiniBuffer___new__`.
 fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let mut w_cdata = *args
-        .get(1)
-        .ok_or_else(|| PyError::type_error("buffer() missing cdata argument"))?;
+    let n_args = args.len();
+    if n_args < 2 {
+        return Err(PyError::type_error("buffer() missing cdata argument"));
+    }
+    let arg_roots = pyre_object::gc_roots::push_roots();
+    let arg_base = arg_roots.pin_roots(args);
+    let mut w_cdata = arg_roots.get(arg_base + 1);
     let cdata = pyre_object::with_roots!(w_cdata => cdataobj::cdata_arg(w_cdata))?;
     let ct = ctypeobj::ctype_at(cdata.ctype)
         .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
     // The signature binder pads an omitted optional argument with `PY_NULL`.
     // `WrappedDefault(-1)` in PyPy makes that indistinguishable from no third
     // app-level argument to `MiniBuffer___new__`.
-    let explicit_size = args.get(2).is_some_and(|value| !value.is_null());
-    let mut size = match args.get(2) {
-        Some(&w_size) if !w_size.is_null() => {
+    let explicit_size = n_args > 2 && !arg_roots.get(arg_base + 2).is_null();
+    let mut size = if n_args > 2 {
+        let w_size = arg_roots.get(arg_base + 2);
+        if !w_size.is_null() {
             pyre_object::with_roots!(w_cdata => pyre_interpreter::baseobjspace::int_w(w_size))?
+        } else {
+            -1
         }
-        None => -1,
-        Some(_) => -1,
+    } else {
+        -1
     };
     match ct.kind {
         ctypeobj::KIND_POINTER => {

@@ -6,17 +6,16 @@
 //! module namespace with constants, error classes, module-level
 //! functions and the `socket` type definition.
 
-
-/// The host socket layer, in the role `_rsocket_rffi.py` plays for rsocket:
-/// one set of names over libc and WinSock, so the bodies below name a single
-/// API.
-#[cfg(any(unix, windows))]
-use pyre_interpreter::rsocket_rffi as rffi;
 /// The same names again where there is no host layer to reach them through:
 /// the four address converters are arithmetic over the spelling, so they are
 /// written out rather than called, and the entry points below cannot tell.
 #[cfg(not(any(unix, windows)))]
 use super::interp_socket_wasm as rffi;
+/// The host socket layer, in the role `_rsocket_rffi.py` plays for rsocket:
+/// one set of names over libc and WinSock, so the bodies below name a single
+/// API.
+#[cfg(any(unix, windows))]
+use pyre_interpreter::rsocket_rffi as rffi;
 
 /// _socket module — PyPy: pypy/module/_socket/.
 ///
@@ -53,7 +52,9 @@ use super::interp_socket_wasm as rffi;
 /// first label is empty answers that same TypeError against
 /// `UnicodeError("encoding with 'idna' codec failed ...")`.
 #[cfg(any(unix, windows))]
-fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, pyre_interpreter::PyError> {
+fn socket_idna_converter(
+    w_host: pyre_object::PyObjectRef,
+) -> Result<Vec<u8>, pyre_interpreter::PyError> {
     let wrong_type = |obj: pyre_object::PyObjectRef| {
         pyre_interpreter::PyError::type_error(format!(
             "str, bytes or bytearray expected, not {}",
@@ -80,8 +81,9 @@ fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, py
                 // raised is dropped for the one message that covers every way
                 // an address host can fail to encode, which also drops a
                 // failure the codec did not cause.
-                pyre_interpreter::type_methods::encode_object(w_host, "idna", "strict")
-                    .map_err(|_| pyre_interpreter::PyError::type_error("encoding of hostname failed"))?
+                pyre_interpreter::type_methods::encode_object(w_host, "idna", "strict").map_err(
+                    |_| pyre_interpreter::PyError::type_error("encoding of hostname failed"),
+                )?
             }
         } else if pyre_object::bytesobject::is_bytes_like(w_host) {
             // The guard admits a bytearray, so the read has to dispatch on
@@ -246,7 +248,11 @@ fn interface_io_error(error: std::io::Error) -> pyre_interpreter::PyError {
         };
         return pyre_interpreter::PyError::os_error_with_errno(errno, message);
     };
-    pyre_interpreter::PyError::os_error_win32_syscall2(winerror, pyre_object::PY_NULL, pyre_object::PY_NULL)
+    pyre_interpreter::PyError::os_error_win32_syscall2(
+        winerror,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    )
 }
 
 /// One `space.acquire_writebuf` export held for the whole of a `recv_into`
@@ -276,8 +282,7 @@ impl SocketWritableBuffer {
     unsafe fn acquire(obj: pyre_object::PyObjectRef) -> Result<Self, pyre_interpreter::PyError> {
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let (data, owner) =
-            socket_writebuf(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+        let (data, owner) = socket_writebuf(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
         let _ = pyre_object::gc_roots::pin_root(owner);
         let owner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
@@ -358,7 +363,9 @@ fn socket_writebuf(
         // `[offset, offset+length)` of the backing storage (itself already the
         // `Buffer::Sub` window for a zero-copy slice), not the whole buffer.
         let Some(full) = (unsafe { view.backing().as_bytes_mut() }) else {
-            return Err(pyre_interpreter::PyError::type_error("cannot modify read-only memory"));
+            return Err(pyre_interpreter::PyError::type_error(
+                "cannot modify read-only memory",
+            ));
         };
         let off = unsafe { view.offset() } as usize;
         let len = unsafe { pyre_object::memoryview::w_memoryview_length(obj) } as usize;
@@ -827,7 +834,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
         // ── SOL_* / SO_* (socket level) ──
         hc!("SOL_SOCKET", SOL_SOCKET, ws::SOL_SOCKET);
         hc!("SO_REUSEADDR", SO_REUSEADDR, ws::SO_REUSEADDR);
-        hc!("SO_EXCLUSIVEADDRUSE", SO_EXCLUSIVEADDRUSE, ws::SO_EXCLUSIVEADDRUSE);
+        hc!(
+            "SO_EXCLUSIVEADDRUSE",
+            SO_EXCLUSIVEADDRUSE,
+            ws::SO_EXCLUSIVEADDRUSE
+        );
         hc!("SO_KEEPALIVE", SO_KEEPALIVE, ws::SO_KEEPALIVE);
         hc!("SO_BROADCAST", SO_BROADCAST, ws::SO_BROADCAST);
         hc!("SO_DEBUG", SO_DEBUG, ws::SO_DEBUG);
@@ -866,10 +877,22 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
         hc!("IP_TOS", IP_TOS, ws::IP_TOS);
         hc!("IP_OPTIONS", IP_OPTIONS, ws::IP_OPTIONS);
         hc!("IP_MULTICAST_TTL", IP_MULTICAST_TTL, ws::IP_MULTICAST_TTL);
-        hc!("IP_MULTICAST_LOOP", IP_MULTICAST_LOOP, ws::IP_MULTICAST_LOOP);
+        hc!(
+            "IP_MULTICAST_LOOP",
+            IP_MULTICAST_LOOP,
+            ws::IP_MULTICAST_LOOP
+        );
         hc!("IP_MULTICAST_IF", IP_MULTICAST_IF, ws::IP_MULTICAST_IF);
-        hc!("IP_ADD_MEMBERSHIP", IP_ADD_MEMBERSHIP, ws::IP_ADD_MEMBERSHIP);
-        hc!("IP_DROP_MEMBERSHIP", IP_DROP_MEMBERSHIP, ws::IP_DROP_MEMBERSHIP);
+        hc!(
+            "IP_ADD_MEMBERSHIP",
+            IP_ADD_MEMBERSHIP,
+            ws::IP_ADD_MEMBERSHIP
+        );
+        hc!(
+            "IP_DROP_MEMBERSHIP",
+            IP_DROP_MEMBERSHIP,
+            ws::IP_DROP_MEMBERSHIP
+        );
         hc!("IP_HDRINCL", IP_HDRINCL, ws::IP_HDRINCL);
         hc!("IP_RECVDSTADDR", IP_RECVDSTADDR, ws::IP_RECVDSTADDR);
         hc!("IP_ADD_SOURCE_MEMBERSHIP", IP_ADD_SOURCE_MEMBERSHIP, 15);
@@ -888,16 +911,32 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
         hc!("IPV6_HOPOPTS", IPV6_HOPOPTS, ws::IPV6_HOPOPTS);
         hc!("IPV6_JOIN_GROUP", IPV6_JOIN_GROUP, ws::IPV6_JOIN_GROUP);
         hc!("IPV6_LEAVE_GROUP", IPV6_LEAVE_GROUP, ws::IPV6_LEAVE_GROUP);
-        hc!("IPV6_MULTICAST_HOPS", IPV6_MULTICAST_HOPS, ws::IPV6_MULTICAST_HOPS);
-        hc!("IPV6_MULTICAST_IF", IPV6_MULTICAST_IF, ws::IPV6_MULTICAST_IF);
-        hc!("IPV6_MULTICAST_LOOP", IPV6_MULTICAST_LOOP, ws::IPV6_MULTICAST_LOOP);
+        hc!(
+            "IPV6_MULTICAST_HOPS",
+            IPV6_MULTICAST_HOPS,
+            ws::IPV6_MULTICAST_HOPS
+        );
+        hc!(
+            "IPV6_MULTICAST_IF",
+            IPV6_MULTICAST_IF,
+            ws::IPV6_MULTICAST_IF
+        );
+        hc!(
+            "IPV6_MULTICAST_LOOP",
+            IPV6_MULTICAST_LOOP,
+            ws::IPV6_MULTICAST_LOOP
+        );
         hc!("IPV6_PKTINFO", IPV6_PKTINFO, ws::IPV6_PKTINFO);
         hc!("IPV6_RECVRTHDR", IPV6_RECVRTHDR, ws::IPV6_RECVRTHDR);
         hc!("IPV6_RECVTCLASS", IPV6_RECVTCLASS, ws::IPV6_RECVTCLASS);
         hc!("IPV6_RECVERR", IPV6_RECVERR, 75);
         hc!("IPV6_RTHDR", IPV6_RTHDR, ws::IPV6_RTHDR);
         hc!("IPV6_TCLASS", IPV6_TCLASS, ws::IPV6_TCLASS);
-        hc!("IPV6_UNICAST_HOPS", IPV6_UNICAST_HOPS, ws::IPV6_UNICAST_HOPS);
+        hc!(
+            "IPV6_UNICAST_HOPS",
+            IPV6_UNICAST_HOPS,
+            ws::IPV6_UNICAST_HOPS
+        );
         // ── shutdown how ──
         hc!("SHUT_RD", SD_RECEIVE, ws::SD_RECEIVE);
         hc!("SHUT_WR", SD_SEND, ws::SD_SEND);
@@ -942,28 +981,63 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
         hc!("EAI_SOCKTYPE", EAI_SOCKTYPE, ws::WSAESOCKTNOSUPPORT);
         // ── WSAIoctl codes `socket.ioctl` names ──
         hc!("SIO_RCVALL", SIO_RCVALL, ws::SIO_RCVALL);
-        hc!("SIO_KEEPALIVE_VALS", SIO_KEEPALIVE_VALS, ws::SIO_KEEPALIVE_VALS);
-        hc!("SIO_LOOPBACK_FAST_PATH", SIO_LOOPBACK_FAST_PATH, ws::SIO_LOOPBACK_FAST_PATH);
+        hc!(
+            "SIO_KEEPALIVE_VALS",
+            SIO_KEEPALIVE_VALS,
+            ws::SIO_KEEPALIVE_VALS
+        );
+        hc!(
+            "SIO_LOOPBACK_FAST_PATH",
+            SIO_LOOPBACK_FAST_PATH,
+            ws::SIO_LOOPBACK_FAST_PATH
+        );
         hc!("RCVALL_OFF", RCVALL_OFF, ws::RCVALL_OFF);
         hc!("RCVALL_ON", RCVALL_ON, ws::RCVALL_ON);
-        hc!("RCVALL_SOCKETLEVELONLY", RCVALL_SOCKETLEVELONLY, ws::RCVALL_SOCKETLEVELONLY);
+        hc!(
+            "RCVALL_SOCKETLEVELONLY",
+            RCVALL_SOCKETLEVELONLY,
+            ws::RCVALL_SOCKETLEVELONLY
+        );
         hc!("RCVALL_MAX", RCVALL_MAX, 3);
         // Hyper-V socket ABI. GUIDs and Bluetooth addresses are strings.
         hc!("HV_PROTOCOL_RAW", HV_PROTOCOL_RAW, 1);
         hc!("HVSOCKET_CONNECT_TIMEOUT", HVSOCKET_CONNECT_TIMEOUT, 1);
         hc!("HVSOCKET_CONNECTED_SUSPEND", HVSOCKET_CONNECTED_SUSPEND, 4);
-        hc!("HVSOCKET_CONNECT_TIMEOUT_MAX", HVSOCKET_CONNECT_TIMEOUT_MAX, 300_000);
-        hc!("HVSOCKET_ADDRESS_FLAG_PASSTHRU", HVSOCKET_ADDRESS_FLAG_PASSTHRU, 1);
+        hc!(
+            "HVSOCKET_CONNECT_TIMEOUT_MAX",
+            HVSOCKET_CONNECT_TIMEOUT_MAX,
+            300_000
+        );
+        hc!(
+            "HVSOCKET_ADDRESS_FLAG_PASSTHRU",
+            HVSOCKET_ADDRESS_FLAG_PASSTHRU,
+            1
+        );
         #[cfg(feature = "host_env")]
         let address_names = [
             ("BDADDR_ANY", rustpython_host_env::socket::BDADDR_ANY),
             ("BDADDR_LOCAL", rustpython_host_env::socket::BDADDR_LOCAL),
             ("HV_GUID_ZERO", rustpython_host_env::socket::HV_GUID_ZERO),
-            ("HV_GUID_WILDCARD", rustpython_host_env::socket::HV_GUID_WILDCARD),
-            ("HV_GUID_BROADCAST", rustpython_host_env::socket::HV_GUID_BROADCAST),
-            ("HV_GUID_CHILDREN", rustpython_host_env::socket::HV_GUID_CHILDREN),
-            ("HV_GUID_LOOPBACK", rustpython_host_env::socket::HV_GUID_LOOPBACK),
-            ("HV_GUID_PARENT", rustpython_host_env::socket::HV_GUID_PARENT),
+            (
+                "HV_GUID_WILDCARD",
+                rustpython_host_env::socket::HV_GUID_WILDCARD,
+            ),
+            (
+                "HV_GUID_BROADCAST",
+                rustpython_host_env::socket::HV_GUID_BROADCAST,
+            ),
+            (
+                "HV_GUID_CHILDREN",
+                rustpython_host_env::socket::HV_GUID_CHILDREN,
+            ),
+            (
+                "HV_GUID_LOOPBACK",
+                rustpython_host_env::socket::HV_GUID_LOOPBACK,
+            ),
+            (
+                "HV_GUID_PARENT",
+                rustpython_host_env::socket::HV_GUID_PARENT,
+            ),
         ];
         #[cfg(not(feature = "host_env"))]
         let address_names = [
@@ -992,7 +1066,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
             "htons",
             |args| {
                 if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error("htons() missing argument"));
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "htons() missing argument",
+                    ));
                 }
                 let x = c_uint_converter(args[0], 0xffff, "uint16_t")? as u16;
                 Ok(pyre_object::w_int_new(x.to_be() as i64))
@@ -1007,7 +1083,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
             "ntohs",
             |args| {
                 if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error("ntohs() missing argument"));
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "ntohs() missing argument",
+                    ));
                 }
                 let x = c_uint_converter(args[0], 0xffff, "uint16_t")? as u16;
                 Ok(pyre_object::w_int_new(u16::from_be(x) as i64))
@@ -1022,7 +1100,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
             "htonl",
             |args| {
                 if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error("htonl() missing argument"));
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "htonl() missing argument",
+                    ));
                 }
                 let x = c_uint_converter(args[0], 0xffff_ffff, "uint32_t")? as u32;
                 Ok(pyre_object::w_int_new(x.to_be() as i64))
@@ -1037,7 +1117,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
             "ntohl",
             |args| {
                 if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error("ntohl() missing argument"));
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "ntohl() missing argument",
+                    ));
                 }
                 let x = c_uint_converter(args[0], 0xffff_ffff, "uint32_t")? as u32;
                 Ok(pyre_object::w_int_new(u32::from_be(x) as i64))
@@ -1054,7 +1136,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
             "inet_aton",
             |args| {
                 if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error("inet_aton() missing argument"));
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "inet_aton() missing argument",
+                    ));
                 }
                 let s = unsafe {
                     if !pyre_object::is_str(args[0]) {
@@ -1064,8 +1148,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     }
                     pyre_interpreter::baseobjspace::str_utf8_w(args[0])?.to_string()
                 };
-                let c = std::ffi::CString::new(s.as_bytes())
-                    .map_err(|_| pyre_interpreter::PyError::value_error("embedded null in argument"))?;
+                let c = std::ffi::CString::new(s.as_bytes()).map_err(|_| {
+                    pyre_interpreter::PyError::value_error("embedded null in argument")
+                })?;
                 let Some(bytes) = rffi::inet_aton(&c) else {
                     return Err(pyre_interpreter::PyError::os_error(
                         "illegal IP address string passed to inet_aton",
@@ -1083,7 +1168,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
             "inet_ntoa",
             |args| {
                 if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error("inet_ntoa() missing argument"));
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "inet_ntoa() missing argument",
+                    ));
                 }
                 let data = unsafe {
                     if !pyre_object::bytesobject::is_bytes_like(args[0]) {
@@ -1130,14 +1217,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     }
                     pyre_interpreter::baseobjspace::str_utf8_w(w_ip)?.to_string()
                 };
-                let c_ip = std::ffi::CString::new(ip.as_bytes())
-                    .map_err(|_| pyre_interpreter::PyError::value_error("embedded null character"))?;
+                let c_ip = std::ffi::CString::new(ip.as_bytes()).map_err(|_| {
+                    pyre_interpreter::PyError::value_error("embedded null character")
+                })?;
                 match rffi::pton(af, &c_ip) {
                     Ok(packed) => Ok(pyre_object::bytesobject::w_bytes_from_bytes(&packed)),
-                    Err(rffi::PtonError::Family(code)) => Err(pyre_interpreter::PyError::os_error_syscall(
-                        code,
-                        pyre_object::PY_NULL,
-                    )),
+                    Err(rffi::PtonError::Family(code)) => Err(
+                        pyre_interpreter::PyError::os_error_syscall(code, pyre_object::PY_NULL),
+                    ),
                     Err(rffi::PtonError::Address) => Err(pyre_interpreter::PyError::os_error(
                         "illegal IP address string passed to inet_pton",
                     )),
@@ -1368,14 +1455,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     // both platforms — WinSock wraps them in anonymous unions.
                     let mut raw = [0u8; 16];
                     let addr_len = if family == rffi::AF_INET6 {
-                        let sin6 =
-                            unsafe { &*(&storage as *const _ as *const rffi::sockaddr_in6) };
+                        let sin6 = unsafe { &*(&storage as *const _ as *const rffi::sockaddr_in6) };
                         raw = rffi::sockaddr_in6_get_addr(sin6);
                         16 as rffi::SockLen
                     } else {
                         let sin = unsafe { &*(&storage as *const _ as *const rffi::sockaddr_in) };
-                        raw[..4]
-                            .copy_from_slice(&rffi::sockaddr_in_get_addr(sin).to_ne_bytes());
+                        raw[..4].copy_from_slice(&rffi::sockaddr_in_get_addr(sin).to_ne_bytes());
                         4 as rffi::SockLen
                     };
                     let _netdb = rffi::netdb_lock();
@@ -1414,16 +1499,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 };
                 let c_name = std::ffi::CString::new(name.as_bytes())
                     .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?;
-                let proto_c: Option<std::ffi::CString> =
-                    if args.len() >= 2 && unsafe { pyre_object::is_str(w_proto) } {
-                        let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
-                        Some(
-                            std::ffi::CString::new(p.as_bytes())
-                                .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
-                        )
-                    } else {
-                        None
-                    };
+                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
+                    && unsafe { pyre_object::is_str(w_proto) }
+                {
+                    let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
+                    Some(
+                        std::ffi::CString::new(p.as_bytes())
+                            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
+                    )
+                } else {
+                    None
+                };
                 let p = unsafe {
                     rffi::serv_by_name(
                         c_name.as_ptr(),
@@ -1474,16 +1560,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     ));
                 }
                 let port = port as u16;
-                let proto_c: Option<std::ffi::CString> =
-                    if args.len() >= 2 && unsafe { pyre_object::is_str(w_proto) } {
-                        let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
-                        Some(
-                            std::ffi::CString::new(p.as_bytes())
-                                .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
-                        )
-                    } else {
-                        None
-                    };
+                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
+                    && unsafe { pyre_object::is_str(w_proto) }
+                {
+                    let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
+                    Some(
+                        std::ffi::CString::new(p.as_bytes())
+                            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
+                    )
+                } else {
+                    None
+                };
                 let p = unsafe {
                     rffi::serv_by_port(
                         port.to_be() as libc::c_int,
@@ -1596,7 +1683,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     }
                 };
                 if secs < 0.0 || !secs.is_finite() {
-                    return Err(pyre_interpreter::PyError::value_error("Timeout value out of range"));
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "Timeout value out of range",
+                    ));
                 }
                 set_default_socket_timeout(Some(secs));
                 Ok(pyre_object::w_none())
@@ -1619,7 +1708,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     return Err(pyre_interpreter::PyError::type_error("close() missing fd"));
                 }
                 if !unsafe { pyre_object::is_int(args[0]) } {
-                    return Err(pyre_interpreter::PyError::type_error("close: fd must be an integer"));
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "close: fd must be an integer",
+                    ));
                 }
                 let fd = rffi::socket_from_i64(unsafe { pyre_object::w_int_get_value(args[0]) });
                 if unsafe { rffi::close(fd) } != 0 {
@@ -1725,8 +1816,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     // spelling, which is also what makes this round-trip with
                     // the `if_nameindex` / `if_indextoname` decode above.
                     let name = pyre_interpreter::gateway::fsencode_bytes_w(args[0])?;
-                    let c_name = std::ffi::CString::new(name)
-                        .map_err(|_| pyre_interpreter::PyError::value_error("embedded null in name"))?;
+                    let c_name = std::ffi::CString::new(name).map_err(|_| {
+                        pyre_interpreter::PyError::value_error("embedded null in name")
+                    })?;
                     #[cfg(not(feature = "host_env"))]
                     {
                         let _ = c_name;
@@ -1759,7 +1851,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     let w_index = pyre_interpreter::baseobjspace::space_index(args[0])?;
                     let index = pyre_interpreter::builtins::space_index_w(w_index)?;
                     if index < 0 {
-                        return Err(pyre_interpreter::PyError::value_error("Cannot convert negative int"));
+                        return Err(pyre_interpreter::PyError::value_error(
+                            "Cannot convert negative int",
+                        ));
                     }
                     let idx = libc::c_uint::try_from(index).map_err(|_| {
                         pyre_interpreter::PyError::overflow_error(
@@ -1808,8 +1902,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 "if_nametoindex",
                 |args| {
                     let name = pyre_interpreter::gateway::fsencode_bytes_w(args[0])?;
-                    let name = std::ffi::CString::new(name)
-                        .map_err(|_| pyre_interpreter::PyError::value_error("embedded null in name"))?;
+                    let name = std::ffi::CString::new(name).map_err(|_| {
+                        pyre_interpreter::PyError::value_error("embedded null in name")
+                    })?;
                     let index = rustpython_host_env::socket::if_nametoindex_checked(&name)
                         .map_err(interface_io_error)?;
                     Ok(pyre_object::w_int_new(index as i64))
@@ -1842,7 +1937,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                         },
                     };
                     if negative {
-                        return Err(pyre_interpreter::PyError::value_error("Cannot convert negative int"));
+                        return Err(pyre_interpreter::PyError::value_error(
+                            "Cannot convert negative int",
+                        ));
                     }
                     let index = word
                         .and_then(|index| u32::try_from(index).ok())
@@ -1886,8 +1983,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                         })?;
                     #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
                     let n = {
-                        let max_payload = i64::from(libc::c_int::MAX)
-                            - i64::from(unsafe { libc::CMSG_SPACE(1) });
+                        let max_payload =
+                            i64::from(libc::c_int::MAX) - i64::from(unsafe { libc::CMSG_SPACE(1) });
                         if raw < 0 || raw > max_payload {
                             return Err(pyre_interpreter::PyError::overflow_error(
                                 "CMSG_SPACE() argument out of range",
@@ -1920,7 +2017,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                         .ok()
                         .and_then(rustpython_host_env::socket::checked_cmsg_len)
                         .ok_or_else(|| {
-                            pyre_interpreter::PyError::overflow_error("CMSG_LEN() argument out of range")
+                            pyre_interpreter::PyError::overflow_error(
+                                "CMSG_LEN() argument out of range",
+                            )
                         })?;
                     #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
                     let n = {
@@ -2030,10 +2129,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 "dup",
                 |args| {
                     if args.is_empty() {
-                        return Err(pyre_interpreter::PyError::type_error("dup() missing argument"));
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "dup() missing argument",
+                        ));
                     }
                     if !unsafe { pyre_object::is_int(args[0]) } {
-                        return Err(pyre_interpreter::PyError::type_error("dup: fd must be an integer"));
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "dup: fd must be an integer",
+                        ));
                     }
                     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     let n = unsafe { majit_rlib::_rsocket_rffi::dup(fd) };
@@ -2111,9 +2214,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
             "dup",
             |args| {
                 let fd = pyre_interpreter::builtins::space_index_w(args[0])?;
-                let share =
-                    rustpython_host_env::socket::share_socket(fd as _, std::process::id())
-                        .map_err(socket_io_err)?;
+                let share = rustpython_host_env::socket::share_socket(fd as _, std::process::id())
+                    .map_err(socket_io_err)?;
                 let shared = rustpython_host_env::socket::socket_from_share_data(&share)
                     .map_err(socket_io_err)?;
                 Ok(pyre_object::w_int_new(shared.raw as i64))
@@ -2128,7 +2230,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
 // `interp_func.py common_wrapgethost` — packs a resolver hostent
 // into the 3-tuple shape used by gethostbyname_ex / gethostbyaddr.
 #[cfg(any(unix, windows))]
-fn unpack_hostent(he: *mut rffi::Hostent) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+fn unpack_hostent(
+    he: *mut rffi::Hostent,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     unsafe {
         let host_name = rffi::hostent_name(he);
         let name = if host_name.is_null() {
@@ -2149,7 +2253,11 @@ fn unpack_hostent(he: *mut rffi::Hostent) -> Result<pyre_object::PyObjectRef, py
                 if alias.is_null() {
                     break;
                 }
-                alias_strings.push(std::ffi::CStr::from_ptr(alias).to_string_lossy().into_owned());
+                alias_strings.push(
+                    std::ffi::CStr::from_ptr(alias)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
                 index += 1;
             }
         }
@@ -2343,20 +2451,21 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
             };
 
             let nargs = args.len();
-            let int_arg =
-                |idx: usize, default: libc::c_int| -> Result<libc::c_int, pyre_interpreter::PyError> {
-                    if nargs > idx {
-                        let v = pyre_object::gc_roots::shadow_stack_get(args_base + idx);
-                        if !unsafe { pyre_object::is_int(v) } {
-                            return Err(pyre_interpreter::PyError::type_error(
-                                "getaddrinfo: family/type/proto/flags must be integers",
-                            ));
-                        }
-                        Ok(unsafe { pyre_object::w_int_get_value(v) } as libc::c_int)
-                    } else {
-                        Ok(default)
+            let int_arg = |idx: usize,
+                           default: libc::c_int|
+             -> Result<libc::c_int, pyre_interpreter::PyError> {
+                if nargs > idx {
+                    let v = pyre_object::gc_roots::shadow_stack_get(args_base + idx);
+                    if !unsafe { pyre_object::is_int(v) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "getaddrinfo: family/type/proto/flags must be integers",
+                        ));
                     }
-                };
+                    Ok(unsafe { pyre_object::w_int_get_value(v) } as libc::c_int)
+                } else {
+                    Ok(default)
+                }
+            };
             let family = int_arg(2, rffi::AF_UNSPEC)?;
             let socktype = int_arg(3, 0)?;
             let proto = int_arg(4, 0)?;
@@ -2460,14 +2569,18 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 // TypeError below rather than a per-item message.
                 let sockaddr_len = unsafe { pyre_object::w_tuple_len(args[0]) };
                 let item = |i: i64| unsafe { pyre_object::w_tuple_getitem(args[0], i) };
-                let illegal_sockaddr =
-                    || pyre_interpreter::PyError::type_error("getnameinfo(): illegal sockaddr argument");
+                let illegal_sockaddr = || {
+                    pyre_interpreter::PyError::type_error(
+                        "getnameinfo(): illegal sockaddr argument",
+                    )
+                };
                 if !(2..=4).contains(&sockaddr_len) {
                     return Err(illegal_sockaddr());
                 }
                 let host_obj = item(0).ok_or_else(illegal_sockaddr)?;
                 let mut port_obj = item(1).ok_or_else(illegal_sockaddr)?;
-                if !unsafe { pyre_object::is_str(host_obj) } || !unsafe { pyre_object::is_int(port_obj) }
+                if !unsafe { pyre_object::is_str(host_obj) }
+                    || !unsafe { pyre_object::is_int(port_obj) }
                 {
                     return Err(illegal_sockaddr());
                 }
@@ -2541,8 +2654,8 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                     ));
                 }
                 let mut resolved: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
-                let resolved_len = (ai.ai_addrlen as usize)
-                    .min(core::mem::size_of::<rffi::sockaddr_storage>());
+                let resolved_len =
+                    (ai.ai_addrlen as usize).min(core::mem::size_of::<rffi::sockaddr_storage>());
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         ai.ai_addr as *const u8,
@@ -2555,9 +2668,8 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                     // tuple fields in the sockaddr handed to getnameinfo.  A
                     // resolver lookup of the bare host cannot recover the
                     // scope id by itself.
-                    let sin6 = unsafe {
-                        &mut *(&mut resolved as *mut _ as *mut rffi::sockaddr_in6)
-                    };
+                    let sin6 =
+                        unsafe { &mut *(&mut resolved as *mut _ as *mut rffi::sockaddr_in6) };
                     sin6.sin6_flowinfo = flowinfo.to_be();
                     rffi::sockaddr_in6_set_scope_id(sin6, scope_id);
                 }
@@ -2630,7 +2742,11 @@ fn socket_io_err(e: std::io::Error) -> pyre_interpreter::PyError {
     // `.winerror` with `.errno` derived from it, not read as an errno itself.
     #[cfg(windows)]
     {
-        pyre_interpreter::PyError::os_error_win32_syscall2(code, pyre_object::PY_NULL, pyre_object::PY_NULL)
+        pyre_interpreter::PyError::os_error_win32_syscall2(
+            code,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        )
     }
     // `rsocket.py` carries the C `strerror` text; build the OSError in
     // its `(errno, strerror)` form so `e.errno` and `str(e)` match.
@@ -2891,9 +3007,10 @@ fn socket_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
         return -1;
     }
     if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(d, key) }
-        && unsafe { pyre_object::is_int(v) } {
-            return unsafe { pyre_object::w_int_get_value(v) };
-        }
+        && unsafe { pyre_object::is_int(v) }
+    {
+        return unsafe { pyre_object::w_int_get_value(v) };
+    }
     -1
 }
 
@@ -2924,7 +3041,9 @@ fn socket_apply_timeout(fd: rffi::Socket, timeout: f64) -> Result<(), pyre_inter
 }
 
 #[cfg(any(unix, windows))]
-pub(crate) fn socket_fd(obj: pyre_object::PyObjectRef) -> Result<rffi::Socket, pyre_interpreter::PyError> {
+pub(crate) fn socket_fd(
+    obj: pyre_object::PyObjectRef,
+) -> Result<rffi::Socket, pyre_interpreter::PyError> {
     let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
     if rffi::is_invalid(fd) {
         // `close` leaves `self.fd = INVALID_SOCKET` (`rsocket.py RSocket.close`)
@@ -3020,8 +3139,9 @@ pub(crate) fn socket_send_bytes(
         let outcome = {
             #[cfg(unix)]
             {
-                let sent =
-                    unsafe { rffi::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags) };
+                let sent = unsafe {
+                    rffi::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags)
+                };
                 if sent >= 0 {
                     Ok(sent)
                 } else {
@@ -3174,7 +3294,8 @@ fn socket_init_state(
 fn socket_detect_family(fd: rffi::Socket) -> Result<libc::c_int, pyre_interpreter::PyError> {
     let mut addr: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-    let res = unsafe { rffi::getsockname(fd, &mut addr as *mut _ as *mut rffi::sockaddr, &mut len) };
+    let res =
+        unsafe { rffi::getsockname(fd, &mut addr as *mut _ as *mut rffi::sockaddr, &mut len) };
     if res != 0 {
         return Err(socket_last_error());
     }
@@ -3211,7 +3332,10 @@ fn socket_getsockopt_int(
 fn socket_get_so_protocol(fd: rffi::Socket) -> Result<libc::c_int, pyre_interpreter::PyError> {
     socket_getsockopt_int(fd, rffi::SOL_SOCKET, libc::SO_PROTOCOL)
 }
-#[cfg(all(any(unix, windows), not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(all(
+    any(unix, windows),
+    not(any(target_os = "linux", target_os = "android"))
+))]
 fn socket_get_so_protocol(_fd: rffi::Socket) -> Result<libc::c_int, pyre_interpreter::PyError> {
     Ok(-1)
 }
@@ -3269,7 +3393,10 @@ fn windows_if_nameindex() -> Result<pyre_object::PyObjectRef, pyre_interpreter::
             if status != NO_ERROR {
                 return Err(win32(status));
             }
-            let end = name.iter().position(|&unit| unit == 0).unwrap_or(name.len());
+            let end = name
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(name.len());
             let entry = {
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
                 fields.push(pyre_object::w_int_new(i64::from(row.InterfaceIndex)));
@@ -3303,7 +3430,11 @@ fn windows_if_nameindex() -> Result<pyre_object::PyObjectRef, pyre_interpreter::
 /// `PyNumber_Index` does rather than by giving the argument's position.
 #[cfg(windows)]
 fn masked_ulong_w(obj: pyre_object::PyObjectRef) -> Result<u32, pyre_interpreter::PyError> {
-    Ok(pyre_interpreter::baseobjspace::truncatedint_w(pyre_interpreter::baseobjspace::space_index(obj)?)? as u32)
+    Ok(
+        pyre_interpreter::baseobjspace::truncatedint_w(
+            pyre_interpreter::baseobjspace::space_index(obj)?,
+        )? as u32,
+    )
 }
 
 /// `k` — [`masked_ulong_w`] behind a `PyIndex_Check` that reports the
@@ -3394,7 +3525,14 @@ fn scan_hex_field(text: &str) -> Option<(u32, &str)> {
     if end == 0 {
         return None;
     }
-    Some((if negative { value.wrapping_neg() } else { value }, &digits[end..]))
+    Some((
+        if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        },
+        &digits[end..],
+    ))
 }
 
 /// `setbdaddr` — six `%X` fields with a colon between each pair, every one of
@@ -3414,7 +3552,11 @@ fn parse_bdaddr(name: &str) -> Option<u64> {
     if !rest.is_empty() || octets.iter().fold(0, |acc, octet| acc | octet) >= 256 {
         return None;
     }
-    Some(octets.iter().fold(0u64, |acc, &octet| (acc << 8) | u64::from(octet)))
+    Some(
+        octets
+            .iter()
+            .fold(0u64, |acc, &octet| (acc << 8) | u64::from(octet)),
+    )
 }
 
 /// `makebdaddr` — `XX:XX:XX:XX:XX:XX`, most significant octet first.
@@ -3465,7 +3607,8 @@ fn pack_bluetooth_addr(
     if name.contains('\0') {
         return Err(wrong_format());
     }
-    let bd_addr = parse_bdaddr(name).ok_or_else(|| pyre_interpreter::PyError::os_error("bad bluetooth address"))?;
+    let bd_addr = parse_bdaddr(name)
+        .ok_or_else(|| pyre_interpreter::PyError::os_error("bad bluetooth address"))?;
     let bth = bt::SOCKADDR_BTH {
         addressFamily: AF_BTH as u16,
         btAddr: bd_addr,
@@ -3541,7 +3684,9 @@ struct SockaddrHv {
 /// shape that is a tuple but not two `str`s — a wrong length included.
 #[cfg(windows)]
 fn hyperv_address_shape_error() -> pyre_interpreter::PyError {
-    pyre_interpreter::PyError::type_error("AF_HYPERV address must be a str tuple (vm_id, service_id)")
+    pyre_interpreter::PyError::type_error(
+        "AF_HYPERV address must be a str tuple (vm_id, service_id)",
+    )
 }
 
 /// `UuidFromStringW`, which takes the bare 8-4-4-4-12 spelling and nothing
@@ -3650,7 +3795,9 @@ fn c_uint_converter(
         }
     };
     if negative {
-        return Err(pyre_interpreter::PyError::value_error("Cannot convert negative int"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "Cannot convert negative int",
+        ));
     }
     match pyre_interpreter::baseobjspace::uint_w(obj) {
         Ok(value) if value <= max => Ok(value),
@@ -3800,7 +3947,11 @@ fn resolve_ip_host(
     // carry, so this is the plain module error, the way "sockaddr resolved to
     // multiple addresses" is.
     resolved.ok_or_else(|| {
-        socket_converted_error("error", None, "getaddrinfo returned no address of the requested family")
+        socket_converted_error(
+            "error",
+            None,
+            "getaddrinfo returned no address of the requested family",
+        )
     })
 }
 
@@ -3936,14 +4087,16 @@ fn pack_inet_addr(
             let Some(value) = (unsafe { pyre_object::w_tuple_getitem(addr, index) }) else {
                 return Ok(None);
             };
-            let value = pyre_interpreter::builtins::space_index_w(pyre_interpreter::baseobjspace::space_index(value)?)?;
+            let value = pyre_interpreter::builtins::space_index_w(
+                pyre_interpreter::baseobjspace::space_index(value)?,
+            )?;
             if value < 0 || value > max {
                 return Err(pyre_interpreter::PyError::overflow_error(format!(
                     "{caller}(): {field} must be 0-{max}."
                 )));
             }
             Ok(Some(value as u32))
-    };
+        };
     let flowinfo = if len >= 3 {
         tuple_unsigned(2, "flowinfo", 0xfffff)?
     } else {
@@ -4077,8 +4230,12 @@ fn unpack_inet_addr(
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(pyre_object::w_str_new_managed(&host));
         fields.push(pyre_object::w_int_new(port));
-        fields.push(pyre_object::w_int_new(u32::from_be(sin6.sin6_flowinfo) as i64));
-        fields.push(pyre_object::w_int_new(rffi::sockaddr_in6_get_scope_id(sin6) as i64));
+        fields.push(pyre_object::w_int_new(
+            u32::from_be(sin6.sin6_flowinfo) as i64
+        ));
+        fields.push(pyre_object::w_int_new(
+            rffi::sockaddr_in6_get_scope_id(sin6) as i64,
+        ));
         pyre_object::w_tuple_new(fields.take())
     } else {
         #[cfg(unix)]
@@ -4133,465 +4290,1060 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // `descr_init` below installs the RSocket state.  Keeping allocation and
     // initialisation separate is required when socket.py's Python subclass
     // explicitly calls `_socket.socket.__init__(self, ...)`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__new__",
-        pyre_interpreter::typedef::make_new_descr(|args| {
-            let cls = args
-                .first()
-                .copied()
-                .filter(|w_cls| { pyre_object::is_type(*w_cls) })
-                .unwrap_or_else(socket_type);
-            Ok(pyre_object::w_instance_new(cls))
-        }),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__del__",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            pyre_interpreter::typedef::make_new_descr(|args| {
+                let cls = args
+                    .first()
+                    .copied()
+                    .filter(|w_cls| pyre_object::is_type(*w_cls))
+                    .unwrap_or_else(socket_type);
+                Ok(pyre_object::w_instance_new(cls))
+            }),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__del__",
-            |args| {
-                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = rffi::socket_from_i64(pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")));
-                if !rffi::is_invalid(fd) {
-                    if let Ok(repr) = pyre_object::with_roots!(obj => { pyre_interpreter::display::py_repr_wtf8(obj) }) {
-                        let _ = pyre_object::with_roots!(obj => pyre_interpreter::warn::warn_category_source(
-                            &format!("unclosed {}", repr.to_string_lossy()),
-                            "ResourceWarning",
-                            1,
-                            obj,
-                        ));
+            pyre_interpreter::make_builtin_function_with_arity(
+                "__del__",
+                |args| {
+                    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let fd = rffi::socket_from_i64(
+                        pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")),
+                    );
+                    if !rffi::is_invalid(fd) {
+                        if let Ok(repr) = pyre_object::with_roots!(obj => { pyre_interpreter::display::py_repr_wtf8(obj) })
+                        {
+                            let _ = pyre_object::with_roots!(obj => pyre_interpreter::warn::warn_category_source(
+                                &format!("unclosed {}", repr.to_string_lossy()),
+                                "ResourceWarning",
+                                1,
+                                obj,
+                            ));
+                        }
+                        let _ = { rffi::close(fd) };
+                        socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
                     }
-                    let _ = { rffi::close(fd) };
-                    socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
-                }
-                Ok(pyre_object::w_none())
-            },
-            1,
-        ),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__init__",
-        pyre_interpreter::make_builtin_function("__init__", |args| {
-            // `interp_socket.py descr_init(family=-1, type=-1, proto=-1,
-            // w_fileno=None)`.
-            let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            let after_self = if args.is_empty() { args } else { &args[1..] };
-            let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(after_self);
-            // `descr_init`'s `@unwrap_spec` signature rejects unknown
-            // keywords and a parameter supplied both by position and name.
-            pyre_interpreter::builtins::kwarg_reject_unknown(
-                kwargs,
-                &["family", "type", "proto", "fileno"],
-                "socket",
-            )?;
-            pyre_interpreter::builtins::kwarg_reject_duplicate(kwargs, "socket", "family", !pos.is_empty())?;
-            pyre_interpreter::builtins::kwarg_reject_duplicate(kwargs, "socket", "type", pos.len() >= 2)?;
-            pyre_interpreter::builtins::kwarg_reject_duplicate(kwargs, "socket", "proto", pos.len() >= 3)?;
-            pyre_interpreter::builtins::kwarg_reject_duplicate(kwargs, "socket", "fileno", pos.len() >= 4)?;
-            // `interp_socket.py descr_init(family=-1, type=-1, proto=-1,
-            // w_fileno=None)` — each parameter comes from its positional
-            // slot, then its keyword; family/type/proto keep the sentinel
-            // -1 (resolved below from the module defaults or the fd).
-            let family_obj = pos
-                .first()
-                .copied()
-                .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "family"));
-            let type_obj = pos
-                .get(1)
-                .copied()
-                .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "type"));
-            let proto_obj = pos
-                .get(2)
-                .copied()
-                .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "proto"));
-            let fileno_obj = pos
-                .get(3)
-                .copied()
-                .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "fileno"));
-            // `@unwrap_spec(family=int, type=int, proto=int)` — a present
-            // argument goes through the gateway int converter (`__index__` /
-            // `__int__`, OverflowError if it does not fit), defaulting to the
-            // -1 sentinel when omitted.
-            let int_arg =
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__init__",
+            pyre_interpreter::make_builtin_function("__init__", |args| {
+                // `interp_socket.py descr_init(family=-1, type=-1, proto=-1,
+                // w_fileno=None)`.
+                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let after_self = if args.is_empty() { args } else { &args[1..] };
+                let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(after_self);
+                // `descr_init`'s `@unwrap_spec` signature rejects unknown
+                // keywords and a parameter supplied both by position and name.
+                pyre_interpreter::builtins::kwarg_reject_unknown(
+                    kwargs,
+                    &["family", "type", "proto", "fileno"],
+                    "socket",
+                )?;
+                pyre_interpreter::builtins::kwarg_reject_duplicate(
+                    kwargs,
+                    "socket",
+                    "family",
+                    !pos.is_empty(),
+                )?;
+                pyre_interpreter::builtins::kwarg_reject_duplicate(
+                    kwargs,
+                    "socket",
+                    "type",
+                    pos.len() >= 2,
+                )?;
+                pyre_interpreter::builtins::kwarg_reject_duplicate(
+                    kwargs,
+                    "socket",
+                    "proto",
+                    pos.len() >= 3,
+                )?;
+                pyre_interpreter::builtins::kwarg_reject_duplicate(
+                    kwargs,
+                    "socket",
+                    "fileno",
+                    pos.len() >= 4,
+                )?;
+                // `interp_socket.py descr_init(family=-1, type=-1, proto=-1,
+                // w_fileno=None)` — each parameter comes from its positional
+                // slot, then its keyword; family/type/proto keep the sentinel
+                // -1 (resolved below from the module defaults or the fd).
+                let family_obj = pos
+                    .first()
+                    .copied()
+                    .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "family"));
+                let type_obj = pos
+                    .get(1)
+                    .copied()
+                    .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "type"));
+                let proto_obj = pos
+                    .get(2)
+                    .copied()
+                    .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "proto"));
+                let fileno_obj = pos
+                    .get(3)
+                    .copied()
+                    .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "fileno"));
+                // `@unwrap_spec(family=int, type=int, proto=int)` — a present
+                // argument goes through the gateway int converter (`__index__` /
+                // `__int__`, OverflowError if it does not fit), defaulting to the
+                // -1 sentinel when omitted.
+                let int_arg =
                 |obj: Option<pyre_object::PyObjectRef>| -> Result<libc::c_int, pyre_interpreter::PyError> {
                 match obj {
                     Some(o) => Ok(pyre_interpreter::baseobjspace::int_w(o)? as libc::c_int),
                     None => Ok(-1),
                 }
             };
-            let mut family = pyre_object::with_roots!(obj => int_arg(family_obj))?;
-            let mut ty = pyre_object::with_roots!(obj => int_arg(type_obj))?;
-            let mut proto = pyre_object::with_roots!(obj => int_arg(proto_obj))?;
-            let has_fileno = match fileno_obj {
-                Some(o) => !{ pyre_object::is_none(o) },
-                None => false,
-            };
-            if !has_fileno {
-                // `interp_socket.py:219-225` — without a fileno the
-                // sentinels resolve to AF_INET / SOCK_STREAM / 0.
+                // Each `int_w` can collect. Read every Option first, then keep
+                // the socket and the four words in one pin for the rest of init.
+                let has_family = family_obj.is_some();
+                let family_word = family_obj.unwrap_or(pyre_object::PY_NULL);
+                let has_type = type_obj.is_some();
+                let type_word = type_obj.unwrap_or(pyre_object::PY_NULL);
+                let has_proto = proto_obj.is_some();
+                let proto_word = proto_obj.unwrap_or(pyre_object::PY_NULL);
+                let has_fileno_obj = fileno_obj.is_some();
+                let fileno_word = fileno_obj.unwrap_or(pyre_object::PY_NULL);
+                let has_fileno = has_fileno_obj && !pyre_object::is_none(fileno_word);
+                let init_roots = pyre_object::gc_roots::push_roots();
+                let init_base =
+                    init_roots.pin_roots(&[obj, family_word, type_word, proto_word, fileno_word]);
+                let mut family = int_arg(has_family.then(|| init_roots.get(init_base + 1)))?;
+                let mut ty = int_arg(has_type.then(|| init_roots.get(init_base + 2)))?;
+                let mut proto = int_arg(has_proto.then(|| init_roots.get(init_base + 3)))?;
+                obj = init_roots.get(init_base);
+                if !has_fileno {
+                    // `interp_socket.py W_Socket.descr_init` — without a fileno the
+                    // sentinels resolve to AF_INET / SOCK_STREAM / 0.
+                    if family == -1 {
+                        family = rffi::AF_INET;
+                    }
+                    if ty == -1 {
+                        ty = rffi::SOCK_STREAM;
+                    }
+                    if proto == -1 {
+                        proto = 0;
+                    }
+                    // `socket` and the cloexec `fcntl` release the interpreter.
+                    // `obj` is reloaded before `socket_init_state` writes it.
+                    let fd = pyre_object::with_roots!(obj => rffi::socket(family, ty, proto));
+                    if rffi::is_invalid(fd) {
+                        return Err(socket_last_error());
+                    }
+                    // `RSocket.__init__` keeps every newly created socket out of
+                    // an exec'd child (PEP 446).
+                    pyre_object::with_roots!(obj => rffi::set_cloexec(fd));
+                    socket_init_state(obj, fd, family, ty, proto)?;
+                    return Ok(pyre_object::w_none());
+                }
+                // A socket handed over by `share` arrives as the bytes of the
+                // `WSAPROTOCOL_INFOW` that wrote it, and re-opening it is what
+                // `WSASocketW` under `FROM_PROTOCOL_INFO` does.  The three
+                // arguments the caller gave are not read at all: the structure
+                // names the family, type and protocol itself, so `fromshare`
+                // reaches this with `socket(0, 0, 0, info)`.
+                #[cfg(all(windows, feature = "host_env"))]
+                if pyre_object::is_bytes(init_roots.get(init_base + 4)) {
+                    // Copied out before the interpreter is released: the borrow
+                    // would not survive a collection running in another thread.
+                    let data = unsafe {
+                        pyre_object::bytesobject::w_bytes_data(init_roots.get(init_base + 4))
+                    }
+                    .to_vec();
+                    let size = rustpython_host_env::socket::protocol_info_size();
+                    if data.len() != size {
+                        return Err(pyre_interpreter::PyError::value_error(format!(
+                            "socket descriptor string has wrong size, should be {size} bytes."
+                        )));
+                    }
+                    let shared = {
+                        let _blocked = pyre_interpreter::module::thread::before_external_block();
+                        rustpython_host_env::socket::socket_from_share_data(&data)
+                    }
+                    .map_err(socket_io_err)?;
+                    socket_init_state(
+                        obj,
+                        shared.raw,
+                        shared.family,
+                        shared.socket_type,
+                        shared.protocol,
+                    )?;
+                    return Ok(pyre_object::w_none());
+                }
+                // `interp_socket.py W_Socket.descr_init` — wrap an existing fd.  A float
+                // fileno is a TypeError, a negative fd a ValueError, and any
+                // -1 family/type/proto is derived from the descriptor itself.
+                if pyre_object::is_float(init_roots.get(init_base + 4)) {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "integer argument expected, got float",
+                    ));
+                }
+                // `interp_socket.py` — `space.int_w(w_fileno)` accepts ints,
+                // longs, and objects with `__int__` / `__index__`.
+                let fd = pyre_object::with_roots!(obj => {
+                    pyre_interpreter::baseobjspace::int_w(init_roots.get(init_base + 4))
+                })?;
+                if fd < 0 {
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "negative file descriptor",
+                    ));
+                }
+                let fd = rffi::socket_from_i64(fd);
+                // [3.14-spec] PyPy `W_Socket.descr_init` only probes SO_TYPE when
+                // `type == -1`, and consequently accepts a regular-file fd when
+                // the caller supplies family/type.  The public 3.14
+                // `test_socket_fileno_requires_socket_fd` requires ENOTSOCK for
+                // both forms.  No JIT/immutability hint covers `descr_init`, so
+                // validate the descriptor once while keeping PyPy's field-owner
+                // and subsequent inference order unchanged.
+                let detected_type = pyre_object::with_roots!(obj => socket_getsockopt_int(fd, rffi::SOL_SOCKET, rffi::SO_TYPE))?;
                 if family == -1 {
-                    family = rffi::AF_INET;
+                    family = pyre_object::with_roots!(obj => socket_detect_family(fd))?;
                 }
                 if ty == -1 {
-                    ty = rffi::SOCK_STREAM;
+                    ty = detected_type;
                 }
                 if proto == -1 {
-                    proto = 0;
+                    proto = pyre_object::with_roots!(obj => socket_get_so_protocol(fd))?;
                 }
-                // `socket` and the cloexec `fcntl` release the interpreter.
-                // `obj` is reloaded before `socket_init_state` writes it.
-                let fd = pyre_object::with_roots!(obj => rffi::socket(family, ty, proto));
-                if rffi::is_invalid(fd) {
-                    return Err(socket_last_error());
-                }
-                // `RSocket.__init__` keeps every newly created socket out of
-                // an exec'd child (PEP 446).
-                pyre_object::with_roots!(obj => rffi::set_cloexec(fd));
                 socket_init_state(obj, fd, family, ty, proto)?;
-                return Ok(pyre_object::w_none());
-            }
-            let fileno_obj = fileno_obj.unwrap();
-            // A socket handed over by `share` arrives as the bytes of the
-            // `WSAPROTOCOL_INFOW` that wrote it, and re-opening it is what
-            // `WSASocketW` under `FROM_PROTOCOL_INFO` does.  The three
-            // arguments the caller gave are not read at all: the structure
-            // names the family, type and protocol itself, so `fromshare`
-            // reaches this with `socket(0, 0, 0, info)`.
-            #[cfg(all(windows, feature = "host_env"))]
-            if unsafe { pyre_object::is_bytes(fileno_obj) } {
-                // Copied out before the interpreter is released: the borrow
-                // would not survive a collection running in another thread.
-                let data = unsafe { pyre_object::bytesobject::w_bytes_data(fileno_obj) }.to_vec();
-                let size = rustpython_host_env::socket::protocol_info_size();
-                if data.len() != size {
-                    return Err(pyre_interpreter::PyError::value_error(format!(
-                        "socket descriptor string has wrong size, should be {size} bytes."
-                    )));
-                }
-                let shared = {
-                    let _blocked = pyre_interpreter::module::thread::before_external_block();
-                    rustpython_host_env::socket::socket_from_share_data(&data)
-                }
-                .map_err(socket_io_err)?;
-                socket_init_state(
-                    obj,
-                    shared.raw,
-                    shared.family,
-                    shared.socket_type,
-                    shared.protocol,
-                )?;
-                return Ok(pyre_object::w_none());
-            }
-            // `interp_socket.py:253-265` — wrap an existing fd.  A float
-            // fileno is a TypeError, a negative fd a ValueError, and any
-            // -1 family/type/proto is derived from the descriptor itself.
-            if pyre_object::is_float(fileno_obj) {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "integer argument expected, got float",
-                ));
-            }
-            // `interp_socket.py` — `space.int_w(w_fileno)` accepts ints,
-            // longs, and objects with `__int__` / `__index__`.
-            let fd = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::int_w(fileno_obj))?;
-            if fd < 0 {
-                return Err(pyre_interpreter::PyError::value_error("negative file descriptor"));
-            }
-            let fd = rffi::socket_from_i64(fd);
-            // [3.14-spec] PyPy `W_Socket.descr_init` only probes SO_TYPE when
-            // `type == -1`, and consequently accepts a regular-file fd when
-            // the caller supplies family/type.  The public 3.14
-            // `test_socket_fileno_requires_socket_fd` requires ENOTSOCK for
-            // both forms.  No JIT/immutability hint covers `descr_init`, so
-            // validate the descriptor once while keeping PyPy's field-owner
-            // and subsequent inference order unchanged.
-            let detected_type = pyre_object::with_roots!(obj => socket_getsockopt_int(fd, rffi::SOL_SOCKET, rffi::SO_TYPE))?;
-            if family == -1 {
-                family = pyre_object::with_roots!(obj => socket_detect_family(fd))?;
-            }
-            if ty == -1 {
-                ty = detected_type;
-            }
-            if proto == -1 {
-                proto = socket_get_so_protocol(fd)?;
-            }
-            socket_init_state(obj, fd, family, ty, proto)?;
-            Ok(pyre_object::w_none())
-        }),
-    ) };
+                Ok(pyre_object::w_none())
+            }),
+        )
+    };
 
     // `interp_socket.py:1157-1160` — `family`/`type`/`proto`/`timeout`
     // are GetSetProperty data descriptors (plain attribute access, not
     // callables).  The getter receives `(descriptor, instance)`, so the
     // socket object is `args[1]`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "family",
-        pyre_interpreter::typedef::make_getset_descriptor_named(
-            pyre_interpreter::make_builtin_function_with_arity(
-                "family",
-                |args| Ok(pyre_object::w_int_new(socket_get_attr_i64(args[1], "_family"))),
-                2,
-            ),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "family",
-        ),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "type",
-        pyre_interpreter::typedef::make_getset_descriptor_named(
-            pyre_interpreter::make_builtin_function_with_arity(
-                "type",
-                |args| Ok(pyre_object::w_int_new(socket_get_attr_i64(args[1], "_type"))),
-                2,
+            pyre_interpreter::typedef::make_getset_descriptor_named(
+                pyre_interpreter::make_builtin_function_with_arity(
+                    "family",
+                    |args| {
+                        Ok(pyre_object::w_int_new(socket_get_attr_i64(
+                            args[1], "_family",
+                        )))
+                    },
+                    2,
+                ),
+                "family",
             ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "type",
-        ),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "proto",
-        pyre_interpreter::typedef::make_getset_descriptor_named(
-            pyre_interpreter::make_builtin_function_with_arity(
-                "proto",
-                |args| Ok(pyre_object::w_int_new(socket_get_attr_i64(args[1], "_proto"))),
-                2,
+            pyre_interpreter::typedef::make_getset_descriptor_named(
+                pyre_interpreter::make_builtin_function_with_arity(
+                    "type",
+                    |args| {
+                        Ok(pyre_object::w_int_new(socket_get_attr_i64(
+                            args[1], "_type",
+                        )))
+                    },
+                    2,
+                ),
+                "type",
             ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "proto",
-        ),
-    ) };
+            pyre_interpreter::typedef::make_getset_descriptor_named(
+                pyre_interpreter::make_builtin_function_with_arity(
+                    "proto",
+                    |args| {
+                        Ok(pyre_object::w_int_new(socket_get_attr_i64(
+                            args[1], "_proto",
+                        )))
+                    },
+                    2,
+                ),
+                "proto",
+            ),
+        )
+    };
     // `interp_socket.py gettimeout_w` — `timeout` is the stored
     // `_timeout` object (float, or `None` when disabled).
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "timeout",
-        pyre_interpreter::typedef::make_getset_descriptor_named(
-            pyre_interpreter::make_builtin_function_with_arity(
-                "timeout",
-                |args| {
-                    let d = pyre_interpreter::baseobjspace::getdict_native(args[1]);
-                    if d.is_null() {
-                        return Ok(pyre_object::w_none());
-                    }
-                    Ok({ pyre_object::w_dict_getitem_str(d, "_timeout") }
-                        .unwrap_or(pyre_object::w_none()))
-                },
-                2,
-            ),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "timeout",
-        ),
-    ) };
+            pyre_interpreter::typedef::make_getset_descriptor_named(
+                pyre_interpreter::make_builtin_function_with_arity(
+                    "timeout",
+                    |args| {
+                        let d = pyre_interpreter::baseobjspace::getdict_native(args[1]);
+                        if d.is_null() {
+                            return Ok(pyre_object::w_none());
+                        }
+                        Ok({ pyre_object::w_dict_getitem_str(d, "_timeout") }
+                            .unwrap_or(pyre_object::w_none()))
+                    },
+                    2,
+                ),
+                "timeout",
+            ),
+        )
+    };
 
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "fileno",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "fileno",
-            |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                Ok(pyre_object::w_int_new(socket_get_attr_i64(obj, "_fd")))
-            },
-            1,
-        ),
-    ) };
+            pyre_interpreter::make_builtin_function_with_arity(
+                "fileno",
+                |args| {
+                    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    Ok(pyre_object::w_int_new(socket_get_attr_i64(obj, "_fd")))
+                },
+                1,
+            ),
+        )
+    };
 
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "close",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "close",
-            |args| {
-                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = rffi::socket_from_i64(pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")));
-                if !rffi::is_invalid(fd) {
-                    // `rsocket.py:RSocket.close` drops ownership before the
-                    // syscall and still reports its failure.  This prevents a
-                    // later double close while preserving EBADF/ENOTSOCK.
-                    socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
-                    if { rffi::close(fd) } != 0 {
-                        return Err(socket_last_error());
+            pyre_interpreter::make_builtin_function_with_arity(
+                "close",
+                |args| {
+                    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let fd = rffi::socket_from_i64(
+                        pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")),
+                    );
+                    if !rffi::is_invalid(fd) {
+                        // `rsocket.py:RSocket.close` drops ownership before the
+                        // syscall and still reports its failure.  This prevents a
+                        // later double close while preserving EBADF/ENOTSOCK.
+                        socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                        if { rffi::close(fd) } != 0 {
+                            return Err(socket_last_error());
+                        }
                     }
-                }
-                Ok(pyre_object::w_none())
-            },
-            1,
-        ),
-    ) };
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        )
+    };
 
     // detach() → returns the fd and forgets it.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "detach",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "detach",
-            |args| {
-                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd"));
-                socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
-                Ok(pyre_object::w_int_new(fd))
-            },
-            1,
-        ),
-    ) };
+            pyre_interpreter::make_builtin_function_with_arity(
+                "detach",
+                |args| {
+                    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let fd = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd"));
+                    socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                    Ok(pyre_object::w_int_new(fd))
+                },
+                1,
+            ),
+        )
+    };
 
     // `interp_socket.py _reuse_w / _drop_w` — refcount methods
     // the app-level `socket._socketobject` wrapper uses to share one
     // underlying fd across `socket.makefile()` file-like aliases.
     // `_reuse` increments the usecount; `_drop` decrements and closes
     // when it reaches zero.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "_reuse",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "_reuse",
-            |args| {
-                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let n = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_usecount"));
-                let n = if n < 0 { 1 } else { n };
-                socket_set_attr(obj, "_usecount", pyre_object::w_int_new(n + 1));
-                Ok(pyre_object::w_none())
-            },
-            1,
-        ),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "_drop",
-        pyre_interpreter::make_builtin_function_with_arity(
+            pyre_interpreter::make_builtin_function_with_arity(
+                "_reuse",
+                |args| {
+                    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let n = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_usecount"));
+                    let n = if n < 0 { 1 } else { n };
+                    socket_set_attr(obj, "_usecount", pyre_object::w_int_new(n + 1));
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "_drop",
-            |args| {
-                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let n = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_usecount"));
-                let n = if n < 0 { 1 } else { n };
-                let next = n - 1;
-                pyre_object::with_roots!(obj => socket_set_attr(obj, "_usecount", pyre_object::w_int_new(next)));
-                if next <= 0 {
-                    let fd = rffi::socket_from_i64(pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")));
-                    if !rffi::is_invalid(fd) {
-                        let _ = { rffi::close(fd) };
-                        socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+            pyre_interpreter::make_builtin_function_with_arity(
+                "_drop",
+                |args| {
+                    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let n = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_usecount"));
+                    let n = if n < 0 { 1 } else { n };
+                    let next = n - 1;
+                    pyre_object::with_roots!(obj => socket_set_attr(obj, "_usecount", pyre_object::w_int_new(next)));
+                    if next <= 0 {
+                        let fd = rffi::socket_from_i64(
+                            pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")),
+                        );
+                        if !rffi::is_invalid(fd) {
+                            let _ = { rffi::close(fd) };
+                            socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                        }
                     }
-                }
-                Ok(pyre_object::w_none())
-            },
-            1,
-        ),
-    ) };
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        )
+    };
 
     // bind(addr) — addr is (host, port) for AF_INET / (host, port, flowinfo,
     // scopeid) for AF_INET6 / path string for AF_UNIX.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "bind",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "bind",
-            |args| {
-                if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error("bind() missing address"));
-                }
-                let mut obj = args[0];
-                let mut w_addr = args[1];
-                let fd = pyre_object::with_roots!(obj, w_addr => socket_fd(obj))?;
-                let family = pyre_object::with_roots!(obj, w_addr => socket_get_attr_i64(obj, "_family")) as libc::c_int;
-                let proto = pyre_object::with_roots!(w_addr => socket_get_attr_i64(obj, "_proto")) as libc::c_int;
-                let (storage, slen) = pack_inet_addr("bind", family, proto, w_addr)?;
-                let r =
-                    { rffi::bind(fd, &storage as *const _ as *const rffi::sockaddr, slen) };
+            pyre_interpreter::make_builtin_function_with_arity(
+                "bind",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "bind() missing address",
+                        ));
+                    }
+                    let mut obj = args[0];
+                    let mut w_addr = args[1];
+                    let fd = pyre_object::with_roots!(obj, w_addr => socket_fd(obj))?;
+                    let family = pyre_object::with_roots!(obj, w_addr => socket_get_attr_i64(obj, "_family"))
+                        as libc::c_int;
+                    let proto = pyre_object::with_roots!(w_addr => socket_get_attr_i64(obj, "_proto"))
+                        as libc::c_int;
+                    let (storage, slen) = pack_inet_addr("bind", family, proto, w_addr)?;
+                    let r = { rffi::bind(fd, &storage as *const _ as *const rffi::sockaddr, slen) };
+                    if r != 0 {
+                        return Err(socket_last_error());
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "listen",
+            pyre_interpreter::make_builtin_function("listen", |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let mut w_backlog = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = pyre_object::with_roots!(w_backlog => socket_fd(obj))?;
+                let backlog = if args.len() >= 2 {
+                    pyre_interpreter::baseobjspace::c_int_w(w_backlog)?
+                } else {
+                    128
+                };
+                let r = { rffi::listen(fd, backlog) };
                 if r != 0 {
                     return Err(socket_last_error());
                 }
                 Ok(pyre_object::w_none())
-            },
-            2,
-        ),
-    ) };
+            }),
+        )
+    };
 
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "listen",
-        pyre_interpreter::make_builtin_function("listen", |args| {
-            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            let mut w_backlog = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            let fd = pyre_object::with_roots!(w_backlog => socket_fd(obj))?;
-            let backlog = if args.len() >= 2 {
-                pyre_interpreter::baseobjspace::c_int_w(w_backlog)?
-            } else {
-                128
-            };
-            let r = { rffi::listen(fd, backlog) };
-            if r != 0 {
-                return Err(socket_last_error());
-            }
-            Ok(pyre_object::w_none())
-        }),
-    ) };
-
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "accept",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "accept",
-            |args| {
-                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-                pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
-                let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family")) as libc::c_int;
-                let ty = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_type")) as libc::c_int;
-                let proto = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_proto")) as libc::c_int;
-                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
-                let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-                let cfd = loop {
-                    let (r, errno) = socket_call(|| {
-                        rffi::accept(fd, &mut storage as *mut _ as *mut rffi::sockaddr, &mut slen)
-                    });
-                    if !rffi::is_invalid(r) {
-                        break r;
-                    }
-                    if !rffi::error_is_interrupted(errno) {
-                        return Err(socket_io_err_for_operation(
-                            obj,
-                            std::io::Error::from_raw_os_error(errno),
-                        ));
-                    }
-                    // EINTR: deliver a pending signal, then retry
-                    // (`converted_error` eintr_retry).
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                };
-                // `rsocket.py:RSocket._accept` returns the new descriptor
-                // already closed over an exec (rsocket uses
-                // accept4(SOCK_CLOEXEC) on Linux; this is the portable path).
-                rffi::set_cloexec(cfd);
-                let mut fields = pyre_object::gc_roots::RootedItems::new();
-                fields.push(socket_from_fd(cfd, family, ty, proto)?);
-                fields.push(unpack_inet_addr(&storage, slen));
-                Ok(pyre_object::w_tuple_new(fields.take()))
-            },
-            1,
-        ),
-    ) };
+            pyre_interpreter::make_builtin_function_with_arity(
+                "accept",
+                |args| {
+                    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                    pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
+                    let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family"))
+                        as libc::c_int;
+                    let ty = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_type"))
+                        as libc::c_int;
+                    let proto = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_proto"))
+                        as libc::c_int;
+                    let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
+                    let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+                    let cfd = loop {
+                        let (r, errno) = socket_call(|| {
+                            rffi::accept(
+                                fd,
+                                &mut storage as *mut _ as *mut rffi::sockaddr,
+                                &mut slen,
+                            )
+                        });
+                        if !rffi::is_invalid(r) {
+                            break r;
+                        }
+                        if !rffi::error_is_interrupted(errno) {
+                            return Err(socket_io_err_for_operation(
+                                obj,
+                                std::io::Error::from_raw_os_error(errno),
+                            ));
+                        }
+                        // EINTR: deliver a pending signal, then retry
+                        // (`converted_error` eintr_retry).
+                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                    };
+                    // `rsocket.py:RSocket._accept` returns the new descriptor
+                    // already closed over an exec (rsocket uses
+                    // accept4(SOCK_CLOEXEC) on Linux; this is the portable path).
+                    rffi::set_cloexec(cfd);
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(socket_from_fd(cfd, family, ty, proto)?);
+                    fields.push(unpack_inet_addr(&storage, slen));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
+                },
+                1,
+            ),
+        )
+    };
 
     // `interp_socket.py socketmethodnames _accept` — primitive
     // returning `(fd, addr)`.  CPython's app-level `socket.py def
     // accept` wraps this to construct the new socket object;
     // pyre's `accept` above bundles both steps for callers that
     // bypass the stdlib wrapper.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "_accept",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "_accept",
-            |args| {
-                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            pyre_interpreter::make_builtin_function_with_arity(
+                "_accept",
+                |args| {
+                    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                    pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
+                    let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
+                    let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+                    let cfd = loop {
+                        let (r, errno) = socket_call(|| {
+                            rffi::accept(
+                                fd,
+                                &mut storage as *mut _ as *mut rffi::sockaddr,
+                                &mut slen,
+                            )
+                        });
+                        if !rffi::is_invalid(r) {
+                            break r;
+                        }
+                        if !rffi::error_is_interrupted(errno) {
+                            return Err(socket_io_err_for_operation(
+                                obj,
+                                std::io::Error::from_raw_os_error(errno),
+                            ));
+                        }
+                        // EINTR: deliver a pending signal, then retry
+                        // (`converted_error` eintr_retry).
+                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                    };
+                    rffi::set_cloexec(cfd);
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_int_new(rffi::socket_to_i64(cfd)));
+                    fields.push(unpack_inet_addr(&storage, slen));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
+                },
+                1,
+            ),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "connect",
+            pyre_interpreter::make_builtin_function_with_arity(
+                "connect",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "connect() missing address",
+                        ));
+                    }
+                    // socket_fd and the attribute reads collect before the address
+                    // is packed. Pin the argument slice once and read it back.
+                    let args_roots = pyre_object::gc_roots::push_roots();
+                    let args_base = args_roots.pin_roots(args);
+                    let mut obj = args_roots.get(args_base);
+                    let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                    let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family"))
+                        as libc::c_int;
+                    let proto = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_proto"))
+                        as libc::c_int;
+                    // `pack_inet_addr` runs Python for a host that is not a plain
+                    // ASCII `str`, so the socket is read back from its slot
+                    // rather than from the native argument slice, which is
+                    // only current at entry.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                    let (storage, slen) =
+                        pack_inet_addr("connect", family, proto, args_roots.get(args_base + 1))?;
+                    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    if let Some(timeout) = socket_positive_timeout(obj) {
+                        return match socket_connect_wait(fd, &storage, slen, timeout) {
+                            Ok(()) => Ok(pyre_object::w_none()),
+                            Err(SocketConnectFailure::Errno(errno)) => {
+                                Err(socket_io_err_for_operation(
+                                    obj,
+                                    std::io::Error::from_raw_os_error(errno),
+                                ))
+                            }
+                            Err(SocketConnectFailure::Timeout(_)) => {
+                                Err(socket_converted_error("timeout", None, "timed out"))
+                            }
+                            Err(SocketConnectFailure::Exception(error)) => Err(error),
+                        };
+                    }
+                    loop {
+                        let (r, errno) = socket_call(|| {
+                            rffi::connect(fd, &storage as *const _ as *const rffi::sockaddr, slen)
+                        });
+                        if r == 0 {
+                            break;
+                        }
+                        if !rffi::error_is_interrupted(errno) {
+                            return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                        }
+                        // EINTR: deliver a pending signal, then retry
+                        // (`converted_error` eintr_retry).
+                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        )
+    };
+
+    // connect_ex(address) → errno (no exception on error)
+    // `interp_socket.py W_Socket.connect_ex_w` — `try: connect; except` equivalent
+    // that returns the errno integer instead of raising OSError.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "connect_ex",
+            pyre_interpreter::make_builtin_function_with_arity(
+                "connect_ex",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "connect_ex() missing address",
+                        ));
+                    }
+                    // socket_fd and the attribute reads collect before the address
+                    // is packed. Pin the argument slice once and read it back.
+                    let args_roots = pyre_object::gc_roots::push_roots();
+                    let args_base = args_roots.pin_roots(args);
+                    let mut obj = args_roots.get(args_base);
+                    let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                    let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family"))
+                        as libc::c_int;
+                    let proto = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_proto"))
+                        as libc::c_int;
+                    // `pack_inet_addr` runs Python for a host that is not a plain
+                    // ASCII `str`, so the socket is read back from its slot
+                    // rather than from the native argument slice, which is
+                    // only current at entry.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                    let (storage, slen) =
+                        pack_inet_addr("connect_ex", family, proto, args_roots.get(args_base + 1))?;
+                    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    if let Some(timeout) = socket_positive_timeout(obj) {
+                        return match socket_connect_wait(fd, &storage, slen, timeout) {
+                            Ok(()) => Ok(pyre_object::w_int_new(0)),
+                            Err(SocketConnectFailure::Errno(errno))
+                            | Err(SocketConnectFailure::Timeout(errno)) => {
+                                Ok(pyre_object::w_int_new(errno as i64))
+                            }
+                            Err(SocketConnectFailure::Exception(error)) => Err(error),
+                        };
+                    }
+                    // `interp_socket.py W_Socket.connect_ex_w` — retry while the call is
+                    // interrupted (EINTR), otherwise return the errno.
+                    let err = loop {
+                        let (r, e) = socket_call(|| {
+                            rffi::connect(fd, &storage as *const _ as *const rffi::sockaddr, slen)
+                        });
+                        if r == 0 {
+                            break 0;
+                        }
+                        if !rffi::error_is_interrupted(e) {
+                            break e;
+                        }
+                        // `interp_socket.py W_Socket.connect_ex_w` — deliver a pending signal, then
+                        // retry the connect.
+                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                    };
+                    Ok(pyre_object::w_int_new(err as i64))
+                },
+                2,
+            ),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "send",
+            pyre_interpreter::make_builtin_function("send", |args| {
+                if args.len() < 2 {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "send() missing buffer",
+                    ));
+                }
+                let nargs = args.len();
+                let args_roots = pyre_object::gc_roots::push_roots();
+                let args_base = args_roots.pin_roots(args);
+                let mut obj = args_roots.get(args_base);
                 let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                // The export owns a bracket of its own, above this one; this one
+                // keeps `obj` rooted until the export is released.
+                let obj_roots = pyre_object::gc_roots::push_roots();
+                let obj_base = obj_roots.pin_roots(&[obj]);
+                let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(
+                    args_roots.get(args_base + 1),
+                );
+                obj = obj_roots.get(obj_base);
+                let buffer = acquired?.ok_or_else(|| {
+                    pyre_interpreter::PyError::type_error("send: buffer must be bytes-like")
+                })?;
+                let flags = if nargs >= 3 {
+                    pyre_object::with_roots!(obj => {
+                        pyre_interpreter::baseobjspace::c_int_w(args_roots.get(args_base + 2))
+                    })?
+                } else {
+                    0
+                };
+                // `PyBuffer_Release` after the call — `SimpleBufferBytes` has no
+                // `Drop`, so an export that is never released leaves a `bytearray`
+                // argument permanently exported and unable to be resized. The
+                // result is held rather than propagated so the release covers the
+                // error paths too.
+                let result = pyre_object::with_roots!(obj => socket_wait_writable(obj, fd))
+                    .and_then(|()| socket_send_bytes(obj, fd, buffer.as_bytes(), flags));
+                buffer.release();
+                Ok(pyre_object::w_int_new(result? as i64))
+            }),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "sendall",
+            pyre_interpreter::make_builtin_function("sendall", |args| {
+                if args.len() < 2 {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "sendall() missing buffer",
+                    ));
+                }
+                let nargs = args.len();
+                let args_roots = pyre_object::gc_roots::push_roots();
+                let args_base = args_roots.pin_roots(args);
+                let mut obj = args_roots.get(args_base);
+                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                // The export owns a bracket of its own, above this one; this one
+                // keeps `obj` rooted until the export is released.
+                let obj_roots = pyre_object::gc_roots::push_roots();
+                let obj_base = obj_roots.pin_roots(&[obj]);
+                let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(
+                    args_roots.get(args_base + 1),
+                );
+                obj = obj_roots.get(obj_base);
+                let buffer = acquired?.ok_or_else(|| {
+                    pyre_interpreter::PyError::type_error("sendall: buffer must be bytes-like")
+                })?;
+                let flags = if nargs >= 3 {
+                    pyre_object::with_roots!(obj => {
+                        pyre_interpreter::baseobjspace::c_int_w(args_roots.get(args_base + 2))
+                    })?
+                } else {
+                    0
+                };
+                // The public 3.14 sendall timeout is one operation-wide deadline;
+                // PyPy's `RSocket.wait_for_data(True)` supplies the writable wait.
+                // Compute it once so handled EINTR cannot restart the full period.
+                let deadline =
+                    pyre_object::with_roots!(obj => socket_positive_timeout(obj)).map(|timeout| {
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs_f64(
+                                timeout.min(i32::MAX as f64 / 1000.0),
+                            )
+                    });
+                // See `send` above: the export is released once the borrow of
+                // `buffer` ends, on the error path as well.
+                let result = (|| -> Result<(), pyre_interpreter::PyError> {
+                    let buf = buffer.as_bytes();
+                    let mut off = 0usize;
+                    while off < buf.len() {
+                        if let Some(deadline) = deadline {
+                            socket_wait_writable_until(fd, deadline)?;
+                        }
+                        let (n, errno) = socket_call(|| {
+                            rffi::send(
+                                fd,
+                                buf[off..].as_ptr() as *const libc::c_void,
+                                buf.len() - off,
+                                flags,
+                            )
+                        });
+                        // `rsocket.py:RSocket.sendall` invokes its
+                        // `signal_checker` after every attempt, not only after an
+                        // EINTR.  SA_RESTART can defer the syscall return until a
+                        // socket timeout, but the handler still owns the result.
+                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                        if n < 0 {
+                            if rffi::error_is_interrupted(errno) {
+                                continue;
+                            }
+                            if deadline.is_some() && rffi::error_is_would_block(errno) {
+                                // Readiness can be consumed between poll and send;
+                                // keep sendall's operation-wide deadline rather
+                                // than exposing the transient race.
+                                continue;
+                            }
+                            return Err(socket_io_err_for_operation(
+                                obj,
+                                std::io::Error::from_raw_os_error(errno),
+                            ));
+                        }
+                        off += n as usize;
+                    }
+                    Ok(())
+                })();
+                buffer.release();
+                result?;
+                Ok(pyre_object::w_none())
+            }),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "recv",
+            pyre_interpreter::make_builtin_function("recv", |args| {
+                if args.len() < 2 {
+                    return Err(pyre_interpreter::PyError::type_error("recv() missing size"));
+                }
+                if !{ pyre_object::is_int(args[1]) } {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "recv: size must be an integer",
+                    ));
+                }
+                let raw = { pyre_object::w_int_get_value(args[1]) };
+                if raw < 0 {
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "negative buffersize in recv",
+                    ));
+                }
+                let nargs = args.len();
+                let args_roots = pyre_object::gc_roots::push_roots();
+                let args_base = args_roots.pin_roots(args);
+                let mut obj = args_roots.get(args_base);
+                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                let n = raw as usize;
+                let flags = if nargs >= 3 {
+                    let flags_obj = args_roots.get(args_base + 2);
+                    if !{ pyre_object::is_int(flags_obj) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "recv: flags must be an integer",
+                        ));
+                    }
+                    ({ pyre_object::w_int_get_value(flags_obj) }) as libc::c_int
+                } else {
+                    0
+                };
+                let mut buf = pyre_interpreter::builtins::try_vec_zeroed(n)?;
                 pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
+                let got = socket_recv_bytes(obj, fd, &mut buf, flags)?;
+                buf.truncate(got);
+                Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
+            }),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "sendto",
+            pyre_interpreter::make_builtin_function("sendto", |args| {
+                // sendto(buffer, [flags,] address)
+                let nargs = args.len();
+                if !(3..=4).contains(&nargs) {
+                    return Err(pyre_interpreter::PyError::type_error(format!(
+                        "sendto() takes 2 or 3 arguments ({} given)",
+                        nargs.saturating_sub(1)
+                    )));
+                }
+                let args_roots = pyre_object::gc_roots::push_roots();
+                let args_base = args_roots.pin_roots(args);
+                let mut obj = args_roots.get(args_base);
+                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                // The export owns a bracket of its own, above this one; this one
+                // keeps `obj` rooted until the export is released.
+                let obj_roots = pyre_object::gc_roots::push_roots();
+                let obj_base = obj_roots.pin_roots(&[obj]);
+                let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(
+                    args_roots.get(args_base + 1),
+                );
+                obj = obj_roots.get(obj_base);
+                let buffer = acquired?.ok_or_else(|| {
+                    pyre_interpreter::PyError::type_error(format!(
+                        "a bytes-like object is required, not '{}'",
+                        pyre_interpreter::type_methods::arg_type_name(
+                            args_roots.get(args_base + 1)
+                        )
+                    ))
+                })?;
+                // 3-arg form: (buf, flags, addr).  4-arg form: (self, buf, flags, addr).
+                // We always take self-as-args[0], so 3 args = (self, buf, addr) [no flags]
+                // and 4 args = (self, buf, flags, addr).
+                let (flags, addr_index) = if nargs == 3 {
+                    (0, 2usize)
+                } else {
+                    let flags = libc::c_int::try_from(pyre_object::with_roots!(obj => {
+                        pyre_interpreter::baseobjspace::int_w(args_roots.get(args_base + 2))
+                    })?)
+                    .map_err(|_| {
+                        pyre_interpreter::PyError::overflow_error(
+                            "Python int too large to convert to C int",
+                        )
+                    })?;
+                    (flags, 3usize)
+                };
+                // See `send` above: the export is released once the borrow of
+                // `buffer` ends, on the error path as well. `pack_inet_addr` runs
+                // Python, so it is inside the released scope too.
+                let result = (|| -> Result<isize, pyre_interpreter::PyError> {
+                    let buf = buffer.as_bytes();
+                    let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
+                    let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                    // `pack_inet_addr` runs Python for a host that is not a plain
+                    // ASCII `str`, so the socket is read back from its slot
+                    // rather than from the native argument slice, which is
+                    // only current at entry.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                    let (storage, slen) = pack_inet_addr(
+                        "sendto",
+                        family,
+                        proto,
+                        args_roots.get(args_base + addr_index),
+                    )?;
+                    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    socket_wait_writable(obj, fd)?;
+                    loop {
+                        let (r, errno) = socket_call(|| {
+                            rffi::sendto(
+                                fd,
+                                buf.as_ptr() as *const libc::c_void,
+                                buf.len(),
+                                flags,
+                                &storage as *const _ as *const rffi::sockaddr,
+                                slen,
+                            )
+                        });
+                        if r >= 0 {
+                            return Ok(r);
+                        }
+                        if !rffi::error_is_interrupted(errno) {
+                            return Err(socket_io_err_for_operation(
+                                obj,
+                                std::io::Error::from_raw_os_error(errno),
+                            ));
+                        }
+                        // EINTR: deliver a pending signal, then retry
+                        // (`converted_error` eintr_retry).
+                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                    }
+                })();
+                buffer.release();
+                Ok(pyre_object::w_int_new(result? as i64))
+            }),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "recvfrom",
+            pyre_interpreter::make_builtin_function("recvfrom", |args| {
+                if args.len() < 2 {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "recvfrom() missing size",
+                    ));
+                }
+                if !{ pyre_object::is_int(args[1]) } {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "recvfrom: size must be an integer",
+                    ));
+                }
+                let raw = { pyre_object::w_int_get_value(args[1]) };
+                if raw < 0 {
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "negative buffersize in recvfrom",
+                    ));
+                }
+                let nargs = args.len();
+                let args_roots = pyre_object::gc_roots::push_roots();
+                let args_base = args_roots.pin_roots(args);
+                let mut obj = args_roots.get(args_base);
+                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                let n = raw as usize;
+                let flags = if nargs >= 3 {
+                    let flags_obj = args_roots.get(args_base + 2);
+                    if !{ pyre_object::is_int(flags_obj) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "recvfrom: flags must be an integer",
+                        ));
+                    }
+                    ({ pyre_object::w_int_get_value(flags_obj) }) as libc::c_int
+                } else {
+                    0
+                };
+                let mut buf = pyre_interpreter::builtins::try_vec_zeroed(n)?;
                 let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-                let cfd = loop {
+                pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
+                let got = loop {
                     let (r, errno) = socket_call(|| {
-                        rffi::accept(fd, &mut storage as *mut _ as *mut rffi::sockaddr, &mut slen)
+                        rffi::recvfrom(
+                            fd,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            n,
+                            flags,
+                            &mut storage as *mut _ as *mut rffi::sockaddr,
+                            &mut slen,
+                        )
                     });
-                    if !rffi::is_invalid(r) {
+                    if r >= 0 {
                         break r;
                     }
                     if !rffi::error_is_interrupted(errno) {
@@ -4604,339 +5356,158 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     // (`converted_error` eintr_retry).
                     pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                 };
-                rffi::set_cloexec(cfd);
+                buf.truncate(got as usize);
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
-                fields.push(pyre_object::w_int_new(rffi::socket_to_i64(cfd)));
+                fields.push(pyre_object::bytesobject::w_bytes_from_bytes(&buf));
                 fields.push(unpack_inet_addr(&storage, slen));
                 Ok(pyre_object::w_tuple_new(fields.take()))
-            },
-            1,
-        ),
-    ) };
+            }),
+        )
+    };
 
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "connect",
-        pyre_interpreter::make_builtin_function_with_arity(
-            "connect",
-            |args| {
+    // recv_into(buffer, [nbytes, flags]) → nbytes_read
+    // `interp_socket.py W_Socket.recv_into_w` — writes directly into a writable
+    // bytes-like buffer.  nbytes==0 uses the full buffer length.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "recv_into",
+            pyre_interpreter::make_builtin_function("recv_into", |args| {
                 if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error("connect() missing address"));
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "recv_into() missing buffer",
+                    ));
                 }
-                let mut obj = args[0];
-                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-                let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family")) as libc::c_int;
-                let proto = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_proto")) as libc::c_int;
-                // `pack_inet_addr` runs Python for a host that is not a plain
-                // ASCII `str`, so the socket is read back from its slot
-                // rather than from the native argument slice, which is
-                // only current at entry.
+                let obj = args[0];
+                let buf_obj = args[1];
                 let _roots = pyre_object::gc_roots::push_roots();
-                let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-                let (storage, slen) = pack_inet_addr("connect", family, proto, args[1])?;
-                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                if let Some(timeout) = socket_positive_timeout(obj) {
-                    return match socket_connect_wait(fd, &storage, slen, timeout) {
-                        Ok(()) => Ok(pyre_object::w_none()),
-                        Err(SocketConnectFailure::Errno(errno)) => Err(socket_io_err_for_operation(
-                            obj,
-                            std::io::Error::from_raw_os_error(errno),
-                        )),
-                        Err(SocketConnectFailure::Timeout(_)) => {
-                            Err(socket_converted_error("timeout", None, "timed out"))
-                        }
-                        Err(SocketConnectFailure::Exception(error)) => Err(error),
-                    };
+                let mut buffer = { SocketWritableBuffer::acquire(buf_obj) }?;
+                let slot = { buffer.as_mut_slice() };
+                let buf_len = slot.len();
+                let nbytes = if args.len() >= 3 {
+                    if !{ pyre_object::is_int(args[2]) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "recv_into: nbytes must be an integer",
+                        ));
+                    }
+                    let raw = { pyre_object::w_int_get_value(args[2]) };
+                    if raw < 0 {
+                        return Err(pyre_interpreter::PyError::value_error(
+                            "negative buffersize in recv_into",
+                        ));
+                    }
+                    let n = raw as usize;
+                    if n == 0 { buf_len } else { n }
+                } else {
+                    buf_len
+                };
+                if buf_len < nbytes {
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "buffer too small for requested bytes",
+                    ));
                 }
-                loop {
+                let flags = if args.len() >= 4 {
+                    if !{ pyre_object::is_int(args[3]) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "recv_into: flags must be an integer",
+                        ));
+                    }
+                    pyre_object::w_int_get_value(args[3]) as libc::c_int
+                } else {
+                    0
+                };
+                let fd = socket_fd(obj)?;
+                socket_wait_readable(obj, fd)?;
+                let got = loop {
                     let (r, errno) = socket_call(|| {
-                        rffi::connect(fd, &storage as *const _ as *const rffi::sockaddr, slen)
+                        rffi::recv(fd, slot.as_mut_ptr() as *mut libc::c_void, nbytes, flags)
                     });
-                    if r == 0 {
-                        break;
+                    if r >= 0 {
+                        break r;
                     }
                     if !rffi::error_is_interrupted(errno) {
-                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
-                    }
-                    // EINTR: deliver a pending signal, then retry
-                    // (`converted_error` eintr_retry).
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                }
-                Ok(pyre_object::w_none())
-            },
-            2,
-        ),
-    ) };
-
-    // connect_ex(address) → errno (no exception on error)
-    // `interp_socket.py:376-392` — `try: connect; except` equivalent
-    // that returns the errno integer instead of raising OSError.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "connect_ex",
-        pyre_interpreter::make_builtin_function_with_arity(
-            "connect_ex",
-            |args| {
-                if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error("connect_ex() missing address"));
-                }
-                let mut obj = args[0];
-                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-                let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family")) as libc::c_int;
-                let proto = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_proto")) as libc::c_int;
-                // `pack_inet_addr` runs Python for a host that is not a plain
-                // ASCII `str`, so the socket is read back from its slot
-                // rather than from the native argument slice, which is
-                // only current at entry.
-                let _roots = pyre_object::gc_roots::push_roots();
-                let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-                let (storage, slen) = pack_inet_addr("connect_ex", family, proto, args[1])?;
-                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                if let Some(timeout) = socket_positive_timeout(obj) {
-                    return match socket_connect_wait(fd, &storage, slen, timeout) {
-                        Ok(()) => Ok(pyre_object::w_int_new(0)),
-                        Err(SocketConnectFailure::Errno(errno))
-                        | Err(SocketConnectFailure::Timeout(errno)) => {
-                            Ok(pyre_object::w_int_new(errno as i64))
-                        }
-                        Err(SocketConnectFailure::Exception(error)) => Err(error),
-                    };
-                }
-                // `interp_socket.py:387-391` — retry while the call is
-                // interrupted (EINTR), otherwise return the errno.
-                let err = loop {
-                    let (r, e) = socket_call(|| {
-                        rffi::connect(fd, &storage as *const _ as *const rffi::sockaddr, slen)
-                    });
-                    if r == 0 {
-                        break 0;
-                    }
-                    if !rffi::error_is_interrupted(e) {
-                        break e;
-                    }
-                    // `interp_socket.py:391` — deliver a pending signal, then
-                    // retry the connect.
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                };
-                Ok(pyre_object::w_int_new(err as i64))
-            },
-            2,
-        ),
-    ) };
-
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "send",
-        pyre_interpreter::make_builtin_function("send", |args| {
-            if args.len() < 2 {
-                return Err(pyre_interpreter::PyError::type_error("send() missing buffer"));
-            }
-            let mut obj = args[0];
-            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-            // The export owns a bracket of its own, above this one; this one
-            // keeps `obj` rooted until the export is released.
-            let obj_roots = pyre_object::gc_roots::push_roots();
-            let obj_base = obj_roots.pin_roots(&[obj]);
-            let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]);
-            obj = obj_roots.get(obj_base);
-            let buffer = acquired?.ok_or_else(|| {
-                pyre_interpreter::PyError::type_error("send: buffer must be bytes-like")
-            })?;
-            let flags = if args.len() >= 3 {
-                pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::c_int_w(args[2]))?
-            } else {
-                0
-            };
-            // `PyBuffer_Release` after the call — `SimpleBufferBytes` has no
-            // `Drop`, so an export that is never released leaves a `bytearray`
-            // argument permanently exported and unable to be resized. The
-            // result is held rather than propagated so the release covers the
-            // error paths too.
-            let result = pyre_object::with_roots!(obj => socket_wait_writable(obj, fd))
-                .and_then(|()| socket_send_bytes(obj, fd, buffer.as_bytes(), flags));
-            buffer.release();
-            Ok(pyre_object::w_int_new(result? as i64))
-        }),
-    ) };
-
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "sendall",
-        pyre_interpreter::make_builtin_function("sendall", |args| {
-            if args.len() < 2 {
-                return Err(pyre_interpreter::PyError::type_error("sendall() missing buffer"));
-            }
-            let mut obj = args[0];
-            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-            // The export owns a bracket of its own, above this one; this one
-            // keeps `obj` rooted until the export is released.
-            let obj_roots = pyre_object::gc_roots::push_roots();
-            let obj_base = obj_roots.pin_roots(&[obj]);
-            let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]);
-            obj = obj_roots.get(obj_base);
-            let buffer = acquired?.ok_or_else(|| {
-                pyre_interpreter::PyError::type_error("sendall: buffer must be bytes-like")
-            })?;
-            let flags = if args.len() >= 3 {
-                pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::c_int_w(args[2]))?
-            } else {
-                0
-            };
-            // The public 3.14 sendall timeout is one operation-wide deadline;
-            // PyPy's `RSocket.wait_for_data(True)` supplies the writable wait.
-            // Compute it once so handled EINTR cannot restart the full period.
-            let deadline = pyre_object::with_roots!(obj => socket_positive_timeout(obj)).map(|timeout| {
-                std::time::Instant::now()
-                    + std::time::Duration::from_secs_f64(
-                        timeout.min(i32::MAX as f64 / 1000.0),
-                    )
-            });
-            // See `send` above: the export is released once the borrow of
-            // `buffer` ends, on the error path as well.
-            let result = (|| -> Result<(), pyre_interpreter::PyError> {
-                let buf = buffer.as_bytes();
-                let mut off = 0usize;
-                while off < buf.len() {
-                    if let Some(deadline) = deadline {
-                        socket_wait_writable_until(fd, deadline)?;
-                    }
-                    let (n, errno) = socket_call(|| {
-                        rffi::send(
-                            fd,
-                            buf[off..].as_ptr() as *const libc::c_void,
-                            buf.len() - off,
-                            flags,
-                        )
-                    });
-                    // `rsocket.py:RSocket.sendall` invokes its
-                    // `signal_checker` after every attempt, not only after an
-                    // EINTR.  SA_RESTART can defer the syscall return until a
-                    // socket timeout, but the handler still owns the result.
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                    if n < 0 {
-                        if rffi::error_is_interrupted(errno) {
-                            continue;
-                        }
-                        if deadline.is_some() && rffi::error_is_would_block(errno) {
-                            // Readiness can be consumed between poll and send;
-                            // keep sendall's operation-wide deadline rather
-                            // than exposing the transient race.
-                            continue;
-                        }
                         return Err(socket_io_err_for_operation(
                             obj,
                             std::io::Error::from_raw_os_error(errno),
                         ));
                     }
-                    off += n as usize;
-                }
-                Ok(())
-            })();
-            buffer.release();
-            result?;
-            Ok(pyre_object::w_none())
-        }),
-    ) };
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                };
+                Ok(pyre_object::w_int_new(got as i64))
+            }),
+        )
+    };
 
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "recv",
-        pyre_interpreter::make_builtin_function("recv", |args| {
-            if args.len() < 2 {
-                return Err(pyre_interpreter::PyError::type_error("recv() missing size"));
-            }
-            if !{ pyre_object::is_int(args[1]) } {
-                return Err(pyre_interpreter::PyError::type_error("recv: size must be an integer"));
-            }
-            let raw = { pyre_object::w_int_get_value(args[1]) };
-            if raw < 0 {
-                return Err(pyre_interpreter::PyError::value_error("negative buffersize in recv"));
-            }
-            let mut obj = args[0];
-            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-            let n = raw as usize;
-            let flags = if args.len() >= 3 {
-                if !{ pyre_object::is_int(args[2]) } {
-                    return Err(pyre_interpreter::PyError::type_error("recv: flags must be an integer"));
+    // recvfrom_into(buffer, [nbytes, flags]) → (nbytes, address)
+    // `interp_socket.py W_Socket.recvfrom_into_w` — recvfrom variant that fills a
+    // caller-provided buffer rather than allocating a new bytes.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "recvfrom_into",
+            pyre_interpreter::make_builtin_function("recvfrom_into", |args| {
+                if args.len() < 2 {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "recvfrom_into() missing buffer",
+                    ));
                 }
-                ({ pyre_object::w_int_get_value(args[2]) }) as libc::c_int
-            } else {
-                0
-            };
-            let mut buf = pyre_interpreter::builtins::try_vec_zeroed(n)?;
-            pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
-            let got = socket_recv_bytes(obj, fd, &mut buf, flags)?;
-            buf.truncate(got);
-            Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
-        }),
-    ) };
-
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "sendto",
-        pyre_interpreter::make_builtin_function("sendto", |args| {
-            // sendto(buffer, [flags,] address)
-            if !(3..=4).contains(&args.len()) {
-                return Err(pyre_interpreter::PyError::type_error(format!(
-                    "sendto() takes 2 or 3 arguments ({} given)",
-                    args.len().saturating_sub(1)
-                )));
-            }
-            let mut obj = args[0];
-            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-            // The export owns a bracket of its own, above this one; this one
-            // keeps `obj` rooted until the export is released.
-            let obj_roots = pyre_object::gc_roots::push_roots();
-            let obj_base = obj_roots.pin_roots(&[obj]);
-            let acquired = pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1]);
-            obj = obj_roots.get(obj_base);
-            let buffer = acquired?.ok_or_else(|| {
-                pyre_interpreter::PyError::type_error(format!(
-                    "a bytes-like object is required, not '{}'",
-                    pyre_interpreter::type_methods::arg_type_name(args[1])
-                ))
-            })?;
-            // 3-arg form: (buf, flags, addr).  4-arg form: (self, buf, flags, addr).
-            // We always take self-as-args[0], so 3 args = (self, buf, addr) [no flags]
-            // and 4 args = (self, buf, flags, addr).
-            let (flags, addr_obj) = if args.len() == 3 {
-                (0, args[2])
-            } else {
-                let flags = libc::c_int::try_from(pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::int_w(args[2]))?)
-                    .map_err(|_| {
-                        pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
-                    })?;
-                (flags, args[3])
-            };
-            // See `send` above: the export is released once the borrow of
-            // `buffer` ends, on the error path as well. `pack_inet_addr` runs
-            // Python, so it is inside the released scope too.
-            let result = (|| -> Result<isize, pyre_interpreter::PyError> {
-                let buf = buffer.as_bytes();
-                let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
-                // `pack_inet_addr` runs Python for a host that is not a plain
-                // ASCII `str`, so the socket is read back from its slot
-                // rather than from the native argument slice, which is
-                // only current at entry.
+                let obj = args[0];
+                let buf_obj = args[1];
                 let _roots = pyre_object::gc_roots::push_roots();
-                let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-                let (storage, slen) = pack_inet_addr("sendto", family, proto, addr_obj)?;
-                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                socket_wait_writable(obj, fd)?;
-                loop {
+                let mut buffer = { SocketWritableBuffer::acquire(buf_obj) }?;
+                let slot = { buffer.as_mut_slice() };
+                let buf_len = slot.len();
+                let nbytes = if args.len() >= 3 {
+                    if !{ pyre_object::is_int(args[2]) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "recvfrom_into: nbytes must be an integer",
+                        ));
+                    }
+                    let raw = { pyre_object::w_int_get_value(args[2]) };
+                    if raw < 0 {
+                        return Err(pyre_interpreter::PyError::value_error(
+                            "negative buffersize in recvfrom_into",
+                        ));
+                    }
+                    let n = raw as usize;
+                    if n == 0 { buf_len } else { n }
+                } else {
+                    buf_len
+                };
+                if nbytes > buf_len {
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "nbytes is greater than the length of the buffer",
+                    ));
+                }
+                let flags = if args.len() >= 4 {
+                    if !{ pyre_object::is_int(args[3]) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "recvfrom_into: flags must be an integer",
+                        ));
+                    }
+                    pyre_object::w_int_get_value(args[3]) as libc::c_int
+                } else {
+                    0
+                };
+                let fd = socket_fd(obj)?;
+                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
+                let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+                socket_wait_readable(obj, fd)?;
+                let got = loop {
                     let (r, errno) = socket_call(|| {
-                        rffi::sendto(
+                        rffi::recvfrom(
                             fd,
-                            buf.as_ptr() as *const libc::c_void,
-                            buf.len(),
+                            slot.as_mut_ptr() as *mut libc::c_void,
+                            nbytes,
                             flags,
-                            &storage as *const _ as *const rffi::sockaddr,
-                            slen,
+                            &mut storage as *mut _ as *mut rffi::sockaddr,
+                            &mut slen,
                         )
                     });
                     if r >= 0 {
-                        return Ok(r);
+                        break r;
                     }
                     if !rffi::error_is_interrupted(errno) {
                         return Err(socket_io_err_for_operation(
@@ -4947,233 +5518,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     // EINTR: deliver a pending signal, then retry
                     // (`converted_error` eintr_retry).
                     pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                }
-            })();
-            buffer.release();
-            Ok(pyre_object::w_int_new(result? as i64))
-        }),
-    ) };
-
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "recvfrom",
-        pyre_interpreter::make_builtin_function("recvfrom", |args| {
-            if args.len() < 2 {
-                return Err(pyre_interpreter::PyError::type_error("recvfrom() missing size"));
-            }
-            if !{ pyre_object::is_int(args[1]) } {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "recvfrom: size must be an integer",
-                ));
-            }
-            let raw = { pyre_object::w_int_get_value(args[1]) };
-            if raw < 0 {
-                return Err(pyre_interpreter::PyError::value_error(
-                    "negative buffersize in recvfrom",
-                ));
-            }
-            let mut obj = args[0];
-            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-            let n = raw as usize;
-            let flags = if args.len() >= 3 {
-                if !{ pyre_object::is_int(args[2]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "recvfrom: flags must be an integer",
-                    ));
-                }
-                ({ pyre_object::w_int_get_value(args[2]) }) as libc::c_int
-            } else {
-                0
-            };
-            let mut buf = pyre_interpreter::builtins::try_vec_zeroed(n)?;
-            let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
-            let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-            pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
-            let got = loop {
-                let (r, errno) = socket_call(|| {
-                    rffi::recvfrom(
-                        fd,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        n,
-                        flags,
-                        &mut storage as *mut _ as *mut rffi::sockaddr,
-                        &mut slen,
-                    )
-                });
-                if r >= 0 {
-                    break r;
-                }
-                if !rffi::error_is_interrupted(errno) {
-                    return Err(socket_io_err_for_operation(
-                        obj,
-                        std::io::Error::from_raw_os_error(errno),
-                    ));
-                }
-                // EINTR: deliver a pending signal, then retry
-                // (`converted_error` eintr_retry).
-                pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-            };
-            buf.truncate(got as usize);
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(pyre_object::bytesobject::w_bytes_from_bytes(&buf));
-            fields.push(unpack_inet_addr(&storage, slen));
-            Ok(pyre_object::w_tuple_new(fields.take()))
-        }),
-    ) };
-
-    // recv_into(buffer, [nbytes, flags]) → nbytes_read
-    // `interp_socket.py:831-863` — writes directly into a writable
-    // bytes-like buffer.  nbytes==0 uses the full buffer length.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "recv_into",
-        pyre_interpreter::make_builtin_function("recv_into", |args| {
-            if args.len() < 2 {
-                return Err(pyre_interpreter::PyError::type_error("recv_into() missing buffer"));
-            }
-            let obj = args[0];
-            let buf_obj = args[1];
-            let _roots = pyre_object::gc_roots::push_roots();
-            let mut buffer = { SocketWritableBuffer::acquire(buf_obj) }?;
-            let slot = { buffer.as_mut_slice() };
-            let buf_len = slot.len();
-            let nbytes = if args.len() >= 3 {
-                if !{ pyre_object::is_int(args[2]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "recv_into: nbytes must be an integer",
-                    ));
-                }
-                let raw = { pyre_object::w_int_get_value(args[2]) };
-                if raw < 0 {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "negative buffersize in recv_into",
-                    ));
-                }
-                let n = raw as usize;
-                if n == 0 { buf_len } else { n }
-            } else {
-                buf_len
-            };
-            if buf_len < nbytes {
-                return Err(pyre_interpreter::PyError::value_error(
-                    "buffer too small for requested bytes",
-                ));
-            }
-            let flags = if args.len() >= 4 {
-                if !{ pyre_object::is_int(args[3]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "recv_into: flags must be an integer",
-                    ));
-                }
-                pyre_object::w_int_get_value(args[3]) as libc::c_int
-            } else {
-                0
-            };
-            let fd = socket_fd(obj)?;
-            socket_wait_readable(obj, fd)?;
-            let got = loop {
-                let (r, errno) = socket_call(|| {
-                    rffi::recv(fd, slot.as_mut_ptr() as *mut libc::c_void, nbytes, flags)
-                });
-                if r >= 0 {
-                    break r;
-                }
-                if !rffi::error_is_interrupted(errno) {
-                    return Err(socket_io_err_for_operation(
-                        obj,
-                        std::io::Error::from_raw_os_error(errno),
-                    ));
-                }
-                // EINTR: deliver a pending signal, then retry
-                // (`converted_error` eintr_retry).
-                pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-            };
-            Ok(pyre_object::w_int_new(got as i64))
-        }),
-    ) };
-
-    // recvfrom_into(buffer, [nbytes, flags]) → (nbytes, address)
-    // `interp_socket.py:866-899` — recvfrom variant that fills a
-    // caller-provided buffer rather than allocating a new bytes.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "recvfrom_into",
-        pyre_interpreter::make_builtin_function("recvfrom_into", |args| {
-            if args.len() < 2 {
-                return Err(pyre_interpreter::PyError::type_error("recvfrom_into() missing buffer"));
-            }
-            let obj = args[0];
-            let buf_obj = args[1];
-            let _roots = pyre_object::gc_roots::push_roots();
-            let mut buffer = { SocketWritableBuffer::acquire(buf_obj) }?;
-            let slot = { buffer.as_mut_slice() };
-            let buf_len = slot.len();
-            let nbytes = if args.len() >= 3 {
-                if !{ pyre_object::is_int(args[2]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "recvfrom_into: nbytes must be an integer",
-                    ));
-                }
-                let raw = { pyre_object::w_int_get_value(args[2]) };
-                if raw < 0 {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "negative buffersize in recvfrom_into",
-                    ));
-                }
-                let n = raw as usize;
-                if n == 0 { buf_len } else { n }
-            } else {
-                buf_len
-            };
-            if nbytes > buf_len {
-                return Err(pyre_interpreter::PyError::value_error(
-                    "nbytes is greater than the length of the buffer",
-                ));
-            }
-            let flags = if args.len() >= 4 {
-                if !{ pyre_object::is_int(args[3]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "recvfrom_into: flags must be an integer",
-                    ));
-                }
-                pyre_object::w_int_get_value(args[3]) as libc::c_int
-            } else {
-                0
-            };
-            let fd = socket_fd(obj)?;
-            let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
-            let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-            socket_wait_readable(obj, fd)?;
-            let got = loop {
-                let (r, errno) = socket_call(|| {
-                    rffi::recvfrom(
-                        fd,
-                        slot.as_mut_ptr() as *mut libc::c_void,
-                        nbytes,
-                        flags,
-                        &mut storage as *mut _ as *mut rffi::sockaddr,
-                        &mut slen,
-                    )
-                });
-                if r >= 0 {
-                    break r;
-                }
-                if !rffi::error_is_interrupted(errno) {
-                    return Err(socket_io_err_for_operation(
-                        obj,
-                        std::io::Error::from_raw_os_error(errno),
-                    ));
-                }
-                // EINTR: deliver a pending signal, then retry
-                // (`converted_error` eintr_retry).
-                pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-            };
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(pyre_object::w_int_new(got as i64));
-            fields.push(unpack_inet_addr(&storage, slen));
-            Ok(pyre_object::w_tuple_new(fields.take()))
-        }),
-    ) };
+                };
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_int_new(got as i64));
+                fields.push(unpack_inet_addr(&storage, slen));
+                Ok(pyre_object::w_tuple_new(fields.take()))
+            }),
+        )
+    };
 
     // recvmsg(bufsize, [ancbufsize, flags]) → (data, ancdata, msg_flags, address)
     // `interp_socket.py:525-569` — receives normal + ancillary data
@@ -5183,170 +5535,171 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // The scatter/gather calls and their ancillary data are POSIX-only;
     // `socket.py` test for each before reaching for it.
     #[cfg(unix)]
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "recvmsg",
-        pyre_interpreter::make_builtin_function("recvmsg", |args| {
-            if args.len() < 2 {
-                return Err(pyre_interpreter::PyError::type_error("recvmsg() missing buffer size"));
-            }
-            if !{ pyre_object::is_int(args[1]) } {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "recvmsg: bufsize must be an integer",
-                ));
-            }
-            let bufsize_raw = { pyre_object::w_int_get_value(args[1]) };
-            if bufsize_raw < 0 {
-                return Err(pyre_interpreter::PyError::value_error(
-                    "negative buffer size in recvmsg()",
-                ));
-            }
-            let bufsize = bufsize_raw as usize;
-            let ancbufsize = if args.len() >= 3 {
-                if !{ pyre_object::is_int(args[2]) } {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "recvmsg",
+            pyre_interpreter::make_builtin_function("recvmsg", |args| {
+                if args.len() < 2 {
                     return Err(pyre_interpreter::PyError::type_error(
-                        "recvmsg: ancbufsize must be an integer",
+                        "recvmsg() missing buffer size",
                     ));
                 }
-                let raw = { pyre_object::w_int_get_value(args[2]) };
-                if raw < 0 {
+                if !{ pyre_object::is_int(args[1]) } {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "recvmsg: bufsize must be an integer",
+                    ));
+                }
+                let bufsize_raw = { pyre_object::w_int_get_value(args[1]) };
+                if bufsize_raw < 0 {
                     return Err(pyre_interpreter::PyError::value_error(
-                        "invalid ancillary data buffer length",
+                        "negative buffer size in recvmsg()",
                     ));
                 }
-                raw as usize
-            } else {
-                0
-            };
-            let flags = if args.len() >= 4 {
-                if !{ pyre_object::is_int(args[3]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "recvmsg: flags must be an integer",
-                    ));
-                }
-                pyre_object::w_int_get_value(args[3]) as libc::c_int
-            } else {
-                0
-            };
-            let mut obj = args[0];
-            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-
-            let mut data = pyre_object::with_roots!(obj => pyre_interpreter::builtins::try_vec_zeroed(bufsize))?;
-            let mut control = pyre_object::with_roots!(obj => pyre_interpreter::builtins::try_vec_zeroed(ancbufsize))?;
-            let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
-            pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
-            let (got, msg_flags, msg_namelen, controllen) = loop {
-                let mut iov = libc::iovec {
-                    iov_base: data.as_mut_ptr() as *mut libc::c_void,
-                    iov_len: bufsize,
+                let bufsize = bufsize_raw as usize;
+                let ancbufsize = if args.len() >= 3 {
+                    if !{ pyre_object::is_int(args[2]) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "recvmsg: ancbufsize must be an integer",
+                        ));
+                    }
+                    let raw = { pyre_object::w_int_get_value(args[2]) };
+                    if raw < 0 {
+                        return Err(pyre_interpreter::PyError::value_error(
+                            "invalid ancillary data buffer length",
+                        ));
+                    }
+                    raw as usize
+                } else {
+                    0
                 };
-                let mut msg: libc::msghdr = { std::mem::zeroed() };
-                msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
-                msg.msg_namelen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-                msg.msg_iov = &mut iov;
-                msg.msg_iovlen = 1;
-                if ancbufsize > 0 {
-                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                    msg.msg_controllen = ancbufsize as _;
-                }
-                let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| {
-                    libc::recvmsg(fd, &mut msg, flags)
-                });
-                if r >= 0 {
-                    break (
-                        r,
-                        msg.msg_flags,
-                        msg.msg_namelen,
-                        msg.msg_controllen,
-                    );
-                }
-                if !rffi::error_is_interrupted(errno) {
-                    return Err(socket_io_err_for_operation(
-                        obj,
-                        std::io::Error::from_raw_os_error(errno),
-                    ));
-                }
-                // EINTR: deliver a pending signal, then retry
-                // (`converted_error` eintr_retry).
-                pyre_object::with_roots!(obj => pyre_interpreter::module::signal::interp_signal::checksignals_now())?;
-            };
-            data.truncate(got as usize);
+                let flags = if args.len() >= 4 {
+                    if !{ pyre_object::is_int(args[3]) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "recvmsg: flags must be an integer",
+                        ));
+                    }
+                    pyre_object::w_int_get_value(args[3]) as libc::c_int
+                } else {
+                    0
+                };
+                let mut obj = args[0];
+                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
 
-            // Walk ancillary data.  Re-run msghdr with the final
-            // controllen so CMSG_* macros see the trimmed buffer.  Every
-            // field, cmsg tuple, the anc list, and the result tuple is a
-            // nursery object. Build the anc list first so its bracket
-            // closes before the result fields are pinned.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let anc = {
-                let mut result_w = pyre_object::gc_roots::RootedItems::new();
-                if ancbufsize > 0 && controllen > 0 {
-                    let mut dummy_iov = libc::iovec {
-                        iov_base: std::ptr::null_mut(),
-                        iov_len: 0,
+                let mut data = pyre_object::with_roots!(obj => pyre_interpreter::builtins::try_vec_zeroed(bufsize))?;
+                let mut control = pyre_object::with_roots!(obj => pyre_interpreter::builtins::try_vec_zeroed(ancbufsize))?;
+                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
+                pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
+                let (got, msg_flags, msg_namelen, controllen) = loop {
+                    let mut iov = libc::iovec {
+                        iov_base: data.as_mut_ptr() as *mut libc::c_void,
+                        iov_len: bufsize,
                     };
                     let mut msg: libc::msghdr = { std::mem::zeroed() };
-                    msg.msg_iov = &mut dummy_iov;
+                    msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
+                    msg.msg_namelen =
+                        core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+                    msg.msg_iov = &mut iov;
                     msg.msg_iovlen = 1;
-                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                    msg.msg_controllen = controllen;
-                    {
-                        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-                        while !cmsg.is_null() {
-                            let header = &*cmsg;
-                            let hdr_size = libc::CMSG_LEN(0) as usize;
-                            let total = header.cmsg_len as usize;
-                            if total < hdr_size {
-                                break;
+                    if ancbufsize > 0 {
+                        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                        msg.msg_controllen = ancbufsize as _;
+                    }
+                    let (r, errno) =
+                        pyre_interpreter::module::thread::call_external_function(|| {
+                            libc::recvmsg(fd, &mut msg, flags)
+                        });
+                    if r >= 0 {
+                        break (r, msg.msg_flags, msg.msg_namelen, msg.msg_controllen);
+                    }
+                    if !rffi::error_is_interrupted(errno) {
+                        return Err(socket_io_err_for_operation(
+                            obj,
+                            std::io::Error::from_raw_os_error(errno),
+                        ));
+                    }
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    pyre_object::with_roots!(obj => pyre_interpreter::module::signal::interp_signal::checksignals_now())?;
+                };
+                data.truncate(got as usize);
+
+                // Walk ancillary data.  Re-run msghdr with the final
+                // controllen so CMSG_* macros see the trimmed buffer.  Every
+                // field, cmsg tuple, the anc list, and the result tuple is a
+                // nursery object. Build the anc list first so its bracket
+                // closes before the result fields are pinned.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let anc = {
+                    let mut result_w = pyre_object::gc_roots::RootedItems::new();
+                    if ancbufsize > 0 && controllen > 0 {
+                        let mut dummy_iov = libc::iovec {
+                            iov_base: std::ptr::null_mut(),
+                            iov_len: 0,
+                        };
+                        let mut msg: libc::msghdr = { std::mem::zeroed() };
+                        msg.msg_iov = &mut dummy_iov;
+                        msg.msg_iovlen = 1;
+                        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                        msg.msg_controllen = controllen;
+                        {
+                            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                            while !cmsg.is_null() {
+                                let header = &*cmsg;
+                                let hdr_size = libc::CMSG_LEN(0) as usize;
+                                let total = header.cmsg_len as usize;
+                                if total < hdr_size {
+                                    break;
+                                }
+                                let payload_ptr = libc::CMSG_DATA(cmsg);
+                                let control_start = control.as_ptr() as usize;
+                                let data_start = payload_ptr as usize;
+                                let control_end = control_start.saturating_add(controllen as usize);
+                                if data_start < control_start || data_start > control_end {
+                                    break;
+                                }
+                                // A truncated cmsg may retain its original cmsg_len.
+                                // `recvmsg.py` returns only bytes the kernel actually
+                                // left inside the final msg_controllen boundary.
+                                let available = control_end - data_start;
+                                let payload_len = (total - hdr_size).min(available);
+                                let payload =
+                                    std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
+                                let pair = {
+                                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                                    fields.push(pyre_object::w_int_new(header.cmsg_level as i64));
+                                    fields.push(pyre_object::w_int_new(header.cmsg_type as i64));
+                                    fields.push(pyre_object::bytesobject::w_bytes_from_bytes(
+                                        &payload,
+                                    ));
+                                    pyre_object::w_tuple_new(fields.take())
+                                };
+                                result_w.push(pair);
+                                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                             }
-                            let payload_ptr = libc::CMSG_DATA(cmsg);
-                            let control_start = control.as_ptr() as usize;
-                            let data_start = payload_ptr as usize;
-                            let control_end = control_start.saturating_add(controllen as usize);
-                            if data_start < control_start || data_start > control_end {
-                                break;
-                            }
-                            // A truncated cmsg may retain its original cmsg_len.
-                            // `recvmsg.py` returns only bytes the kernel actually
-                            // left inside the final msg_controllen boundary.
-                            let available = control_end - data_start;
-                            let payload_len = (total - hdr_size).min(available);
-                            let payload =
-                                std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
-                            let pair = {
-                                let mut fields = pyre_object::gc_roots::RootedItems::new();
-                                fields.push(pyre_object::w_int_new(header.cmsg_level as i64));
-                                fields.push(pyre_object::w_int_new(header.cmsg_type as i64));
-                                fields.push(pyre_object::bytesobject::w_bytes_from_bytes(
-                                    &payload,
-                                ));
-                                pyre_object::w_tuple_new(fields.take())
-                            };
-                            result_w.push(pair);
-                            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                         }
                     }
-                }
-                pyre_object::w_list_new(result_w.take())
-            };
-            let anc_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(anc);
-            let data_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(
-                pyre_object::bytesobject::w_bytes_from_bytes(&data),
-            );
-            let flags_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(msg_flags as i64));
-            let addr_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(unpack_inet_addr(&storage, msg_namelen));
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::gc_roots::shadow_stack_get(data_slot),
-                pyre_object::gc_roots::shadow_stack_get(anc_slot),
-                pyre_object::gc_roots::shadow_stack_get(flags_slot),
-                pyre_object::gc_roots::shadow_stack_get(addr_slot),
-            ]))
-        }),
-    ) };
+                    pyre_object::w_list_new(result_w.take())
+                };
+                let anc_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(anc);
+                let data_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(
+                    pyre_object::bytesobject::w_bytes_from_bytes(&data),
+                );
+                let flags_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(msg_flags as i64));
+                let addr_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(unpack_inet_addr(&storage, msg_namelen));
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::gc_roots::shadow_stack_get(data_slot),
+                    pyre_object::gc_roots::shadow_stack_get(anc_slot),
+                    pyre_object::gc_roots::shadow_stack_get(flags_slot),
+                    pyre_object::gc_roots::shadow_stack_get(addr_slot),
+                ]))
+            }),
+        )
+    };
 
     // recvmsg_into(buffers, [ancbufsize, [flags]]) ->
     //   (nbytes, ancdata, msg_flags, address)
@@ -5356,168 +5709,176 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // The scatter/gather calls and their ancillary data are POSIX-only;
     // `socket.py` test for each before reaching for it.
     #[cfg(unix)]
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "recvmsg_into",
-        pyre_interpreter::make_builtin_function("recvmsg_into", |args| {
-            if args.len() < 2 {
-                return Err(pyre_interpreter::PyError::type_error("recvmsg_into() missing buffers"));
-            }
-            // One scope for the whole set: `SocketWritableBuffer` records slot
-            // indices into it, and the vector's elements are dropped front to
-            // back.
-            let _roots = pyre_object::gc_roots::push_roots();
-            // `W_Socket.recvmsg_into_w` snapshots an arbitrary iterable with
-            // `space.unpackiterable` before acquiring any writable views.  In
-            // particular a generator is part of the public accepted surface.
-            let seq_slot = pyre_object::gc_roots::pin_roots(&[args[1]]);
-            let buffer_items = pyre_interpreter::baseobjspace::unpackiterable(
-                pyre_object::gc_roots::shadow_stack_get(seq_slot),
-                -1,
-            )?;
-            let items_base = pyre_object::gc_roots::pin_roots(&buffer_items);
-            let mut buffers: Vec<SocketWritableBuffer> =
-                Vec::with_capacity(buffer_items.len());
-            for i in 0..buffer_items.len() {
-                let item = pyre_object::gc_roots::shadow_stack_get(items_base + i);
-                buffers.push({ SocketWritableBuffer::acquire(item) }?);
-            }
-            let ancbufsize = if args.len() >= 3 {
-                if !{ pyre_object::is_int(args[2]) } {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "recvmsg_into",
+            pyre_interpreter::make_builtin_function("recvmsg_into", |args| {
+                if args.len() < 2 {
                     return Err(pyre_interpreter::PyError::type_error(
-                        "recvmsg_into: ancbufsize must be an integer",
+                        "recvmsg_into() missing buffers",
                     ));
                 }
-                let raw = { pyre_object::w_int_get_value(args[2]) };
-                if raw < 0 {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "invalid ancillary data buffer length",
-                    ));
+                let nargs = args.len();
+                // One scope for the whole set: `SocketWritableBuffer` records slot
+                // indices into it, and the vector's elements are dropped front to
+                // back. The argument slice is pinned with that scope: unpacking
+                // the buffers collects before the socket and the later integers
+                // are read.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let args_base = _roots.pin_roots(args);
+                // `W_Socket.recvmsg_into_w` snapshots an arbitrary iterable with
+                // `space.unpackiterable` before acquiring any writable views.  In
+                // particular a generator is part of the public accepted surface.
+                let buffer_items =
+                    pyre_interpreter::baseobjspace::unpackiterable(_roots.get(args_base + 1), -1)?;
+                let items_base = pyre_object::gc_roots::pin_roots(&buffer_items);
+                let mut buffers: Vec<SocketWritableBuffer> = Vec::with_capacity(buffer_items.len());
+                for i in 0..buffer_items.len() {
+                    let item = pyre_object::gc_roots::shadow_stack_get(items_base + i);
+                    buffers.push({ SocketWritableBuffer::acquire(item) }?);
                 }
-                raw as usize
-            } else {
-                0
-            };
-            let flags = if args.len() >= 4 {
-                if !{ pyre_object::is_int(args[3]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "recvmsg_into: flags must be an integer",
-                    ));
-                }
-                pyre_object::w_int_get_value(args[3]) as libc::c_int
-            } else {
-                0
-            };
-            let fd = socket_fd(args[0])?;
-
-            let mut iovs: Vec<libc::iovec> = buffers
-                .iter_mut()
-                .map(|buffer| {
-                    let slice = { buffer.as_mut_slice() };
-                    libc::iovec {
-                    iov_base: slice.as_mut_ptr() as *mut libc::c_void,
-                    iov_len: slice.len(),
+                let ancbufsize = if nargs >= 3 {
+                    let anc_obj = _roots.get(args_base + 2);
+                    if !{ pyre_object::is_int(anc_obj) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "recvmsg_into: ancbufsize must be an integer",
+                        ));
                     }
-                })
-                .collect();
-            let mut control = pyre_interpreter::builtins::try_vec_zeroed(ancbufsize)?;
-            let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
-            socket_wait_readable(args[0], fd)?;
-            let (got, msg_flags, msg_namelen, controllen) = loop {
-                let mut msg: libc::msghdr = { std::mem::zeroed() };
-                msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
-                msg.msg_namelen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-                msg.msg_iov = iovs.as_mut_ptr();
-                msg.msg_iovlen = iovs.len() as _;
-                if ancbufsize > 0 {
-                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                    msg.msg_controllen = ancbufsize as _;
-                }
-                let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| {
-                    libc::recvmsg(fd, &mut msg, flags)
-                });
-                if r >= 0 {
-                    break (r, msg.msg_flags, msg.msg_namelen, msg.msg_controllen);
-                }
-                if !rffi::error_is_interrupted(errno) {
-                    return Err(socket_io_err_for_operation(
-                        args[0],
-                        std::io::Error::from_raw_os_error(errno),
-                    ));
-                }
-                // EINTR: deliver a pending signal, then retry
-                // (`converted_error` eintr_retry).
-                pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-            };
+                    let raw = { pyre_object::w_int_get_value(anc_obj) };
+                    if raw < 0 {
+                        return Err(pyre_interpreter::PyError::value_error(
+                            "invalid ancillary data buffer length",
+                        ));
+                    }
+                    raw as usize
+                } else {
+                    0
+                };
+                let flags = if nargs >= 4 {
+                    let flags_obj = _roots.get(args_base + 3);
+                    if !{ pyre_object::is_int(flags_obj) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "recvmsg_into: flags must be an integer",
+                        ));
+                    }
+                    pyre_object::w_int_get_value(flags_obj) as libc::c_int
+                } else {
+                    0
+                };
+                let fd = socket_fd(_roots.get(args_base))?;
 
-            // Every field, cmsg tuple, the anc list, and the result tuple
-            // sit on the same bracket already opened for the writable
-            // buffers. Build the anc list first so its bracket closes
-            // before the result fields are pinned.
-            let anc = {
-                let mut result_w = pyre_object::gc_roots::RootedItems::new();
-                if ancbufsize > 0 && controllen > 0 {
-                    let mut dummy_iov = libc::iovec {
-                        iov_base: std::ptr::null_mut(),
-                        iov_len: 0,
-                    };
+                let mut iovs: Vec<libc::iovec> = buffers
+                    .iter_mut()
+                    .map(|buffer| {
+                        let slice = { buffer.as_mut_slice() };
+                        libc::iovec {
+                            iov_base: slice.as_mut_ptr() as *mut libc::c_void,
+                            iov_len: slice.len(),
+                        }
+                    })
+                    .collect();
+                let mut control = pyre_interpreter::builtins::try_vec_zeroed(ancbufsize)?;
+                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
+                socket_wait_readable(_roots.get(args_base), fd)?;
+                let (got, msg_flags, msg_namelen, controllen) = loop {
                     let mut msg: libc::msghdr = { std::mem::zeroed() };
-                    msg.msg_iov = &mut dummy_iov;
-                    msg.msg_iovlen = 1;
-                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                    msg.msg_controllen = controllen;
-                    {
-                        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-                        while !cmsg.is_null() {
-                            let header = &*cmsg;
-                            let hdr_size = libc::CMSG_LEN(0) as usize;
-                            let total = header.cmsg_len as usize;
-                            if total < hdr_size {
-                                break;
+                    msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
+                    msg.msg_namelen =
+                        core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+                    msg.msg_iov = iovs.as_mut_ptr();
+                    msg.msg_iovlen = iovs.len() as _;
+                    if ancbufsize > 0 {
+                        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                        msg.msg_controllen = ancbufsize as _;
+                    }
+                    let (r, errno) =
+                        pyre_interpreter::module::thread::call_external_function(|| {
+                            libc::recvmsg(fd, &mut msg, flags)
+                        });
+                    if r >= 0 {
+                        break (r, msg.msg_flags, msg.msg_namelen, msg.msg_controllen);
+                    }
+                    if !rffi::error_is_interrupted(errno) {
+                        return Err(socket_io_err_for_operation(
+                            _roots.get(args_base),
+                            std::io::Error::from_raw_os_error(errno),
+                        ));
+                    }
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                };
+
+                // Every field, cmsg tuple, the anc list, and the result tuple
+                // sit on the same bracket already opened for the writable
+                // buffers. Build the anc list first so its bracket closes
+                // before the result fields are pinned.
+                let anc = {
+                    let mut result_w = pyre_object::gc_roots::RootedItems::new();
+                    if ancbufsize > 0 && controllen > 0 {
+                        let mut dummy_iov = libc::iovec {
+                            iov_base: std::ptr::null_mut(),
+                            iov_len: 0,
+                        };
+                        let mut msg: libc::msghdr = { std::mem::zeroed() };
+                        msg.msg_iov = &mut dummy_iov;
+                        msg.msg_iovlen = 1;
+                        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                        msg.msg_controllen = controllen;
+                        {
+                            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                            while !cmsg.is_null() {
+                                let header = &*cmsg;
+                                let hdr_size = libc::CMSG_LEN(0) as usize;
+                                let total = header.cmsg_len as usize;
+                                if total < hdr_size {
+                                    break;
+                                }
+                                let payload_ptr = libc::CMSG_DATA(cmsg);
+                                let control_start = control.as_ptr() as usize;
+                                let data_start = payload_ptr as usize;
+                                let control_end = control_start.saturating_add(controllen as usize);
+                                if data_start < control_start || data_start > control_end {
+                                    break;
+                                }
+                                let available = control_end - data_start;
+                                let payload_len = (total - hdr_size).min(available);
+                                let payload =
+                                    std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
+                                let pair = {
+                                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                                    fields.push(pyre_object::w_int_new(header.cmsg_level as i64));
+                                    fields.push(pyre_object::w_int_new(header.cmsg_type as i64));
+                                    fields.push(pyre_object::bytesobject::w_bytes_from_bytes(
+                                        &payload,
+                                    ));
+                                    pyre_object::w_tuple_new(fields.take())
+                                };
+                                result_w.push(pair);
+                                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                             }
-                            let payload_ptr = libc::CMSG_DATA(cmsg);
-                            let control_start = control.as_ptr() as usize;
-                            let data_start = payload_ptr as usize;
-                            let control_end = control_start.saturating_add(controllen as usize);
-                            if data_start < control_start || data_start > control_end {
-                                break;
-                            }
-                            let available = control_end - data_start;
-                            let payload_len = (total - hdr_size).min(available);
-                            let payload =
-                                std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
-                            let pair = {
-                                let mut fields = pyre_object::gc_roots::RootedItems::new();
-                                fields.push(pyre_object::w_int_new(header.cmsg_level as i64));
-                                fields.push(pyre_object::w_int_new(header.cmsg_type as i64));
-                                fields.push(pyre_object::bytesobject::w_bytes_from_bytes(
-                                    &payload,
-                                ));
-                                pyre_object::w_tuple_new(fields.take())
-                            };
-                            result_w.push(pair);
-                            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                         }
                     }
-                }
-                pyre_object::w_list_new(result_w.take())
-            };
-            let anc_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(anc);
-            let got_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(got as i64));
-            let flags_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(msg_flags as i64));
-            let addr_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(unpack_inet_addr(&storage, msg_namelen));
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::gc_roots::shadow_stack_get(got_slot),
-                pyre_object::gc_roots::shadow_stack_get(anc_slot),
-                pyre_object::gc_roots::shadow_stack_get(flags_slot),
-                pyre_object::gc_roots::shadow_stack_get(addr_slot),
-            ]))
-        }),
-    ) };
+                    pyre_object::w_list_new(result_w.take())
+                };
+                let anc_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(anc);
+                let got_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(got as i64));
+                let flags_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(msg_flags as i64));
+                let addr_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(unpack_inet_addr(&storage, msg_namelen));
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::gc_roots::shadow_stack_get(got_slot),
+                    pyre_object::gc_roots::shadow_stack_get(anc_slot),
+                    pyre_object::gc_roots::shadow_stack_get(flags_slot),
+                    pyre_object::gc_roots::shadow_stack_get(addr_slot),
+                ]))
+            }),
+        )
+    };
 
     // sendmsg(data_iter[, ancillary[, flags[, address]]]) → bytes_sent
     // `interp_socket.py:711-773` — gather-write of multiple bytes-like
@@ -5527,493 +5888,545 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // The scatter/gather calls and their ancillary data are POSIX-only;
     // `socket.py` test for each before reaching for it.
     #[cfg(unix)]
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "sendmsg",
-        pyre_interpreter::make_builtin_function("sendmsg", |args| {
-            if args.len() < 2 {
-                return Err(pyre_interpreter::PyError::type_error("sendmsg() missing data"));
-            }
-            let mut obj = args[0];
-            let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-
-            // PyPy `interp_socket.py`: `space.unpackiterable(w_data)`,
-            // then acquire/release one `BUF_SIMPLE` view per item and retain
-            // the copied strings.  In particular, asyncio passes an
-            // `itertools.islice` of memoryviews here, not a list or tuple.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let data_slot = pyre_object::gc_roots::pin_roots(&[args[1]]);
-            let data_items = pyre_interpreter::baseobjspace::unpackiterable(
-                pyre_object::gc_roots::shadow_stack_get(data_slot),
-                -1,
-            )?;
-            let items_base = pyre_object::gc_roots::pin_roots(&data_items);
-            let mut data_buffers: Vec<Vec<u8>> = Vec::with_capacity(data_items.len());
-            // `simple_buffer_bytes` looks up `__buffer__` and builds a
-            // memoryview, so every iteration can collect; read each item back
-            // from its slot instead of consuming the unrooted vector.
-            for i in 0..data_items.len() {
-                let item = pyre_object::gc_roots::shadow_stack_get(items_base + i);
-                let Some(buffer) = pyre_interpreter::baseobjspace::simple_buffer_bytes(item)? else {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "sendmsg",
+            pyre_interpreter::make_builtin_function("sendmsg", |args| {
+                if args.len() < 2 {
                     return Err(pyre_interpreter::PyError::type_error(
-                        "sendmsg: data items must be bytes-like",
+                        "sendmsg() missing data",
                     ));
-                };
-                data_buffers.push(buffer.as_bytes().to_vec());
-                buffer.release();
-            }
-            let mut iovs: Vec<libc::iovec> = data_buffers
-                .iter()
-                .map(|s| libc::iovec {
-                    iov_base: s.as_ptr() as *mut libc::c_void,
-                    iov_len: s.len(),
-                })
-                .collect();
+                }
+                let nargs = args.len();
+                // The argument slice and the socket stay live across unpacking,
+                // buffer export, and address packing. Pin the slice once; the
+                // socket is reloaded from its own slot after each collecting call.
+                let args_roots = pyre_object::gc_roots::push_roots();
+                let args_base = args_roots.pin_roots(args);
+                let mut obj = args_roots.get(args_base);
+                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
 
-            // Build ancillary control buffer from args[2] (optional).
-            let mut cmsgs: Vec<(libc::c_int, libc::c_int, Vec<u8>)> = Vec::new();
-            if args.len() >= 3 && !{ pyre_object::is_none(args[2]) } {
-                // PyPy `W_Socket.sendmsg_w` snapshots both iterable levels
-                // with `space.unpackiterable` before converting their fields.
-                // That order is semantic: `__index__` may mutate the original
-                // ancillary list, but it cannot rewrite the captured message.
-                let ancillary_slot = pyre_object::gc_roots::pin_roots(&[args[2]]);
-                let ancillary_items = pyre_interpreter::baseobjspace::unpackiterable(
-                    pyre_object::gc_roots::shadow_stack_get(ancillary_slot),
+                // PyPy `interp_socket.py`: `space.unpackiterable(w_data)`,
+                // then acquire/release one `BUF_SIMPLE` view per item and retain
+                // the copied strings.  In particular, asyncio passes an
+                // `itertools.islice` of memoryviews here, not a list or tuple.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(obj);
+                let data_items = pyre_interpreter::baseobjspace::unpackiterable(
+                    args_roots.get(args_base + 1),
                     -1,
                 )?;
-                let ancillary_base = pyre_object::gc_roots::pin_roots(&ancillary_items);
-                for i in 0..ancillary_items.len() {
-                    let item = pyre_object::gc_roots::shadow_stack_get(ancillary_base + i);
-                    let fields = pyre_interpreter::baseobjspace::unpackiterable(item, -1)?;
-                    if fields.len() != 3 {
+                let items_base = pyre_object::gc_roots::pin_roots(&data_items);
+                let mut data_buffers: Vec<Vec<u8>> = Vec::with_capacity(data_items.len());
+                // `simple_buffer_bytes` looks up `__buffer__` and builds a
+                // memoryview, so every iteration can collect; read each item back
+                // from its slot instead of consuming the unrooted vector.
+                for i in 0..data_items.len() {
+                    let item = pyre_object::gc_roots::shadow_stack_get(items_base + i);
+                    let Some(buffer) = pyre_interpreter::baseobjspace::simple_buffer_bytes(item)?
+                    else {
                         return Err(pyre_interpreter::PyError::type_error(
-                            "sendmsg: ancillary items must be 3-tuples",
-                        ));
-                    }
-                    let fields_base = pyre_object::gc_roots::pin_roots(&fields);
-                    let level_o = pyre_object::gc_roots::shadow_stack_get(fields_base);
-                    let level = libc::c_int::try_from(pyre_interpreter::baseobjspace::int_w(level_o)?)
-                        .map_err(|_| {
-                            pyre_interpreter::PyError::overflow_error(
-                                "Python int too large to convert to C int",
-                            )
-                        })?;
-                    let type_o = pyre_object::gc_roots::shadow_stack_get(fields_base + 1);
-                    let ty = libc::c_int::try_from(pyre_interpreter::baseobjspace::int_w(type_o)?)
-                        .map_err(|_| {
-                            pyre_interpreter::PyError::overflow_error(
-                                "Python int too large to convert to C int",
-                            )
-                        })?;
-                    let data_o = pyre_object::gc_roots::shadow_stack_get(fields_base + 2);
-                    // interp_socket.py:811-816 acquires a BUF_SIMPLE view,
-                    // just like the ordinary data items above.  This includes
-                    // array.array payloads used by multiprocessing's
-                    // SCM_RIGHTS fd transfer, not only bytes/bytearray.
-                    let Some(buffer) = pyre_interpreter::baseobjspace::simple_buffer_bytes(data_o)? else {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "sendmsg: ancillary data must be bytes-like",
+                            "sendmsg: data items must be bytes-like",
                         ));
                     };
-                    let data = buffer.as_bytes().to_vec();
+                    data_buffers.push(buffer.as_bytes().to_vec());
                     buffer.release();
-                    cmsgs.push((level, ty, data));
                 }
-            }
-            let flags = if args.len() >= 4 {
-                if !{ pyre_object::is_int(args[3]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "sendmsg: flags must be an integer",
-                    ));
+                let mut iovs: Vec<libc::iovec> = data_buffers
+                    .iter()
+                    .map(|s| libc::iovec {
+                        iov_base: s.as_ptr() as *mut libc::c_void,
+                        iov_len: s.len(),
+                    })
+                    .collect();
+
+                // Build ancillary control buffer from args[2] (optional).
+                let mut cmsgs: Vec<(libc::c_int, libc::c_int, Vec<u8>)> = Vec::new();
+                if nargs >= 3 && !pyre_object::is_none(args_roots.get(args_base + 2)) {
+                    // PyPy `W_Socket.sendmsg_w` snapshots both iterable levels
+                    // with `space.unpackiterable` before converting their fields.
+                    // That order is semantic: `__index__` may mutate the original
+                    // ancillary list, but it cannot rewrite the captured message.
+                    let ancillary_items = pyre_interpreter::baseobjspace::unpackiterable(
+                        args_roots.get(args_base + 2),
+                        -1,
+                    )?;
+                    let ancillary_base = pyre_object::gc_roots::pin_roots(&ancillary_items);
+                    for i in 0..ancillary_items.len() {
+                        let item = pyre_object::gc_roots::shadow_stack_get(ancillary_base + i);
+                        let fields = pyre_interpreter::baseobjspace::unpackiterable(item, -1)?;
+                        if fields.len() != 3 {
+                            return Err(pyre_interpreter::PyError::type_error(
+                                "sendmsg: ancillary items must be 3-tuples",
+                            ));
+                        }
+                        let fields_base = pyre_object::gc_roots::pin_roots(&fields);
+                        let level_o = pyre_object::gc_roots::shadow_stack_get(fields_base);
+                        let level =
+                            libc::c_int::try_from(pyre_interpreter::baseobjspace::int_w(level_o)?)
+                                .map_err(|_| {
+                                    pyre_interpreter::PyError::overflow_error(
+                                        "Python int too large to convert to C int",
+                                    )
+                                })?;
+                        let type_o = pyre_object::gc_roots::shadow_stack_get(fields_base + 1);
+                        let ty =
+                            libc::c_int::try_from(pyre_interpreter::baseobjspace::int_w(type_o)?)
+                                .map_err(|_| {
+                                pyre_interpreter::PyError::overflow_error(
+                                    "Python int too large to convert to C int",
+                                )
+                            })?;
+                        let data_o = pyre_object::gc_roots::shadow_stack_get(fields_base + 2);
+                        // interp_socket.py W_Socket.sendmsg_w acquires a BUF_SIMPLE view,
+                        // just like the ordinary data items above.  This includes
+                        // array.array payloads used by multiprocessing's
+                        // SCM_RIGHTS fd transfer, not only bytes/bytearray.
+                        let Some(buffer) =
+                            pyre_interpreter::baseobjspace::simple_buffer_bytes(data_o)?
+                        else {
+                            return Err(pyre_interpreter::PyError::type_error(
+                                "sendmsg: ancillary data must be bytes-like",
+                            ));
+                        };
+                        let data = buffer.as_bytes().to_vec();
+                        buffer.release();
+                        cmsgs.push((level, ty, data));
+                    }
                 }
-                pyre_object::w_int_get_value(args[3]) as libc::c_int
-            } else {
-                0
-            };
-            // `pack_inet_addr` runs Python for a host that is not a plain
-            // ASCII `str`, so the socket is read back from its slot rather
-            // than from the native argument slice, which is only current at
-            // entry.  The scope opened above covers the slot.
-            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-            let (addr_storage, addr_len) =
-                if args.len() >= 5 && !{ pyre_object::is_none(args[4]) } {
-                    let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                    let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
-                    let (s, l) = pack_inet_addr("sendmsg", family, proto, args[4])?;
+                let flags = if nargs >= 4 {
+                    let flags_obj = args_roots.get(args_base + 3);
+                    if !{ pyre_object::is_int(flags_obj) } {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "sendmsg: flags must be an integer",
+                        ));
+                    }
+                    pyre_object::w_int_get_value(flags_obj) as libc::c_int
+                } else {
+                    0
+                };
+                // `pack_inet_addr` runs Python for a host that is not a plain
+                // ASCII `str`, so the socket and the address are read back from
+                // their slots rather than from the locals copied at entry.
+                let (addr_storage, addr_len) = if nargs >= 5
+                    && !pyre_object::is_none(args_roots.get(args_base + 4))
+                {
+                    let family = socket_get_attr_i64(
+                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                        "_family",
+                    ) as libc::c_int;
+                    let proto = socket_get_attr_i64(
+                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                        "_proto",
+                    ) as libc::c_int;
+                    let (s, l) =
+                        pack_inet_addr("sendmsg", family, proto, args_roots.get(args_base + 4))?;
                     (Some(s), l)
                 } else {
                     (None, 0)
                 };
-            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
 
-            // Lay out cmsgs into a single control buffer.
-            #[cfg(all(feature = "host_env", not(target_os = "redox")))]
-            let mut control = {
-                let refs: Vec<_> = cmsgs
-                    .iter()
-                    .map(|(level, ty, data)| (*level, *ty, data.as_slice()))
-                    .collect();
-                rustpython_host_env::socket::pack_ancillary_messages(&refs).map_err(|error| {
-                    use rustpython_host_env::socket::AncillaryPackError;
-                    match error {
-                        AncillaryPackError::ItemTooLarge => {
-                            pyre_interpreter::PyError::os_error("ancillary data item too large")
-                        }
-                        AncillaryPackError::TooMuchData => {
-                            pyre_interpreter::PyError::os_error("too much ancillary data")
-                        }
-                        AncillaryPackError::UnexpectedNullHeader => pyre_interpreter::PyError::runtime_error(
-                            "unexpected NULL result from CMSG_FIRSTHDR/CMSG_NXTHDR",
-                        ),
-                    }
-                })?
-            };
-            #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
-            let mut control = {
-                let total_control: usize = cmsgs
-                    .iter()
-                    .map(|(_, _, d)| unsafe {
-                        libc::CMSG_SPACE(d.len() as libc::c_uint) as usize
-                    })
-                    .sum();
-                let mut control = vec![0u8; total_control];
-                if total_control > 0 {
-                    let mut packing_msg: libc::msghdr = unsafe { std::mem::zeroed() };
-                    packing_msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                    packing_msg.msg_controllen = total_control as _;
-                    unsafe {
-                        let mut cur = libc::CMSG_FIRSTHDR(&packing_msg);
-                        for (level, ty, data) in &cmsgs {
-                            if cur.is_null() {
-                                break;
+                // Lay out cmsgs into a single control buffer.
+                #[cfg(all(feature = "host_env", not(target_os = "redox")))]
+                let mut control = {
+                    let refs: Vec<_> = cmsgs
+                        .iter()
+                        .map(|(level, ty, data)| (*level, *ty, data.as_slice()))
+                        .collect();
+                    rustpython_host_env::socket::pack_ancillary_messages(&refs).map_err(
+                        |error| {
+                            use rustpython_host_env::socket::AncillaryPackError;
+                            match error {
+                                AncillaryPackError::ItemTooLarge => {
+                                    pyre_interpreter::PyError::os_error(
+                                        "ancillary data item too large",
+                                    )
+                                }
+                                AncillaryPackError::TooMuchData => {
+                                    pyre_interpreter::PyError::os_error("too much ancillary data")
+                                }
+                                AncillaryPackError::UnexpectedNullHeader => {
+                                    pyre_interpreter::PyError::runtime_error(
+                                        "unexpected NULL result from CMSG_FIRSTHDR/CMSG_NXTHDR",
+                                    )
+                                }
                             }
-                            let cmsg_len = libc::CMSG_LEN(data.len() as libc::c_uint);
-                            (*cur).cmsg_level = *level;
-                            (*cur).cmsg_type = *ty;
-                            (*cur).cmsg_len = cmsg_len as _;
-                            std::ptr::copy_nonoverlapping(
-                                data.as_ptr(),
-                                libc::CMSG_DATA(cur),
-                                data.len(),
-                            );
-                            cur = libc::CMSG_NXTHDR(&packing_msg, cur);
+                        },
+                    )?
+                };
+                #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
+                let mut control = {
+                    let total_control: usize = cmsgs
+                        .iter()
+                        .map(|(_, _, d)| unsafe {
+                            libc::CMSG_SPACE(d.len() as libc::c_uint) as usize
+                        })
+                        .sum();
+                    let mut control = vec![0u8; total_control];
+                    if total_control > 0 {
+                        let mut packing_msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                        packing_msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                        packing_msg.msg_controllen = total_control as _;
+                        unsafe {
+                            let mut cur = libc::CMSG_FIRSTHDR(&packing_msg);
+                            for (level, ty, data) in &cmsgs {
+                                if cur.is_null() {
+                                    break;
+                                }
+                                let cmsg_len = libc::CMSG_LEN(data.len() as libc::c_uint);
+                                (*cur).cmsg_level = *level;
+                                (*cur).cmsg_type = *ty;
+                                (*cur).cmsg_len = cmsg_len as _;
+                                std::ptr::copy_nonoverlapping(
+                                    data.as_ptr(),
+                                    libc::CMSG_DATA(cur),
+                                    data.len(),
+                                );
+                                cur = libc::CMSG_NXTHDR(&packing_msg, cur);
+                            }
                         }
                     }
+                    control
+                };
+                let total_control = control.len();
+                let mut msg: libc::msghdr = { std::mem::zeroed() };
+                msg.msg_iov = iovs.as_mut_ptr();
+                msg.msg_iovlen = iovs.len() as _;
+                if let Some(ref s) = addr_storage {
+                    msg.msg_name = s as *const _ as *mut libc::c_void;
+                    msg.msg_namelen = addr_len;
                 }
-                control
-            };
-            let total_control = control.len();
-            let mut msg: libc::msghdr = { std::mem::zeroed() };
-            msg.msg_iov = iovs.as_mut_ptr();
-            msg.msg_iovlen = iovs.len() as _;
-            if let Some(ref s) = addr_storage {
-                msg.msg_name = s as *const _ as *mut libc::c_void;
-                msg.msg_namelen = addr_len;
-            }
-            if total_control > 0 {
-                msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                msg.msg_controllen = total_control as _;
-            }
+                if total_control > 0 {
+                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                    msg.msg_controllen = total_control as _;
+                }
 
-            socket_wait_writable(obj, fd)?;
-            let sent = loop {
-                let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| {
-                    libc::sendmsg(fd, &msg, flags)
-                });
-                if r >= 0 {
-                    break r;
-                }
-                if !rffi::error_is_interrupted(errno) {
-                    return Err(socket_io_err_for_operation(
-                        obj,
-                        std::io::Error::from_raw_os_error(errno),
+                socket_wait_writable(pyre_object::gc_roots::shadow_stack_get(obj_slot), fd)?;
+                let sent = loop {
+                    let (r, errno) =
+                        pyre_interpreter::module::thread::call_external_function(|| {
+                            libc::sendmsg(fd, &msg, flags)
+                        });
+                    if r >= 0 {
+                        break r;
+                    }
+                    if !rffi::error_is_interrupted(errno) {
+                        return Err(socket_io_err_for_operation(
+                            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                            std::io::Error::from_raw_os_error(errno),
+                        ));
+                    }
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                };
+                Ok(pyre_object::w_int_new(sent as i64))
+            }),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "shutdown",
+            pyre_interpreter::make_builtin_function_with_arity(
+                "shutdown",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "shutdown() missing how",
+                        ));
+                    }
+                    let w_self = args[0];
+                    let mut w_how = args[1];
+                    let fd = pyre_object::with_roots!(w_how => socket_fd(w_self))?;
+                    let how = pyre_interpreter::baseobjspace::c_int_w(w_how)?;
+                    let r = { rffi::shutdown(fd, how) };
+                    if r != 0 {
+                        return Err(socket_last_error());
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "getsockname",
+            pyre_interpreter::make_builtin_function_with_arity(
+                "getsockname",
+                |args| {
+                    let fd = socket_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
+                    let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
+                    let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+                    let r = {
+                        rffi::getsockname(
+                            fd,
+                            &mut storage as *mut _ as *mut rffi::sockaddr,
+                            &mut slen,
+                        )
+                    };
+                    if r != 0 {
+                        return Err(socket_last_error());
+                    }
+                    Ok(unpack_inet_addr(&storage, slen))
+                },
+                1,
+            ),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "getpeername",
+            pyre_interpreter::make_builtin_function_with_arity(
+                "getpeername",
+                |args| {
+                    let fd = socket_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
+                    let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
+                    let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+                    let r = {
+                        rffi::getpeername(
+                            fd,
+                            &mut storage as *mut _ as *mut rffi::sockaddr,
+                            &mut slen,
+                        )
+                    };
+                    if r != 0 {
+                        return Err(socket_last_error());
+                    }
+                    Ok(unpack_inet_addr(&storage, slen))
+                },
+                1,
+            ),
+        )
+    };
+
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "setsockopt",
+            pyre_interpreter::make_builtin_function("setsockopt", |args| {
+                if args.len() < 4 {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "setsockopt() requires self + level + name + value",
                     ));
                 }
-                // EINTR: deliver a pending signal, then retry
-                // (`converted_error` eintr_retry).
-                pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-            };
-            Ok(pyre_object::w_int_new(sent as i64))
-        }),
-    ) };
-
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "shutdown",
-        pyre_interpreter::make_builtin_function_with_arity(
-            "shutdown",
-            |args| {
-                if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error("shutdown() missing how"));
+                let mut w_self = args[0];
+                let mut w_level = args[1];
+                let mut w_name = args[2];
+                let mut val = args[3];
+                let fd =
+                    pyre_object::with_roots!(w_self, w_level, w_name, val => socket_fd(w_self))?;
+                let level = pyre_object::with_roots!(w_self, w_name, val =>
+                    pyre_interpreter::baseobjspace::c_int_w(w_level)
+                )?;
+                let name = pyre_object::with_roots!(w_self, val =>
+                    pyre_interpreter::baseobjspace::c_int_w(w_name)
+                )?;
+                // `sock_setsockopt` sends an int for this option through
+                // `WSAIoctl` and keeps the value, because the option number is an
+                // ioctl code that `setsockopt` itself rejects.  A bytes value is
+                // not covered there either and still goes the ordinary way.
+                #[cfg(windows)]
+                if name == SIO_TCP_SET_ACK_FREQUENCY && unsafe { pyre_object::is_int(val) } {
+                    let flag = (unsafe { pyre_object::w_int_get_value(val) }) as libc::c_int;
+                    if unsafe { rffi::set_ack_frequency(fd, flag) } != 0 {
+                        return Err(socket_last_error());
+                    }
+                    socket_set_attr(w_self, "_quickack", pyre_object::w_int_new(flag as i64));
+                    return Ok(pyre_object::w_none());
                 }
-                let w_self = args[0];
-                let mut w_how = args[1];
-                let fd = pyre_object::with_roots!(w_how => socket_fd(w_self))?;
-                let how = pyre_interpreter::baseobjspace::c_int_w(w_how)?;
-                let r = { rffi::shutdown(fd, how) };
+                let r = {
+                    if pyre_object::is_int(val) {
+                        let v = pyre_object::w_int_get_value(val) as libc::c_int;
+                        rffi::setsockopt(
+                            fd,
+                            level,
+                            name,
+                            &v as *const _ as *const libc::c_void,
+                            core::mem::size_of::<libc::c_int>() as rffi::SockLen,
+                        )
+                    } else if pyre_object::bytesobject::is_bytes_like(val) {
+                        // Copied before the call: `setsockopt` releases the
+                        // interpreter, and the bytes object can move.
+                        let data = pyre_object::bytesobject::bytes_like_data(val).to_vec();
+                        rffi::setsockopt(
+                            fd,
+                            level,
+                            name,
+                            data.as_ptr() as *const libc::c_void,
+                            data.len() as rffi::SockLen,
+                        )
+                    } else {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "setsockopt: value must be int or bytes-like",
+                        ));
+                    }
+                };
                 if r != 0 {
                     return Err(socket_last_error());
                 }
                 Ok(pyre_object::w_none())
-            },
-            2,
-        ),
-    ) };
+            }),
+        )
+    };
 
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "getsockname",
-        pyre_interpreter::make_builtin_function_with_arity(
-            "getsockname",
-            |args| {
-                let fd = socket_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
-                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
-                let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-                let r = {
-                    rffi::getsockname(fd, &mut storage as *mut _ as *mut rffi::sockaddr, &mut slen)
-                };
-                if r != 0 {
-                    return Err(socket_last_error());
-                }
-                Ok(unpack_inet_addr(&storage, slen))
-            },
-            1,
-        ),
-    ) };
-
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "getpeername",
-        pyre_interpreter::make_builtin_function_with_arity(
-            "getpeername",
-            |args| {
-                let fd = socket_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
-                let mut storage: rffi::sockaddr_storage = { std::mem::zeroed() };
-                let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
-                let r = {
-                    rffi::getpeername(fd, &mut storage as *mut _ as *mut rffi::sockaddr, &mut slen)
-                };
-                if r != 0 {
-                    return Err(socket_last_error());
-                }
-                Ok(unpack_inet_addr(&storage, slen))
-            },
-            1,
-        ),
-    ) };
-
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "setsockopt",
-        pyre_interpreter::make_builtin_function("setsockopt", |args| {
-            if args.len() < 4 {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "setsockopt() requires self + level + name + value",
-                ));
-            }
-            let mut w_self = args[0];
-            let mut w_level = args[1];
-            let mut w_name = args[2];
-            let mut val = args[3];
-            let fd = pyre_object::with_roots!(w_self, w_level, w_name, val => socket_fd(w_self))?;
-            let level = pyre_object::with_roots!(w_self, w_name, val =>
-                pyre_interpreter::baseobjspace::c_int_w(w_level)
-            )?;
-            let name = pyre_object::with_roots!(w_self, val =>
-                pyre_interpreter::baseobjspace::c_int_w(w_name)
-            )?;
-            // `sock_setsockopt` sends an int for this option through
-            // `WSAIoctl` and keeps the value, because the option number is an
-            // ioctl code that `setsockopt` itself rejects.  A bytes value is
-            // not covered there either and still goes the ordinary way.
-            #[cfg(windows)]
-            if name == SIO_TCP_SET_ACK_FREQUENCY
-                && unsafe { pyre_object::is_int(val) }
-            {
-                let flag = (unsafe { pyre_object::w_int_get_value(val) }) as libc::c_int;
-                if unsafe { rffi::set_ack_frequency(fd, flag) } != 0 {
-                    return Err(socket_last_error());
-                }
-                socket_set_attr(w_self, "_quickack", pyre_object::w_int_new(flag as i64));
-                return Ok(pyre_object::w_none());
-            }
-            let r = {
-                if pyre_object::is_int(val) {
-                    let v = pyre_object::w_int_get_value(val) as libc::c_int;
-                    rffi::setsockopt(
-                        fd,
-                        level,
-                        name,
-                        &v as *const _ as *const libc::c_void,
-                        core::mem::size_of::<libc::c_int>() as rffi::SockLen,
-                    )
-                } else if pyre_object::bytesobject::is_bytes_like(val) {
-                    // Copied before the call: `setsockopt` releases the
-                    // interpreter, and the bytes object can move.
-                    let data = pyre_object::bytesobject::bytes_like_data(val).to_vec();
-                    rffi::setsockopt(
-                        fd,
-                        level,
-                        name,
-                        data.as_ptr() as *const libc::c_void,
-                        data.len() as rffi::SockLen,
-                    )
-                } else {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "getsockopt",
+            pyre_interpreter::make_builtin_function("getsockopt", |args| {
+                if args.len() < 3 {
                     return Err(pyre_interpreter::PyError::type_error(
-                        "setsockopt: value must be int or bytes-like",
+                        "getsockopt() requires self + level + name [+ buflen]",
                     ));
                 }
-            };
-            if r != 0 {
-                return Err(socket_last_error());
-            }
-            Ok(pyre_object::w_none())
-        }),
-    ) };
-
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "getsockopt",
-        pyre_interpreter::make_builtin_function("getsockopt", |args| {
-            if args.len() < 3 {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "getsockopt() requires self + level + name [+ buflen]",
-                ));
-            }
-            let mut w_self = args[0];
-            let mut w_level = args[1];
-            let mut w_name = args[2];
-            let mut w_buflen = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
-            let fd = pyre_object::with_roots!(w_self, w_level, w_name, w_buflen => socket_fd(w_self))?;
-            let level = pyre_object::with_roots!(w_self, w_name, w_buflen =>
-                pyre_interpreter::baseobjspace::c_int_w(w_level)
-            )?;
-            let name = pyre_object::with_roots!(w_self, w_buflen =>
-                pyre_interpreter::baseobjspace::c_int_w(w_name)
-            )?;
-            // `interp_socket.py getsockopt_w` — `buflen == 0`
-            // (including when omitted) reads an int option; otherwise the
-            // length must be in `1..=1024` and a bytes buffer is returned.
-            let buflen = if args.len() >= 4 {
-                pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::c_int_w(w_buflen))? as i64
-            } else {
-                0
-            };
-            if buflen == 0 {
-                // `sock_getsockopt` answers the value `setsockopt` last wrote
-                // rather than asking WinSock, which has no call that reads an
-                // ioctl's current setting.
-                #[cfg(windows)]
-                if name == SIO_TCP_SET_ACK_FREQUENCY {
-                    return Ok(pyre_object::w_int_new(socket_get_attr_i64(
-                        w_self,
-                        "_quickack",
-                    )));
-                }
-                let mut v: libc::c_int = 0;
-                let mut sz = core::mem::size_of::<libc::c_int>() as rffi::SockLen;
-                let r = {
-                    rffi::getsockopt(
-                        fd,
-                        level,
-                        name,
-                        &mut v as *mut _ as *mut libc::c_void,
-                        &mut sz,
-                    )
+                let mut w_self = args[0];
+                let mut w_level = args[1];
+                let mut w_name = args[2];
+                let mut w_buflen = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = pyre_object::with_roots!(w_self, w_level, w_name, w_buflen => socket_fd(w_self))?;
+                let level = pyre_object::with_roots!(w_self, w_name, w_buflen =>
+                    pyre_interpreter::baseobjspace::c_int_w(w_level)
+                )?;
+                let name = pyre_object::with_roots!(w_self, w_buflen =>
+                    pyre_interpreter::baseobjspace::c_int_w(w_name)
+                )?;
+                // `interp_socket.py getsockopt_w` — `buflen == 0`
+                // (including when omitted) reads an int option; otherwise the
+                // length must be in `1..=1024` and a bytes buffer is returned.
+                let buflen = if args.len() >= 4 {
+                    pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::c_int_w(w_buflen))?
+                        as i64
+                } else {
+                    0
                 };
-                if r != 0 {
-                    return Err(socket_last_error());
+                if buflen == 0 {
+                    // `sock_getsockopt` answers the value `setsockopt` last wrote
+                    // rather than asking WinSock, which has no call that reads an
+                    // ioctl's current setting.
+                    #[cfg(windows)]
+                    if name == SIO_TCP_SET_ACK_FREQUENCY {
+                        return Ok(pyre_object::w_int_new(socket_get_attr_i64(
+                            w_self,
+                            "_quickack",
+                        )));
+                    }
+                    let mut v: libc::c_int = 0;
+                    let mut sz = core::mem::size_of::<libc::c_int>() as rffi::SockLen;
+                    let r = {
+                        rffi::getsockopt(
+                            fd,
+                            level,
+                            name,
+                            &mut v as *mut _ as *mut libc::c_void,
+                            &mut sz,
+                        )
+                    };
+                    if r != 0 {
+                        return Err(socket_last_error());
+                    }
+                    Ok(pyre_object::w_int_new(v as i64))
+                } else {
+                    if !(0..=1024).contains(&buflen) {
+                        return Err(pyre_interpreter::PyError::os_error(
+                            "getsockopt buflen out of range",
+                        ));
+                    }
+                    let buflen = buflen as usize;
+                    let mut buf = vec![0u8; buflen];
+                    let mut sz = buflen as rffi::SockLen;
+                    let r = {
+                        rffi::getsockopt(
+                            fd,
+                            level,
+                            name,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            &mut sz,
+                        )
+                    };
+                    if r != 0 {
+                        return Err(socket_last_error());
+                    }
+                    buf.truncate(sz as usize);
+                    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
                 }
-                Ok(pyre_object::w_int_new(v as i64))
-            } else {
-                if !(0..=1024).contains(&buflen) {
-                    return Err(pyre_interpreter::PyError::os_error("getsockopt buflen out of range"));
-                }
-                let buflen = buflen as usize;
-                let mut buf = vec![0u8; buflen];
-                let mut sz = buflen as rffi::SockLen;
-                let r = {
-                    rffi::getsockopt(
-                        fd,
-                        level,
-                        name,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        &mut sz,
-                    )
-                };
-                if r != 0 {
-                    return Err(socket_last_error());
-                }
-                buf.truncate(sz as usize);
-                Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
-            }
-        }),
-    ) };
+            }),
+        )
+    };
 
     // `sock_ioctl` is published where `SIO_RCVALL` is defined, which is
     // Windows.  It is `WSAIoctl` under a socket method, and the three commands
     // it names are the ones whose input is a value rather than a buffer.
     #[cfg(windows)]
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "ioctl",
-        pyre_interpreter::make_builtin_function("ioctl", |args| {
-            use windows_sys::Win32::Networking::WinSock as ws;
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "ioctl",
+            pyre_interpreter::make_builtin_function("ioctl", |args| {
+                use windows_sys::Win32::Networking::WinSock as ws;
 
-            if args.len() != 3 {
-                return Err(pyre_interpreter::PyError::type_error(format!(
-                    "ioctl() takes exactly 2 arguments ({} given)",
-                    args.len().saturating_sub(1)
-                )));
-            }
-            let fd = socket_fd(args[0])?;
-            let cmd = ioctl_command_w(args[1], "argument 1")?;
-            let returned = match cmd {
-                ws::SIO_RCVALL | ws::SIO_LOOPBACK_FAST_PATH => {
-                    let value = masked_ulong_w(args[2])?;
-                    #[cfg(feature = "host_env")]
-                    {
-                        rustpython_host_env::socket::ioctl_u32(fd as _, cmd, value).ok()
-                    }
-                    #[cfg(not(feature = "host_env"))]
-                    {
-                        let _ = value;
-                        None
-                    }
-                }
-                ws::SIO_KEEPALIVE_VALS => {
-                    let [onoff, keepalivetime, keepaliveinterval] = ioctl_keepalive_w(args[2])?;
-                    #[cfg(feature = "host_env")]
-                    {
-                        rustpython_host_env::socket::ioctl_keepalive(
-                            fd as _,
-                            rustpython_host_env::socket::TcpKeepalive {
-                                onoff,
-                                keepalivetime,
-                                keepaliveinterval,
-                            },
-                        )
-                        .ok()
-                    }
-                    #[cfg(not(feature = "host_env"))]
-                    {
-                        let _ = (onoff, keepalivetime, keepaliveinterval);
-                        None
-                    }
-                }
-                _ => {
-                    return Err(pyre_interpreter::PyError::value_error(format!(
-                        "invalid ioctl command {cmd}"
+                if args.len() != 3 {
+                    return Err(pyre_interpreter::PyError::type_error(format!(
+                        "ioctl() takes exactly 2 arguments ({} given)",
+                        args.len().saturating_sub(1)
                     )));
                 }
-            };
-            match returned {
-                Some(returned) => Ok(pyre_object::w_int_new(i64::from(returned))),
-                None => Err(socket_last_error()),
-            }
-        }),
-    ) };
+                let fd = socket_fd(args[0])?;
+                let cmd = ioctl_command_w(args[1], "argument 1")?;
+                let returned = match cmd {
+                    ws::SIO_RCVALL | ws::SIO_LOOPBACK_FAST_PATH => {
+                        let value = masked_ulong_w(args[2])?;
+                        #[cfg(feature = "host_env")]
+                        {
+                            rustpython_host_env::socket::ioctl_u32(fd as _, cmd, value).ok()
+                        }
+                        #[cfg(not(feature = "host_env"))]
+                        {
+                            let _ = value;
+                            None
+                        }
+                    }
+                    ws::SIO_KEEPALIVE_VALS => {
+                        let [onoff, keepalivetime, keepaliveinterval] = ioctl_keepalive_w(args[2])?;
+                        #[cfg(feature = "host_env")]
+                        {
+                            rustpython_host_env::socket::ioctl_keepalive(
+                                fd as _,
+                                rustpython_host_env::socket::TcpKeepalive {
+                                    onoff,
+                                    keepalivetime,
+                                    keepaliveinterval,
+                                },
+                            )
+                            .ok()
+                        }
+                        #[cfg(not(feature = "host_env"))]
+                        {
+                            let _ = (onoff, keepalivetime, keepaliveinterval);
+                            None
+                        }
+                    }
+                    _ => {
+                        return Err(pyre_interpreter::PyError::value_error(format!(
+                            "invalid ioctl command {cmd}"
+                        )));
+                    }
+                };
+                match returned {
+                    Some(returned) => Ok(pyre_object::w_int_new(i64::from(returned))),
+                    None => Err(socket_last_error()),
+                }
+            }),
+        )
+    };
 
     // `sock_share` sits beside `ioctl`, published on the same Windows-only
     // footing: `WSADuplicateSocketW` writes a `WSAPROTOCOL_INFOW` describing
@@ -6021,246 +6434,272 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // the whole answer.  `socket.py` grows `fromshare` as soon as the method
     // exists, and hands the blob straight back to the constructor.
     #[cfg(all(windows, feature = "host_env"))]
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "share",
-        pyre_interpreter::make_builtin_function("share", |args| {
-            // `METH_O`, so a wrong count is reported by the call machinery
-            // rather than by a converter naming the method.
-            if args.len() != 2 {
-                return Err(pyre_interpreter::PyError::type_error(format!(
-                    "function takes exactly 1 argument ({} given)",
-                    args.len().saturating_sub(1)
-                )));
-            }
-            let fd = socket_fd(args[0])?;
-            let process_id = masked_ulong_w(args[1])?;
-            let info = {
-                let _blocked = pyre_interpreter::module::thread::before_external_block();
-                rustpython_host_env::socket::share_socket(fd, process_id)
-            }
-            .map_err(socket_io_err)?;
-            Ok(pyre_object::w_bytes_from_bytes(&info))
-        }),
-    ) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "share",
+            pyre_interpreter::make_builtin_function("share", |args| {
+                // `METH_O`, so a wrong count is reported by the call machinery
+                // rather than by a converter naming the method.
+                if args.len() != 2 {
+                    return Err(pyre_interpreter::PyError::type_error(format!(
+                        "function takes exactly 1 argument ({} given)",
+                        args.len().saturating_sub(1)
+                    )));
+                }
+                let fd = socket_fd(args[0])?;
+                let process_id = masked_ulong_w(args[1])?;
+                let info = {
+                    let _blocked = pyre_interpreter::module::thread::before_external_block();
+                    rustpython_host_env::socket::share_socket(fd, process_id)
+                }
+                .map_err(socket_io_err)?;
+                Ok(pyre_object::w_bytes_from_bytes(&info))
+            }),
+        )
+    };
 
     // `interp_socket.py setblocking_w` per PyPy docstring: True
     // is equivalent to `settimeout(None)`, False to `settimeout(0.0)`.
     // Routing through `socket_apply_timeout` keeps the SO_*TIMEO state
     // consistent with the timeout attribute and prevents a stale
     // SO_RCVTIMEO from surviving a `setblocking(True)` call.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "setblocking",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "setblocking",
-            |args| {
-                if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error("setblocking() missing argument"));
-                }
-                let mut obj = args[0];
-                let w_flag = args[1];
-                let blocking =
-                    pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::is_true(w_flag))?;
-                let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
-                let timeout = if blocking { -1.0 } else { 0.0 };
-                pyre_object::with_roots!(obj => socket_apply_timeout(fd, timeout))?;
-                let w_timeout = pyre_object::with_roots!(obj => if blocking {
-                    pyre_object::w_none()
-                } else {
-                    pyre_object::floatobject::w_float_new(0.0)
-                });
-                socket_set_attr(obj, "_timeout", w_timeout);
-                Ok(pyre_object::w_none())
-            },
-            2,
-        ),
-    ) };
+            pyre_interpreter::make_builtin_function_with_arity(
+                "setblocking",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "setblocking() missing argument",
+                        ));
+                    }
+                    let mut obj = args[0];
+                    let w_flag = args[1];
+                    let blocking = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::is_true(w_flag))?;
+                    let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
+                    let timeout = if blocking { -1.0 } else { 0.0 };
+                    pyre_object::with_roots!(obj => socket_apply_timeout(fd, timeout))?;
+                    let w_timeout = pyre_object::with_roots!(obj => if blocking {
+                        pyre_object::w_none()
+                    } else {
+                        pyre_object::floatobject::w_float_new(0.0)
+                    });
+                    socket_set_attr(obj, "_timeout", w_timeout);
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        )
+    };
 
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "getblocking",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "getblocking",
-            |args| {
-                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                pyre_object::with_roots!(obj => socket_fd(obj))?;
-                // `sock_getblocking` answers from the stored timeout rather
-                // than from the descriptor: `settimeout` is its only writer,
-                // and WinSock's `FIONBIO` cannot be read back.
-                let d = pyre_interpreter::baseobjspace::getdict_native(obj);
-                let blocking = d.is_null()
-                    || { pyre_object::w_dict_getitem_str(d, "_timeout") }
-                        .filter(|t| { pyre_object::is_float(*t) })
-                        .is_none_or(|t| {
-                            pyre_object::floatobject::w_float_get_value(t) != 0.0
-                        });
-                Ok(pyre_object::w_bool_from(blocking))
-            },
-            1,
-        ),
-    ) };
+            pyre_interpreter::make_builtin_function_with_arity(
+                "getblocking",
+                |args| {
+                    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    pyre_object::with_roots!(obj => socket_fd(obj))?;
+                    // `sock_getblocking` answers from the stored timeout rather
+                    // than from the descriptor: `settimeout` is its only writer,
+                    // and WinSock's `FIONBIO` cannot be read back.
+                    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+                    let blocking =
+                        d.is_null() || { pyre_object::w_dict_getitem_str(d, "_timeout") }
+                            .filter(|t| pyre_object::is_float(*t))
+                            .is_none_or(|t| pyre_object::floatobject::w_float_get_value(t) != 0.0);
+                    Ok(pyre_object::w_bool_from(blocking))
+                },
+                1,
+            ),
+        )
+    };
 
     // `interp_socket.py settimeout_w` then `rsocket.py:RSocket.
     // settimeout`, which ends in `_setblocking(self.timeout < 0.0)`: None →
     // blocking; 0.0 and any positive duration alike → O_NONBLOCK on, the
     // duration being `wait_for_data`'s to enforce rather than the
     // descriptor's; <0 → ValueError "Timeout value out of range".
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "settimeout",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "settimeout",
-            |args| {
-                if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error("settimeout() missing argument"));
-                }
-                let mut obj = args[0];
-                let mut w_t = args[1];
-                let timeout: f64 = if pyre_object::is_none(w_t) {
-                    -1.0
-                } else {
-                    let v = {
-                        if pyre_object::is_float(w_t) {
-                            pyre_object::floatobject::w_float_get_value(w_t)
-                        } else if pyre_object::is_int(w_t) {
-                            pyre_object::w_int_get_value(w_t) as f64
-                        } else {
-                            return Err(pyre_interpreter::PyError::type_error(
-                                "settimeout: timeout must be a float or None",
+            pyre_interpreter::make_builtin_function_with_arity(
+                "settimeout",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "settimeout() missing argument",
+                        ));
+                    }
+                    let mut obj = args[0];
+                    let mut w_t = args[1];
+                    let timeout: f64 = if pyre_object::is_none(w_t) {
+                        -1.0
+                    } else {
+                        let v = {
+                            if pyre_object::is_float(w_t) {
+                                pyre_object::floatobject::w_float_get_value(w_t)
+                            } else if pyre_object::is_int(w_t) {
+                                pyre_object::w_int_get_value(w_t) as f64
+                            } else {
+                                return Err(pyre_interpreter::PyError::type_error(
+                                    "settimeout: timeout must be a float or None",
+                                ));
+                            }
+                        };
+                        if v < 0.0 {
+                            return Err(pyre_interpreter::PyError::value_error(
+                                "Timeout value out of range",
                             ));
                         }
+                        v
                     };
-                    if v < 0.0 {
-                        return Err(pyre_interpreter::PyError::value_error("Timeout value out of range"));
-                    }
-                    v
-                };
-                let fd = pyre_object::with_roots!(obj, w_t => socket_fd(obj))?;
-                socket_apply_timeout(fd, timeout)?;
-                // `gettimeout()` reports a float, and the timeout readers below
-                // recognise only that type; storing the caller's `int` verbatim
-                // would make `settimeout(1)` silently untimed.
-                let stored = if pyre_object::is_none(w_t) {
-                    w_t
-                } else {
-                    pyre_object::floatobject::w_float_new(timeout)
-                };
-                socket_set_attr(obj, "_timeout", stored);
-                Ok(pyre_object::w_none())
-            },
-            2,
-        ),
-    ) };
+                    let fd = pyre_object::with_roots!(obj, w_t => socket_fd(obj))?;
+                    socket_apply_timeout(fd, timeout)?;
+                    // `gettimeout()` reports a float, and the timeout readers below
+                    // recognise only that type; storing the caller's `int` verbatim
+                    // would make `settimeout(1)` silently untimed.
+                    let stored = if pyre_object::is_none(w_t) {
+                        w_t
+                    } else {
+                        pyre_object::floatobject::w_float_new(timeout)
+                    };
+                    socket_set_attr(obj, "_timeout", stored);
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        )
+    };
 
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "gettimeout",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "gettimeout",
-            |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let d = pyre_interpreter::baseobjspace::getdict_native(obj);
-                if d.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                Ok({ pyre_object::w_dict_getitem_str(d, "_timeout") }
-                    .unwrap_or(pyre_object::w_none()))
-            },
-            1,
-        ),
-    ) };
+            pyre_interpreter::make_builtin_function_with_arity(
+                "gettimeout",
+                |args| {
+                    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+                    if d.is_null() {
+                        return Ok(pyre_object::w_none());
+                    }
+                    Ok({ pyre_object::w_dict_getitem_str(d, "_timeout") }
+                        .unwrap_or(pyre_object::w_none()))
+                },
+                1,
+            ),
+        )
+    };
 
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__enter__",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__enter__",
-            |args| Ok(args.first().copied().unwrap_or(pyre_object::w_none())),
-            1,
-        ),
-    ) };
+            pyre_interpreter::make_builtin_function_with_arity(
+                "__enter__",
+                |args| Ok(args.first().copied().unwrap_or(pyre_object::w_none())),
+                1,
+            ),
+        )
+    };
 
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__exit__",
-        pyre_interpreter::make_builtin_function("__exit__", |args| {
-            if let Some(&(mut obj)) = args.first() {
-                let fd = rffi::socket_from_i64(pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")));
-                if !rffi::is_invalid(fd) {
-                    let _ = { rffi::close(fd) };
-                    socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__exit__",
+            pyre_interpreter::make_builtin_function("__exit__", |args| {
+                if let Some(&(mut obj)) = args.first() {
+                    let fd = rffi::socket_from_i64(
+                        pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")),
+                    );
+                    if !rffi::is_invalid(fd) {
+                        let _ = { rffi::close(fd) };
+                        socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                    }
                 }
-            }
-            Ok(pyre_object::w_bool_from(false))
-        }),
-    ) };
+                Ok(pyre_object::w_bool_from(false))
+            }),
+        )
+    };
 
     // __repr__ — `interp_socket.py descr_repr`.  Format
     // matches CPython: `<socket object, fd=N, family=F, type=T, proto=P>`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "__repr__",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__repr__",
-            |args| {
-                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd"));
-                let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family"));
-                let ty = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_type"));
-                let proto = socket_get_attr_i64(obj, "_proto");
-                Ok(pyre_object::w_str_new_managed(&format!(
-                    "<socket object, fd={fd}, family={family}, type={ty}, proto={proto}>"
-                )))
-            },
-            1,
-        ),
-    ) };
+            pyre_interpreter::make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let fd = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd"));
+                    let family =
+                        pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family"));
+                    let ty = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_type"));
+                    let proto = socket_get_attr_i64(obj, "_proto");
+                    Ok(pyre_object::w_str_new_managed(&format!(
+                        "<socket object, fd={fd}, family={family}, type={ty}, proto={proto}>"
+                    )))
+                },
+                1,
+            ),
+        )
+    };
 
     // set_inheritable / get_inheritable — `interp_socket.py` wraps whether
     // an exec'd child keeps the descriptor.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "set_inheritable",
-        pyre_interpreter::make_builtin_function_with_arity(
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "set_inheritable",
-            |args| {
-                if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "set_inheritable() missing argument",
-                    ));
-                }
-                let w_self = args[0];
-                let mut w_inheritable = args[1];
-                let fd = pyre_object::with_roots!(w_inheritable => socket_fd(w_self))?;
-                let want_inheritable = {
-                    if pyre_object::is_bool(w_inheritable) {
-                        pyre_object::boolobject::w_bool_get_value(w_inheritable)
-                    } else if pyre_object::is_int(w_inheritable) {
-                        pyre_object::w_int_get_value(w_inheritable) != 0
-                    } else {
+            pyre_interpreter::make_builtin_function_with_arity(
+                "set_inheritable",
+                |args| {
+                    if args.len() < 2 {
                         return Err(pyre_interpreter::PyError::type_error(
-                            "set_inheritable: value must be bool",
+                            "set_inheritable() missing argument",
                         ));
                     }
-                };
-                rffi::set_inheritable(fd, want_inheritable).map_err(socket_io_err)?;
-                Ok(pyre_object::w_none())
-            },
-            2,
-        ),
-    ) };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-        ns,
-        "get_inheritable",
-        pyre_interpreter::make_builtin_function_with_arity(
+                    let w_self = args[0];
+                    let mut w_inheritable = args[1];
+                    let fd = pyre_object::with_roots!(w_inheritable => socket_fd(w_self))?;
+                    let want_inheritable = {
+                        if pyre_object::is_bool(w_inheritable) {
+                            pyre_object::boolobject::w_bool_get_value(w_inheritable)
+                        } else if pyre_object::is_int(w_inheritable) {
+                            pyre_object::w_int_get_value(w_inheritable) != 0
+                        } else {
+                            return Err(pyre_interpreter::PyError::type_error(
+                                "set_inheritable: value must be bool",
+                            ));
+                        }
+                    };
+                    rffi::set_inheritable(fd, want_inheritable).map_err(socket_io_err)?;
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "get_inheritable",
-            |args| {
-                let fd = socket_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
-                let inheritable = rffi::get_inheritable(fd).map_err(socket_io_err)?;
-                Ok(pyre_object::w_bool_from(inheritable))
-            },
-            1,
-        ),
-    ) };
+            pyre_interpreter::make_builtin_function_with_arity(
+                "get_inheritable",
+                |args| {
+                    let fd = socket_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
+                    let inheritable = rffi::get_inheritable(fd).map_err(socket_io_err)?;
+                    Ok(pyre_object::w_bool_from(inheritable))
+                },
+                1,
+            ),
+        )
+    };
 }

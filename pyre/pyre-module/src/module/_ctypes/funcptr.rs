@@ -201,7 +201,14 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
         // `(name, dll)`, with paramflags allowed after it.
         Some(a) if unsafe { pyre_object::is_tuple(a) } => {
             paramflags = pos.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            resolve_from_tuple(a)?
+            // `resolve_from_tuple` allocates.  The callback word, the
+            // paramflags word, and the tuple itself are pinned together
+            // before that, then read back.
+            let keep = pyre_object::gc_roots::pin_roots(&[callback, paramflags, a]);
+            let addr = resolve_from_tuple(pyre_object::gc_roots::shadow_stack_get(keep + 2))?;
+            callback = pyre_object::gc_roots::shadow_stack_get(keep);
+            paramflags = pyre_object::gc_roots::shadow_stack_get(keep + 1);
+            addr
         }
         // `index, name` — a COM method, with paramflags and then the interface
         // id allowed after it.  It has no address: the vtable of whatever
@@ -233,10 +240,15 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
             0
         }
     };
+    // Every arm above writes `callback` and `paramflags`, so the pin has to
+    // follow the match: an earlier pin is killed by those assignments.
+    let keep = pyre_object::gc_roots::pin_roots(&[callback, paramflags]);
+    let argtypes = type_argtypes(pyre_object::gc_roots::shadow_stack_get(cls_slot));
     let paramflags = validate_paramflags(
-        paramflags,
-        type_argtypes(pyre_object::gc_roots::shadow_stack_get(cls_slot)).as_deref(),
+        pyre_object::gc_roots::shadow_stack_get(keep + 1),
+        argtypes.as_deref(),
     )?;
+    let callback = pyre_object::gc_roots::shadow_stack_get(keep);
     let callback_slot = if callback.is_null() {
         None
     } else {
@@ -703,7 +715,7 @@ fn argtypes_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter
 }
 
 fn argtypes_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let mut value = args[2];
+    let value = args[2];
     // `_argtypes_` must be a sequence of types; a bare type (`fn.argtypes =
     // c_int`) or other non-sequence is rejected rather than silently ignored.
     if !unsafe { pyre_object::is_none(value) } && seq_to_vec(value).is_none() {
@@ -712,13 +724,27 @@ fn argtypes_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter
         ));
     }
     // Paramflags describe the argtypes one for one, so replacing the argtypes
-    // has to leave that description true.
-    if let Some(paramflags) =
-        pyre_object::with_roots!(value => instance_get(args[1], PARAMFLAGS_KEY))
-    {
-        pyre_object::with_roots!(value => validate_paramflags(paramflags, argtypes_seq(value).as_deref()))?;
+    // has to leave that description true.  The whole argument slice is pinned
+    // first: both lookups allocate, and the receiver and the new value are
+    // read back from its slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    if let Some(paramflags) = instance_get(
+        pyre_object::gc_roots::shadow_stack_get(args_base + 1),
+        PARAMFLAGS_KEY,
+    ) {
+        let flags_slot = pyre_object::gc_roots::pin_roots(&[paramflags]);
+        let seq = argtypes_seq(pyre_object::gc_roots::shadow_stack_get(args_base + 2));
+        validate_paramflags(
+            pyre_object::gc_roots::shadow_stack_get(flags_slot),
+            seq.as_deref(),
+        )?;
     }
-    instance_set(args[1], ARGTYPES_KEY, value);
+    instance_set(
+        pyre_object::gc_roots::shadow_stack_get(args_base + 1),
+        ARGTYPES_KEY,
+        pyre_object::gc_roots::shadow_stack_get(args_base + 2),
+    );
     Ok(pyre_object::w_none())
 }
 
@@ -842,27 +868,29 @@ fn resolve_checker(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// `None` here; anything else replaces the result outright, `out` parameters
 /// included.
 fn apply_errcheck(
-    mut self_obj: PyObjectRef,
-    mut result: PyObjectRef,
+    self_obj: PyObjectRef,
+    result: PyObjectRef,
     inargs: &[PyObjectRef],
 ) -> Result<Option<PyObjectRef>, pyre_interpreter::PyError> {
-    let Some(errcheck) =
-        pyre_object::with_roots!(self_obj, result => instance_get(self_obj, ERRCHECK_KEY))
+    // The receiver, the result, and every positional argument are published
+    // before the first lookup.  Sequential pins would let that lookup move
+    // the arguments before they were on the root stack.
+    let n_inargs = inargs.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::publish_roots(&[self_obj, result]);
+    let inargs_base = pyre_object::gc_roots::publish_roots(inargs);
+    pyre_object::gc_roots::normalize_roots(base, 2 + n_inargs);
+    let Some(errcheck) = instance_get(pyre_object::gc_roots::shadow_stack_get(base), ERRCHECK_KEY)
     else {
         return Ok(None);
     };
-    // Building the argument tuple allocates, so the three values the call still
-    // needs are read back out of root slots afterwards.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    for value in [self_obj, result, errcheck] {
-        let _ = pyre_object::gc_roots::pin_root(value);
-    }
-    let arguments = pyre_object::w_tuple_new(inargs.to_vec());
-    let arguments_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(arguments);
+    let errcheck_slot = pyre_object::gc_roots::pin_roots(&[errcheck]);
+    let mut inargs_now = vec![pyre_object::PY_NULL; n_inargs];
+    pyre_object::gc_roots::shadow_stack_copy_range(inargs_base, &mut inargs_now);
+    let arguments = pyre_object::w_tuple_new(inargs_now);
+    let arguments_slot = pyre_object::gc_roots::pin_roots(&[arguments]);
     let value = pyre_interpreter::call::call_function_impl_result(
-        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        pyre_object::gc_roots::shadow_stack_get(errcheck_slot),
         &[
             pyre_object::gc_roots::shadow_stack_get(base + 1),
             pyre_object::gc_roots::shadow_stack_get(base),
@@ -1174,27 +1202,44 @@ pub(super) fn callback_result(
 }
 
 fn call_python_callback(
-    mut obj: PyObjectRef,
+    obj: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let mut callable = pyre_object::with_roots!(obj => instance_get(obj, CALLABLE_KEY))
-        .ok_or_else(|| pyre_interpreter::PyError::type_error("callback has no callable"))?;
+    // The callable and the argument slice both have to be on the root stack
+    // before the first lookup.  Each argument is read from its slot at the
+    // conversion that consumes it, because that conversion can allocate.
+    let n_args = args.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::publish_roots(&[obj]);
+    let args_base = pyre_object::gc_roots::publish_roots(args);
+    pyre_object::gc_roots::normalize_roots(obj_slot, 1 + n_args);
+    let callable = instance_get(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        CALLABLE_KEY,
+    )
+    .ok_or_else(|| pyre_interpreter::PyError::type_error("callback has no callable"))?;
+    let callable_slot = pyre_object::gc_roots::pin_roots(&[callable]);
     let argtypes =
-        pyre_object::with_roots!(callable, obj => resolve_argtypes(obj)).unwrap_or_default();
-    if args.len() != argtypes.len() {
+        resolve_argtypes(pyre_object::gc_roots::shadow_stack_get(obj_slot)).unwrap_or_default();
+    if n_args != argtypes.len() {
         return Err(pyre_interpreter::PyError::type_error(format!(
             "this function takes {} arguments ({} given)",
             argtypes.len(),
-            args.len(),
+            n_args,
         )));
     }
     let converted = argtypes
         .into_iter()
-        .zip(args.iter().copied())
-        .map(|(ty, value)| callback_argument(ty, value))
+        .enumerate()
+        .map(|(i, ty)| {
+            callback_argument(ty, pyre_object::gc_roots::shadow_stack_get(args_base + i))
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    let result = pyre_object::with_roots!(obj => pyre_interpreter::call::call_function_impl_result(callable, &converted));
-    callback_result(obj, result)
+    let result = pyre_interpreter::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        &converted,
+    );
+    callback_result(pyre_object::gc_roots::shadow_stack_get(obj_slot), result)
 }
 
 /// `_CFuncPtr.__call__(self, *args)`.
@@ -1204,36 +1249,64 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
             "__call__ requires self",
         ));
     }
-    let mut self_obj = args[0];
     // A keyword argument only ever names a paramflag, and one that names
     // nothing is not an error — it simply goes unread.
     let (inargs, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
-    let settled_already = pyre_object::with_roots!(self_obj => settled(self_obj));
+    // self, the positional arguments, and the keyword dict are published
+    // before the first allocating call.  Later steps read those slots; the
+    // originals are not.
+    let n_inargs = inargs.len();
+    let has_kwargs = kwargs.is_some();
+    let kwargs_word = kwargs.unwrap_or(pyre_object::PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::publish_roots(&[args[0]]);
+    let inargs_base = pyre_object::gc_roots::publish_roots(inargs);
+    let kwargs_slot = pyre_object::gc_roots::publish_roots(&[kwargs_word]);
+    pyre_object::gc_roots::normalize_roots(self_slot, 1 + n_inargs + 1);
+    let reload_inargs = || -> Vec<PyObjectRef> {
+        let mut reloaded = vec![pyre_object::PY_NULL; n_inargs];
+        pyre_object::gc_roots::shadow_stack_copy_range(inargs_base, &mut reloaded);
+        reloaded
+    };
+    let settled_already = settled(pyre_object::gc_roots::shadow_stack_get(self_slot));
     // A plan that turns out not to describe this call after all leaves the
     // general path to derive it again and record what it finds.
     let mut settled_stands = settled_already.is_some();
     if let Some(Settled::Plan(plan)) = settled_already {
-        match pyre_object::with_roots!(self_obj => call_settled(self_obj, &plan, inargs))? {
+        match call_settled(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            &plan,
+            &reload_inargs(),
+        )? {
             Some(value) => return Ok(value),
             None => settled_stands = false,
         }
     }
-    let addr = pyre_object::with_roots!(self_obj => funcptr_addr(self_obj));
+    let addr = funcptr_addr(pyre_object::gc_roots::shadow_stack_get(self_slot));
     if addr == 0
-        && pyre_object::with_roots!(self_obj => instance_get(self_obj, CALLABLE_KEY)).is_some()
+        && instance_get(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            CALLABLE_KEY,
+        )
+        .is_some()
     {
-        return call_python_callback(self_obj, inargs);
+        return call_python_callback(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            &reload_inargs(),
+        );
     }
     match addr {
-        INTERNAL_CAST_ADDR => return internal_cast(inargs),
-        INTERNAL_STRING_AT_ADDR => return internal_string_at(inargs),
-        INTERNAL_WSTRING_AT_ADDR => return internal_wstring_at(inargs),
-        INTERNAL_MEMORYVIEW_AT_ADDR => return internal_memoryview_at(inargs),
-        INTERNAL_PYBYTES_FROMSTRINGANDSIZE => return internal_pybytes_fromstringandsize(inargs),
-        INTERNAL_PYOS_SNPRINTF => return internal_pyos_snprintf(inargs),
+        INTERNAL_CAST_ADDR => return internal_cast(&reload_inargs()),
+        INTERNAL_STRING_AT_ADDR => return internal_string_at(&reload_inargs()),
+        INTERNAL_WSTRING_AT_ADDR => return internal_wstring_at(&reload_inargs()),
+        INTERNAL_MEMORYVIEW_AT_ADDR => return internal_memoryview_at(&reload_inargs()),
+        INTERNAL_PYBYTES_FROMSTRINGANDSIZE => {
+            return internal_pybytes_fromstringandsize(&reload_inargs());
+        }
+        INTERNAL_PYOS_SNPRINTF => return internal_pyos_snprintf(&reload_inargs()),
         #[cfg(windows)]
         INTERNAL_PYERR_SETFROMWINDOWSERR => {
-            return internal_pyerr_setfromwindowserr(inargs);
+            return internal_pyerr_setfromwindowserr(&reload_inargs());
         }
         _ => {}
     }
@@ -1242,22 +1315,39 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
     // the first argument is what its vtable is read out of, and that pointer
     // then leads the call.
     #[cfg(windows)]
-    let com = match com_index(self_obj) {
-        Some(index) => Some(super::com::call_target(index, inargs)?),
+    let com = match com_index(pyre_object::gc_roots::shadow_stack_get(self_slot)) {
+        Some(index) => Some(super::com::call_target(index, &reload_inargs())?),
         None => None,
     };
     #[cfg(not(windows))]
     let com: Option<(usize, usize)> = None;
 
-    let argtypes = pyre_object::with_roots!(self_obj => resolve_argtypes(self_obj));
-    let paramflags = pyre_object::with_roots!(self_obj => instance_get(self_obj, PARAMFLAGS_KEY));
-    let callargs = pyre_object::with_roots!(self_obj => build_callargs(self_obj, argtypes.as_deref(), inargs, kwargs, com.is_some()))?;
-    let call_args = callargs.args.as_slice();
+    let argtypes = resolve_argtypes(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    let paramflags = instance_get(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        PARAMFLAGS_KEY,
+    );
+    let has_paramflags = paramflags.is_some();
+    let paramflags_word = paramflags.unwrap_or(pyre_object::PY_NULL);
+    let _paramflags_slot = pyre_object::gc_roots::pin_roots(&[paramflags_word]);
+    let kwargs_now = has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
+    let mut callargs = build_callargs(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        argtypes.as_deref(),
+        &reload_inargs(),
+        kwargs_now,
+        com.is_some(),
+    )?;
+    let n_call_args = callargs.args.len();
+    let call_args_base = {
+        let call_args = callargs.args.as_slice();
+        pyre_object::gc_roots::pin_roots(call_args)
+    };
 
     // Marshal arguments into owned scalar data.  `keepalive` owns any
     // null-terminated `bytes` copies that pointer args address; `owned` owns
     // the typed buffers.  Both must outlive the borrowed `SimpleArg`s below.
-    let mut owned: Vec<OwnedArg> = Vec::with_capacity(call_args.len() + 1);
+    let mut owned: Vec<OwnedArg> = Vec::with_capacity(n_call_args + 1);
     let mut keepalive: Vec<Vec<u8>> = Vec::new();
     if let Some((this_ptr, _)) = com {
         owned.push(OwnedArg::Pointer(this_ptr));
@@ -1269,75 +1359,109 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
     match &argtypes {
         Some(argtypes) => {
             for (i, &at) in argtypes.iter().enumerate() {
-                let arg = *call_args.get(i).ok_or_else(|| {
-                    pyre_interpreter::PyError::type_error(format!(
+                if i >= n_call_args {
+                    return Err(pyre_interpreter::PyError::type_error(format!(
                         "this function takes at least {} argument(s)",
                         argtypes.len()
-                    ))
-                })?;
+                    )));
+                }
                 let kind = classify_argtype(at).ok_or_else(|| {
                     pyre_interpreter::PyError::type_error("argtype has no valid '_type_'")
                 })?;
                 kinds.push(kind);
-                owned.push(pyre_object::with_roots!(self_obj => marshal_typed_arg(arg, at, kind, &mut keepalive))?);
+                owned.push(marshal_typed_arg(
+                    pyre_object::gc_roots::shadow_stack_get(call_args_base + i),
+                    at,
+                    kind,
+                    &mut keepalive,
+                )?);
             }
             // Variadic tail (printf-style): arguments past the declared
             // argtypes are marshalled by the default conversion rules.
-            for &arg in &call_args[argtypes.len().min(call_args.len())..] {
-                owned.push(
-                    pyre_object::with_roots!(self_obj => marshal_default_arg(arg, &mut keepalive))?,
-                );
+            for i in argtypes.len().min(n_call_args)..n_call_args {
+                owned.push(marshal_default_arg(
+                    pyre_object::gc_roots::shadow_stack_get(call_args_base + i),
+                    &mut keepalive,
+                )?);
             }
         }
         None => {
-            for &arg in call_args {
-                owned.push(
-                    pyre_object::with_roots!(self_obj => marshal_default_arg(arg, &mut keepalive))?,
-                );
+            for i in 0..n_call_args {
+                owned.push(marshal_default_arg(
+                    pyre_object::gc_roots::shadow_stack_get(call_args_base + i),
+                    &mut keepalive,
+                )?);
             }
         }
     }
 
-    let ret = pyre_object::with_roots!(self_obj => resolve_restype(self_obj))?;
-    let flags = funcptr_flags(self_obj);
-    let result =
-        pyre_object::with_roots!(self_obj => invoke(call_address(addr, com), &owned, ret, flags))?;
+    let ret = resolve_restype(pyre_object::gc_roots::shadow_stack_get(self_slot))?;
+    let flags = funcptr_flags(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    let result = invoke(call_address(addr, com), &owned, ret, flags)?;
     // `owned` / `keepalive` must outlive the call above.
     drop(keepalive);
     // A COM method constructed with an interface id answers the plain status,
     // and asks the callee what went wrong when that status is a failure; the
     // restype never gets a look in.
-    let checker = pyre_object::with_roots!(self_obj => resolve_checker(self_obj));
-    let mut value = match com_status(self_obj, com, &result) {
+    let checker = resolve_checker(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    let has_checker = checker.is_some();
+    let checker_word = checker.unwrap_or(pyre_object::PY_NULL);
+    let checker_slot = pyre_object::gc_roots::pin_roots(&[checker_word]);
+    let value = match com_status(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        com,
+        &result,
+    ) {
         Some(status) => status?,
         None => {
-            let value = pyre_object::with_roots!(self_obj => build_return_value(ret, result))?;
-            match checker {
-                Some(checker) => {
-                    pyre_object::with_roots!(self_obj => pyre_interpreter::call::call_function_impl_result(checker, &[value]))?
-                }
-                None => value,
+            let value = build_return_value(ret, result)?;
+            if has_checker {
+                pyre_interpreter::call::call_function_impl_result(
+                    pyre_object::gc_roots::shadow_stack_get(checker_slot),
+                    &[value],
+                )?
+            } else {
+                value
             }
         }
     };
-    let errcheck =
-        pyre_object::with_roots!(self_obj, value => instance_get(self_obj, ERRCHECK_KEY));
-    let mut value = match pyre_object::with_roots!(self_obj, value => apply_errcheck(self_obj, value, call_args))?
-    {
+    let value_slot = pyre_object::gc_roots::pin_roots(&[value]);
+    let errcheck = instance_get(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        ERRCHECK_KEY,
+    );
+    let has_errcheck = errcheck.is_some();
+    let errcheck_word = errcheck.unwrap_or(pyre_object::PY_NULL);
+    let _errcheck_slot = pyre_object::gc_roots::pin_roots(&[errcheck_word]);
+    let mut call_args_now = vec![pyre_object::PY_NULL; n_call_args];
+    pyre_object::gc_roots::shadow_stack_copy_range(call_args_base, &mut call_args_now);
+    let applied = apply_errcheck(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        pyre_object::gc_roots::shadow_stack_get(value_slot),
+        &call_args_now,
+    )?;
+    pyre_object::gc_roots::shadow_stack_copy_range(call_args_base, &mut call_args_now);
+    callargs.args = call_args_now;
+    let mut value = match applied {
         Some(forced) => forced,
-        None => pyre_object::with_roots!(self_obj => build_result(value, &callargs))?,
+        None => build_result(
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+            &callargs,
+        )?,
     };
     if !settled_stands {
-        pyre_object::with_roots!(value => store_settled(
-            self_obj,
+        let value_out = pyre_object::gc_roots::pin_roots(&[value]);
+        store_settled(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
             plan_of_call(
                 addr,
                 flags,
                 ret,
                 &kinds,
-                com.is_some() || checker.is_some() || errcheck.is_some() || paramflags.is_some(),
+                com.is_some() || has_checker || has_errcheck || has_paramflags,
             ),
-        ));
+        );
+        value = pyre_object::gc_roots::shadow_stack_get(value_out);
     }
     Ok(value)
 }
@@ -1580,29 +1704,39 @@ fn build_callargs(
         inoutmask: 0,
         numretvals: 0,
     };
+    // Publish the receiver, the keyword dict, and the positional arguments
+    // before the paramflags lookup.  A pin of only the dict would let that
+    // lookup move the arguments.
+    let n_passed = passed.len();
+    let has_kwargs = kwargs.is_some();
+    let kwargs_word = kwargs.unwrap_or(pyre_object::PY_NULL);
     let roots = pyre_object::gc_roots::push_roots();
-    let kwargs_slot = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-    let paramflags = instance_get(self_obj, PARAMFLAGS_KEY);
-    let w = roots.get(kwargs_slot);
-    let kwargs = if w.is_null() { None } else { Some(w) };
-    drop(roots);
+    let self_slot = roots.publish(&[self_obj]);
+    let kwargs_slot = roots.publish(&[kwargs_word]);
+    let passed_base = roots.publish(passed);
+    roots.normalize(self_slot, 2 + n_passed);
+    let passed_now = || -> Vec<PyObjectRef> {
+        let mut reloaded = vec![pyre_object::PY_NULL; n_passed];
+        pyre_object::gc_roots::shadow_stack_copy_range(passed_base, &mut reloaded);
+        reloaded
+    };
+    let kwargs_now = || has_kwargs.then(|| roots.get(kwargs_slot));
+    let paramflags = instance_get(roots.get(self_slot), PARAMFLAGS_KEY);
     let (Some(paramflags), Some(argtypes)) = (paramflags, argtypes) else {
-        return Ok(plain(passed.to_vec()));
+        return Ok(plain(passed_now()));
     };
     if argtypes.is_empty() || !unsafe { pyre_object::is_tuple(paramflags) } {
-        return Ok(plain(passed.to_vec()));
+        return Ok(plain(passed_now()));
     }
     let mut out = plain(Vec::with_capacity(argtypes.len()));
     // `out_parameter` instantiates the argtype, which is arbitrary Python, so
     // every value already collected lives in a root slot across it; the list
     // is read back out of those slots once the loop is done.
-    let _roots = pyre_object::gc_roots::push_roots();
     // `paramflags` is the tuple the loop indexes on every turn, and the same
     // arbitrary Python runs between two of those reads.  A tuple relocates, so
     // it is pinned ahead of `base` -- the values below want a contiguous run
     // starting there -- and read back at each index.
-    let paramflags_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(paramflags);
+    let paramflags_slot = roots.pin_roots(&[paramflags]);
     let base = pyre_object::gc_roots::shadow_stack_len();
     let mut index = 0;
     for (i, &at) in argtypes.iter().enumerate() {
@@ -1654,7 +1788,13 @@ fn build_callargs(
                     out.inoutmask |= param_bit(i);
                     out.numretvals += 1;
                 }
-                get_arg(&mut index, name.as_deref(), defval, passed, kwargs)?
+                get_arg(
+                    &mut index,
+                    name.as_deref(),
+                    defval,
+                    &passed_now(),
+                    kwargs_now(),
+                )?
             }
         };
         let value = pyre_object::gc_roots::pin_root(value);
@@ -1855,7 +1995,7 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
             "cast() argument 2 must be a pointer type",
         ));
     }
-    let mut target = args[2];
+    let target = args[2];
     // `_ctypes.c cast_check_pointertype`: a pointer type, a function-pointer
     // type, or a simple type whose code is one of the pointer-shaped ones.
     let is_pointer = stginfo::stginfo_of(target)
@@ -1868,26 +2008,49 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
             "cast() argument 2 must be a pointer type",
         ));
     }
-    let address = pyre_object::with_roots!(target => argument_address(args[0]))?;
-    let mut result = pyre_object::with_roots!(target => pyre_interpreter::call::type_call_instantiate(target, &[]))?;
-    if is_funcptr_type(target) {
+    // The address read and the instance allocation both move.  The whole
+    // argument slice is pinned once; the source, the type, and the kept
+    // object are read from those slots afterwards.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let address = argument_address(pyre_object::gc_roots::shadow_stack_get(args_base))?;
+    let result = pyre_interpreter::call::type_call_instantiate(
+        pyre_object::gc_roots::shadow_stack_get(args_base + 2),
+        &[],
+    )?;
+    let result_slot = pyre_object::gc_roots::pin_roots(&[result]);
+    if is_funcptr_type(pyre_object::gc_roots::shadow_stack_get(args_base + 2)) {
         // A foreign function keeps its address beside the buffer, and that is
         // the copy a call reads.
-        pyre_object::with_roots!(result => store_funcptr_addr(result, address))?;
+        store_funcptr_addr(
+            pyre_object::gc_roots::shadow_stack_get(result_slot),
+            address,
+        )?;
     } else {
         let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
             "P",
             host_ctypes::SimpleStorageValue::Pointer(address),
             false,
         );
-        pyre_object::with_roots!(result => cdata::cdata_write(result, 0, &bytes));
+        cdata::cdata_write(
+            pyre_object::gc_roots::shadow_stack_get(result_slot),
+            0,
+            &bytes,
+        );
     }
-    if cdata::is_cdata_instance(args[1]) {
-        pyre_object::with_roots!(result => cdata::share_objects_for_cast(result, args[1]));
+    if cdata::is_cdata_instance(pyre_object::gc_roots::shadow_stack_get(args_base + 1)) {
+        cdata::share_objects_for_cast(
+            pyre_object::gc_roots::shadow_stack_get(result_slot),
+            pyre_object::gc_roots::shadow_stack_get(args_base + 1),
+        );
     } else {
-        pyre_object::with_roots!(result => cdata::keep_ref(result, "1", args[1]));
+        cdata::keep_ref(
+            pyre_object::gc_roots::shadow_stack_get(result_slot),
+            "1",
+            pyre_object::gc_roots::shadow_stack_get(args_base + 1),
+        );
     }
-    Ok(result)
+    Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
 }
 
 /// What a `string_at`/`wstring_at` read that `host_env` refuses to attempt

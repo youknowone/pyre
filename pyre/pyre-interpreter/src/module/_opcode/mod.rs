@@ -66,18 +66,21 @@ fn stack_effect(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
         .first()
         .copied()
         .ok_or_else(|| pyre_interpreter::PyError::type_error("stack_effect() missing opcode"))?;
+    let npos = positional.len();
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let pos_base = roots.pin_roots(positional);
     let raw = pyre_interpreter::baseobjspace::int_w(raw);
     let w = roots.get(base);
     kwargs = if w.is_null() { None } else { Some(w) };
+    let positional_1 = (npos > 1).then(|| roots.get(pos_base + 1));
     drop(roots);
     let raw = raw?;
     let opcode = try_opcode(raw)
         .filter(|op| op.real().is_none_or(|real| real.deopt().is_none()))
         .ok_or_else(|| pyre_interpreter::PyError::value_error("invalid opcode or oparg"))?;
 
-    let oparg = match positional.get(1).copied() {
+    let oparg = match positional_1 {
         Some(value) if unsafe { !is_none(value) } => {
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);

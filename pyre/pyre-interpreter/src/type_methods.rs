@@ -2280,15 +2280,18 @@ fn format_render(
     // address. Publish the run and both keyword sources here and read each one
     // back at its use; the absent source takes a slot too, so the two indices
     // stay fixed whichever spelling the caller used.
+    let npositional = positional.len();
+    let has_kwargs = kwargs_dict.is_some();
+    let has_mapping = mapping.is_some();
     let _roots = pyre_object::gc_roots::push_roots();
     let positional_base = pyre_object::gc_roots::publish_roots(positional);
     let kwargs_slot =
         pyre_object::gc_roots::publish_roots(&[kwargs_dict.unwrap_or(pyre_object::PY_NULL)]);
     let mapping_slot =
         pyre_object::gc_roots::publish_roots(&[mapping.unwrap_or(pyre_object::PY_NULL)]);
-    pyre_object::gc_roots::normalize_roots(positional_base, positional.len() + 2);
+    pyre_object::gc_roots::normalize_roots(positional_base, npositional + 2);
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
-        if mapping.is_some() {
+        if has_mapping {
             // `newformat.format_method(... w_mapping, True)` resolves
             // `{name}` via `space.getitem(mapping, w_key)` per
             // `newformat.py:Template.get_value`; KeyError propagates
@@ -2304,7 +2307,7 @@ fn format_render(
             )
             .map(Some);
         }
-        if kwargs_dict.is_some() {
+        if has_kwargs {
             let dict = pyre_object::gc_roots::shadow_stack_get(kwargs_slot);
             let v = unsafe { pyre_object::w_dict_getitem_str(dict, name) };
             return Ok(v);
@@ -2355,7 +2358,7 @@ fn format_render(
         }
         let FieldName { field_type, .. } =
             FieldName::parse(&head).map_err(|e| format_parse_err(e, fmt))?;
-        if mapping.is_some() && matches!(field_type, FieldType::Auto | FieldType::Index(_)) {
+        if has_mapping && matches!(field_type, FieldType::Auto | FieldType::Index(_)) {
             return Err(crate::PyError::value_error(
                 "Format string contains positional fields",
             ));
@@ -2371,7 +2374,7 @@ fn format_render(
                 *numbering = Some(true);
                 let idx = *auto_idx;
                 *auto_idx += 1;
-                index_positional(positional_base, positional.len(), idx)?
+                index_positional(positional_base, npositional, idx)?
             }
             FieldType::Index(idx) => {
                 if let Some(true) = *numbering {
@@ -2381,7 +2384,7 @@ fn format_render(
                     ));
                 }
                 *numbering = Some(false);
-                index_positional(positional_base, positional.len(), idx)?
+                index_positional(positional_base, npositional, idx)?
             }
             FieldType::Keyword(name) => {
                 let name_str = name.as_str().unwrap_or("");
@@ -2464,13 +2467,13 @@ fn format_render(
             let inner = pyre_object::gc_roots::push_roots();
             let val_slot = inner.base();
             let _ = inner.pin_root(val);
-            let reloaded: Vec<PyObjectRef> = (0..positional.len())
+            let reloaded: Vec<PyObjectRef> = (0..npositional)
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
                 .collect();
             let kwargs_now =
-                kwargs_dict.map(|_| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
+                has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
             let mapping_now =
-                mapping.map(|_| pyre_object::gc_roots::shadow_stack_get(mapping_slot));
+                has_mapping.then(|| pyre_object::gc_roots::shadow_stack_get(mapping_slot));
             let spec = format_render(
                 format_spec,
                 &reloaded,
@@ -4610,7 +4613,11 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         };
     let w_encoding = if npos > 1 { Some(reload(1)) } else { None };
     let w_errors = if npos > 2 { Some(reload(2)) } else { None };
-    let encoding = str_arg(dual("encoding", w_encoding)?, "utf-8")?;
+    let has_w_errors = w_errors.is_some();
+    let w_errors_slot = _roots.pin_roots(&[w_errors.unwrap_or(pyre_object::PY_NULL)]);
+    let encoding_arg = dual("encoding", w_encoding)?;
+    let encoding = str_arg(encoding_arg, "utf-8")?;
+    let w_errors = has_w_errors.then(|| _roots.get(w_errors_slot));
     let errors = str_arg(dual("errors", w_errors)?, "strict")?;
     Ok(pyre_object::w_bytes_from_bytes(&encode_object(
         reload(0),
@@ -7075,13 +7082,16 @@ pub fn dict_init_or_update(
     // object whose `arguments_w` entries are roots in translated RPython.
     // Keep the flat Rust ABI's equivalent slots live before inspecting the
     // trailing kwargs vehicle or passing an operand to `update1`.
+    let nargs = args.len();
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::pin_roots(args);
-    let rooted_args = (0..args.len())
+    let rooted_args = (0..nargs)
         .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + i))
         .collect::<Vec<_>>();
     require_receiver(&rooted_args, "update")?;
     let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(&rooted_args);
+    let has_kwargs = kwargs_dict.is_some();
+    let kwargs_slot = _roots.pin_roots(&[kwargs_dict.unwrap_or(pyre_object::PY_NULL)]);
     if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "{name} expected at most 1 argument, got {}",
@@ -7104,8 +7114,8 @@ pub fn dict_init_or_update(
     }
     let backing_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(backing);
-    if kwargs_dict.is_some() {
-        let kwargs = pyre_object::gc_roots::shadow_stack_get(root_base + args.len() - 1);
+    if has_kwargs {
+        let kwargs = _roots.get(kwargs_slot);
         unsafe {
             // Every pair stays rooted while an earlier store runs a key's
             // `__hash__` / `__eq__`.

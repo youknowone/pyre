@@ -3446,9 +3446,12 @@ fn save_reduce(
                 pyre_object::gc_roots::shadow_stack_get(slot),
                 "__class__",
             )?;
-            if !pyre_interpreter::baseobjspace::is_w(args_get(0), w_class) {
-                let _ = pyre_object::gc_roots::pin_root(w_class);
-                let class_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let _ = pyre_object::gc_roots::pin_root(w_class);
+            let class_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            if !pyre_interpreter::baseobjspace::is_w(
+                args_get(0),
+                pyre_object::gc_roots::shadow_stack_get(class_slot),
+            ) {
                 let cls_repr = unsafe { pyre_interpreter::display::py_repr_wtf8(args_get(0))? };
                 let obj_class_repr = unsafe {
                     pyre_interpreter::display::py_repr_wtf8(
@@ -3576,9 +3579,12 @@ fn save_reduce(
                 pyre_object::gc_roots::shadow_stack_get(slot),
                 "__class__",
             )?;
-            if !pyre_interpreter::baseobjspace::is_w(args_get(0), w_class) {
-                let _ = pyre_object::gc_roots::pin_root(w_class);
-                let class_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let _ = pyre_object::gc_roots::pin_root(w_class);
+            let class_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            if !pyre_interpreter::baseobjspace::is_w(
+                args_get(0),
+                pyre_object::gc_roots::shadow_stack_get(class_slot),
+            ) {
                 let cls_repr = unsafe { pyre_interpreter::display::py_repr_wtf8(args_get(0))? };
                 let obj_class_repr = unsafe {
                     pyre_interpreter::display::py_repr_wtf8(

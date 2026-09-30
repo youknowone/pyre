@@ -11,10 +11,10 @@
 // POSIX, the file handle on Windows — so close()/GC release exactly that
 // object's native resources.
 
-#[cfg(windows)]
-use rustpython_host_env::mmap as host_mmap;
 #[cfg(unix)]
 use majit_rlib::rmmap;
+#[cfg(windows)]
+use rustpython_host_env::mmap as host_mmap;
 
 /// POSIX mapping from `c_mmap`. `Drop` calls `c_munmap_safe` (`__del__`).
 #[cfg(unix)]
@@ -1141,17 +1141,23 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     let mut obj = args[0];
-                    let access = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_access"));
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = roots.pin_roots(&[obj]);
+                    let args_base = roots.pin_roots(args);
+                    let access = mmap_get_attr_i64(roots.get(obj_slot), "_access");
                     if access == MMAP_ACCESS_READ {
                         return Err(pyre_interpreter::PyError::type_error("mmap is read-only"));
                     }
+                    let arg1 = roots.get(args_base + 1);
+                    obj = roots.get(obj_slot);
+                    drop(roots);
                     let buf = {
-                        if !pyre_object::bytesobject::is_bytes_like(args[1]) {
+                        if !pyre_object::bytesobject::is_bytes_like(arg1) {
                             return Err(pyre_interpreter::PyError::type_error(
                                 "write: buffer must be bytes-like",
                             ));
                         }
-                        pyre_object::bytesobject::bytes_like_data(args[1])
+                        pyre_object::bytesobject::bytes_like_data(arg1)
                     };
                     let (p, len) = mmap_ptr(obj)?;
                     let pos =
@@ -1187,15 +1193,21 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     let mut obj = args[0];
-                    let access = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_access"));
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = roots.pin_roots(&[obj]);
+                    let args_base = roots.pin_roots(args);
+                    let access = mmap_get_attr_i64(roots.get(obj_slot), "_access");
                     if access == MMAP_ACCESS_READ {
                         return Err(pyre_interpreter::PyError::type_error("mmap is read-only"));
                     }
+                    let arg1 = roots.get(args_base + 1);
+                    obj = roots.get(obj_slot);
+                    drop(roots);
                     // `interp_mmap.py write_byte(byte=int)` —
                     // `@unwrap_spec(byte=int)` rejects non-ints, then
                     // `chr(byte)` raises ValueError on values outside
                     // 0..256.
-                    let raw = pyre_object::with_roots!(obj => mmap_index_w(obj, args[1]))?;
+                    let raw = pyre_object::with_roots!(obj => mmap_index_w(obj, arg1))?;
                     if !(0..=255).contains(&raw) {
                         return Err(pyre_interpreter::PyError::value_error(
                             "byte must be in range(0, 256)",
@@ -1583,23 +1595,29 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             "madvise",
             pyre_interpreter::make_builtin_function("madvise", |args| {
                 let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let _ = mmap_ptr(obj)?;
-                if args.len() < 2 {
+                let nargs = args.len();
+                let roots = pyre_object::gc_roots::push_roots();
+                let obj_slot = roots.pin_roots(&[obj]);
+                let args_base = roots.pin_roots(args);
+                let _ = mmap_ptr(roots.get(obj_slot))?;
+                if nargs < 2 {
                     return Err(pyre_interpreter::PyError::type_error(
                         "madvise() requires option",
                     ));
                 }
-                let option = pyre_object::with_roots!(obj => mmap_index_w(obj, args[1]))? as i32;
-                let start_raw = match args.get(2) {
-                    Some(&value) => pyre_object::with_roots!(obj => mmap_index_w(obj, value))?,
-                    None => 0,
+                let option = mmap_index_w(roots.get(obj_slot), roots.get(args_base + 1))? as i32;
+                let start_raw = if nargs > 2 {
+                    mmap_index_w(roots.get(obj_slot), roots.get(args_base + 2))?
+                } else {
+                    0
                 };
-                let length_arg = match args.get(3) {
-                    Some(&value) => {
-                        Some(pyre_object::with_roots!(obj => mmap_index_w(obj, value))?)
-                    }
-                    None => None,
+                let length_arg = if nargs > 3 {
+                    Some(mmap_index_w(roots.get(obj_slot), roots.get(args_base + 3))?)
+                } else {
+                    None
                 };
+                obj = roots.get(obj_slot);
+                drop(roots);
                 // Every `__index__` above could have resized the mapping, so the
                 // extent the advice is applied to is read once they are all done.
                 let (_, total) = mmap_ptr(obj)?;
@@ -1655,16 +1673,19 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     // `@unwrap_spec(dest=int, src=int, count=int)` plus
                     // `self.check_writeable()` upfront.  We require all
                     // three args use the index protocol and reject ACCESS_READ.
-                    if pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_access"))
-                        == MMAP_ACCESS_READ
-                    {
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = roots.pin_roots(&[obj]);
+                    let args_base = roots.pin_roots(args);
+                    if mmap_get_attr_i64(roots.get(obj_slot), "_access") == MMAP_ACCESS_READ {
                         return Err(pyre_interpreter::PyError::type_error("mmap is read-only"));
                     }
                     let dest =
-                        pyre_object::with_roots!(obj => mmap_index_w(obj, args[1]))? as usize;
-                    let src = pyre_object::with_roots!(obj => mmap_index_w(obj, args[2]))? as usize;
+                        mmap_index_w(roots.get(obj_slot), roots.get(args_base + 1))? as usize;
+                    let src = mmap_index_w(roots.get(obj_slot), roots.get(args_base + 2))? as usize;
                     let count =
-                        pyre_object::with_roots!(obj => mmap_index_w(obj, args[3]))? as usize;
+                        mmap_index_w(roots.get(obj_slot), roots.get(args_base + 3))? as usize;
+                    obj = roots.get(obj_slot);
+                    drop(roots);
                     let (p, total) = mmap_ptr(obj)?;
                     if dest.saturating_add(count) > total || src.saturating_add(count) > total {
                         return Err(pyre_interpreter::PyError::value_error(
@@ -1785,8 +1806,8 @@ fn mmap_resize_mapping(
     old_len: usize,
     newsize: usize,
 ) -> Result<(), pyre_interpreter::PyError> {
-    let fd = mmap_get_attr_i64(obj, "_fd") as libc::c_int;
-    let offset = mmap_get_attr_i64(obj, "_offset");
+    let fd = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_fd")) as libc::c_int;
+    let offset = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_offset"));
     // `mmap_resize_method`: shared anonymous maps cannot grow.
     //   if (self->fd == -1 && !(self->flags & MAP_PRIVATE) && new_size > self->size)
     if fd < 0 && mmap_native(obj)?.flags & rmmap::MAP_PRIVATE == 0 && newsize > old_len {
@@ -1807,19 +1828,13 @@ fn mmap_resize_mapping(
         // `mremap` keeps the mapping's protection. Remap from the stored mode
         // (`rmmap.mmap` access→prot), not from `_access`: a PROT_READ map and
         // a shared writable map are different, and `MAP_FIXED` is not replayed.
-        let mode = mmap_get_attr_i64(obj, "_mode");
+        let mode = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_mode"));
         let (flags, prot) = if mode == MMAP_ACCESS_READ {
             (rmmap::MAP_SHARED, rmmap::PROT_READ)
         } else if mode == MMAP_ACCESS_COPY {
-            (
-                rmmap::MAP_PRIVATE,
-                rmmap::PROT_READ | rmmap::PROT_WRITE,
-            )
+            (rmmap::MAP_PRIVATE, rmmap::PROT_READ | rmmap::PROT_WRITE)
         } else {
-            (
-                rmmap::MAP_SHARED,
-                rmmap::PROT_READ | rmmap::PROT_WRITE,
-            )
+            (rmmap::MAP_SHARED, rmmap::PROT_READ | rmmap::PROT_WRITE)
         };
         let ptr = pyre_object::with_roots!(obj => unsafe {
             rmmap::c_mmap(
@@ -2165,14 +2180,8 @@ fn mmap_construct(
     })?;
     let (mut flags, prot) = match access {
         x if x == MMAP_ACCESS_READ => (rmmap::MAP_SHARED, rmmap::PROT_READ),
-        x if x == MMAP_ACCESS_WRITE => (
-            rmmap::MAP_SHARED,
-            rmmap::PROT_READ | rmmap::PROT_WRITE,
-        ),
-        x if x == MMAP_ACCESS_COPY => (
-            rmmap::MAP_PRIVATE,
-            rmmap::PROT_READ | rmmap::PROT_WRITE,
-        ),
+        x if x == MMAP_ACCESS_WRITE => (rmmap::MAP_SHARED, rmmap::PROT_READ | rmmap::PROT_WRITE),
+        x if x == MMAP_ACCESS_COPY => (rmmap::MAP_PRIVATE, rmmap::PROT_READ | rmmap::PROT_WRITE),
         x if x == MMAP_ACCESS_DEFAULT => {
             if prot_arg & rmmap::PROT_WRITE != 0 && prot_arg & rmmap::PROT_READ == 0 {
                 access = MMAP_ACCESS_WRITE;

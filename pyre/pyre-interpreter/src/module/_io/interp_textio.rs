@@ -1723,6 +1723,7 @@ impl W_TextIOWrapper {
 
         if position_cookie.chars_to_skip != 0 {
             let _roots = pyre_object::gc_roots::push_roots();
+            let pos_slot = _roots.pin_roots(&[w_position]);
             let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(self.w_buffer);
             let size_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1763,6 +1764,7 @@ impl W_TextIOWrapper {
             self.decoded.set(decoded)?;
             self.decoded
                 .get_chars(Some(position_cookie.chars_to_skip as usize));
+            w_position = _roots.get(pos_slot);
         } else {
             self.snapshot = Some(PositionSnapshot {
                 flags: position_cookie.dec_flags,
@@ -1881,7 +1883,11 @@ impl W_TextIOWrapper {
 
         // CPython 3.14 `_textiowrapper_writeflush`: every reconfiguration
         // first commits pending output, even when every option is omitted.
-        pyre_object::with_roots!(newline => super::call_method_result(self.self_obj(), "flush", &[]))?;
+        let has_new_codec = new_codec.is_some();
+        let mut new_codec_obj = new_codec.unwrap_or(pyre_object::PY_NULL);
+        pyre_object::with_roots!(new_codec_obj, newline => {
+            super::call_method_result(self.self_obj(), "flush", &[])
+        })?;
         if let Some(value) = new_newline.as_ref() {
             self.w_newline = newline;
             self.set_newline(value.as_deref());
@@ -1895,8 +1901,8 @@ impl W_TextIOWrapper {
             self.w_errors = w_str_new_managed(value);
             self.publish_refs();
         }
-        if let Some(codec) = new_codec {
-            self.set_encoder_decoder(codec)?;
+        if has_new_codec {
+            self.set_encoder_decoder(new_codec_obj)?;
         }
         if let Some(value) = new_line_buffering {
             self.line_buffering = value;

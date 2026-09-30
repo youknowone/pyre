@@ -358,22 +358,38 @@ fn init_compress_type(ns: PyObjectRef) {
 }
 
 fn compress_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let mut cls = args.first().copied().unwrap_or_else(compress_type);
-    let level = pyre_object::with_roots!(cls => int_or_default(args.get(1).copied().unwrap_or(PY_NULL), -1))?
-        as i32;
-    let method = pyre_object::with_roots!(cls => int_or_default(args.get(2).copied().unwrap_or(PY_NULL), 8))?
-        as i32;
-    let wbits = to_wbits(pyre_object::with_roots!(cls => int_or_default(
-        args.get(3).copied().unwrap_or(PY_NULL),
-        backend::MAX_WBITS as i64,
-    ))?);
-    let mem_level = pyre_object::with_roots!(cls => int_or_default(args.get(4).copied().unwrap_or(PY_NULL), 8))?
-        as i32;
-    let strategy = pyre_object::with_roots!(cls => int_or_default(args.get(5).copied().unwrap_or(PY_NULL), 0))?
-        as i32;
-    let zdict =
-        pyre_object::with_roots!(cls => zdict_or_none(args.get(6).copied().unwrap_or(PY_NULL)))?;
-    make_compress_for(cls, level, method, wbits, mem_level, strategy, zdict)
+    // An empty argument list's class is a fresh type object.  Otherwise slot
+    // 0 is the class the caller passed, and every later index is read back
+    // from the same pin: each `int_or_default` can allocate.
+    let n_args = args.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = if n_args == 0 {
+        pyre_object::gc_roots::pin_roots(&[compress_type()])
+    } else {
+        pyre_object::gc_roots::pin_roots(args)
+    };
+    let arg = |index: usize| {
+        if n_args == 0 || index >= n_args {
+            PY_NULL
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(base + index)
+        }
+    };
+    let level = int_or_default(arg(1), -1)? as i32;
+    let method = int_or_default(arg(2), 8)? as i32;
+    let wbits = to_wbits(int_or_default(arg(3), backend::MAX_WBITS as i64)?);
+    let mem_level = int_or_default(arg(4), 8)? as i32;
+    let strategy = int_or_default(arg(5), 0)? as i32;
+    let zdict = zdict_or_none(arg(6))?;
+    make_compress_for(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        level,
+        method,
+        wbits,
+        mem_level,
+        strategy,
+        zdict,
+    )
 }
 
 fn make_compress(
@@ -652,14 +668,25 @@ fn init_decompress_type(ns: PyObjectRef) {
 }
 
 fn decompress_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let mut cls = args.first().copied().unwrap_or_else(decompress_type);
-    let wbits = to_wbits(pyre_object::with_roots!(cls => int_or_default(
-        args.get(1).copied().unwrap_or(PY_NULL),
-        backend::MAX_WBITS as i64,
-    ))?);
-    let zdict =
-        pyre_object::with_roots!(cls => zdict_or_none(args.get(2).copied().unwrap_or(PY_NULL)))?;
-    make_decompress_for(cls, wbits, zdict)
+    // Same shape as `compress_new`: the class is the fresh type only when no
+    // arguments were passed, and is argument 0 otherwise.
+    let n_args = args.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = if n_args == 0 {
+        pyre_object::gc_roots::pin_roots(&[decompress_type()])
+    } else {
+        pyre_object::gc_roots::pin_roots(args)
+    };
+    let arg = |index: usize| {
+        if n_args == 0 || index >= n_args {
+            PY_NULL
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(base + index)
+        }
+    };
+    let wbits = to_wbits(int_or_default(arg(1), backend::MAX_WBITS as i64)?);
+    let zdict = zdict_or_none(arg(2))?;
+    make_decompress_for(pyre_object::gc_roots::shadow_stack_get(base), wbits, zdict)
 }
 
 fn make_decompress(

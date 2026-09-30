@@ -756,25 +756,28 @@ fn promote_anonymous_fields(
                 byte_size,
                 index,
             ));
-            // The promoted field's `dict` moves and each copied entry
-            // allocates the key string, so the word is read back out of a
-            // root slot on every iteration.  `promoted` does not move but is
-            // unreferenced until `set_type_attr` below, so it takes one pin.
+            // The promoted field's dict moves and each copied entry allocates
+            // the key string. `promoted`, `child`, `cls`, and `proto` stay
+            // pinned across those copies; later reads use the slots.
             let roots = pyre_object::gc_roots::push_roots();
-            let promoted = roots.pin_root(promoted);
-            let d_slot = roots.base() + 1;
-            let _ = roots.pin_root(pyre_interpreter::baseobjspace::getdict_native(promoted));
+            let base = roots.pin_roots(&[promoted, child, cls, proto]);
+            let d_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(pyre_interpreter::baseobjspace::getdict_native(
+                roots.get(base),
+            ));
             unsafe {
                 for key in ["size", "bit_size", "bit_offset", "is_bitfield"] {
                     if let Some(value) = pyre_object::w_dict_getitem_str(
-                        pyre_interpreter::baseobjspace::getdict_native(child),
+                        pyre_interpreter::baseobjspace::getdict_native(roots.get(base + 1)),
                         key,
                     ) {
                         pyre_object::w_dict_setitem_str(roots.get(d_slot), key, value);
                     }
                 }
             }
-            set_type_attr(cls, &name, promoted);
+            set_type_attr(roots.get(base + 2), &name, roots.get(base));
+            cls = roots.get(base + 2);
+            proto = roots.get(base + 3);
         }
     }
     Ok(())
@@ -1477,11 +1480,15 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
         }
         ParamFunc::Array => {
             let element = stginfo::stginfo_of(proto).and_then(stginfo::stginfo_proto);
-            let all = pyre_object::with_roots!(obj, proto => cdata::cdata_bytes(obj))
+            let has_element = element.is_some();
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.pin_roots(&[obj, proto, element.unwrap_or(pyre_object::PY_NULL)]);
+            let all = cdata::cdata_bytes(roots.get(base))
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("instance has no buffer"))?;
             let start = offset.min(all.len());
             let end = (offset + size).min(all.len());
             let field = &all[start..end];
+            let element = has_element.then(|| roots.get(base + 2));
             match element.and_then(cdata::type_code_of).as_deref() {
                 Some("c") => {
                     let n = field.iter().position(|&b| b == 0).unwrap_or(field.len());
@@ -1490,7 +1497,13 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
                 Some("u") => Ok(pyre_object::w_str_new_managed(
                     &host_ctypes::wstring_from_bytes(field),
                 )),
-                _ => Ok(cdata::make_indexed_subview(proto, obj, offset, size, index)),
+                _ => Ok(cdata::make_indexed_subview(
+                    roots.get(base + 1),
+                    roots.get(base),
+                    offset,
+                    size,
+                    index,
+                )),
             }
         }
         ParamFunc::Struct | ParamFunc::Union | ParamFunc::Pointer => {
@@ -1551,19 +1564,27 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 return Ok(pyre_object::w_none());
             }
             // `value` is an arbitrary object under `"O"`, and the encode both
-            // allocates and can run Python: pin it and read the slot back.
+            // allocates and can run Python. `obj` and `proto` stay pinned
+            // across that call; later reads use the slots.
             let _roots = pyre_object::gc_roots::push_roots();
-            let value_slot = pyre_object::gc_roots::shadow_stack_len();
-            let value = pyre_object::gc_roots::pin_root(value);
-            let mut bytes = cdata::encode_instance_or_value(&tc, value, obj, &index.to_string())?;
-            if field_needs_swap(obj, proto, size) {
+            let base = _roots.pin_roots(&[value, obj, proto]);
+            let mut bytes = cdata::encode_instance_or_value(
+                &tc,
+                _roots.get(base),
+                _roots.get(base + 1),
+                &index.to_string(),
+            )?;
+            if field_needs_swap(_roots.get(base + 1), _roots.get(base + 2), size) {
                 bytes.reverse();
             }
-            cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
-            cdata::cdata_write(obj, offset, &bytes);
-            let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+            cdata::release_bstr_slot(
+                &tc,
+                cdata::cdata_addr(_roots.get(base + 1)).unwrap_or(0) + offset,
+            );
+            cdata::cdata_write(_roots.get(base + 1), offset, &bytes);
+            let value = _roots.get(base);
             if let Some(keep) = cdata::value_for_keep(&tc, value, &bytes) {
-                cdata::keep_ref(obj, &index.to_string(), keep);
+                cdata::keep_ref(_roots.get(base + 1), &index.to_string(), keep);
             }
             Ok(pyre_object::w_none())
         }
@@ -2168,13 +2189,22 @@ fn array_init(args: &[PyObjectRef]) -> PyResult {
     }
     let mut obj = args[0];
     let (pos, _kw) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
-    let meta = pyre_object::with_roots!(obj => array_meta(obj))?;
-    if pos.len() > meta.length {
+    let npos = pos.len();
+    let roots = pyre_object::gc_roots::push_roots();
+    let pos_base = roots.publish(pos);
+    let obj_slot = roots.publish(&[obj]);
+    roots.normalize(pos_base, npos + 1);
+    let meta = array_meta(roots.get(obj_slot))?;
+    let mut pos_buf = vec![pyre_object::PY_NULL; npos];
+    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
+    obj = roots.get(obj_slot);
+    drop(roots);
+    if pos_buf.len() > meta.length {
         return Err(pyre_interpreter::PyError::index_error(
             "too many initializers",
         ));
     }
-    for (i, &val) in pos.iter().enumerate() {
+    for (i, &val) in pos_buf.iter().enumerate() {
         pyre_object::with_roots!(obj => array_set_index(obj, &meta, i, val))?;
     }
     Ok(pyre_object::w_none())
@@ -2261,16 +2291,24 @@ fn array_set_index(
             let tc = cdata::type_code_of(meta.proto)
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("element has no '_type_'"))?;
             // `value` is an arbitrary object under `"O"`, and the encode both
-            // allocates and can run Python: pin it and read the slot back.
+            // allocates and can run Python. `obj` stays pinned across that
+            // call; later reads use the slot.
             let _roots = pyre_object::gc_roots::push_roots();
-            let value_slot = pyre_object::gc_roots::shadow_stack_len();
-            let value = pyre_object::gc_roots::pin_root(value);
-            let bytes = cdata::encode_instance_or_value(&tc, value, obj, &idx.to_string())?;
-            cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
-            cdata::cdata_write(obj, offset, &bytes);
-            let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+            let base = _roots.pin_roots(&[value, obj]);
+            let bytes = cdata::encode_instance_or_value(
+                &tc,
+                _roots.get(base),
+                _roots.get(base + 1),
+                &idx.to_string(),
+            )?;
+            cdata::release_bstr_slot(
+                &tc,
+                cdata::cdata_addr(_roots.get(base + 1)).unwrap_or(0) + offset,
+            );
+            cdata::cdata_write(_roots.get(base + 1), offset, &bytes);
+            let value = _roots.get(base);
             if let Some(keep) = cdata::value_for_keep(&tc, value, &bytes) {
-                cdata::keep_ref(obj, &idx.to_string(), keep);
+                cdata::keep_ref(_roots.get(base + 1), &idx.to_string(), keep);
             }
             Ok(pyre_object::w_none())
         }
@@ -2558,8 +2596,15 @@ fn cpointertype_init(args: &[PyObjectRef]) -> PyResult {
 fn pointer_init_stginfo(mut cls: PyObjectRef) -> PyResult {
     let proto = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_type_") }
         .filter(|&t| !t.is_null() && unsafe { pyre_object::is_type(t) });
-    if let Some(p) = proto
-        && pyre_object::with_roots!(cls => stginfo::field_size_of(p)).is_none()
+    let has_proto = proto.is_some();
+    // `proto` is read again after every layout query below.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[proto.unwrap_or(pyre_object::PY_NULL), cls]);
+    let proto_slot = base;
+    let cls_slot = base + 1;
+    cls = roots.get(cls_slot);
+    if has_proto
+        && pyre_object::with_roots!(cls => stginfo::field_size_of(roots.get(proto_slot))).is_none()
     {
         return Err(pyre_interpreter::PyError::type_error(
             "_type_ must have storage info",
@@ -2569,23 +2614,32 @@ fn pointer_init_stginfo(mut cls: PyObjectRef) -> PyResult {
     let mut data = StgInfoData::new(psize, psize, ParamFunc::Pointer);
     data.length = 1;
     data.flags |= stginfo::TYPEFLAG_ISPOINTER;
-    data.proto = proto;
-    data.format = Some(match proto {
-        Some(mut p)
-            if pyre_object::with_roots!(cls => stginfo::field_size_of(p)).unwrap_or(0) > 0 =>
-        {
+    data.format = Some(
+        if has_proto && {
+            cls = roots.get(cls_slot);
+            pyre_object::with_roots!(cls => stginfo::field_size_of(roots.get(proto_slot)))
+                .unwrap_or(0)
+                > 0
+        } {
             let shape = {
                 let mut dims = Vec::new();
+                let mut p = roots.get(proto_slot);
                 let mut current = p;
                 while let Some(mut info) = stginfo::stginfo_of(current) {
+                    cls = roots.get(cls_slot);
+                    p = roots.get(proto_slot);
                     if pyre_object::with_roots!(cls, info, p => stginfo::stginfo_paramfunc(info))
                         != ParamFunc::Array
                     {
                         break;
                     }
+                    cls = roots.get(cls_slot);
+                    p = roots.get(proto_slot);
                     dims.push(
                         pyre_object::with_roots!(cls, info, p => stginfo::stginfo_length(info)),
                     );
+                    cls = roots.get(cls_slot);
+                    p = roots.get(proto_slot);
                     let Some(next) =
                         pyre_object::with_roots!(cls, p => stginfo::stginfo_proto(info))
                     else {
@@ -2607,29 +2661,49 @@ fn pointer_init_stginfo(mut cls: PyObjectRef) -> PyResult {
                         .join(",")
                 )
             };
+            cls = roots.get(cls_slot);
             format!(
                 "&{prefix}{}",
-                pyre_object::with_roots!(cls => cdata::ctype_pep3118_format(p, None))
+                pyre_object::with_roots!(cls => {
+                    cdata::ctype_pep3118_format(roots.get(proto_slot), None)
+                })
             )
-        }
-        _ => "&B".to_string(),
+        } else {
+            "&B".to_string()
+        },
+    );
+    cls = roots.get(cls_slot);
+    let info = pyre_object::with_roots!(cls => {
+        data.proto = has_proto.then(|| roots.get(proto_slot));
+        stginfo::stginfo_new(data)
     });
-    let info = pyre_object::with_roots!(cls => stginfo::stginfo_new(data));
     stginfo::stginfo_set(cls, info);
 
-    if let Some(mut p) = proto {
+    if has_proto {
+        let mut p = roots.get(proto_slot);
         let pinfo = match stginfo::stginfo_of(p) {
             Some(i) => i,
             None => {
+                cls = roots.get(cls_slot);
+                p = roots.get(proto_slot);
                 let size =
                     pyre_object::with_roots!(cls, p => stginfo::field_size_of(p)).unwrap_or(0);
+                cls = roots.get(cls_slot);
+                p = roots.get(proto_slot);
                 let align =
                     pyre_object::with_roots!(cls, p => stginfo::field_align_of(p)).unwrap_or(1);
-                let info = pyre_object::with_roots!(cls, p => stginfo::stginfo_new(StgInfoData::new(size, align, ParamFunc::Simple)));
+                cls = roots.get(cls_slot);
+                p = roots.get(proto_slot);
+                let info = pyre_object::with_roots!(cls, p => stginfo::stginfo_new(StgInfoData::new(
+                    size,
+                    align,
+                    ParamFunc::Simple
+                )));
                 stginfo::stginfo_set(p, info);
                 info
             }
         };
+        cls = roots.get(cls_slot);
         stginfo::stginfo_set_pointer_type(pinfo, cls);
     }
     Ok(pyre_object::w_none())
@@ -2842,16 +2916,21 @@ fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("element has no '_type_'"))?;
             // `value` is an arbitrary object under `"O"`, and the encode both
-            // allocates and can run Python: pin it and read the slot back.
+            // allocates and can run Python. `obj` stays pinned across that
+            // call; later reads use the slot.
             let _roots = pyre_object::gc_roots::push_roots();
-            let value_slot = pyre_object::gc_roots::shadow_stack_len();
-            let value = pyre_object::gc_roots::pin_root(value);
-            let bytes = cdata::encode_instance_or_value(&tc, value, obj, &index.to_string())?;
+            let base = _roots.pin_roots(&[value, obj]);
+            let bytes = cdata::encode_instance_or_value(
+                &tc,
+                _roots.get(base),
+                _roots.get(base + 1),
+                &index.to_string(),
+            )?;
             cdata::release_bstr_slot(&tc, addr);
             unsafe { host_ctypes::copy_bytes_to_address(addr, &bytes, element_size) };
-            let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+            let value = _roots.get(base);
             if let Some(keep) = cdata::value_for_keep(&tc, value, &bytes) {
-                cdata::keep_ref(obj, &index.to_string(), keep);
+                cdata::keep_ref(_roots.get(base + 1), &index.to_string(), keep);
             }
             Ok(pyre_object::w_none())
         }

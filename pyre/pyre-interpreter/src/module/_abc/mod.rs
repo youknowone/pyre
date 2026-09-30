@@ -516,9 +516,16 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
             // below reject is consumed all the same, so a subclass re-running
             // `_abc_init` does not inherit the same rejection.
             let roots = pyre_object::gc_roots::push_roots();
-            let flags_slot = roots.publish(&[w_flags]);
-            pyre_interpreter::type_dict_delete(cls, "__abc_tpflags__");
-            unsafe { pyre_interpreter::baseobjspace::mutated(cls, Some("__abc_tpflags__")) };
+            let base = roots.pin_roots(&[w_flags, cls]);
+            let flags_slot = base;
+            let cls_slot = base + 1;
+            pyre_interpreter::type_dict_delete(roots.get(cls_slot), "__abc_tpflags__");
+            unsafe {
+                pyre_interpreter::baseobjspace::mutated(
+                    roots.get(cls_slot),
+                    Some("__abc_tpflags__"),
+                )
+            };
             let w_flags = roots.get(flags_slot);
             // `PyLong_CheckExact` -- an `int` subclass, `bool` included, is
             // consumed and ignored, as is anything that is not an int at all.
@@ -533,7 +540,7 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
                     ));
                 }
                 if flags & COLLECTION_FLAGS != 0 {
-                    set_collection_flag_of(cls, flags & COLLECTION_FLAGS)?;
+                    set_collection_flag_of(roots.get(cls_slot), flags & COLLECTION_FLAGS)?;
                 }
             }
         }

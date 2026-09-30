@@ -370,40 +370,59 @@ fn unpickle(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
 }
 
 pub(super) fn cdata_in_dll(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    if args.len() < 3 {
+    let n_args = args.len();
+    if n_args < 3 {
         return Err(pyre_interpreter::PyError::type_error(
             "in_dll() needs a library and name",
         ));
     }
-    let mut cls = args[0];
+    let arg_roots = pyre_object::gc_roots::push_roots();
+    let arg_base = arg_roots.pin_roots(args);
+    let mut cls = arg_roots.get(arg_base);
     let size = ctype_size_of(cls)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
-    let handle_obj = pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::getattr_str(args[1], "_handle"))?;
+    cls = arg_roots.get(arg_base);
+    let handle_obj = pyre_object::with_roots!(cls => {
+        pyre_interpreter::baseobjspace::getattr_str(arg_roots.get(arg_base + 1), "_handle")
+    })?;
+    cls = arg_roots.get(arg_base);
     let handle = pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::int_w(handle_obj))?
         as usize;
-    if !unsafe { pyre_object::is_str(args[2]) } {
+    if !unsafe { pyre_object::is_str(arg_roots.get(arg_base + 2)) } {
         return Err(pyre_interpreter::PyError::type_error(
             "name must be a string",
         ));
     }
-    let name =
-        pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::str_utf8_w(args[2]))?;
+    cls = arg_roots.get(arg_base);
+    let name = pyre_object::with_roots!(cls => {
+        pyre_interpreter::baseobjspace::str_utf8_w(arg_roots.get(arg_base + 2))
+    })?;
     if name == "Py_OptimizeFlag" {
         let optimize = pyre_interpreter::importing::get_interpreter_sys_module()
             .and_then(|sys| pyre_interpreter::baseobjspace::getattr_str(sys, "flags").ok())
             .and_then(|flags| pyre_interpreter::baseobjspace::getattr_str(flags, "optimize").ok())
             .unwrap_or_else(|| pyre_object::w_int_new(0));
-        return pyre_interpreter::call::type_call_instantiate(cls, &[optimize]);
+        return pyre_interpreter::call::type_call_instantiate(arg_roots.get(arg_base), &[optimize]);
     }
     if let Some(pointer_variable) =
         pyre_interpreter::module::imp::interp_imp::frozen_abi_pointer_variable(name)
     {
-        return Ok(make_at_address(cls, pointer_variable, size, args[1]));
+        return Ok(make_at_address(
+            arg_roots.get(arg_base),
+            pointer_variable,
+            size,
+            arg_roots.get(arg_base + 1),
+        ));
     }
     let address = super::interp_ctypes::lookup_symbol(handle, name.as_bytes()).map_err(|_| {
         pyre_interpreter::PyError::value_error(format!("symbol '{name}' not found"))
     })?;
-    Ok(make_at_address(cls, address, size, args[1]))
+    Ok(make_at_address(
+        arg_roots.get(arg_base),
+        address,
+        size,
+        arg_roots.get(arg_base + 1),
+    ))
 }
 
 fn cdata_objects_get(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
@@ -447,17 +466,23 @@ pub(super) fn cdata_from_address(
 }
 
 fn cdata_from_buffer_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    if args.len() < 2 {
+    let n_args = args.len();
+    if n_args < 2 {
         return Err(pyre_interpreter::PyError::type_error(
             "from_buffer_copy() missing source",
         ));
     }
-    let mut cls = args[0];
+    let arg_roots = pyre_object::gc_roots::push_roots();
+    let arg_base = arg_roots.pin_roots(args);
+    let mut cls = arg_roots.get(arg_base);
     let size = ctype_size_of(cls)
         .filter(|&n| n != 0)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
-    let offset = if let Some(&o) = args.get(2) {
-        pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::int_w(o))?
+    let offset = if n_args > 2 {
+        cls = arg_roots.get(arg_base);
+        pyre_object::with_roots!(cls => {
+            pyre_interpreter::baseobjspace::int_w(arg_roots.get(arg_base + 2))
+        })?
     } else {
         0
     };
@@ -466,7 +491,7 @@ fn cdata_from_buffer_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_inte
             "offset cannot be negative",
         ));
     }
-    let source = pyre_interpreter::typedef::buffer_as_bytes_like(args[1])?
+    let source = pyre_interpreter::typedef::buffer_as_bytes_like(arg_roots.get(arg_base + 1))?
         .ok_or_else(|| pyre_interpreter::PyError::type_error("a bytes-like object is required"))?;
     let all = unsafe { pyre_object::bytesobject::bytes_like_data(source) };
     let offset = offset as usize;
@@ -478,21 +503,27 @@ fn cdata_from_buffer_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_inte
         )));
     }
     let copied = all[offset..offset + size].to_vec();
-    new_cdata_obj_from_bytes(cls, size, &copied)
+    new_cdata_obj_from_bytes(arg_roots.get(arg_base), size, &copied)
 }
 
 fn cdata_from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    if args.len() < 2 {
+    let n_args = args.len();
+    if n_args < 2 {
         return Err(pyre_interpreter::PyError::type_error(
             "from_buffer() missing source",
         ));
     }
-    let mut cls = args[0];
+    let arg_roots = pyre_object::gc_roots::push_roots();
+    let arg_base = arg_roots.pin_roots(args);
+    let mut cls = arg_roots.get(arg_base);
     let size = ctype_size_of(cls)
         .filter(|&n| n != 0)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
-    let offset = if let Some(&o) = args.get(2) {
-        pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::int_w(o))?
+    let offset = if n_args > 2 {
+        cls = arg_roots.get(arg_base);
+        pyre_object::with_roots!(cls => {
+            pyre_interpreter::baseobjspace::int_w(arg_roots.get(arg_base + 2))
+        })?
     } else {
         0
     };
@@ -504,8 +535,10 @@ fn cdata_from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpret
 
     // Acquire and retain a real memoryview so the exporter's resize lock and
     // lifetime follow the buffer protocol, as PyCData_FromBaseObj requires.
-    let view_obj =
-        pyre_object::with_roots!(cls => pyre_interpreter::builtins::w_memoryview_new(args[1]))?;
+    cls = arg_roots.get(arg_base);
+    let view_obj = pyre_object::with_roots!(cls => {
+        pyre_interpreter::builtins::w_memoryview_new(arg_roots.get(arg_base + 1))
+    })?;
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let view_obj = pyre_object::gc_roots::pin_root(view_obj);
@@ -540,10 +573,15 @@ fn cdata_from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpret
         ));
     }
     let address = unsafe { backing.as_mut_ptr().add(start) } as usize;
-    let obj = make_at_address(cls, address, size, pyre_object::PY_NULL);
-    let rooted_view = pyre_object::gc_roots::shadow_stack_get(sp);
-    keep_ref(obj, "ffffffff", rooted_view);
-    Ok(obj)
+    let obj = make_at_address(arg_roots.get(arg_base), address, size, pyre_object::PY_NULL);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    keep_ref(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        "ffffffff",
+        pyre_object::gc_roots::shadow_stack_get(sp),
+    );
+    Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
 }
 
 /// The native `_SimpleCData` type object (cached, `hasdict=true`).
@@ -752,38 +790,43 @@ pub(super) fn new_simplecdata_obj(
     value: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let size = host_ctypes::simple_type_size(tc).ok_or_else(invalid_type_code_error)?;
+    let has_value = value.is_some();
+    let _value_roots = pyre_object::gc_roots::push_roots();
+    let value_slot = _value_roots.pin_roots(&[value.unwrap_or(pyre_object::PY_NULL)]);
     let obj = pyre_object::with_roots!(cls => new_cdata_obj_from_bytes(cls, size, &[]))?;
     // The new instance is reachable only from this frame while `encode_value_into`
-    // runs, and that call can run Python.  It does not move, so it is pinned once
-    // and never re-read; the bytearray rides along through the instance dict and
+    // runs, and that call can run Python.  The instance and its class stay pinned
+    // across the encode; the bytearray rides along through the instance dict and
     // does move, so it is looked up there after the encode.
     let _roots = pyre_object::gc_roots::push_roots();
-    let obj = pyre_object::gc_roots::pin_root(obj);
+    let base = _roots.pin_roots(&[obj, cls]);
     // Encode after the instance exists so a `char*` keepalive can attach to it.
-    if let Some(v) = value {
+    if has_value {
         // `v` is an arbitrary object, so under `"O"` it can be a `list` or a
         // `dict`, both of which move: pin it before the encode and read the slot
         // back where it is stored.
         let v_slot = pyre_object::gc_roots::shadow_stack_len();
-        let v = pyre_object::gc_roots::pin_root(v);
-        let mut bytes = encode_value_into(tc, v, obj, "0")?;
-        if unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }
-            .is_some()
+        let v = pyre_object::gc_roots::pin_root(_value_roots.get(value_slot));
+        let mut bytes = encode_value_into(tc, v, _roots.get(base), "0")?;
+        if unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(_roots.get(base + 1), "_swappedbytes_")
+        }
+        .is_some()
         {
             bytes.reverse();
         }
         let n = bytes.len().min(size);
-        let ba = cdata_buffer(obj).expect("new cdata object has a backing buffer");
+        let ba = cdata_buffer(_roots.get(base)).expect("new cdata object has a backing buffer");
         unsafe {
             pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
         }
         if matches!(tc, "z" | "Z" | "O") {
-            let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+            let d = pyre_interpreter::baseobjspace::getdict_native(_roots.get(base));
             let v = pyre_object::gc_roots::shadow_stack_get(v_slot);
             unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, v) };
         }
     }
-    Ok(obj)
+    Ok(_roots.get(base))
 }
 
 pub(super) fn new_cdata_obj_from_bytes(

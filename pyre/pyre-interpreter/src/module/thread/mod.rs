@@ -2231,8 +2231,7 @@ fn spawn_thread(
             };
             let kwargs = Some(pyre_object::gc_roots::shadow_stack_get(worker_base + 2))
                 .filter(|w_kwargs| !w_kwargs.is_null());
-            let handle = Some(pyre_object::gc_roots::shadow_stack_get(worker_base + 3))
-                .filter(|w_handle| !w_handle.is_null());
+            let has_handle = !pyre_object::gc_roots::shadow_stack_get(worker_base + 3).is_null();
             // `JitDriver` currently owns a per-TLS background compiler.
             // Creating a compiler thread for every short-lived Python thread
             // makes teardown wait on unrelated compiler polling.  Execute
@@ -2273,6 +2272,11 @@ fn spawn_thread(
             }
             thread_is_stopping(&mut ec);
             crate::call::set_last_exec_ctx(std::ptr::null());
+            let handle = if has_handle {
+                pyre_object::gc_roots::shadow_stack_get(worker_base + 3)
+            } else {
+                pyre_object::PY_NULL
+            };
             drop(worker_roots);
             drop(ec);
             // `_thread._count()` is the completion signal used by PyPy's
@@ -2286,7 +2290,7 @@ fn spawn_thread(
             // and ExecutionContext have gone away.  In particular, join()
             // must not return while the worker still roots Thread._bootstrap,
             // which would keep Thread._target argument cycles alive.
-            if let Some(handle) = handle {
+            if has_handle {
                 W_ThreadHandle::from_obj(handle).unwrap().finish();
             }
         })
@@ -2372,10 +2376,14 @@ fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         return Err(crate::PyError::type_error("function must be callable"));
     }
     let requested = crate::builtins::kwarg_get(kwargs, "handle");
+    let has_requested = requested.is_some();
+    let req_roots = pyre_object::gc_roots::push_roots();
+    let req_slot = req_roots.pin_roots(&[requested.unwrap_or(PY_NULL)]);
     let daemon = match crate::builtins::kwarg_get(kwargs, "daemon") {
         Some(value) => pyre_object::with_roots!(callable => crate::baseobjspace::is_true(value))?,
         None => false,
     };
+    let requested = has_requested.then(|| req_roots.get(req_slot));
     let handle = match requested {
         Some(obj) if unsafe { !is_none(obj) } => {
             if W_ThreadHandle::from_obj(obj).is_none() {

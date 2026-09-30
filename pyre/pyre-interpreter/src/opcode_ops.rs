@@ -479,14 +479,17 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
             return Err(crate::call::take_call_error()
                 .unwrap_or_else(|| PyError::type_error("mapping pattern lookup failed")));
         }
+        // `is_w` can collect. This slot is also the accumulation entry when
+        // the value is not the sentinel, so the result tuple stays contiguous.
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_value);
         if crate::baseobjspace::is_w(
-            w_value,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
             pyre_object::gc_roots::shadow_stack_get(sentinel_slot),
         ) {
             all_match = false;
             break;
         }
-        let _ = pyre_object::gc_roots::pin_root(w_value);
         value_count += 1;
     }
     Ok(if all_match {
@@ -520,17 +523,20 @@ pub fn match_class_value(
     // run Python, so the subject moves under the pattern and so does every
     // attribute extracted before it.  Pin the subject and read it back at each
     // use; hold the extracted values as shadow-stack slots rather than as raw
-    // copies and read them back when the result tuple is built.  `cls` is a
-    // type, which is old-gen and never moves.  Pinning `kwd_attrs` is what
-    // makes the collector walk it, so its name slots are forwarded too.
+    // copies and read them back when the result tuple is built.  `cls` is
+    // pinned with them: a pattern class can be a young type object.  Pinning
+    // `kwd_attrs` is what makes the collector walk it, so its name slots are
+    // forwarded too.
     let roots = pyre_object::gc_roots::push_roots();
-    let pair = pyre_object::gc_roots::pin_roots(&[subject, kwd_attrs]);
+    let pair = pyre_object::gc_roots::pin_roots(&[subject, kwd_attrs, cls]);
     let subject_slot = pair;
     let kwd_attrs_slot = pair + 1;
+    let cls_slot = pair + 2;
     let subject = || roots.get(subject_slot);
     let kwd_attrs = || roots.get(kwd_attrs_slot);
+    let cls = || roots.get(cls_slot);
 
-    if !crate::baseobjspace::isinstance(subject(), cls)? {
+    if !crate::baseobjspace::isinstance(subject(), cls())? {
         return Ok(pyre_object::w_none());
     }
 
@@ -538,7 +544,7 @@ pub fn match_class_value(
     let mut seen: Vec<String> = Vec::new();
 
     if count > 0 {
-        let match_args = match crate::baseobjspace::getattr_str(cls, "__match_args__") {
+        let match_args = match crate::baseobjspace::getattr_str(cls(), "__match_args__") {
             Ok(v) => Some(v),
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
             Err(e) => return Err(e),
@@ -608,7 +614,7 @@ pub fn match_class_value(
             // No `__match_args__`: the builtin "atomic" types (int, str,
             // bytes, ...) match the subject itself as their single
             // positional sub-pattern (Py_TPFLAGS_MATCH_SELF).
-            let is_self = unsafe { pyre_object::typeobject::w_type_has_match_self(cls) };
+            let is_self = unsafe { pyre_object::typeobject::w_type_has_match_self(cls()) };
             if is_self {
                 if count == 1 {
                     extracted.push(subject_slot);
@@ -967,9 +973,12 @@ pub fn dict_merge_value(
     let source = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let w_callable = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
     let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    let dict_type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_dict_type);
+    let w_dict_type = || pyre_object::gc_roots::shadow_stack_get(dict_type_slot);
     // `space.isinstance_w(w_dict, space.w_dict)` accepts dict subclasses;
     // a non-dict target is a RuntimeError, not a TypeError.
-    if !unsafe { crate::baseobjspace::isinstance_w(dict(), w_dict_type) } {
+    if !unsafe { crate::baseobjspace::isinstance_w(dict(), w_dict_type()) } {
         let type_name = unsafe { (*(*dict()).ob_type).name };
         return Err(PyError::new(
             crate::PyErrorKind::RuntimeError,
@@ -981,7 +990,7 @@ pub fn dict_merge_value(
     let l1 = crate::baseobjspace::len_w(dict())?;
     // pyopcode.py `_dict_merge`: `unroll_safe = jit.isvirtual(w_dict) and l1 < 10`.
     let mut unroll_safe = majit_rlib::jit::isvirtual(&dict()) && l1 < 10;
-    let source_is_dict = unsafe { crate::baseobjspace::isinstance_w(source(), w_dict_type) };
+    let source_is_dict = unsafe { crate::baseobjspace::isinstance_w(source(), w_dict_type()) };
     if !source_is_dict {
         unroll_safe = false;
         // `if not space.ismapping_w(w_item): raise oefmt(... "%s argument

@@ -1033,11 +1033,21 @@ crate::py_module! {
         ) -> Result<PyObjectRef, PyError> {
             let source_line = pyre_object::with_roots!(category, filename, message, module, registry, source => get_source_line(module_globals, lineno))?;
             let _roots = pyre_object::gc_roots::push_roots();
-            let source_line_slot = pin_root_slot(source_line);
-            let category = get_category(message, category)?;
+            // `get_category` allocates.  The source line and every argument
+            // the warning still needs are pinned together and read back after.
+            let base = pyre_object::gc_roots::pin_roots(&[
+                source_line, message, filename, module, registry, source,
+            ]);
+            let category = get_category(pyre_object::gc_roots::shadow_stack_get(base + 1), category)?;
             do_warn_explicit(
-                category, message, filename, lineno, module, registry,
-                pyre_object::gc_roots::shadow_stack_get(source_line_slot), source,
+                category,
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                pyre_object::gc_roots::shadow_stack_get(base + 2),
+                lineno,
+                pyre_object::gc_roots::shadow_stack_get(base + 3),
+                pyre_object::gc_roots::shadow_stack_get(base + 4),
+                pyre_object::gc_roots::shadow_stack_get(base),
+                pyre_object::gc_roots::shadow_stack_get(base + 5),
             )?;
             Ok(w_none())
         }

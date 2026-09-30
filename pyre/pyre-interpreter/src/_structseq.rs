@@ -104,8 +104,10 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     // The class reads below can allocate; the instance is reloaded from its
     // root afterwards, and the class is re-read through it.
+    let has_kwargs = kwargs.is_some();
     let roots = pyre_object::gc_roots::push_roots();
     let inst_slot = roots.pin_roots(&[inst]);
+    let kwargs_slot = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
     let cls = || unsafe { (*roots.get(inst_slot)).w_class };
     if !is_structseq_type(cls()) {
         return Err(PyError::type_error(
@@ -122,6 +124,7 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let fields = match_args_names(cls())?;
     let extra_fields = extra_field_names(cls())?;
     let inst = roots.get(inst_slot);
+    let kwargs = has_kwargs.then(|| roots.get(kwargs_slot));
 
     // Key stays the str object. A lone surrogate is not a field name and
     // must survive into the unexpected-field repr (`structseq___replace__`

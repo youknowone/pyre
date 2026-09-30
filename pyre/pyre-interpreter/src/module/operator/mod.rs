@@ -65,7 +65,13 @@ fn op_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let base = pyre_object::gc_roots::pin_roots(args);
         let w_index = crate::baseobjspace::space_index(w_default)?;
         w_iterable = pyre_object::gc_roots::shadow_stack_get(base);
-        crate::baseobjspace::int_w(w_index)?
+        // `__index__` above can collect; `int_w` can collect again while the
+        // iterable is still needed by `length_hint`.
+        let iter_base = _roots.pin_roots(&[w_iterable, w_index]);
+        let default =
+            crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(iter_base + 1))?;
+        w_iterable = pyre_object::gc_roots::shadow_stack_get(iter_base);
+        default
     } else {
         0
     };
