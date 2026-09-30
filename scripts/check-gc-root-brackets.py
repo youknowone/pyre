@@ -11,7 +11,7 @@ they retain their existing source `push_roots` brackets and this gate stops
 those brackets being taken on trust. See the module docs on
 `majit-translate/src/memory/gctransform/mod.rs` for that current port boundary.
 
-Two of the reported numbers are invariants at zero and are held there.  The
+Some of the reported numbers are invariants at zero and are held there.  The
 rest are a backlog: they are ratcheted, so a change may pay them down but not
 add to them.
 
@@ -20,11 +20,13 @@ from this platform's sources, and the interpreter's `cfg` arms differ across
 them, so the counts do too -- a baseline written from one platform cannot be
 satisfied from another, and `--update` rewrites only the entry it measured.
 
-The ratchet is read against the base the baseline was taken on.  The backlog
-counts every unbracketed call in the artefact, not this branch's share of
-them, so a base that has moved brings code the baseline never saw into the
-same number a regression would land in.  A rise measured over a moved base is
-therefore reported and not failed; the invariants are held either way.
+The ratchet counts every unbracketed call in the artefact, this branch's and
+main's together.  A base that has moved brings code the baseline never saw
+into the same number a regression would land in.  The gate holds that number:
+a rise fails wherever it is measured, and a rise on main is fixed on main.
+The run still says when the base has moved, so the reader can see whose code
+the count now includes.  A column the baseline entry does not record yet is
+printed as unrecorded and is not a failure; `--update` records it.
 
 Run the analysis and compare:
 
@@ -65,58 +67,79 @@ SUBJECTS = (
     "build/llbc/pyre-module.ullbc",
 )
 
-# (key, regex, how many groups to keep).  Every one of these must match exactly
-# once, in this order: `tier 1` is printed twice, once for the main scan and
-# once for the frame scan, and telling them apart is positional.
+# (key, regex).  Every one of these must match exactly once, in this order.
+# `tier 1` is printed twice, and `counting unresolved dispatch` is printed
+# twice; telling each pair apart is positional.  `short_brackets` ends on the
+# count so the following pattern can read `unread_brackets` off the same line.
 PATTERNS = [
     ("unmatched_seeds",
      r"collecting-alloc seeds:.*?UNMATCHED patterns: \[(?P<v>.*?)\]"),
     ("brackets_reaching_no_collection",
      r"cannot reach any collection\s*: (?P<v>\d+)"),
+    ("short_brackets",
+     r"of those withheld: \d+ pin every live pointer, (?P<v>\d+)"),
+    ("unread_brackets",
+     r"are SHORT a root, (?P<v>\d+) could not be read"),
+    ("stale_pins",
+     r"pins whose argument the body still reads afterwards: (?P<v>\d+)"),
     ("unbracketed_calls",
      r"unbracketed calls that can collect with a live PyObjectRef: (?P<v>\d+) in (?P<w>\d+) fn"),
+    ("unresolved_collecting_calls",
+     r"counting unresolved dispatch as collecting too: (?P<v>\d+) in (?P<w>\d+) fn"),
     ("tier1_calls",
      r"tier 1 \(callee IS a dispatch seed\): (?P<v>\d+) call\(s\) in (?P<w>\d+) fn"),
     ("tier15_calls",
      r"tier 1\.5 \(live ptr later addressed as list/dict\): (?P<v>\d+) call\(s\) in (?P<w>\d+) fn"),
+    ("tier15_unresolved_calls",
+     r"tier 1\.5 counting unresolved dispatch too: (?P<v>\d+) call\(s\)"),
     ("frames_across_collecting",
      r"frame carried across a call that can collect: (?P<v>\d+) in (?P<w>\d+) fn"),
+    ("frames_unresolved_calls",
+     r"counting unresolved dispatch as collecting too: (?P<v>\d+) call\(s\)"),
     ("frame_tier1_calls",
      r"tier 1 \(callee IS a dispatch seed\): (?P<v>\d+) call\(s\) in (?P<w>\d+) fn"),
 ]
 
 # Held at zero rather than ratcheted.  A frame carried across a collecting call
 # whose callee is a dispatch seed is a stale frame, not a backlog entry.
-INVARIANT_ZERO = ("frame_tier1_calls",)
+# `tier1_calls` measures zero and is held there with it.  `tier15_calls`, the
+# alias-closed column, was paid down to zero and is now held there.
+INVARIANT_ZERO = ("frame_tier1_calls", "tier1_calls", "tier15_calls")
 
 # A crate with no `PyFrame` (optional modules) skips the frame scan.
 # That is not a liveness skip: `PyObjectRef` was already measured.
-FRAME_KEYS = ("frames_across_collecting", "frame_tier1_calls")
+FRAME_KEYS = (
+    "frames_across_collecting",
+    "frames_unresolved_calls",
+    "frame_tier1_calls",
+)
 FRAME_SKIPPED = "frame scan skipped"
 
-# Ratcheted: may fall, may not rise.
-#
-# `tier15_calls` was held at zero here until the column that feeds it was
-# measured and found dead: the pinned locals and the movable-callee arguments
-# were two spellings of one value -- MIR materialises a call argument as its own
-# temporary -- so the intersection was empty whatever the corpus contained, and
-# the zero said nothing.  With the alias closure in place the same corpus scores
-# in the hundreds, and the first site the column named reproduced a crash at
-# production defaults, so the entries are real rather than noise.  A ratchet is
-# what a real backlog gets; restoring the zero would mean either the dead column
-# or a corpus nobody has paid down yet.
-#
-# The label the report prints still reads `list/dict`, and the regex above
-# matches it: it is the report's wording, not this gate's claim, and the two
-# are kept in step rather than corrected apart.  Read this count with the
-# `movable-argument supply` line beside it -- the column ranks only what that
-# supply feeds it, so a fall here is progress only while that supply holds.
+# Printed only by the liveness scan.  When that scan is skipped these columns
+# are zero, so the shape error stays on the unbracketed-call line the scan
+# exists to produce.
+LIVENESS_KEYS = (
+    "short_brackets",
+    "unread_brackets",
+    "stale_pins",
+    "unresolved_collecting_calls",
+    "tier15_unresolved_calls",
+)
+LIVENESS_SKIPPED = "liveness scan skipped"
+
+# Ratcheted: may fall, may not rise.  A column the baseline entry does not
+# record yet is unrecorded and fails until `--update` stores it.
 RATCHET = (
     "unbracketed_calls",
-    "tier1_calls",
-    "tier15_calls",
     "frames_across_collecting",
     "brackets_reaching_no_collection",
+    "short_brackets",
+    "unread_brackets",
+    "stale_pins",
+    "unresolved_collecting_calls",
+    "unresolved_collecting_calls_fns",
+    "tier15_unresolved_calls",
+    "frames_unresolved_calls",
 )
 
 
@@ -140,11 +163,11 @@ def platform_key() -> str:
 def merge_base() -> str:
     """The upstream commit this branch is measured against.
 
-    The numbers below are a ratchet over a moving base.  A rebase brings
-    interpreter code the baseline never saw, and its unbracketed calls land in
-    this count exactly like a regression would -- so record what the baseline
-    was taken against, and say when that has moved rather than let the reader
-    infer that the rise is theirs.
+    The numbers below count every unbracketed call in the artefact.  A rebase
+    brings interpreter code the baseline never saw, and its calls land in this
+    count exactly like a regression would -- so record what the baseline was
+    taken against, and say when that has moved.  The rise fails either way,
+    and a rise on main is fixed on main.
     """
     # A shallow CI checkout is grafted: it holds no `main` ref, and the
     # merge commit's parent list is truncated away, so nothing in the
@@ -185,7 +208,13 @@ def merge_counts(left: dict, right: dict) -> dict:
 
 
 def run_one(subject: str, donors: list[str]) -> str:
-    env = dict(os.environ, GC_JOIN_WITH=",".join(donors))
+    # Option<PyObjectRef> and &[PyObjectRef] locals count as GC pointers.
+    env = dict(
+        os.environ,
+        GC_JOIN_WITH=",".join(donors),
+        GC_OPTION_REFS="1",
+        GC_SLICE_ARGS="1",
+    )
     proc = subprocess.run(
         [str(EXAMPLE), subject],
         cwd=ROOT,
@@ -227,16 +256,26 @@ def parse(report: str) -> dict:
 
     A gate whose pass is indistinguishable from a gate that matched nothing is
     a gate nobody can trust, so a pattern that does not appear where it is
-    expected is an error rather than a missing key.
+    expected is an error rather than a missing key.  A skipped liveness scan
+    or a skipped frame scan has no lines for the columns that scan prints;
+    those columns are zero.
     """
     got: dict = {}
     pos = 0
+    liveness_skipped = LIVENESS_SKIPPED in report
     frame_skipped = FRAME_SKIPPED in report
     for key, pattern in PATTERNS:
         m = re.compile(pattern, re.S).search(report, pos)
         if m is None:
-            if frame_skipped and key in FRAME_KEYS:
+            skipped = (liveness_skipped and key in LIVENESS_KEYS) or (
+                frame_skipped and key in FRAME_KEYS
+            )
+            if skipped:
                 got[key] = 0
+                # The fn-count is the same line.  A skipped scan records it as
+                # zero too, matching the call count above.
+                if key == "unresolved_collecting_calls":
+                    got["unresolved_collecting_calls_fns"] = 0
                 continue
             sys.exit(
                 f"error: the analysis report has no `{key}` line after "
@@ -290,30 +329,40 @@ def main() -> int:
     # Printed whichever way this ends, so a reader can see what was measured
     # rather than infer it from silence.
     print(f"gc root bracket gate — measured [{key}]:")
+    return compare(got, want)
+
+
+def compare(got: dict, want: dict) -> int:
+    """Score one run against one platform's baseline entry.
+
+    Returns 0 when every invariant is zero and no ratcheted column rose.
+    A ratcheted column the baseline does not record yet fails as unrecorded.
+    A rise fails even when this run's base is not the base
+    the baseline recorded: the gate holds main's own code too, and a rise on
+    main is fixed on main.
+    """
+    got = dict(got)
     for k in sorted(got):
-        base = want.get(k, "—")
-        mark = "" if got[k] == base else f"   (baseline {base})"
+        if k not in want:
+            mark = "   (unrecorded)"
+        else:
+            base = want[k]
+            mark = "" if got[k] == base else f"   (baseline {base})"
         print(f"  {k:34} {got[k]}{mark}")
 
-    rebased = bool(got["base"]) and got["base"] != want.get("base")
-    if rebased:
+    base_now = got.get("base", "")
+    if base_now and base_now != want.get("base"):
+        recorded = want.get("base")
+        recorded = recorded[:12] if recorded else "(unrecorded)"
         print(
-            f"\nNOTE: the baseline was taken against {want.get('base', '(unrecorded)')[:12]}"
-            f" and this run sits on {got['base'][:12]}. Interpreter code the"
+            f"\nNOTE: the baseline was taken against {recorded}"
+            f" and this run sits on {base_now[:12]}. Interpreter code the"
             f" baseline never saw is in this count; attribute a rise before"
             f" paying it down."
         )
 
-    # A rise measured over a base the baseline never saw is not this branch's
-    # to answer for: the backlog counts every unbracketed call in the artefact,
-    # so interpreter code merged into the base since lands in it whole.  A pull
-    # request is measured on its merge commit, so this is the ordinary case for
-    # any branch whose base has moved, and failing it there accuses the branch
-    # of a rise it did not cause.  The invariants are still held: those are
-    # zero for the whole artefact whoever wrote the code.
     bad = []
-    unattributed = []
-    del got["base"]
+    got.pop("base", None)
     for k in INVARIANT_ZERO:
         if got[k] != 0:
             bad.append(f"{k} is {got[k]}, and this one is held at zero: a live "
@@ -321,12 +370,16 @@ def main() -> int:
                        f"unbracketed collecting call is a use-after-move, not "
                        f"a backlog entry.")
     for k in RATCHET:
-        if k in want and got[k] > want[k]:
-            rise = (f"{k} rose {want[k]} -> {got[k]}. Bracket the new call "
-                    f"with `pyre_object::with_roots!`, or pay the baseline "
-                    f"down and rerun with --update if the rise is real and "
-                    f"intended.")
-            (unattributed if rebased else bad).append(rise)
+        if k not in want:
+            bad.append(
+                f"{k} is {got[k]} (unrecorded). Seed this platform's "
+                f"baseline with --update so the column is enforced."
+            )
+        elif got[k] > want[k]:
+            bad.append(
+                f"{k} rose {want[k]} -> {got[k]}. Root the new call, "
+                f"or pay the baseline down with --update."
+            )
     if "unmatched_seeds" in want and got["unmatched_seeds"] != want["unmatched_seeds"]:
         bad.append(
             f"the unmatched seed set changed: {want['unmatched_seeds']} -> "
@@ -340,13 +393,6 @@ def main() -> int:
         for b in bad:
             print(f"  - {b}")
         return 1
-    if unattributed:
-        print("\nWARN — a raised backlog this run cannot attribute:")
-        for u in unattributed:
-            print(f"  - {u}")
-        print("  Rebase onto the recorded base and rerun to attribute these, "
-              "or rebaseline from a run that sits on it.")
-        return 0
     print("\nOK — invariants at zero, backlog not raised.")
     return 0
 

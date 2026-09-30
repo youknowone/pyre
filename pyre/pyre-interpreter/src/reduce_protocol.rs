@@ -379,9 +379,10 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         let _ = pyre_object::gc_roots::pin_root(w_cls_reduce);
         let w_obj_reduce =
             crate::baseobjspace::getattr_str(crate::typedef::w_object(), "__reduce__")?;
+        let obj_reduce_slot = _roots.pin_roots(&[w_obj_reduce]);
         let w_cls_reduce = pyre_object::gc_roots::shadow_stack_get(cls_reduce_slot);
         let w_reduce = pyre_object::gc_roots::shadow_stack_get(reduce_slot);
-        let mut override_ = !crate::baseobjspace::is_w(w_cls_reduce, w_obj_reduce);
+        let mut override_ = !crate::baseobjspace::is_w(w_cls_reduce, _roots.get(obj_reduce_slot));
         // Built-in types (range, the iterators) expose `__reduce__`
         // through instance dispatch rather than the type MRO, so the
         // type-level comparison above sees `object.__reduce__` and
@@ -394,7 +395,7 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
             } else {
                 w_reduce
             };
-            override_ = !crate::baseobjspace::is_w(w_inst_func, w_obj_reduce);
+            override_ = !crate::baseobjspace::is_w(w_inst_func, _roots.get(obj_reduce_slot));
         }
         if override_ {
             return crate::call::call_function_impl_result(

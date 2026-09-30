@@ -1499,7 +1499,11 @@ mod context_methods {
                     "Value is not a SSLSession.",
                 ));
             }
+            let has_session = session.is_some();
+            let session_roots = pyre_object::gc_roots::push_roots();
+            let session_slot = session_roots.pin_roots(&[session.unwrap_or(pyre_object::PY_NULL)]);
             let (hostname, hostname_obj) = pyre_object::with_roots!(incoming, outgoing, owner => parse_server_hostname(hostname))?;
+            let session = has_session.then(|| session_roots.get(session_slot));
             if !server_side
                 && unsafe { pyre_native::ssl::context_check_hostname(self.backend) }
                 && hostname.is_none()
@@ -1603,8 +1607,12 @@ mod context_methods {
                     "Value is not a SSLSession.",
                 ));
             }
+            let has_session = session.is_some();
+            let session_roots = pyre_object::gc_roots::push_roots();
+            let session_slot = session_roots.pin_roots(&[session.unwrap_or(pyre_object::PY_NULL)]);
             let (hostname, hostname_obj) =
                 pyre_object::with_roots!(owner, socket => parse_server_hostname(hostname))?;
+            let session = has_session.then(|| session_roots.get(session_slot));
             if !server_side
                 && unsafe { pyre_native::ssl::context_check_hostname(self.backend) }
                 && hostname.is_none()
@@ -3201,15 +3209,20 @@ fn txt2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErro
             "txt2obj() takes 1 or 2 arguments",
         ));
     }
+    let npos = positional.len();
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-    let value = pyre_interpreter::baseobjspace::str_utf8_w(positional[0]);
+    let base = roots.publish(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let pos_base = roots.publish(positional);
+    roots.normalize(base, 1 + npos);
+    let value = pyre_interpreter::baseobjspace::str_utf8_w(roots.get(pos_base));
     let w = roots.get(base);
     let kwargs = if w.is_null() { None } else { Some(w) };
+    let mut pos_buf = vec![pyre_object::PY_NULL; npos];
+    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
     drop(roots);
     let value = value?;
     let name_arg =
-        pyre_interpreter::builtins::bind_pos_or_kw(positional, kwargs, 1, "name", "txt2obj", 2)?;
+        pyre_interpreter::builtins::bind_pos_or_kw(&pos_buf, kwargs, 1, "name", "txt2obj", 2)?;
     pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["name"], "txt2obj")?;
     let allow_names = name_arg
         .map(pyre_interpreter::baseobjspace::is_true)

@@ -1461,11 +1461,7 @@ fn make_match(
     // `_last_index` (interp_sre.py); -1 plays None.
     let lastindex = {
         let li = state.marks.last_index();
-        if li >= 0 {
-            li as i64
-        } else {
-            -1
-        }
+        if li >= 0 { li as i64 } else { -1 }
     };
     let spans = flatten_spans(pat, state);
     w_sre_match_new(pat, string, w_buffer, pos, endpos, lastindex, &spans)
@@ -1762,18 +1758,20 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         ));
     }
     let pat = args[0];
-    // `pat` is a non-moving old-gen `W_SRE_Pattern`. The receiver stays live
-    // on the caller frame, so the address is stable without a pin of its own.
-    // The replacement and the subject are ordinary objects, and everything
-    // below runs Python -- an `__index__` on `count`, the template parse, and
-    // the filter once per match.  A match object stamps the subject and its
-    // buffer into traced fields, so a stale word here is one the collector
-    // follows on its next walk rather than one that is merely read back wrong.
-    let base = pyre_object::gc_roots::pin_roots(&[args[1], args[2]]);
+    // The pattern, the replacement, and the subject are published together.
+    // Everything below runs Python -- an `__index__` on `count`, the template
+    // parse, and the filter once per match -- and a match object stamps the
+    // subject into traced fields.  `base` stays the replacement slot so the
+    // held export below is the subject at `base + 1`.
+    let pat_slot = pyre_object::gc_roots::publish_roots(&[pat]);
+    let base = pyre_object::gc_roots::publish_roots(&[args[1], args[2]]);
+    pyre_object::gc_roots::normalize_roots(pat_slot, 3);
     let w_repl = || pyre_object::gc_roots::shadow_stack_get(base);
     let string = || pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
-    let (subj, w_buffer_obj) = make_subject(pat, string())?;
+    let code = get_code(pyre_object::gc_roots::shadow_stack_get(pat_slot))
+        .ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
+    let (subj, w_buffer_obj) =
+        make_subject(pyre_object::gc_roots::shadow_stack_get(pat_slot), string())?;
     let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_buffer_obj);
     let w_buffer = || pyre_object::gc_roots::shadow_stack_get(buffer_slot);
@@ -1813,7 +1811,12 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
             }
         };
         Some(if repl_bytes.contains(&b'\\') {
-            parse_replacement_template(w_repl(), repl_bytes, pat, is_bytes)?
+            parse_replacement_template(
+                w_repl(),
+                repl_bytes,
+                pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                is_bytes,
+            )?
         } else {
             // `subx` literal arm: no backslash, so the replacement is copied
             // verbatim and the template compiler is not invoked.
@@ -1835,12 +1838,26 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         }
         last = mend;
         if let Some(items) = &template {
-            let m = make_match_from_snapshot(pat, string(), w_buffer(), snap, 0, endpos as i64);
+            let m = make_match_from_snapshot(
+                pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                string(),
+                w_buffer(),
+                snap,
+                0,
+                endpos as i64,
+            );
             expand_into(&mut out, items, m as *const W_SRE_Match, subject_now());
         } else {
             // interp_sre.py:505-513 — callable filter; None means "no
             // piece" (treated as empty), otherwise the returned string.
-            let m = make_match_from_snapshot(pat, string(), w_buffer(), snap, 0, endpos as i64);
+            let m = make_match_from_snapshot(
+                pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                string(),
+                w_buffer(),
+                snap,
+                0,
+                endpos as i64,
+            );
             let w_piece = crate::call::call_function_impl_result(w_repl(), &[m])?;
             if !unsafe { is_none(w_piece) } {
                 match subj {
@@ -1880,7 +1897,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
             0,
             endpos,
             code,
-            pat,
+            pyre_object::gc_roots::shadow_stack_get(pat_slot),
             count,
             on_match,
         )?,
@@ -1889,7 +1906,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
             0,
             endpos,
             code,
-            pat,
+            pyre_object::gc_roots::shadow_stack_get(pat_slot),
             count,
             on_match,
         )?,
@@ -1949,9 +1966,18 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         .copied()
         .ok_or_else(|| crate::PyError::type_error("split requires self and string"))?;
     let string = required_arg_kw(args, 1, kwargs, "string", "split")?;
-    let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
-    let string_slot = pyre_object::gc_roots::pin_roots(&[string]);
-    let (subj, w_buffer) = make_subject(pat, pyre_object::gc_roots::shadow_stack_get(string_slot))?;
+    // The pattern and the subject are published together: the count conversion
+    // and the result list both allocate, and the pattern is read again after
+    // each of them.
+    let pat_slot = pyre_object::gc_roots::publish_roots(&[pat]);
+    let string_slot = pyre_object::gc_roots::publish_roots(&[string]);
+    pyre_object::gc_roots::normalize_roots(pat_slot, 2);
+    let code = get_code(pyre_object::gc_roots::shadow_stack_get(pat_slot))
+        .ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
+    let (subj, w_buffer) = make_subject(
+        pyre_object::gc_roots::shadow_stack_get(pat_slot),
+        pyre_object::gc_roots::shadow_stack_get(string_slot),
+    )?;
     let buffer_slot = pyre_object::gc_roots::pin_roots(&[w_buffer]);
     // `subj` borrows the payload, and everything below allocates. Re-read it
     // through the pinned subject objects after each allocation.
@@ -1962,7 +1988,10 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         )
     };
     let maxsplit = arg_int_kw(args, 2, kwargs, "maxsplit", 0)?;
-    let num_groups = unsafe { (*(pat as *const W_SRE_Pattern)).num_groups }.max(0) as usize;
+    let num_groups = unsafe {
+        (*(pyre_object::gc_roots::shadow_stack_get(pat_slot) as *const W_SRE_Pattern)).num_groups
+    }
+    .max(0) as usize;
     let w_empty = RootedObject::pin(empty_subject(subj));
 
     let endpos = subject_now().len();
@@ -2003,7 +2032,7 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             0,
             endpos,
             code,
-            pat,
+            pyre_object::gc_roots::shadow_stack_get(pat_slot),
             maxsplit,
             on_match,
         )?,
@@ -2012,7 +2041,7 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             0,
             endpos,
             code,
-            pat,
+            pyre_object::gc_roots::shadow_stack_get(pat_slot),
             maxsplit,
             on_match,
         )?,

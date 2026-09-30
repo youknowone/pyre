@@ -174,12 +174,14 @@ fn find_duplicate_kwarg(
     keyword_names_w: &[PyObjectRef],
     w_function: PyObjectRef,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
+    let existing_len = existingkeywords_w.len();
+    let names_len = keyword_names_w.len();
     let roots = pyre_object::gc_roots::push_roots();
     let function_slot = roots.pin_roots(&[w_function]);
     let existing_base = roots.pin_roots(existingkeywords_w);
     let names_base = roots.pin_roots(keyword_names_w);
-    let mut existing_now = existingkeywords_w.to_vec();
-    for i in 0..keyword_names_w.len() {
+    let mut existing_now = vec![pyre_object::PY_NULL; existing_len];
+    for i in 0..names_len {
         pyre_object::gc_roots::shadow_stack_copy_range(existing_base, &mut existing_now);
         if contains_w_names(roots.get(names_base + i), &existing_now) {
             return Some((roots.get(names_base + i), roots.get(function_slot)));
@@ -806,6 +808,7 @@ impl Arguments {
         // `arguments_w` are published here and read back where the second arm
         // uses them; none of the three sits in storage a root walker updates.
         let _roots = pyre_object::gc_roots::push_roots();
+        let has_starstar = w_starstararg.is_some();
         let root_base = pyre_object::gc_roots::pin_roots(&[
             w_starstararg.unwrap_or(pyre_object::PY_NULL),
             w_function,
@@ -824,7 +827,7 @@ impl Arguments {
         // the helper runs whether or not it produced any keys, mirroring
         // PyPy's unconditional `self.keyword_names_w = ...` at lines
         // 145-150.
-        if w_starstararg.is_some() {
+        if has_starstar {
             let args_base = pyre_object::gc_roots::pin_roots(&self.arguments_w[..]);
             let mut names = self.keyword_names_w.take().unwrap_or_default();
             let mut values = self.keywords_w.take().unwrap_or_default();
@@ -1171,7 +1174,7 @@ impl Arguments {
         // positional copy above are in it already, and every later store goes
         // through `store` so the refresh before `Ok(())` reads the whole scope
         // back at its current addresses.
-        let scope_base = pyre_object::gc_roots::pin_roots(&scope_w[..]);
+        let scope_base = pyre_object::gc_roots::pin_roots(scope_w);
         let store = |scope_w: &mut [PyObjectRef], index: usize, w_value: PyObjectRef| {
             scope_w[index] = w_value;
             pyre_object::gc_roots::shadow_stack_set(scope_base + index, w_value);
@@ -1314,7 +1317,7 @@ impl Arguments {
         if too_many_args {
             let mut kwonly_given: usize = 0;
             for i in co_argcount..(co_argcount + co_kwonlyargcount) {
-                if !scope_w[i].is_null() {
+                if !pyre_object::gc_roots::shadow_stack_get(scope_base + i).is_null() {
                     kwonly_given += 1;
                 }
             }
@@ -1342,7 +1345,7 @@ impl Arguments {
             let mut missing_kwonly: Option<Vec<String>> = None;
             // argument.py:306-315 — posonly defaults.
             for i in input_argcount..co_argcount {
-                if !scope_w[i].is_null() {
+                if !pyre_object::gc_roots::shadow_stack_get(scope_base + i).is_null() {
                     continue;
                 }
                 let defnum = (i as isize) - def_first;
@@ -1358,7 +1361,7 @@ impl Arguments {
             }
             // argument.py:317-333 — kwonly defaults via w_kw_defs dict.
             for i in co_argcount..(co_argcount + co_kwonlyargcount) {
-                if !scope_w[i].is_null() {
+                if !pyre_object::gc_roots::shadow_stack_get(scope_base + i).is_null() {
                     continue;
                 }
                 let name = signature.argnames[i];

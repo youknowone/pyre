@@ -2084,7 +2084,12 @@ fn set_extension_module_spec(
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
     let bootstrap = pyre_object::with_roots!(module => importlib_bootstrap_module());
-    let ext = pyre_object::with_roots!(module => importlib_bootstrap_external_module());
+    let has_bootstrap = bootstrap.is_some();
+    let mut bootstrap_root = bootstrap.unwrap_or(pyre_object::PY_NULL);
+    let ext = pyre_object::with_roots!(
+        module, bootstrap_root => importlib_bootstrap_external_module()
+    );
+    let bootstrap = has_bootstrap.then(|| bootstrap_root);
     let (Some(bootstrap), Some(ext)) = (bootstrap, ext) else {
         return Ok(());
     };
@@ -4852,6 +4857,10 @@ fn load_source_module(
     let canonical = roots.get(globals_slot);
     let mut module = pyre_object::w_module_new_aliasing_dict(modulename, canonical);
     pyre_object::with_roots!(module => set_sys_module(modulename, module));
+    // Exec and the sys.modules reads below can collect. The identity compare
+    // after exec has to see the same module the dict entry was updated to.
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(module);
 
     // A source copy of the public submodule (`from . import _bootstrap` once
     // `_frozen_importlib` is blocked) still execs here under the frozen
@@ -4903,7 +4912,7 @@ fn load_source_module(
     // late rewiring). Honour that — PyPy: interp_import.importhook
     // reads sys.modules again after exec_code_module via importcache.
     if let Some(replaced) = check_sys_modules(modulename)
-        && !std::ptr::eq(replaced, module)
+        && !std::ptr::eq(replaced, roots.get(module_slot))
     {
         return Ok(replaced);
     }
@@ -4931,7 +4940,7 @@ fn load_source_module(
         return Err(e);
     }
 
-    Ok(module)
+    Ok(roots.get(module_slot))
 }
 
 /// PyPy installs the importlib bootstrap once while constructing the object
@@ -5598,8 +5607,14 @@ fn absolute_import(
     }
 
     let parts = split_module_name(modulename);
-    let mut first: Option<PyObjectRef> = None;
-    let mut parent: Option<PyObjectRef> = None;
+    // Each iteration's module is read by the next iteration's cache and
+    // package checks, which can collect. The two slots are the leaf's parent
+    // and the top-level module; they start empty and are overwritten when a
+    // part actually loads.
+    let loop_roots = pyre_object::gc_roots::push_roots();
+    let pair = loop_roots.pin_roots(&[pyre_object::PY_NULL, pyre_object::PY_NULL]);
+    let mut has_first = false;
+    let mut has_parent = false;
     let mut prefix: Vec<&Wtf8> = Vec::new();
 
     for (level, &part) in parts.iter().enumerate() {
@@ -5622,7 +5637,8 @@ fn absolute_import(
         // `load_part`, which answers the cache and cannot be asked afterwards.
         let was_cached =
             pyre_object::with_roots!(w_fromlist => modules_cached(&full_name)).is_some();
-        let parent_dirs = match parent {
+        let parent_live = has_parent.then(|| loop_roots.get(pair + 1));
+        let parent_dirs = match parent_live {
             None => None,
             Some(_) if was_cached || modules_block(&full_name) => None,
             Some(mut parent_mod) => {
@@ -5646,7 +5662,7 @@ fn absolute_import(
         // A child whose name is not UTF-8 was answered from `sys.modules`
         // (`was_cached`) or not found; the attribute bind is a `&str` store.
         if !was_cached
-            && let Some(parent_mod) = parent
+            && let Some(mut parent_mod) = has_parent.then(|| loop_roots.get(pair + 1))
             && let Some(part_utf8) = name_utf8(part)
             && let Err(err) = pyre_object::with_roots!(module, w_fromlist => crate::setattr_str(parent_mod, part_utf8, module))
         {
@@ -5664,10 +5680,14 @@ fn absolute_import(
             }
         }
         if level == 0 {
-            first = Some(module);
+            has_first = true;
+            loop_roots.set(pair, module);
         }
-        parent = Some(module);
+        has_parent = true;
+        loop_roots.set(pair + 1, module);
     }
+    let mut first = has_first.then(|| loop_roots.get(pair));
+    drop(loop_roots);
 
     // PyPy: if w_fromlist is not None, return the leaf module.
     // Otherwise, return the first (top-level) module.
@@ -7853,8 +7873,13 @@ fn import_from_slow(mut module: PyObjectRef, name: &str) -> Result<PyObjectRef, 
     // it twice runs a `__getattr__`- or descriptor-backed `__name__` twice,
     // which the single protected read upstream does not.
     let _roots = pyre_object::gc_roots::push_roots();
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module);
     let pkgname_slot = pyre_object::gc_roots::shadow_stack_len();
-    let (w_pkgname, named) = match crate::baseobjspace::getattr_str(module, "__name__") {
+    let (w_pkgname, named) = match crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+        "__name__",
+    ) {
         Ok(v) if unsafe { pyre_object::is_str(v) } => (v, true),
         _ => (
             pyre_object::w_str_new_managed("<unknown module name>"),
@@ -7891,7 +7916,10 @@ fn import_from_slow(mut module: PyObjectRef, name: &str) -> Result<PyObjectRef, 
     // a missing / None path takes the default.
     // pypy/module/imp/importing.py get_path — a non-str `__file__`
     // (including None) reports the location as unknown.
-    let w_pkgpath = match crate::baseobjspace::getattr_str(module, "__file__") {
+    let w_pkgpath = match crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+        "__file__",
+    ) {
         Ok(v) if unsafe { pyre_object::is_str(v) } => v,
         Ok(_) => pyre_object::w_str_new_managed("unknown location"),
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
@@ -7914,7 +7942,7 @@ fn import_from_slow(mut module: PyObjectRef, name: &str) -> Result<PyObjectRef, 
     // Classify the failure through `__spec__`: a same-named file shadowing a
     // search-path module is flagged first, then a module still executing
     // reports the circular-import cause, then an unset submodule slot.
-    let w_spec = get_spec(module)?;
+    let w_spec = get_spec(pyre_object::gc_roots::shadow_stack_get(module_slot))?;
     let spec_slot = pyre_object::gc_roots::shadow_stack_len();
     let w_spec = pyre_object::gc_roots::pin_root(w_spec);
     let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);

@@ -991,10 +991,15 @@ pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyEr
     if args.is_empty() {
         return Err(PyError::type_error("__call__ needs a cdata receiver"));
     }
-    let cdata = cdata_arg(args[0])?;
+    let nargs = args.len();
+    let roots = pyre_object::gc_roots::push_roots();
+    let args_base = roots.pin_roots(args);
+    let cdata = cdata_arg(roots.get(args_base))?;
     let ct = cdata.ctype_ref()?;
     if ct.kind == ctypeobj::KIND_FUNC {
-        return super::ctypefunc::call(ct, cdata.ptr, &args[1..]);
+        let mut rest = vec![pyre_object::PY_NULL; nargs - 1];
+        pyre_object::gc_roots::shadow_stack_copy_range(args_base + 1, &mut rest);
+        return super::ctypefunc::call(ct, cdata.ptr, &rest);
     }
     Err(unsafe { PyError::from_exc_object(cdata_not_callable(ct)) })
 }

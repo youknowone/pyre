@@ -9330,18 +9330,17 @@ impl MiniMarkGC {
     /// carry cards. The sites that owe this call are the item moves in
     /// `pyre_object::listobject`'s `W_ListObject` — `object_insert`,
     /// `object_remove` and `object_drain` each shift items with a bare
-    /// `ptr::copy`, and `object_reverse` permutes them with a bare
-    /// `slice::reverse`. The last one is the one to miss: it moves pointers
-    /// across card pages with no copy to search for, and permuting within an
-    /// array leaves the referenced set identical, so only the card
-    /// granularity makes it a move at all. `object_splice` is not on this
-    /// list — it already calls `list_write_barrier` before its copies.
+    /// `ptr::copy`. `object_reverse` follows `rlist.py ll_reverse` and
+    /// stores through `ll_list_obj_setitem_fast` (`setarrayitem_gc`): the
+    /// host setter (`items_block_set_ref`) records the whole `ItemsBlock`
+    /// in the generic remembered set. `object_splice` is not on this list —
+    /// it already calls `list_write_barrier` before its copies.
     ///
     /// Upstream reaches this barrier from those operations through
     /// `rgc.ll_arraymove`, which `ll_insert_nonneg`, `ll_pop_zero`,
     /// `ll_delitem_nonneg` and `ll_listdelslice_startstop` all call; pyre's
     /// list is not an rtyper-lowered list, so it has no such seam, and the
-    /// four calls are written out at those sites as
+    /// three calls are written out at those sites as
     /// `listobject::list_before_move_barrier`.
     ///
     /// The order was not free. Those sites are prerequisites of a production

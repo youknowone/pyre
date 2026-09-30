@@ -2498,11 +2498,13 @@ fn call_non_function_callable_with_mode(
             mode,
             std::ptr::null_mut(),
         )?;
+        let result_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(result);
         set_orig_class(
-            result,
+            pyre_object::gc_roots::shadow_stack_get(result_slot),
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
         )?;
-        return Ok(result);
+        return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
     }
 
     call_function_carrier_with_mode(
@@ -3348,27 +3350,31 @@ fn call_with_kwargs_in_ctx_impl(
     // transform explicitly: keyword binding below allocates tuples, dicts,
     // and keyword-name strings before the callee frame owns these values.
     let _call_roots = pyre_object::gc_roots::push_roots();
+    let nargs = pos_args.len();
+    let nkwargs = kwargs.len();
     let call_root_base = pyre_object::gc_roots::shadow_stack_len();
-    let callable = pyre_object::gc_roots::pin_root(callable);
-    for &arg in pos_args {
-        let _ = pyre_object::gc_roots::pin_root(arg);
-    }
+    // Publish the whole live set, then one normalize. `pin_root` /
+    // `pin_roots` query after the first write and would leave later
+    // slices invisible to that safepoint.
+    let _ = pyre_object::gc_roots::publish_roots(&[callable]);
+    let _ = pyre_object::gc_roots::publish_roots(pos_args);
     for (_, value) in kwargs {
-        let _ = pyre_object::gc_roots::pin_root(*value);
+        let _ = pyre_object::gc_roots::publish_roots(&[*value]);
     }
+    pyre_object::gc_roots::normalize_roots(call_root_base, 1 + nargs + nkwargs);
+    let callable = pyre_object::gc_roots::shadow_stack_get(call_root_base);
     let current_callable = || pyre_object::gc_roots::shadow_stack_get(call_root_base);
     let current_pos_arg =
         |index: usize| pyre_object::gc_roots::shadow_stack_get(call_root_base + 1 + index);
-    let current_kwarg = |index: usize| {
-        pyre_object::gc_roots::shadow_stack_get(call_root_base + 1 + pos_args.len() + index)
-    };
+    let current_kwarg =
+        |index: usize| pyre_object::gc_roots::shadow_stack_get(call_root_base + 1 + nargs + index);
     // `Arguments` survives the whole dispatch upstream because its
     // `arguments_w`/`keywords_w` lists are traced and updated in place. The
     // builtin ABI passes a raw `&[PyObjectRef]` copy the collector cannot see,
     // so every forward across an allocating call rebuilds the view from the
     // roots pinned above rather than handing on the incoming slices.
     let extend_current_args = |dst: &mut Vec<PyObjectRef>| {
-        for index in 0..pos_args.len() {
+        for index in 0..nargs {
             dst.push(current_pos_arg(index));
         }
     };
@@ -3385,13 +3391,15 @@ fn call_with_kwargs_in_ctx_impl(
     // collections unchanged to its w_function.
     if unsafe { pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE) } {
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
-        return call_with_kwargs_in_ctx(execution_context, func, pos_args, kwargs);
+        let mut rooted_pos = Vec::with_capacity(nargs);
+        extend_current_args(&mut rooted_pos);
+        return call_with_kwargs_in_ctx(execution_context, func, &rooted_pos, &current_kwargs());
     }
     // Binding any of the three overrides below runs Python, so each bound call
     // is dispatched from the roots pinned above rather than from the incoming
     // slices — the same rebuild the builtin ABI arms already do.
     let overridden_args = || {
-        let mut current = Vec::with_capacity(pos_args.len());
+        let mut current = Vec::with_capacity(nargs);
         extend_current_args(&mut current);
         current
     };
@@ -3429,11 +3437,11 @@ fn call_with_kwargs_in_ctx_impl(
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };
         let receiver = unsafe { pyre_object::w_method_get_self(callable) };
-        let mut full_args = Vec::with_capacity(1 + pos_args.len());
+        let mut full_args = Vec::with_capacity(1 + nargs);
         if !receiver.is_null() {
             full_args.push(receiver);
         }
-        full_args.extend_from_slice(pos_args);
+        extend_current_args(&mut full_args);
         return call_with_kwargs_in_ctx_impl(
             execution_context,
             func,
@@ -3459,9 +3467,8 @@ fn call_with_kwargs_in_ctx_impl(
     }
 
     if unsafe { crate::is_function_carrier(callable) } {
-        if unsafe { crate::is_slot_wrapper(callable) }
-            && let Some(&receiver) = pos_args.first()
-        {
+        if unsafe { crate::is_slot_wrapper(callable) } && nargs > 0 {
+            let receiver = current_pos_arg(0);
             crate::typedef::slot_wrapper_check_instance(callable, receiver)?;
         }
         let code = unsafe { crate::getcode(callable) };
@@ -3494,28 +3501,32 @@ fn call_with_kwargs_in_ctx_impl(
             {
                 // `descr_check` before the binder, as above: a keyword that
                 // names nothing is reported only once the receiver stands.
+                let check_pos = overridden_args();
                 unsafe {
                     crate::gateway::builtin_code_check_receiver(
                         code as *const crate::gateway::BuiltinCode,
-                        pos_args,
+                        &check_pos,
                     )
                 }?;
+                let name_pos = overridden_args();
                 let fname = unsafe {
                     crate::gateway::builtin_code_call_name(
                         code as pyre_object::PyObjectRef,
-                        pos_args.first().copied(),
+                        name_pos.first().copied(),
                     )
                 };
-                let bound = match bind_kwargs_to_signature(sig, &fname, pos_args, kwargs) {
+                let bind_pos = overridden_args();
+                let bound = match bind_kwargs_to_signature(sig, &fname, &bind_pos, kwargs) {
                     Ok(bound) => bound,
                     Err(err) => {
                         let kw_names: Vec<Wtf8Buf> =
                             kwargs.iter().map(|(name, _)| name.clone()).collect();
+                        let err_pos = overridden_args();
                         return Err(unsafe {
                             crate::gateway::builtin_code_binding_error(
                                 code as pyre_object::PyObjectRef,
                                 sig,
-                                pos_args,
+                                &err_pos,
                                 &kw_names,
                                 err,
                             )
@@ -3556,7 +3567,7 @@ fn call_with_kwargs_in_ctx_impl(
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
                         (0..kwargs.len()).map(current_kwarg).collect();
                     let refreshed_pos: Vec<pyre_object::PyObjectRef> =
-                        (0..pos_args.len()).map(current_pos_arg).collect();
+                        (0..nargs).map(current_pos_arg).collect();
                     let refreshed_kwargs: Vec<(Wtf8Buf, PyObjectRef)> = kwargs
                         .iter()
                         .enumerate()
@@ -3609,7 +3620,7 @@ fn call_with_kwargs_in_ctx_impl(
                     let _ = pyre_object::gc_roots::pin_root(w_res);
                     if !ec.is_null() {
                         let arguments = crate::argument::Arguments::with_kw(
-                            &(0..pos_args.len()).map(current_pos_arg).collect::<Vec<_>>(),
+                            &(0..nargs).map(current_pos_arg).collect::<Vec<_>>(),
                             &(0..kwargs.len()).map(current_kw_name).collect::<Vec<_>>(),
                             &(0..kwargs.len()).map(current_kwarg).collect::<Vec<_>>(),
                         );
@@ -3639,7 +3650,7 @@ fn call_with_kwargs_in_ctx_impl(
                 return Err(unsafe {
                     crate::builtin_code_no_keyword_arguments(
                         code as pyre_object::PyObjectRef,
-                        pos_args.first().copied(),
+                        (nargs > 0).then(|| current_pos_arg(0)),
                     )
                 });
             }
@@ -3685,8 +3696,7 @@ fn call_with_kwargs_in_ctx_impl(
                     pyre_object::w_dict_store(kw_roots.get(kw_slot), marker_key, marker_value);
                 }
             }
-            let mut full_args: Vec<PyObjectRef> =
-                (0..pos_args.len()).map(current_pos_arg).collect();
+            let mut full_args: Vec<PyObjectRef> = (0..nargs).map(current_pos_arg).collect();
             if !kwargs.is_empty() {
                 full_args.push(kw_roots.get(kw_slot));
                 // Step 2 of the Arguments port: when this is a profiled
@@ -3725,7 +3735,7 @@ fn call_with_kwargs_in_ctx_impl(
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
                         (0..kwargs.len()).map(current_kwarg).collect();
                     let refreshed_pos: Vec<pyre_object::PyObjectRef> =
-                        (0..pos_args.len()).map(current_pos_arg).collect();
+                        (0..nargs).map(current_pos_arg).collect();
                     let mut arguments = crate::argument::Arguments::with_kw(
                         &refreshed_pos,
                         &keyword_names_w,
@@ -3769,12 +3779,11 @@ fn call_with_kwargs_in_ctx_impl(
             // *vararg; the error is raised after keyword matching
             // (`argument.py:289`) so a duplicate/positional-only/unknown-keyword
             // error on the same call wins first.
-            let too_many_args = pos_args.len() > n_pos_params && !has_varargs;
+            let too_many_args = nargs > n_pos_params && !has_varargs;
             // Every binding error below goes through
             // `builtins::applevel_binding_error` with the rooted words.
             let binding_error = |err: PyError| {
-                let positional: Vec<PyObjectRef> =
-                    (0..pos_args.len()).map(current_pos_arg).collect();
+                let positional: Vec<PyObjectRef> = (0..nargs).map(current_pos_arg).collect();
                 let kw_names: Vec<Wtf8Buf> = kwargs.iter().map(|(name, _)| name.clone()).collect();
                 crate::builtins::applevel_binding_error(
                     current_callable(),
@@ -3788,7 +3797,7 @@ fn call_with_kwargs_in_ctx_impl(
             let mut result = vec![pyre_object::PY_NULL; total_params];
             // Fill positional args — bound at `n_pos_params` so excess
             // positionals don't spill into kwonly slots.
-            for i in 0..pos_args.len().min(n_pos_params) {
+            for i in 0..nargs.min(n_pos_params) {
                 result[i] = current_pos_arg(i);
             }
             // Match keywords to parameter names
@@ -3884,11 +3893,7 @@ fn call_with_kwargs_in_ctx_impl(
                         if n_pos_params != 1 { "s" } else { "" }
                     )
                 };
-                let given_str = format!(
-                    "{} {}",
-                    pos_args.len(),
-                    if pos_args.len() != 1 { "were" } else { "was" }
-                );
+                let given_str = format!("{} {}", nargs, if nargs != 1 { "were" } else { "was" });
                 let mut msg = Wtf8Buf::new();
                 msg.push_wtf8(&fname);
                 msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
@@ -4010,10 +4015,8 @@ fn call_with_kwargs_in_ctx_impl(
             // objects below are the allocations still ahead of the frame.
             let mut packed_tail_slots = Vec::new();
             if has_varargs {
-                let extra_pos: Vec<PyObjectRef> = if pos_args.len() > n_pos_params {
-                    (n_pos_params..pos_args.len())
-                        .map(current_pos_arg)
-                        .collect()
+                let extra_pos: Vec<PyObjectRef> = if nargs > n_pos_params {
+                    (n_pos_params..nargs).map(current_pos_arg).collect()
                 } else {
                     vec![]
                 };
@@ -4093,10 +4096,14 @@ fn call_with_kwargs_in_ctx_impl(
         let type_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(callable);
         let current_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
-        if let Some(result) = type_call_special_case(current_type(), pos_args, !kwargs.is_empty()) {
+        let special_args = overridden_args();
+        if let Some(result) =
+            type_call_special_case(current_type(), &special_args, !kwargs.is_empty())
+        {
             return result;
         }
-        if let Some(result) = type_call_vectorcall(current_type(), pos_args, kwargs) {
+        let vector_args = overridden_args();
+        if let Some(result) = type_call_vectorcall(current_type(), &vector_args, kwargs) {
             return result;
         }
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
@@ -4142,7 +4149,7 @@ fn call_with_kwargs_in_ctx_impl(
         // shape: the former `len >= 2 && args[1] is tuple` condition also
         // captured ordinary constructors such as
         // `_GenericAlias(origin, args, **kw)`.
-        let w_metaclass = if pos_args.len() >= 3
+        let w_metaclass = if nargs >= 3
             && unsafe { pyre_object::is_str(current_pos_arg(0)) }
             && unsafe { pyre_object::is_tuple(current_pos_arg(1)) }
         {
@@ -4158,7 +4165,7 @@ fn call_with_kwargs_in_ctx_impl(
             unsafe { crate::baseobjspace::lookup_in_type(current_metaclass(), "__new__") }
         {
             let new_fn = unsafe { unwrap_static_new(new_fn) };
-            let mut new_args = Vec::with_capacity(1 + pos_args.len());
+            let mut new_args = Vec::with_capacity(1 + nargs);
             // `lookup_in_type` interns its name and can collect; reload the
             // winning metaclass and the arguments rather than retaining their
             // pre-lookup addresses.
@@ -4198,7 +4205,7 @@ fn call_with_kwargs_in_ctx_impl(
             let init_result = if unsafe {
                 crate::is_function(init_descr) || crate::is_slot_wrapper(init_descr)
             } {
-                let mut init_args = Vec::with_capacity(1 + pos_args.len());
+                let mut init_args = Vec::with_capacity(1 + nargs);
                 // The `__new__` result and the constructor arguments are
                 // movable nursery objects, and `__new__` has just run
                 // arbitrary allocating code. Reload every one of them from
@@ -4213,17 +4220,20 @@ fn call_with_kwargs_in_ctx_impl(
                     &current_kwargs(),
                 )?
             } else {
+                // One pin covers the descriptor and the instance type: a
+                // per-value pin would collect before the second word was visible.
+                let init_slot = pyre_object::gc_roots::pin_roots(&[init_descr, w_insttype]);
                 let init_fn = unsafe {
                     crate::baseobjspace::get(
-                        init_descr,
+                        pyre_object::gc_roots::shadow_stack_get(init_slot),
                         pyre_object::gc_roots::shadow_stack_get(instance_slot),
-                        w_insttype,
+                        pyre_object::gc_roots::shadow_stack_get(init_slot + 1),
                     )?
                 }
-                .unwrap_or(init_descr);
+                .unwrap_or_else(|| pyre_object::gc_roots::shadow_stack_get(init_slot));
                 // Binding the descriptor allocates, so the arguments are
                 // reloaded after it rather than before.
-                let mut init_args = Vec::with_capacity(pos_args.len());
+                let mut init_args = Vec::with_capacity(nargs);
                 extend_current_args(&mut init_args);
                 call_with_kwargs_in_ctx(execution_context, init_fn, &init_args, &current_kwargs())?
             };
@@ -4236,11 +4246,11 @@ fn call_with_kwargs_in_ctx_impl(
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };
         let w_self = unsafe { pyre_object::w_method_get_self(callable) };
-        let mut full_args = Vec::with_capacity(1 + pos_args.len());
+        let mut full_args = Vec::with_capacity(1 + nargs);
         if !w_self.is_null() {
             full_args.push(w_self);
         }
-        full_args.extend_from_slice(pos_args);
+        extend_current_args(&mut full_args);
         return call_with_kwargs_in_ctx_impl(
             execution_context,
             func,
@@ -4256,7 +4266,7 @@ fn call_with_kwargs_in_ctx_impl(
         // Arguments view from the roots installed at function entry instead
         // of forwarding the stale incoming slices.
         if prepend_receiver {
-            let mut call_args = Vec::with_capacity(1 + pos_args.len());
+            let mut call_args = Vec::with_capacity(1 + nargs);
             call_args.push(current_callable());
             extend_current_args(&mut call_args);
             return call_with_kwargs_in_ctx(
@@ -4270,7 +4280,7 @@ fn call_with_kwargs_in_ctx_impl(
         // keep it off the tail so a self-referential `A.__call__ = A()`
         // recurses natively for stack_check (see call_callable_with_mode).
         let _depth_guard = enter_native_dispatch();
-        let mut call_args = Vec::with_capacity(pos_args.len());
+        let mut call_args = Vec::with_capacity(nargs);
         extend_current_args(&mut call_args);
         return call_with_kwargs_in_ctx(execution_context, call_fn, &call_args, &current_kwargs());
     }
@@ -4280,13 +4290,21 @@ fn call_with_kwargs_in_ctx_impl(
     // `result.__orig_class__ = self`.
     if unsafe { pyre_object::is_generic_alias(callable) } {
         let origin = unsafe { pyre_object::w_generic_alias_get_origin(callable) };
-        let result = call_with_kwargs_in_ctx(execution_context, origin, pos_args, kwargs)?;
-        set_orig_class(result, callable)?;
-        return Ok(result);
+        let alias_args = overridden_args();
+        let result =
+            call_with_kwargs_in_ctx(execution_context, origin, &alias_args, &current_kwargs())?;
+        let result_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(result);
+        set_orig_class(
+            pyre_object::gc_roots::shadow_stack_get(result_slot),
+            current_callable(),
+        )?;
+        return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
     }
 
     // Fallback: call_callable with positional args only
-    call_callable_in_ctx(execution_context, callable, pos_args)
+    let fallback_args = overridden_args();
+    call_callable_in_ctx(execution_context, current_callable(), &fallback_args)
 }
 
 pub fn register_build_class() {
@@ -4506,8 +4524,13 @@ pub fn call_function_impl_result(
         if pyre_object::is_generic_alias(callable) {
             let origin = pyre_object::w_generic_alias_get_origin(callable);
             let result = call_function_impl_result(origin, &reloaded_args())?;
-            set_orig_class(result, _roots.get(root_base))?;
-            return Ok(result);
+            let result_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(result);
+            set_orig_class(
+                pyre_object::gc_roots::shadow_stack_get(result_slot),
+                _roots.get(root_base),
+            )?;
+            return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
         }
         if let Some((call_fn, prepend_receiver)) =
             user_call_slot(pyre_object::gc_roots::shadow_stack_get(root_base))?
@@ -5950,12 +5973,15 @@ fn build_class_inner(
     let _ = pyre_object::gc_roots::pin_root(body_fn);
     let bases = || bases_scope.get(bases_slot);
     // `__prepare__` / the metaclass `__new__` run Python. The parameter is a
-    // raw copy; getattr_str pins its own and does not rewrite this native.
-    let metaclass_slot = w_metaclass.map(|w_metaclass| {
+    // raw copy; read it once into a slot before any of those calls.
+    let has_metaclass = w_metaclass.is_some();
+    let metaclass_slot = if has_metaclass {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_metaclass);
-        slot
-    });
+        let _ = pyre_object::gc_roots::pin_root(w_metaclass.unwrap_or(pyre_object::PY_NULL));
+        Some(slot)
+    } else {
+        None
+    };
     let w_metaclass_live = || metaclass_slot.map(pyre_object::gc_roots::shadow_stack_get);
 
     // Call metaclass.__prepare__(name, bases, **kwds) if it exists.
@@ -6199,6 +6225,18 @@ fn build_class_inner(
     let mapping_namespace = w_namespace_root
         .map(pyre_object::gc_roots::shadow_stack_get)
         .filter(|&w| unsafe { !pyre_object::is_dict(w) });
+    // The prepared mapping is live across the class body and the replay
+    // below. Read the Option before any of those calls and keep the word
+    // in one slot.
+    let has_mapping_namespace = mapping_namespace.is_some();
+    let mapping_word = mapping_namespace.unwrap_or(pyre_object::PY_NULL);
+    let prepared_mapping_slot = if has_mapping_namespace {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(mapping_word);
+        slot
+    } else {
+        0
+    };
 
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
@@ -6217,12 +6255,10 @@ fn build_class_inner(
     // `__classdict__` cells close over class_ns, so STORE_NAME must update that
     // same object rather than a temporary copy.
     let _ns_root = pyre_object::gc_roots::push_roots();
-    let (body_ns, body_ns_root): (PyObjectRef, Option<usize>) = match mapping_namespace {
-        Some(w_ns) => (w_ns, None),
-        None => {
-            let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-            (class_ns, Some(class_ns_root))
-        }
+    let body_ns = if has_mapping_namespace {
+        pyre_object::gc_roots::shadow_stack_get(prepared_mapping_slot)
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(class_ns_root)
     };
     frame.setdictscope(body_ns)?;
 
@@ -6242,15 +6278,20 @@ fn build_class_inner(
     // dereference reclaimed memory (`resolve_dict_backing` / `w_dict_items`
     // below, then `__set_name__`).
     let body_ns = frame.get_w_locals();
-    let mapping_namespace = mapping_namespace.map(|_| body_ns);
+    if has_mapping_namespace {
+        pyre_object::gc_roots::shadow_stack_set(prepared_mapping_slot, body_ns);
+    }
+    let body_is_mapping = has_mapping_namespace;
 
     // The body wrote through `body_ns`; mirror its final contents into
     // class_ns for the downstream type construction (classcell capture,
     // create_all_slots, __set_name__), which read class_ns.
     {
-        let w_ns = body_ns_root
-            .map(pyre_object::gc_roots::shadow_stack_get)
-            .unwrap_or(body_ns);
+        let w_ns = if has_mapping_namespace {
+            pyre_object::gc_roots::shadow_stack_get(prepared_mapping_slot)
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(class_ns_root)
+        };
         let ns_slot = pyre_object::gc_roots::shadow_stack_len();
         let w_ns = pyre_object::gc_roots::pin_root(w_ns);
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
@@ -6288,7 +6329,7 @@ fn build_class_inner(
                 let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
                 unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(class_ns, &key, value) };
             }
-        } else if distinct_namespace && w_metaclass.is_some() {
+        } else if distinct_namespace && has_metaclass {
             // A custom metaclass receives the raw mapping unchanged (passed
             // below) and owns its enumeration — `type.__new__` runs
             // `PyMapping_Keys` itself.  The mapping must therefore not be
@@ -6327,20 +6368,25 @@ fn build_class_inner(
             )?;
             let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
             let keys = crate::builtins::collect_iterable(keys_obj)?;
-            for key in keys {
+            let nkeys = keys.len();
+            let key_base = pyre_object::gc_roots::pin_roots(&keys);
+            for index in 0..nkeys {
+                let key = pyre_object::gc_roots::shadow_stack_get(key_base + index);
                 if !unsafe { pyre_object::is_str(key) } {
                     continue;
                 }
                 let value = crate::baseobjspace::getitem(
                     pyre_object::gc_roots::shadow_stack_get(ns_slot),
-                    key,
+                    pyre_object::gc_roots::shadow_stack_get(key_base + index),
                 )?;
                 if !value.is_null() {
                     let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
                     unsafe {
                         pyre_object::w_dict_setitem_wtf8_no_proxy(
                             class_ns,
-                            pyre_object::w_str_get_wtf8(key),
+                            pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                                key_base + index,
+                            )),
                             value,
                         )
                     };
@@ -6360,11 +6406,13 @@ fn build_class_inner(
                 pyre_object::gc_roots::shadow_stack_get(orig_bases_slot),
             )
         };
-        if let Some(w_ns) = mapping_namespace {
+        if has_mapping_namespace {
             // Interning the key still allocates on a first sighting, so
             // the mapping is reloaded after the pin.
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_ns);
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(
+                prepared_mapping_slot,
+            ));
             let key_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
                 "__orig_bases__",
@@ -6392,26 +6440,28 @@ fn build_class_inner(
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         unsafe { pyre_object::w_dict_getitem_str(class_ns, "__classcell__") }
     };
-    if w_metaclass.is_none()
-        && classcell.is_some_and(|value| unsafe { !pyre_object::is_cell(value) })
-    {
-        let value = classcell.unwrap();
+    // Read the Option once. Later checks reload the word from the slot:
+    // metaclass construction collects before the cell is stored into.
+    let has_classcell = classcell.is_some();
+    let classcell_word = classcell.unwrap_or(pyre_object::PY_NULL);
+    let classcell_is_cell = has_classcell && unsafe { pyre_object::is_cell(classcell_word) };
+    if !has_metaclass && has_classcell && !classcell_is_cell {
         return Err(crate::builtins::cell_slot_type_error(
             "__classcell__",
-            value,
+            classcell_word,
         ));
     }
-    // typeobject.py `_store_type_in_classcell` runs after metaclass /
-    // `w_type_new` / `__set_name__`, all of which collect. Pin the cell
-    // the way `__classdictcell__` is pinned below; a raw local is left
-    // pointing at the from-space word (empty cell → NameError __class__,
-    // poison → SEGV in w_type_ready).
-    let classcell_root = classcell
-        .filter(|value| unsafe { pyre_object::is_cell(*value) })
-        .map(|cell| {
-            let _ = pyre_object::gc_roots::pin_root(cell);
-            pyre_object::gc_roots::shadow_stack_len() - 1
-        });
+    // `_store_type_in_classcell` runs after metaclass / `w_type_new` /
+    // `__set_name__`, all of which collect. Pin the cell the way
+    // `__classdictcell__` is pinned below.
+    let classcell_slot = if has_classcell {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(classcell_word);
+        Some(slot)
+    } else {
+        None
+    };
+    let classcell_root = classcell_slot.filter(|_| classcell_is_cell);
     // CPython 3.14 type_new_set_classdict: compiler-generated annotation
     // functions and comprehensions capture `__classdict__` through this
     // separate cell.  type.__new__ consumes the namespace entry and replaces
@@ -6422,9 +6472,7 @@ fn build_class_inner(
         // `type_new_set_classdictcell` refuses a non-cell value; only the
         // default shortcut has to spell it here, because a custom metaclass
         // reaches `type.__new__` and is refused there.
-        if w_metaclass.is_none()
-            && cell.is_some_and(|value| unsafe { !pyre_object::is_cell(value) })
-        {
+        if !has_metaclass && cell.is_some_and(|value| unsafe { !pyre_object::is_cell(value) }) {
             return Err(crate::builtins::cell_slot_type_error(
                 "__classdictcell__",
                 cell.unwrap(),
@@ -6460,7 +6508,7 @@ fn build_class_inner(
     let w_effective_bases = pyre_object::gc_roots::pin_root(w_effective_bases);
     // A custom metaclass owns its bases until (and unless) it invokes
     // type.__new__; do not perform type's C3 validation before dispatch.
-    if w_metaclass.is_none() {
+    if !has_metaclass {
         let w_effective_bases = pyre_object::gc_roots::shadow_stack_get(bases_root);
         unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, false)? };
     }
@@ -6468,12 +6516,12 @@ fn build_class_inner(
     // PyPy: typeobject.py — metaclass(name, bases, dict_w) or type.__new__
     // Keep the default path's fresh managed namespace rooted until slot
     // creation, __set_name__, and classcell binding have all completed.
-    let _dict_root = if w_metaclass.is_none() {
+    let _dict_root = if !has_metaclass {
         Some(pyre_object::gc_roots::push_roots())
     } else {
         None
     };
-    let w_type = if let Some(w_metaclass) = w_metaclass_live() {
+    let w_type = if has_metaclass {
         let _metaclass_ns_root = pyre_object::gc_roots::push_roots();
         let mut w_namespace_dict_root = None;
         // Convert class namespace to a dict for metaclass call.
@@ -6487,7 +6535,7 @@ fn build_class_inner(
             // directly against the mapping (setdictscope above) it
             // already holds every store; replaying would re-run __setitem__
             // and, for _EnumDict, reject the duplicate member keys.
-            if mapping_namespace.is_none() {
+            if !body_is_mapping {
                 let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
                 let keys: Vec<Wtf8Buf> = unsafe {
                     pyre_object::w_dict_str_entries_wtf8(class_ns)
@@ -6506,7 +6554,7 @@ fn build_class_inner(
                     }
                     let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
                     // `w_prepared_dict` is an exact `dict` on this branch
-                    // (`mapping_namespace.is_none()`), so no user code runs.
+                    // (`!body_is_mapping`), so no user code runs.
                     unsafe {
                         pyre_object::w_dict_setitem_wtf8_no_proxy(w_prepared_dict, &key, value)
                     };
@@ -6554,7 +6602,7 @@ fn build_class_inner(
             let has_extra = unsafe { pyre_object::is_dict(kw) && pyre_object::w_dict_len(kw) > 0 };
             if has_extra {
                 call_metaclass_with_kwargs(
-                    w_metaclass_live().unwrap_or(w_metaclass),
+                    w_metaclass_live().unwrap_or(pyre_object::PY_NULL),
                     pyre_object::gc_roots::shadow_stack_get(name_slot),
                     bases(),
                     w_namespace_dict,
@@ -6562,7 +6610,7 @@ fn build_class_inner(
                 )
             } else {
                 crate::call_function(
-                    w_metaclass_live().unwrap_or(w_metaclass),
+                    w_metaclass_live().unwrap_or(pyre_object::PY_NULL),
                     &[
                         pyre_object::gc_roots::shadow_stack_get(name_slot),
                         bases(),
@@ -6572,7 +6620,7 @@ fn build_class_inner(
             }
         } else {
             crate::call_function(
-                w_metaclass_live().unwrap_or(w_metaclass),
+                w_metaclass_live().unwrap_or(pyre_object::PY_NULL),
                 &[
                     pyre_object::gc_roots::shadow_stack_get(name_slot),
                     bases(),
@@ -6603,12 +6651,12 @@ fn build_class_inner(
         // typeobject.py `_store_type_in_classcell` validates the value before
         // deleting it.  The default-metaclass shortcut bypasses
         // `type.__new__`, so it must preserve that check here too.
-        if let Some(w_classcell) = classcell
-            && !unsafe { pyre_object::is_cell(w_classcell) }
+        if let Some(classcell_slot) = classcell_slot
+            && !classcell_is_cell
         {
             return Err(crate::builtins::cell_slot_type_error(
                 "__classcell__",
-                w_classcell,
+                pyre_object::gc_roots::shadow_stack_get(classcell_slot),
             ));
         }
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
@@ -6737,6 +6785,11 @@ fn build_class_inner(
         }
         pyre_object::gc_roots::shadow_stack_get(w_root)
     };
+    // Class-cell checks and `__init_subclass__` run Python after this
+    // binding. Keep the class object in a slot and read it back.
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    let w_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
 
     // `_store_type_in_classcell` runs inside type.__new__, which the
     // metaclass path reaches; the default path builds via raw
@@ -6756,19 +6809,19 @@ fn build_class_inner(
     //                     "__class__ set to %S defining %S as %S", ...)
     if let Some(classcell_root) = classcell_root {
         let classcell = pyre_object::gc_roots::shadow_stack_get(classcell_root);
-        if w_metaclass.is_some() && unsafe { pyre_object::is_type(w_type) } {
+        if has_metaclass && unsafe { pyre_object::is_type(w_type()) } {
             let cell_value = unsafe { pyre_object::w_cell_get(classcell) };
             if cell_value.is_null() {
-                let class_str = unsafe { crate::py_str_wtf8(w_type) }?;
+                let class_str = unsafe { crate::py_str_wtf8(w_type()) }?;
                 return Err(PyError::runtime_error(crate::display::wtf8_format!(
                     format!("__class__ not set defining {name} as "),
                     class_str,
                     ". Was __classcell__ propagated to type.__new__?",
                 )));
             }
-            if !std::ptr::eq(cell_value, w_type) {
+            if !std::ptr::eq(cell_value, w_type()) {
                 let cell_str = unsafe { crate::py_str_wtf8(cell_value) }?;
-                let class_str = unsafe { crate::py_str_wtf8(w_type) }?;
+                let class_str = unsafe { crate::py_str_wtf8(w_type()) }?;
                 return Err(PyError::type_error(crate::display::wtf8_format!(
                     "__class__ set to ",
                     cell_str,
@@ -6777,7 +6830,7 @@ fn build_class_inner(
                 )));
             }
         } else {
-            unsafe { pyre_object::w_cell_set(classcell, w_type) };
+            unsafe { pyre_object::w_cell_set(classcell, w_type()) };
         }
     }
 
@@ -6785,10 +6838,10 @@ fn build_class_inner(
     // normally binds it inside type.__new__.  Retain this final validation/
     // fallback for a custom metaclass returning a type without delegating.
     if let Some(classdictcell_root) = classdictcell_root
-        && unsafe { pyre_object::is_type(w_type) }
+        && unsafe { pyre_object::is_type(w_type()) }
     {
         let classdictcell = pyre_object::gc_roots::shadow_stack_get(classdictcell_root);
-        let type_dict = unsafe { pyre_object::w_type_get_dict_ptr(w_type) as PyObjectRef };
+        let type_dict = unsafe { pyre_object::w_type_get_dict_ptr(w_type()) as PyObjectRef };
         if !type_dict.is_null() {
             unsafe { pyre_object::w_cell_set(classdictcell, type_dict) };
         }
@@ -6802,7 +6855,7 @@ fn build_class_inner(
     // path routes through `type.__new__` (builtins.rs `type_descr_new`),
     // which fires __init_subclass__ with the subset of keywords the
     // metaclass actually forwarded — so it must NOT be re-fired here.
-    if w_metaclass.is_none() {
+    if !has_metaclass {
         let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> = match current_kwds() {
             Some(kw) if unsafe { pyre_object::is_dict(kw) } => unsafe {
                 pyre_object::w_dict_items(kw)
@@ -6813,13 +6866,13 @@ fn build_class_inner(
             _ => Vec::new(),
         };
         call_init_subclass_on_bases(
-            w_type,
+            w_type(),
             pyre_object::gc_roots::shadow_stack_get(bases_root),
             &init_subclass_kwargs,
         )?;
     }
 
-    Ok(w_type)
+    Ok(w_type())
 }
 
 /// Pack `(name, value)` keyword pairs into the `__pyre_kw__`-tagged
@@ -6894,10 +6947,16 @@ pub(crate) fn call_init_subclass_on_bases(
         .iter()
         .flat_map(|&(key, value)| [key, value])
         .collect();
-    let kwarg_base = pyre_object::gc_roots::pin_roots(&flat);
-    let w_objtype = crate::builtins::super_check(w_type, w_type)?;
+    let kwarg_base = pyre_object::gc_roots::publish_roots(&flat);
+    let type_slot = pyre_object::gc_roots::publish_roots(&[w_type]);
+    pyre_object::gc_roots::normalize_roots(
+        kwarg_base,
+        pyre_object::gc_roots::shadow_stack_len() - kwarg_base,
+    );
+    let w_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
+    let w_objtype = crate::builtins::super_check(w_type(), w_type())?;
     let w_super =
-        pyre_object::descriptor::w_super_new(w_type, w_objtype, w_type, pyre_object::PY_NULL);
+        pyre_object::descriptor::w_super_new(w_type(), w_objtype, w_type(), pyre_object::PY_NULL);
     let w_func = crate::baseobjspace::getattr_str(w_super, "__init_subclass__")?;
     // typeobject.py — `args = __args__.replace_arguments([])` then
     // `space.call_args(w_func, args)`: keywords only, no positionals, and no

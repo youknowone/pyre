@@ -373,10 +373,13 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     // A keyed spec still consumes a positional slot when one
                     // is available (`%(k)s %s` leaves nothing for the `%s`).
                     let _ = pos.next();
-                    let w_value = pyre_object::gc_roots::pin_root(w_value);
+                    // `mapping_star_operands` pins the mapped value when a
+                    // `*` field reads it. The conversion uses that slot.
+                    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(w_value);
                     mapping_star_operands(
                         &mut spec,
-                        w_value,
+                        pyre_object::gc_roots::shadow_stack_get(value_slot),
                         current_deferred
                             .and_then(DeferredPercentError::before_conversion)
                             .is_none(),
@@ -386,7 +389,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     {
                         return Err(PyError::value_error(error.to_string()));
                     }
-                    w_value
+                    pyre_object::gc_roots::shadow_stack_get(value_slot)
                 } else {
                     update_quantity_from_tuple(
                         &mut pos,
@@ -532,10 +535,13 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                         pyre_object::gc_roots::shadow_stack_get(args_slot),
                         pyre_object::gc_roots::shadow_stack_get(key_slot),
                     )?;
-                    let value = pyre_object::gc_roots::pin_root(value);
+                    // `mapping_star_operands` pins the mapped value when a
+                    // `*` field reads it. The conversion uses that slot.
+                    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(value);
                     mapping_star_operands(
                         &mut spec,
-                        value,
+                        pyre_object::gc_roots::shadow_stack_get(value_slot),
                         current_deferred
                             .and_then(DeferredPercentError::before_conversion)
                             .is_none(),
@@ -545,7 +551,10 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                     {
                         return Err(PyError::value_error(error.to_string()));
                     }
-                    result.extend(spec_format_bytes(&spec, value)?);
+                    result.extend(spec_format_bytes(
+                        &spec,
+                        pyre_object::gc_roots::shadow_stack_get(value_slot),
+                    )?);
                 }
             }
         }

@@ -1,40 +1,54 @@
 {
   "darwin": {
-    "base": "ebcb8f09ddfe6c6a2e9fb666a09c36ba456c577a",
-    "brackets_reaching_no_collection": 1,
+    "base": "8145b7a605ec384d54011efcd3c8fdf49e837b0e",
+    "brackets_reaching_no_collection": 10,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
     "frames_across_collecting": 0,
     "frames_across_collecting_fns": 0,
-    "tier15_calls": 101,
-    "tier15_calls_fns": 55,
+    "frames_unresolved_calls": 30,
+    "short_brackets": 2,
+    "stale_pins": 3,
+    "tier15_calls": 0,
+    "tier15_calls_fns": 0,
+    "tier15_unresolved_calls": 4397,
     "tier1_calls": 0,
     "tier1_calls_fns": 0,
-    "unbracketed_calls": 2044,
-    "unbracketed_calls_fns": 826,
+    "unbracketed_calls": 0,
+    "unbracketed_calls_fns": 0,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
-    ]
+    ],
+    "unread_brackets": 387,
+    "unresolved_collecting_calls": 10891,
+    "unresolved_collecting_calls_fns": 2112
   },
   "linux": {
-    "base": "e5dc7a13e494f0d9b612573e9a4f23feb44830a6",
-    "brackets_reaching_no_collection": 7,
+    "base": "66046ac2d53275769790ab940b60ecd91adfea42",
+    "brackets_reaching_no_collection": 10,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
     "frames_across_collecting": 0,
     "frames_across_collecting_fns": 0,
-    "tier15_calls": 76,
-    "tier15_calls_fns": 47,
+    "frames_unresolved_calls": 30,
+    "short_brackets": 2,
+    "stale_pins": 3,
+    "tier15_calls": 0,
+    "tier15_calls_fns": 0,
+    "tier15_unresolved_calls": 4397,
     "tier1_calls": 0,
     "tier1_calls_fns": 0,
-    "unbracketed_calls": 1889,
-    "unbracketed_calls_fns": 773,
+    "unbracketed_calls": 0,
+    "unbracketed_calls_fns": 0,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
-    ]
+    ],
+    "unread_brackets": 387,
+    "unresolved_collecting_calls": 10883,
+    "unresolved_collecting_calls_fns": 2111
   }
 }

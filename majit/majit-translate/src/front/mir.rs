@@ -1432,12 +1432,19 @@ impl<'l> CrateLowering<'l> {
     ) -> Option<crate::model::FunctionGraph> {
         let locals = fd.unstructured_locals()?;
         let mut graph = crate::model::FunctionGraph::new(graph_name_of(self.llbc, fd));
+        let cells = gc_mut_ref_param_locals(
+            &locals,
+            self.llbc,
+            &self.state.tombstoned_leaves,
+            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
+        );
         pygraph_initial_block(
             &mut graph,
             &locals,
             self.llbc,
             fd.generics.as_ref(),
             &self.state.tombstoned_leaves,
+            &cells,
         );
         if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
@@ -1607,12 +1614,19 @@ impl<'l> CrateLowering<'l> {
             .fn_by_id(spec.body.fn_id)
             .expect("a declared specialization names its FunDecl");
         let mut graph = crate::model::FunctionGraph::new(spec.body.segments.join("::"));
+        let cells = gc_mut_ref_param_locals(
+            &spec.body.body.locals,
+            self.llbc,
+            &self.state.tombstoned_leaves,
+            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
+        );
         pygraph_initial_block(
             &mut graph,
             &spec.body.body.locals,
             self.llbc,
             fd.generics.as_ref(),
             &self.state.tombstoned_leaves,
+            &cells,
         );
         if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
@@ -3977,6 +3991,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     spec_body: bool,
 ) -> Result<FunctionGraph, LowerError> {
     let name = graph_name_of(llbc, fd);
+    // `name` is `graph_name_of`: `name_path()` still carries the crate
+    // segment, and a Charon instance is a crate-stripped `__spec_` path.
+    // `dont_look_inside` is keyed by `strip_crate_prefix(name_path())` on
+    // the declaration, which that instance name does not spell.
+    let self_dont_look_inside = fun_decl_is_dont_look_inside(fd, dont_look_inside);
     // The Result-of-PyError exception-link lowering's callee rule
     // applies when this body is a scoped callee (see
     // `front::result_exc`); the caller rule applies to the diamond
@@ -4638,6 +4657,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             tombstoned_leaves,
             accum,
             root_stack,
+            self_dont_look_inside,
         )?;
         if builder_mode {
             lo.enable_builder_mode();
@@ -4690,6 +4710,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         tombstoned_leaves,
         accum,
         root_stack,
+        self_dont_look_inside,
     )?;
     if builder_mode {
         lo.enable_builder_mode();
@@ -4728,6 +4749,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 tombstoned_leaves,
                 accum,
                 root_stack,
+                self_dont_look_inside,
             )?;
             if builder_mode {
                 lo.enable_builder_mode();
@@ -5099,6 +5121,12 @@ fn next_struct_aggregate_ctor(
                 continue;
             }
             if majit_charon_reader::ullbc::is_closure_leaf(name) {
+                continue;
+            }
+            // The callee writes the cell, so the post-call field read is
+            // not the pre-call SSA value. `optimizeopt/virtualize.py`
+            // removes the cell once the callee is inlined.
+            if is_mut_ref_cell_name(name) {
                 continue;
             }
             let ValueType::Ref(Some(owner)) = result_ty else {
@@ -5483,6 +5511,12 @@ fn aggregate_ctor_owner(
         return None;
     }
     if majit_charon_reader::ullbc::is_closure_leaf(name) {
+        return None;
+    }
+    // The callee writes the cell, so the post-call field read is not the
+    // pre-call SSA value. `optimizeopt/virtualize.py` removes the cell
+    // once the callee is inlined.
+    if is_mut_ref_cell_name(name) {
         return None;
     }
     let ValueType::Ref(Some(owner)) = result_ty else {
@@ -6724,6 +6758,9 @@ struct Lowering<'a> {
     /// wrong field.  A local assigned once in the whole body carries the
     /// reaching place at every use of it; a rebound one stays a call.
     atomic_ref_place: std::collections::HashMap<usize, Place>,
+    /// Parameter locals declared `&mut T` where `T` is a GC reference.
+    /// The local holds the one-field cell, not the reference word.
+    gc_mut_ref_params: std::collections::HashSet<usize>,
     /// MIR locals bound to a `core::sync::atomic::Ordering` value, mapped to
     /// the variant's name.
     ///
@@ -6976,6 +7013,7 @@ fn pygraph_initial_block(
     llbc: &Llbc,
     generics: Option<&serde_json::Value>,
     tombstoned_leaves: &std::collections::HashSet<String>,
+    gc_mut_ref_params: &std::collections::HashSet<usize>,
 ) -> Vec<Option<Variable>> {
     let n_locals = locals.locals.len();
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
@@ -7033,10 +7071,19 @@ fn pygraph_initial_block(
         // param is never touched, and a fieldless enum — already
         // resolved to `Int` above regardless of its own zero-sized
         // layout — never reaches this arm.
-        let ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc) {
+        let mut ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc) {
             ValueType::Void
         } else {
             ty
+        };
+        // Same membership as [`gc_mut_ref_param_locals`], including the
+        // residual exclusion: a cell parameter is the `MutRef<T>` the
+        // caller passes, not `T`. Seeding `T` hoists `value` onto `T`'s class.
+        let cell_root = if gc_mut_ref_params.contains(&i) {
+            tyref_mut_ref_pointee(&local.ty, llbc)
+                .and_then(|pointee| mut_ref_cell_root_of(&pointee, llbc, tombstoned_leaves))
+        } else {
+            None
         };
         // `class_root` carries the param's named-ADT leaf so
         // `derive_subject_inputcells` can seed the receiver's
@@ -7060,7 +7107,9 @@ fn pygraph_initial_block(
         // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
         // `RootScope` method form puts `&self` first, so stamping index 1
         // there annotates the receiver and leaves the GC pointer untouched.
-        let class_root = if i == arg_count && gc_root_pin_path(&graph.name) {
+        let class_root = if let Some(root) = &cell_root {
+            Some(root.clone())
+        } else if i == arg_count && gc_root_pin_path(&graph.name) {
             Some("GCREF".to_string())
         } else {
             match &ty {
@@ -7109,6 +7158,9 @@ fn pygraph_initial_block(
                 _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
             }
         };
+        if let Some(root) = cell_root {
+            ty = ValueType::Ref(Some(root));
+        }
         input_ops.push(SpaceOperation {
             result: Some(var.clone()),
             kind: OpKind::Input {
@@ -7146,10 +7198,19 @@ impl<'a> Lowering<'a> {
         tombstoned_leaves: &'a std::collections::HashSet<String>,
         accum: &AccumulatorFacts,
         root_stack: &RootStackAnalyzer<'_>,
+        self_dont_look_inside: bool,
     ) -> Result<Self, LowerError> {
+        let gc_mut_ref_params =
+            gc_mut_ref_param_locals(&body.locals, llbc, tombstoned_leaves, self_dont_look_inside);
         let mut graph = FunctionGraph::new(name);
-        let local_var =
-            pygraph_initial_block(&mut graph, &body.locals, llbc, generics, tombstoned_leaves);
+        let local_var = pygraph_initial_block(
+            &mut graph,
+            &body.locals,
+            llbc,
+            generics,
+            tombstoned_leaves,
+            &gc_mut_ref_params,
+        );
         let n_locals = local_var.len();
         let arg_count = body.locals.arg_count as usize;
         // Pre-allocate a Block for each MIR basic block so terminators
@@ -7245,7 +7306,6 @@ impl<'a> Lowering<'a> {
                 block_entry_local_var[mir_bb].set(local_idx, var);
             }
         }
-
         Ok(Self {
             graph,
             llbc,
@@ -7281,6 +7341,7 @@ impl<'a> Lowering<'a> {
             accum: accum.clone(),
             index_elem_alias: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
+            gc_mut_ref_params,
             atomic_ordering_locals: std::collections::HashMap::new(),
             spec: None,
             spec_body: false,
@@ -8326,6 +8387,15 @@ impl<'a> Lowering<'a> {
                 {
                     self.prebuilt_once_value_locals.push(dest_local);
                 }
+                // `let q = p` keeps the cell ABI. `gc_mut_ref_param_root`
+                // otherwise only names the original parameter local.
+                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                    && !self.multi_assigned_locals.contains(&dest_local)
+                    && let PlaceKind::Local(src_local) = src.kind
+                    && self.gc_mut_ref_params.contains(&(src_local as usize))
+                {
+                    self.gc_mut_ref_params.insert(dest_local);
+                }
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
@@ -8994,6 +9064,21 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         deref_base_is_raw_ptr: bool,
     ) -> Result<Option<OpKind>, LowerError> {
+        // A GC reference behind `&mut` lives in a one-field GC cell for
+        // the duration of the borrow. Copy-in/copy-out is exact because
+        // the borrow is exclusive and does not outlive the call. Raw
+        // memory cannot hold a GC reference, so `*p = v` writes the
+        // cell's `value` field.
+        if let Some(local) = inner_local
+            && let Some(root) = self.gc_mut_ref_param_root(local)
+        {
+            return Ok(Some(OpKind::FieldWrite {
+                base,
+                field: FieldDescriptor::new("value", Some(root)),
+                value: LinkArg::Value(value),
+                ty: ValueType::Ref(None),
+            }));
+        }
         if let Some(local) = inner_local {
             let place = Place {
                 kind: PlaceKind::Projection(
@@ -9034,6 +9119,284 @@ impl<'a> Lowering<'a> {
         Err(LowerError::Unsupported(format!(
             "bb{mir_bb}: deref store is not a field, array element, or raw word"
         )))
+    }
+
+    /// A GC reference behind `&mut` lives in a one-field GC cell for the
+    /// duration of the borrow. Copy-in/copy-out is exact because the borrow
+    /// is exclusive and does not outlive the call. Raw memory cannot hold a
+    /// GC reference.
+    ///
+    /// The pointee has to lower to `ValueType::Ref`, and it has to be a thin
+    /// pointer (raw, borrowed, or a transparent newtype of one) whose target
+    /// also lowers to `Ref`.
+    fn mut_ref_cell_root(&self, pointee: &TyRef) -> Option<String> {
+        mut_ref_cell_root_of(pointee, self.llbc, self.tombstoned_leaves)
+    }
+
+    fn gc_mut_ref_param_root(&self, local: usize) -> Option<String> {
+        if !self.gc_mut_ref_params.contains(&local) {
+            return None;
+        }
+        let ty = &self.body.locals.locals.get(local)?.ty;
+        let pointee = tyref_mut_ref_pointee(ty, self.llbc)?;
+        self.mut_ref_cell_root(&pointee)
+    }
+
+    fn deref_cell_param_local(&self, place: &Place) -> Option<usize> {
+        let PlaceKind::Projection(inner, elem) = &place.kind else {
+            return None;
+        };
+        if !matches!(elem, ProjectionElem::Atom(name) if name == "Deref") {
+            return None;
+        }
+        let PlaceKind::Local(local) = &inner.kind else {
+            return None;
+        };
+        let local = *local as usize;
+        self.gc_mut_ref_params.contains(&local).then_some(local)
+    }
+
+    /// `&mut *p` where `p` is a cell, or a temp whose borrow peels to one.
+    fn reborrow_cell_param(&self, place: &Place) -> Option<usize> {
+        if let Some(cell) = self.deref_cell_param_local(place) {
+            return Some(cell);
+        }
+        let PlaceKind::Projection(inner, elem) = &place.kind else {
+            return None;
+        };
+        if !matches!(elem, ProjectionElem::Atom(name) if name == "Deref") {
+            return None;
+        }
+        let PlaceKind::Local(local) = &inner.kind else {
+            return None;
+        };
+        let recorded = self.atomic_ref_place.get(&(*local as usize))?;
+        let followed = self.concrete_borrow_place(recorded.clone());
+        self.deref_cell_param_local(&followed)
+    }
+
+    fn defined_local(&self, mir_bb: usize, local: usize) -> Result<Variable, LowerError> {
+        self.local_var
+            .get(local)
+            .and_then(Clone::clone)
+            .ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: read of MIR local {local} before any Assign — \
+                     uninitialised local, not yet supported"
+                ))
+            })
+    }
+
+    /// A GC reference behind `&mut` lives in a one-field GC cell for the
+    /// duration of the borrow. Copy-in/copy-out is exact because the borrow
+    /// is exclusive and does not outlive the call. Raw memory cannot hold a
+    /// GC reference, so `*p` reads the cell's `value` field.
+    fn emit_gc_mut_ref_field_read(
+        &mut self,
+        mir_bb: usize,
+        base: Variable,
+        root: &str,
+    ) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let loaded = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new("value", Some(root.to_string())),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        loaded
+    }
+
+    /// A GC reference behind `&mut` lives in a one-field GC cell for the
+    /// duration of the borrow. Copy-in/copy-out is exact because the borrow
+    /// is exclusive and does not outlive the call. Raw memory cannot hold a
+    /// GC reference, so the caller writes the local into the cell and passes
+    /// the cell.
+    fn emit_gc_mut_ref_cell(&mut self, mir_bb: usize, root: &str, value: Variable) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let cell = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let root_owned = root.to_string();
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(cell.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_struct_ctor(
+                    Vec::new(),
+                    root_owned.clone(),
+                ),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some(root_owned.clone())),
+            },
+        });
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: cell.clone(),
+                field: FieldDescriptor::new("value", Some(root_owned)),
+                value: LinkArg::Value(value),
+                ty: ValueType::Ref(None),
+            },
+        });
+        cell
+    }
+
+    fn gc_mut_ref_signature(&self, func: &CallFunc) -> Option<(u64, Vec<(usize, String)>)> {
+        let CallFunc::Regular(reg) = func else {
+            return None;
+        };
+        let id = regular_call_fun_decl_id(&reg.kind)?;
+        let fd = self.llbc.fn_by_id(id)?;
+        // A residual callee is entered through its Rust ABI, which takes
+        // the address of the word. The cell exists only inside a traced body.
+        if fun_decl_is_residual(fd, self.dont_look_inside) {
+            return None;
+        }
+        let mut cells = Vec::new();
+        for (index, ty) in fd.signature.inputs.iter().enumerate() {
+            let Some(pointee) = tyref_mut_ref_pointee(ty, self.llbc) else {
+                continue;
+            };
+            let Some(root) = self.mut_ref_cell_root(&pointee) else {
+                continue;
+            };
+            cells.push((index, root));
+        }
+        if cells.is_empty() {
+            None
+        } else {
+            Some((id, cells))
+        }
+    }
+
+    fn call_target_is_fun(&self, target: &CallTarget, fun_id: u64) -> bool {
+        if target.fun_decl_id() == Some(fun_id) {
+            return true;
+        }
+        if target.fun_decl_id().is_some() {
+            return false;
+        }
+        let Some(decl_path) = self
+            .llbc
+            .fn_by_id(fun_id)
+            .map(|fd| fd.item_meta.name_path())
+        else {
+            return false;
+        };
+        match target {
+            CallTarget::FunctionPath { segments, .. } => path_names_decl(&decl_path, segments),
+            CallTarget::Method {
+                resolved_path: Some(path),
+                ..
+            } => path_names_decl(&decl_path, &path.segments),
+            _ => false,
+        }
+    }
+
+    fn classify_gc_mut_ref_arg(&self, arg_local: Option<usize>) -> Result<GcMutRefArg, LowerError> {
+        let Some(local) = arg_local else {
+            return Err(gc_mut_ref_not_whole_local());
+        };
+        if self.gc_mut_ref_params.contains(&local) {
+            return Ok(GcMutRefArg::CellParam(local));
+        }
+        let Some(recorded) = self.atomic_ref_place.get(&local).cloned() else {
+            return Err(gc_mut_ref_not_whole_local());
+        };
+        let followed = self.concrete_borrow_place(recorded);
+        if let PlaceKind::Local(slot) = &followed.kind {
+            let slot = *slot as usize;
+            if self.gc_mut_ref_params.contains(&slot) {
+                return Ok(GcMutRefArg::CellParam(slot));
+            }
+            return Ok(GcMutRefArg::WholeLocal(slot));
+        }
+        if let Some(cell) = self.deref_cell_param_local(&followed) {
+            return Ok(GcMutRefArg::CellParam(cell));
+        }
+        Err(gc_mut_ref_not_whole_local())
+    }
+
+    fn install_gc_mut_ref_call(
+        &mut self,
+        mir_bb: usize,
+        op_kind: &mut OpKind,
+        sig: &Option<(u64, Vec<(usize, String)>)>,
+        arg_locals: &[Option<usize>],
+        resolved_args: &[Variable],
+    ) -> Result<Vec<(Variable, String, usize)>, LowerError> {
+        let plan = {
+            let Some((fun_id, cells)) = sig else {
+                return Ok(Vec::new());
+            };
+            let OpKind::Call { target, args, .. } = &*op_kind else {
+                return Ok(Vec::new());
+            };
+            if !self.call_target_is_fun(target, *fun_id) || args.len() != resolved_args.len() {
+                return Ok(Vec::new());
+            }
+            let mut plan = Vec::new();
+            for (index, root) in cells {
+                let Some(arg) = args.get(*index).and_then(LinkArg::as_variable) else {
+                    continue;
+                };
+                if arg != &resolved_args[*index] {
+                    continue;
+                }
+                let arg_local = arg_locals.get(*index).copied().flatten();
+                plan.push((
+                    *index,
+                    root.clone(),
+                    self.classify_gc_mut_ref_arg(arg_local)?,
+                ));
+            }
+            plan
+        };
+        let mut copies = Vec::new();
+        let mut replacements = Vec::new();
+        for (index, root, class) in plan {
+            let (local, copy_out) = match class {
+                GcMutRefArg::WholeLocal(local) => (local, true),
+                GcMutRefArg::CellParam(local) => (local, false),
+            };
+            let Some(current) = self.local_var.get(local).and_then(Clone::clone) else {
+                return Err(if copy_out {
+                    gc_mut_ref_not_whole_local()
+                } else {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: GC reference cell {local} before its definition"
+                    ))
+                });
+            };
+            let cell = if copy_out {
+                let cell = self.emit_gc_mut_ref_cell(mir_bb, &root, current);
+                copies.push((cell.clone(), root, local));
+                cell
+            } else {
+                current
+            };
+            replacements.push((index, cell));
+        }
+        let OpKind::Call { args, .. } = op_kind else {
+            return Ok(copies);
+        };
+        for (index, cell) in replacements {
+            args[index] = LinkArg::Value(cell);
+        }
+        Ok(copies)
+    }
+
+    fn copy_out_gc_mut_ref(&mut self, mir_bb: usize, copies: &[(Variable, String, usize)]) {
+        for (cell, root, local) in copies {
+            let loaded = self.emit_gc_mut_ref_field_read(mir_bb, cell.clone(), root);
+            self.local_var[*local] = Some(loaded);
+        }
     }
 
     /// Preserve the declared RPython reference repr of a typed field value.
@@ -9609,7 +9972,19 @@ impl<'a> Lowering<'a> {
             // the value flowing through the reference, not the reference
             // itself. Aliasing the dest local to the referent Variable
             // keeps the IR small, treating `&x` as a same-Variable copy.
-            Rvalue::Ref { place, .. } => {
+            Rvalue::Ref { place, kind, .. } => {
+                // `&mut *p` of a cell parameter is that cell. The reborrow
+                // does not load `value`.
+                if borrow_kind_is_exclusive(&kind)
+                    && let Some(cell) = self.reborrow_cell_param(&place)
+                {
+                    let v = self.local_var.get(cell).and_then(Clone::clone).ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: reborrow of GC reference cell {cell} before its definition"
+                        ))
+                    })?;
+                    return Ok((None, v));
+                }
                 // A `StringBuilder` is a GC reference (`STRINGBUILDERPTR`):
                 // `&mut self._s` is the `getfield` of that reference, not the
                 // address of an inline substructure.
@@ -10639,7 +11014,8 @@ impl<'a> Lowering<'a> {
                 // Atom projections (`Deref` and others) still
                 // collapse: `Deref` is a no-op for typed refs at the
                 // JIT IR level, and any other Atom variant has no
-                // typed analogue today.
+                // typed analogue today. A cell parameter is the
+                // exception: `*p` reads the cell's `value` field.
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
                     && let Some((owner_root, field_name, field_ty, owner_id)) =
@@ -11036,18 +11412,35 @@ impl<'a> Lowering<'a> {
                 }
                 // `*_r` reads the place recorded when `_r` was bound, the
                 // same place a later write updates. The binding itself
-                // holds the value from before that write.
+                // holds the value from before that write. A cell parameter
+                // reads the cell's `value` field instead of collapsing to
+                // the cell pointer.
                 if let ProjectionElem::Atom(name) = &elem
                     && name == "Deref"
-                    && let PlaceKind::Local(local) = inner.kind
-                    && let Some(recorded) = self.atomic_ref_place.get(&(local as usize)).cloned()
+                    && let PlaceKind::Local(local) = &inner.kind
                 {
-                    let followed = self.concrete_borrow_place(recorded);
-                    // A local is the slot `mem::replace` writes. A projection
-                    // stays the borrowed value: re-resolving it would emit a
-                    // fresh field or index read for every borrow.
-                    if matches!(followed.kind, PlaceKind::Local(_)) {
-                        return self.resolve_place(mir_bb, followed);
+                    let local = *local as usize;
+                    if let Some(root) = self.gc_mut_ref_param_root(local) {
+                        let base = self.defined_local(mir_bb, local)?;
+                        return Ok(self.emit_gc_mut_ref_field_read(mir_bb, base, &root));
+                    }
+                    if let Some(recorded) = self.atomic_ref_place.get(&local).cloned() {
+                        let followed = self.concrete_borrow_place(recorded);
+                        // A local is the slot `mem::replace` writes. A projection
+                        // stays the borrowed value: re-resolving it would emit a
+                        // fresh field or index read for every borrow.
+                        if matches!(followed.kind, PlaceKind::Local(_)) {
+                            return self.resolve_place(mir_bb, followed);
+                        }
+                        if let Some(cell) = self.deref_cell_param_local(&followed) {
+                            let root = self.gc_mut_ref_param_root(cell).ok_or_else(|| {
+                                LowerError::Unsupported(format!(
+                                    "bb{mir_bb}: GC reference cell {cell} has no root"
+                                ))
+                            })?;
+                            let base = self.defined_local(mir_bb, cell)?;
+                            return Ok(self.emit_gc_mut_ref_field_read(mir_bb, base, &root));
+                        }
                     }
                 }
                 match elem {
@@ -12957,9 +13350,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return Ok(());
         };
-        let path = strip_crate_prefix(&fd.item_meta.name_path());
-        let residual = !fd.has_unstructured_body() || self.dont_look_inside.contains(&path);
-        if !residual {
+        if !fun_decl_is_residual(fd, self.dont_look_inside) {
             return Ok(());
         }
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
@@ -13227,6 +13618,8 @@ impl<'a> Lowering<'a> {
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
+        let resolved_call_args = args.clone();
+        let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func);
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
             self.string_array_view_locals.iter().any(|(local, _)| {
                 self.local_var
@@ -18655,7 +19048,7 @@ impl<'a> Lowering<'a> {
         }
         let op_kind =
             self.rewrite_equal_layout_result_branch(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
-        let op_kind =
+        let mut op_kind =
             self.stamp_result_branch_payloads(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
         // `lower_std_primitive_op` rewrites an identity wrapper
         // (`Box::as_ref` / `as_mut`, `Cell::get`, scalar `clone`) to
@@ -18671,10 +19064,20 @@ impl<'a> Lowering<'a> {
             self.graph.set_goto(bb_id, target_bb, link_args);
             return Ok(());
         }
+        // Copy the borrowed GC reference into the cell before the call.
+        // The copy-out below rebinds the local before the successor edge.
+        let gc_mut_ref_copies = self.install_gc_mut_ref_call(
+            mir_bb,
+            &mut op_kind,
+            &gc_mut_ref_sig,
+            &arg_locals,
+            &resolved_call_args,
+        )?;
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
         });
+        self.copy_out_gc_mut_ref(mir_bb, &gc_mut_ref_copies);
         // Narrow a classdef-less registered-ADT call result to
         // `SomeInstance(root)` (see `result_narrow_root` above).  Identity at
         // jitcode (`__cast_instance_intrinsic` → cast_pointer → `same_as`), so
@@ -19833,6 +20236,25 @@ impl<'a> Lowering<'a> {
         place: &Place,
         new_value: Variable,
     ) -> Result<Option<Variable>, LowerError> {
+        // `*p` of a cell parameter exchanges the cell's `value` field.
+        // Raw memory cannot hold the GC reference.
+        if let Some(cell) = self.deref_cell_param_local(place)
+            && let Some(root) = self.gc_mut_ref_param_root(cell)
+        {
+            let base = self.defined_local(mir_bb, cell)?;
+            let old = self.emit_gc_mut_ref_field_read(mir_bb, base.clone(), &root);
+            let bb_id = self.block_id[mir_bb];
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base,
+                    field: FieldDescriptor::new("value", Some(root)),
+                    value: LinkArg::Value(new_value),
+                    ty: ValueType::Ref(None),
+                },
+            });
+            return Ok(Some(old));
+        }
         let PlaceKind::Projection(inner, _) = &place.kind else {
             return Ok(None);
         };
@@ -37538,6 +37960,186 @@ fn tyref_peel_one_raw_ptr_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l 
     strip_ty_indirections(pointee, llbc)
 }
 
+/// `MutRef<T>` is the cell a GC reference occupies for an `&mut` borrow.
+/// The callee writes the field, so the post-call read is not the pre-call
+/// SSA value. `optimizeopt/virtualize.py` removes the cell once the callee
+/// is inlined; this pass must leave the constructor.
+fn is_mut_ref_cell_name(name: &str) -> bool {
+    name.starts_with("MutRef<")
+}
+
+/// A GC reference behind `&mut` lives in a one-field GC cell for the
+/// duration of the borrow. Copy-in/copy-out is exact because the borrow
+/// is exclusive and does not outlive the call. Raw memory cannot hold a
+/// GC reference.
+///
+/// The pointee has to lower to `ValueType::Ref`, and it has to be a thin
+/// pointer (raw, borrowed, or a transparent newtype of one) whose target
+/// also lowers to `Ref`.
+fn mut_ref_cell_root_of(
+    pointee: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if !matches!(
+        tyref_to_value_type_with(pointee, llbc, tombstoned),
+        ValueType::Ref(_)
+    ) {
+        return None;
+    }
+    if !gc_ref_pointer(pointee, llbc, tombstoned, 0) {
+        return None;
+    }
+    Some(format!("MutRef<{}>", tyref_to_ast_string(pointee, llbc)))
+}
+
+fn gc_ref_pointer(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    depth: usize,
+) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    if let Some(target) = node.as_object().and_then(pointer_target_json).cloned() {
+        let Ok(target_ty) = serde_json::from_value::<TyRef>(target) else {
+            return false;
+        };
+        return matches!(
+            tyref_to_value_type_with(&target_ty, llbc, tombstoned),
+            ValueType::Ref(_)
+        );
+    }
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(decl) = llbc.type_by_id(id) else {
+        return false;
+    };
+    if !decl.is_repr_transparent() {
+        return false;
+    }
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return false;
+    };
+    let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
+        fields.get(index)
+    } else if fields.len() == 1 {
+        fields.first()
+    } else {
+        None
+    };
+    field.is_some_and(|field| gc_ref_pointer(&field.ty, llbc, tombstoned, depth + 1))
+}
+
+fn pointer_target_json(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&serde_json::Value> {
+    if let Some(target) = obj
+        .get("RawPtr")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+    {
+        return Some(target);
+    }
+    obj.get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+}
+
+fn tyref_mut_ref_pointee(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let reference = node.as_object()?.get("Ref")?.as_array()?;
+    if reference.get(2)?.as_str() != Some("Mut") {
+        return None;
+    }
+    serde_json::from_value(reference.get(1)?.clone()).ok()
+}
+
+/// `dont_look_inside` is keyed by `strip_crate_prefix(name_path())`.
+fn fun_decl_is_dont_look_inside(
+    fd: &FunDecl,
+    dont_look_inside: &std::collections::HashSet<String>,
+) -> bool {
+    dont_look_inside.contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+}
+
+/// A callee reached through its real Rust ABI. It has no unstructured
+/// body to enter, or its path is in `dont_look_inside`.
+fn fun_decl_is_residual(
+    fd: &FunDecl,
+    dont_look_inside: &std::collections::HashSet<String>,
+) -> bool {
+    !fd.has_unstructured_body() || fun_decl_is_dont_look_inside(fd, dont_look_inside)
+}
+
+fn gc_mut_ref_param_locals(
+    locals: &majit_charon_reader::ullbc::Locals,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    self_dont_look_inside: bool,
+) -> std::collections::HashSet<usize> {
+    // A `dont_look_inside` body is called through the same raw-word ABI
+    // its residual callers use, so its parameters are not cells.
+    if self_dont_look_inside {
+        return std::collections::HashSet::new();
+    }
+    let mut params = std::collections::HashSet::new();
+    let arg_count = locals.arg_count as usize;
+    for index in 1..=arg_count {
+        let Some(local) = locals.locals.get(index) else {
+            continue;
+        };
+        let Some(pointee) = tyref_mut_ref_pointee(&local.ty, llbc) else {
+            continue;
+        };
+        if mut_ref_cell_root_of(&pointee, llbc, tombstoned).is_some() {
+            params.insert(index);
+        }
+    }
+    params
+}
+
+fn borrow_kind_is_exclusive(kind: &serde_json::Value) -> bool {
+    match kind.as_str() {
+        Some("Mut" | "TwoPhaseMut") => true,
+        Some(_) => false,
+        None => kind
+            .as_object()
+            .is_some_and(|obj| obj.contains_key("Mut") || obj.contains_key("TwoPhaseMut")),
+    }
+}
+
+fn gc_mut_ref_not_whole_local() -> LowerError {
+    LowerError::Unsupported(
+        "mutable borrow of a GC reference that is not a whole local".to_string(),
+    )
+}
+
+enum GcMutRefArg {
+    WholeLocal(usize),
+    CellParam(usize),
+}
+
+fn path_names_decl(decl_path: &str, segments: &[String]) -> bool {
+    if segments.is_empty() {
+        return false;
+    }
+    let joined = segments.join("::");
+    if joined == decl_path {
+        return true;
+    }
+    // A bare leaf (`new`, `get`) collides across decls. A module segment
+    // keeps the name on this decl.
+    joined.contains("::")
+        && (decl_path.ends_with(&format!("::{joined}"))
+            || joined.ends_with(&format!("::{decl_path}")))
+}
+
 /// The pointee of `&self` for `Clone::clone`, or the type itself when the
 /// argument is already a by-value Copy scalar / thin pointer.
 fn tyref_clone_pointee_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
@@ -52107,6 +52709,7 @@ mod tests {
                 &tombstoned_leaves,
                 &accum,
                 &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+                false,
             )
             .unwrap();
             assert_eq!(
@@ -56804,6 +57407,7 @@ mod tests {
             &tombstoned_leaves,
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+            false,
         )
         .unwrap();
         let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
@@ -57428,6 +58032,7 @@ mod tests {
             &tombstoned,
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+            false,
         )
         .unwrap();
         let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
@@ -57470,6 +58075,7 @@ mod tests {
             &tombstoned,
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+            false,
         )
         .unwrap();
         let base = TyRef::Other(serde_json::json!({"Adt": {"id": 1, "builtin": null}}));
@@ -57601,6 +58207,7 @@ mod tests {
             &cross,
             &accum_a,
             &super::RootStackAnalyzer::new(&a, &super::RootStackState::new(&a)),
+            false,
         )
         .unwrap();
         let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
@@ -57641,6 +58248,7 @@ mod tests {
             &cross,
             &accum_b,
             &super::RootStackAnalyzer::new(&b, &super::RootStackState::new(&b)),
+            false,
         )
         .unwrap();
         let (owner_b, field_b, _, id_b) = lowering_b
@@ -61426,6 +62034,354 @@ mod tests {
             ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")),
             "the address comparison lowers to a `BinOp(ne)`"
         );
+    }
+
+    #[test]
+    fn mut_ref_cell_root_names_a_gc_pointer_only() {
+        let llbc = fixture_llbc();
+        let tomb = no_tombstoned_leaves();
+        let i64 = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let i64_ty: TyRef = serde_json::from_value(i64.clone()).unwrap();
+        assert!(super::mut_ref_cell_root_of(&i64_ty, &llbc, tomb).is_none());
+        let raw_i64: TyRef =
+            serde_json::from_value(serde_json::json!({"RawPtr": [i64, "Mut"]})).unwrap();
+        assert!(super::mut_ref_cell_root_of(&raw_i64, &llbc, tomb).is_none());
+        let obj = serde_json::json!({"Adt": {"id": 7}});
+        let obj_ty: TyRef = serde_json::from_value(obj.clone()).unwrap();
+        assert!(super::mut_ref_cell_root_of(&obj_ty, &llbc, tomb).is_none());
+        let raw_obj: TyRef =
+            serde_json::from_value(serde_json::json!({"RawPtr": [obj, "Mut"]})).unwrap();
+        assert_eq!(
+            super::mut_ref_cell_root_of(&raw_obj, &llbc, tomb).as_deref(),
+            Some("MutRef<*mut ??adt#7>")
+        );
+    }
+
+    /// A cell parameter's startblock input is the `MutRef<T>` class, not the
+    /// pointee. A `dont_look_inside` subject keeps the raw word.
+    #[test]
+    fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
+        use crate::model::OpKind;
+
+        let llbc = fixture_llbc();
+        let tomb = no_tombstoned_leaves();
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let pointee = serde_json::json!({"RawPtr": [{"Adt": {"id": 7}}, "Mut"]});
+        let mut_ref = serde_json::json!({"Ref": ["Erased", pointee, "Mut"]});
+        let locals: majit_charon_reader::ullbc::Locals =
+            serde_json::from_value(serde_json::json!({
+                "arg_count": 1,
+                "locals": [
+                    {
+                        "index": 0,
+                        "name": null,
+                        "span": span,
+                        "ty": {"Scalar": {"Integer": {"Signed": "I64"}}}
+                    },
+                    {"index": 1, "name": "slot", "span": span, "ty": mut_ref}
+                ]
+            }))
+            .unwrap();
+        let pointee_ty: TyRef = serde_json::from_value(pointee).unwrap();
+        let root = super::mut_ref_cell_root_of(&pointee_ty, &llbc, tomb)
+            .expect("raw GC pointer behind &mut is a cell");
+        let slot = |graph: &FunctionGraph| {
+            graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .find(|op| matches!(&op.kind, OpKind::Input { name, .. } if name == "slot"))
+                .expect("slot input")
+                .clone()
+        };
+
+        let cells = super::gc_mut_ref_param_locals(&locals, &llbc, tomb, false);
+        assert!(cells.contains(&1));
+        let mut graph = FunctionGraph::new("c::holder");
+        super::pygraph_initial_block(&mut graph, &locals, &llbc, None, tomb, &cells);
+        let OpKind::Input { ty, class_root, .. } = &slot(&graph).kind else {
+            panic!("slot op is an input");
+        };
+        assert_eq!(class_root.as_deref(), Some(root.as_str()));
+        assert_eq!(ty, &ValueType::Ref(Some(root)));
+
+        let residual = super::gc_mut_ref_param_locals(&locals, &llbc, tomb, true);
+        assert!(residual.is_empty());
+        let mut residual_graph = FunctionGraph::new("c::holder");
+        super::pygraph_initial_block(&mut residual_graph, &locals, &llbc, None, tomb, &residual);
+        let OpKind::Input { class_root, .. } = &slot(&residual_graph).kind else {
+            panic!("slot op is an input");
+        };
+        assert!(
+            !class_root.as_deref().unwrap_or("").starts_with("MutRef<"),
+            "a residual subject's parameter keeps the raw word"
+        );
+    }
+
+    /// A residual callee — no body, or `dont_look_inside` — is not given a
+    /// cell signature. The traced callee with the same `&mut` GC pointer is.
+    #[test]
+    fn mut_ref_cell_signature_skips_a_residual_callee() {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let mut_ref = serde_json::json!({
+            "Ref": ["Erased", {"RawPtr": [{"Adt": {"id": 7}}, "Mut"]}, "Mut"]
+        });
+        let item = |leaf: &str| {
+            serde_json::json!({
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": [leaf, 0]}
+                ],
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let signature = serde_json::json!({
+            "is_unsafe": false,
+            "inputs": [mut_ref],
+            "output": {"Tuple": []}
+        });
+        let body = serde_json::json!({
+            "Unstructured": {
+                "locals": {"arg_count": 0, "locals": []},
+                "body": [],
+                "span": span.clone()
+            }
+        });
+        let decl = |id: u64, leaf: &str, body: serde_json::Value| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item(leaf),
+                "signature": signature.clone(),
+                "body": body
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [
+                    decl(0, "traced", body.clone()),
+                    decl(1, "opaque", serde_json::Value::Null),
+                    decl(2, "marked", body)
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+        let mut dont_look_inside = std::collections::HashSet::new();
+        dont_look_inside.insert("marked".to_string());
+        assert!(!super::fun_decl_is_residual(
+            llbc.fn_by_id(0).unwrap(),
+            &dont_look_inside
+        ));
+        assert!(super::fun_decl_is_residual(
+            llbc.fn_by_id(1).unwrap(),
+            &dont_look_inside
+        ));
+        assert!(super::fun_decl_is_residual(
+            llbc.fn_by_id(2).unwrap(),
+            &dont_look_inside
+        ));
+
+        let subject: super::Unstructured = serde_json::from_value(serde_json::json!({
+            "locals": {"arg_count": 0, "locals": []},
+            "body": [],
+            "span": span
+        }))
+        .unwrap();
+        let accum = super::AccumulatorFacts::build(&llbc, &subject);
+        let tombstoned_leaves = std::collections::HashSet::new();
+        let lowering = super::Lowering::new(
+            &llbc,
+            "fixture::holder".into(),
+            &subject,
+            crate::HostStaticAddrs::default(),
+            &[],
+            None,
+            &dont_look_inside,
+            &tombstoned_leaves,
+            &accum,
+            &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+            false,
+        )
+        .unwrap();
+        let call = |id: u64| {
+            serde_json::from_value::<super::CallFunc>(serde_json::json!({
+                "Regular": {
+                    "kind": {"Fun": id},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }))
+            .unwrap()
+        };
+        let traced = lowering
+            .gc_mut_ref_signature(&call(0))
+            .expect("a traced &mut GC pointer is a cell");
+        assert_eq!(traced.0, 0);
+        assert!(traced.1[0].1.starts_with("MutRef<"));
+        assert!(lowering.gc_mut_ref_signature(&call(1)).is_none());
+        assert!(lowering.gc_mut_ref_signature(&call(2)).is_none());
+    }
+
+    /// `&mut PyObjectRef` parameters are one-field GC cells. Stores and
+    /// loads of `*lhs` / `*rhs` are field operations on `MutRef<…>`, and
+    /// the pointer word is not a raw load or store.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn mut_ref_cell_try_dispatch_binary_special() {
+        use crate::model::{OpKind, ValueType};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::objspace::descroperation::try_dispatch_binary_special",
+        )
+        .expect("lower try_dispatch_binary_special");
+        let ops = || {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+        };
+        assert!(
+            ops()
+                .all(|op| { !matches!(op.kind, OpKind::RawStore { .. } | OpKind::RawLoad { .. }) }),
+            "a GC-reference `&mut` cell does not raw-load or raw-store the pointer word"
+        );
+        assert!(
+            ops().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if mut_ref_value_field(field)
+            )),
+            "stores through the cell write the `value` field"
+        );
+        assert!(
+            ops().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if mut_ref_value_field(field)
+            )),
+            "reads through the cell read the `value` field"
+        );
+        let start = graph.block(graph.startblock);
+        let mut cell_params = 0usize;
+        for op in &start.operations {
+            let OpKind::Input {
+                name,
+                ty,
+                class_root,
+            } = &op.kind
+            else {
+                continue;
+            };
+            if name != "lhs" && name != "rhs" {
+                continue;
+            }
+            let root = class_root.as_deref().unwrap_or("");
+            assert!(
+                root.starts_with("MutRef<"),
+                "{name} class_root {root:?} is not the cell"
+            );
+            assert_eq!(ty, &ValueType::Ref(Some(root.to_string())), "{name}");
+            cell_params += 1;
+        }
+        assert_eq!(cell_params, 2, "lhs and rhs are the cell parameters");
+    }
+
+    /// `sub_impl` passes `&mut a` / `&mut b` into
+    /// `try_dispatch_binary_special`. The cell is built in the caller,
+    /// passed as the argument, and read back into the local after the call.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn mut_ref_cell_copy_sub_impl() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::objspace::descroperation::sub_impl",
+        )
+        .expect("lower sub_impl");
+        let mut found = false;
+        for block in &graph.blocks {
+            let ops = &block.operations;
+            for (idx, op) in ops.iter().enumerate() {
+                let OpKind::Call { target, .. } = &op.kind else {
+                    continue;
+                };
+                if !target_is_try_dispatch(target) {
+                    continue;
+                }
+                let before = ops[..idx].iter().any(|earlier| {
+                    matches!(
+                        &earlier.kind,
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { name, .. },
+                            ..
+                        } if name.starts_with("MutRef<")
+                    )
+                });
+                let after = ops[idx + 1..].iter().any(|later| {
+                    matches!(
+                        &later.kind,
+                        OpKind::FieldRead { field, .. } if mut_ref_value_field(field)
+                    )
+                });
+                if before && after {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                break;
+            }
+        }
+        assert!(
+            found,
+            "a MutRef constructor precedes try_dispatch_binary_special and a value FieldRead follows it in the same block"
+        );
+    }
+
+    fn mut_ref_value_field(field: &FieldDescriptor) -> bool {
+        field.name == "value"
+            && field
+                .owner_root
+                .as_deref()
+                .is_some_and(|owner| owner.starts_with("MutRef<"))
+    }
+
+    fn target_is_try_dispatch(target: &CallTarget) -> bool {
+        match target {
+            CallTarget::FunctionPath { segments, .. } => {
+                super::fmt_path_ends_with(segments, &["try_dispatch_binary_special"])
+            }
+            CallTarget::Method { name, .. } => name == "try_dispatch_binary_special",
+            _ => false,
+        }
     }
 
     /// `<Option<*mut PyObject> as PartialEq>::ne` in `try_hash_value`

@@ -2544,7 +2544,6 @@ pub(crate) fn eval_frame_plain_with_resume(
     // `FrameRoot`, and this interpreter entry does the same with `FrameAnchor`.
     let frame_anchor = FrameAnchor::new(frame);
     let mut got_exception = true;
-    let mut w_exitvalue = pyre_object::w_none();
     // pyframe.py PyFrame.execute_frame parity:
     //   try:
     //     ec.call_trace(self)            # outside inner try
@@ -2561,7 +2560,7 @@ pub(crate) fn eval_frame_plain_with_resume(
     // enter() already executed).  Python finally semantics: a finally
     // block that raises replaces the prior exception (return_trace
     // overrides eval-body, leave overrides everything).
-    let mut outer_result = (|| -> PyResult {
+    let (mut outer_result, w_exitvalue) = (|| -> (PyResult, PyObjectRef) {
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
         // The sent `OperationError` is a GC object there (`error.py`). Pin
         // the native carrier across the hook and write the slots back before
@@ -2571,7 +2570,9 @@ pub(crate) fn eval_frame_plain_with_resume(
             let slot = err.pin_gc_refs(&roots);
             (roots, slot)
         });
-        execution_context.call_trace(frame_anchor.live())?;
+        if let Err(e) = execution_context.call_trace(frame_anchor.live()) {
+            return (Err(e), pyre_object::w_none());
+        }
         if let Some((roots, slot)) = &operr_pin
             && let Some(err) = resume.operr.as_mut()
         {
@@ -2581,14 +2582,16 @@ pub(crate) fn eval_frame_plain_with_resume(
         let mut inner_result = (|| -> PyResult {
             let frame = unsafe { &mut *frame_anchor.live() };
             if let Some(value) = prepare_frame_resume_for_dispatch(frame, &mut resume)? {
-                w_exitvalue = value;
                 return Ok(value);
             }
             let frame = unsafe { &mut *frame_anchor.live() };
             let result = eval_loop(frame, ec)?;
-            w_exitvalue = result;
             Ok(result)
         })();
+        let mut w_exitvalue = match &inner_result {
+            Ok(v) => *v,
+            Err(_) => pyre_object::w_none(),
+        };
         // `return_trace` runs application Python while the exit value and
         // the pending exception are still owed to `leave`.
         let return_trace_result = {
@@ -2613,13 +2616,10 @@ pub(crate) fn eval_frame_plain_with_resume(
         // the local and `inner_result` carry the word taken before the
         // callback ran, so each result is rebuilt from what came back.
         let combined = match return_trace_result {
-            Err(rt_err) => Err(rt_err),
-            Ok(live) => {
-                w_exitvalue = live;
-                inner_result.map(|_| live)
-            }
+            Err(rt_err) => (Err(rt_err), w_exitvalue),
+            Ok(live) => (inner_result.map(|_| live), live),
         };
-        if combined.is_ok() {
+        if combined.0.is_ok() {
             got_exception = false;
         }
         combined

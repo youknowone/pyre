@@ -982,13 +982,16 @@ fn ctypes_resize(
             "resize() needs (obj, size)",
         ));
     }
-    let mut obj = args[0];
-    if !cdata::is_cdata_instance(obj) {
+    if !cdata::is_cdata_instance(args[0]) {
         return Err(pyre_interpreter::PyError::type_error(
             "excepted ctypes instance",
         ));
     }
-    if !pyre_object::with_roots!(obj => cdata::owns_buffer(obj)) {
+    // The instance and the requested size stay pinned across the ownership
+    // check and the integer conversion.  Both reads come back from those slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    if !cdata::owns_buffer(pyre_object::gc_roots::shadow_stack_get(args_base)) {
         return Err(pyre_interpreter::PyError::value_error(
             "Memory cannot be resized because this object doesn't own it",
         ));
@@ -996,9 +999,12 @@ fn ctypes_resize(
     // The floor is the type's natural size, not the current buffer length, so a
     // previously enlarged object can be shrunk back down to it.  A negative
     // request would wrap to a huge `usize`, so reject the signed value first.
-    let requested =
-        pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::int_w(args[1]))?;
-    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    let requested = pyre_interpreter::baseobjspace::int_w(
+        pyre_object::gc_roots::shadow_stack_get(args_base + 1),
+    )?;
+    let cls = unsafe {
+        pyre_object::w_instance_get_type(pyre_object::gc_roots::shadow_stack_get(args_base))
+    };
     let min = stginfo::stginfo_of(cls)
         .map(stginfo::stginfo_size)
         .or_else(|| cdata::type_code_of(cls).and_then(|tc| host_ctypes::simple_type_size(&tc)))
@@ -1009,7 +1015,7 @@ fn ctypes_resize(
         )));
     }
     let size = requested as usize;
-    if let Some(ba) = cdata::cdata_buffer(obj) {
+    if let Some(ba) = cdata::cdata_buffer(pyre_object::gc_roots::shadow_stack_get(args_base)) {
         unsafe {
             let old_size = pyre_object::w_bytearray_len(ba);
             pyre_object::w_bytearray_vec_mut(ba).resize(size, 0);

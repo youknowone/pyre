@@ -402,18 +402,23 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     // its slot where it is used.
     let _pos_roots = pyre_object::gc_roots::push_roots();
     let pos_base = pyre_object::gc_roots::pin_roots(pos);
-    let cls = pyre_object::gc_roots::shadow_stack_get(pos_base);
     let canonical = pyre_interpreter::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
         .map_or(PY_NULL, |ty| ty.as_ptr());
+    let canonical_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(canonical);
+    let cls = pyre_object::gc_roots::shadow_stack_get(pos_base);
     // PyPy's interp2app gateway leaves keywords available to a subtype's
     // overridden __init__.  The exact array type (and a subtype inheriting
     // array.__init__) rejects them later; __new__ itself must not mistake the
     // flat ABI's kwargs marker for the optional initializer.
-    let init_matches = std::ptr::eq(cls, canonical)
+    let init_matches = std::ptr::eq(cls, pyre_object::gc_roots::shadow_stack_get(canonical_slot))
         || unsafe {
             match (
                 pyre_interpreter::baseobjspace::lookup_in_type(cls, "__init__"),
-                pyre_interpreter::baseobjspace::lookup_in_type(canonical, "__init__"),
+                pyre_interpreter::baseobjspace::lookup_in_type(
+                    pyre_object::gc_roots::shadow_stack_get(canonical_slot),
+                    "__init__",
+                ),
             ) {
                 (Some(sub), Some(base)) => std::ptr::eq(sub, base),
                 (None, None) => true,
@@ -460,7 +465,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     let cls = pyre_object::gc_roots::shadow_stack_get(pos_base);
     let obj = if !cls.is_null()
         && unsafe { pyre_object::is_type(cls) }
-        && !std::ptr::eq(cls, canonical)
+        && !std::ptr::eq(cls, pyre_object::gc_roots::shadow_stack_get(canonical_slot))
     {
         // `allocate_instance(W_ArrayUser, w_cls)` (`typedef.py` `_getusercls`),
         // then the user-finalizer enqueue `tag_subclass_instance` performs

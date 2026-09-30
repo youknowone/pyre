@@ -391,7 +391,8 @@ fn write_object(
     // PyPy `marshal`: instances of user heap types skip the builtin
     // marshaller table completely.  They may still reach the buffer fallback
     // below (notably bytes/bytearray subclasses).
-    let is_heap_type = crate::typedef::r#type(obj)
+    // `reserve` pins `obj`. The type test reads the word that pin published.
+    let is_heap_type = crate::typedef::r#type(obj_root.get())
         .is_some_and(|w_type| unsafe { typeobject::w_type_is_heaptype(w_type.as_ptr()) });
 
     unsafe {

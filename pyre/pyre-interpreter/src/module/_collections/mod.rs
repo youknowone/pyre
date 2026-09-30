@@ -1114,11 +1114,13 @@ impl W_Deque {
         // reset; an already-empty deque leaves `lock` untouched, so re-init
         // while iterating an empty deque yields StopIteration, not a mutation
         // RuntimeError.
+        let has_iterable = iterable.is_some();
+        let mut iterable_obj = iterable.unwrap_or(PY_NULL);
         if deque_len(self_obj) > 0 {
-            pyre_object::with_roots!(self_obj => clear_blocks(self_obj));
+            pyre_object::with_roots!(self_obj, iterable_obj => clear_blocks(self_obj));
         }
-        if let Some(it) = iterable {
-            extend_from_iterable(self_obj, it, true)?;
+        if has_iterable {
+            extend_from_iterable(self_obj, iterable_obj, true)?;
         }
         Ok(())
     }
@@ -1327,6 +1329,8 @@ impl W_Deque {
         let self_obj = self as *mut W_Deque as PyObjectRef;
         // Everything live is published before `snapshot`: taking the deque
         // lock may block, and a blocked thread is a safepoint.
+        let has_start = start.is_some();
+        let has_stop = stop.is_some();
         let _roots = pyre_object::gc_roots::push_roots();
         let own_base = pyre_object::gc_roots::pin_roots(&[
             self_obj,
@@ -1337,8 +1341,9 @@ impl W_Deque {
         ]);
         let x_slot = own_base + 4;
         let items = snapshot(pyre_object::gc_roots::shadow_stack_get(own_base));
+        let items_len = items.len();
         let items_base = pyre_object::gc_roots::pin_roots(&items);
-        let len = items.len() as i64;
+        let len = items_len as i64;
         // `space.iter(self)` takes the lock before `unwrap_start_stop`,
         // so a `__index__` on start/stop that mutates the deque is caught
         // by the first `checklock`.
@@ -1347,17 +1352,15 @@ impl W_Deque {
         let clamp = |i: i64| if i < 0 { (i + len).max(0) } else { i.min(len) };
         // `start` and `stop` are read back from their slots: `getindex_w`
         // on the first may run `__index__` and collect.
-        let start = clamp(match start {
-            Some(_) => {
-                crate::builtins::getindex_w(pyre_object::gc_roots::shadow_stack_get(own_base + 2))?
-            }
-            None => 0,
+        let start = clamp(if has_start {
+            crate::builtins::getindex_w(pyre_object::gc_roots::shadow_stack_get(own_base + 2))?
+        } else {
+            0
         });
-        let stop = clamp(match stop {
-            Some(_) => {
-                crate::builtins::getindex_w(pyre_object::gc_roots::shadow_stack_get(own_base + 3))?
-            }
-            None => len,
+        let stop = clamp(if has_stop {
+            crate::builtins::getindex_w(pyre_object::gc_roots::shadow_stack_get(own_base + 3))?
+        } else {
+            len
         });
         let upper = stop.min(len);
         let mut i = 0i64;

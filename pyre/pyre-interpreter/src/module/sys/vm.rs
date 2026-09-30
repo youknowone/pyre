@@ -401,6 +401,8 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
         operands.push(kwargs);
     }
     let operands_sp = _roots.pin_roots(&operands);
+    let has_kwargs = kwargs.is_some();
+    let kwargs_slot = _roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
     if positional.len() == 2 {
         let temporary = w_dict_new();
         let _ = pyre_object::gc_roots::pin_root(temporary);
@@ -416,6 +418,7 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
             false,
         )?;
     }
+    let kwargs = has_kwargs.then(|| _roots.get(kwargs_slot));
     let w_kwargs = if kwargs.is_some() {
         Some(pyre_object::gc_roots::shadow_stack_get(
             operands_sp + 1 + usize::from(positional.len() == 2),
@@ -1722,7 +1725,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // slot and each store reads it back from there rather than from the word
     // that was live before the decode.
     let roots = pyre_object::gc_roots::push_roots();
-    let xoptions_slot = roots.base();
+    // The module namespace stays live across every later allocation.
+    let ns_slot = roots.base();
+    let _ = roots.pin_root(ns);
+    let xoptions_slot = ns_slot + 1;
     let _ = roots.pin_root(w_dict_new());
     for option in crate::importing::xoptions() {
         // `split('=', 1)` over a value that need not have a UTF-8 form. `=` is
@@ -1757,7 +1763,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             );
         }
     }
-    module_ns_store(ns, "_xoptions", roots.get(xoptions_slot));
+    module_ns_store(roots.get(ns_slot), "_xoptions", roots.get(xoptions_slot));
     // Format matches `platform._sys_version`'s CPython parser:
     // `version (buildinfo) [compiler]`.
     //
@@ -1793,7 +1799,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     };
     let compiler = format!("{name}{arch}");
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "version",
         w_str_new(&format!("3.14.6 (pyre 0.0.1) [{compiler}]")),
     );
@@ -1807,7 +1813,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // what this target is.  Reported for both wasm hosts: what the guest can
     // do is the same on either side of the browser boundary.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "platform",
         w_str_new(if cfg!(target_os = "macos") {
             "darwin"
@@ -1831,7 +1837,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // `venv.EnvBuilder.setup_python` reads the same config var to name
     // `python3.14t.exe`.
     #[cfg(windows)]
-    module_ns_store(ns, "winver", w_str_new("3.14t"));
+    module_ns_store(roots.get(ns_slot), "winver", w_str_new("3.14t"));
     // sys.dllhandle — the handle of the DLL exporting the Python C API,
     // published beside `winver` because both come from the same `MS_COREDLL`
     // block.  `ctypes/__init__.py` builds `pythonapi` out of it with no
@@ -1841,16 +1847,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // handle names an API this interpreter does not export, and reporting the
     // executable's own module would only make `pythonapi` fail one call later.
     #[cfg(windows)]
-    module_ns_store(ns, "dllhandle", w_int_new(0));
+    module_ns_store(roots.get(ns_slot), "dllhandle", w_int_new(0));
     // sys._vpath — the build's relative path from the executable's directory to
     // the prefix. `sysconfig._init_config_vars` subscripts it under `os.name ==
     // 'nt'`, so it is an AttributeError out of the first `get_config_var` call
     // when absent; it is stored into `_CONFIG_VARS['VPATH']` and read nowhere
     // else, `sys._stdlib_dir` being what locates the stdlib here.
     #[cfg(windows)]
-    module_ns_store(ns, "_vpath", w_str_new(r"..\.."));
+    module_ns_store(roots.get(ns_slot), "_vpath", w_str_new(r"..\.."));
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "byteorder",
         w_str_new(if cfg!(target_endian = "little") {
             "little"
@@ -1873,7 +1879,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         fields.push(w_str_new("final"));
         fields.push(w_int_new(0));
         let vi = crate::_structseq::new_instance(version_info_type, fields.take());
-        module_ns_store(ns, "version_info", vi);
+        module_ns_store(roots.get(ns_slot), "version_info", vi);
     }
     // PyPy exposes its implementation release independently from the Python
     // language compatibility version.  pip's vendored packaging consumes the
@@ -1892,34 +1898,37 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         fields.push(w_str_new("final"));
         fields.push(w_int_new(0));
         let vi = crate::_structseq::new_instance(pyre_version_info_type, fields.take());
-        module_ns_store(ns, "pyre_version_info", vi);
+        module_ns_store(roots.get(ns_slot), "pyre_version_info", vi);
     }
     // sys.modules — live dict synced with the import cache.
     let modules_dict = w_dict_new();
     crate::importing::set_sys_modules_dict(modules_dict);
-    module_ns_store(ns, "modules", modules_dict);
+    module_ns_store(roots.get(ns_slot), "modules", modules_dict);
     // sys.path — flush the native search-path seed into the authoritative list
     // the instant `sys` exists; from here on the Python list is the source of
     // truth and `add_sys_path` mutates it in place.
-    module_ns_store(ns, "path", crate::importing::create_sys_path_list());
+    let path_list = crate::importing::create_sys_path_list();
+    module_ns_store(roots.get(ns_slot), "path", path_list);
     // sys.stdout/stderr/stdin — `_io.TextIOWrapper`-typed file-like objects.
     // Real CPython wires these through io.TextIOWrapper around the std fds;
     // pyre exposes objects of the same type with the minimum surface so
     // anything that writes status (unittest, traceback, warnings) keeps
     // working.  `sys.__stdout__ is sys.stdout` (a single object each).
     let stdout = make_std_stream("<stdout>", 1);
+    let stdout_slot = roots.pin_roots(&[stdout]);
     let stderr = make_std_stream("<stderr>", 2);
+    let stderr_slot = roots.pin_roots(&[stderr]);
     let stdin = make_std_stream("<stdin>", 0);
-    module_ns_store(ns, "stdout", stdout);
-    module_ns_store(ns, "stderr", stderr);
-    module_ns_store(ns, "stdin", stdin);
-    module_ns_store(ns, "__stdout__", stdout);
-    module_ns_store(ns, "__stderr__", stderr);
-    module_ns_store(ns, "__stdin__", stdin);
+    module_ns_store(roots.get(ns_slot), "stdout", roots.get(stdout_slot));
+    module_ns_store(roots.get(ns_slot), "stderr", roots.get(stderr_slot));
+    module_ns_store(roots.get(ns_slot), "stdin", stdin);
+    module_ns_store(roots.get(ns_slot), "__stdout__", roots.get(stdout_slot));
+    module_ns_store(roots.get(ns_slot), "__stderr__", roots.get(stderr_slot));
+    module_ns_store(roots.get(ns_slot), "__stdin__", stdin);
     // `vm.py _getframe` (arguments) over `vm.py getframe` (the walk) —
     // see [`sys_getframe`] and [`getframe`], which keep upstream's split.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_getframe",
         crate::make_builtin_function("_getframe", sys_getframe),
     );
@@ -1936,7 +1945,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // function whose `__module__` was reassigned after definition therefore
     // still reports its defining module.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_getframemodulename",
         crate::make_builtin_function("_getframemodulename", |args| {
             let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -2004,7 +2013,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // `__majit_wrap_exc_info` rather than a closure so the tracer can descend
     // into it.
     let exc_info_fn = make_builtin_function_with_arity("exc_info", __majit_wrap_exc_info, 0);
-    module_ns_store(ns, "exc_info", exc_info_fn);
+    module_ns_store(roots.get(ns_slot), "exc_info", exc_info_fn);
     // baseobjspace.py: register `space._code_of_sys_exc_info` so
     // `function.funccall_valuestack` can take the JIT direct path
     // (function.py:146-150). The builtin code pointer lives on the
@@ -2102,11 +2111,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ),
             ],
         );
-        module_ns_store(ns, "flags", flags);
+        module_ns_store(roots.get(ns_slot), "flags", flags);
     }
     // sys.getdefaultencoding
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "getdefaultencoding",
         make_builtin_function_with_arity("getdefaultencoding", |_| Ok(w_str_new("utf-8")), 0),
     );
@@ -2123,7 +2132,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // a release shipped as an enablement package over the previous build.
     #[cfg(windows)]
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "getwindowsversion",
         make_builtin_function_with_arity(
             "getwindowsversion",
@@ -2216,7 +2225,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // `-X cpu_count` and `PYTHON_CPU_COUNT`, and this interpreter reads
     // neither, so there is no configured count to report.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_get_cpu_count_config",
         make_builtin_function_with_arity("_get_cpu_count_config", |_| Ok(w_int_new(-1)), 0),
     );
@@ -2225,7 +2234,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // helpers route through it so the interpreter, JIT prologue probe,
     // and blackhole resume see a consistent recursion budget.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "getrecursionlimit",
         make_builtin_function_with_arity(
             "getrecursionlimit",
@@ -2242,7 +2251,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "setrecursionlimit",
         make_builtin_function_with_arity(
             "setrecursionlimit",
@@ -2274,7 +2283,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "getswitchinterval",
         make_builtin_function_with_arity(
             "getswitchinterval",
@@ -2296,7 +2305,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "setswitchinterval",
         make_builtin_function_with_arity(
             "setswitchinterval",
@@ -2326,7 +2335,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_current_frames",
         make_builtin_function_with_arity(
             "_current_frames",
@@ -2342,7 +2351,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_current_exceptions",
         make_builtin_function_with_arity(
             "_current_exceptions",
@@ -2354,7 +2363,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // set_int_max_str_digits. The limit is object-space state, shared by
     // every caller rather than thread-local state.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "get_int_max_str_digits",
         make_builtin_function_with_arity(
             "get_int_max_str_digits",
@@ -2376,7 +2385,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "set_int_max_str_digits",
         make_builtin_function_with_arity_and_maybe_sig(
             "set_int_max_str_digits",
@@ -2410,7 +2419,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     );
     // sys.intern
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "intern",
         make_builtin_function_with_arity(
             "intern",
@@ -2434,45 +2443,48 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             1,
         ),
     );
-    module_ns_store(ns, "api_version", w_int_new(1013));
+    module_ns_store(roots.get(ns_slot), "api_version", w_int_new(1013));
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_git",
         w_tuple_new(vec![w_str_new("pyre"), w_str_new(""), w_str_new("")]),
     );
-    module_ns_store(ns, "_home", w_none());
+    module_ns_store(roots.get(ns_slot), "_home", w_none());
     // sys.implementation — PyPy app.py's implementation_dict, with the Pyre
     // implementation version rather than Python's language version.
     {
         let impl_obj = w_instance_new(simple_namespace_type());
-        crate::baseobjspace::setdictvalue_native(impl_obj, "name", w_str_new("pyre"));
-        let implementation_version = crate::runtime_ops::module_ns_get(ns, "pyre_version_info")
-            .expect("sys.pyre_version_info was installed above");
-        crate::baseobjspace::setdictvalue_native(impl_obj, "version", implementation_version);
+        let impl_slot = roots.pin_roots(&[impl_obj]);
+        let name_obj = w_str_new("pyre");
+        crate::baseobjspace::setdictvalue_native(roots.get(impl_slot), "name", name_obj);
+        let implementation_version =
+            crate::runtime_ops::module_ns_get(roots.get(ns_slot), "pyre_version_info")
+                .expect("sys.pyre_version_info was installed above");
+        crate::baseobjspace::setdictvalue_native(
+            roots.get(impl_slot),
+            "version",
+            implementation_version,
+        );
         let version_major = env!("CARGO_PKG_VERSION_MAJOR").parse::<i64>().unwrap_or(0);
         let version_minor = env!("CARGO_PKG_VERSION_MINOR").parse::<i64>().unwrap_or(0);
         let version_micro = env!("CARGO_PKG_VERSION_PATCH").parse::<i64>().unwrap_or(0);
         let implementation_hexversion =
             (version_major << 24) | (version_minor << 16) | (version_micro << 8) | 0xf0;
-        crate::baseobjspace::setdictvalue_native(
-            impl_obj,
-            "hexversion",
-            w_int_new(implementation_hexversion),
-        );
-        crate::baseobjspace::setdictvalue_native(impl_obj, "cache_tag", w_str_new("pyre314"));
+        let hexversion = w_int_new(implementation_hexversion);
+        crate::baseobjspace::setdictvalue_native(roots.get(impl_slot), "hexversion", hexversion);
+        let cache_tag = w_str_new("pyre314");
+        crate::baseobjspace::setdictvalue_native(roots.get(impl_slot), "cache_tag", cache_tag);
         // PEP 734. pyre runs one interpreter per process, so the answer is
         // false; `sys.implementation` carries the name either way from 3.14 on.
+        let supports = w_bool_from(false);
         crate::baseobjspace::setdictvalue_native(
-            impl_obj,
+            roots.get(impl_slot),
             "supports_isolated_interpreters",
-            w_bool_from(false),
+            supports,
         );
-        crate::baseobjspace::setdictvalue_native(
-            impl_obj,
-            "_multiarch",
-            w_str_new(crate::importing::multiarch()),
-        );
-        module_ns_store(ns, "implementation", impl_obj);
+        let multiarch = w_str_new(crate::importing::multiarch());
+        crate::baseobjspace::setdictvalue_native(roots.get(impl_slot), "_multiarch", multiarch);
+        module_ns_store(roots.get(ns_slot), "implementation", roots.get(impl_slot));
     }
     // `system.py:get_hash_info|get_float_info|get_thread_info|get_int_info`:
     // these values are instances of their named structseq classes, not
@@ -2504,7 +2516,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         fields.push(w_int_new(128));
         fields.push(w_int_new(0));
         let value = crate::_structseq::new_instance(ty, fields.take());
-        module_ns_store(ns, "hash_info", value);
+        module_ns_store(roots.get(ns_slot), "hash_info", value);
     }
     {
         let ty = crate::_structseq::make_struct_seq(
@@ -2536,11 +2548,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         fields.push(w_int_new(2));
         fields.push(w_int_new(1));
         let value = crate::_structseq::new_instance(ty, fields.take());
-        module_ns_store(ns, "float_info", value);
+        module_ns_store(roots.get(ns_slot), "float_info", value);
     }
     // sysmodule.c — `sys.float_repr_style` is "short" wherever float repr
     // uses David Gay's shortest-round-trip algorithm (always, here).
-    module_ns_store(ns, "float_repr_style", w_str_new("short"));
+    module_ns_store(roots.get(ns_slot), "float_repr_style", w_str_new("short"));
     {
         let ty =
             crate::_structseq::make_struct_seq("sys.thread_info", &["name", "lock", "version"]);
@@ -2553,7 +2565,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         });
         fields.push(w_none());
         let value = crate::_structseq::new_instance(ty, fields.take());
-        module_ns_store(ns, "thread_info", value);
+        module_ns_store(roots.get(ns_slot), "thread_info", value);
     }
     {
         let ty = crate::_structseq::make_struct_seq(
@@ -2571,9 +2583,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         fields.push(w_int_new(4300));
         fields.push(w_int_new(640));
         let value = crate::_structseq::new_instance(ty, fields.take());
-        module_ns_store(ns, "int_info", value);
+        module_ns_store(roots.get(ns_slot), "int_info", value);
     }
-    module_ns_store(ns, "hexversion", w_int_new(0x030e06f0));
+    module_ns_store(roots.get(ns_slot), "hexversion", w_int_new(0x030e06f0));
     #[cfg(feature = "host_env")]
     {
         // `app_main.setup_bootstrap_path` obtains all five values from one
@@ -2585,44 +2597,47 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         let fs_path = |path: &std::path::Path| {
             w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(path.as_os_str()))
         };
-        module_ns_store(ns, "executable", fs_path(&paths.executable));
-        module_ns_store(ns, "_base_executable", fs_path(&paths.base_executable));
-        module_ns_store(ns, "prefix", fs_path(&paths.prefix));
-        module_ns_store(ns, "exec_prefix", fs_path(&paths.prefix));
-        module_ns_store(ns, "base_prefix", fs_path(&paths.base_prefix));
-        module_ns_store(ns, "base_exec_prefix", fs_path(&paths.base_prefix));
+        let executable = fs_path(&paths.executable);
+        module_ns_store(roots.get(ns_slot), "executable", executable);
+        let base_executable = fs_path(&paths.base_executable);
+        module_ns_store(roots.get(ns_slot), "_base_executable", base_executable);
+        let prefix = fs_path(&paths.prefix);
+        module_ns_store(roots.get(ns_slot), "prefix", prefix);
+        let exec_prefix = fs_path(&paths.prefix);
+        module_ns_store(roots.get(ns_slot), "exec_prefix", exec_prefix);
+        let base_prefix = fs_path(&paths.base_prefix);
+        module_ns_store(roots.get(ns_slot), "base_prefix", base_prefix);
+        let base_exec_prefix = fs_path(&paths.base_prefix);
+        module_ns_store(roots.get(ns_slot), "base_exec_prefix", base_exec_prefix);
         // FrozenImporter uses the resolved stdlib root to reconstruct source
         // filenames for frozen stdlib modules.
         let stdlib_dir = paths.stdlib.as_deref().map(fs_path).unwrap_or_else(w_none);
-        module_ns_store(ns, "_stdlib_dir", stdlib_dir);
+        module_ns_store(roots.get(ns_slot), "_stdlib_dir", stdlib_dir);
     }
     #[cfg(not(feature = "host_env"))]
     {
-        module_ns_store(ns, "executable", w_str_new(""));
-        module_ns_store(ns, "_base_executable", w_str_new(""));
-        module_ns_store(ns, "prefix", w_str_new(""));
-        module_ns_store(ns, "exec_prefix", w_str_new(""));
-        module_ns_store(ns, "base_prefix", w_str_new(""));
-        module_ns_store(ns, "base_exec_prefix", w_str_new(""));
-        module_ns_store(ns, "_stdlib_dir", w_none());
+        module_ns_store(roots.get(ns_slot), "executable", w_str_new(""));
+        module_ns_store(roots.get(ns_slot), "_base_executable", w_str_new(""));
+        module_ns_store(roots.get(ns_slot), "prefix", w_str_new(""));
+        module_ns_store(roots.get(ns_slot), "exec_prefix", w_str_new(""));
+        module_ns_store(roots.get(ns_slot), "base_prefix", w_str_new(""));
+        module_ns_store(roots.get(ns_slot), "base_exec_prefix", w_str_new(""));
+        module_ns_store(roots.get(ns_slot), "_stdlib_dir", w_none());
     }
     // sys._framework — macOS framework name (empty string on non-framework builds)
-    module_ns_store(ns, "_framework", w_str_new(""));
+    module_ns_store(roots.get(ns_slot), "_framework", w_str_new(""));
     // sys._jit — namespace with is_enabled/is_available methods.
     // Python 3.14+ introduced sys._jit for CPython tier-2 JIT support checks.
     {
         let jit = make_sys_namespace_instance();
-        crate::baseobjspace::setdictvalue_native(
-            jit,
-            "is_enabled",
-            make_builtin_function_with_arity("is_enabled", |_| Ok(w_bool_from(false)), 0),
-        );
-        crate::baseobjspace::setdictvalue_native(
-            jit,
-            "is_available",
-            make_builtin_function_with_arity("is_available", |_| Ok(w_bool_from(false)), 0),
-        );
-        module_ns_store(ns, "_jit", jit);
+        let jit_slot = roots.pin_roots(&[jit]);
+        let is_enabled =
+            make_builtin_function_with_arity("is_enabled", |_| Ok(w_bool_from(false)), 0);
+        crate::baseobjspace::setdictvalue_native(roots.get(jit_slot), "is_enabled", is_enabled);
+        let is_available =
+            make_builtin_function_with_arity("is_available", |_| Ok(w_bool_from(false)), 0);
+        crate::baseobjspace::setdictvalue_native(roots.get(jit_slot), "is_available", is_available);
+        module_ns_store(roots.get(ns_slot), "_jit", roots.get(jit_slot));
     }
     // sys.monitoring — PEP 669 low-impact monitoring API. The runtime hooks
     // are stubbed (no events ever fire), but the namespace, tool-id
@@ -2631,6 +2646,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // their tracer objects.
     {
         let mon = make_sys_namespace_instance();
+        let mon_slot = roots.pin_roots(&[mon]);
         // Tool-id constants (Python/instrumentation.c).
         for (name, id) in [
             ("DEBUGGER_ID", 0),
@@ -2638,16 +2654,25 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("PROFILER_ID", 2),
             ("OPTIMIZER_ID", 5),
         ] {
-            crate::baseobjspace::setdictvalue_native(mon, name, w_int_new(id));
+            let value = w_int_new(id);
+            crate::baseobjspace::setdictvalue_native(roots.get(mon_slot), name, value);
         }
         // DISABLE / MISSING sentinels — distinct singleton objects compared
         // by identity (`callback() == DISABLE`, `assertIs(x, MISSING)`).
-        crate::baseobjspace::setdictvalue_native(mon, "DISABLE", make_sys_namespace_instance());
-        crate::baseobjspace::setdictvalue_native(mon, "MISSING", make_sys_namespace_instance());
+        let disable = make_sys_namespace_instance();
+        crate::baseobjspace::setdictvalue_native(roots.get(mon_slot), "DISABLE", disable);
+        let missing = make_sys_namespace_instance();
+        crate::baseobjspace::setdictvalue_native(roots.get(mon_slot), "MISSING", missing);
         // events namespace — `1 << event_id` flags that OR together.
         {
             let events = make_sys_namespace_instance();
-            crate::baseobjspace::setdictvalue_native(events, "NO_EVENTS", w_int_new(0));
+            let events_slot = roots.pin_roots(&[events]);
+            let no_events = w_int_new(0);
+            crate::baseobjspace::setdictvalue_native(
+                roots.get(events_slot),
+                "NO_EVENTS",
+                no_events,
+            );
             for (i, name) in [
                 "PY_START",
                 "PY_RESUME",
@@ -2671,23 +2696,29 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             .iter()
             .enumerate()
             {
-                crate::baseobjspace::setdictvalue_native(events, name, w_int_new(1i64 << i));
+                let flag = w_int_new(1i64 << i);
+                crate::baseobjspace::setdictvalue_native(roots.get(events_slot), name, flag);
             }
             // BRANCH retained as an alias of BRANCH_LEFT for callers predating
             // the 3.14 left/right split.
-            crate::baseobjspace::setdictvalue_native(events, "BRANCH", w_int_new(1i64 << 8));
-            crate::baseobjspace::setdictvalue_native(mon, "events", events);
+            let branch = w_int_new(1i64 << 8);
+            crate::baseobjspace::setdictvalue_native(roots.get(events_slot), "BRANCH", branch);
+            crate::baseobjspace::setdictvalue_native(
+                roots.get(mon_slot),
+                "events",
+                roots.get(events_slot),
+            );
         }
         // Runtime hooks — no-op stubs returning sensible defaults.
-        let store_fn = |obj, name: &'static str, f: crate::gateway::BuiltinCodeFn, arity: u16| {
-            crate::baseobjspace::setdictvalue_native(
-                obj,
-                name,
-                make_builtin_function_with_arity(name, f, arity),
-            );
-        };
+        let store_fn =
+            |mut obj, name: &'static str, f: crate::gateway::BuiltinCodeFn, arity: u16| {
+                let func = pyre_object::with_roots!(obj => {
+                    make_builtin_function_with_arity(name, f, arity)
+                });
+                crate::baseobjspace::setdictvalue_native(obj, name, func);
+            };
         store_fn(
-            mon,
+            roots.get(mon_slot),
             "use_tool_id",
             |args| {
                 if args.len() != 2 {
@@ -2704,7 +2735,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             2,
         );
         store_fn(
-            mon,
+            roots.get(mon_slot),
             "free_tool_id",
             |args| {
                 if args.len() != 1 {
@@ -2721,7 +2752,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // claim on the id; with the event machinery inert there is nothing to
         // clear, so only the id check is observable.
         store_fn(
-            mon,
+            roots.get(mon_slot),
             "clear_tool_id",
             |args| {
                 if args.len() != 1 {
@@ -2735,7 +2766,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             1,
         );
         store_fn(
-            mon,
+            roots.get(mon_slot),
             "get_tool",
             |args| {
                 if args.len() != 1 {
@@ -2748,20 +2779,30 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             },
             1,
         );
-        store_fn(mon, "register_callback", |_| Ok(w_none()), 3);
-        store_fn(mon, "set_events", |_| Ok(w_none()), 2);
-        store_fn(mon, "get_events", |_| Ok(w_int_new(0)), 1);
-        store_fn(mon, "set_local_events", |_| Ok(w_none()), 3);
-        store_fn(mon, "get_local_events", |_| Ok(w_int_new(0)), 2);
-        store_fn(mon, "restart_events", |_| Ok(w_none()), 0);
-        module_ns_store(ns, "monitoring", mon);
+        store_fn(
+            roots.get(mon_slot),
+            "register_callback",
+            |_| Ok(w_none()),
+            3,
+        );
+        store_fn(roots.get(mon_slot), "set_events", |_| Ok(w_none()), 2);
+        store_fn(roots.get(mon_slot), "get_events", |_| Ok(w_int_new(0)), 1);
+        store_fn(roots.get(mon_slot), "set_local_events", |_| Ok(w_none()), 3);
+        store_fn(
+            roots.get(mon_slot),
+            "get_local_events",
+            |_| Ok(w_int_new(0)),
+            2,
+        );
+        store_fn(roots.get(mon_slot), "restart_events", |_| Ok(w_none()), 0);
+        module_ns_store(roots.get(ns_slot), "monitoring", roots.get(mon_slot));
     }
     // sys.platlibdir — the platform-specific library directory sysconfig and
     // `site.addsitepackages` build install paths from: "lib" on POSIX, and
     // "DLLs" on Windows, where the extension modules sit beside the interpreter
     // instead of under a versioned lib directory.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "platlibdir",
         w_str_new(if cfg!(windows) { "DLLs" } else { "lib" }),
     );
@@ -2774,7 +2815,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // print-non-integral-and-exit-1) is the launcher's job
     // (`app_main.py handle_sys_exit`).
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "exit",
         crate::make_module_builtin_function("exit", |args| {
             // `exit(exitcode=None)` — resolve the single optional argument
@@ -2817,7 +2858,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // relied on by the 3.14 Windows sys tests, so do not publish an empty
     // stand-in.
     #[cfg(not(windows))]
-    module_ns_store(ns, "abiflags", w_str_new("t"));
+    module_ns_store(roots.get(ns_slot), "abiflags", w_str_new("t"));
     // sys.argv — pick up pending argv from set_sys_argv if available.
     let pending = crate::importing::take_pending_sys_argv();
     let argv = if pending.is_null() {
@@ -2825,7 +2866,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     } else {
         pending
     };
-    module_ns_store(ns, "argv", argv);
+    module_ns_store(roots.get(ns_slot), "argv", argv);
     // sys.warnoptions — each decoded option is freshly allocated and the next
     // decode allocates again, so they are pinned as they arrive
     // (`build_list_storage`).
@@ -2834,7 +2875,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         for option in crate::importing::warnoptions() {
             warnoptions.push(crate::gateway::fsdecode_os_str(&option));
         }
-        module_ns_store(ns, "warnoptions", w_list_new(warnoptions.take()));
+        let warn_list = w_list_new(warnoptions.take());
+        module_ns_store(roots.get(ns_slot), "warnoptions", warn_list);
     }
     // sys.builtin_module_names — tuple of names of modules compiled into
     // the interpreter. PyPy: pypy/module/sys/state.py get_builtin_module_names,
@@ -2842,7 +2884,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // advertised set cannot drift from what is actually importable on a build.
     let builtin_names = crate::importing::builtin_module_names();
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "builtin_module_names",
         w_tuple_new(builtin_names.into_iter().map(w_str_new).collect()),
     );
@@ -3151,7 +3193,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         "zoneinfo",
     ];
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "stdlib_module_names",
         pyre_object::setobject::w_frozenset_from_items(
             &STDLIB_MODULE_NAMES
@@ -3163,12 +3205,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // sys.exception() — the value half of `sys.exc_info()`: the exception
     // instance currently being handled, or None outside an `except` block.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "exception",
         make_builtin_function_with_arity("exception", __majit_wrap_sys_exception, 0),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "call_tracing",
         make_builtin_function_with_arity(
             "call_tracing",
@@ -3197,7 +3239,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_clear_internal_caches",
         make_builtin_function_with_arity(
             "_clear_internal_caches",
@@ -3210,7 +3252,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_clear_type_cache",
         make_builtin_function_with_arity(
             "_clear_type_cache",
@@ -3228,12 +3270,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_debugmallocstats",
         make_builtin_function_with_arity("_debugmallocstats", |_| Ok(w_none()), 0),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "getallocatedblocks",
         make_builtin_function_with_arity(
             "getallocatedblocks",
@@ -3244,7 +3286,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "getunicodeinternedsize",
         crate::make_builtin_function("getunicodeinternedsize", |args| {
             let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -3271,7 +3313,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_is_interned",
         make_builtin_function_with_arity(
             "_is_interned",
@@ -3291,7 +3333,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_is_immortal",
         make_builtin_function_with_arity(
             "_is_immortal",
@@ -3304,7 +3346,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_is_gil_enabled",
         // Whether the interpreter is *currently* running with the lock on,
         // which is a separate question from the `t` ABI `sysconfig` publishes.
@@ -3315,7 +3357,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         make_builtin_function_with_arity("_is_gil_enabled", |_| Ok(w_bool_from(true)), 0),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "activate_stack_trampoline",
         make_builtin_function_with_arity(
             "activate_stack_trampoline",
@@ -3324,12 +3366,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "deactivate_stack_trampoline",
         make_builtin_function_with_arity("deactivate_stack_trampoline", |_| Ok(w_none()), 0),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "is_stack_trampoline_active",
         make_builtin_function_with_arity(
             "is_stack_trampoline_active",
@@ -3338,7 +3380,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_dump_tracelets",
         make_builtin_function_with_arity(
             "_dump_tracelets",
@@ -3350,12 +3392,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_baserepl",
         make_builtin_function_with_arity("_baserepl", sys_baserepl, 0),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "remote_exec",
         make_builtin_function_with_arity(
             "remote_exec",
@@ -3376,7 +3418,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // sys.is_remote_debug_enabled() — no remote-debug interface is wired,
     // so always False.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "is_remote_debug_enabled",
         make_builtin_function_with_arity(
             "is_remote_debug_enabled",
@@ -3386,12 +3428,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     );
     // sys.copyright — informational string consumed by `site` and `test`.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "copyright",
         w_str_new("Copyright (c) 2001-2024 Python Software Foundation.\nAll Rights Reserved."),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "getsizeof",
         crate::gateway::make_builtin_function_with_doc(
             "getsizeof",
@@ -3428,7 +3470,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // its object payload, while other tracing-GC objects report the stable
     // call/argument baseline.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "getrefcount",
         make_builtin_function_with_arity(
             "getrefcount",
@@ -3445,38 +3487,38 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     );
     // sys.gettrace / settrace
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "gettrace",
         make_builtin_function_with_arity("gettrace", sys_gettrace_impl, 0),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "settrace",
         make_builtin_function_with_arity("settrace", sys_settrace_impl, 1),
     );
     // sys.getprofile / setprofile
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "getprofile",
         make_builtin_function_with_arity("getprofile", sys_getprofile_impl, 0),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "setprofile",
         make_builtin_function_with_arity("setprofile", sys_setprofile_impl, 1),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_settraceallthreads",
         make_builtin_function_with_arity("_settraceallthreads", sys_settraceallthreads_impl, 1),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_setprofileallthreads",
         make_builtin_function_with_arity("_setprofileallthreads", sys_setprofileallthreads_impl, 1),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "get_coroutine_origin_tracking_depth",
         make_builtin_function_with_arity(
             "get_coroutine_origin_tracking_depth",
@@ -3485,7 +3527,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "set_coroutine_origin_tracking_depth",
         // `depth` is positional-or-keyword, so this cannot take the
         // fixed-arity carrier (which rejects keywords before the body runs).
@@ -3495,18 +3537,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "get_asyncgen_hooks",
         make_builtin_function_with_arity("get_asyncgen_hooks", sys_get_asyncgen_hooks_impl, 0),
     );
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "set_asyncgen_hooks",
         crate::make_builtin_function("set_asyncgen_hooks", sys_set_asyncgen_hooks_impl),
     );
     // sys.getfilesystemencoding
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "getfilesystemencoding",
         make_builtin_function_with_arity(
             "getfilesystemencoding",
@@ -3519,7 +3561,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // reads this at import, so it decides the app-level conversion the same way
     // `gateway::fsencode` decides the interpreter's.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "getfilesystemencodeerrors",
         make_builtin_function_with_arity(
             "getfilesystemencodeerrors",
@@ -3529,7 +3571,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     );
     #[cfg(windows)]
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_enablelegacywindowsfsencoding",
         make_builtin_function_with_arity(
             "_enablelegacywindowsfsencoding",
@@ -3558,7 +3600,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // `vm.py audit` — `@unwrap_spec(event="text")`, so the event name is
     // required and must be a str; everything after it is the argument tuple.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "audit",
         crate::make_builtin_function("audit", sys_audit),
     );
@@ -3566,13 +3608,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // original class before `dataclasses._add_slots` copies its namespace into
     // the replacement slotted class.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "_clear_type_descriptors",
         make_builtin_function_with_arity("_clear_type_descriptors", sys_clear_type_descriptors, 1),
     );
     // sys.is_finalizing
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "is_finalizing",
         make_builtin_function_with_arity(
             "is_finalizing",
@@ -3585,35 +3627,37 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // restore them.
     let displayhook_fn =
         make_builtin_function_with_arity("displayhook", crate::builtins::sys_displayhook, 1);
-    module_ns_store(ns, "displayhook", displayhook_fn);
-    module_ns_store(ns, "__displayhook__", displayhook_fn);
+    module_ns_store(roots.get(ns_slot), "displayhook", displayhook_fn);
+    module_ns_store(roots.get(ns_slot), "__displayhook__", displayhook_fn);
     let excepthook_fn =
         make_builtin_function_with_arity("excepthook", crate::builtins::sys_excepthook, 3);
-    module_ns_store(ns, "excepthook", excepthook_fn);
-    module_ns_store(ns, "__excepthook__", excepthook_fn);
+    module_ns_store(roots.get(ns_slot), "excepthook", excepthook_fn);
+    module_ns_store(roots.get(ns_slot), "__excepthook__", excepthook_fn);
     // sys.breakpointhook — `app.py breakpointhook`, called by `breakpoint()`.
     // `__breakpointhook__` keeps the original so code can restore it.
     let breakpointhook_fn = make_builtin_function("breakpointhook", sys_breakpointhook);
-    module_ns_store(ns, "breakpointhook", breakpointhook_fn);
-    module_ns_store(ns, "__breakpointhook__", breakpointhook_fn);
+    module_ns_store(roots.get(ns_slot), "breakpointhook", breakpointhook_fn);
+    module_ns_store(roots.get(ns_slot), "__breakpointhook__", breakpointhook_fn);
     // sys.unraisablehook(unraisable) — handles exceptions raised where they
     // cannot propagate (e.g. __del__).  Stored alongside the read-only
     // `__unraisablehook__` original so code can save and restore it.
     let unraisablehook_fn =
         make_builtin_function_with_arity("unraisablehook", sys_unraisablehook, 1);
-    module_ns_store(ns, "unraisablehook", unraisablehook_fn);
-    module_ns_store(ns, "__unraisablehook__", unraisablehook_fn);
+    module_ns_store(roots.get(ns_slot), "unraisablehook", unraisablehook_fn);
+    module_ns_store(roots.get(ns_slot), "__unraisablehook__", unraisablehook_fn);
     // sys.path_hooks / path_importer_cache
-    module_ns_store(ns, "path_hooks", w_list_new(vec![]));
-    module_ns_store(ns, "path_importer_cache", w_dict_new());
+    let path_hooks = w_list_new(vec![]);
+    module_ns_store(roots.get(ns_slot), "path_hooks", path_hooks);
+    module_ns_store(roots.get(ns_slot), "path_importer_cache", w_dict_new());
     // sys.meta_path — empty
-    module_ns_store(ns, "meta_path", w_list_new(vec![]));
+    let meta_path = w_list_new(vec![]);
+    module_ns_store(roots.get(ns_slot), "meta_path", meta_path);
     // sys.dont_write_bytecode — mirrors `sys.flags.dont_write_bytecode`
     // (`-B` / PYTHONDONTWRITEBYTECODE). The flag is honoured, not merely
     // reported: `_bootstrap_external` writes `__pycache__/*.pyre314.pyc` next
     // to every source it imports unless it is set.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "dont_write_bytecode",
         w_bool_from(crate::importing::dont_write_bytecode_flag()),
     );
@@ -3623,14 +3667,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // decoded the way `sys._xoptions` decodes the same bytes, so one the host
     // cannot spell in UTF-8 arrives with the surrogates that re-encode to it.
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "pycache_prefix",
         crate::importing::pycache_prefix()
             .map_or_else(w_none, |path| crate::gateway::fsdecode_os_str(&path)),
     );
     // `vm.py addaudithook`
     module_ns_store(
-        ns,
+        roots.get(ns_slot),
         "addaudithook",
         make_builtin_function_with_arity("addaudithook", sys_addaudithook, 1),
     );

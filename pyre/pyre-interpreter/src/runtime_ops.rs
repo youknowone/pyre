@@ -108,6 +108,11 @@ pub extern "C" fn jit_load_name_from_namespace(
     let Some(name) = decode_name(name_ptr, name_len) else {
         return PY_NULL;
     };
+    // A nursery-born frame moves under `finditem_str`. The raw operand is the
+    // abandoned copy after that call; read the builtin module back through the
+    // anchor.
+    let frame_anchor =
+        unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr as *mut crate::pyframe::PyFrame) };
     // `pyopcode.py _load_global`: `space.finditem_str(w_globals,
     // varname)`.  finditem_str takes the borrowed-string fast path for real
     // dict layouts and dispatches a dict subclass through the general mapping
@@ -138,8 +143,9 @@ pub extern "C" fn jit_load_name_from_namespace(
     // raises NameError.  The accessor still prefers the picked module when a
     // frame does carry one, so a mid-execution `__builtins__` rebind is
     // honoured exactly as before.
-    let w_builtin = if !frame_ptr.is_null() {
-        unsafe { (*frame_ptr).get_builtin() }
+    let frame = frame_anchor.live();
+    let w_builtin = if !frame.is_null() {
+        unsafe { (*frame).get_builtin() }
     } else {
         std::ptr::null_mut()
     };

@@ -1262,17 +1262,15 @@ impl<'a> MiniXmlParser<'a> {
         if handler.is_null() || unsafe { is_none(handler) } {
             return Ok(());
         }
-        // A class-held handler is a freshly bound method named only by this
-        // local, and the base lookup that follows is a full `getattr`, so it
-        // takes one liveness pin.  `sysid` / `pubid` are the caller's, pinned
-        // there for the whole doctype.
+        // The handler, the system id, and the public id stay pinned across
+        // the base lookup.  The call reads them back from those slots.
         let roots = pyre_object::gc_roots::push_roots();
-        let handler = roots.pin_root(handler);
+        let pinned = roots.pin_roots(&[handler, pubid, sysid]);
         let base = pyre_interpreter::baseobjspace::getattr_str(self.parser(), "_pyre_base")
             .unwrap_or_else(|_| w_none());
         let ret = pyre_interpreter::call::call_function_impl_result(
-            handler,
-            &[w_none(), base, sysid, pubid],
+            roots.get(pinned),
+            &[w_none(), base, roots.get(pinned + 2), roots.get(pinned + 1)],
         )?;
         if unsafe { is_int(ret) && w_int_get_value(ret) == 0 } {
             return self.fail("error in processing external entity reference");
@@ -1688,16 +1686,15 @@ fn call_foreign_dtd_handler(
     if handler.is_null() || unsafe { is_none(handler) } {
         return Ok(());
     }
-    // A class-held handler is a freshly bound method named only by this local,
-    // and the base lookup that follows is a full `getattr`, so it takes one
-    // liveness pin.
+    // The handler, the system id, the public id, and the parser stay pinned
+    // across the base lookup.  The lookup reads the parser from its slot.
     let roots = pyre_object::gc_roots::push_roots();
-    let handler = roots.pin_root(handler);
-    let base = pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_base")
+    let pinned = roots.pin_roots(&[handler, pubid, sysid, parser]);
+    let base = pyre_interpreter::baseobjspace::getattr_str(roots.get(pinned + 3), "_pyre_base")
         .unwrap_or_else(|_| w_none());
     let ret = pyre_interpreter::call::call_function_impl_result(
-        handler,
-        &[w_none(), base, sysid, pubid],
+        roots.get(pinned),
+        &[w_none(), base, roots.get(pinned + 2), roots.get(pinned + 1)],
     )?;
     if unsafe { is_int(ret) && w_int_get_value(ret) == 0 } {
         return Err(pyexpat_error(

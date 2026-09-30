@@ -578,10 +578,11 @@ pub fn complete_struct_or_union(
     let descrs = pyre_object::with_roots!(w_ctype => read_field_descrs(ct, w_fields))?;
 
     let roots = pyre_object::gc_roots::push_roots();
-    let list_slot = roots.base();
-    let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
-    let dict_slot = list_slot + 1;
-    let _ = roots.pin_root(pyre_object::dictmultiobject::w_dict_new());
+    // The ctype stays pinned across every allocation below, including the two
+    // containers.  Their slots are the indices those pins return.
+    let ctype_slot = roots.pin_roots(&[w_ctype]);
+    let list_slot = roots.pin_roots(&[pyre_object::w_list_new(Vec::new())]);
+    let dict_slot = roots.pin_roots(&[pyre_object::dictmultiobject::w_dict_new()]);
     let append = |w_field: PyObjectRef| unsafe {
         pyre_object::listobject::w_list_append(roots.get(list_slot), w_field);
     };
@@ -696,9 +697,10 @@ pub fn complete_struct_or_union(
                     let srcfld = super::ctypestruct::W_CField::from_obj(w_srcfld)
                         .ok_or_else(|| PyError::system_error("field list holds a non-field"))?;
                     let w_fld = super::ctypestruct::make_shifted(srcfld, byteoffset, fflags);
-                    append(w_fld);
+                    let fld_slot = roots.pin_roots(&[w_fld]);
+                    append(roots.get(fld_slot));
                     if let Some(name) = super::ctypestruct::name_of_field(ftype, w_srcfld)? {
-                        record(&name, w_fld);
+                        record(&name, roots.get(fld_slot));
                     }
                 }
                 // Such a structure can never be passed by value.
@@ -706,8 +708,9 @@ pub fn complete_struct_or_union(
             } else {
                 let w_fld =
                     super::ctypestruct::new_cfield(descr.w_ftype, byteoffset, bs_flag, -1, fflags);
-                append(w_fld);
-                record(fname, w_fld);
+                let fld_slot = roots.pin_roots(&[w_fld]);
+                append(roots.get(fld_slot));
+                record(fname, roots.get(fld_slot));
             }
             if ftype.size >= 0 {
                 byteoffset += ftype.size;
@@ -814,8 +817,9 @@ pub fn complete_struct_or_union(
                         fbitsize,
                         fflags,
                     );
-                    append(w_fld);
-                    record(fname, w_fld);
+                    let fld_slot = roots.pin_roots(&[w_fld]);
+                    append(roots.get(fld_slot));
+                    record(fname, roots.get(fld_slot));
                 }
             }
         }
@@ -864,9 +868,8 @@ pub fn complete_struct_or_union(
     if with_packed_change {
         ct.flags |= ctypeobj::CTypeFlags::WITH_PACKED_CHANGE.bits();
     }
-    // The ctype is old-gen and both containers are young, so the barrier has
-    // to run after the two writes.
-    pyre_object::gc_hook::try_gc_write_barrier_managed(w_ctype.cast::<u8>());
+    // The field containers were just stored into the ctype.
+    pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(ctype_slot).cast::<u8>());
     Ok(())
 }
 
@@ -1142,13 +1145,22 @@ pub fn build_function_type(
             0
         },
     );
+    // The argument slice is published with the new ctype and the result type
+    // before the tuple allocation.  Later reads rebuild it from those slots.
+    let n_fargs = fargs.len();
     let roots = pyre_object::gc_roots::push_roots();
-    let ctype_slot = roots.pin_roots(&[w_ctype, w_fresult]);
+    let ctype_slot = pyre_object::gc_roots::publish_roots(&[w_ctype, w_fresult]);
     let fresult_slot = ctype_slot + 1;
-    let fargs_slot = ctype_slot + 2;
-    let _ = roots.pin_root(pyre_object::w_tuple_new(fargs.to_vec()));
+    let fargs_base = pyre_object::gc_roots::publish_roots(fargs);
+    pyre_object::gc_roots::normalize_roots(ctype_slot, 2 + n_fargs);
+    let fargs_now = || -> Vec<PyObjectRef> {
+        let mut reloaded = vec![pyre_object::PY_NULL; n_fargs];
+        pyre_object::gc_roots::shadow_stack_copy_range(fargs_base, &mut reloaded);
+        reloaded
+    };
+    let fargs_tuple_slot = roots.pin_roots(&[pyre_object::w_tuple_new(fargs_now())]);
     let ct = ctypeobj::ctype_arg(roots.get(ctype_slot))?;
-    ct.fargs = roots.get(fargs_slot);
+    ct.fargs = roots.get(fargs_tuple_slot);
     ct.abi = abi;
     pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(ctype_slot).cast::<u8>());
     if !ellipsis {
@@ -1156,15 +1168,14 @@ pub fn build_function_type(
         // computed per call from the types actually passed.  For every other
         // one it is computed once, here.  A NotImplementedError is eaten; the
         // call itself raises it if one is ever made.
-        match super::ctypefunc::build_cif_descr(fargs, roots.get(fresult_slot), abi, None) {
+        match super::ctypefunc::build_cif_descr(&fargs_now(), roots.get(fresult_slot), abi, None) {
             Ok(cif) => ct.cif_descr = cif,
             Err(e) if e.kind == pyre_interpreter::PyErrorKind::NotImplementedError => {}
             Err(e) => return Err(e),
         }
     }
     let weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(roots.get(ctype_slot));
-    let weak_slot = fargs_slot + 1;
-    let _ = roots.pin_root(weak);
+    let weak_slot = roots.pin_roots(&[weak]);
     let mut cache = function_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1177,7 +1188,13 @@ pub fn build_function_type(
                     existing_root_slot,
                 ))
             };
-            if function_type_matches(existing, fargs, roots.get(fresult_slot), ellipsis, abi) {
+            if function_type_matches(
+                existing,
+                &fargs_now(),
+                roots.get(fresult_slot),
+                ellipsis,
+                abi,
+            ) {
                 return Ok(existing);
             }
         }

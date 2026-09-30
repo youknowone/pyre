@@ -381,19 +381,19 @@ pub(crate) mod cif {
     /// `CifDescrBuilder` — the two-pass bump allocator that measures the block
     /// and then fills it.
     ///
-    /// The argument and result types are ctypes, born through
-    /// `allocate_stable`: a collection never moves them, and the caller's
-    /// function type or rooted arguments keep them alive.
-    struct Builder<'a> {
-        fargs: &'a [PyObjectRef],
-        w_fresult: PyObjectRef,
+    /// The argument and result types stay on the shadow stack across both
+    /// passes.
+    struct Builder {
+        fargs_base: usize,
+        nargs: usize,
+        fresult_slot: usize,
         nb_bytes: usize,
         bufferp: *mut u8,
         atypes: *mut *mut ffi_type,
         rtype: *mut ffi_type,
     }
 
-    impl Builder<'_> {
+    impl Builder {
         /// `CifDescrBuilder.fb_alloc`.  Every request is a multiple of eight
         /// and the block itself comes from `malloc`, so each record inside it
         /// lands on its own alignment.
@@ -410,15 +410,20 @@ pub(crate) mod cif {
 
         /// `CifDescrBuilder.fb_build`.
         fn build(&mut self) -> Result<(), PyError> {
-            let nargs = self.fargs.len();
+            let nargs = self.nargs;
             self.alloc(
                 std::mem::size_of::<CifDescription>() + nargs * std::mem::size_of::<usize>(),
             );
             let atypes = self.alloc(nargs * std::mem::size_of::<*mut ffi_type>());
             self.atypes = atypes.cast::<*mut ffi_type>();
-            self.rtype = self.fill_type(ctypeobj::ctype_arg(self.w_fresult)?, true)?;
+            self.rtype = self.fill_type(
+                ctypeobj::ctype_arg(pyre_object::gc_roots::shadow_stack_get(self.fresult_slot))?,
+                true,
+            )?;
             for i in 0..nargs {
-                let farg = ctypeobj::ctype_arg(self.fargs[i])?;
+                let farg = ctypeobj::ctype_arg(pyre_object::gc_roots::shadow_stack_get(
+                    self.fargs_base + i,
+                ))?;
                 let atype = self.fill_type(farg, false)?;
                 if !self.atypes.is_null() {
                     unsafe { self.atypes.add(i).write(atype) };
@@ -670,9 +675,14 @@ pub(crate) mod cif {
         abi: i64,
         nfixedargs: Option<usize>,
     ) -> Result<usize, PyError> {
+        let nargs = fargs.len();
+        let roots = pyre_object::gc_roots::push_roots();
+        let fargs_base = roots.pin_roots(fargs);
+        let fresult_slot = roots.pin_roots(&[w_fresult]);
         let mut builder = Builder {
-            fargs,
-            w_fresult,
+            fargs_base,
+            nargs,
+            fresult_slot,
             nb_bytes: 0,
             bufferp: std::ptr::null_mut(),
             atypes: std::ptr::null_mut(),
@@ -688,7 +698,6 @@ pub(crate) mod cif {
         }
 
         // `CifDescrBuilder.fb_build_exchange`.
-        let nargs = fargs.len();
         let mut offset = std::mem::size_of::<*mut u8>() * nargs;
         offset = align_arg(align_to(offset, builder.rtype));
         let exchange_result = offset;
@@ -696,7 +705,7 @@ pub(crate) mod cif {
         for i in 0..nargs {
             // Room for the must-free flag the pointer conversion writes just
             // before the slot.
-            if ctypeobj::ctype_arg(fargs[i])?.kind == ctypeobj::KIND_POINTER {
+            if ctypeobj::ctype_arg(roots.get(fargs_base + i))?.kind == ctypeobj::KIND_POINTER {
                 offset += 1;
             }
             let atype = unsafe { builder.atypes.add(i).read() };
