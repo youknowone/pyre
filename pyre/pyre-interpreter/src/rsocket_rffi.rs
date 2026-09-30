@@ -292,57 +292,28 @@ pub fn protocol_by_name(name: &std::ffi::CStr) -> Option<libc::c_int> {
     (!entry.is_null()).then(|| unsafe { (*entry).p_proto as libc::c_int })
 }
 
-/// `inet_aton` — the lenient dotted-quad parser, returning the four address
-/// bytes in network order.  WinSock has no `inet_aton`; `inet_addr` accepts
-/// the same spellings and reports failure as `INADDR_NONE`, which is the
-/// substitution `socketmodule.c socket_inet_aton` makes without one.
+/// `inet_aton` — four address bytes in network order. The body is
+/// `rsocket.inet_aton`.
 #[cfg(unix)]
 pub fn inet_aton(text: &std::ffi::CStr) -> Option<[u8; 4]> {
-    let mut addr: libc::in_addr = unsafe { core::mem::zeroed() };
-    (unsafe { majit_rlib::_rsocket_rffi::inet_aton(text.as_ptr(), &mut addr) } != 0)
-        .then(|| addr.s_addr.to_ne_bytes())
+    majit_rlib::rsocket::inet_aton(text).ok()
 }
 #[cfg(windows)]
 pub fn inet_aton(text: &std::ffi::CStr) -> Option<[u8; 4]> {
-    // `INADDR_NONE` is both the failure report and the broadcast address, so
-    // the one spelling that collides is answered before the call — the
-    // substitution `rsocket.py`'s own `inet_addr` fallback makes.
-    if text.to_bytes() == b"255.255.255.255" {
-        return Some([0xff; 4]);
-    }
     init();
-    let addr = unsafe { ws::inet_addr(text.as_ptr() as *const u8) };
-    (addr != win_c::INADDR_NONE).then(|| addr.to_ne_bytes())
+    majit_rlib::rsocket::inet_aton(text).ok()
 }
 
-/// `inet_ntoa` — the dotted-quad spelling of four address bytes in network
-/// order.
+/// `inet_ntoa` — the dotted-quad spelling of four address bytes. The body is
+/// `rsocket.inet_ntoa`.
 #[cfg(unix)]
 pub fn inet_ntoa(packed: [u8; 4]) -> Option<String> {
-    let addr = libc::in_addr {
-        s_addr: u32::from_ne_bytes(packed),
-    };
-    let text = unsafe { majit_rlib::_rsocket_rffi::inet_ntoa(addr) };
-    (!text.is_null()).then(|| {
-        unsafe { std::ffi::CStr::from_ptr(text) }
-            .to_string_lossy()
-            .into_owned()
-    })
+    majit_rlib::rsocket::inet_ntoa(&packed).ok()
 }
 #[cfg(windows)]
 pub fn inet_ntoa(packed: [u8; 4]) -> Option<String> {
     init();
-    let addr = ws::IN_ADDR {
-        S_un: ws::IN_ADDR_0 {
-            S_addr: u32::from_ne_bytes(packed),
-        },
-    };
-    let text = unsafe { ws::inet_ntoa(addr) };
-    (!text.is_null()).then(|| {
-        unsafe { std::ffi::CStr::from_ptr(text as *const libc::c_char) }
-            .to_string_lossy()
-            .into_owned()
-    })
+    majit_rlib::rsocket::inet_ntoa(&packed).ok()
 }
 
 // ── descriptor inheritance ──

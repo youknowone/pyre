@@ -5,7 +5,8 @@
 //! `socketpair`, `if_nameindex`). `recvmsg_implementation`,
 //! `sendmsg_implementation`, `CMSG_SPACE_wrapper` and `CMSG_LEN_wrapper`
 //! stay out: each one is a separate C source. Windows here is `FD_*`,
-//! `select`, and `_WSAGetLastError`.
+//! `select`, `getsockname`, `getsockopt`, the byte-order conversions,
+//! `inet_addr`, `inet_ntoa`, and `_WSAGetLastError`.
 
 #![allow(non_snake_case, non_camel_case_types)]
 
@@ -730,6 +731,29 @@ mod winsock {
         pub ntohl = "ntohl",
         [UINT],
         UINT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+
+    /// `struct in_addr`. `S_addr` is the first field of `S_un`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct in_addr {
+        pub s_addr: u32,
+    }
+
+    // `inet_addr` / `inet_ntoa`. Windows has no `inet_aton`.
+    crate::rffi::llexternal!(
+        pub inet_addr = "inet_addr",
+        [*const std::ffi::c_char],
+        UINT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub inet_ntoa = "inet_ntoa",
+        [in_addr],
+        *mut std::ffi::c_char,
         compilation_info = ECI,
         calling_conv = "win"
     );

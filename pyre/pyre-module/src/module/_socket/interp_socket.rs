@@ -1167,11 +1167,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 let c = std::ffi::CString::new(s.as_bytes()).map_err(|_| {
                     pyre_interpreter::PyError::value_error("embedded null in argument")
                 })?;
-                let Some(bytes) = rffi::inet_aton(&c) else {
-                    return Err(pyre_interpreter::PyError::os_error(
+                #[cfg(any(unix, windows))]
+                let bytes = majit_rlib::rsocket::inet_aton(&c).map_err(|error| {
+                    pyre_interpreter::PyError::os_error(error.message)
+                })?;
+                #[cfg(not(any(unix, windows)))]
+                let bytes = rffi::inet_aton(&c).ok_or_else(|| {
+                    pyre_interpreter::PyError::os_error(
                         "illegal IP address string passed to inet_aton",
-                    ));
-                };
+                    )
+                })?;
                 Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
             },
             1,
@@ -1196,15 +1201,25 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     }
                     pyre_object::bytesobject::bytes_like_data(args[0])
                 };
-                if data.len() != 4 {
-                    return Err(pyre_interpreter::PyError::os_error(
-                        "packed IP wrong length for inet_ntoa",
-                    ));
+                #[cfg(any(unix, windows))]
+                {
+                    let text = majit_rlib::rsocket::inet_ntoa(data).map_err(|error| {
+                        pyre_interpreter::PyError::os_error(error.message)
+                    })?;
+                    return Ok(pyre_object::w_str_new_managed(&text));
                 }
-                let Some(text) = rffi::inet_ntoa([data[0], data[1], data[2], data[3]]) else {
-                    return Err(pyre_interpreter::PyError::os_error("inet_ntoa failed"));
-                };
-                Ok(pyre_object::w_str_new_managed(&text))
+                #[cfg(not(any(unix, windows)))]
+                {
+                    if data.len() != 4 {
+                        return Err(pyre_interpreter::PyError::os_error(
+                            "packed IP wrong length for inet_ntoa",
+                        ));
+                    }
+                    let Some(text) = rffi::inet_ntoa([data[0], data[1], data[2], data[3]]) else {
+                        return Err(pyre_interpreter::PyError::os_error("inet_ntoa failed"));
+                    };
+                    Ok(pyre_object::w_str_new_managed(&text))
+                }
             },
             1,
         ),

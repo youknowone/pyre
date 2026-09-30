@@ -83,6 +83,74 @@ pub fn setdefaulttimeout(timeout: f64) {
     DEFAULT_TIMEOUT_BITS.store(timeout.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `RSocketError`. `message` is `get_msg`.
+#[derive(Debug)]
+pub struct RSocketError {
+    pub message: &'static str,
+}
+
+fn rsocket_error(message: &'static str) -> RSocketError {
+    RSocketError { message }
+}
+
+/// `inet_aton`. Four address bytes, network order.
+///
+/// Windows has no `inet_aton`. `inet_addr` reports failure as `INADDR_NONE`,
+/// which is also the broadcast address, so that spelling is answered first.
+#[cfg(unix)]
+pub fn inet_aton(ip: &std::ffi::CStr) -> Result<[u8; 4], RSocketError> {
+    let mut addr: libc::in_addr = unsafe { std::mem::zeroed() };
+    let ok = unsafe { crate::_rsocket_rffi::inet_aton(ip.as_ptr(), &raw mut addr) };
+    if ok == 0 {
+        return Err(rsocket_error(
+            "illegal IP address string passed to inet_aton",
+        ));
+    }
+    Ok(addr.s_addr.to_ne_bytes())
+}
+
+#[cfg(windows)]
+pub fn inet_aton(ip: &std::ffi::CStr) -> Result<[u8; 4], RSocketError> {
+    if ip.to_bytes() == b"255.255.255.255" {
+        return Ok([0xff; 4]);
+    }
+    let packed = unsafe { crate::_rsocket_rffi::inet_addr(ip.as_ptr()) };
+    if packed == crate::rffi::UINT::MAX {
+        return Err(rsocket_error(
+            "illegal IP address string passed to inet_aton",
+        ));
+    }
+    Ok((packed as u32).to_ne_bytes())
+}
+
+/// `inet_ntoa`. The packed buffer is `sizeof(in_addr)` bytes.
+pub fn inet_ntoa(packed: &[u8]) -> Result<String, RSocketError> {
+    #[cfg(unix)]
+    let width = std::mem::size_of::<libc::in_addr>();
+    #[cfg(windows)]
+    let width = std::mem::size_of::<crate::_rsocket_rffi::in_addr>();
+    if packed.len() != width {
+        return Err(rsocket_error("packed IP wrong length for inet_ntoa"));
+    }
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(packed);
+    #[cfg(unix)]
+    let addr = libc::in_addr {
+        s_addr: u32::from_ne_bytes(bytes),
+    };
+    #[cfg(windows)]
+    let addr = crate::_rsocket_rffi::in_addr {
+        s_addr: u32::from_ne_bytes(bytes),
+    };
+    let text = unsafe { crate::_rsocket_rffi::inet_ntoa(addr) };
+    if text.is_null() {
+        return Err(rsocket_error("inet_ntoa failed"));
+    }
+    Ok(unsafe { std::ffi::CStr::from_ptr(text) }
+        .to_string_lossy()
+        .into_owned())
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
@@ -162,5 +230,26 @@ mod tests {
         setdefaulttimeout(-4.0);
         assert_eq!(getdefaulttimeout(), -1.0);
         setdefaulttimeout(saved);
+    }
+
+    #[test]
+    fn inet_aton_and_ntoa_round_trip() {
+        let packed = inet_aton(c"127.0.0.1").expect("loopback");
+        assert_eq!(packed, [127, 0, 0, 1]);
+        assert_eq!(inet_ntoa(&packed).expect("ntoa"), "127.0.0.1");
+        let broadcast = inet_aton(c"255.255.255.255").expect("broadcast");
+        assert_eq!(broadcast, [255, 255, 255, 255]);
+        assert_eq!(
+            inet_ntoa(&broadcast).expect("broadcast text"),
+            "255.255.255.255"
+        );
+        assert_eq!(
+            inet_aton(c"nope").expect_err("bad address").message,
+            "illegal IP address string passed to inet_aton"
+        );
+        assert_eq!(
+            inet_ntoa(&[1, 2, 3]).expect_err("short").message,
+            "packed IP wrong length for inet_ntoa"
+        );
     }
 }
