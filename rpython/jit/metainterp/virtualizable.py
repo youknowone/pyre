@@ -112,6 +112,28 @@ class VirtualizableInfo(object):
                     i = i + 1
             assert len(boxes) == i + 1
 
+        def write_box_at(virtualizable, boxes, index):
+            # write_boxes for one slot. Flat layout: static fields in
+            # unroll_static_fields order, then each array's items in
+            # unroll_array_fields order. The last box is the virtualizable.
+            virtualizable = cast_gcref_to_vtype(virtualizable)
+            assert 0 <= index < len(boxes) - 1
+            i = index
+            for FIELDTYPE, fieldname in unroll_static_fields:
+                if i == 0:
+                    x = unwrap(FIELDTYPE, boxes[index])
+                    setattr(virtualizable, fieldname, x)
+                    return
+                i = i - 1
+            for ARRAYITEMTYPE, fieldname in unroll_array_fields:
+                lst = getattr(virtualizable, fieldname)
+                length = len(lst)
+                if i < length:
+                    lst[i] = unwrap(ARRAYITEMTYPE, boxes[index])
+                    return
+                i = i - length
+            assert False, "invalid index"
+
         def get_total_size(virtualizable):
             virtualizable = cast_gcref_to_vtype(virtualizable)
             size = num_static_fields
@@ -198,6 +220,7 @@ class VirtualizableInfo(object):
                                                      array_fields))
         self.read_boxes = read_boxes
         self.write_boxes = write_boxes
+        self.write_box_at = write_box_at
         self.write_from_resume_data_partial = write_from_resume_data_partial
         self.load_list_of_boxes = load_list_of_boxes
         self.check_boxes = check_boxes
