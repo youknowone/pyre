@@ -21,12 +21,19 @@ use std::cell::UnsafeCell;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub static SET_TYPE: PyType = crate::pyobject::new_pytype_with_user_subclass("set", &SET_USER_TYPE);
+pub static SET_TYPE: PyType = crate::pyobject::new_pytype_with_user_subclass_and_weakref(
+    "set",
+    &SET_USER_TYPE,
+    std::mem::offset_of!(W_SetObject, lifeline),
+);
 /// `W_SetObjectUser` (`typedef.py` `_getusercls(W_SetObject)`).
 pub static SET_USER_TYPE: PyType =
     crate::pyobject::new_user_pytype("set", &SET_TYPE, std::mem::offset_of!(W_SetObjectUser, map));
-pub static FROZENSET_TYPE: PyType =
-    crate::pyobject::new_pytype_with_user_subclass("frozenset", &FROZENSET_USER_TYPE);
+pub static FROZENSET_TYPE: PyType = crate::pyobject::new_pytype_with_user_subclass_and_weakref(
+    "frozenset",
+    &FROZENSET_USER_TYPE,
+    std::mem::offset_of!(W_SetObject, lifeline),
+);
 /// `W_SetObjectUser` for `frozenset` (`typedef.py` `_getusercls`). The two
 /// user typeptrs share one payload layout and one GC tid.
 pub static FROZENSET_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
@@ -440,7 +447,7 @@ pub static IDENTITY_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
 
 /// Python set object.
 ///
-/// Layout: `[ob_header | sstorage | strategy | len | hash | set_id | content_gen]`,
+/// Layout: `[ob_header | sstorage | strategy | len | hash | set_id | content_gen | lifeline]`,
 /// the `W_BaseSetObject` slots `sstorage` and `strategy` (`setobject.py`) plus
 /// the atomic count, the frozenset hash cache, and the two words the integer
 /// `add` hit guard reads. `sstorage` is the erased box;
@@ -486,6 +493,10 @@ pub struct W_SetObject {
     /// key already stored does not reach either, so the word stays put.
     /// Relaxed, same as `len`.
     pub content_gen: AtomicUsize,
+    /// `setobject.py W_BaseSetObject` `_lifeline_` methods. Exact `set` and
+    /// `frozenset` instances store the lifeline here; a `_getusercls` subclass
+    /// keeps this null and uses `MapdictWeakrefSupport`.
+    pub lifeline: PyObjectRef,
 }
 
 impl W_SetObject {
@@ -2543,6 +2554,7 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
         hash: -1,
         set_id: fresh_set_id(),
         content_gen: crate::object_array::length_cell(0),
+        lifeline: PY_NULL,
     };
     if !raw.is_null() {
         unsafe {
@@ -2586,6 +2598,7 @@ pub fn w_set_user_new_empty(w_class: PyObjectRef, frozen: bool) -> PyObjectRef {
             hash: -1,
             set_id: fresh_set_id(),
             content_gen: crate::object_array::length_cell(0),
+            lifeline: PY_NULL,
         },
         map: 0,
         storage: std::ptr::null_mut(),
@@ -4287,7 +4300,7 @@ mod tests {
         assert_eq!(W_SET_USER_GC_TYPE_ID, 166);
         assert_eq!(
             W_SET_OBJECT_SIZE,
-            std::mem::offset_of!(W_SetObject, content_gen) + std::mem::size_of::<AtomicUsize>()
+            std::mem::offset_of!(W_SetObject, lifeline) + std::mem::size_of::<PyObjectRef>()
         );
         assert_eq!(
             W_SET_USER_OBJECT_SIZE,

@@ -12,10 +12,15 @@ use rustpython_wtf8::Wtf8Buf;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 /// Type descriptor for user-defined functions.
-pub static FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("function");
+pub static FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype_with_weakref(
+    "function",
+    std::mem::offset_of!(Function, lifeline),
+);
 /// Type descriptor for module-level builtins.
-pub static BUILTIN_FUNCTION_TYPE: PyType =
-    pyre_object::pyobject::new_pytype("builtin_function_or_method");
+pub static BUILTIN_FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype_with_weakref(
+    "builtin_function_or_method",
+    std::mem::offset_of!(Function, lifeline),
+);
 /// CPython-compatible interp-level method descriptor.
 ///
 /// PyPy represents these as `FunctionWithFixedCode`; the separate public
@@ -208,6 +213,9 @@ pub struct Function {
     /// so a write revokes nothing.  The block is created on first install and
     /// freed by [`function_destructor`] on sweep.
     pub mutate_slots: AtomicPtr<FunctionQuasiImmutSlots>,
+    /// `function.py` `make_weakref_descr(Function)` `_lifeline_`.
+    /// `builtin_function_or_method` shares this payload.
+    pub lifeline: PyObjectRef,
 }
 
 /// One `QuasiImmutField` per `function.py:34-42` `?` entry.
@@ -452,6 +460,8 @@ pub const FUNCTION_W_TEXT_SIGNATURE_OFFSET: usize =
 pub const FUNCTION_W_NEW_SELF_OFFSET: usize = std::mem::offset_of!(Function, w_new_self);
 /// Field offset of PyPy `BuiltinFunction.w_moduleobj`.
 pub const FUNCTION_W_MODULEOBJ_OFFSET: usize = std::mem::offset_of!(Function, w_moduleobj);
+/// Field offset of the `make_weakref_descr` `_lifeline_` slot.
+pub const FUNCTION_LIFELINE_OFFSET: usize = std::mem::offset_of!(Function, lifeline);
 /// Field offset of the `mutate_<name>` block pointer within `Function`.
 /// Declared `Type::Ref` on `FUNCTION_DESCR_GROUP` so `clear_gc_fields` NULLs it
 /// behind a JIT allocation; absent from [`FUNCTION_GC_PTR_OFFSETS`] so the
@@ -497,7 +507,7 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// W_FloatObject leave the typeptr-shaped header field out of their
 /// `gc_ptr_offsets`. W_TypeObject instances are static-region and
 /// not subject to nursery relocation.
-pub const FUNCTION_GC_PTR_OFFSETS: [usize; 18] = [
+pub const FUNCTION_GC_PTR_OFFSETS: [usize; 19] = [
     FUNCTION_CODE_OFFSET,
     // `name` — GC-managed `NameStorage` box when the collector owns the function
     // (skipped by the walker's managed-object guard for a pre-hook `malloc_raw` name).
@@ -542,6 +552,7 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 18] = [
     // is never nursery-relocated (same reasoning as `ob.w_class`).
     // PyPy `BuiltinFunction.w_moduleobj` is an ordinary GC module reference.
     FUNCTION_W_MODULEOBJ_OFFSET,
+    FUNCTION_LIFELINE_OFFSET,
 ];
 
 impl pyre_object::lltype::GcType for Function {
@@ -708,6 +719,7 @@ fn function_object_value(
         w_moduleobj: PY_NULL,
         // quasiimmut `mutate_<name>` — null until the first read is recorded.
         mutate_slots: AtomicPtr::new(std::ptr::null_mut()),
+        lifeline: PY_NULL,
     }
 }
 
@@ -4512,6 +4524,7 @@ mod tests {
                 std::mem::offset_of!(Function, w_objclass),
                 std::mem::offset_of!(Function, w_text_signature),
                 std::mem::offset_of!(Function, w_moduleobj),
+                std::mem::offset_of!(Function, lifeline),
             ]
         );
     }

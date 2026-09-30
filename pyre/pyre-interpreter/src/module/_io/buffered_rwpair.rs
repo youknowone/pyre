@@ -6,7 +6,7 @@ use super::DEFAULT_BUFFER_SIZE;
 
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // BufferedRWPair heap spec.
-#[crate::pyre_class("_io.BufferedRWPair", cpython_heaptype)]
+#[crate::pyre_class("_io.BufferedRWPair", cpython_heaptype, weakrefable)]
 pub struct W_BufferedRWPair {
     w_reader: PyObjectRef,
     w_writer: PyObjectRef,
@@ -21,6 +21,7 @@ impl Default for W_BufferedRWPair {
             w_reader: PY_NULL,
             w_writer: PY_NULL,
             w_dict: PY_NULL,
+            lifeline: PY_NULL,
         }
     }
 }

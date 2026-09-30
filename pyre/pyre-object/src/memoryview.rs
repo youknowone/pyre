@@ -22,7 +22,7 @@ use pyre_macros::pyre_class;
 
 /// A `memoryview` — a view over a byte backing, behind an off-heap
 /// [`BufferView`].
-#[pyre_class("memoryview", static_name = "MEMORYVIEW")]
+#[pyre_class("memoryview", static_name = "MEMORYVIEW", weakrefable)]
 pub struct W_MemoryView {
     /// `self.view` (`memoryobject.py`).  Never null for a live memoryview; the
     /// geometry and backing live here, off the GC heap, reached by the custom
@@ -304,28 +304,6 @@ pub unsafe fn w_memoryview_exports_decref(obj: PyObjectRef) {
         debug_assert!((*mv).exports > 0);
         (*mv).exports -= 1;
     }
-}
-
-/// `W_Root.getweakref()` storage supplied by
-/// `make_weakref_descr(W_MemoryView)` in PyPy's memoryview typedef.
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_memoryview_getweakref(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_MemoryView)).w_weakreflifeline }
-}
-
-/// Store the per-view weakref lifeline and remember the old-to-young edge.
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_memoryview_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
-    unsafe {
-        (*(obj as *mut W_MemoryView)).w_weakreflifeline = lifeline;
-    }
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// The cached content hash (`self._hash`), `-1` until computed.

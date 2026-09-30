@@ -177,7 +177,7 @@ impl Drop for NativeMMap {
 /// on the object and the low-level `rmmap.MMap` is owned by that same object.
 /// A user subclass is `typedef.py` `_getusercls` (`MapdictStorageMixin`).
 #[cfg(any(unix, windows))]
-#[pyre_interpreter::pyre_class("mmap.mmap", cpython_heaptype, user_layout)]
+#[pyre_interpreter::pyre_class("mmap.mmap", cpython_heaptype, user_layout, weakrefable)]
 #[derive(Default)]
 pub struct W_MMap {
     backend: *mut NativeMMap,
@@ -2077,6 +2077,7 @@ fn mmap_new_object(
             mode,
             offset,
             exports: 0,
+            lifeline: pyre_object::PY_NULL,
         },
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
     )

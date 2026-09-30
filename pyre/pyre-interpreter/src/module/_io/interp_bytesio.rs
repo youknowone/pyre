@@ -6,7 +6,7 @@ const AT_END: i64 = -1;
 
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // BytesIO heap spec.
-#[crate::pyre_class("_io.BytesIO", cpython_heaptype)]
+#[crate::pyre_class("_io.BytesIO", cpython_heaptype, weakrefable)]
 pub struct W_BytesIO {
     // rpython/rlib/rStringIO.py:16-23 splits immutable strings between an
     // append-optimized builder and a mutable character list. A bytearray is
@@ -26,6 +26,7 @@ impl Default for W_BytesIO {
             pos: AT_END,
             closed: false,
             w_dict: PY_NULL,
+            lifeline: PY_NULL,
         }
     }
 }

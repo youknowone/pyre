@@ -5860,8 +5860,8 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
 // ── Attribute operations ──────────────────────────────────────────────
 
 // `MapdictDictSupport` and `MapdictWeakrefSupport` live in
-// `objspace/std/mapdict.rs`. A weakref lifeline for an object without mapdict
-// storage is `WEAKREF_TABLE`.
+// `objspace/std/mapdict.rs`. `make_weakref_descr` stores `_lifeline_` at
+// `PyType.weakref_offset`; `W_Root` answers every other object.
 
 /// A hasdict receiver that matched none of the typed `getdict` owners and
 /// has no mapdict storage. PyPy cannot reach this state: `typedef.py`
@@ -6293,53 +6293,23 @@ pub(crate) fn getdictvalue_via_dict(
     finditem_str(w_dict, name)
 }
 
-/// interpreter/baseobjspace.py W_Root.getweakref().
+/// interpreter/baseobjspace.py `W_Root.getweakref`.
 ///
 /// ```python
 /// def getweakref(self):
 ///     return None
 /// ```
 ///
-/// MapdictWeakrefSupport.getweakref overrides it.
+/// `make_weakref_descr` and `MapdictWeakrefSupport` override it. Both live in
+/// [`mapdict::getweakref`](crate::objspace::std::mapdict::getweakref): a nonzero
+/// `PyType.weakref_offset` is the `_lifeline_` field, and a `_getusercls`
+/// layout uses the `"weakref"` SPECIAL slot. The class `weakrefable` flag
+/// gates both. A null lifeline is None.
 pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
-    if unsafe { crate::pycode::is_code(obj) } {
-        let lifeline = unsafe { crate::pycode::w_code_getweakref(obj) };
-        return (!lifeline.is_null()).then_some(lifeline);
-    }
-    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
-        let lifeline = unsafe { pyre_object::memoryview::w_memoryview_getweakref(obj) };
-        return (!lifeline.is_null()).then_some(lifeline);
-    }
-    if unsafe { pyre_object::interp_exceptions::is_exception(obj) } {
-        if crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-        {
-            let lifeline = unsafe { pyre_object::interp_exceptions::w_exception_getweakref(obj) };
-            return (!lifeline.is_null()).then_some(lifeline);
-        }
-        return None;
-    }
-    if unsafe { pyre_object::interp_array::is_array(obj) } {
-        if crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-        {
-            let lifeline = unsafe { pyre_object::interp_array::w_array_getweakref(obj) };
-            return (!lifeline.is_null()).then_some(lifeline);
-        }
-        return None;
-    }
-    if crate::module::r#struct::W_Struct::from_obj(obj).is_some() {
-        return crate::module::r#struct::W_Struct::getweakref(obj);
-    }
-    let w_type = crate::typedef::r#type(obj)?;
-    if unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) } {
-        crate::objspace::std::mapdict::getweakref(obj)
-    } else {
-        None
-    }
+    crate::objspace::std::mapdict::getweakref(obj)
 }
 
-/// interpreter/baseobjspace.py W_Root.setweakref(space, weakreflifeline).
+/// interpreter/baseobjspace.py `W_Root.setweakref`.
 ///
 /// ```python
 /// def setweakref(self, space, weakreflifeline):
@@ -6347,92 +6317,23 @@ pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
 ///                  "cannot create weak reference to '%T' object", self)
 /// ```
 ///
-/// MapdictWeakrefSupport.setweakref overrides it.
+/// `make_weakref_descr` and `MapdictWeakrefSupport` override it. See
+/// [`mapdict::setweakref`](crate::objspace::std::mapdict::setweakref).
 pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), PyError> {
-    if unsafe { crate::pycode::is_code(obj) } {
-        unsafe { crate::pycode::w_code_setweakref(obj, weakreflifeline) };
-        return Ok(());
-    }
-    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
-        unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, weakreflifeline) };
-        return Ok(());
-    }
-    if unsafe { pyre_object::interp_exceptions::is_exception(obj) }
-        && crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-    {
-        unsafe { pyre_object::interp_exceptions::w_exception_setweakref(obj, weakreflifeline) };
-        return Ok(());
-    }
-    if unsafe { pyre_object::interp_array::is_array(obj) }
-        && crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-    {
-        unsafe { pyre_object::interp_array::w_array_setweakref(obj, weakreflifeline) };
-        return Ok(());
-    }
-    if crate::module::r#struct::W_Struct::setweakref(obj, weakreflifeline) {
-        return Ok(());
-    }
-    let w_type = match crate::typedef::r#type(obj) {
-        Some(tp) => tp,
-        None => {
-            return Err(PyError::type_error(
-                "cannot create weak reference to object".to_string(),
-            ));
-        }
-    };
-    if unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) } {
-        crate::objspace::std::mapdict::setweakref(obj, weakreflifeline);
-        Ok(())
-    } else {
-        let tp_name = unsafe { pyre_object::w_type_get_name(w_type.as_ptr()) };
-        Err(PyError::type_error(format!(
-            "cannot create weak reference to '{}' object",
-            tp_name,
-        )))
-    }
+    crate::objspace::std::mapdict::setweakref(obj, weakreflifeline)
 }
 
-/// interpreter/baseobjspace.py W_Root.delweakref().
+/// interpreter/baseobjspace.py `W_Root.delweakref`.
 ///
 /// ```python
 /// def delweakref(self):
 ///     pass
 /// ```
+///
+/// `make_weakref_descr` and `MapdictWeakrefSupport` clear the lifeline. See
+/// [`mapdict::delweakref`](crate::objspace::std::mapdict::delweakref).
 pub fn delweakref(obj: PyObjectRef) {
-    if unsafe { crate::pycode::is_code(obj) } {
-        unsafe { crate::pycode::w_code_setweakref(obj, PY_NULL) };
-        return;
-    }
-    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
-        unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, PY_NULL) };
-        return;
-    }
-    if unsafe { pyre_object::interp_exceptions::is_exception(obj) }
-        && crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-    {
-        unsafe { pyre_object::interp_exceptions::w_exception_setweakref(obj, PY_NULL) };
-        return;
-    }
-    if unsafe { pyre_object::interp_array::is_array(obj) }
-        && crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-    {
-        unsafe { pyre_object::interp_array::w_array_setweakref(obj, PY_NULL) };
-        return;
-    }
-    if crate::module::r#struct::W_Struct::delweakref(obj) {
-        return;
-    }
-    let w_type = match crate::typedef::r#type(obj) {
-        Some(tp) => tp,
-        None => return,
-    };
-    if unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) } {
-        crate::objspace::std::mapdict::delweakref(obj);
-    }
+    crate::objspace::std::mapdict::delweakref(obj);
 }
 
 /// `W_Root.clear_all_weakrefs` — detach the lifeline before clearing it so a

@@ -5,7 +5,7 @@ use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // StringIO heap spec.
-#[crate::pyre_class("_io.StringIO", cpython_heaptype)]
+#[crate::pyre_class("_io.StringIO", cpython_heaptype, weakrefable)]
 pub struct W_StringIO {
     // interp_stringio.py stores UnicodeIO.data as a list of r_int32.
     // `array('w')` is the existing GC object whose raw payload is a mutable
@@ -36,6 +36,7 @@ impl Default for W_StringIO {
             readtranslate: false,
             w_decoder: PY_NULL,
             w_dict: PY_NULL,
+            lifeline: PY_NULL,
         }
     }
 }

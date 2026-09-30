@@ -268,7 +268,7 @@ pub mod bufferable_impl {
     }
 }
 
-#[crate::pyre_class("pickle.PickleBuffer")]
+#[crate::pyre_class("pickle.PickleBuffer", weakrefable)]
 pub struct W_PickleBuffer {
     /// The wrapped buffer-supporting object, or `None` after `release()`.
     w_obj: PyObjectRef,
@@ -320,6 +320,7 @@ impl W_PickleBuffer {
             export_active,
             release_memoryview,
             w_release_exporter: pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            lifeline: pyre_object::PY_NULL,
         });
         // `_finalize_` releases the acquired export. Pyre also routes weakref
         // invalidation through this queue, so register immutable-buffer

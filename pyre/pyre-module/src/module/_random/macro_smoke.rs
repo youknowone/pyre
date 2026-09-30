@@ -15,7 +15,7 @@ use pyre_object::*;
 
 /// `#[pyre_class]` typed payload exercising getter/setter/deleter,
 /// `__reduce__`, and the declarative `base = <expr>` arm.
-#[pyre_interpreter::pyre_class("_pyre_smoke.Demo")]
+#[pyre_interpreter::pyre_class("_pyre_smoke.Demo", weakrefable)]
 #[derive(Default)]
 pub struct Demo {
     pub state: u64,

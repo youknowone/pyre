@@ -1413,11 +1413,15 @@ struct PyreClassAttrs {
     /// `cpython_heaptype`; absent this marker, heap extension types default to
     /// IMMUTABLETYPE, matching the dominant 3.14 shape.
     cpython_mutable: bool,
+    /// Append (or reuse) the `make_weakref_descr` `_lifeline_` field and
+    /// publish its byte offset on this class's PyType. Does not set the
+    /// app-level weakrefable flag; `#[pyre_methods(weakrefable)]` does that.
+    weakrefable: bool,
 }
 
 impl syn::parse::Parse for PyreClassAttrs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        // `"name.path"[, type_id = N][, static_name = "PREFIX"][, user_subclass = "IDENT"][, user_layout]`
+        // `"name.path"[, type_id = N][, static_name = "PREFIX"][, user_subclass = "IDENT"][, user_layout][, weakrefable]`
         let name: syn::LitStr = input.parse()?;
         let mut type_id: Option<syn::LitInt> = None;
         let mut static_name: Option<syn::LitStr> = None;
@@ -1426,6 +1430,7 @@ impl syn::parse::Parse for PyreClassAttrs {
         let mut user_layout = false;
         let mut cpython_heaptype = false;
         let mut cpython_mutable = false;
+        let mut weakrefable = false;
         while !input.is_empty() {
             input.parse::<syn::Token![,]>()?;
             if input.is_empty() {
@@ -1446,6 +1451,10 @@ impl syn::parse::Parse for PyreClassAttrs {
                     user_layout = true;
                     continue;
                 }
+                "weakrefable" => {
+                    weakrefable = true;
+                    continue;
+                }
                 _ => {}
             }
             input.parse::<syn::Token![=]>()?;
@@ -1460,8 +1469,8 @@ impl syn::parse::Parse for PyreClassAttrs {
                         format!(
                             "unknown `#[pyre_class]` key `{other}` — \
                              expected `type_id` / `static_name` / `pytype_static` / \
-                             `user_subclass` / `user_layout` / `cpython_heaptype` / \
-                             `cpython_mutable`",
+                             `user_subclass` / `user_layout` / `weakrefable` / \
+                             `cpython_heaptype` / `cpython_mutable`",
                         ),
                     ));
                 }
@@ -1476,6 +1485,7 @@ impl syn::parse::Parse for PyreClassAttrs {
             user_layout,
             cpython_heaptype,
             cpython_mutable,
+            weakrefable,
         })
     }
 }
@@ -1508,6 +1518,7 @@ fn expand_pyre_class(
     };
     let has_mapdict_mixin = has_map && has_storage;
     let user_layout = attrs.user_layout;
+    let weakrefable = attrs.weakrefable;
     if user_layout && attrs.user_subclass.is_some() {
         return Err(syn::Error::new(
             st.span(),
@@ -1575,24 +1586,6 @@ fn expand_pyre_class(
     // omitted `type_id`, the cell starts unassigned and the legacy
     // const is not emitted — callers must read the cell at runtime via
     // `<W_X as GcType>::type_id()` (which itself becomes `cell.get()`).
-    // `user_subclass` names the `_getusercls` typeptr (`typedef.py`
-    // `_getusercls`); that wins over the mapdict-mixin constructor.
-    // A struct with `map` and `storage` records `map`'s byte offset on
-    // the typeptr (`MapdictStorageMixin`); `storage` is the next word.
-    let pytype_init = match &user_subclass {
-        Some(ident) => quote! {
-            ::pyre_object::pyobject::new_pytype_with_user_subclass(#name_lit, &#ident)
-        },
-        None if has_mapdict_mixin => quote! {
-            ::pyre_object::pyobject::new_pytype_with_mapdict_mixin(
-                #name_lit,
-                ::std::mem::offset_of!(#st_name, map),
-            )
-        },
-        None => quote! {
-            ::pyre_object::pyobject::new_pytype(#name_lit)
-        },
-    };
     let mapdict_adjacency_assert = if has_mapdict_mixin {
         quote! {
             const _: () = {
@@ -1658,6 +1651,90 @@ fn expand_pyre_class(
             .expect("parse ob field");
         named.named.insert(0, ob_field);
     }
+
+    // `typedef.py make_weakref_descr` stores `_lifeline_` on the instance.
+    // Reuse `lifeline` or `w_weakreflifeline` when the struct already has
+    // one; otherwise append `lifeline`. This attribute publishes the
+    // offset only — `#[pyre_methods(weakrefable)]` owns the app-level flag.
+    let weakref_field: Option<syn::Ident> = if weakrefable {
+        let existing = named.named.iter().find_map(|f| {
+            f.ident.as_ref().and_then(|ident| {
+                if ident == "lifeline" || ident == "w_weakreflifeline" {
+                    Some(ident.clone())
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(ident) = existing {
+            Some(ident)
+        } else {
+            use syn::parse::Parser;
+            let lifeline_field: syn::Field = syn::Field::parse_named
+                .parse2(quote! { pub lifeline: ::pyre_object::PyObjectRef })
+                .expect("parse lifeline field");
+            named.named.push(lifeline_field);
+            Some(syn::Ident::new("lifeline", proc_macro2::Span::call_site()))
+        }
+    } else {
+        None
+    };
+    // `user_subclass` names the `_getusercls` typeptr (`typedef.py`
+    // `_getusercls`) and wins over the mapdict-mixin constructor. The
+    // user typeptr publishes the same lifeline offset only when the
+    // field exists: `base` is a prefix, so `offset_of!(Base, field)`
+    // addresses it on a subclass instance too.
+    let pytype_init = match (&user_subclass, &weakref_field) {
+        (Some(ident), Some(field)) => quote! {
+            ::pyre_object::pyobject::new_pytype_with_user_subclass_and_weakref(
+                #name_lit,
+                &#ident,
+                ::std::mem::offset_of!(#st_name, #field),
+            )
+        },
+        (Some(ident), None) => quote! {
+            ::pyre_object::pyobject::new_pytype_with_user_subclass(#name_lit, &#ident)
+        },
+        (None, Some(field)) if has_mapdict_mixin => quote! {
+            ::pyre_object::pyobject::new_pytype_with_mapdict_and_weakref(
+                #name_lit,
+                ::std::mem::offset_of!(#st_name, map),
+                ::std::mem::offset_of!(#st_name, #field),
+            )
+        },
+        (None, None) if has_mapdict_mixin => quote! {
+            ::pyre_object::pyobject::new_pytype_with_mapdict_mixin(
+                #name_lit,
+                ::std::mem::offset_of!(#st_name, map),
+            )
+        },
+        (None, Some(field)) => quote! {
+            ::pyre_object::pyobject::new_pytype_with_weakref(
+                #name_lit,
+                ::std::mem::offset_of!(#st_name, #field),
+            )
+        },
+        (None, None) => quote! {
+            ::pyre_object::pyobject::new_pytype(#name_lit)
+        },
+    };
+    let user_pytype_init = match &weakref_field {
+        Some(field) => quote! {
+            ::pyre_object::pyobject::new_user_pytype_with_lifeline(
+                #name_lit,
+                &#pytype_static,
+                ::std::mem::offset_of!(#user_struct_name, map),
+                ::std::mem::offset_of!(#st_name, #field),
+            )
+        },
+        None => quote! {
+            ::pyre_object::pyobject::new_user_pytype(
+                #name_lit,
+                &#pytype_static,
+                ::std::mem::offset_of!(#user_struct_name, map),
+            )
+        },
+    };
 
     // Collect `PyObjectRef` fields' offsets for GC tracing.  `ob` is the
     // `PyObject` header; its `w_class` word is the instance -> class edge
@@ -1725,11 +1802,7 @@ fn expand_pyre_class(
                 };
 
                 #st_vis static #user_pytype_static: ::pyre_object::PyType =
-                    ::pyre_object::pyobject::new_user_pytype(
-                        #name_lit,
-                        &#pytype_static,
-                        ::std::mem::offset_of!(#user_struct_name, map),
-                    );
+                    #user_pytype_init;
 
                 #st_vis static #user_gc_type_id_cell: ::pyre_object::lltype::TypeIdCell =
                     ::pyre_object::lltype::TypeIdCell::auto();

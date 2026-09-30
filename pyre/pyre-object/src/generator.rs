@@ -13,9 +13,18 @@
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
 
-pub static GENERATOR_TYPE: PyType = crate::pyobject::new_pytype("generator");
-pub static COROUTINE_TYPE: PyType = crate::pyobject::new_pytype("coroutine");
-pub static ASYNC_GENERATOR_TYPE: PyType = crate::pyobject::new_pytype("async_generator");
+pub static GENERATOR_TYPE: PyType = crate::pyobject::new_pytype_with_weakref(
+    "generator",
+    std::mem::offset_of!(GeneratorIterator, lifeline),
+);
+pub static COROUTINE_TYPE: PyType = crate::pyobject::new_pytype_with_weakref(
+    "coroutine",
+    std::mem::offset_of!(GeneratorIterator, lifeline),
+);
+pub static ASYNC_GENERATOR_TYPE: PyType = crate::pyobject::new_pytype_with_weakref(
+    "async_generator",
+    std::mem::offset_of!(GeneratorIterator, lifeline),
+);
 
 /// Generator object: holds a boxed frame that can be resumed.
 ///
@@ -61,6 +70,9 @@ pub struct GeneratorIterator {
     pub hooks_inited: bool,
     pub ag_running: bool,
     pub w_finalizer: PyObjectRef,
+    /// `generator.py` `make_weakref_descr` `_lifeline_`, shared by generator,
+    /// coroutine and async-generator instances.
+    pub lifeline: PyObjectRef,
 }
 
 /// PyPy `generator.py CoroutineWrapper`: the iterator returned by
@@ -170,6 +182,7 @@ fn w_generator_or_coroutine_new(
         hooks_inited: false,
         ag_running: false,
         w_finalizer: PY_NULL,
+        lifeline: PY_NULL,
     };
     // A generator must be GC-managed, not immortal `malloc_typed`: the
     // collector never reaches an immortal object, so the registered

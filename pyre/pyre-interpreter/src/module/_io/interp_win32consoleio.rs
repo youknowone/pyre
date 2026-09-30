@@ -7,7 +7,7 @@ use rustpython_host_env::{io as host_io, nt as host_nt};
 const SMALLBUF: usize = 4;
 const BUFMAX: usize = 32 * 1024 * 1024;
 
-#[crate::pyre_class("_io._WindowsConsoleIO")]
+#[crate::pyre_class("_io._WindowsConsoleIO", weakrefable)]
 pub struct W_WinConsoleIO {
     // PyPy `W_WinConsoleIO.__init__`: all state belongs to the raw stream.
     // In particular the incomplete UTF-8 character is not a process-global or
@@ -38,6 +38,7 @@ impl Default for W_WinConsoleIO {
             blksize: super::DEFAULT_BUFFER_SIZE,
             smallbuf: [0; SMALLBUF],
             w_dict: PY_NULL,
+            lifeline: PY_NULL,
         }
     }
 }

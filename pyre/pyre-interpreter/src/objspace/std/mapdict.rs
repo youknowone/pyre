@@ -2,7 +2,9 @@
 //!
 //! Mapdict provides per-instance dict and weakref slots for hasdict /
 //! weakrefable types. PyPy stores these inside the mapdict map's "dict"
-//! and "weakref" SPECIAL slots; pyre does the same for user instances.
+//! and "weakref" SPECIAL slots; pyre does the same for a `_getusercls`
+//! layout whose base typedef is not weakrefable. `make_weakref_descr`
+//! stores `_lifeline_` on the instance instead.
 //!
 //! The names below mirror PyPy: `MapdictDictSupport.getdict` →
 //! `_obj_getdict`, `MapdictWeakrefSupport.setweakref` →
@@ -16,7 +18,7 @@ use pyre_object::quasiimmut::QuasiImmutField;
 use parking_lot::Mutex;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 
@@ -5156,41 +5158,6 @@ pub unsafe fn node_write<O: MapdictObject>(
     }
 }
 
-/// `MapdictWeakrefSupport` keeps a weakref lifeline in the `"weakref"` SPECIAL
-/// slot when the object carries mapdict storage. An object without that layout
-/// keeps the lifeline here. PyPy's SPECIAL field is visible to every
-/// ExecutionContext, so this carrier is interpreter-owned, never TLS.
-pub static WEAKREF_TABLE: LazyLock<Mutex<HashMap<usize, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Keys whose table value has been stored since the last minor root walk, and
-/// so may still be a nursery object.  See [`snapshot_root_entries`].
-static WEAKREF_TABLE_PENDING: LazyLock<Mutex<HashSet<usize>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-/// Keys that were a nursery address when the entry was made.  A nursery
-/// address is handed to the next allocation as soon as the collection that
-/// dropped its owner resets the nursery, so such a key must be resolved to
-/// where the owner moved — or dropped, if it died — before that happens.  See
-/// [`reconcile_young_owner_entries`].
-static WEAKREF_TABLE_YOUNG: LazyLock<Mutex<HashSet<usize>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-fn note_young_owner(young: &Mutex<HashSet<usize>>, key: PyObjectRef) {
-    if majit_gc::gc_is_nursery_object(key as usize) {
-        young.lock().insert(key as usize);
-    }
-}
-
-fn weakref_table_insert(key: PyObjectRef, value: PyObjectRef) {
-    WEAKREF_TABLE.lock().insert(key as usize, value as usize);
-    WEAKREF_TABLE_PENDING.lock().insert(key as usize);
-    note_young_owner(&WEAKREF_TABLE_YOUNG, key);
-}
-
-struct MapdictRootArea;
-static MAPDICT_ROOT_AREA: MapdictRootArea = MapdictRootArea;
-
 // ── MapdictDictSupport ────────────────────────────────────────────────
 
 /// `MapDictStrategy.length` (mapdict.py) — count the DICT attributes
@@ -5896,10 +5863,6 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     pyre_object::gc_roots::shadow_stack_get(dict_slot)
 }
 
-fn current_owner_key(key: usize) -> usize {
-    pyre_object::gc_hook::try_gc_current_object_address(key as *mut u8) as usize
-}
-
 /// GC custom trace over a live instance's `storage` value slots.
 ///
 /// `mapdict.py _set_mapdict_map` — an instance's attribute values live in the
@@ -5994,225 +5957,6 @@ pub unsafe fn mapdict_storage_custom_trace(
     };
 }
 
-/// Walk roots held by the weakref lifeline side table.
-///
-/// PyPy stores the weakref lifeline in a mapdict SPECIAL slot, so the translated
-/// GC sees it as an ordinary object field. A `W_ObjectObject` is GC-managed
-/// (`W_OBJECT_OBJECT_GC_TYPE_ID`): its attribute storage and `"dict"` SPECIAL-slot
-/// wrapper are forwarded by `object_object_custom_trace`. An object without
-/// mapdict storage keeps the lifeline in [`WEAKREF_TABLE`]. Expose those value
-/// slots here so the backend GC can update them when nursery objects move.
-pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
-    let data = capture_mapdict_root_area();
-    unsafe { walk_mapdict_roots_area(data, &mut visitor) };
-}
-
-pub fn capture_mapdict_root_area() -> *const () {
-    &MAPDICT_ROOT_AREA as *const _ as *const ()
-}
-
-/// The `(owner, value)` pairs a root walk of `table` has to visit.
-///
-/// A major walk visits the whole table.  A minor one visits only the keys
-/// stored since the previous minor walk, and retires them: an entry an earlier
-/// minor walk already visited had its value dragged out to the old generation
-/// and its key rewritten to the owner's post-move address, and an old value's
-/// own contents are reached through its write barrier and custom trace
-/// (`dict_write_barrier` / `dict_object_custom_trace`), never from here.  A
-/// non-moving major (`do_collect_oldgen`) leaves the nursery intact, so only
-/// the minor walk may drain the pending set.  A value the GC does not own has
-/// neither of those two paths, so [`walk_mapdict_roots_area`] puts its key
-/// straight back.
-///
-/// Without this split each collection cloned and walked the whole table, whose
-/// entries are roots and therefore outlive their owners: the per-collection
-/// cost grew with the number of weakref lifelines the program had ever created.
-fn snapshot_root_entries(
-    table: &Mutex<HashMap<usize, usize>>,
-    pending: &Mutex<HashSet<usize>>,
-    minor: bool,
-) -> Vec<(usize, PyObjectRef)> {
-    if !minor {
-        return table
-            .lock()
-            .iter()
-            .map(|(&key, &value)| (key, value as PyObjectRef))
-            .collect();
-    }
-    let keys = std::mem::take(&mut *pending.lock());
-    let table = table.lock();
-    keys.into_iter()
-        .filter_map(|key| table.get(&key).map(|&value| (key, value as PyObjectRef)))
-        .collect()
-}
-
-/// Drop every entry whose owner did not survive the collection.
-///
-/// [`WEAKREF_TABLE`] is keyed by owner address and holds its value as a root,
-/// so without this an owner's weakref lifeline outlives it: the table only
-/// grows, and every major collection marks the whole accumulation. Upstream
-/// has no equivalent table — the lifeline is a SPECIAL slot of the object,
-/// which dies with it — so the entries have to be given the same ephemeron
-/// semantics explicitly.
-///
-/// Registered with `majit_gc::shadow_stack::register_ephemeron_pruner`, which
-/// runs it from a major collection only.  `classify` returns the owner's
-/// current address, or `None` if it died; a major is mark-and-sweep and moves
-/// nothing, so a surviving owner always answers with the key it was asked
-/// about and the surviving entries keep their keys.
-pub fn prune_dead_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>) {
-    for (table, pending) in [(&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING)] {
-        let mut table = table.lock();
-        let dead: Vec<usize> = table
-            .keys()
-            .copied()
-            .filter(|&key| classify(key) != Some(key))
-            .collect();
-        if dead.is_empty() {
-            continue;
-        }
-        let mut pending = pending.lock();
-        for key in dead {
-            table.remove(&key);
-            pending.remove(&key);
-        }
-    }
-}
-
-/// Resolve every entry whose owner was young when it was made: move it to
-/// where the owner went, or drop it if the owner died.
-///
-/// [`prune_dead_owner_entries`] answers the same question for old-gen owners,
-/// but a major is far too late for a young one. A nursery address is reused by
-/// the very next allocation after the collection resets the nursery, so a
-/// surviving entry does not just leak — the unrelated object that lands on
-/// that address inherits the dead owner's weakref lifeline.
-///
-/// Registered with `majit_gc::shadow_stack::register_young_owner_reconciler`,
-/// which runs it from a minor collection once every survivor has been
-/// evacuated. `classify` returns the owner's current address, or `None` if it
-/// died. Only keys recorded as young are asked about, so the cost is
-/// proportional to the entries made since the previous minor.
-pub fn reconcile_young_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>) {
-    for (table, pending, young) in [(&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING, &WEAKREF_TABLE_YOUNG)]
-    {
-        let keys: Vec<usize> = {
-            let mut young = young.lock();
-            std::mem::take(&mut *young).into_iter().collect()
-        };
-        if keys.is_empty() {
-            continue;
-        }
-        let mut table = table.lock();
-        let mut pending = pending.lock();
-        let mut still_young = Vec::new();
-        for key in keys {
-            match classify(key) {
-                // The owner stayed put, which for a nursery address means it
-                // was pinned: keep tracking it, the next minor asks again.
-                Some(new_key) if new_key == key => still_young.push(key),
-                Some(new_key) => {
-                    // The root walk may already have re-keyed this entry, in
-                    // which case there is nothing left at the old address.
-                    if let Some(value) = table.remove(&key) {
-                        table.insert(new_key, value);
-                    }
-                    if pending.remove(&key) {
-                        pending.insert(new_key);
-                    }
-                }
-                None => {
-                    table.remove(&key);
-                    pending.remove(&key);
-                }
-            }
-        }
-        if !still_young.is_empty() {
-            young.lock().extend(still_young);
-        }
-    }
-}
-
-/// Mark side-table values only for owners that survived major marking.
-///
-/// PyPy stores the weakref lifeline in a field on each concrete object, so
-/// ordinary tracing reaches the value iff it first reaches the owner. The
-/// temporary address-keyed carrier must reproduce that conditional edge.
-/// Unconditionally rooting a lifeline whose value points back at its owner
-/// would keep the owner alive for the rest of the process.
-pub fn mark_live_side_table_entries(
-    classify: &mut dyn FnMut(usize) -> Option<usize>,
-    roots: &mut Vec<majit_ir::GcRef>,
-) {
-    for table in [&WEAKREF_TABLE] {
-        let entries: Vec<(usize, usize)> = table
-            .lock()
-            .iter()
-            .map(|(&owner, &value)| (owner, value))
-            .collect();
-        for (owner, value) in entries {
-            if classify(owner).is_some() && value != 0 {
-                roots.push(majit_ir::GcRef(value));
-            }
-        }
-    }
-}
-
-/// Re-key and re-point the entries a root walk moved, as `(old, new, value)`.
-///
-/// Collected during the walk and applied in one pass because the walk must not
-/// hold the table lock across a visitor callback, and a major walk that
-/// re-locked per entry paid a lock and a hash lookup for every entry the
-/// program had ever created — almost none of which move, since only a nursery
-/// object has an address to rewrite.
-fn apply_root_rekeys(table: &Mutex<HashMap<usize, usize>>, rekeys: Vec<(usize, usize, usize)>) {
-    if rekeys.is_empty() {
-        return;
-    }
-    let mut table = table.lock();
-    for (key, new_key, value) in rekeys {
-        if new_key == key {
-            if let Some(slot) = table.get_mut(&key) {
-                *slot = value;
-            }
-        } else if table.remove(&key).is_some() {
-            table.insert(new_key, value);
-        }
-    }
-}
-
-/// # Safety
-/// `data` must come from [`capture_mapdict_root_area`], and the owning thread
-/// must be quiesced.
-pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(&mut PyObjectRef)) {
-    // incminimark.py:339-355 prebuilt-object scanning parity: a minor
-    // collection reaches an old structure only through the write barrier, so
-    // only the entries stored since the previous minor walk are visited here.
-    let minor = majit_gc::shadow_stack::extra_root_walk_kind()
-        == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
-    // The weakref walk visits the lifeline pointer and stops there, so it needs
-    // no such re-arming: an off-GC lifeline never moves, and its own fields are
-    // outside what this walk ever traced.
-    // A major collection handles this table through the ephemeron marker
-    // above, after ordinary owner marking has settled. A minor still forwards
-    // freshly stored lifelines because owner liveness is not being decided.
-    let weakref_values = if minor {
-        snapshot_root_entries(&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING, true)
-    } else {
-        Vec::new()
-    };
-    let mut weakref_rekeys = Vec::new();
-    for (key, mut value) in weakref_values {
-        let old_value = value;
-        visitor(&mut value);
-        let new_key = current_owner_key(key);
-        if new_key != key || value != old_value {
-            weakref_rekeys.push((key, new_key, value as usize));
-        }
-    }
-    apply_root_rekeys(&WEAKREF_TABLE, weakref_rekeys);
-}
-
 /// objspace/std/mapdict.py _obj_setdict.
 ///
 /// ```python
@@ -6281,68 +6025,95 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
 
 // ── MapdictWeakrefSupport ─────────────────────────────────────────────
 
-/// objspace/std/mapdict.py MapdictWeakrefSupport.getweakref.
-///
-/// ```python
-/// def getweakref(self):
-///     from pypy.module._weakref.interp__weakref import WeakrefLifeline
-///     lifeline = self._get_mapdict_map().read(self, "weakref", SPECIAL)
-///     if lifeline is None:
-///         return None
-///     assert isinstance(lifeline, WeakrefLifeline)
-///     return lifeline
-/// ```
-/// `Module.typedef` is weakrefable (`make_weakref_descr(Module)`), so
-/// `_getusercls` does not mix `MapdictWeakrefSupport`. `ModuleUser` keeps
-/// the lifeline in `WEAKREF_TABLE`, the same place an exact module uses.
-fn weakref_uses_table(self_ref: PyObjectRef) -> bool {
-    unsafe { pyre_object::is_module(self_ref) || !has_mapdict_layout(self_ref) }
+/// Byte offset of `make_weakref_descr`'s `_lifeline_` on `obj`, or `0` when
+/// the typeptr does not publish one. A tagged int has no `ob_type` word.
+fn weakref_layout_offset(obj: PyObjectRef) -> usize {
+    if obj.is_null() {
+        return 0;
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return 0;
+    }
+    let tp = unsafe { (*obj).ob_type };
+    if tp.is_null() {
+        return 0;
+    }
+    unsafe { (*tp).weakref_offset }
 }
 
+/// `TypeDef.weakrefable` (`typedef.py`). Exact `object` shares `INSTANCE_TYPE`
+/// with user instances, and every exception kind shares one layout typeptr, so
+/// the offset alone is not the flag. Both the `_lifeline_` field and the
+/// `"weakref"` SPECIAL slot are gated on it.
+fn class_is_weakrefable(obj: PyObjectRef) -> bool {
+    crate::typedef::r#type(obj)
+        .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
+}
+
+/// `MapdictWeakrefSupport.getweakref`, and `make_weakref_descr`'s `getweakref`
+/// when the typeptr publishes `_lifeline_`. `W_Root.getweakref` returns None.
+/// A null lifeline is None.
 pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
-    // `_getusercls` mixes `MapdictWeakrefSupport` whenever
-    // `not typedef.weakrefable`, independent of `hasdict`. A slots-only
-    // user layout (`class S(list): __slots__ = ('__weakref__',)`) still
-    // carries the mixin, so the lifeline lives in the `"weakref"` SPECIAL
-    // slot the custom GC trace walks. A weakrefable base such as `Module`
-    // keeps the table even after `_getusercls` adds mapdict storage.
-    if weakref_uses_table(self_ref) {
-        WEAKREF_TABLE
-            .lock()
-            .get(&(self_ref as usize))
-            .copied()
-            .map(|value| value as PyObjectRef)
+    let offset = weakref_layout_offset(self_ref);
+    let mapdict = offset == 0 && unsafe { has_mapdict_layout(self_ref) };
+    if (offset == 0 && !mapdict) || !class_is_weakrefable(self_ref) {
+        return None;
+    }
+    if offset != 0 {
+        let lifeline = unsafe { pyre_object::read_weakref_lifeline(self_ref) };
+        (!lifeline.is_null()).then_some(lifeline)
     } else {
         unsafe { instance_get_weakref_slot(self_ref) }
     }
 }
 
-/// objspace/std/mapdict.py MapdictWeakrefSupport.setweakref.
-///
-/// ```python
-/// def setweakref(self, space, weakreflifeline):
-///     from pypy.module._weakref.interp__weakref import WeakrefLifeline
-///     assert isinstance(weakreflifeline, WeakrefLifeline)
-///     self._get_mapdict_map().write(self, "weakref", SPECIAL, weakreflifeline)
-/// ```
-pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
-    if weakref_uses_table(self_ref) {
-        weakref_table_insert(self_ref, weakreflifeline);
-    } else {
+/// `MapdictWeakrefSupport.setweakref`, and `make_weakref_descr`'s `setweakref`.
+/// `W_Root.setweakref` raises TypeError. A class whose `weakrefable` flag is
+/// set but whose layout has neither `_lifeline_` nor mapdict storage is a
+/// missing port and raises SystemError, the same shape as a missing dict.
+pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), PyError> {
+    let offset = weakref_layout_offset(self_ref);
+    let mapdict = offset == 0 && unsafe { has_mapdict_layout(self_ref) };
+    let w_type = crate::typedef::r#type(self_ref);
+    let weakrefable =
+        w_type.is_some_and(|w| unsafe { pyre_object::w_type_get_weakrefable(w.as_ptr()) });
+    if weakrefable && offset != 0 {
+        unsafe { pyre_object::write_weakref_lifeline(self_ref, weakreflifeline) };
+        return Ok(());
+    }
+    if weakrefable && mapdict {
         let flag = unsafe { instance_set_weakref_slot(self_ref, weakreflifeline) };
         debug_assert!(flag, "write to the weakref SPECIAL slot failed");
+        return Ok(());
+    }
+    let Some(w_type) = w_type else {
+        return Err(PyError::type_error(
+            "cannot create weak reference to object".to_string(),
+        ));
+    };
+    let tp_name = unsafe { pyre_object::w_type_get_name(w_type.as_ptr()) };
+    if weakrefable {
+        Err(PyError::system_error(format!(
+            "'{tp_name}' instance has no weakref storage (builtin base without a lifeline)"
+        )))
+    } else {
+        Err(PyError::type_error(format!(
+            "cannot create weak reference to '{tp_name}' object"
+        )))
     }
 }
 
-/// objspace/std/mapdict.py MapdictWeakrefSupport.delweakref.
-///
-/// ```python
-/// def delweakref(self):
-///     self._get_mapdict_map().write(self, "weakref", SPECIAL, None)
-/// ```
+/// `MapdictWeakrefSupport.delweakref`, and `make_weakref_descr`'s `delweakref`.
+/// `W_Root.delweakref` is a no-op. A field clear stores null and runs the
+/// write barrier.
 pub fn delweakref(self_ref: PyObjectRef) {
-    if weakref_uses_table(self_ref) {
-        WEAKREF_TABLE.lock().remove(&(self_ref as usize));
+    let offset = weakref_layout_offset(self_ref);
+    let mapdict = offset == 0 && unsafe { has_mapdict_layout(self_ref) };
+    if (offset == 0 && !mapdict) || !class_is_weakrefable(self_ref) {
+        return;
+    }
+    if offset != 0 {
+        unsafe { pyre_object::write_weakref_lifeline(self_ref, pyre_object::PY_NULL) };
     } else {
         unsafe { instance_del_weakref_slot(self_ref) };
     }
@@ -7217,6 +6988,9 @@ mod tests {
             let w_class =
                 pyre_object::w_type_new("SlotsOnlyStr", pyre_object::PY_NULL, std::ptr::null_mut());
             assert!(!pyre_object::w_type_get_hasdict(w_class));
+            // The class flag defaults false. `setweakref` gates the SPECIAL
+            // slot on `TypeDef.weakrefable`, which this slots layout sets.
+            pyre_object::w_type_set_weakrefable(w_class, true);
             let obj = pyre_object::w_str_subclass_from_wtf8(wb("abc"), w_class);
 
             // Auto-assigned type ids are registered by the JIT driver. Unit
@@ -7231,9 +7005,8 @@ mod tests {
             instance_walk_boxed_storage(obj, &mut |_| {});
 
             let lifeline = pyre_object::w_instance_new(pyre_object::PY_NULL);
-            setweakref(obj, lifeline);
+            setweakref(obj, lifeline).unwrap();
             assert_eq!(instance_get_weakref_slot(obj), Some(lifeline));
-            assert!(WEAKREF_TABLE.lock().get(&(obj as usize)).is_none());
             delweakref(obj);
             assert_eq!(instance_get_weakref_slot(obj), None);
         }
@@ -7655,72 +7428,6 @@ mod tests {
                 10
             );
         }
-    }
-
-    // The side-table root bookkeeping below takes its table and pending set as
-    // arguments, so these exercise the real functions on local tables — the
-    // process-global `WEAKREF_TABLE` is shared with every
-    // other test running concurrently and must not be touched here.
-    fn table(entries: &[(usize, usize)]) -> Mutex<HashMap<usize, usize>> {
-        Mutex::new(entries.iter().copied().collect())
-    }
-    fn pending(keys: &[usize]) -> Mutex<HashSet<usize>> {
-        Mutex::new(keys.iter().copied().collect())
-    }
-    fn keys_of(snapshot: &[(usize, PyObjectRef)]) -> Vec<usize> {
-        let mut keys: Vec<usize> = snapshot.iter().map(|&(key, _)| key).collect();
-        keys.sort_unstable();
-        keys
-    }
-
-    #[test]
-    fn major_snapshot_takes_the_whole_table_and_keeps_the_pending_set() {
-        let table = table(&[(0x10, 0xA0), (0x20, 0xB0), (0x30, 0xC0)]);
-        let pending = pending(&[0x20]);
-        let snapshot = snapshot_root_entries(&table, &pending, false);
-        assert_eq!(keys_of(&snapshot), [0x10, 0x20, 0x30]);
-        // A major moves nothing, so it must not retire the keys a later minor
-        // still owes a visit to.
-        assert_eq!(pending.lock().len(), 1);
-    }
-
-    #[test]
-    fn minor_snapshot_drains_the_pending_set() {
-        let table = table(&[(0x10, 0xA0), (0x20, 0xB0), (0x30, 0xC0)]);
-        let pending = pending(&[0x20, 0x30]);
-        let snapshot = snapshot_root_entries(&table, &pending, true);
-        assert_eq!(keys_of(&snapshot), [0x20, 0x30]);
-        assert!(pending.lock().is_empty());
-        // Drained: the entries are old by now and reached through their own
-        // write barrier, so the next minor visits nothing.
-        assert!(snapshot_root_entries(&table, &pending, true).is_empty());
-    }
-
-    #[test]
-    fn minor_snapshot_drops_a_pending_key_whose_entry_is_gone() {
-        let table = table(&[(0x10, 0xA0)]);
-        let pending = pending(&[0x10, 0x99]);
-        let snapshot = snapshot_root_entries(&table, &pending, true);
-        assert_eq!(keys_of(&snapshot), [0x10]);
-    }
-
-    #[test]
-    fn rekey_moves_a_promoted_owner_and_repoints_a_moved_value() {
-        let table = table(&[(0x10, 0xA0), (0x20, 0xB0)]);
-        // 0x10's owner moved to 0x11 and its value to 0xA1; 0x20 stayed put but
-        // its value moved.
-        apply_root_rekeys(&table, vec![(0x10, 0x11, 0xA1), (0x20, 0x20, 0xB1)]);
-        let table = table.lock();
-        assert_eq!(table.get(&0x10), None);
-        assert_eq!(table.get(&0x11), Some(&0xA1));
-        assert_eq!(table.get(&0x20), Some(&0xB1));
-    }
-
-    #[test]
-    fn rekey_of_an_entry_deleted_during_the_walk_reinserts_nothing() {
-        let table = table(&[]);
-        apply_root_rekeys(&table, vec![(0x10, 0x11, 0xA1), (0x20, 0x20, 0xB1)]);
-        assert!(table.lock().is_empty());
     }
 
     /// `typedef.py` `_getusercls`: an enumerate subclass instance is

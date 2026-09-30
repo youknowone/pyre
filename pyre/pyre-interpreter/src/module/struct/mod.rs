@@ -1353,7 +1353,7 @@ pub(crate) fn unpack_half(bits: u16) -> f64 {
 /// format string and precomputed size.
 // CPython 3.14 Modules/_struct.c:_struct_exec uses
 // PyType_FromModuleAndSpec; PyStructType carries IMMUTABLETYPE.
-#[crate::pyre_class("_struct.Struct", cpython_heaptype, user_layout)]
+#[crate::pyre_class("_struct.Struct", cpython_heaptype, user_layout, weakrefable)]
 pub struct W_Struct {
     /// Format string object (`text_or_bytes_w` of the constructor arg),
     /// promoted by value before each pack/unpack.  `_immutable_fields_ =
@@ -1366,24 +1366,6 @@ pub struct W_Struct {
 }
 
 impl W_Struct {
-    pub(crate) fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
-        let lifeline = W_Struct::from_obj(obj)?.w_weakreflifeline;
-        (!lifeline.is_null()).then_some(lifeline)
-    }
-
-    pub(crate) fn setweakref(obj: PyObjectRef, lifeline: PyObjectRef) -> bool {
-        let Some(this) = W_Struct::from_obj(obj) else {
-            return false;
-        };
-        this.w_weakreflifeline = lifeline;
-        pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
-        true
-    }
-
-    pub(crate) fn delweakref(obj: PyObjectRef) -> bool {
-        W_Struct::setweakref(obj, PY_NULL)
-    }
-
     /// CPython 3.14 `ENSURE_STRUCT_IS_READY` — every operation other than the
     /// `size` getter rejects an object allocated with `Struct.__new__` but not
     /// initialized yet.

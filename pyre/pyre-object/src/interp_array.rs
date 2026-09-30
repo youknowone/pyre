@@ -29,7 +29,8 @@ use rustpython_wtf8::{CodePoint, Wtf8Buf};
 #[pyre_class(
     "array.array",
     static_name = "ARRAY",
-    user_subclass = "ARRAY_USER_TYPE"
+    user_subclass = "ARRAY_USER_TYPE",
+    weakrefable
 )]
 pub struct W_Array {
     pub typecode: u8,
@@ -60,10 +61,11 @@ const _: () = {
 
 /// User-subclass `array.array` typeptr (`typedef.py` `_getusercls`).
 /// Instances share `W_Array`'s payload and add mapdict `map` / `storage`.
-pub static ARRAY_USER_TYPE: PyType = new_user_pytype(
+pub static ARRAY_USER_TYPE: PyType = new_user_pytype_with_lifeline(
     "array.array",
     &ARRAY_TYPE,
     std::mem::offset_of!(W_ArrayUser, map),
+    std::mem::offset_of!(W_Array, w_weakreflifeline),
 );
 
 /// User-subclass array layout (`typedef.py` `_getusercls`). Unconditional,
@@ -182,23 +184,6 @@ pub unsafe fn w_array_dealloc(obj: PyObjectRef) {
         unsafe { drop(Box::from_raw(array.data)) };
         array.data = std::ptr::null_mut();
     }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_array_getweakref(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_Array)).w_weakreflifeline }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_array_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
-    unsafe { (*(obj as *mut W_Array)).w_weakreflifeline = lifeline };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// # Safety

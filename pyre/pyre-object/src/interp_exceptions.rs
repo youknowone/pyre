@@ -14,7 +14,14 @@
 use crate::pyobject::*;
 use rustpython_wtf8::Wtf8;
 
-pub static EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("BaseException");
+/// Every instance vtable from [`exc_kind_to_pytype`] carries
+/// `W_BaseException.w_weakreflifeline`. The group layout static is not one
+/// of those vtables.
+const fn exc_pytype(name: &'static str) -> PyType {
+    crate::pyobject::new_pytype_with_weakref(name, EXC_W_WEAKREF_OFFSET)
+}
+
+pub static EXCEPTION_TYPE: PyType = exc_pytype("BaseException");
 /// PyPy `interp_group.W_BaseExceptionGroup` is a concrete interpreter class
 /// over `W_BaseException`, so its TypeDef owns a child instance Layout.
 ///
@@ -25,36 +32,31 @@ pub static EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("BaseException")
 /// `pyobject::all_foreign_pytypes`.
 pub static EXC_BASE_EXCEPTION_GROUP_LAYOUT_TYPE: PyType =
     crate::pyobject::new_pytype("BaseExceptionGroup");
-pub static EXC_EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("Exception");
-pub static EXC_ARITHMETIC_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ArithmeticError");
-pub static EXC_OVERFLOW_ERROR_TYPE: PyType = crate::pyobject::new_pytype("OverflowError");
-pub static EXC_ZERO_DIVISION_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ZeroDivisionError");
-pub static EXC_TYPE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("TypeError");
-pub static EXC_VALUE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ValueError");
-pub static EXC_NAME_ERROR_TYPE: PyType = crate::pyobject::new_pytype("NameError");
-pub static EXC_UNBOUND_LOCAL_ERROR_TYPE: PyType = crate::pyobject::new_pytype("UnboundLocalError");
-pub static EXC_INDEX_ERROR_TYPE: PyType = crate::pyobject::new_pytype("IndexError");
-pub static EXC_KEY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("KeyError");
-pub static EXC_ATTRIBUTE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("AttributeError");
-pub static EXC_RUNTIME_ERROR_TYPE: PyType = crate::pyobject::new_pytype("RuntimeError");
-pub static EXC_STOP_ITERATION_TYPE: PyType = crate::pyobject::new_pytype("StopIteration");
-pub static EXC_STOP_ASYNC_ITERATION_TYPE: PyType =
-    crate::pyobject::new_pytype("StopAsyncIteration");
-pub static EXC_IMPORT_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ImportError");
-pub static EXC_MODULE_NOT_FOUND_ERROR_TYPE: PyType =
-    crate::pyobject::new_pytype("ModuleNotFoundError");
-pub static EXC_NOT_IMPLEMENTED_ERROR_TYPE: PyType =
-    crate::pyobject::new_pytype("NotImplementedError");
-pub static EXC_ASSERTION_ERROR_TYPE: PyType = crate::pyobject::new_pytype("AssertionError");
-pub static EXC_REFERENCE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ReferenceError");
-pub static EXC_GENERATOR_EXIT_TYPE: PyType = crate::pyobject::new_pytype("GeneratorExit");
-pub static EXC_RECURSION_ERROR_TYPE: PyType = crate::pyobject::new_pytype("RecursionError");
-pub static EXC_OS_ERROR_TYPE: PyType = crate::pyobject::new_pytype("OSError");
-pub static EXC_FILE_NOT_FOUND_ERROR_TYPE: PyType = crate::pyobject::new_pytype("FileNotFoundError");
-pub static EXC_UNICODE_DECODE_ERROR_TYPE: PyType =
-    crate::pyobject::new_pytype("UnicodeDecodeError");
-pub static EXC_UNICODE_ENCODE_ERROR_TYPE: PyType =
-    crate::pyobject::new_pytype("UnicodeEncodeError");
+pub static EXC_EXCEPTION_TYPE: PyType = exc_pytype("Exception");
+pub static EXC_ARITHMETIC_ERROR_TYPE: PyType = exc_pytype("ArithmeticError");
+pub static EXC_OVERFLOW_ERROR_TYPE: PyType = exc_pytype("OverflowError");
+pub static EXC_ZERO_DIVISION_ERROR_TYPE: PyType = exc_pytype("ZeroDivisionError");
+pub static EXC_TYPE_ERROR_TYPE: PyType = exc_pytype("TypeError");
+pub static EXC_VALUE_ERROR_TYPE: PyType = exc_pytype("ValueError");
+pub static EXC_NAME_ERROR_TYPE: PyType = exc_pytype("NameError");
+pub static EXC_UNBOUND_LOCAL_ERROR_TYPE: PyType = exc_pytype("UnboundLocalError");
+pub static EXC_INDEX_ERROR_TYPE: PyType = exc_pytype("IndexError");
+pub static EXC_KEY_ERROR_TYPE: PyType = exc_pytype("KeyError");
+pub static EXC_ATTRIBUTE_ERROR_TYPE: PyType = exc_pytype("AttributeError");
+pub static EXC_RUNTIME_ERROR_TYPE: PyType = exc_pytype("RuntimeError");
+pub static EXC_STOP_ITERATION_TYPE: PyType = exc_pytype("StopIteration");
+pub static EXC_STOP_ASYNC_ITERATION_TYPE: PyType = exc_pytype("StopAsyncIteration");
+pub static EXC_IMPORT_ERROR_TYPE: PyType = exc_pytype("ImportError");
+pub static EXC_MODULE_NOT_FOUND_ERROR_TYPE: PyType = exc_pytype("ModuleNotFoundError");
+pub static EXC_NOT_IMPLEMENTED_ERROR_TYPE: PyType = exc_pytype("NotImplementedError");
+pub static EXC_ASSERTION_ERROR_TYPE: PyType = exc_pytype("AssertionError");
+pub static EXC_REFERENCE_ERROR_TYPE: PyType = exc_pytype("ReferenceError");
+pub static EXC_GENERATOR_EXIT_TYPE: PyType = exc_pytype("GeneratorExit");
+pub static EXC_RECURSION_ERROR_TYPE: PyType = exc_pytype("RecursionError");
+pub static EXC_OS_ERROR_TYPE: PyType = exc_pytype("OSError");
+pub static EXC_FILE_NOT_FOUND_ERROR_TYPE: PyType = exc_pytype("FileNotFoundError");
+pub static EXC_UNICODE_DECODE_ERROR_TYPE: PyType = exc_pytype("UnicodeDecodeError");
+pub static EXC_UNICODE_ENCODE_ERROR_TYPE: PyType = exc_pytype("UnicodeEncodeError");
 /// PyPy `pypy/module/exceptions/interp_exceptions.py W_UnicodeTranslateError
 /// W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
 /// W_UnicodeError, ...)` — subclass of UnicodeError.  A dedicated PyType
@@ -62,29 +64,28 @@ pub static EXC_UNICODE_ENCODE_ERROR_TYPE: PyType =
 /// `(object, start, end, reason)` init signature and the class's own
 /// `__str__` formatting.  See the `ExcKind::UnicodeTranslateError` doc
 /// for the field flattening its payload slots follow.
-pub static EXC_UNICODE_TRANSLATE_ERROR_TYPE: PyType =
-    crate::pyobject::new_pytype("UnicodeTranslateError");
-pub static EXC_SYSTEM_EXIT_TYPE: PyType = crate::pyobject::new_pytype("SystemExit");
-pub static EXC_MEMORY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("MemoryError");
-pub static EXC_SYSTEM_ERROR_TYPE: PyType = crate::pyobject::new_pytype("SystemError");
+pub static EXC_UNICODE_TRANSLATE_ERROR_TYPE: PyType = exc_pytype("UnicodeTranslateError");
+pub static EXC_SYSTEM_EXIT_TYPE: PyType = exc_pytype("SystemExit");
+pub static EXC_MEMORY_ERROR_TYPE: PyType = exc_pytype("MemoryError");
+pub static EXC_SYSTEM_ERROR_TYPE: PyType = exc_pytype("SystemError");
 /// PyPy `W_EOFError`, a direct `Exception` subclass used by stream readers
 /// such as pickle and marshal.
-pub static EXC_EOF_ERROR_TYPE: PyType = crate::pyobject::new_pytype("EOFError");
+pub static EXC_EOF_ERROR_TYPE: PyType = exc_pytype("EOFError");
 /// `BufferError` — raised when an operation cannot proceed because a
 /// buffer is exported (e.g. resizing a bytearray that backs a live
 /// memoryview).  Direct subclass of Exception.
-pub static EXC_BUFFER_ERROR_TYPE: PyType = crate::pyobject::new_pytype("BufferError");
+pub static EXC_BUFFER_ERROR_TYPE: PyType = exc_pytype("BufferError");
 /// PyPy `pypy/module/exceptions/interp_exceptions.py:474
 /// W_LookupError = _new_exception('LookupError', W_Exception, ...)`
 /// — intermediate parent for IndexError and KeyError.
-pub static EXC_LOOKUP_ERROR_TYPE: PyType = crate::pyobject::new_pytype("LookupError");
+pub static EXC_LOOKUP_ERROR_TYPE: PyType = exc_pytype("LookupError");
 /// PyPy `pypy/module/exceptions/interp_exceptions.py:418
 /// W_UnicodeError = _new_exception('UnicodeError', W_ValueError, ...)`
 /// — intermediate parent for UnicodeDecodeError and UnicodeEncodeError.
-pub static EXC_UNICODE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("UnicodeError");
+pub static EXC_UNICODE_ERROR_TYPE: PyType = exc_pytype("UnicodeError");
 /// `pypy/module/exceptions/interp_exceptions.py W_SyntaxError` — subclass
 /// of Exception raised by `compile`/`exec`/`eval`/`ast.parse`.
-pub static EXC_SYNTAX_ERROR_TYPE: PyType = crate::pyobject::new_pytype("SyntaxError");
+pub static EXC_SYNTAX_ERROR_TYPE: PyType = exc_pytype("SyntaxError");
 
 /// Per-`ExcKind` `ob_type` resolver. `w_exception_new` writes the
 /// returned pointer into the allocated `W_BaseException` so the
@@ -1422,29 +1423,6 @@ pub unsafe fn w_exception_peek_dict(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_dict = w_dict;
-        exception_write_barrier(obj);
-    }
-}
-
-/// Read the per-exception weakref lifeline. Builtin exceptions and
-/// their subclasses keep this slot on the slim [`W_BaseException`]
-/// prefix so a fieldless instance can be weakrefable.
-///
-/// # Safety
-/// `obj` must point to a valid `W_BaseException`.
-#[inline]
-pub unsafe fn w_exception_getweakref(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_weakreflifeline }
-}
-
-/// Store the per-exception weakref lifeline and remember an old-to-young edge.
-///
-/// # Safety
-/// `obj` must point to a valid `W_BaseException`.
-#[inline]
-pub unsafe fn w_exception_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
-    unsafe {
-        (*(obj as *mut W_BaseException)).w_weakreflifeline = lifeline;
         exception_write_barrier(obj);
     }
 }

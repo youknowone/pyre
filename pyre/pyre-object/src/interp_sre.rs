@@ -13,7 +13,7 @@ use pyre_macros::pyre_class;
 /// runs the sre-engine crate's u32 opcode buffer, leaked once at
 /// compile time and immutable for the pattern's lifetime
 /// (`_immutable_fields_ = ["code", ...]`, interp_sre.py:148).
-#[pyre_class("re.Pattern", static_name = "SRE_PATTERN")]
+#[pyre_class("re.Pattern", static_name = "SRE_PATTERN", weakrefable)]
 pub struct W_SRE_Pattern {
     /// interp_sre.py `srepat.w_pattern` — original uncompiled pattern.
     pub w_pattern: PyObjectRef,
@@ -61,6 +61,7 @@ pub fn w_sre_pattern_new(
         num_groups,
         w_groupindex,
         w_indexgroup,
+        lifeline: PY_NULL,
     })
 }
 

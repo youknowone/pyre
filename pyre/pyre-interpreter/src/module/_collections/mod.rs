@@ -74,7 +74,7 @@ pub mod deque_lock {
 /// protocols, with `maxlen` bounding).
 // CPython 3.14 Modules/_collectionsmodule.c:collections_exec ADD_TYPEs
 // deque_spec through a module heap type; the spec is immutable.
-#[crate::pyre_class("collections.deque", cpython_heaptype, user_layout)]
+#[crate::pyre_class("collections.deque", cpython_heaptype, user_layout, weakrefable)]
 pub struct W_Deque {
     leftblock: PyObjectRef,
     rightblock: PyObjectRef,
@@ -1059,6 +1059,7 @@ impl W_Deque {
                 len: 0,
                 maxlen: -1,
                 lock: PY_NULL,
+                lifeline: PY_NULL,
             },
             pyre_object::gc_roots::shadow_stack_get(cls_slot),
         ))
@@ -1702,6 +1703,7 @@ mod tests {
                 len: 0,
                 maxlen: -1,
                 lock: PY_NULL,
+                lifeline: PY_NULL,
             },
             sub,
         );
@@ -1723,12 +1725,51 @@ mod tests {
                 len: 0,
                 maxlen: -1,
                 lock: PY_NULL,
+                lifeline: PY_NULL,
             },
             PY_NULL,
         );
         unsafe {
             assert!(std::ptr::eq((*exact).ob_type, &DEQUE_TYPE));
             assert!(!crate::objspace::std::mapdict::has_mapdict_layout(exact));
+        }
+    }
+
+    #[test]
+    fn weakref_lifeline_roundtrip_set_type_and_deque_subclass() {
+        crate::typedef::init_typeobjects();
+        let set_obj = pyre_object::w_set_new();
+        let type_obj = pyre_object::w_type_new("LifelineRoundTrip", PY_NULL, std::ptr::null_mut());
+        let w_class = pyre_object::w_type_new("DequeSubLifeline", PY_NULL, std::ptr::null_mut());
+        unsafe { pyre_object::w_type_set_weakrefable(w_class, true) };
+        let block = deque_block::new(PY_NULL, PY_NULL);
+        let deque_obj = W_Deque::allocate_instance(
+            W_Deque {
+                ob: pyre_object::PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+                leftblock: block,
+                rightblock: block,
+                leftindex: super::CENTER + 1,
+                rightindex: super::CENTER,
+                len: 0,
+                maxlen: -1,
+                lock: PY_NULL,
+                lifeline: PY_NULL,
+            },
+            w_class,
+        );
+        for obj in [set_obj, type_obj, deque_obj] {
+            unsafe {
+                assert_ne!((*(*obj).ob_type).weakref_offset, 0);
+            }
+            let lifeline = pyre_object::w_instance_new(PY_NULL);
+            assert!(crate::baseobjspace::getweakref(obj).is_none());
+            crate::baseobjspace::setweakref(obj, lifeline).unwrap();
+            assert_eq!(crate::baseobjspace::getweakref(obj), Some(lifeline));
+            crate::baseobjspace::delweakref(obj);
+            assert!(crate::baseobjspace::getweakref(obj).is_none());
         }
     }
 }

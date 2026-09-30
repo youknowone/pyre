@@ -80,7 +80,7 @@ pub(super) fn raw_readinto_size(
 
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // BufferedReader heap spec.
-#[crate::pyre_class("_io.BufferedReader", cpython_heaptype)]
+#[crate::pyre_class("_io.BufferedReader", cpython_heaptype, weakrefable)]
 pub struct W_BufferedReader {
     state: i64,
     w_raw: PyObjectRef,
@@ -117,6 +117,7 @@ impl Default for W_BufferedReader {
             writable: false,
             lock: 0,
             w_dict: PY_NULL,
+            lifeline: PY_NULL,
         }
     }
 }

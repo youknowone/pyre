@@ -505,6 +505,7 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
     f(&mut t.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut t.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.w_name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.w_qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -548,6 +549,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         }
     }
     f(&mut t.dict as *mut *mut u8 as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut t.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
 /// Reclaim the Rust-owned, out-of-line `weak_subclasses` container of a swept
@@ -632,11 +634,13 @@ unsafe fn classmethod_destructor(obj_addr: usize) {
 unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let gen_obj = unsafe { &mut *(obj_addr as *mut pyre_object::generator::GeneratorIterator) };
     f(&mut gen_obj.ob.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut gen_obj.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.pycode as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.cr_origin as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.w_finalizer as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut gen_obj.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.saved_exc_value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(
         &mut gen_obj.previous_gen_or_coroutine as *mut pyre_object::PyObjectRef
@@ -1133,6 +1137,7 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     // releases the last other reference to a frozenset subclass immediately
     // before its instance finalizer resolves `__del__` through that class.
     f(&mut set.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut set.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // `sstorage` (`setobject.py`). The box traces its own entries
     // (`set_items_storage_custom_trace`, `int_set_storage_custom_trace`,
     // `bytes_set_storage_custom_trace`, `ascii_set_storage_custom_trace`,
@@ -1144,6 +1149,7 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
         let storage_slot = std::ptr::addr_of_mut!(set.sstorage);
         f(storage_slot as *mut majit_ir::GcRef);
     }
+    f(&mut set.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
 unsafe fn set_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
@@ -4500,8 +4506,15 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::pyobject::MODULE_USER_TYPE as *const _ as usize,
         module_user_tid,
     );
+    // `W_LocalUser` (`typedef.py` `_getusercls`). Parent is W_Local (133).
+    // `make_weakref_descr(Local)` keeps `_lifeline_` on the prefix.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::thread::W_LOCAL_USER_PYRE_CLASS_DESCRIPTOR,
+    );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 204),
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 205),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,
@@ -5283,7 +5296,7 @@ fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 }
 
 /// Phase B: root walkers that reference interpreter state (immortal dicts,
-/// mapdict side table, etc.).  Registration stores fn pointers only, so it
+/// parked exceptions).  Registration stores fn pointers only, so it
 /// runs at the tail of `init_gc_subsystem`, before anything the walkers
 /// answer for has been allocated.
 fn install_gc_root_walkers() {
@@ -5297,22 +5310,6 @@ fn install_gc_root_walkers() {
         "immortal_store_roots",
     );
     majit_gc::shadow_stack::register_rescan_root_walker(walk_rescan_tls_exception_roots);
-    // The mapdict side tables are keyed by owner address. Their values are
-    // conditional edges, matching the instance-dict and weakref fields PyPy
-    // stores on the owner itself, so major marking keeps a value only after
-    // its owner is known live and drops entries whose owner is about to sweep.
-    majit_gc::shadow_stack::register_ephemeron_pruner(
-        pyre_interpreter::objspace::std::mapdict::prune_dead_owner_entries,
-    );
-    majit_gc::shadow_stack::register_ephemeron_marker(
-        pyre_interpreter::objspace::std::mapdict::mark_live_side_table_entries,
-    );
-    // An owner that dies in the nursery cannot wait for that major: the reset
-    // hands its address to the next allocation, which would then answer to its
-    // entry.
-    majit_gc::shadow_stack::register_young_owner_reconciler(
-        pyre_interpreter::objspace::std::mapdict::reconcile_young_owner_entries,
-    );
 }
 
 fn register_thread_root_areas() {
@@ -5361,11 +5358,6 @@ fn register_thread_root_areas() {
             walk_end_root_walker_area,
             pyre_jit_trace::trace::capture_walk_end_root_area(),
             "walk_end",
-        );
-        register(
-            mapdict_root_walker_area,
-            pyre_interpreter::objspace::std::mapdict::capture_mapdict_root_area(),
-            "mapdict",
         );
         register(
             signal_handler_root_walker_area,
@@ -5575,7 +5567,7 @@ thread_local! {
 }
 
 /// Phase B of GC init: register root walkers that touch interpreter
-/// state (immortal dicts, mapdict side table, etc.).  Called from
+/// state (immortal dicts, parked exceptions).  Called from
 /// `init_gc_subsystem` once the collector is installed, and again on the
 /// first eval entry for the paths that reach an eval loop without it.
 /// Idempotent.
@@ -6344,14 +6336,6 @@ unsafe fn walk_end_root_walker_area(
     unsafe { pyre_jit_trace::trace::walk_walk_end_roots_area(data, visitor) };
 }
 
-unsafe fn mapdict_root_walker_area(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    unsafe {
-        pyre_interpreter::objspace::std::mapdict::walk_mapdict_roots_area(data, |slot| {
-            visit_pyobject_root(slot, visitor);
-        });
-    }
-}
-
 unsafe fn signal_handler_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -6378,13 +6362,6 @@ fn visit_pyobject_root(
     let gcref: &mut majit_ir::GcRef =
         unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
     visitor(gcref);
-}
-
-#[allow(dead_code)]
-fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    pyre_interpreter::objspace::std::mapdict::walk_mapdict_roots(|slot| {
-        visit_pyobject_root(slot, visitor);
-    });
 }
 
 #[allow(dead_code)]

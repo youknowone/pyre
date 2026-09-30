@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 // CPython 3.14 Modules/_queuemodule.c:_queue_exec uses
 // PyType_FromModuleAndSpec with IMMUTABLETYPE.
-#[pyre_interpreter::pyre_class("_queue.SimpleQueue", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_queue.SimpleQueue", cpython_heaptype, weakrefable)]
 #[derive(Default)]
 pub struct W_SimpleQueue {
     pub map: *const u8,

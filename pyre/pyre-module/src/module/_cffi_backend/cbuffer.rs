@@ -11,7 +11,7 @@ use super::ctypeobj;
 const DOC: &str = "ffi.buffer(cdata[, byte_size]):\nReturn a read-write buffer object that references the raw C data\npointed to by the given 'cdata'.  The 'cdata' must be a pointer or an\narray.  Can be passed to functions expecting a buffer, or directly\nmanipulated with:\n\n    buf[:]          get a copy of it in a regular string, or\n    buf[idx]        as a single character\n    buf[:] = ...\n    buf[idx] = ...  change the content\n";
 
 /// `cbuffer.py MiniBuffer`.
-#[pyre_interpreter::pyre_class("_cffi_backend.buffer")]
+#[pyre_interpreter::pyre_class("_cffi_backend.buffer", weakrefable)]
 #[derive(Default)]
 pub struct MiniBuffer {
     /// `LLBuffer.raw_cdata`.

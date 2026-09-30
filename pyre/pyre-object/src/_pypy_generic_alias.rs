@@ -16,7 +16,12 @@ use pyre_macros::pyre_class;
 /// - `args`: tuple of the type arguments (`(int,)`) — `_args`
 /// - `parameters`: tuple of free type variables — `_parameters`
 /// - `unpacked`: set by `_make_starred` for `*Ts` unpacking — `__unpacked__`
-#[pyre_class("types.GenericAlias", static_name = "GENERIC_ALIAS", user_layout)]
+#[pyre_class(
+    "types.GenericAlias",
+    static_name = "GENERIC_ALIAS",
+    user_layout,
+    weakrefable
+)]
 pub struct GenericAlias {
     pub origin: PyObjectRef,
     pub args: PyObjectRef,
@@ -72,6 +77,7 @@ pub fn w_generic_alias_new(
             args: std::ptr::null_mut(),
             parameters: std::ptr::null_mut(),
             unpacked: false,
+            lifeline: PY_NULL,
         });
         unsafe {
             (*(obj as *mut GenericAlias)).origin = crate::gc_roots::shadow_stack_get(save_point);
@@ -94,6 +100,7 @@ pub fn w_generic_alias_new(
                 args: crate::gc_roots::shadow_stack_get(save_point + 1),
                 parameters: crate::gc_roots::shadow_stack_get(save_point + 2),
                 unpacked: false,
+                lifeline: PY_NULL,
             },
             crate::gc_roots::shadow_stack_get(save_point + 3),
         )
@@ -192,7 +199,7 @@ mod tests {
 /// - `parameters`: tuple of free type variables — `__parameters__`
 ///
 /// PyPy equivalent: UnionType in _pypy_generic_alias.py
-#[pyre_class("types.UnionType", type_id = 22, static_name = "UNION")]
+#[pyre_class("types.UnionType", type_id = 22, static_name = "UNION", weakrefable)]
 pub struct UnionType {
     /// CPython 3.14 `unionobject.args`.
     pub args: PyObjectRef,
@@ -253,6 +260,7 @@ pub fn w_union_from_parts(
         hashable_args: std::ptr::null_mut(),
         unhashable_args: std::ptr::null_mut(),
         parameters: std::ptr::null_mut(),
+        lifeline: PY_NULL,
     });
     unsafe {
         (*(obj as *mut UnionType)).args = crate::gc_roots::shadow_stack_get(args_slot);

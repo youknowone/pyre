@@ -9,7 +9,7 @@ use pyre_macros::pyre_class;
 // PyPy: pypy/interpreter/function.py Method
 
 /// Python bound method wrapper.
-#[pyre_class("method", type_id = 16, static_name = "METHOD")]
+#[pyre_class("method", type_id = 16, static_name = "METHOD", weakrefable)]
 pub struct Method {
     pub w_function: PyObjectRef,
     pub w_self: PyObjectRef,
@@ -31,6 +31,7 @@ pub const METHOD_W_FUNCTION_OFFSET: usize = std::mem::offset_of!(Method, w_funct
 pub const METHOD_W_SELF_OFFSET: usize = std::mem::offset_of!(Method, w_self);
 pub const METHOD_W_CLASS_OFFSET: usize = std::mem::offset_of!(Method, w_class);
 pub const METHOD_W_MODULE_OFFSET: usize = std::mem::offset_of!(Method, w_module);
+pub const METHOD_LIFELINE_OFFSET: usize = std::mem::offset_of!(Method, lifeline);
 
 pub fn w_method_new(
     w_function: PyObjectRef,
@@ -81,6 +82,7 @@ pub fn w_method_new(
                     w_self: PY_NULL,
                     w_class: PY_NULL,
                     w_module,
+                    lifeline: PY_NULL,
                 },
             );
         }
@@ -127,6 +129,7 @@ pub fn w_method_new(
                     w_self,
                     w_class,
                     w_module,
+                    lifeline: PY_NULL,
                 },
             );
         }
@@ -144,6 +147,7 @@ pub fn w_method_new(
         w_self,
         w_class,
         w_module,
+        lifeline: PY_NULL,
     })
 }
 

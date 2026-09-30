@@ -136,7 +136,7 @@ impl Random {
 /// `interp_random.py` `W_Random`. A user subclass is `typedef.py`
 /// `_getusercls` (`MapdictStorageMixin`), allocated by `objspace.py`
 /// `allocate_instance`. The builtin keeps `self._rnd` only.
-#[pyre_interpreter::pyre_class("_random.Random", cpython_mutable, user_layout)]
+#[pyre_interpreter::pyre_class("_random.Random", cpython_mutable, user_layout, weakrefable)]
 #[derive(Default)]
 pub struct W_Random {
     /// `interp_random.py self._rnd = rrandom.Random()` — the reference to a

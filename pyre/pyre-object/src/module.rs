@@ -8,7 +8,7 @@ use crate::pyobject::*;
 
 /// Python module object.
 ///
-/// Layout: `[ob_type | w_name | w_dict | w_initialdict | startup_called]`
+/// Layout: `[ob_type | w_name | w_dict | w_initialdict | startup_called | lifeline]`
 ///
 /// `w_dict` mirrors PyPy `module.py self.w_dict = w_dict` — every
 /// Module owns a non-null `W_DictObject` (or dict subclass instance
@@ -33,6 +33,8 @@ pub struct Module {
     pub w_initialdict: PyObjectRef,
     /// `module.py Module.startup_called`.
     pub startup_called: bool,
+    /// `typedef.py make_weakref_descr(Module)` `_lifeline_`.
+    pub lifeline: PyObjectRef,
 }
 
 /// GC type id assigned to `Module` at JitDriver init time.
@@ -56,11 +58,12 @@ pub const W_MODULE_OBJECT_SIZE: usize = std::mem::size_of::<Module>();
 ///
 /// `w_initialdict` — the saved builtin dict a later import copies from.
 ///
-pub const W_MODULE_GC_PTR_OFFSETS: [usize; 4] = [
+pub const W_MODULE_GC_PTR_OFFSETS: [usize; 5] = [
     std::mem::offset_of!(Module, ob_header.w_class),
     std::mem::offset_of!(Module, w_name),
     std::mem::offset_of!(Module, w_dict),
     std::mem::offset_of!(Module, w_initialdict),
+    std::mem::offset_of!(Module, lifeline),
 ];
 
 impl crate::lltype::GcType for Module {
@@ -110,6 +113,7 @@ fn module_value(name: &str) -> Module {
         w_dict,
         w_initialdict: PY_NULL,
         startup_called: false,
+        lifeline: PY_NULL,
     }
 }
 
@@ -252,6 +256,7 @@ fn module_aliasing_dict_value(name: &str, w_dict_object: PyObjectRef) -> Module 
         w_dict: w_dict_object,
         w_initialdict: PY_NULL,
         startup_called: false,
+        lifeline: PY_NULL,
     }
 }
 

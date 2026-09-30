@@ -863,7 +863,11 @@ pub unsafe fn is_groupby_iterator(obj: PyObjectRef) -> bool {
 //
 // Each shared node owns one cached item and the next node.  Every tee copy
 // holds its own cursor into this same chain while sharing the source iterator.
-#[pyre_class("itertools._tee_dataobject", static_name = "TEE_DATAOBJECT")]
+#[pyre_class(
+    "itertools._tee_dataobject",
+    static_name = "TEE_DATAOBJECT",
+    weakrefable
+)]
 pub struct W_TeeChainedListNode {
     pub w_next: PyObjectRef,
     pub w_obj: PyObjectRef,
@@ -879,6 +883,7 @@ pub fn w_tee_chained_list_node_new() -> PyObjectRef {
         w_next: std::ptr::null_mut(),
         w_obj: std::ptr::null_mut(),
         running: false,
+        lifeline: PY_NULL,
     })
 }
 
@@ -890,7 +895,7 @@ pub unsafe fn is_tee_dataobject(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &TEE_DATAOBJECT_TYPE) }
 }
 
-#[pyre_class("itertools._tee", static_name = "TEE_ITERABLE")]
+#[pyre_class("itertools._tee", static_name = "TEE_ITERABLE", weakrefable)]
 pub struct W_TeeIterable {
     pub w_iterator: PyObjectRef,
     pub w_chained_list: PyObjectRef,
@@ -909,6 +914,7 @@ pub fn w_tee_iterable_new(w_iterator: PyObjectRef, w_chained_list: PyObjectRef) 
         },
         w_iterator,
         w_chained_list,
+        lifeline: PY_NULL,
     })
 }
 

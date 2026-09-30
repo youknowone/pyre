@@ -76,7 +76,7 @@ bitflags::bitflags! {
 /// ctypes through weak references (`W_CType._pointer_type`,
 /// `W_CTypePointer._array_types`).  Thus a derived ctype dies with its last
 /// user while a repeated constructor still returns the live memoized object.
-#[pyre_interpreter::pyre_class("_cffi_backend.CType")]
+#[pyre_interpreter::pyre_class("_cffi_backend.CType", weakrefable)]
 // The `_immutable_fields_` the RPython hierarchy spreads over its subclasses,
 // restricted to the ones this flattened struct still writes only while a ctype
 // is being constructed: `W_CType` names `name_position`, `W_CTypePtrOrArray`
@@ -406,6 +406,7 @@ impl Default for W_CType {
             enumvalues2erators: pyre_object::PY_NULL,
             lazy_ffi: pyre_object::PY_NULL,
             lazy_sindex: -1,
+            lifeline: pyre_object::PY_NULL,
         }
     }
 }

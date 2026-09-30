@@ -1659,6 +1659,15 @@ static W_SET_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            (
+                "lifeline",
+                std::mem::offset_of!(pyre_object::setobject::W_SetObject, lifeline),
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_SetObject",
         "setobject::W_SetObject",
@@ -2155,6 +2164,7 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // needs the census entry that gets it NULLed behind the allocation.
             field("w_new_self", f::FUNCTION_W_NEW_SELF_OFFSET),
             field("w_moduleobj", f::FUNCTION_W_MODULEOBJ_OFFSET),
+            field("lifeline", f::FUNCTION_LIFELINE_OFFSET),
             // The `mutate_<name>` block pointer.  `Type::Ref` puts it in
             // `gc_fielddescrs`, which is what `rewrite.py
             // clear_gc_fields` walks, so a JIT-allocated function gets its NULL
@@ -2239,8 +2249,8 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
-/// `Method` field layout — `w_function`, `w_self`, `w_class`, `w_module`.
-/// All four are Ref slots; the JIT only consumes `w_function` (for guarding
+/// `Method` field layout — `w_function`, `w_self`, `w_class`, `w_module`,
+/// `lifeline`. All five are Ref slots; the JIT only consumes `w_function` (for guarding
 /// which method) and `w_self` (for recovering the receiver `OpRef` discarded
 /// by `LOAD_METHOD`). `w_class` and `w_module` are included for layout
 /// completeness so the descrs match the struct order — a field the struct
@@ -2254,8 +2264,8 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// construction by `w_method_set_module` and is mutable for that reason.
 static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::function::{
-        METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_MODULE_OFFSET,
-        METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE,
+        METHOD_LIFELINE_OFFSET, METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET,
+        METHOD_W_MODULE_OFFSET, METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE,
     };
     build_object_descr_group_with_def_path(
         W_METHOD_OBJECT_SIZE,
@@ -2292,6 +2302,15 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_module",
                 METHOD_W_MODULE_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "lifeline",
+                METHOD_LIFELINE_OFFSET,
                 WORD,
                 Type::Ref,
                 false,
@@ -3982,7 +4001,7 @@ pub fn method_w_module_descr() -> DescrRef {
 /// the standalone `w_class_descr`) so an inline emit's store is a virtual
 /// field of the same size descr and materialization reproduces the header.
 pub fn method_header_w_class_descr() -> DescrRef {
-    field_descr_from_group(&W_METHOD_DESCR_GROUP, 4)
+    field_descr_from_group(&W_METHOD_DESCR_GROUP, 5)
 }
 
 /// Size descriptor for `Method` allocation via `NewWithVtable`
@@ -5157,6 +5176,19 @@ static W_MODULE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new
     )
 });
 
+static W_LOCAL_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::thread::W_LocalUser>(),
+        pyre_interpreter::module::thread::W_LOCAL_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::thread::LOCAL_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::thread::W_LocalUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::thread::W_LocalUser, storage),
+        "W_LocalUser",
+        "module::thread::W_LocalUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF70,
+    )
+});
+
 struct ModuleUserLayoutGroup {
     /// `ob_type` of a `typedef.py` `_getusercls` instance.
     pytype: usize,
@@ -5375,6 +5407,10 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_CLASSMETHOD_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::py_type_check(obj, &pyre_object::pyobject::MODULE_USER_TYPE) } {
         field_descr_from_group(&W_MODULE_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::thread::LOCAL_USER_TYPE)
+    } {
+        field_descr_from_group(&W_LOCAL_USER_DESCR_GROUP, 0)
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 0) } {
         descr
     } else {
@@ -5501,6 +5537,10 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_CLASSMETHOD_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::py_type_check(obj, &pyre_object::pyobject::MODULE_USER_TYPE) } {
         field_descr_from_group(&W_MODULE_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::thread::LOCAL_USER_TYPE)
+    } {
+        field_descr_from_group(&W_LOCAL_USER_DESCR_GROUP, 1)
     } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 1) } {
         descr
     } else {
@@ -7510,6 +7550,10 @@ mod tests {
         assert_eq!(
             W_MODULE_USER_DESCR_GROUP.field_descrs[0].index(),
             0x6100_0F60
+        );
+        assert_eq!(
+            W_LOCAL_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F70
         );
         assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
@@ -9522,6 +9566,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("module::ModuleUser", || {
         LazyLock::force(&W_MODULE_USER_DESCR_GROUP);
+    }),
+    ("module::thread::W_LocalUser", || {
+        LazyLock::force(&W_LOCAL_USER_DESCR_GROUP);
     }),
     ("tupleobject::W_TupleObject", || {
         LazyLock::force(&W_TUPLE_DESCR_GROUP);

@@ -483,6 +483,7 @@ unsafe fn walk_raw_function_roots(
         // Builtin functions are immortal, so only this raw-root walker can
         // forward the slot during a collection.
         visit_slot(&mut func.w_moduleobj, visitor);
+        visit_slot(&mut func.lifeline, visitor);
     }
 }
 
@@ -837,6 +838,7 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
                 // object's trace function does.
                 let dict_slot = &mut t.dict as *mut *mut u8 as *mut PyObjectRef;
                 forward(&mut *dict_slot);
+                forward(&mut t.lifeline);
                 pyre_object::dictmultiobject::w_dict_walk_gc_refs(*dict_slot, &mut |slot| {
                     forward(slot)
                 });

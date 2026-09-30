@@ -270,7 +270,7 @@ impl DecodeBuffer {
 
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // TextIOWrapper heap spec.
-#[crate::pyre_class("_io.TextIOWrapper", cpython_heaptype)]
+#[crate::pyre_class("_io.TextIOWrapper", cpython_heaptype, weakrefable)]
 pub struct W_TextIOWrapper {
     state: i64,
     w_buffer: PyObjectRef,
@@ -325,6 +325,7 @@ impl Default for W_TextIOWrapper {
             telling: false,
             encoding_start_of_stream: false,
             w_dict: PY_NULL,
+            lifeline: PY_NULL,
         }
     }
 }

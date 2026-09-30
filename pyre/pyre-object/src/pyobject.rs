@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
     "name",
     "instantiate",
     "mapdict_offset",
+    "weakref_offset",
     "user_subclass",
     "user_base"
 )]
@@ -61,6 +62,14 @@ pub struct PyType {
     /// mixin offset. The offset lives on the typeptr, the RPython class,
     /// not on a caller-side type whitelist.
     pub mapdict_offset: usize,
+    /// Byte offset of the `make_weakref_descr` `_lifeline_` slot
+    /// (`typedef.py`). `0` means the class has no lifeline field: offset 0
+    /// is the header's `ob_type`, so it cannot be a real field offset.
+    /// A `_getusercls` class of a weakrefable base inherits the base's
+    /// offset (the user struct keeps the base as a prefix). A non-weakrefable
+    /// base leaves this at 0 and `MapdictWeakrefSupport` uses the `"weakref"`
+    /// SPECIAL slot instead.
+    pub weakref_offset: usize,
     /// `typedef.py get_unique_interplevel_subclass(space, cls)` answered
     /// ahead of time: the class every user subclass instance of this
     /// builtin carries as its typeptr (`_unique_subclass_cache[cls]`).  Null
@@ -147,7 +156,7 @@ pub const PY_NULL: PyObjectRef = std::ptr::null_mut();
 /// Construct a PyType with zeroed subclass ranges.
 /// Ranges are assigned at init time by `assign_subclass_range()`.
 pub const fn new_pytype(name: &'static str) -> PyType {
-    new_pytype_kind(name, 0)
+    new_pytype_kind(name, 0, 0)
 }
 
 /// [`new_pytype`] for a storage class that imported `MapdictStorageMixin`.
@@ -155,16 +164,40 @@ pub const fn new_pytype(name: &'static str) -> PyType {
 /// `storage` follows at the next word.
 pub const fn new_pytype_with_mapdict_mixin(name: &'static str, mapdict_offset: usize) -> PyType {
     assert!(mapdict_offset != 0);
-    new_pytype_kind(name, mapdict_offset)
+    new_pytype_kind(name, mapdict_offset, 0)
 }
 
-const fn new_pytype_kind(name: &'static str, mapdict_offset: usize) -> PyType {
+/// [`new_pytype_with_mapdict_mixin`] whose class also carries a
+/// `make_weakref_descr` `_lifeline_` field.
+pub const fn new_pytype_with_mapdict_and_weakref(
+    name: &'static str,
+    mapdict_offset: usize,
+    weakref_offset: usize,
+) -> PyType {
+    assert!(mapdict_offset != 0);
+    assert!(weakref_offset != 0);
+    new_pytype_kind(name, mapdict_offset, weakref_offset)
+}
+
+/// [`new_pytype`] for a class whose payload carries a `_lifeline_` field
+/// and no `MapdictStorageMixin`.
+pub const fn new_pytype_with_weakref(name: &'static str, weakref_offset: usize) -> PyType {
+    assert!(weakref_offset != 0);
+    new_pytype_kind(name, 0, weakref_offset)
+}
+
+const fn new_pytype_kind(
+    name: &'static str,
+    mapdict_offset: usize,
+    weakref_offset: usize,
+) -> PyType {
     PyType {
         subclassrange_min: AtomicI64::new(0),
         subclassrange_max: AtomicI64::new(0),
         name,
         instantiate: AtomicPtr::new(std::ptr::null_mut()),
         mapdict_offset,
+        weakref_offset,
         user_subclass: std::ptr::null(),
         user_base: std::ptr::null(),
     }
@@ -176,7 +209,22 @@ pub const fn new_pytype_with_user_subclass(
     name: &'static str,
     user_subclass: &'static PyType,
 ) -> PyType {
-    let mut tp = new_pytype_kind(name, 0);
+    let mut tp = new_pytype_kind(name, 0, 0);
+    tp.user_subclass = user_subclass;
+    tp
+}
+
+/// [`new_pytype_with_user_subclass`] whose exact instances also carry a
+/// `_lifeline_` field. The user typeptr does not inherit that offset:
+/// a non-weakrefable typedef keeps `MapdictWeakrefSupport`, and a
+/// weakrefable one publishes the offset on the user typeptr itself.
+pub const fn new_pytype_with_user_subclass_and_weakref(
+    name: &'static str,
+    user_subclass: &'static PyType,
+    weakref_offset: usize,
+) -> PyType {
+    assert!(weakref_offset != 0);
+    let mut tp = new_pytype_kind(name, 0, weakref_offset);
     tp.user_subclass = user_subclass;
     tp
 }
@@ -190,9 +238,65 @@ pub const fn new_user_pytype(
     mapdict_offset: usize,
 ) -> PyType {
     assert!(mapdict_offset != 0);
-    let mut tp = new_pytype_kind(name, mapdict_offset);
+    let mut tp = new_pytype_kind(name, mapdict_offset, 0);
     tp.user_base = base;
     tp
+}
+
+/// [`new_user_pytype`] for a weakrefable base. `weakref_offset` is the
+/// base field's offset; the user struct keeps `base` as a prefix, so the
+/// same number addresses the lifeline on a subclass instance.
+pub const fn new_user_pytype_with_lifeline(
+    name: &'static str,
+    base: &'static PyType,
+    mapdict_offset: usize,
+    weakref_offset: usize,
+) -> PyType {
+    assert!(mapdict_offset != 0);
+    assert!(weakref_offset != 0);
+    let mut tp = new_pytype_kind(name, mapdict_offset, weakref_offset);
+    tp.user_base = base;
+    tp
+}
+
+/// Whether `obj`'s typeptr publishes a `_lifeline_` field offset.
+///
+/// # Safety
+/// `obj` must be a live object with a live `ob_type`.
+#[inline]
+pub unsafe fn has_weakref_lifeline_field(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    let tp = unsafe { (*obj).ob_type };
+    !tp.is_null() && unsafe { (*tp).weakref_offset } != 0
+}
+
+/// Read the `make_weakref_descr` `_lifeline_` slot.
+///
+/// # Safety
+/// `obj` must be a live object whose typeptr has a nonzero `weakref_offset`,
+/// and that offset must address a `PyObjectRef` inside `obj`.
+#[inline]
+pub unsafe fn read_weakref_lifeline(obj: PyObjectRef) -> PyObjectRef {
+    let off = unsafe { (*(*obj).ob_type).weakref_offset };
+    debug_assert!(off != 0);
+    unsafe { *((obj as *const u8).add(off) as *const PyObjectRef) }
+}
+
+/// Store `value` into the `_lifeline_` slot, then run the write barrier.
+/// The slot is a traced `PyObjectRef`, so the barrier roots `obj`.
+///
+/// # Safety
+/// Same as [`read_weakref_lifeline`].
+#[inline]
+pub unsafe fn write_weakref_lifeline(obj: PyObjectRef, value: PyObjectRef) {
+    let off = unsafe { (*(*obj).ob_type).weakref_offset };
+    debug_assert!(off != 0);
+    unsafe {
+        *((obj as *mut u8).add(off) as *mut PyObjectRef) = value;
+    }
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// The builtin class whose typedef and payload layout `tp` uses: `tp`'s
@@ -456,15 +560,24 @@ pub static LONG_USER_TYPE: PyType = new_user_pytype(
 pub static NONE_TYPE: PyType = new_pytype("NoneType");
 pub static NOTIMPLEMENTED_TYPE: PyType = new_pytype("NotImplementedType");
 pub static ELLIPSIS_TYPE: PyType = new_pytype("ellipsis");
-pub static MODULE_TYPE: PyType = new_pytype_with_user_subclass("module", &MODULE_USER_TYPE);
-/// `ModuleUser` (`typedef.py` `_getusercls(Module)`).
-pub static MODULE_USER_TYPE: PyType = new_user_pytype(
+pub static MODULE_TYPE: PyType = new_pytype_with_user_subclass_and_weakref(
+    "module",
+    &MODULE_USER_TYPE,
+    std::mem::offset_of!(crate::module::Module, lifeline),
+);
+/// `ModuleUser` (`typedef.py` `_getusercls(Module)`). The lifeline lives on
+/// the `Module` prefix, so a subclass instance addresses the same word.
+pub static MODULE_USER_TYPE: PyType = new_user_pytype_with_lifeline(
     "module",
     &MODULE_TYPE,
     std::mem::offset_of!(crate::module::ModuleUser, map),
+    std::mem::offset_of!(crate::module::Module, lifeline),
 );
 pub static MAPPING_PROXY_TYPE: PyType = new_pytype("mappingproxy");
-pub static TYPE_TYPE: PyType = new_pytype("type");
+pub static TYPE_TYPE: PyType = new_pytype_with_weakref(
+    "type",
+    std::mem::offset_of!(crate::typeobject::W_TypeObject, lifeline),
+);
 pub static INSTANCE_TYPE: PyType = new_pytype_with_mapdict_mixin(
     "object",
     std::mem::offset_of!(crate::objectobject::W_ObjectObject, map),
@@ -852,9 +965,9 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // user layouts, and `__pypy__.Bufferable`).
     // 168 is `interp__weakref.py` `W_Weakref`, an object subclass.
     // 169-195 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
-    // 196-203 append deque, Struct, GenericAlias, big-int, weakref,
-    // staticmethod, classmethod and module user layouts without moving
-    // the closed block above.
+    // 196-204 append deque, Struct, GenericAlias, big-int, weakref,
+    // staticmethod, classmethod, module and `_thread._local` user layouts
+    // without moving the closed block above.
     (158, Some(1)),
     (159, Some(34)),
     (160, Some(8)),
@@ -902,20 +1015,21 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (201, Some(20)),  // StaticMethodUser
     (202, Some(21)),  // ClassMethodUser
     (203, Some(36)),  // ModuleUser
+    (204, Some(133)), // W_LocalUser
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail, after the `_getusercls` layouts (158-203).
-    (204, Some(0)),
-    // Native-only type IDs 205 and 206 represent `posix.DirEntry` and
+    // posix / console tail, after the `_getusercls` layouts (158-204).
+    (205, Some(0)),
+    // Native-only type IDs 206 and 207 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (205, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
     (206, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (207, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (207, Some(0)),
+    (208, Some(0)),
     // The classes `pyre-module` registers follow, numbered by `build_gc` in
     // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
