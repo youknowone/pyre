@@ -267,8 +267,9 @@ pub fn hostname() -> std::io::Result<std::ffi::OsString> {
 /// name stands for, or `None` when the database does not name it.
 #[cfg(unix)]
 pub fn protocol_by_name(name: &std::ffi::CStr) -> Option<libc::c_int> {
-    let entry = unsafe { majit_rlib::_rsocket_rffi::getprotobyname(name.as_ptr()) };
-    (!entry.is_null()).then(|| unsafe { (*entry).p_proto })
+    majit_rlib::rsocket::getprotobyname(name)
+        .ok()
+        .and_then(|proto| libc::c_int::try_from(proto).ok())
 }
 #[cfg(windows)]
 pub fn protocol_by_name(name: &std::ffi::CStr) -> Option<libc::c_int> {

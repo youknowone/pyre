@@ -1540,38 +1540,43 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 };
                 let c_name = std::ffi::CString::new(name.as_bytes())
                     .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?;
-                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
-                    && unsafe { pyre_object::is_str(w_proto) }
+                let proto_c: Option<std::ffi::CString> =
+                    if args.len() >= 2 && unsafe { pyre_object::is_str(w_proto) } {
+                        let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
+                        Some(
+                            std::ffi::CString::new(p.as_bytes())
+                                .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
+                        )
+                    } else {
+                        None
+                    };
+                #[cfg(unix)]
                 {
-                    let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
-                    Some(
-                        std::ffi::CString::new(p.as_bytes())
-                            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
-                    )
-                } else {
-                    None
-                };
-                let p = unsafe {
-                    rffi::serv_by_name(
-                        c_name.as_ptr(),
-                        proto_c
-                            .as_ref()
-                            .map(|c| c.as_ptr())
-                            .unwrap_or(std::ptr::null()),
-                    )
-                };
-                if p.is_null() {
-                    // `rsocket.getservbyname` raises
-                    // `RSocketError("service/proto not found")`; neither it nor
-                    // `socket_getservbyname` names the service it looked for.
-                    return Err(socket_converted_error(
-                        "error",
-                        None,
-                        "service/proto not found",
-                    ));
+                    let port = majit_rlib::rsocket::getservbyname(&c_name, proto_c.as_deref())
+                        .map_err(|error| socket_converted_error("error", None, error.message))?;
+                    return Ok(pyre_object::w_int_new(port));
                 }
-                let port = unsafe { u16::from_be(rffi::servent_port(p)) };
-                Ok(pyre_object::w_int_new(port as i64))
+                #[cfg(windows)]
+                {
+                    let p = unsafe {
+                        rffi::serv_by_name(
+                            c_name.as_ptr(),
+                            proto_c
+                                .as_ref()
+                                .map(|c| c.as_ptr())
+                                .unwrap_or(std::ptr::null()),
+                        )
+                    };
+                    if p.is_null() {
+                        return Err(socket_converted_error(
+                            "error",
+                            None,
+                            "service/proto not found",
+                        ));
+                    }
+                    let port = unsafe { u16::from_be(rffi::servent_port(p)) };
+                    Ok(pyre_object::w_int_new(port as i64))
+                }
             }),
         );
 
@@ -1601,41 +1606,47 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     ));
                 }
                 let port = port as u16;
-                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
-                    && unsafe { pyre_object::is_str(w_proto) }
+                let proto_c: Option<std::ffi::CString> =
+                    if args.len() >= 2 && unsafe { pyre_object::is_str(w_proto) } {
+                        let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
+                        Some(
+                            std::ffi::CString::new(p.as_bytes())
+                                .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
+                        )
+                    } else {
+                        None
+                    };
+                #[cfg(unix)]
                 {
-                    let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
-                    Some(
-                        std::ffi::CString::new(p.as_bytes())
-                            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
-                    )
-                } else {
-                    None
-                };
-                let p = unsafe {
-                    rffi::serv_by_port(
-                        port.to_be() as libc::c_int,
-                        proto_c
-                            .as_ref()
-                            .map(|c| c.as_ptr())
-                            .unwrap_or(std::ptr::null()),
-                    )
-                };
-                if p.is_null() {
-                    // `rsocket.getservbyport` raises
-                    // `RSocketError("port/proto not found")`, without the port.
-                    return Err(socket_converted_error(
-                        "error",
-                        None,
-                        "port/proto not found",
-                    ));
+                    let name = majit_rlib::rsocket::getservbyport(i32::from(port), proto_c.as_deref())
+                        .map_err(|error| socket_converted_error("error", None, error.message))?;
+                    return Ok(pyre_object::w_str_new_managed(&name));
                 }
-                let name = unsafe {
-                    std::ffi::CStr::from_ptr(rffi::servent_name(p))
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                Ok(pyre_object::w_str_new_managed(&name))
+                #[cfg(windows)]
+                {
+                    let p = unsafe {
+                        rffi::serv_by_port(
+                            port.to_be() as libc::c_int,
+                            proto_c
+                                .as_ref()
+                                .map(|c| c.as_ptr())
+                                .unwrap_or(std::ptr::null()),
+                        )
+                    };
+                    if p.is_null() {
+                        return Err(socket_converted_error(
+                            "error",
+                            None,
+                            "port/proto not found",
+                        ));
+                    }
+                    let name = unsafe {
+                        std::ffi::CStr::from_ptr(rffi::servent_name(p))
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    Ok(pyre_object::w_str_new_managed(&name))
+                }
             }),
         );
     }
@@ -1782,10 +1793,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 let name = pyre_interpreter::baseobjspace::str_utf8_w(args[0])?.to_string();
                 let c_name = std::ffi::CString::new(name.as_bytes())
                     .map_err(|_| pyre_interpreter::PyError::value_error("embedded null in name"))?;
-                let Some(proto) = rffi::protocol_by_name(&c_name) else {
-                    return Err(socket_converted_error("error", None, "protocol not found"));
+                #[cfg(unix)]
+                let proto = majit_rlib::rsocket::getprotobyname(&c_name)
+                    .map_err(|error| socket_converted_error("error", None, error.message))?;
+                #[cfg(windows)]
+                let proto = {
+                    let Some(proto) = rffi::protocol_by_name(&c_name) else {
+                        return Err(socket_converted_error("error", None, "protocol not found"));
+                    };
+                    i64::from(proto)
                 };
-                Ok(pyre_object::w_int_new(proto as i64))
+                Ok(pyre_object::w_int_new(proto))
             },
             1,
         ),

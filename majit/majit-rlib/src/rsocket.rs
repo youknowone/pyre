@@ -164,6 +164,54 @@ pub fn gethostname() -> Result<Vec<u8>, CSocketError> {
     Ok(buf[..end].to_vec())
 }
 
+#[cfg(unix)]
+fn proto_ptr(proto: Option<&std::ffi::CStr>) -> *const std::ffi::c_char {
+    proto
+        .map(std::ffi::CStr::as_ptr)
+        .unwrap_or(std::ptr::null())
+}
+
+/// `getservbyname`. `proto` null matches any protocol. The port is host order.
+#[cfg(unix)]
+pub fn getservbyname(
+    name: &std::ffi::CStr,
+    proto: Option<&std::ffi::CStr>,
+) -> Result<i64, RSocketError> {
+    let servent = unsafe { crate::_rsocket_rffi::getservbyname(name.as_ptr(), proto_ptr(proto)) };
+    if servent.is_null() {
+        return Err(rsocket_error("service/proto not found"));
+    }
+    let port = unsafe { (*servent).s_port } as crate::rffi::USHORT;
+    Ok(ntohs(port))
+}
+
+/// `getservbyport`. `port` is host order. The name is copied off the record.
+#[cfg(unix)]
+pub fn getservbyport(port: i32, proto: Option<&std::ffi::CStr>) -> Result<String, RSocketError> {
+    let net = htons(port as crate::rffi::USHORT) as crate::rffi::INT;
+    let servent = unsafe { crate::_rsocket_rffi::getservbyport(net, proto_ptr(proto)) };
+    if servent.is_null() {
+        return Err(rsocket_error("port/proto not found"));
+    }
+    let name = unsafe { (*servent).s_name };
+    if name.is_null() {
+        return Err(rsocket_error("port/proto not found"));
+    }
+    Ok(unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// `getprotobyname`. The number is `p_proto`.
+#[cfg(unix)]
+pub fn getprotobyname(name: &std::ffi::CStr) -> Result<i64, RSocketError> {
+    let entry = unsafe { crate::_rsocket_rffi::getprotobyname(name.as_ptr()) };
+    if entry.is_null() {
+        return Err(rsocket_error("protocol not found"));
+    }
+    Ok(i64::from(unsafe { (*entry).p_proto }))
+}
+
 /// `sethostname`. `hostname` is the raw byte count passed to the syscall.
 #[cfg(unix)]
 pub fn sethostname(hostname: &[u8]) -> Result<(), CSocketError> {
@@ -289,5 +337,25 @@ mod tests {
         assert_eq!(rc, 0);
         let end = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
         assert_eq!(ours, buf[..end]);
+    }
+
+    #[test]
+    fn service_and_protocol_lookups() {
+        assert_eq!(getprotobyname(c"tcp").expect("tcp"), 6);
+        assert_eq!(getprotobyname(c"udp").expect("udp"), 17);
+        assert_eq!(
+            getprotobyname(c"not-a-proto")
+                .expect_err("missing proto")
+                .message,
+            "protocol not found"
+        );
+        assert_eq!(getservbyname(c"http", Some(c"tcp")).expect("http"), 80);
+        assert_eq!(getservbyport(80, Some(c"tcp")).expect("port 80"), "http");
+        assert_eq!(
+            getservbyname(c"not-a-service", Some(c"tcp"))
+                .expect_err("missing service")
+                .message,
+            "service/proto not found"
+        );
     }
 }
