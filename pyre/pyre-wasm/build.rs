@@ -1,12 +1,11 @@
 //! Writes `$OUT_DIR/residual_sig_call.rs`: one `extern "C"` trampoline per
 //! concrete wasm type the blackhole path `call_indirect`s.
 //!
-//! Integer mixes cover arity 0..=7 and every i32/i64 mask, with result tags
-//! void / i32 / i64 / f64. Uniform f64 covers arity 1..=4 and result tags
-//! void / i64 / f64. Signatures that contain an f64 and an integer cover
-//! arity 1..=5 and the same four result tags. An i32 argument is truncated;
-//! an i32 result is zero-extended; an f64 argument is `f64::from_bits` and
-//! an f64 result is returned as bits.
+//! Integer mixes cover arity 0..=8 and every i32/i64 mask, with result tags
+//! void / i32 / i64 / f64 / f32. Uniform f64 covers arity 1..=4 and result
+//! tags void / i64 / f64. Any other mix of i32/i64/f32/f64 covers arity 1..=5
+//! and the same five result tags. An i32 argument is truncated; an i32
+//! result is zero-extended; f32 and f64 travel as their bit patterns.
 
 use std::fmt::Write as _;
 
@@ -29,10 +28,10 @@ fn generate() -> String {
          \n",
     );
 
-    for arity in 0..=7 {
+    for arity in 0..=8 {
         let masks = 1u16 << arity;
         for mask in 0..masks {
-            for tag in 0..4 {
+            for tag in 0..5 {
                 emit_int(&mut out, arity, mask, tag);
             }
         }
@@ -43,8 +42,8 @@ fn generate() -> String {
         }
     }
     for arity in 1..=5 {
-        for_each_f64_mix(arity, &mut |code| {
-            for tag in 0..4 {
+        for_each_float_mix(arity, &mut |code| {
+            for tag in 0..5 {
                 emit_mix(&mut out, arity, code, tag);
             }
         });
@@ -68,21 +67,22 @@ fn emit_int(out: &mut String, arity: usize, mask: u16, tag: u8) {
     );
 }
 
-/// Digits match `FuncSigVal` param bits: 0 = i32, 1 = i64, 3 = f64.
-fn for_each_f64_mix(arity: usize, emit: &mut dyn FnMut(u32)) {
-    fn walk(arity: usize, pos: usize, code: u32, seen_f64: bool, emit: &mut dyn FnMut(u32)) {
+/// Digits match `FuncSigVal` param bits: 0 = i32, 1 = i64, 2 = f32, 3 = f64.
+/// Integer-only codes are emitted separately.
+fn for_each_float_mix(arity: usize, emit: &mut dyn FnMut(u32)) {
+    fn walk(arity: usize, pos: usize, code: u32, seen_float: bool, emit: &mut dyn FnMut(u32)) {
         if pos == arity {
-            if seen_f64 {
+            if seen_float {
                 emit(code);
             }
             return;
         }
-        for digit in [0u32, 1, 3] {
+        for digit in [0u32, 1, 2, 3] {
             walk(
                 arity,
                 pos + 1,
                 code | (digit << (2 * pos)),
-                seen_f64 || digit == 3,
+                seen_float || digit >= 2,
                 emit,
             );
         }
@@ -95,6 +95,7 @@ fn emit_mix(out: &mut String, arity: usize, code: u32, tag: u8) {
         .map(|i| match (code >> (2 * i)) & 0b11 {
             0 => "i32",
             1 => "i64",
+            2 => "f32",
             _ => "f64",
         })
         .collect::<Vec<_>>()
@@ -103,6 +104,7 @@ fn emit_mix(out: &mut String, arity: usize, code: u32, tag: u8) {
         .map(|i| match (code >> (2 * i)) & 0b11 {
             0 => format!("args[{i}] as i32"),
             1 => format!("args[{i}]"),
+            2 => format!("f32::from_bits(args[{i}] as u32)"),
             _ => format!("f64::from_bits(args[{i}] as u64)"),
         })
         .collect::<Vec<_>>()
@@ -162,6 +164,7 @@ fn ret_ty(tag: u8) -> &'static str {
         1 => " -> i32",
         2 => " -> i64",
         3 => " -> f64",
+        4 => " -> f32",
         _ => unreachable!(),
     }
 }
@@ -171,7 +174,7 @@ fn call_body(tag: u8, call: &str) -> String {
         0 => format!("{call};\n    0"),
         1 => format!("{call} as u32 as i64"),
         2 => call.to_string(),
-        3 => format!("{call}.to_bits() as i64"),
+        3 | 4 => format!("{call}.to_bits() as i64"),
         _ => unreachable!(),
     }
 }
@@ -189,15 +192,15 @@ fn emit_int_dispatch(out: &mut String) {
          Some(FuncSigVal::I32) => 1,\n        \
          Some(FuncSigVal::I64) => 2,\n        \
          Some(FuncSigVal::F64) => 3,\n        \
-         Some(FuncSigVal::F32) => return None,\n    \
+         Some(FuncSigVal::F32) => 4,\n    \
          };\n    \
          Some(unsafe {\n        \
          match (args.len(), mask, tag) {\n",
     );
-    for arity in 0..=7 {
+    for arity in 0..=8 {
         let masks = 1u16 << arity;
         for mask in 0..masks {
-            for tag in 0..4 {
+            for tag in 0..5 {
                 let _ = writeln!(
                     out,
                     "            ({arity}, {mask}, {tag}) => c_{arity}_{mask}_{tag}(slot, args),"
@@ -244,14 +247,14 @@ fn emit_mix_dispatch(out: &mut String) {
          Some(FuncSigVal::I32) => 1,\n        \
          Some(FuncSigVal::I64) => 2,\n        \
          Some(FuncSigVal::F64) => 3,\n        \
-         Some(FuncSigVal::F32) => return None,\n    \
+         Some(FuncSigVal::F32) => 4,\n    \
          };\n    \
          Some(unsafe {\n        \
          match (args.len(), code, tag) {\n",
     );
     for arity in 1..=5 {
-        for_each_f64_mix(arity, &mut |code| {
-            for tag in 0..4 {
+        for_each_float_mix(arity, &mut |code| {
+            for tag in 0..5 {
                 let _ = writeln!(
                     out,
                     "            ({arity}, {code}, {tag}) => m_{arity}_{code}_{tag}(slot, args),"
