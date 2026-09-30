@@ -262,7 +262,7 @@ def store_attr_cold_subclass_float(n):
     return type(holder.x).__name__
 
 
-# `truth_int` reaches the same hole from the branch side rather than the value
+# An int truth guard reaches the same hole from the branch side rather than the value
 # side: `POP_JUMP_IF_*` and the short-circuit operators read the truth of a
 # payload the `GUARD_CLASS INT` admits, so a `__bool__` override on a zero-payload
 # subclass is skipped and the branch is taken the wrong way. `bool(a)` does not

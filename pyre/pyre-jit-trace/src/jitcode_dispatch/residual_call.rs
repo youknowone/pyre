@@ -6406,8 +6406,7 @@ pub(crate) fn residual_call_is_exception_match(
 /// Such an operand's `__bool__` is `int`'s or `bool`'s, so the call reads a
 /// field and returns an int: it commits nothing a replay could double.  That is
 /// the same argument the `replay_safe_read` set is built on, and it holds
-/// whether or not the walk-time folds (`try_walker_specialize_truth_int`,
-/// `try_walker_specialize_truth_bool`) erase the residual.
+/// whether or not the walk of `opcode_ops::truth_value` erases the residual.
 ///
 /// `iRd>i`: the funcbox int operand, then the R-list (length byte, then one
 /// register per entry), then the descr.  Only the one-operand arity is the
@@ -7782,25 +7781,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     do_jit_force_virtual_guard(ei, op.pc)?;
 
     if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
-        // #124: a TO_BOOL / POP_JUMP truth residual on a provably-int box
-        // (e.g. the `(i % 7)` in `(i % 7) and (i + 3)`) folds to a pure
-        // `int_is_true`, eliding the may-force call whose force/exc guards
-        // mis-resume the kept short-circuit stack.
+        // A TO_BOOL / POP_JUMP truth residual walks
+        // `opcode_ops::truth_value` (`is_true`). That elides the may-force
+        // call whose force/exc guards mis-resume the kept short-circuit
+        // stack (`(i % 7) and ...`, and the boxed bool a COMPARE_OP leaves
+        // for `if a == b:`).
         if foldable_runtime_helper == majit_ir::RuntimeHelperKind::Truth {
-            if let Some(truth) = spec_gate(SpecFold::TruthInt, || {
-                try_walker_specialize_truth_int(ctx, op.pc, r_args[0])
-            })? {
-                write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            // The boxed bool a residual `COMPARE_OP` leaves behind — the int
-            // arm above guards `INT_TYPE` and declines it, so without this the
-            // test on every `if a == b:` stays a second may-force call.
-            if let Some(truth) = spec_gate(SpecFold::TruthBool, || {
-                try_walker_specialize_truth_bool(ctx, op.pc, r_args[0])
-            })? {
-                write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
-                return Ok((DispatchOutcome::Continue, op.next_pc));
+            if let Some(outcome) = try_walker_orthodox_truth(ctx, op.pc, r_args[0], dst, dst_bank)?
+            {
+                return Ok((outcome, op.next_pc));
             }
         }
     }
@@ -8186,10 +8175,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::IntCall, || {
-            try_walker_specialize_int_call(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
+        && try_walker_orthodox_int_call(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
@@ -8218,20 +8204,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::FloatCall, || {
-            try_walker_specialize_float_call(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
+        && try_walker_orthodox_float_call(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::StrCall, || {
-            try_walker_specialize_str_call(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
+        && try_walker_orthodox_str_call(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }

@@ -1,6 +1,5 @@
 # pyre-check: max-pypy-ratio=1.8
 # pyre-check: requires-modules=math
-# pyre-check: spec-folds=float_call
 # pyre-check: skip-cpython
 # This fixture carried a wasm allowance of 13, fitted to a darwin-arm64
 # reading of 8.1-9.0x.  Most of that was the host crossing: `isclose`, `frexp`
