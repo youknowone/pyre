@@ -8617,6 +8617,17 @@ impl<'a> Lowering<'a> {
                 {
                     self.gc_mut_ref_params.insert(dest_local);
                 }
+                // `_j = move _i` of a whole always-`Ok` local is the same
+                // payload, so `_j` keeps the constant tag its `expect` /
+                // `Discriminant` readers fold against (`with_roots!` returns
+                // its body's `Result` through such a temporary).
+                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                    && let PlaceKind::Local(src_local) = src.kind
+                    && !self.multi_assigned_locals.contains(&dest_local)
+                    && let Some(&tag) = self.const_discriminant_locals.get(&(src_local as usize))
+                {
+                    self.const_discriminant_locals.insert(dest_local, tag);
+                }
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
