@@ -4362,7 +4362,9 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
         rehome_cached_star(&extract_roots, cached_pin, &mut concretes);
         return Some((args, concretes, star, None));
     };
-    let kwargs_live = kwargs_slot.map(|slot| extract_roots.get(slot)).unwrap_or(kwargs);
+    let kwargs_live = kwargs_slot
+        .map(|slot| extract_roots.get(slot))
+        .unwrap_or(kwargs);
     let mut star_kwargs =
         unsafe { fbw_bind_star_kwargs(r_args[3], kwargs_live, w_code, args.len(), nparams) }?;
     let bound_live: Vec<pyre_object::PyObjectRef> =
@@ -8615,12 +8617,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         } else {
             for index in 0..star.values.len() {
-                let (elem, concrete) = with_arg_refs_pinned(&mut callee_arg_concretes, |concretes| {
-                    let ConcreteValue::Ref(value) = concretes[index] else {
-                        unreachable!("unpacked star element is a ref");
-                    };
-                    emit_pair_tuple_item(ctx, op.pc, star.starargs_op, star.repr, index, value)
-                })?;
+                let (elem, concrete) =
+                    with_arg_refs_pinned(&mut callee_arg_concretes, |concretes| {
+                        let ConcreteValue::Ref(value) = concretes[index] else {
+                            unreachable!("unpacked star element is a ref");
+                        };
+                        emit_pair_tuple_item(ctx, op.pc, star.starargs_op, star.repr, index, value)
+                    })?;
                 callee_args[index] = elem;
                 if let Some(ConcreteValue::Ref(obj)) = concrete {
                     adopt_rooted_ref(
