@@ -12914,12 +12914,12 @@ pub(super) fn generator_resume_yield<Sym: WalkSym>(
         "last_instr",
         resume.yield_py_pc as i64,
     );
-    // `popvalue` (`pyframe.py`) nulls the slot it pops. The depth store above
-    // is that pop's index write; the yielded int is still in the slot, and
-    // the next `pushvalue_none` requires it to be None.
-    unsafe {
-        (*(resume.frame as *mut pyre_interpreter::PyFrame)).set_locals_w(top, std::ptr::null_mut());
-    }
+    // `popvalue_maybe_none` (`pyframe.py`) writes None into the slot it pops.
+    // The depth store above is that pop's index write; the yielded object is
+    // still in the slot, and the next `pushvalue_none` requires the slot to
+    // be null. The compiled loop has to store that too: the GC scans the
+    // array independently of `valuestackdepth`.
+    publish_generator_slot_null(ctx, resume.frame, resume.frame_box, top);
     Ok(Some(store.value))
 }
 
@@ -13202,6 +13202,40 @@ fn publish_generator_suspension<Sym: WalkSym>(
     let value_op = ctx.trace_ctx.const_int(value);
     ctx.trace_ctx
         .record_op_with_descr(OpCode::SetfieldGc, &[frame_box, value_op], descr);
+}
+
+/// `popvalue_maybe_none` (`pyframe.py`) stores None over the popped slot.
+///
+/// The generator frame is not the trace's standard virtualizable, so the
+/// marker's `setarrayitem_vable_r` did not write this array. Null the live
+/// slot and record the same store (`GetfieldGc` of `locals_cells_stack_w`,
+/// then `SetarrayitemGc` of `PY_NULL`).
+fn publish_generator_slot_null<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    frame: usize,
+    frame_box: OpRef,
+    index: usize,
+) {
+    unsafe {
+        (*(frame as *mut pyre_interpreter::PyFrame)).set_locals_w(index, std::ptr::null_mut());
+    }
+    let locals_descr = crate::descr::pyframe_locals_cells_stack_descr();
+    let locals_array =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::GetfieldGcR, &[frame_box], locals_descr);
+    let array_ptr =
+        unsafe { (*(frame as *mut pyre_interpreter::PyFrame)).locals_cells_stack_w as usize };
+    ctx.trace_ctx.set_opref_concrete(
+        locals_array,
+        majit_ir::Value::Ref(majit_ir::GcRef(array_ptr)),
+    );
+    let idx = ctx.trace_ctx.const_int(index as i64);
+    let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetarrayitemGc,
+        &[locals_array, idx, null_ref],
+        crate::state::pyobject_gcarray_descr(),
+    );
 }
 
 /// Why a `FOR_ITER` over a suspended generator was not resumed into the trace.
@@ -13982,6 +14016,11 @@ fn walk_generator_resume<Sym: WalkSym>(
         frame_box,
         majit_ir::Value::Ref(majit_ir::GcRef(gen_frame as usize)),
     );
+    // The slot `pushvalue_none` just counted may still hold the object the
+    // previous traced yield left behind. Recording already nulled it; the
+    // compiled resume has to as well, before anything reads the frame back.
+    let resumed_depth = unsafe { (*gen_frame).valuestackdepth.saturating_sub(1) };
+    publish_generator_slot_null(ctx, gen_frame as usize, frame_box, resumed_depth);
     ctx.fbw_mode.generator_resume = Some(GeneratorResumeSubwalk {
         frame: gen_frame as usize,
         frame_box,
