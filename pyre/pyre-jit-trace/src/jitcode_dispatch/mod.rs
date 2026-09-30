@@ -12406,9 +12406,8 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     stamp_live_execution_context(ctx.trace_ctx, ec_box);
     let descr = crate::descr::ec_w_tracefunc_descr();
     let descr_index = descr.index();
-    // Consult the cache before the marker. `record_quasiimmut_field`
-    // publishes the loaded constant, and that publication is not itself
-    // the `promote(None)` guard.
+    // Consult the cache before the marker. The getfield below publishes
+    // the loaded constant; the marker is only the invalidation half.
     let already = ctx
         .trace_ctx
         .heapcache_getfield_cached(ec_box, descr_index)
