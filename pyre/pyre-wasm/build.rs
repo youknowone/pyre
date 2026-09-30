@@ -1,7 +1,7 @@
 //! Writes `$OUT_DIR/residual_sig_call.rs`: one `extern "C"` trampoline per
 //! concrete wasm type the blackhole path `call_indirect`s.
 //!
-//! Integer mixes cover arity 0..=8 and every i32/i64 mask, with result tags
+//! Integer mixes cover arity 0..=12 and every i32/i64 mask, with result tags
 //! void / i32 / i64 / f64 / f32. Uniform f64 covers arity 1..=4 and result
 //! tags void / i64 / f64. Any other mix of i32/i64/f32/f64 covers arity 1..=5
 //! and the same five result tags. An i32 argument is truncated; an i32
@@ -28,8 +28,8 @@ fn generate() -> String {
          \n",
     );
 
-    for arity in 0..=8 {
-        let masks = 1u16 << arity;
+    for arity in 0..=12 {
+        let masks = 1u32 << arity;
         for mask in 0..masks {
             for tag in 0..5 {
                 emit_int(&mut out, arity, mask, tag);
@@ -54,7 +54,7 @@ fn generate() -> String {
     out
 }
 
-fn emit_int(out: &mut String, arity: usize, mask: u16, tag: u8) {
+fn emit_int(out: &mut String, arity: usize, mask: u32, tag: u8) {
     let params = int_params(arity, mask);
     let args = int_args(arity, mask);
     let _ = writeln!(
@@ -138,17 +138,23 @@ fn emit_f64(out: &mut String, arity: usize, tag: u8) {
     );
 }
 
-fn int_params(arity: usize, mask: u16) -> String {
+fn int_params(arity: usize, mask: u32) -> String {
     (0..arity)
-        .map(|i| if mask & (1 << i) != 0 { "i32" } else { "i64" })
+        .map(|i| {
+            if mask & (1u32 << i) != 0 {
+                "i32"
+            } else {
+                "i64"
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn int_args(arity: usize, mask: u16) -> String {
+fn int_args(arity: usize, mask: u32) -> String {
     (0..arity)
         .map(|i| {
-            if mask & (1 << i) != 0 {
+            if mask & (1u32 << i) != 0 {
                 format!("args[{i}] as i32")
             } else {
                 format!("args[{i}]")
@@ -184,7 +190,7 @@ fn emit_int_dispatch(out: &mut String) {
         "pub fn call_int_sig(\n    \
          slot: usize,\n    \
          args: &[i64],\n    \
-         mask: u16,\n    \
+         mask: u32,\n    \
          result: Option<FuncSigVal>,\n\
          ) -> Option<i64> {\n    \
          let tag = match result {\n        \
@@ -197,8 +203,8 @@ fn emit_int_dispatch(out: &mut String) {
          Some(unsafe {\n        \
          match (args.len(), mask, tag) {\n",
     );
-    for arity in 0..=8 {
-        let masks = 1u16 << arity;
+    for arity in 0..=12 {
+        let masks = 1u32 << arity;
         for mask in 0..masks {
             for tag in 0..5 {
                 let _ = writeln!(

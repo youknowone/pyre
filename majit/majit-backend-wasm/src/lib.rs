@@ -3308,6 +3308,7 @@ fn stub_matches_table(
         let expect = match class {
             ArgClass::Int => FuncSigVal::I64,
             ArgClass::Float => FuncSigVal::F64,
+            ArgClass::Single => FuncSigVal::F32,
         };
         if *param != expect {
             return false;

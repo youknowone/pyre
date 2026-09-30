@@ -16,14 +16,16 @@
 use majit_jitcode::codewriter::insns::MAX_HOST_CALL_ARITY;
 use majit_jitcode::jitcode::{BhCallDescr, BhCallStub};
 
-/// `descr.py TYPE()` collapsed to the two C-ABI register classes the
-/// dispatch table can express: `'i'`, `'r'` and `'L'` (`lltype.Signed`,
-/// `llmemory.GCREF`, `lltype.SignedLongLong`) all pass in an integer register;
-/// `'f'` (`lltype.Float`) passes in a floating-point register.
+/// `descr.py TYPE()` collapsed to the C-ABI register classes the dispatch
+/// table can express: `'i'`, `'r'` and `'L'` (`lltype.Signed`,
+/// `llmemory.GCREF`, `lltype.SignedLongLong`) pass in an integer register;
+/// `'f'` (`lltype.Float`) passes as `f64`; `'S'` (`lltype.SingleFloat`)
+/// passes as `f32`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArgClass {
     Int,
     Float,
+    Single,
 }
 
 /// Class-sequence table shared by `bh_call_i_dispatch`, `bh_call_f_dispatch`,
@@ -52,6 +54,9 @@ macro_rules! invoke_ty {
     (Float) => {
         f64
     };
+    (Single) => {
+        f32
+    };
 }
 
 macro_rules! invoke_arg {
@@ -60,6 +65,9 @@ macro_rules! invoke_arg {
     };
     (Float, $a:ident, $i:tt) => {
         f64::from_bits($a[$i] as u64)
+    };
+    (Single, $a:ident, $i:tt) => {
+        f32::from_bits($a[$i] as u32)
     };
 }
 
@@ -369,7 +377,7 @@ macro_rules! define_call_sig_stubs {
                         stub
                     }
                 )*
-                classes => unsupported_call_sig(classes),
+                classes => lookup_single_i(classes),
             }
         }
 
@@ -383,7 +391,7 @@ macro_rules! define_call_sig_stubs {
                         stub
                     }
                 )*
-                classes => unsupported_call_sig(classes),
+                classes => lookup_single_f(classes),
             }
         }
 
@@ -397,11 +405,13 @@ macro_rules! define_call_sig_stubs {
                         stub
                     }
                 )*
-                classes => unsupported_call_sig(classes),
+                classes => lookup_single_v(classes),
             }
         }
     };
 }
+
+include!(concat!(env!("OUT_DIR"), "/single_stubs.rs"));
 
 fn unsupported_call_sig(classes: &[ArgClass]) -> ! {
     // `descr.py CallDescr.create_call_stub` generates a
@@ -420,11 +430,15 @@ fn unsupported_call_sig(classes: &[ArgClass]) -> ! {
 
 call_sig_table!(define_call_sig_stubs);
 
-/// The static stub table has every sequence through arity 5 and all-`Int`
+/// The static stub table has every `Int`/`Float` sequence through arity 5,
+/// every sequence that contains `Single` through arity 5, and all-`Int`
 /// through [`MAX_HOST_CALL_ARITY`].
 pub fn call_stub_arm_exists(classes: &[ArgClass]) -> bool {
     let n = classes.len();
-    n <= MAX_HOST_CALL_ARITY && (n <= 5 || !classes.contains(&ArgClass::Float))
+    let wide_float = classes
+        .iter()
+        .any(|class| matches!(class, ArgClass::Float | ArgClass::Single));
+    n <= MAX_HOST_CALL_ARITY && (n <= 5 || !wide_float)
 }
 
 fn wasm_residual_host_call(
@@ -636,13 +650,8 @@ pub fn create_call_stub(arg_classes: &str, result_type: char) -> BhCallStub {
             'r' => (BhCallStub::BANK_R, ArgClass::Int),
             'f' => (BhCallStub::BANK_F, ArgClass::Float),
             'L' => (BhCallStub::BANK_F, ArgClass::Int),
-            'S' => {
-                panic!(
-                    "BhCallDescr.collect_call_args: 'S' (SingleFloat) ABI \
-                     requires f32-aware dispatch; pyre's dispatch table \
-                     only supports f64. arg_classes={arg_classes:?}"
-                );
-            }
+            // descr.py process('S'): storage bank = `args_i`, C type = float.
+            'S' => (BhCallStub::BANK_I, ArgClass::Single),
             other => panic!(
                 "BhCallDescr.collect_call_args: unsupported arg class {other:?} \
                  in arg_classes={arg_classes:?}"
@@ -786,21 +795,12 @@ pub unsafe fn bh_call_v_with_descr(
 /// | `r`   | `args_r`     | `llmemory.GCREF`        | Int            |
 /// | `f`   | `args_f`     | `lltype.Float`          | Float          |
 /// | `L`   | `args_f`     | `lltype.SignedLongLong` | Int            |
-/// | `S`   | `args_i`     | `lltype.SingleFloat`    | Float (f32)    |
+/// | `S`   | `args_i`     | `lltype.SingleFloat`    | Single         |
 ///
 /// Note the asymmetry: `L` is stored in the float bank (PyPy `process('L')`
 /// rewrites `c = 'f'` for the storage lookup) yet passed in an integer
 /// register, while `S` is stored in the int bank (PyPy
-/// `int2singlefloat(args_i[..])`) yet passed in a float register as a
-/// 32-bit value.
-///
-/// `S` currently panics: pyre's dispatch table only emits `extern "C" fn(.., f64, ..)`
-/// arms, so an `f32` ABI cannot be transmuted accurately (a 64-bit movsd
-/// vs. a 32-bit movss to the same xmm/d register file). Pyre's
-/// `type_to_argclass` (`majit-translate/src/codewriter/call.rs:190-197`)
-/// never produces `S`, so the panic is unreachable from in-tree callers
-/// today; reaching it requires a foreign-supplied calldescr (e.g. a
-/// build-time bincode embed loaded from RPython).
+/// `int2singlefloat(args_i[..])`) yet passed as C `float`.
 ///
 /// Mirrors `rpython/jit/backend/llsupport/descr.py verify_types`:
 /// the per-class counts in `arg_classes` must match the corresponding list
@@ -881,18 +881,12 @@ pub fn collect_call_args(
             }
             'S' => {
                 // descr.py process('S'): storage bank = `args_i`
-                // (PyPy reads via `int2singlefloat(args_i[..])`); FUNC
-                // parameter type = `lltype.SingleFloat` -> C `float` ->
-                // 32-bit float dispatched in an xmm/d register. pyre's
-                // dispatch table emits only `extern "C" fn(.., f64, ..)`
-                // arms, so transmuting f32 through f64 would mismatch the
-                // C ABI (movss vs. movsd to the same register file).
-                let _ = (ii, args_i);
-                panic!(
-                    "BhCallDescr.collect_call_args: 'S' (SingleFloat) ABI \
-                     requires f32-aware dispatch; pyre's dispatch table \
-                     only supports f64. arg_classes={arg_classes:?}"
+                // (`int2singlefloat`); FUNC parameter type = C `float`.
+                out.push(
+                    ArgClass::Single,
+                    args_i.expect("BhCallDescr.collect_call_args: args_i missing")[ii],
                 );
+                ii += 1;
             }
             other => panic!(
                 "BhCallDescr.collect_call_args: unsupported arg class {other:?} \
@@ -1038,6 +1032,10 @@ pub fn residual_host_call() -> Option<ResidualHostCallFn> {
 mod tests {
     use super::*;
 
+    extern "C" fn single_int(a: f32, b: i64) -> i64 {
+        a.to_bits() as i64 + b
+    }
+
     extern "C" fn f2(a: f64, b: *const i64) -> f64 {
         a + unsafe { *b } as f64
     }
@@ -1048,6 +1046,23 @@ mod tests {
 
     extern "C" fn float_float_int(a: f64, b: f64, c: i64) -> f64 {
         a + b * 10.0 + c as f64 * 100.0
+    }
+
+    /// `descr.py process('S')`: the bits live in `args_i` and the callee
+    /// receives a C `float`.
+    #[test]
+    fn call_stub_i_singlefloat_passes_f32() {
+        let bits = 1.5f32.to_bits() as i64;
+        let collected = collect_call_args("Si", Some(&[bits, 7]), None, None);
+        assert_eq!(collected.classes(), &[ArgClass::Single, ArgClass::Int]);
+        let result = unsafe {
+            bh_call_i_dispatch(
+                single_int as *const () as usize,
+                collected.classes(),
+                collected.args(),
+            )
+        };
+        assert_eq!(result, bits + 7);
     }
 
     /// Rust port of
@@ -1200,6 +1215,8 @@ mod tests {
             collect_call_args("iriririr", Some(&[1, 2, 3, 4]), Some(&[5, 6, 7, 8]), None);
         assert!(collected.classes().iter().all(|c| *c == ArgClass::Int));
         assert!(call_stub_arm_exists(collected.classes()));
+        assert!(call_stub_arm_exists(&[ArgClass::Single, ArgClass::Int]));
+        assert!(!call_stub_arm_exists(&[ArgClass::Single; 6]));
         assert!(!call_stub_arm_exists(&[ArgClass::Float; 6]));
         let mut past = [ArgClass::Int; 6];
         past[3] = ArgClass::Float;
