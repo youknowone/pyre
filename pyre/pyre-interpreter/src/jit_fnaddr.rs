@@ -4996,7 +4996,20 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             bytearrayobject::BYTEARRAY_TYPE
         ),
         pytype_addr!("bytesobject::BYTES_TYPE", bytesobject::BYTES_TYPE),
+        pytype_addr!("bytesobject::BYTES_USER_TYPE", bytesobject::BYTES_USER_TYPE),
+        pytype_addr!(
+            "bytearrayobject::BYTEARRAY_USER_TYPE",
+            bytearrayobject::BYTEARRAY_USER_TYPE
+        ),
         pytype_addr!("interp_array::ARRAY_TYPE", interp_array::ARRAY_TYPE),
+        pytype_addr!(
+            "interp_array::ARRAY_USER_TYPE",
+            interp_array::ARRAY_USER_TYPE
+        ),
+        pytype_addr!(
+            "weakref::WEAKREF_LAYOUT_USER_TYPE",
+            weakref::WEAKREF_LAYOUT_USER_TYPE
+        ),
         pytype_addr!(
             "celldict::OBJECT_MUTABLE_CELL_TYPE",
             celldict::OBJECT_MUTABLE_CELL_TYPE
@@ -5214,6 +5227,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("pyobject::COMPLEX_TYPE", pyobject::COMPLEX_TYPE),
         pytype_addr!("pyobject::STR_TYPE", pyobject::STR_TYPE),
         pytype_addr!("pyobject::LIST_TYPE", pyobject::LIST_TYPE),
+        pytype_addr!("pyobject::LIST_USER_TYPE", pyobject::LIST_USER_TYPE),
         pytype_addr!("pyobject::TUPLE_TYPE", pyobject::TUPLE_TYPE),
         pytype_addr!("pyobject::DICT_TYPE", pyobject::DICT_TYPE),
         pytype_addr!("pyobject::LONG_TYPE", pyobject::LONG_TYPE),
@@ -5228,7 +5242,12 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("pyobject::TYPE_TYPE", pyobject::TYPE_TYPE),
         pytype_addr!("pyobject::INSTANCE_TYPE", pyobject::INSTANCE_TYPE),
         pytype_addr!("setobject::SET_TYPE", setobject::SET_TYPE),
+        pytype_addr!("setobject::SET_USER_TYPE", setobject::SET_USER_TYPE),
         pytype_addr!("setobject::FROZENSET_TYPE", setobject::FROZENSET_TYPE),
+        pytype_addr!(
+            "setobject::FROZENSET_USER_TYPE",
+            setobject::FROZENSET_USER_TYPE
+        ),
         pytype_addr!(
             "specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE",
             specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE

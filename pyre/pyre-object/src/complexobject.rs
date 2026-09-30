@@ -23,6 +23,13 @@ pub struct W_ComplexObjectUser {
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_ComplexObjectUser, storage)
+            == std::mem::offset_of!(W_ComplexObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
 /// Field offset of `real` within `W_ComplexObject`.
 pub const COMPLEX_REAL_OFFSET: usize = std::mem::offset_of!(W_ComplexObject, real);
 

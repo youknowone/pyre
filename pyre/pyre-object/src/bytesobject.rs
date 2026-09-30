@@ -7,7 +7,14 @@
 
 use crate::pyobject::*;
 
-pub static BYTES_TYPE: PyType = crate::pyobject::new_pytype("bytes");
+pub static BYTES_TYPE: PyType =
+    crate::pyobject::new_pytype_with_user_subclass("bytes", &BYTES_USER_TYPE);
+/// `W_BytesObjectUser` (`typedef.py _getusercls(W_BytesObject)`).
+pub static BYTES_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
+    "bytes",
+    &BYTES_TYPE,
+    std::mem::offset_of!(W_BytesObjectUser, map),
+);
 
 /// GC-managed byte buffer behind a `bytearray` body.
 ///
@@ -264,13 +271,24 @@ pub struct W_BytesObject {
     /// `sys.getrefcount` compatibility without changing object identity or
     /// storing a parallel object side table.
     pub ctypes_keepalive_refs: usize,
-    /// Mapdict's per-instance `dict` SPECIAL slot for a user subclass.
-    /// Exact bytes objects leave this null.
-    pub w_dict: PyObjectRef,
-    /// Mapdict's per-instance `weakref` SPECIAL slot for a user subclass.
-    /// Exact bytes objects leave this null.
-    pub w_weakreflifeline: PyObjectRef,
 }
+
+/// The translated user-subclass layout selected by `typedef.py _getusercls`.
+/// `W_BytesObject` remains the base payload; `MapdictStorageMixin` contributes
+/// its fields only to the generated user class.
+#[repr(C)]
+pub struct W_BytesObjectUser {
+    pub base: W_BytesObject,
+    pub map: usize,
+    pub storage: *mut crate::object_array::ItemsBlock,
+}
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_BytesObjectUser, storage)
+            == std::mem::offset_of!(W_BytesObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
 
 /// `W_BytesObject.data` — the pointer to the block holding the bytes.
 pub const BYTES_DATA_OFFSET: usize = std::mem::offset_of!(W_BytesObject, data);
@@ -283,15 +301,13 @@ pub const BYTES_LEN_OFFSET: usize = std::mem::offset_of!(W_BytesObject, len);
 pub const BYTES_CTYPES_KEEPALIVE_REFS_OFFSET: usize =
     std::mem::offset_of!(W_BytesObject, ctypes_keepalive_refs);
 
-/// `W_BytesObject.w_dict` — mapdict's per-instance dict SPECIAL slot.
-pub const BYTES_W_DICT_OFFSET: usize = std::mem::offset_of!(W_BytesObject, w_dict);
-
-/// `W_BytesObject.w_weakreflifeline` — mapdict's per-instance weakref slot.
-pub const BYTES_W_WEAKREFLIFELINE_OFFSET: usize =
-    std::mem::offset_of!(W_BytesObject, w_weakreflifeline);
-
 /// GC type id assigned to `W_BytesObject` at JitDriver init time.
 pub const W_BYTES_GC_TYPE_ID: u32 = 27;
+/// User-subclass bytes layout (`typedef.py` `_getusercls`). Unconditional,
+/// so its tid sits with the other closed ids (163) ahead of the
+/// target-gated tail.
+pub const W_BYTES_USER_GC_TYPE_ID: u32 = 163;
+pub const W_BYTES_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_BytesObjectUser>();
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_BYTES_OBJECT_SIZE: usize = std::mem::size_of::<W_BytesObject>();
@@ -301,6 +317,14 @@ impl crate::lltype::GcType for W_BytesObject {
         W_BYTES_GC_TYPE_ID
     }
     const SIZE: usize = W_BYTES_OBJECT_SIZE;
+}
+
+impl crate::lltype::GcType for W_BytesObjectUser {
+    #[inline(always)]
+    fn type_id() -> u32 {
+        W_BYTES_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_BYTES_USER_OBJECT_SIZE;
 }
 
 /// Allocate a new bytes object from a byte slice.
@@ -362,8 +386,6 @@ fn build_bytes(len: usize, data: *mut BytesBlock) -> PyObjectRef {
         data: crate::gc_roots::shadow_stack_get(data_slot) as *const BytesBlock,
         len,
         ctypes_keepalive_refs: 0,
-        w_dict: PY_NULL,
-        w_weakreflifeline: PY_NULL,
     };
     let w_bytes = if !raw.is_null() {
         unsafe {
@@ -397,8 +419,6 @@ pub fn w_bytes_from_block(data: *const BytesBlock) -> PyObjectRef {
         data,
         len: unsafe { (*data).length },
         ctypes_keepalive_refs: 0,
-        w_dict: PY_NULL,
-        w_weakreflifeline: PY_NULL,
     };
     if raw.is_null() {
         crate::lltype::malloc_typed(body) as PyObjectRef
@@ -436,25 +456,25 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
     let data_slot = crate::gc_roots::shadow_stack_len();
     let data = alloc_bytes_block(bytes);
     let _ = crate::gc_roots::pin_root(data as PyObjectRef);
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
-        <W_BytesObject as crate::lltype::GcType>::type_id(),
-        <W_BytesObject as crate::lltype::GcType>::SIZE,
-    );
-    let payload = W_BytesObject {
-        ob_header: PyObject {
-            ob_type: &BYTES_TYPE as *const PyType,
-            w_class: crate::gc_roots::shadow_stack_get(root_base),
+    let raw =
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_BYTES_USER_GC_TYPE_ID, W_BYTES_USER_OBJECT_SIZE);
+    let payload = W_BytesObjectUser {
+        base: W_BytesObject {
+            ob_header: PyObject {
+                ob_type: &BYTES_USER_TYPE as *const PyType,
+                w_class: crate::gc_roots::shadow_stack_get(root_base),
+            },
+            data: crate::gc_roots::shadow_stack_get(data_slot) as *const BytesBlock,
+            len: bytes.len(),
+            ctypes_keepalive_refs: 0,
         },
-        data: crate::gc_roots::shadow_stack_get(data_slot) as *const BytesBlock,
-        len: bytes.len(),
-        ctypes_keepalive_refs: 0,
-        w_dict: PY_NULL,
-        w_weakreflifeline: PY_NULL,
+        map: 0,
+        storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {
         crate::lltype::malloc_typed(payload) as PyObjectRef
     } else {
-        unsafe { std::ptr::write(raw as *mut W_BytesObject, payload) };
+        unsafe { std::ptr::write(raw as *mut W_BytesObjectUser, payload) };
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     };
@@ -463,40 +483,6 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
     // so the hook resolves the subclass rather than the canonical bytes type.
     crate::gc_hook::maybe_register_finalizer(obj);
     obj
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_bytes_getdict(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BytesObject)).w_dict }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_bytes_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
-    unsafe { (*(obj as *mut W_BytesObject)).w_dict = w_dict };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_bytes_getweakref(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BytesObject)).w_weakreflifeline }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_bytes_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
-    unsafe { (*(obj as *mut W_BytesObject)).w_weakreflifeline = lifeline };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// Allocate an empty bytes object.
@@ -509,7 +495,7 @@ pub fn w_bytes_empty() -> PyObjectRef {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_bytes(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &BYTES_TYPE) }
+    unsafe { py_type_check(obj, &BYTES_TYPE) || py_type_check(obj, &BYTES_USER_TYPE) }
 }
 
 #[inline]
@@ -682,6 +668,26 @@ pub unsafe fn bytes_like_data(obj: PyObjectRef) -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `typedef.py _getusercls(W_BytesObject)`: exact bytes keep the bare
+    /// payload and a subclass instance is `W_BytesObjectUser` carrying
+    /// `BYTES_USER_TYPE`.
+    #[test]
+    fn bytes_subclass_instance_carries_user_typeptr() {
+        assert_eq!(
+            W_BYTES_OBJECT_SIZE,
+            std::mem::size_of::<PyObject>()
+                + std::mem::size_of::<*const BytesBlock>()
+                + std::mem::size_of::<usize>() * 2
+        );
+        let obj = w_bytes_subclass_from_bytes(b"ab", get_instantiate(&BYTES_TYPE));
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &BYTES_USER_TYPE));
+            assert!(is_bytes(obj));
+            assert!(!crate::pyobject::is_exact_type(obj, &BYTES_TYPE));
+            assert_eq!(w_bytes_len(obj), 2);
+        }
+    }
 
     #[test]
     fn test_bytes_basic() {

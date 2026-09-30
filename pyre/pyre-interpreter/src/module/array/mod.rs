@@ -451,16 +451,26 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
             "The 'u' type code is deprecated and will be removed in Python 3.16",
         )?;
     }
-    let obj = arr::w_array_new(typecode, itemsize);
+    // The 'u' deprecation warning above can collect, so the subclass word is
+    // re-read from the shadow stack rather than the pre-warning local.
+    let cls = pyre_object::gc_roots::shadow_stack_get(pos_base);
+    let obj = if !cls.is_null()
+        && unsafe { pyre_object::is_type(cls) }
+        && !std::ptr::eq(cls, canonical)
+    {
+        // `allocate_instance(W_ArrayUser, w_cls)` (`typedef.py` `_getusercls`),
+        // then the user-finalizer enqueue `tag_subclass_instance` performs
+        // after `user_setup`.
+        let obj = arr::w_array_user_new(typecode, itemsize, cls);
+        pyre_object::gc_hook::maybe_register_finalizer(obj);
+        obj
+    } else {
+        arr::w_array_new(typecode, itemsize)
+    };
     // Nothing refers to the fresh array yet and every initializer below runs
     // Python.  An array is stable, so the local stays a valid address; the pin
     // is what stops a major cycle sweeping it as unreachable.
     let obj = pyre_object::gc_roots::pin_root(obj);
-    // Subclass: retag the fresh array with the requested class.
-    let cls = pyre_object::gc_roots::shadow_stack_get(pos_base);
-    if !cls.is_null() && unsafe { pyre_object::is_type(cls) } && !std::ptr::eq(cls, canonical) {
-        crate::typedef::tag_subclass_instance(obj, cls);
-    }
     // Optional initializer.
     if pos.len() >= 3 {
         let w_init = pyre_object::gc_roots::shadow_stack_get(pos_base + 2);
@@ -2399,6 +2409,7 @@ pub fn init_array_type(ns: PyObjectRef) {
                 ),
                 PY_NULL,
                 PY_NULL,
+                PY_NULL,
             ),
         )
     };
@@ -2417,6 +2428,7 @@ pub fn init_array_type(ns: PyObjectRef) {
                     },
                     1,
                 ),
+                PY_NULL,
                 PY_NULL,
                 PY_NULL,
             ),

@@ -6896,7 +6896,8 @@ pub(crate) fn call_init_subclass_on_bases(
         .collect();
     let kwarg_base = pyre_object::gc_roots::pin_roots(&flat);
     let w_objtype = crate::builtins::super_check(w_type, w_type)?;
-    let w_super = pyre_object::descriptor::w_super_new(w_type, w_objtype, w_type);
+    let w_super =
+        pyre_object::descriptor::w_super_new(w_type, w_objtype, w_type, pyre_object::PY_NULL);
     let w_func = crate::baseobjspace::getattr_str(w_super, "__init_subclass__")?;
     // typeobject.py — `args = __args__.replace_arguments([])` then
     // `space.call_args(w_func, args)`: keywords only, no positionals, and no

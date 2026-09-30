@@ -95,11 +95,13 @@ pub unsafe fn w_weakref_lifeline_set_has_callbacks(obj: PyObjectRef) {
 
 /// `interp__weakref.py W_Weakref(W_WeakrefBase)` — exact builtin
 /// weak references own the base weak slot/callback and their cached hash
-/// directly.  A Python subclass is a separate translated user layout with
-/// mapdict storage; until that generated layout is ported, the interpreter
-/// keeps its existing mapdict carrier and reaches both shapes through the
-/// accessors below.
-#[pyre_class("weakref.ReferenceType", static_name = "WEAKREF_LAYOUT")]
+/// directly. A user subclass is `typedef.py` `_getusercls`: [`W_WeakrefUser`]
+/// appends `MapdictStorageMixin` and carries `__dict__` / `__slots__` there.
+#[pyre_class(
+    "weakref.ReferenceType",
+    static_name = "WEAKREF_LAYOUT",
+    user_subclass = "WEAKREF_LAYOUT_USER_TYPE"
+)]
 pub struct W_Weakref {
     /// `W_WeakrefBase.__init__: self.w_obj_weak = weakref.ref(w_obj)`.
     pub w_obj_weak: PyObjectRef,
@@ -107,8 +109,44 @@ pub struct W_Weakref {
     pub w_callable: PyObjectRef,
     /// `W_Weakref.__init__: self.w_hash = None`.
     pub w_hash: PyObjectRef,
-    /// Native-subclass `__slots__` storage indexed by `Member.index`.
-    pub w_slots: PyObjectRef,
+}
+
+/// `typedef.py` `_getusercls(W_Weakref)`: the base payload plus
+/// `MapdictStorageMixin`.
+#[repr(C)]
+pub struct W_WeakrefUser {
+    pub base: W_Weakref,
+    pub map: usize,
+    pub storage: *mut crate::object_array::ItemsBlock,
+}
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_WeakrefUser, storage)
+            == std::mem::offset_of!(W_WeakrefUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
+/// User-subclass `weakref.ref` typeptr (`typedef.py` `_getusercls`).
+/// Instances share `W_Weakref`'s payload and add mapdict `map` / `storage`.
+pub static WEAKREF_LAYOUT_USER_TYPE: PyType = new_user_pytype(
+    "weakref.ReferenceType",
+    &WEAKREF_LAYOUT_TYPE,
+    std::mem::offset_of!(W_WeakrefUser, map),
+);
+
+/// User-subclass weakref layout (`typedef.py` `_getusercls`). Unconditional,
+/// so its tid sits with the other closed ids (168) ahead of the
+/// target-gated tail.
+pub const W_WEAKREF_USER_GC_TYPE_ID: u32 = 168;
+pub const W_WEAKREF_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_WeakrefUser>();
+
+impl crate::lltype::GcType for W_WeakrefUser {
+    #[inline(always)]
+    fn type_id() -> u32 {
+        W_WEAKREF_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_WEAKREF_USER_OBJECT_SIZE;
 }
 
 /// Allocate the exact builtin W_Weakref payload. The caller has already
@@ -124,13 +162,52 @@ pub fn w_weakref_object_new(
         w_obj_weak,
         w_callable,
         w_hash,
-        w_slots: PY_NULL,
     })
+}
+
+/// `allocate_instance(W_WeakrefUser, w_class)`: `map` / `storage` at the
+/// `MapdictStorageMixin` initial state. The header is non-moving, the same
+/// allocator `W_Weakref::allocate_stable` uses.
+pub fn w_weakref_user_new(
+    w_obj_weak: PyObjectRef,
+    w_callable: PyObjectRef,
+    w_hash: PyObjectRef,
+    w_class: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let base = crate::gc_roots::pin_roots(&[w_obj_weak, w_callable, w_hash, w_class]);
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+        W_WEAKREF_USER_GC_TYPE_ID,
+        W_WEAKREF_USER_OBJECT_SIZE,
+    );
+    let body = W_WeakrefUser {
+        base: W_Weakref {
+            ob: PyObject {
+                ob_type: &WEAKREF_LAYOUT_USER_TYPE as *const PyType,
+                w_class: crate::gc_roots::shadow_stack_get(base + 3),
+            },
+            w_obj_weak: crate::gc_roots::shadow_stack_get(base),
+            w_callable: crate::gc_roots::shadow_stack_get(base + 1),
+            w_hash: crate::gc_roots::shadow_stack_get(base + 2),
+        },
+        map: 0,
+        storage: std::ptr::null_mut(),
+    };
+    if raw.is_null() {
+        return crate::lltype::malloc_typed(body) as PyObjectRef;
+    }
+    unsafe {
+        std::ptr::write(raw as *mut W_WeakrefUser, body);
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+    }
+    raw as PyObjectRef
 }
 
 #[inline]
 pub unsafe fn is_typed_weakref(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &WEAKREF_LAYOUT_TYPE) }
+    unsafe {
+        py_type_check(obj, &WEAKREF_LAYOUT_TYPE) || py_type_check(obj, &WEAKREF_LAYOUT_USER_TYPE)
+    }
 }
 
 #[inline]
@@ -164,29 +241,6 @@ pub unsafe fn w_weakref_object_hash(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_weakref_object_set_hash(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut W_Weakref)).w_hash = value };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-}
-
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_weakref_object_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    let slots = unsafe { (*(obj as *const W_Weakref)).w_slots };
-    unsafe { crate::slots::slot_get(slots, index) }
-}
-
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_weakref_object_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    crate::slot_set_direct!(obj, index, value, W_Weakref, w_slots)
-}
-
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_weakref_object_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    let slots = unsafe { (*(obj as *const W_Weakref)).w_slots };
-    unsafe { crate::slots::slot_del(slots, index) }
 }
 
 /// GC type id for the WEAKREF GcStruct. Registered by
@@ -584,15 +638,6 @@ mod tests {
         assert_eq!(unsafe { w_weakref_object_hash(weakref) }, hash);
         assert!(unsafe { w_weakref_object_callable(weakref) }.is_null());
 
-        let slot_value = 0x7000_usize as PyObjectRef;
-        unsafe { w_weakref_object_slot_set(weakref, 2, slot_value) };
-        assert_eq!(
-            unsafe { w_weakref_object_slot_get(weakref, 2) },
-            Some(slot_value)
-        );
-        assert!(unsafe { w_weakref_object_slot_del(weakref, 2) });
-        assert_eq!(unsafe { w_weakref_object_slot_get(weakref, 2) }, None);
-
         assert_eq!(
             W_Weakref::DESCRIPTOR.ptr_offsets,
             &[
@@ -600,9 +645,43 @@ mod tests {
                 std::mem::offset_of!(W_Weakref, w_obj_weak),
                 std::mem::offset_of!(W_Weakref, w_callable),
                 std::mem::offset_of!(W_Weakref, w_hash),
-                std::mem::offset_of!(W_Weakref, w_slots),
             ]
         );
+    }
+
+    /// `typedef.py` `_getusercls(W_Weakref)`: a subclass instance is
+    /// `W_WeakrefUser` carrying `WEAKREF_LAYOUT_USER_TYPE`.
+    #[test]
+    fn weakref_subclass_instance_carries_user_typeptr() {
+        assert_eq!(W_WEAKREF_USER_GC_TYPE_ID, 168);
+        assert_eq!(
+            W_WEAKREF_LAYOUT_OBJECT_SIZE,
+            std::mem::offset_of!(W_Weakref, w_hash) + std::mem::size_of::<PyObjectRef>()
+        );
+        assert_eq!(
+            W_WEAKREF_USER_OBJECT_SIZE,
+            W_WEAKREF_LAYOUT_OBJECT_SIZE
+                + std::mem::size_of::<usize>()
+                + std::mem::size_of::<*mut crate::object_array::ItemsBlock>()
+        );
+        let obj_weak = 0x4000_usize as PyObjectRef;
+        let obj = w_weakref_object_new(obj_weak, PY_NULL, PY_NULL);
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &WEAKREF_LAYOUT_TYPE));
+            assert!(is_typed_weakref(obj));
+        }
+        let obj = w_weakref_user_new(
+            obj_weak,
+            PY_NULL,
+            PY_NULL,
+            get_instantiate(&WEAKREF_LAYOUT_TYPE),
+        );
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &WEAKREF_LAYOUT_USER_TYPE));
+            assert!(is_typed_weakref(obj));
+            assert!(!crate::pyobject::is_exact_type(obj, &WEAKREF_LAYOUT_TYPE));
+            assert_eq!(w_weakref_object_obj_weak(obj), obj_weak);
+        }
     }
 
     #[test]

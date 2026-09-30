@@ -13,7 +13,7 @@ use pyre_macros::pyre_class;
 // starting from the next class after super_type in obj's MRO.
 
 /// super proxy: [ob_type | super_type (cls) | obj_type | obj (self)]
-#[pyre_class("super", type_id = 18, static_name = "SUPER")]
+#[pyre_class("super", type_id = 18, static_name = "SUPER", user_layout)]
 pub struct W_Super {
     /// The class passed to super() — lookup starts after this in MRO.
     pub super_type: PyObjectRef,
@@ -23,58 +23,31 @@ pub struct W_Super {
     pub obj: PyObjectRef,
 }
 
-/// Allocate the empty proxy in the same graph that constructs its Rust
-/// payload.  Keeping the aggregate and `malloc_typed_stable` together is the
-/// source shape `fuse_boxing_alloc` lowers to PyPy's `new_with_vtable`;
-/// accepting a `W_Super` payload from the caller would make that by-value
-/// aggregate execute before the generated inline call.
-fn w_super_alloc_empty() -> PyObjectRef {
-    let value = W_Super {
-        ob: PyObject {
-            ob_type: &SUPER_TYPE as *const PyType,
-            w_class: get_instantiate(&SUPER_TYPE),
-        },
-        super_type: PY_NULL,
-        obj_type: PY_NULL,
-        obj: PY_NULL,
-    };
-    crate::lltype::malloc_typed_stable(value) as PyObjectRef
-}
-
 /// Create a new super proxy.
+///
+/// `objspace.py` `allocate_instance`: `w_subtype` null (or the builtin
+/// `super` type) is the base layout; a user subclass is `W_SuperUser`.
+/// The three payload refs and `w_subtype` stay pinned across that malloc.
 pub fn w_super_new(
     super_type: PyObjectRef,
     obj_type: PyObjectRef,
     obj: PyObjectRef,
+    w_subtype: PyObjectRef,
 ) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
-    // `super_type`/`obj_type`/`obj` fields across the GC malloc and re-read their
-    // relocated addresses afterwards (a minor collection inside the malloc
-    // may move them). A super proxy whose members are reachable only
-    // through it must be GC-traced; a `malloc_typed` proxy is invisible to
-    // mark-sweep, whereas `register_pyre_class` registers this layout's
-    // `ptr_offsets`, so mark-sweep follows the members. The write barrier
-    // below keeps the old-gen proxy in the remembered set so young members
-    // survive a later minor collection.
     let _roots = crate::gc_roots::push_roots();
-    let save_point = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(super_type);
-    let _ = crate::gc_roots::pin_root(obj_type);
-    let _ = crate::gc_roots::pin_root(obj);
-    // Allocate first, then install the GC-forwarded roots.  This is PyPy's
-    // ordinary malloc + setfield shape; spelling the raw byte allocation and
-    // whole-struct `ptr::write` here left the embedded `PyObject` aggregate as
-    // a synthetic callable in generated JitCode.
-    let super_obj = w_super_alloc_empty();
-    unsafe {
-        w_super_set_fields(
-            super_obj,
-            crate::gc_roots::shadow_stack_get(save_point),
-            crate::gc_roots::shadow_stack_get(save_point + 1),
-            crate::gc_roots::shadow_stack_get(save_point + 2),
-        );
-    }
-    super_obj
+    let base = crate::gc_roots::pin_roots(&[super_type, obj_type, obj, w_subtype]);
+    W_Super::allocate_instance(
+        W_Super {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            super_type: crate::gc_roots::shadow_stack_get(base),
+            obj_type: crate::gc_roots::shadow_stack_get(base + 1),
+            obj: crate::gc_roots::shadow_stack_get(base + 2),
+        },
+        crate::gc_roots::shadow_stack_get(base + 3),
+    )
 }
 
 #[inline]
@@ -82,7 +55,7 @@ pub fn w_super_new(
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_super(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &SUPER_TYPE) }
+    unsafe { py_type_check(obj, &SUPER_TYPE) || py_type_check(obj, &SUPER_USER_TYPE) }
 }
 
 /// Get the super_type (cls) from a super proxy.
@@ -160,7 +133,7 @@ mod super_tests {
 ///
 /// Layout: `[ob_type | fget | fset | fdel | w_doc | w_name | getter_doc |
 /// fget_watchers | fset_watchers]`
-#[pyre_class("property", type_id = 19, static_name = "PROPERTY")]
+#[pyre_class("property", type_id = 19, static_name = "PROPERTY", user_layout)]
 pub struct W_Property {
     /// `descriptor.py:175 _immutable_fields_ = ["w_fget?", "w_fset?",
     /// "w_fdel?"]` declares all three quasi-immutable; the hidden watcher
@@ -204,55 +177,35 @@ pub struct W_Property {
 /// Allocate a new property object.
 ///
 /// PyPy: W_Property.__init__(space, w_fget, w_fset, w_fdel, w_doc)
-pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
-    // three accessors across the GC malloc and read back relocated
-    // addresses. A property whose `fget`/`fset`/`fdel` is reachable only
-    // through it must be GC-traced; a `malloc_typed` property is invisible
-    // to mark-sweep. The `w_doc`/`w_name` setters already carry the write
-    // barrier (`set_doc`/`set_name`).
+pub fn w_property_new(
+    fget: PyObjectRef,
+    fset: PyObjectRef,
+    fdel: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
+    // Pin the accessors and `w_subtype` across `allocate_instance`
+    // (`objspace.py`). A property whose `fget`/`fset`/`fdel` is reachable
+    // only through it must be GC-traced. The `w_doc`/`w_name` setters
+    // already carry the write barrier (`set_doc`/`set_name`).
     let _roots = crate::gc_roots::push_roots();
-    let save_point = crate::gc_roots::pin_roots(&[fget, fset, fdel]);
-    let header = PyObject {
-        ob_type: &PROPERTY_TYPE as *const PyType,
-        w_class: get_instantiate(&PROPERTY_TYPE),
-    };
-    let raw =
-        crate::gc_hook::try_gc_alloc_nursery_raw(W_PROPERTY_GC_TYPE_ID, W_PROPERTY_OBJECT_SIZE);
-    let fget = crate::gc_roots::shadow_stack_get(save_point);
-    let fset = crate::gc_roots::shadow_stack_get(save_point + 1);
-    let fdel = crate::gc_roots::shadow_stack_get(save_point + 2);
-    if !raw.is_null() {
-        unsafe {
-            std::ptr::write(
-                raw as *mut W_Property,
-                W_Property {
-                    ob: header,
-                    fget,
-                    fset,
-                    fdel,
-                    w_doc: PY_NULL,
-                    w_name: PY_NULL,
-                    getter_doc: false,
-                    fget_watchers: crate::quasiimmut::QuasiImmutField::new(),
-                    fset_watchers: crate::quasiimmut::QuasiImmutField::new(),
-                },
-            );
-        }
-        crate::gc_hook::try_gc_write_barrier(raw);
-        return raw as PyObjectRef;
-    }
-    W_Property::allocate(W_Property {
-        ob: header,
-        fget,
-        fset,
-        fdel,
-        w_doc: PY_NULL,
-        w_name: PY_NULL,
-        getter_doc: false,
-        fget_watchers: crate::quasiimmut::QuasiImmutField::new(),
-        fset_watchers: crate::quasiimmut::QuasiImmutField::new(),
-    })
+    let base = crate::gc_roots::pin_roots(&[fget, fset, fdel, w_subtype]);
+    W_Property::allocate_instance(
+        W_Property {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            fget: crate::gc_roots::shadow_stack_get(base),
+            fset: crate::gc_roots::shadow_stack_get(base + 1),
+            fdel: crate::gc_roots::shadow_stack_get(base + 2),
+            w_doc: PY_NULL,
+            w_name: PY_NULL,
+            getter_doc: false,
+            fget_watchers: crate::quasiimmut::QuasiImmutField::new(),
+            fset_watchers: crate::quasiimmut::QuasiImmutField::new(),
+        },
+        crate::gc_roots::shadow_stack_get(base + 3),
+    )
 }
 
 /// # Safety
@@ -429,7 +382,7 @@ pub unsafe fn w_property_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_property(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &PROPERTY_TYPE)
+    unsafe { py_type_check(obj, &PROPERTY_TYPE) || py_type_check(obj, &PROPERTY_USER_TYPE) }
 }
 
 /// `type(obj) is property`, as opposed to [`is_property`]'s layout test.
@@ -442,11 +395,10 @@ pub unsafe fn is_property(obj: PyObjectRef) -> bool {
 /// the MRO — so calling `fget` in place of `__get__` is licensed only when the
 /// descriptor's type is `property` itself and cannot have overridden it.
 ///
-/// The two answers really do separate: `property_descr_new` allocates through
-/// [`w_property_new`], which sets `w_class` to `property`, and calls
-/// `tag_subclass_instance` — the only writer of `w_class` — solely when the
-/// requested type is not `property`.  `ob_type`, which [`is_property`] reads,
-/// stays the shared layout word either way.
+/// `allocate_instance` (`objspace.py`) stamps `PROPERTY_TYPE` and the builtin
+/// `property` class on an exact instance. A subclass is `PROPERTY_USER_TYPE`
+/// (`typedef.py` `_getusercls`) with `w_class` set to that subtype, so
+/// [`is_property`] accepts both layouts and this check stays on `w_class`.
 ///
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -461,7 +413,7 @@ mod property_tests {
 
     #[test]
     fn test_property_create() {
-        let obj = w_property_new(PY_NULL, PY_NULL, PY_NULL);
+        let obj = w_property_new(PY_NULL, PY_NULL, PY_NULL, PY_NULL);
         unsafe {
             assert!(is_property(obj));
             assert!(!is_int(obj));
@@ -470,7 +422,7 @@ mod property_tests {
 
     #[test]
     fn property_reinit_replaces_accessors_and_clears_metadata() {
-        let obj = w_property_new(PY_NULL, PY_NULL, PY_NULL);
+        let obj = w_property_new(PY_NULL, PY_NULL, PY_NULL, PY_NULL);
         let old_doc = crate::w_int_new(10);
         let old_name = crate::w_int_new(11);
         let fget = crate::w_int_new(1);

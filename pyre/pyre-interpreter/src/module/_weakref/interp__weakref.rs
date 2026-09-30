@@ -761,9 +761,10 @@ pub fn W_Weakref_new(
         w_subtype
     };
     // `W_Weakref` (interp__weakref.py) / `descr__new__weakref`
-    // (interp__weakref.py): the three fields are interpreter-owned, so
-    // every subtype keeps the builtin payload. Its Python-level `__dict__` and
-    // slots use the same tagged carrier as other builtin subclasses.
+    // (interp__weakref.py): the three fields are interpreter-owned.
+    // `allocate_instance(W_Weakref, w_subtype)` (`typedef.py` `_getusercls`)
+    // stamps a subclass with `WEAKREF_LAYOUT_USER_TYPE`; an exact `ref` keeps
+    // the base payload.
     let exact_type = std::ptr::eq(actual_type, weakref_type());
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
@@ -780,18 +781,17 @@ pub fn W_Weakref_new(
     } else {
         pyre_object::PY_NULL
     };
-    let weakref = pyre_object::weakref::w_weakref_object_new(
-        pyre_object::gc_roots::shadow_stack_get(root_base + 3),
-        callable,
-        pyre_object::PY_NULL,
-    );
+    let cls = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+    let obj_weak = pyre_object::gc_roots::shadow_stack_get(root_base + 3);
     if exact_type {
-        weakref
+        pyre_object::weakref::w_weakref_object_new(obj_weak, callable, pyre_object::PY_NULL)
     } else {
-        crate::typedef::tag_subclass_instance(
-            weakref,
-            pyre_object::gc_roots::shadow_stack_get(root_base + 2),
-        )
+        // The user-finalizer enqueue `tag_subclass_instance` performs after
+        // `user_setup`. `w_class` is already the subclass.
+        let obj =
+            pyre_object::weakref::w_weakref_user_new(obj_weak, callable, pyre_object::PY_NULL, cls);
+        pyre_object::gc_hook::maybe_register_finalizer(obj);
+        obj
     }
 }
 

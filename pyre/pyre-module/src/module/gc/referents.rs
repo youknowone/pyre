@@ -208,7 +208,7 @@ fn pin_unboxed_container_referents(source_slot: usize) {
         return;
     }
     unsafe {
-        if std::ptr::eq((*w_obj).ob_type, &LIST_TYPE) {
+        if pyre_object::is_list(w_obj) {
             let list = &*(w_obj as *const listobject::W_ListObject);
             if matches!(
                 list.strategy,

@@ -51,6 +51,14 @@ pub struct W_ObjectObject {
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
+// `storage` is the word immediately after `map` (`MapdictStorageMixin`).
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_ObjectObject, storage)
+            == std::mem::offset_of!(W_ObjectObject, map) + std::mem::size_of::<usize>()
+    );
+};
+
 /// Fixed payload size of the `[ob_header | map | storage]` instance
 /// payload (`framework.py:811`).
 pub const W_OBJECT_OBJECT_SIZE: usize = std::mem::size_of::<W_ObjectObject>();

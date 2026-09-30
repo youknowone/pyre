@@ -1347,6 +1347,18 @@ struct PyreClassAttrs {
     /// Specifying this lets the GC consts retain one prefix while the
     /// PyType keeps its historical name.
     pytype_static: Option<syn::LitStr>,
+    /// Optional name of the `_getusercls` typeptr static
+    /// (`typedef.py` `_getusercls`). When set, the PyType is built with
+    /// `new_pytype_with_user_subclass` and `from_obj` accepts that
+    /// typeptr as well as this class's own: a user-subclass layout
+    /// starts with the base payload. Example:
+    /// `user_subclass = "ARRAY_USER_TYPE"`.
+    user_subclass: Option<syn::LitStr>,
+    /// Emit `typedef.py` `_getusercls`: `SUser` appends `MapdictStorageMixin`
+    /// (`map` then `storage`), `P_USER_TYPE` is that layout's typeptr, and
+    /// `allocate_instance` (`objspace.py`) picks it when `w_subtype` is a
+    /// real subclass. Mutually exclusive with `user_subclass`.
+    user_layout: bool,
     /// CPython 3.14 constructs this module type with `PyType_From*Spec`.
     /// This is a public flag projection only; the PyPy TypeDef remains a
     /// builtin internally.
@@ -1359,11 +1371,13 @@ struct PyreClassAttrs {
 
 impl syn::parse::Parse for PyreClassAttrs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        // `"name.path"[, type_id = N][, static_name = "PREFIX"]`
+        // `"name.path"[, type_id = N][, static_name = "PREFIX"][, user_subclass = "IDENT"][, user_layout]`
         let name: syn::LitStr = input.parse()?;
         let mut type_id: Option<syn::LitInt> = None;
         let mut static_name: Option<syn::LitStr> = None;
         let mut pytype_static: Option<syn::LitStr> = None;
+        let mut user_subclass: Option<syn::LitStr> = None;
+        let mut user_layout = false;
         let mut cpython_heaptype = false;
         let mut cpython_mutable = false;
         while !input.is_empty() {
@@ -1382,6 +1396,10 @@ impl syn::parse::Parse for PyreClassAttrs {
                     cpython_mutable = true;
                     continue;
                 }
+                "user_layout" => {
+                    user_layout = true;
+                    continue;
+                }
                 _ => {}
             }
             input.parse::<syn::Token![=]>()?;
@@ -1389,13 +1407,15 @@ impl syn::parse::Parse for PyreClassAttrs {
                 "type_id" => type_id = Some(input.parse()?),
                 "static_name" => static_name = Some(input.parse()?),
                 "pytype_static" => pytype_static = Some(input.parse()?),
+                "user_subclass" => user_subclass = Some(input.parse()?),
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "unknown `#[pyre_class]` key `{other}` — \
                              expected `type_id` / `static_name` / `pytype_static` / \
-                             `cpython_heaptype` / `cpython_mutable`",
+                             `user_subclass` / `user_layout` / `cpython_heaptype` / \
+                             `cpython_mutable`",
                         ),
                     ));
                 }
@@ -1406,6 +1426,8 @@ impl syn::parse::Parse for PyreClassAttrs {
             type_id,
             static_name,
             pytype_static,
+            user_subclass,
+            user_layout,
             cpython_heaptype,
             cpython_mutable,
         })
@@ -1421,7 +1443,7 @@ fn expand_pyre_class(
     let name_lit = attrs.name;
     let cpython_heaptype = attrs.cpython_heaptype;
     let cpython_immutabletype = !attrs.cpython_mutable;
-    let has_mapdict_mixin = {
+    let (has_map, has_storage) = {
         let Fields::Named(ref named) = st.fields else {
             return Err(syn::Error::new(
                 st.span(),
@@ -1436,8 +1458,22 @@ fn expand_pyre_class(
             .named
             .iter()
             .any(|f| f.ident.as_ref().is_some_and(|i| i == "storage"));
-        has_map && has_storage
+        (has_map, has_storage)
     };
+    let has_mapdict_mixin = has_map && has_storage;
+    let user_layout = attrs.user_layout;
+    if user_layout && attrs.user_subclass.is_some() {
+        return Err(syn::Error::new(
+            st.span(),
+            "`user_layout` cannot be combined with `user_subclass`",
+        ));
+    }
+    if user_layout && (has_map || has_storage) {
+        return Err(syn::Error::new(
+            st.span(),
+            "`user_layout` rejects a struct that already declares `map` or `storage`",
+        ));
+    }
 
     // Derive static names from the struct name.
     //   W_Random          -> RANDOM_TYPE, W_RANDOM_GC_TYPE_ID,
@@ -1460,6 +1496,31 @@ fn expand_pyre_class(
     let descriptor_static = format_ident!("W_{}_PYRE_CLASS_DESCRIPTOR", suffix);
     let descriptor_slice_elem = format_ident!("W_{}_PYRE_CLASS_DESCRIPTOR_SLICE", suffix);
     let descriptor_ctor_fn = format_ident!("__register_w_{}_pyre_class_descriptor", suffix);
+    let user_struct_name = format_ident!("{}User", st_name);
+    let user_pytype_static = {
+        let base = pytype_static.to_string();
+        let name = match base.strip_suffix("_TYPE") {
+            Some(stem) => format!("{stem}_USER_TYPE"),
+            None => format!("{base}_USER_TYPE"),
+        };
+        format_ident!("{name}")
+    };
+    let user_gc_type_id_cell = format_ident!("W_{}_USER_GC_TYPE_ID_CELL", suffix);
+    let user_descriptor_static = format_ident!("W_{}_USER_PYRE_CLASS_DESCRIPTOR", suffix);
+    let user_descriptor_slice_elem = format_ident!("W_{}_USER_PYRE_CLASS_DESCRIPTOR_SLICE", suffix);
+    let user_descriptor_ctor_fn =
+        format_ident!("__register_w_{}_user_pyre_class_descriptor", suffix);
+    // `user_layout` builds the `_getusercls` typeptr itself and feeds it
+    // through the same `from_obj` / `new_pytype_with_user_subclass` path as
+    // an explicit `user_subclass` ident.
+    let user_subclass = if user_layout {
+        Some(user_pytype_static.clone())
+    } else {
+        attrs
+            .user_subclass
+            .as_ref()
+            .map(|s| format_ident!("{}", s.value()))
+    };
 
     // When the user declared `type_id = N` we pre-initialize the cell
     // to `N` and additionally emit the legacy `pub const W_X_GC_TYPE_ID:
@@ -1468,10 +1529,47 @@ fn expand_pyre_class(
     // omitted `type_id`, the cell starts unassigned and the legacy
     // const is not emitted — callers must read the cell at runtime via
     // `<W_X as GcType>::type_id()` (which itself becomes `cell.get()`).
-    let pytype_ctor = if has_mapdict_mixin {
-        quote! { ::pyre_object::pyobject::new_pytype_with_mapdict_mixin }
+    // `user_subclass` names the `_getusercls` typeptr (`typedef.py`
+    // `_getusercls`); that wins over the mapdict-mixin constructor.
+    // A struct with `map` and `storage` records `map`'s byte offset on
+    // the typeptr (`MapdictStorageMixin`); `storage` is the next word.
+    let pytype_init = match &user_subclass {
+        Some(ident) => quote! {
+            ::pyre_object::pyobject::new_pytype_with_user_subclass(#name_lit, &#ident)
+        },
+        None if has_mapdict_mixin => quote! {
+            ::pyre_object::pyobject::new_pytype_with_mapdict_mixin(
+                #name_lit,
+                ::std::mem::offset_of!(#st_name, map),
+            )
+        },
+        None => quote! {
+            ::pyre_object::pyobject::new_pytype(#name_lit)
+        },
+    };
+    let mapdict_adjacency_assert = if has_mapdict_mixin {
+        quote! {
+            const _: () = {
+                assert!(
+                    ::std::mem::offset_of!(#st_name, storage)
+                        == ::std::mem::offset_of!(#st_name, map)
+                            + ::std::mem::size_of::<usize>()
+                );
+            };
+        }
     } else {
-        quote! { ::pyre_object::pyobject::new_pytype }
+        quote! {}
+    };
+    let from_obj_type_check = match &user_subclass {
+        Some(ident) => quote! {
+            unsafe {
+                ::pyre_object::py_type_check(obj, &#pytype_static)
+                    || ::pyre_object::py_type_check(obj, &#ident)
+            }
+        },
+        None => quote! {
+            unsafe { ::pyre_object::py_type_check(obj, &#pytype_static) }
+        },
     };
 
     let (cell_init, legacy_const) = match attrs.type_id.as_ref() {
@@ -1545,11 +1643,162 @@ fn expand_pyre_class(
             )
             .collect();
 
+    let payload_restores: Vec<proc_macro2::TokenStream> = ptr_field_idents
+        .iter()
+        .enumerate()
+        .map(|(i, ident)| {
+            let idx = i + 1usize;
+            quote! {
+                payload.#ident = ::pyre_object::gc_roots::shadow_stack_get(__base + #idx);
+            }
+        })
+        .collect();
+    let payload_binding = if ptr_field_idents.is_empty() {
+        quote! { payload }
+    } else {
+        quote! { mut payload }
+    };
+    let (user_layout_items, allocate_instance_fn) = if user_layout {
+        (
+            quote! {
+                /// `typedef.py` `_getusercls`: the base payload plus
+                /// `MapdictStorageMixin` (`map` followed by `storage`).
+                #[repr(C)]
+                pub struct #user_struct_name {
+                    pub base: #st_name,
+                    pub map: usize,
+                    pub storage: *mut ::pyre_object::object_array::ItemsBlock,
+                }
+
+                const _: () = {
+                    assert!(
+                        ::std::mem::offset_of!(#user_struct_name, storage)
+                            == ::std::mem::offset_of!(#user_struct_name, map)
+                                + ::std::mem::size_of::<usize>()
+                    );
+                };
+
+                #st_vis static #user_pytype_static: ::pyre_object::PyType =
+                    ::pyre_object::pyobject::new_user_pytype(
+                        #name_lit,
+                        &#pytype_static,
+                        ::std::mem::offset_of!(#user_struct_name, map),
+                    );
+
+                #st_vis static #user_gc_type_id_cell: ::pyre_object::lltype::TypeIdCell =
+                    ::pyre_object::lltype::TypeIdCell::auto();
+
+                impl ::pyre_object::lltype::GcType for #user_struct_name {
+                    #[inline]
+                    fn type_id() -> u32 {
+                        #user_gc_type_id_cell.get()
+                    }
+                    const SIZE: usize = ::std::mem::size_of::<#user_struct_name>();
+                }
+
+                #st_vis static #user_descriptor_static: ::pyre_object::lltype::PyreClassDescriptor =
+                    ::pyre_object::lltype::PyreClassDescriptor {
+                        pytype_ptr: &#user_pytype_static as *const ::pyre_object::PyType,
+                        gc_type_id: &#user_gc_type_id_cell,
+                        object_size: ::std::mem::size_of::<#user_struct_name>(),
+                        ptr_offsets: &#ptr_offsets_const,
+                        pyname: #name_lit,
+                        pytype_path: ::core::concat!(
+                            ::core::module_path!(),
+                            "::",
+                            ::core::stringify!(#user_pytype_static),
+                        ),
+                        struct_path: ::core::concat!(
+                            ::core::module_path!(),
+                            "::",
+                            ::core::stringify!(#user_struct_name),
+                        ),
+                        mapdict_user_layout: true,
+                    };
+
+                #[cfg(not(target_arch = "wasm32"))]
+                #[::linkme::distributed_slice(::pyre_object::lltype::PYRE_CLASS_DESCRIPTORS)]
+                static #user_descriptor_slice_elem: &'static ::pyre_object::lltype::PyreClassDescriptor =
+                    &#user_descriptor_static;
+
+                #[cfg(target_arch = "wasm32")]
+                #[::ctor::ctor(unsafe)]
+                fn #user_descriptor_ctor_fn() {
+                    ::pyre_object::lltype::register_class_descriptor(&#user_descriptor_static);
+                }
+            },
+            quote! {
+                /// `objspace.py` `allocate_instance`. An exact instance (null
+                /// `w_subtype`, or the builtin type object) is the base layout.
+                /// A user subclass is `typedef.py` `_getusercls`: `SUser` with
+                /// mapdict `map` / `storage`, `ob_type` the user typeptr, and
+                /// `w_class` equal to `w_subtype`. The finalizer enqueue runs
+                /// when that class has `__del__`.
+                #[allow(dead_code)]
+                pub fn allocate_instance(
+                    #payload_binding: Self,
+                    w_subtype: ::pyre_object::PyObjectRef,
+                ) -> ::pyre_object::PyObjectRef {
+                    if w_subtype.is_null()
+                        || ::std::ptr::eq(
+                            w_subtype,
+                            ::pyre_object::pyobject::get_instantiate(&#pytype_static),
+                        )
+                    {
+                        return Self::allocate_stable(payload);
+                    }
+                    let _roots = ::pyre_object::gc_roots::push_roots();
+                    let __refs = [w_subtype, #(payload.#ptr_field_idents),*];
+                    let __base = ::pyre_object::gc_roots::pin_roots(&__refs);
+                    let type_id = match <#user_struct_name as ::pyre_object::lltype::GcType>::type_id() {
+                        ::pyre_object::lltype::TypeIdCell::UNASSIGNED => 0,
+                        id => id,
+                    };
+                    let raw = ::pyre_object::gc_hook::try_gc_alloc_stable_raw(
+                        type_id,
+                        ::std::mem::size_of::<#user_struct_name>(),
+                    );
+                    let w_subtype = ::pyre_object::gc_roots::shadow_stack_get(__base);
+                    #(#payload_restores)*
+                    let user = #user_struct_name {
+                        base: Self {
+                            ob: ::pyre_object::PyObject {
+                                ob_type: &#user_pytype_static as *const ::pyre_object::PyType,
+                                w_class: w_subtype,
+                            },
+                            ..payload
+                        },
+                        map: 0,
+                        storage: ::std::ptr::null_mut(),
+                    };
+                    let obj = if raw.is_null() {
+                        ::pyre_object::lltype::malloc_typed(user)
+                            as ::pyre_object::PyObjectRef
+                    } else {
+                        unsafe {
+                            ::std::ptr::write(raw as *mut #user_struct_name, user);
+                            ::pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
+                            raw as ::pyre_object::PyObjectRef
+                        }
+                    };
+                    ::pyre_object::gc_hook::maybe_register_finalizer(obj);
+                    obj
+                }
+            },
+        )
+    } else {
+        (quote! {}, quote! {})
+    };
+
     Ok(quote! {
         #st
 
+        #mapdict_adjacency_assert
+
+        #user_layout_items
+
         #st_vis static #pytype_static: ::pyre_object::PyType =
-            #pytype_ctor(#name_lit);
+            #pytype_init;
 
         /// Runtime-resolved GC tid for this class.  Initialized either
         /// to the explicit `type_id = N` from the attribute (drift-
@@ -1592,6 +1841,7 @@ fn expand_pyre_class(
                     "::",
                     ::core::stringify!(#st_name),
                 ),
+                mapdict_user_layout: false,
             };
 
         /// Registration of this class's descriptor into the whole-program
@@ -1635,7 +1885,7 @@ fn expand_pyre_class(
             pub fn from_obj(obj: ::pyre_object::PyObjectRef)
                 -> ::std::option::Option<&'static mut Self>
             {
-                if unsafe { ::pyre_object::py_type_check(obj, &#pytype_static) } {
+                if #from_obj_type_check {
                     ::std::option::Option::Some(unsafe { &mut *(obj as *mut Self) })
                 } else {
                     ::std::option::Option::None
@@ -1686,6 +1936,8 @@ fn expand_pyre_class(
                 };
                 ::pyre_object::lltype::malloc_typed_stable(full) as ::pyre_object::PyObjectRef
             }
+
+            #allocate_instance_fn
         }
     })
 }

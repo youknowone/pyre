@@ -1,11 +1,21 @@
-# CPython-suite gap: no test stores __slots__ members on float/complex/str/bytearray subclasses under a hot loop.
+# CPython-suite gap: no test stores __slots__ members on float/complex/str/bytearray/list/set/frozenset/array/weakref subclasses under a hot loop.
 # parity-tests reason: this targets the typedef.py _getusercls mapdict storage behind slot members.
 
-"""`__slots__` members of float/complex/str/bytearray subclasses.
+"""`__slots__` members of float/complex/str/bytearray/list/set/frozenset/array/weakref subclasses.
 
 A slots-only subclass has no `__dict__`; a subclass that also asks for
 `__dict__` must still keep the slot value in the slot, not in the dict.
 """
+
+import array
+import weakref
+
+
+class _Referent:
+    pass
+
+
+_referent = _Referent()
 
 # int, tuple and bytes reject a nonempty __slots__.
 BASES = [
@@ -13,6 +23,11 @@ BASES = [
     (complex, (1 + 2j,)),
     (str, ("ab",)),
     (bytearray, (b"ab",)),
+    (list, ()),
+    (set, ()),
+    (frozenset, ()),
+    (array.array, ("i", [1, 2])),
+    (weakref.ref, (_referent,)),
 ]
 
 N = 2000
@@ -48,9 +63,36 @@ def check(base, args):
         assert "x" not in d.__dict__, (base, d.__dict__)
         assert d.__dict__ == {"y": i}, (base, d.__dict__)
         total += d.x + d.y
+
+        # Direct member descriptor, typedef.py Member.descr_member_set.
+        member = SlotsOnly.x
+        s2 = SlotsOnly(*args)
+        member.__set__(s2, i)
+        assert member.__get__(s2, SlotsOnly) == i
+        member.__delete__(s2)
+        try:
+            member.__get__(s2, SlotsOnly)
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError("deleted slot still readable via Member on %s" % base.__name__)
     assert total == 3 * N * (N - 1) // 2, (base, total)
+
+
+def check_weakref_only(base, args):
+    # typedef.py _getusercls mixes MapdictWeakrefSupport even when the
+    # subclass has no __dict__. Types whose typedef is already weakrefable
+    # reject a second __weakref__ slot.
+    try:
+        WeakOnly = type("W" + base.__name__, (base,), {"__slots__": ("__weakref__",)})
+    except TypeError:
+        return
+    x = WeakOnly(*args)
+    assert weakref.ref(x)() is x, base
+    assert not hasattr(x, "__dict__"), base
 
 
 for base, args in BASES:
     check(base, args)
+    check_weakref_only(base, args)
 print("OK")

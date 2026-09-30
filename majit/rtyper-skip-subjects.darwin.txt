@@ -5,6 +5,7 @@
 # corpus=fc443dd78349e2a3 platform=darwin
 direct-skip (never reaches unported_category)	pyre_interpreter::module::_random::<Impl>::new_instance
 two-phase-never-a-subject	argument::raise_type_error__spec_String_f3a4935218b38edd
+two-phase-never-a-subject	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
 two-phase-never-a-subject	error::PyError::oefmt_name_error_text__spec_String_0f8488b534c96dc1
 two-phase-never-a-subject	error::write_exception__spec_Global__4755b4afeb6210aa
@@ -63,6 +64,7 @@ two-phase-never-a-subject	pyre_interpreter::app_functional::is_published_sorted
 two-phase-never-a-subject	pyre_interpreter::argument::<Impl>::_combine_wrapped
 two-phase-never-a-subject	pyre_interpreter::argument::<Impl>::new
 two-phase-never-a-subject	pyre_interpreter::argument::<Impl>::positional_only
+two-phase-never-a-subject	pyre_interpreter::argument::check_not_duplicate_kwargs
 two-phase-never-a-subject	pyre_interpreter::argument::combine_starargs_wrapped
 two-phase-never-a-subject	pyre_interpreter::argument::combine_starstarargs_wrapped
 two-phase-never-a-subject	pyre_interpreter::argument::combine_starstarargs_wrapped::<Impl>::call
@@ -1719,6 +1721,8 @@ two-phase-never-a-subject	pyre_object::float_array::<Impl>::from_vec
 two-phase-never-a-subject	pyre_object::float_array::<Impl>::pop
 two-phase-never-a-subject	pyre_object::float_array::<Impl>::remove
 two-phase-never-a-subject	pyre_object::float_array::<Impl>::with_capacity
+two-phase-never-a-subject	pyre_object::functional::<Impl>::allocate_instance
+two-phase-never-a-subject	pyre_object::functional::<Impl>::type_id
 two-phase-never-a-subject	pyre_object::gc_hook::gc_identity_hash
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc
 two-phase-never-a-subject	pyre_object::gc_hook::try_gc_alloc_collecting_rooted

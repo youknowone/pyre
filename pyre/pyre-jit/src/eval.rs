@@ -586,7 +586,8 @@ unsafe fn type_object_destructor(obj_addr: usize) {
 /// # Safety
 ///
 /// `obj_addr` must be a live `W_Property` payload the collector is sweeping,
-/// and the collector must call this exactly once.
+/// and the collector must call this exactly once. `W_PropertyUser` is a
+/// `W_Property` prefix, so the same cast covers that layout.
 unsafe fn property_destructor(obj_addr: usize) {
     let p = obj_addr as *const pyre_object::descriptor::W_Property;
     unsafe { (*p).fget_watchers.reclaim() };
@@ -893,8 +894,16 @@ unsafe fn bytes_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
         let data_slot = std::ptr::addr_of_mut!(bytes.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
-    f(&mut bytes.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut bytes.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+}
+
+unsafe fn bytes_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { bytes_object_custom_trace(obj_addr, f) };
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
 }
 
 /// Custom trace for `W_BytearrayObject`. Same GC-managed leaf storage box as
@@ -906,9 +915,19 @@ unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
         let data_slot = std::ptr::addr_of_mut!(ba.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
-    f(&mut ba.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut ba.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut ba.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+}
+
+unsafe fn bytearray_user_object_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    unsafe { bytearray_object_custom_trace(obj_addr, f) };
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
 }
 
 /// `interp_array.py W_ArrayBase.__del__`: free the raw element buffer when
@@ -917,6 +936,52 @@ unsafe fn array_object_destructor(obj_addr: usize) {
     unsafe {
         pyre_object::interp_array::w_array_dealloc(obj_addr as pyre_object::PyObjectRef);
     }
+}
+
+/// `#[pyre_class(..., user_layout)]` user instance (`typedef.py`
+/// `_getusercls`). Fixed payload offsets are walked by the GC from
+/// `ptr_offsets`; this hook only forwards mapdict `storage`.
+unsafe fn pyre_class_user_layout_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
+/// `W_ArrayUser` (`typedef.py` `_getusercls`): the base array's inline edges
+/// plus mapdict `storage`.
+unsafe fn array_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    for offset in pyre_object::interp_array::W_ARRAY_GC_PTR_OFFSETS {
+        f((obj_addr + offset) as *mut majit_ir::GcRef);
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
+/// `W_WeakrefUser` (`typedef.py` `_getusercls`): the base weakref's inline
+/// edges plus mapdict `storage`.
+unsafe fn weakref_user_object_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    for offset in pyre_object::weakref::W_WEAKREF_LAYOUT_GC_PTR_OFFSETS {
+        f((obj_addr + offset) as *mut majit_ir::GcRef);
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
 }
 
 unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
@@ -1029,6 +1094,16 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     }
 }
 
+unsafe fn set_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { set_object_custom_trace(obj_addr, f) };
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
 /// Custom trace for `W_TupleObject`. `wrappeditems` points at an off-GC
 /// `std::alloc`'d `ItemsBlock` (`tupleobject.rs`'s `W_TupleObject`), so the
 /// element slots are unreachable through inline `gc_ptr_offsets` — the
@@ -1041,7 +1116,6 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
     let tuple_ptr = obj_addr as *mut pyre_object::tupleobject::W_TupleObject;
     let tuple = unsafe { &mut *tuple_ptr };
     f(&mut tuple.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut tuple.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     let block = tuple.wrappeditems;
     if block.is_null() {
         return;
@@ -1083,7 +1157,6 @@ unsafe fn unicode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     {
         f(std::ptr::addr_of_mut!(unicode.value) as *mut majit_ir::GcRef);
     }
-    f(&mut unicode.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !unicode.index_storage.is_null()
         && pyre_object::gc_hook::try_gc_owns_object(unicode.index_storage as *mut u8)
     {
@@ -1121,7 +1194,6 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let list_ptr = obj_addr as *mut pyre_object::listobject::W_ListObject;
     let list = unsafe { &mut *list_ptr };
     f(&mut list.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut list.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if matches!(
         list.strategy,
         pyre_object::listobject::ListStrategy::Size
@@ -1208,6 +1280,16 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
             }
         }
     }
+}
+
+unsafe fn list_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { list_object_custom_trace(obj_addr, f) };
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
 }
 
 /// Custom trace for `W_MemoryView`.  Its geometry and backing live in an
@@ -1932,11 +2014,29 @@ fn build_gc() -> Box<MiniMarkGC> {
          descr: &'static pyre_object::lltype::PyreClassDescriptor,
          memory_pressure_offset: Option<usize>|
          -> u32 {
-            let mut type_info = TypeInfo::object_subclass_with_gc_ptrs(
-                descr.object_size,
-                object_tid,
-                descr.ptr_offsets.to_vec(),
-            );
+            let parent_tid = if descr.mapdict_user_layout {
+                let base = unsafe { pyre_object::layout_base(descr.pytype_ptr) };
+                pytype_to_tid
+                    .get(&(base as usize))
+                    .copied()
+                    .unwrap_or(object_tid)
+            } else {
+                object_tid
+            };
+            let mut type_info = if descr.mapdict_user_layout {
+                TypeInfo::object_subclass_with_gc_ptrs_and_custom_trace(
+                    descr.object_size,
+                    parent_tid,
+                    descr.ptr_offsets.to_vec(),
+                    pyre_class_user_layout_custom_trace,
+                )
+            } else {
+                TypeInfo::object_subclass_with_gc_ptrs(
+                    descr.object_size,
+                    parent_tid,
+                    descr.ptr_offsets.to_vec(),
+                )
+            };
             if let Some(offset) = memory_pressure_offset {
                 type_info = type_info.with_memory_pressure_offset(offset);
             }
@@ -3299,11 +3399,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_object::interp_itertools::W_Cycle
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // W_Array (`array.array`) — typed payload via `#[pyre_class]`
-    // in AUTO-ID mode. Its elements are unboxed scalars in a raw
-    // `*mut Vec<u8>` buffer, released by W_ArrayBase.__del__; the descriptor
-    // traces the object-resident mapdict, weakref, and indexed-slot fields.
-    // Tail of the tid chain.
+    // W_Array (`array.array`) — typed payload in AUTO-ID mode. Its elements
+    // are unboxed scalars in a raw `*mut Vec<u8>` buffer, released by
+    // W_ArrayBase.__del__; the descriptor traces the header `w_class` and
+    // the base weakref lifeline. Subclass `__dict__` / `__slots__` are the
+    // user tid's mapdict storage. Tail of the tid chain.
     {
         let array_descr = <pyre_object::interp_array::W_Array
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
@@ -3972,8 +4072,183 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::pyobject::COMPLEX_USER_TYPE as *const _ as usize,
         complex_user_tid,
     );
+    let bytes_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::bytesobject::W_BYTES_USER_OBJECT_SIZE,
+        w_bytes_tid,
+        bytes_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        bytes_user_tid,
+        pyre_object::bytesobject::W_BYTES_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::bytesobject::BYTES_USER_TYPE as *const _ as usize,
+        bytes_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::bytesobject::BYTES_USER_TYPE as *const _ as usize,
+        bytes_user_tid,
+    );
+    let bytearray_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::bytearrayobject::W_BYTEARRAY_USER_OBJECT_SIZE,
+        w_bytearray_tid,
+        bytearray_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        bytearray_user_tid,
+        pyre_object::bytearrayobject::W_BYTEARRAY_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::bytearrayobject::BYTEARRAY_USER_TYPE as *const _ as usize,
+        bytearray_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::bytearrayobject::BYTEARRAY_USER_TYPE as *const _ as usize,
+        bytearray_user_tid,
+    );
+    let list_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::listobject::W_LIST_USER_OBJECT_SIZE,
+        w_list_tid,
+        list_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        list_user_tid,
+        pyre_object::listobject::W_LIST_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::LIST_USER_TYPE as *const _ as usize,
+        list_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::LIST_USER_TYPE as *const _ as usize,
+        list_user_tid,
+    );
+    // `W_SetObjectUser` (`typedef.py` `_getusercls`). `set` and `frozenset`
+    // subclass instances share this tid, a subclass-range child of the set
+    // tid, traced as a set plus its mapdict storage.
+    let set_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::setobject::W_SET_USER_OBJECT_SIZE,
+        w_set_tid,
+        set_user_object_custom_trace,
+    ));
+    debug_assert_eq!(set_user_tid, pyre_object::setobject::W_SET_USER_GC_TYPE_ID);
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::setobject::SET_USER_TYPE as *const _ as usize,
+        set_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::setobject::SET_USER_TYPE as *const _ as usize,
+        set_user_tid,
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::setobject::FROZENSET_USER_TYPE as *const _ as usize,
+        set_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::setobject::FROZENSET_USER_TYPE as *const _ as usize,
+        set_user_tid,
+    );
+    // `W_ArrayUser` (`typedef.py` `_getusercls`). Subclass instances are a
+    // subclass-range child of the array tid, traced as an array plus its
+    // mapdict storage. The raw element buffer is released by the same
+    // `W_ArrayBase.__del__` destructor as the base tid.
+    let array_tid = <pyre_object::interp_array::W_Array as pyre_object::lltype::GcType>::type_id();
+    debug_assert_eq!(array_tid, 94);
+    let array_user_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            pyre_object::interp_array::W_ARRAY_USER_OBJECT_SIZE,
+            array_tid,
+            array_user_object_custom_trace,
+        )
+        .with_destructor_fn(array_object_destructor),
+    );
+    debug_assert_eq!(
+        array_user_tid,
+        pyre_object::interp_array::W_ARRAY_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::interp_array::ARRAY_USER_TYPE as *const _ as usize,
+        array_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::interp_array::ARRAY_USER_TYPE as *const _ as usize,
+        array_user_tid,
+    );
+    // `W_WeakrefUser` (`typedef.py` `_getusercls`). Subclass instances are
+    // traced as a weakref plus its mapdict storage. `W_Weakref`'s own GC
+    // class is the tail `with_gc_ptrs` layout, registered after the module
+    // classes, so it is not an rclass and cannot parent a tid in this block.
+    // The user layout is an rclass child of object; the trace still walks
+    // `W_WEAKREF_LAYOUT_GC_PTR_OFFSETS`.
+    debug_assert_eq!(object_tid, 0);
+    let weakref_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::weakref::W_WEAKREF_USER_OBJECT_SIZE,
+        object_tid,
+        weakref_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        weakref_user_tid,
+        pyre_object::weakref::W_WEAKREF_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE as *const _ as usize,
+        weakref_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE as *const _ as usize,
+        weakref_user_tid,
+    );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 163),
+    // `#[pyre_class(..., user_layout)]` (`typedef.py` `_getusercls`).
+    // Each is an rclass child of its builtin layout. Fixed payload offsets
+    // stay on the descriptor; the custom trace walks mapdict storage only.
+    debug_assert_eq!(gc.types.len(), 169);
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::functional::W_ENUMERATE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::functional::W_MAP_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::functional::W_FILTER_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::functional::W_ZIP_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::functional::W_REVERSED_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::descriptor::W_SUPER_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    let property_user_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::descriptor::W_PROPERTY_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    gc.types
+        .set_destructor(property_user_tid, property_destructor);
+
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 176),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,
@@ -4202,9 +4477,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `interp__weakref.py W_Weakref` exact builtin payload. Like the
     // lifeline above, its allocation is selected by its translated GC layout;
     // Python class identity remains in the header's `w_class`. Append it after
-    // the lifeline so the already-published lifeline tid stays stable. Every
-    // `weakref.ref` subclass instance carries this same payload, so its
-    // `w_slots` tail is traced here too.
+    // the lifeline so the already-published lifeline tid stays stable.
+    // Subclass `__dict__` / `__slots__` are `W_WeakrefUser`'s mapdict storage
+    // (tid 177), not a tail on this payload.
     let weakref_descr =
         <pyre_object::weakref::W_Weakref as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
     let weakref_object_tid = gc.register_type(TypeInfo::with_gc_ptrs(

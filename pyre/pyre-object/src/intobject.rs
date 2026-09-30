@@ -27,6 +27,13 @@ pub struct W_IntObjectUser {
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_IntObjectUser, storage)
+            == std::mem::offset_of!(W_IntObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
 /// Field offset of `intval` within `W_IntObject`, for JIT field access.
 pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
 
@@ -38,7 +45,7 @@ pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
 /// type at collection time.
 pub const W_INT_GC_TYPE_ID: u32 = 1;
 /// User-subclass int layout (`typedef.py` `_getusercls`). Unconditional,
-/// so its tid sits with the other closed ids (166) ahead of the
+/// so its tid sits with the other closed ids (158) ahead of the
 /// target-gated tail.
 pub const W_INT_USER_GC_TYPE_ID: u32 = 158;
 pub const W_INT_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_IntObjectUser>();
@@ -447,13 +454,12 @@ mod tests {
 
         assert_eq!(std::mem::size_of::<W_IntObject>(), 24);
         assert_eq!(std::mem::size_of::<W_BoolObject>(), 24);
-        assert_eq!(std::mem::size_of::<W_UnicodeObject>(), 64);
-        assert_eq!(std::mem::size_of::<W_TupleObject>(), 40);
+        assert_eq!(std::mem::size_of::<W_UnicodeObject>(), 56);
+        assert_eq!(std::mem::size_of::<W_TupleObject>(), 32);
         assert_eq!(INT_INTVAL_OFFSET, 16);
         assert_eq!(UNICODE_VALUE_OFFSET, 16);
         assert_eq!(std::mem::offset_of!(W_TupleObject, hash), 16);
         assert_eq!(std::mem::offset_of!(W_TupleObject, wrappeditems), 24);
-        assert_eq!(std::mem::offset_of!(W_TupleObject, w_dict), 32);
     }
 
     #[test]

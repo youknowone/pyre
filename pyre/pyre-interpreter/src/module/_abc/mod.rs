@@ -282,10 +282,10 @@ fn simple_weak_set_contains(
     let cache_slot = roots.publish(&[cache]);
     let item_slot = roots.publish(&[item]);
     let data = pyre_interpreter::baseobjspace::getattr_str(roots.get(cache_slot), "data")?;
-    // Exactly a `set`, not merely one by layout: a subclass keeps the base
-    // layout in `ob_type` and retags `w_class`, and `contains` dispatches such
-    // a subclass's `__contains__` override through `subclass_special_override`.
-    // Reading the table directly would answer past the override.
+    // Exactly a `set`. A subclass carries `SET_USER_TYPE` (`typedef.py`
+    // `_getusercls`) and `contains` dispatches its `__contains__` override
+    // through `subclass_special_override`. Reading the table directly would
+    // answer past the override.
     if !unsafe { pyre_object::is_exact_type(data, &pyre_object::setobject::SET_TYPE) } {
         return Ok(None);
     }

@@ -249,12 +249,24 @@ pub struct W_ListObject {
     pub float_items: FloatArray,
     pub bytes_items: BytesArray,
     pub ascii_items: UnicodeArray,
-    /// PyPy `BaseUserClassMapdict` indexed instance storage for a native
-    /// `list` subclass declaring `__slots__`.  Kept on the object itself,
-    /// just like `W_UnicodeObject.w_slots`; `PY_NULL` means that no slot has
-    /// been assigned yet.
-    pub w_slots: PyObjectRef,
 }
+
+/// The translated user-subclass layout selected by `typedef.py _getusercls`.
+/// `W_ListObject` remains the base payload; `MapdictStorageMixin`
+/// contributes its fields only to the generated user class.
+#[repr(C)]
+pub struct W_ListObjectUser {
+    pub base: W_ListObject,
+    pub map: usize,
+    pub storage: *mut ItemsBlock,
+}
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_ListObjectUser, storage)
+            == std::mem::offset_of!(W_ListObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
 
 /// GC type id assigned to `W_ListObject` at `JitDriver` init time.
 /// Held as a constant here (rather than runtime-queried) so
@@ -265,6 +277,19 @@ pub struct W_ListObject {
 /// call sites.
 pub const W_LIST_GC_TYPE_ID: u32 = 7;
 pub const W_LIST_OBJECT_SIZE: usize = std::mem::size_of::<W_ListObject>();
+/// User-subclass list layout (`typedef.py` `_getusercls`). Unconditional,
+/// so its tid sits with the other closed ids (165) ahead of the
+/// target-gated tail.
+pub const W_LIST_USER_GC_TYPE_ID: u32 = 165;
+pub const W_LIST_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_ListObjectUser>();
+
+impl crate::lltype::GcType for W_ListObjectUser {
+    #[inline(always)]
+    fn type_id() -> u32 {
+        W_LIST_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_LIST_USER_OBJECT_SIZE;
+}
 
 /// Allocate the translated `SizeListStrategy` instance payload.  The object
 /// space reference is process-global in pyre, leaving its sole per-instance
@@ -1817,19 +1842,63 @@ pub fn w_list_allocate_instance(w_listtype: PyObjectRef) -> PyObjectRef {
     // shadow stack and be re-read afterwards.
     let _roots = crate::gc_roots::push_roots();
     let type_slot = crate::gc_roots::pin_roots(&[w_listtype]);
-    let obj = w_list_new_with_strategy(Vec::new(), ListStrategy::Empty);
+    let list_class = get_instantiate(&LIST_TYPE);
     let w_listtype = crate::gc_roots::shadow_stack_get(type_slot);
-    if !w_listtype.is_null() {
-        let list_class = get_instantiate(&LIST_TYPE);
-        if w_listtype != list_class {
-            unsafe {
-                crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-                (*obj).w_class = w_listtype;
-            }
-            crate::gc_hook::maybe_register_finalizer(obj);
+    if !w_listtype.is_null() && w_listtype != list_class {
+        let obj = w_list_user_new_empty(w_listtype);
+        crate::gc_hook::maybe_register_finalizer(obj);
+        return obj;
+    }
+    w_list_new_with_strategy(Vec::new(), ListStrategy::Empty)
+}
+
+/// `allocate_instance(W_ListObjectUser, w_listtype)`: empty strategy, with
+/// `map`/`storage` at the `MapdictStorageMixin` initial state.
+pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
+    let mut allocation_root: *mut u8 = std::ptr::null_mut();
+    let mut needs_write_barrier = true;
+    let raw = unsafe {
+        crate::gc_hook::try_gc_alloc_collecting_rooted(
+            W_LIST_USER_GC_TYPE_ID,
+            W_LIST_USER_OBJECT_SIZE,
+            &mut allocation_root,
+            &mut needs_write_barrier,
+        )
+    };
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
+        .allocated_or_abort(W_LIST_USER_OBJECT_SIZE)
+        .unwrap_or(std::ptr::null_mut());
+    let body = W_ListObjectUser {
+        base: W_ListObject {
+            ob_header: PyObject {
+                ob_type: &LIST_USER_TYPE as *const PyType,
+                w_class: crate::gc_roots::shadow_stack_get(class_slot),
+            },
+            allocated: 0,
+            length: list_length_cell(0),
+            items: std::ptr::null_mut(),
+            strategy: ListStrategy::Empty,
+            int_items: IntArray::empty(),
+            float_items: FloatArray::empty(),
+            bytes_items: BytesArray::empty(),
+            ascii_items: UnicodeArray::empty(),
+        },
+        map: 0,
+        storage: std::ptr::null_mut(),
+    };
+    if raw.is_null() {
+        return crate::lltype::malloc_typed(body) as PyObjectRef;
+    }
+    unsafe {
+        std::ptr::write(raw as *mut W_ListObjectUser, body);
+        if needs_write_barrier {
+            crate::gc_hook::try_gc_write_barrier_managed(raw);
         }
     }
-    obj
+    raw as PyObjectRef
 }
 
 /// `rpython.rlib.objectmodel.newlist_hint` for interpreter-level temporary
@@ -2202,7 +2271,6 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
             float_items,
             bytes_items,
             ascii_items,
-            w_slots: PY_NULL,
         });
         return Box::into_raw(boxed) as PyObjectRef;
     }
@@ -2219,7 +2287,6 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
                 float_items,
                 bytes_items,
                 ascii_items,
-                w_slots: PY_NULL,
             },
         );
     }
@@ -2356,7 +2423,6 @@ unsafe fn w_list_from_storage_and_strategy(
             float_items,
             bytes_items,
             ascii_items,
-            w_slots: PY_NULL,
         })) as PyObjectRef
     } else {
         std::ptr::write(
@@ -2371,7 +2437,6 @@ unsafe fn w_list_from_storage_and_strategy(
                 float_items,
                 bytes_items,
                 ascii_items,
-                w_slots: PY_NULL,
             },
         );
         raw as PyObjectRef
@@ -2482,68 +2547,6 @@ pub unsafe fn w_list_getslice(
             )
         }
     }
-}
-
-/// Read one app-level `__slots__` entry from a `list` subclass.
-///
-/// PyPy's `BaseUserClassMapdict.getslotvalue` indexes the instance-owned
-/// storage list by `Member.index`. `PY_NULL` is the unbound-slot sentinel.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_list_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    let slots = unsafe { (*(obj as *const W_ListObject)).w_slots };
-    if slots.is_null() {
-        return None;
-    }
-    unsafe { w_list_getitem(slots, index as i64) }.filter(|value| !value.is_null())
-}
-
-/// Write one app-level `__slots__` entry on a `list` subclass.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_list_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    let _roots = crate::gc_roots::push_roots();
-    let _ = crate::gc_roots::pin_root(obj);
-    let _ = crate::gc_roots::pin_root(value);
-    let obj_slot = crate::gc_roots::shadow_stack_len() - 2;
-    let value_slot = crate::gc_roots::shadow_stack_len() - 1;
-
-    let mut rooted_obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let mut slots = unsafe { (*(rooted_obj as *const W_ListObject)).w_slots };
-    if slots.is_null() {
-        slots = w_list_new(vec![PY_NULL; index + 1]);
-        rooted_obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        unsafe { (*(rooted_obj as *mut W_ListObject)).w_slots = slots };
-        crate::gc_hook::try_gc_write_barrier(rooted_obj as *mut u8);
-    }
-    let _ = crate::gc_roots::pin_root(slots);
-    let slots_slot = crate::gc_roots::shadow_stack_len() - 1;
-    while unsafe { w_list_len(crate::gc_roots::shadow_stack_get(slots_slot)) } <= index {
-        unsafe { w_list_append(crate::gc_roots::shadow_stack_get(slots_slot), PY_NULL) };
-    }
-    unsafe {
-        w_list_setitem(
-            crate::gc_roots::shadow_stack_get(slots_slot),
-            index as i64,
-            crate::gc_roots::shadow_stack_get(value_slot),
-        );
-    }
-}
-
-/// Clear one app-level `__slots__` entry on a `list` subclass.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_list_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    let slots = unsafe { (*(obj as *const W_ListObject)).w_slots };
-    if slots.is_null()
-        || unsafe { w_list_getitem(slots, index as i64) }.is_none_or(|value| value.is_null())
-    {
-        return false;
-    }
-    unsafe { w_list_setitem(slots, index as i64, PY_NULL) }
 }
 
 // Integer-strategy low-level access primitives, mirroring the rlist.py
@@ -5794,6 +5797,33 @@ pub extern "C" fn jit_list_reverse(list: PyObjectRef) -> i64 {
 mod tests {
     use super::*;
     use crate::intobject::w_int_new;
+
+    /// `typedef.py _getusercls(W_ListObject)`: a subclass instance is
+    /// `W_ListObjectUser` carrying `LIST_USER_TYPE`.
+    #[test]
+    fn list_subclass_instance_carries_user_typeptr() {
+        assert_eq!(
+            W_LIST_OBJECT_SIZE,
+            std::mem::offset_of!(W_ListObject, ascii_items) + std::mem::size_of::<UnicodeArray>()
+        );
+        assert_eq!(
+            W_LIST_USER_OBJECT_SIZE,
+            W_LIST_OBJECT_SIZE
+                + std::mem::size_of::<usize>()
+                + std::mem::size_of::<*mut ItemsBlock>()
+        );
+        let obj = w_list_allocate_instance(get_instantiate(&LIST_TYPE));
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &LIST_TYPE));
+        }
+        let obj = w_list_user_new_empty(get_instantiate(&LIST_TYPE));
+        unsafe {
+            assert!(std::ptr::eq((*obj).ob_type, &LIST_USER_TYPE));
+            assert!(crate::pyobject::is_list(obj));
+            assert!(!crate::pyobject::is_exact_type(obj, &LIST_TYPE));
+            assert_eq!(w_list_len(obj), 0);
+        }
+    }
 
     #[test]
     fn list_lock_handle_releases_one_recursive_level() {

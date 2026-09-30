@@ -4402,19 +4402,12 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
 /// all -- which is also what lets the allocation die, since a virtual whose
 /// every read is answered has nothing left to materialise for.
 ///
-/// `GuardClass(su, SUPER_TYPE)` is what stands in for the `global_super` pin
-/// the opcode form carries: only `w_super_new` builds one of these, so a
-/// receiver that passes the guard came from `super()` whatever the global
-/// named at the time.
-///
-/// It does not stand in for the Python class, though.  `super_descr_new`
-/// allocates a subclass instance through `w_super_new` too and then retags only
-/// `w_class`, so `class MySuper(super)` shares the `ob_type` this guard reads
-/// and would reuse the trace.  Its `__getattribute__` override owns the answer,
-/// and this body does not run it, so the operand is pinned on the `w_class`
-/// axis as well -- the same split `walker_exact_builtin_class` handles for the
-/// numeric folds.  A proxy this walk emitted is virtual and carries the
-/// canonical class by construction, so the pin costs it nothing.
+/// `GuardClass(su, SUPER_TYPE)` matches the exact builtin layout.
+/// `allocate_instance` stamps `SUPER_USER_TYPE` on a subclass
+/// (`typedef.py` `_getusercls`), so the guard already excludes it. The
+/// `w_class` pin stays because `walker_exact_builtin_class` records the
+/// canonical Python class, and a walker-emitted proxy is virtual and
+/// already carries it.
 pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -4859,7 +4852,12 @@ fn walker_emit_super_proxy_storage<Sym: WalkSym>(
         .class_now_known(proxy_op, super_type_addr);
     // The concrete proxy the walker's own execution must observe.  Built last:
     // it allocates, and every address baked above is read before it runs.
-    let proxy = pyre_object::descriptor::w_super_new(concrete_cls, objtype, concrete_obj);
+    let proxy = pyre_object::descriptor::w_super_new(
+        concrete_cls,
+        objtype,
+        concrete_obj,
+        pyre_object::PY_NULL,
+    );
     ctx.trace_ctx.set_opref_concrete(
         proxy_op,
         majit_ir::Value::Ref(majit_ir::GcRef(proxy as usize)),
@@ -15427,13 +15425,12 @@ fn pin_int_guard_value<Sym: WalkSym>(
 /// `W_IntObject`, so it takes the helper rather than the intval guard.  A
 /// concrete miss stays the MayForce substitution below.
 ///
-/// Recognition declines before emitting IR, and what it admits is deliberately
-/// the builtin's own predicate: `require_set_receiver` is `is_set`, an
-/// `ob_type == &SET_TYPE` layout test, so a `set` subclass that inherits `add`
-/// passes both it and the class guard below and is substituted — the builtin
-/// would have run this identical body.  A subclass that OVERRIDES `add` is
-/// excluded instead by the `GuardValue` pinning the bound function, and a
-/// frozenset receiver by the layout guard, which matters because
+/// Recognition declines before emitting IR. It admits an exact `set`
+/// (`ob_type == &SET_TYPE`). A subclass instance carries `SET_USER_TYPE`
+/// (`typedef.py` `_getusercls`) and does not match the `GuardClass` below.
+/// A subclass that overrides `add` is excluded by the `GuardValue` pinning
+/// the bound function, and a frozenset receiver by the layout guard, which
+/// matters because
 /// [`pyre_interpreter::opcode_ops::set_add_value`] itself accepts
 /// `is_set_or_frozenset` and would mutate one.  Anything else falls through to
 /// the generic residual, which still runs the builtin's receiver and arity
@@ -15458,18 +15455,20 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // Recognition: the callable must be the bound builtin `set.add`, over the
-    // receiver `require_set_receiver` accepts.  `is_set` is that predicate
-    // verbatim, and the class guard below is emitted in the same spelling, so
-    // recognition and guard admit the same set of receivers.  It excludes a
-    // frozenset, which `set_add_value` would otherwise mutate.
+    // Recognition: the callable must be the bound builtin `set.add`, over an
+    // exact `set`. `py_type_check(..., &SET_TYPE)` is the layout the
+    // `GuardClass` below pins, so a `SET_USER_TYPE` receiver is not
+    // substituted. It excludes a frozenset, which `set_add_value` would
+    // otherwise mutate.
     let (inner_func, inner_self) = unsafe {
         if !pyre_object::function::is_method(callable) {
             return Ok(None);
         }
         let inner_func = pyre_object::function::w_method_get_func(callable);
         let inner_self = pyre_object::function::w_method_get_self(callable);
-        if inner_func.is_null() || !pyre_object::setobject::is_set(inner_self) {
+        if inner_func.is_null()
+            || !pyre_object::py_type_check(inner_self, &pyre_object::setobject::SET_TYPE)
+        {
             return Ok(None);
         }
         let set_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);

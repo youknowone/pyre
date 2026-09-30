@@ -890,8 +890,8 @@ assert result == 300, result
 /// `blobs` (bytes reachable only through a list), `ba` (a live bytearray grown
 /// after the collections), and `pieces` (bytearray fragments held only through a
 /// list) must all survive the 100 collections. `slot_ba.x` additionally lives
-/// only in the `BaseUserClassMapdict`-shaped `w_slots` list traced by
-/// `bytearray_object_custom_trace`; its ordinary `z` attribute must remain in
+/// only in the `W_BytearrayObjectUser` mapdict storage traced by
+/// `bytearray_user_object_custom_trace`; its ordinary `z` attribute must remain in
 /// the separate instance dict. Each round allocates fresh dead bytes/bytearray
 /// garbage. The returned checksum is reachable only if every live edge and
 /// buffer survived intact.
