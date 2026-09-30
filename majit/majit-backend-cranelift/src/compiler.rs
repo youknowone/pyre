@@ -8475,10 +8475,24 @@ fn opcode_is_vector(opcode: OpCode) -> bool {
         )
 }
 
+/// Guards whose failure stub consumes a pending exception.
+///
+/// `assembler.py patch_jump_for_descr` rewrites every guard branch,
+/// `guard_no_exception` included. That guard loads the exc-value global,
+/// and a merged failure edge is the same parameter-less jump as any other
+/// guard; the guard's own miss still stages through `emit_guard_exit`.
+/// `guard_exception` and `guard_not_forced` consume the pending exception
+/// inside the exit stub, which that jump does not replay.
+fn merge_excluded_guard(opcode: OpCode) -> bool {
+    matches!(
+        opcode,
+        OpCode::GuardException | OpCode::GuardNotForced | OpCode::GuardNotForced2
+    )
+}
+
 fn opcode_excluded_from_merge(opcode: OpCode) -> bool {
     opcode_is_vector(opcode)
-        || guard_must_save_exception(opcode)
-        || matches!(opcode, OpCode::GuardNotForced2)
+        || merge_excluded_guard(opcode)
         || opcode.is_call_may_force()
         || opcode.is_call_assembler()
         || opcode.is_call_release_gil()
@@ -8490,14 +8504,13 @@ fn opcode_excluded_from_merge(opcode: OpCode) -> bool {
 /// Exclusions, any one of which keeps today's separate functions:
 /// - `constants_nonempty`: the codegen pool `CraneliftBackend::constants`
 ///   (`set_constants` / `set_constants_pool`) held a value for this compile
-/// - `GUARD_NOT_FORCED` / `GUARD_NOT_FORCED_2`
+/// - `GUARD_EXCEPTION` / `GUARD_NOT_FORCED` / `GUARD_NOT_FORCED_2`
+///   (`merge_excluded_guard`). `GUARD_NO_EXCEPTION` stays eligible.
 /// - any `CALL_MAY_FORCE_*` (`OpCode::is_call_may_force`),
 ///   `CALL_ASSEMBLER_*` (`OpCode::is_call_assembler`),
 ///   `CALL_RELEASE_GIL_*` (`OpCode::is_call_release_gil`)
 /// - any vector opcode (`opcode_is_vector`: `is_vec_producing_opcode` and
 ///   the other `Vec*` opcodes the emitter matches)
-/// - a guard whose `must_save_exception` is true (`guard_must_save_exception`,
-///   the predicate `collect_guards` stores and `emit_guard_exit` branches on)
 fn merge_source_eligible(constants_nonempty: bool, ops: &[OpRc]) -> bool {
     if constants_nonempty {
         return false;
@@ -8751,6 +8764,13 @@ fn member_input_map(entry_args: &[OpRef], next_raw: &mut u32) -> Vec<(OpRef, OpR
         .collect()
 }
 
+/// `rewrite.rewrite` drops `DEBUG_MERGE_POINT` before `emit_op`, and
+/// `emit_op` keeps a `JIT_DEBUG` ConstPtr inline. Neither address is entered
+/// in the gc table.
+fn constptr_stays_inline(opcode: OpCode) -> bool {
+    matches!(opcode, OpCode::DebugMergePoint | OpCode::JitDebug)
+}
+
 /// Re-read every non-null reference constant of `ops` from `table`, the
 /// `GcTable` the compile of these ops filled: `remove_constptr` and the
 /// fail-arg `_gcref_index` put each such constant there, keyed by the address
@@ -8772,6 +8792,9 @@ fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> 
         )))
     };
     for op in ops {
+        if constptr_stays_inline(op.opcode) {
+            continue;
+        }
         for i in 0..op.num_args() {
             let fresh = refresh(&op.arg(i))?;
             op.args_slice_mut()[i] = fresh;
@@ -8793,8 +8816,9 @@ fn guard_shape_refuses_merge(op: &Op) -> bool {
     }
     // A non-identity `rd_locs` is the normal layout `apply_resident_failarg_locs`
     // publishes. The merged exit honours that table; it does not refuse it.
-    guard_must_save_exception(op.opcode)
-        || matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2)
+    // `guard_no_exception` is eligible: `patch_jump_for_descr` rewrites it,
+    // and its miss still stages through `emit_guard_exit`.
+    merge_excluded_guard(op.opcode)
 }
 
 /// The rewritten op index of each segment's source guard, aligned with
@@ -25443,7 +25467,7 @@ mod tests {
     }
 
     #[test]
-    fn must_save_exception_guard_skips_merged_entry() {
+    fn guard_no_exception_bridge_merges_into_the_loop() {
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(16);
         let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
@@ -25496,7 +25520,11 @@ mod tests {
             .unwrap()
             .entry_code_ptr
             .load(Ordering::Acquire);
+        // `guard_no_exception` in the bridge used to refuse the splice
+        // (`merge_excluded_guard`). The miss still stages through
+        // `emit_guard_exit`; the hit is `patch_jump_for_descr`'s local jump.
         let bridge_ops = vec![
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
                 &[OpRef::input_arg_int(0), OpRef::const_int(10)],
@@ -25522,7 +25550,7 @@ mod tests {
             .unwrap()
             .entry_code_ptr
             .load(Ordering::Acquire);
-        assert_eq!(entry_before, entry_after);
+        assert_ne!(entry_before, entry_after);
         assert!(fail_descr_bridge_ref(as_fd(&odd_descr)).is_some());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert!(Arc::ptr_eq(
@@ -25530,6 +25558,53 @@ mod tests {
             &exit_descr
         ));
         assert_eq!(backend.get_int_value(&frame, 0), 108);
+    }
+
+    #[test]
+    fn guard_exception_still_refuses_merge() {
+        let noexc = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
+        assert!(!guard_shape_refuses_merge(&noexc));
+        assert!(merge_source_eligible(false, &[noexc]));
+
+        let exc = mk_op(
+            OpCode::GuardException,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        assert!(guard_shape_refuses_merge(&exc));
+        assert!(!merge_source_eligible(false, &[exc]));
+
+        let forced = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        assert!(guard_shape_refuses_merge(&forced));
+        assert!(!merge_source_eligible(false, &[forced]));
+    }
+
+    #[test]
+    fn debug_merge_point_constptr_does_not_refuse_refresh() {
+        let ptr = majit_ir::GcRef(0x3e5d_f0dc);
+        let dbg = Op::new(
+            OpCode::DebugMergePoint,
+            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                ptr,
+            ))],
+        );
+        assert!(refresh_retained_constptrs(std::slice::from_ref(&dbg), None).is_some());
+
+        let jit_debug = Op::new(
+            OpCode::JitDebug,
+            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                ptr,
+            ))],
+        );
+        assert!(refresh_retained_constptrs(std::slice::from_ref(&jit_debug), None).is_some());
+
+        let used = Op::new(
+            OpCode::SameAsR,
+            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                ptr,
+            ))],
+        );
+        assert!(refresh_retained_constptrs(std::slice::from_ref(&used), None).is_none());
     }
 
     #[test]
