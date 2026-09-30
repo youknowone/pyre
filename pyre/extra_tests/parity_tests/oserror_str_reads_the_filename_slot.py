@@ -12,8 +12,11 @@
 # filename that the exception does not have, and the difference shows only in
 # the message -- every attribute read still answers correctly.
 #
-# CPython 3.14 and PyPy agree on every arm below.
+# CPython 3.14 and PyPy agree on every arm below.  A None `winerror`
+# is different on Windows: `OSError_str` prints it, and that spelling
+# lives in `oserror_winerror_none_names_both_filenames.py`.
 import errno
+import sys
 
 
 def a_characters_written_argument_is_not_a_filename():
@@ -31,6 +34,12 @@ def a_third_argument_is_a_filename_for_a_plain_oserror():
 
 def a_fifth_argument_is_the_second_filename():
     exc = OSError(2, 'nope', 'a.txt', None, 'b.txt')
+    assert exc.filename == 'a.txt', exc.filename
+    assert exc.filename2 == 'b.txt', exc.filename2
+    # Windows keeps the None winerror slot, so `OSError_str` takes the
+    # WinError arm.  `W_OSError.descr_str` treats that None as absent.
+    if sys.platform == "win32":
+        return
     assert str(exc) == "[Errno 2] nope: 'a.txt' -> 'b.txt'", str(exc)
 
 
