@@ -30,7 +30,7 @@ import sys
 _gf = sys._getframe
 
 N = 5
-PASSES = 6000
+PASSES = 96000
 wrong = []
 
 

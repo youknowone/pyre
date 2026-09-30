@@ -37,7 +37,7 @@ try:
 except ImportError:
     pass
 
-N = 20000
+N = 140000
 
 
 class Plain:

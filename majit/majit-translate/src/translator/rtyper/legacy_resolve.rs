@@ -156,6 +156,9 @@ pub fn resolve_types(graph: &FunctionGraph) {
             "xor" | "bitxor" | "bitxor_assign" => Some("xor"),
             "rshift" | "shr" | "rshift_assign" => Some("rshift"),
             "lshift" | "shl" | "lshift_assign" => Some("lshift"),
+            // `_int_to_int_cast` narrow signed target. Both operands are
+            // signed words (`int_signext(v, nbytes)`).
+            "signext" => Some("signext"),
             "lt" => Some("lt"),
             "le" => Some("le"),
             "gt" => Some("gt"),

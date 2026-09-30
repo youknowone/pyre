@@ -135,6 +135,13 @@ const EC_PROFILEFUNC_INDEX: u32 = EC_DESCR_TAG + 1;
 const OBJECT_W_CLASS_DESCR_TAG: u32 = 0x5500_0000;
 const OBJECT_W_CLASS_INDEX: u32 = OBJECT_W_CLASS_DESCR_TAG;
 
+// `GilReadyState.gil_ready` is a process-global `i64`, not a `PyObject`
+// field. `quasi_immut_descr` selects the watcher from `descr.index()`
+// alone, so the index has to be an owner identity. Next free tag after
+// `PyObject.w_class` (`0x5500_0000`); `0x6100_0000` is native mapdict.
+const GIL_READY_DESCR_TAG: u32 = 0x5600_0000;
+const GIL_READY_INDEX: u32 = GIL_READY_DESCR_TAG;
+
 // The generated native user layouts append mapdict fields at different base
 // sizes. HeapCache keys by descriptor index; give each translated STRUCT field
 // the distinct identity provided by descr.py's per-STRUCT cache.
@@ -1747,6 +1754,36 @@ static RANGE_ITER_STEP_ONE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLoc
 });
 
 /// `functional.py W_IntRangeOneArgIterator` — the `range(stop)` shape.
+static CALLABLE_ITERATOR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::operation::_CallableIterator>(),
+        <pyre_object::operation::_CallableIterator as pyre_object::lltype::GcType>::type_id(),
+        &pyre_object::operation::CALLABLE_ITERATOR_TYPE as *const _ as usize,
+        &[
+            (
+                "callable",
+                std::mem::offset_of!(pyre_object::operation::_CallableIterator, callable),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "sentinel",
+                std::mem::offset_of!(pyre_object::operation::_CallableIterator, sentinel),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "_CallableIterator",
+        "operation::_CallableIterator",
+    )
+});
+
 static RANGE_ITER_ONE_ARG_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::functional::W_IntRangeOneArgIterator>(),
@@ -6168,6 +6205,37 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
     )
 });
 
+/// `gil.py` `GILThreadLocals.gil_ready` (`_immutable_fields_ = ['gil_ready?']`).
+///
+/// One process-wide `i64` at offset 0 of a non-GC `static mut`. Both
+/// `is_immutable` and `is_quasi_immutable` are set so `SimpleFieldDescr::is_always_pure`
+/// stays false: an always-pure read of a constant receiver folds the zero
+/// with no `QuasiimmutField` and no invalidation. `is_gc_managed` is false
+/// so the read does not emit `GUARD_GC_TYPE` against the bytes before the
+/// static.
+static GIL_READY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
+    use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
+    let spec = SimpleFieldDescrSpec {
+        index: GIL_READY_INDEX,
+        field_key: "gil_ready".to_string(),
+        name: "GilReadyState.gil_ready".to_string(),
+        offset: 0,
+        field_size: 8,
+        field_type: Type::Int,
+        is_immutable: true,
+        is_quasi_immutable: true,
+        flag: ArrayFlag::Signed,
+        virtualizable: false,
+        index_in_parent: 0,
+        is_class_word: Some(false),
+    };
+    majit_ir::descr::make_simple_descr_group_with_flags(u32::MAX, 8, 0, 0, false, false, &[spec])
+});
+
+pub fn gil_ready_descr() -> DescrRef {
+    GIL_READY_DESCR_GROUP.field_descrs[0].clone() as DescrRef
+}
+
 /// Size descriptor for W_SliceObject allocation via NewWithVtable.
 /// vtable = &SLICE_TYPE (ob_type for virtual materialization).
 /// Mirrors `pypy/objspace/std/objspace.py` `space.newslice` →
@@ -7693,6 +7761,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gil_ready_descr_is_quasi_immutable_not_always_pure() {
+        let descr = gil_ready_descr();
+        assert!(descr.is_quasi_immutable());
+        assert!(!descr.is_always_pure());
+        assert_eq!(descr.index(), GIL_READY_INDEX);
+        let field = descr.as_field_descr().expect("field descr");
+        assert_eq!(field.offset(), 0);
+        assert_eq!(field.field_size(), 8);
+        assert_eq!(field.field_type(), Type::Int);
+    }
+
+    #[test]
+    fn make_descr_from_bh_bridges_gil_ready_to_the_quasi_descr() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let canonical = gil_ready_descr();
+        for owner in [
+            "GilReadyState",
+            "gil_ready::GilReadyState",
+            "pyre_object::gil_ready::GilReadyState",
+        ] {
+            let descr = make_descr_from_bh(&BhDescr::Field {
+                offset: 0,
+                field_size: 8,
+                field_type: Type::Int,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: true,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: Some(0),
+                parent: None,
+                name: "gil_ready".into(),
+                owner: owner.into(),
+            });
+            assert!(
+                std::sync::Arc::ptr_eq(&descr, &canonical),
+                "{owner}.gil_ready must bridge to the quasi descr",
+            );
+        }
+
+        let narrow = make_descr_from_bh(&BhDescr::Field {
+            offset: 0,
+            field_size: 4,
+            field_type: Type::Int,
+            field_flag: ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(0),
+            parent: None,
+            name: "gil_ready".into(),
+            owner: "GilReadyState".into(),
+        });
+        assert!(
+            !std::sync::Arc::ptr_eq(&narrow, &canonical),
+            "a 4-byte spelling must not bridge onto the 8-byte cell",
+        );
+    }
+
     /// The hand-lowered handler ops and translated execution-context helpers
     /// address the same three words through the same descriptor objects.
     /// `pypy/jit/backend/llsupport/descr.py GcCache.get_field_descr` has no
@@ -8025,6 +8154,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("functional::W_IntRangeOneArgIterator", || {
         LazyLock::force(&RANGE_ITER_ONE_ARG_DESCR_GROUP);
+    }),
+    ("operation::_CallableIterator", || {
+        LazyLock::force(&CALLABLE_ITERATOR_DESCR_GROUP);
     }),
     ("functional::W_Range", || {
         LazyLock::force(&RANGE_DESCR_GROUP);
@@ -8736,6 +8868,24 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     return canonical;
                 }
             }
+            // `GilReadyState.gil_ready` is the process-wide `gil_ready?`
+            // word. The codewriter has no `?` attribute on it (that would
+            // emit `record_quasiimmut_field`, which the production
+            // blackhole builder does not implement) and names the owner by
+            // leaf or by module path. Bridge to the one quasi descr before
+            // the generic parent lookup mints a mutable twin.
+            if (owner.as_str() == "GilReadyState" || owner.as_str().ends_with("::GilReadyState"))
+                && name.as_str() == "gil_ready"
+            {
+                let canonical = gil_ready_descr();
+                if let Some(field) = canonical.as_field_descr()
+                    && field.offset() == *offset
+                    && field.field_size() == *field_size
+                    && field.field_type() == *field_type
+                {
+                    return canonical;
+                }
+            }
             if owner.as_str() == "W_ListObject" {
                 match name.as_str() {
                     "int_items.len" => return list_int_items_len_descr(),
@@ -9013,6 +9163,10 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             is_gc_managed,
             ..
         } => {
+            // Publish this module's group before the lookup. A `BhDescr`
+            // that arrives first would keep a vtable captured in the
+            // producing process and a field list with no `w_class` edge.
+            force_declared_group(*type_id);
             // `descr.py get_size_descr` cache-hit semantics:
             // when the producer's `type_id` matches a runtime publish
             // (`build_object_descr_group_with_def_path` →

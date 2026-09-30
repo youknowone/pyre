@@ -9328,6 +9328,18 @@ impl<'a> Lowering<'a> {
                     if src_is_prebuilt_once_value && matches!(dst_kind, ValueType::Ref(_)) {
                         return Ok((None, arg));
                     }
+                    let src_width = match &operand {
+                        Operand::Copy(place) | Operand::Move(place) => {
+                            self.literal_int_width(&place.ty)
+                        }
+                        Operand::Const(_) => None,
+                    };
+                    if let (Some(src_w), Some(dst_w)) = (src_width, self.literal_int_width(dest_ty))
+                        && let Some(lowered) =
+                            self.materialize_int_cast(mir_bb, src_w, dst_w, arg.clone())
+                    {
+                        return Ok(lowered);
+                    }
                     // Signedness-flipping int cast (`w_tuple_len(obj) as i64`)
                     // — aliasing keeps the source `r_uint` annotation on the
                     // signed destination, tripping the SomeInteger signedness
@@ -9620,6 +9632,8 @@ impl<'a> Lowering<'a> {
                 // Ref source may narrow or erase below.
                 let src_kind = self.operand_value_kind(&operand);
                 let src_root = self.operand_class_root(&operand);
+                let src_int = operand_tyref(&operand).and_then(|src| self.literal_int_width(src));
+                let dst_int = self.literal_int_width(&ty);
                 let v = self.resolve_operand(mir_bb, operand)?;
                 // A same-bank ptr→ptr cast keeps the i64 pointer carrier in
                 // place, so it would alias — but the pointee type it
@@ -9634,6 +9648,11 @@ impl<'a> Lowering<'a> {
                         self.ptr_cast_marker(src_kind.as_ref(), src_root.as_deref(), &ty, &v)
                 {
                     return Ok((Some(op), res));
+                }
+                if let (Some(src), Some(dst)) = (src_int, dst_int)
+                    && let Some(lowered) = self.materialize_int_cast(mir_bb, src, dst, v.clone())
+                {
+                    return Ok(lowered);
                 }
                 Ok((None, v))
             }
@@ -16954,9 +16973,15 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|ty| self.tyref_literal_int_atom(ty) == Some("I64"))
             && let Some(residual) = match target {
-                CallTarget::FunctionPath { segments, .. } => segments.last().and_then(|leaf| {
-                    crate::front::rbigint_call::int_binop_residual_for_method(leaf)
-                }),
+                CallTarget::FunctionPath { segments, .. } => {
+                    crate::front::rbigint_call::bigint_int_payload_residual_path(segments).or_else(
+                        || {
+                            segments.last().and_then(|leaf| {
+                                crate::front::rbigint_call::int_binop_residual_for_method(leaf)
+                            })
+                        },
+                    )
+                }
                 CallTarget::Method { name, .. } => {
                     crate::front::rbigint_call::int_binop_residual_for_method(name)
                 }
@@ -26736,6 +26761,133 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Bit width and unsignedness of a literal integer `TyRef`.
+    /// `I128` / `U128` stay `None` so the 128-bit carrier is left alone.
+    fn literal_int_width(&self, ty: &TyRef) -> Option<(u32, bool)> {
+        let word_bits = (crate::layout::target_word_size() * 8) as u32;
+        if let Some(atom) = self.tyref_literal_uint_atom(ty) {
+            let bits = match atom {
+                "U8" => 8,
+                "U16" => 16,
+                "U32" => 32,
+                "U64" => 64,
+                "Usize" => word_bits,
+                _ => return None,
+            };
+            return Some((bits, true));
+        }
+        if let Some(atom) = self.tyref_literal_int_atom(ty) {
+            let bits = match atom {
+                "I8" => 8,
+                "I16" => 16,
+                "I32" => 32,
+                "I64" => 64,
+                "Isize" => word_bits,
+                _ => return None,
+            };
+            return Some((bits, false));
+        }
+        None
+    }
+
+    /// `jtransform.py` `_int_to_int_cast` / `rewrite_op_cast_primitive`.
+    /// A word-sized target is an identity retype (`r_uint` / `intmask`).
+    /// A narrower unsigned target is `int_and` with the low-byte mask; a
+    /// narrower signed target is `int_signext(v, nbytes)`.
+    fn materialize_int_cast(
+        &mut self,
+        mir_bb: usize,
+        src: (u32, bool),
+        dst: (u32, bool),
+        arg: Variable,
+    ) -> Option<(Option<OpKind>, Variable)> {
+        let action = int_cast_action(src.0, src.1, dst.0, dst.1)?;
+        let bb_id = self.block_id[mir_bb];
+        Some(match action {
+            IntCastAction::Alias => (None, arg),
+            IntCastAction::RUint => {
+                let res = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                (
+                    Some(OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect(),
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(vec![arg]),
+                        result_ty: ValueType::Unsigned,
+                    }),
+                    res,
+                )
+            }
+            IntCastAction::IntMask => {
+                let res = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                (
+                    Some(OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: ["rpython", "rlib", "rarithmetic", "intmask"]
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect(),
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(vec![arg]),
+                        result_ty: ValueType::Int,
+                    }),
+                    res,
+                )
+            }
+            IntCastAction::And(mask) => {
+                let mask_var = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(mask_var.clone()),
+                    kind: OpKind::ConstUInt(mask),
+                });
+                let res = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                (
+                    Some(OpKind::BinOp {
+                        op: "and".to_string(),
+                        lhs: arg,
+                        rhs: mask_var,
+                        result_ty: ValueType::Unsigned,
+                    }),
+                    res,
+                )
+            }
+            IntCastAction::SignExt(nbytes) => {
+                let width = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(width.clone()),
+                    kind: OpKind::ConstInt(nbytes),
+                });
+                let res = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                (
+                    Some(OpKind::BinOp {
+                        op: "signext".to_string(),
+                        lhs: arg,
+                        rhs: width,
+                        result_ty: ValueType::Int,
+                    }),
+                    res,
+                )
+            }
+        })
+    }
+
     /// The `UInt` width atom (`"U8"` / `"U32"` / `"Usize"` …) of a
     /// scalar-typed [`TyRef`], `None` for any non-`UInt` shape.
     fn tyref_literal_uint_atom<'t>(&self, ty: &'t TyRef) -> Option<&'t str>
@@ -33784,6 +33936,72 @@ fn unary_op_label(v: &serde_json::Value) -> Result<String, LowerError> {
             let suffix = payload.as_str();
             Ok(canonical_binop_label(tag, suffix))
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IntCastAction {
+    Alias,
+    RUint,
+    IntMask,
+    And(u64),
+    SignExt(i64),
+}
+
+fn integer_bounds(bits: u32, unsigned: bool) -> (i128, i128) {
+    if unsigned {
+        (0, (1i128 << bits) - 1)
+    } else {
+        let half = 1i128 << (bits - 1);
+        (-half, half - 1)
+    }
+}
+
+/// `jtransform.py` `_int_to_int_cast`. `None` for a width the word-sized
+/// JIT carrier does not narrow (128-bit).
+///
+/// The comparison word is the Int box (`Value::Int(i64)`), 64 bits on every
+/// target, not the pointer width: on wasm32 an `i64 -> u32` still has to
+/// mask and a `u32 -> i32` still has to sign-extend inside that box.
+fn int_cast_action(
+    src_bits: u32,
+    src_unsigned: bool,
+    dst_bits: u32,
+    dst_unsigned: bool,
+) -> Option<IntCastAction> {
+    let word_bits = i64::BITS;
+    if src_bits == 0 || dst_bits == 0 || src_bits > word_bits || dst_bits > word_bits {
+        return None;
+    }
+    if dst_bits == word_bits {
+        return Some(if src_unsigned == dst_unsigned {
+            IntCastAction::Alias
+        } else if dst_unsigned {
+            IntCastAction::RUint
+        } else {
+            IntCastAction::IntMask
+        });
+    }
+    let (min1, max1) = integer_bounds(src_bits, src_unsigned);
+    let (min2, max2) = integer_bounds(dst_bits, dst_unsigned);
+    if min2 <= min1 && max1 <= max2 {
+        return Some(if src_unsigned == dst_unsigned {
+            IntCastAction::Alias
+        } else if dst_unsigned {
+            IntCastAction::RUint
+        } else {
+            IntCastAction::IntMask
+        });
+    }
+    if dst_unsigned {
+        let mask = if dst_bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << dst_bits) - 1
+        };
+        Some(IntCastAction::And(mask))
+    } else {
+        Some(IntCastAction::SignExt(i64::from(dst_bits / 8)))
     }
 }
 
@@ -46237,6 +46455,33 @@ fn collapse_panic_message_chains(graph: &mut FunctionGraph) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn int_cast_action_narrows_inside_the_64_bit_int_box() {
+        // `int_or_float_decode_int`: `value as u32 as i32 as i64`. With a
+        // 32-bit `usize` (wasm32) the first two steps still narrow inside
+        // the Int box.
+        assert_eq!(
+            super::int_cast_action(64, false, 32, true),
+            Some(super::IntCastAction::And(0xffff_ffff))
+        );
+        assert_eq!(
+            super::int_cast_action(32, true, 32, false),
+            Some(super::IntCastAction::SignExt(4))
+        );
+        assert_eq!(
+            super::int_cast_action(32, false, 64, false),
+            Some(super::IntCastAction::Alias)
+        );
+        assert_eq!(
+            super::int_cast_action(32, true, 64, false),
+            Some(super::IntCastAction::IntMask)
+        );
+        assert_eq!(
+            super::int_cast_action(64, false, 64, true),
+            Some(super::IntCastAction::RUint)
+        );
+        assert_eq!(super::int_cast_action(128, false, 64, false), None);
+    }
 
     use super::harden_duplicate_leaf_metadata;
     use super::{

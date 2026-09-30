@@ -4887,15 +4887,28 @@ fn a_pointer_array_item_is_read_and_written_at_the_same_width() {
     let (bytes, _guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
 
-    let (mut narrow_loads, mut wide_loads, mut narrow_stores, mut wide_stores) =
-        (0usize, 0usize, 0usize, 0usize);
-    count_operators(&bytes, |op| match op {
-        wasmparser::Operator::I64Load32U { .. } => narrow_loads += 1,
-        wasmparser::Operator::I64Load { .. } => wide_loads += 1,
-        wasmparser::Operator::I64Store32 { .. } => narrow_stores += 1,
-        wasmparser::Operator::I64Store { .. } => wide_stores += 1,
-        _ => {}
-    });
+    // The entry loader reads every input from its frame slot, a Ref one
+    // with `i64.load32_u`. Counting the same inputs finished without the
+    // array ops leaves only the item read and the item write.
+    let count_widths = |bytes: &[u8]| {
+        let mut counts = [0usize; 4];
+        count_operators(bytes, |op| match op {
+            wasmparser::Operator::I64Load32U { .. } => counts[0] += 1,
+            wasmparser::Operator::I64Load { .. } => counts[1] += 1,
+            wasmparser::Operator::I64Store32 { .. } => counts[2] += 1,
+            wasmparser::Operator::I64Store { .. } => counts[3] += 1,
+            _ => {}
+        });
+        counts
+    };
+    let finish_only = vec![Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))])];
+    let (finish_only, finish_constants) = rewrite_frontend_ops(&inputargs, finish_only);
+    let (entry_bytes, _guards) = build_module_default(&inputargs, &finish_only, &finish_constants);
+    validate_wasm(&entry_bytes);
+    let entry = count_widths(&entry_bytes);
+    let all = count_widths(&bytes);
+    let [narrow_loads, wide_loads, narrow_stores, wide_stores] =
+        std::array::from_fn(|i| all[i].saturating_sub(entry[i]));
     assert!(
         narrow_loads + wide_loads >= 1 && narrow_stores + wide_stores >= 1,
         "GcLoadIndexedR / GcStoreIndexed must both access the item: loads=({narrow_loads},{wide_loads}) stores=({narrow_stores},{wide_stores})"

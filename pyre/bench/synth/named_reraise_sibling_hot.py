@@ -6,7 +6,7 @@
 # binding `m` is cleared. A `del` of a bound local inside the try body plus a
 # sibling clause exercises the same walker-native DELETE_FAST bound
 # continuation. Output is verified against CPython/PyPy.
-N = 9000
+N = 270000
 
 
 def reraise_sibling(i):

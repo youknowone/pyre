@@ -5301,6 +5301,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("interp_itertools::CHAIN_TYPE", interp_itertools::CHAIN_TYPE),
         pytype_addr!("interp_sre::SRE_SCANNER_TYPE", interp_sre::SRE_SCANNER_TYPE),
         pytype_addr!(
+            "interp_sre::SRE_TEMPLATE_TYPE",
+            interp_sre::SRE_TEMPLATE_TYPE
+        ),
+        pytype_addr!(
             "functional::LONG_RANGE_ITER_TYPE",
             functional::LONG_RANGE_ITER_TYPE
         ),
@@ -5564,6 +5568,14 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         (
             "stack_check::PYRE_STACKTOOBIG",
             &crate::stack_check::PYRE_STACKTOOBIG as *const _ as i64,
+        ),
+        // `gil.py` `GILThreadLocals.gil_ready`. `static mut`, so the
+        // address is the live cell: a translated field load must not
+        // fold the initializer. `&raw const` — a shared reference to
+        // `static mut` is rejected.
+        (
+            "gil_ready::GIL_READY_STATE",
+            &raw const pyre_object::gil_ready::GIL_READY_STATE as *const _ as i64,
         ),
     ]
 }

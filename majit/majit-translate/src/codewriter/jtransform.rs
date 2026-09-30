@@ -638,6 +638,10 @@ pub struct Transformer<'a> {
     /// Threaded for `constant_fold_ll_issubclass`; `None` is the
     /// `cpu is None` no-op arm.
     excmatch: Option<&'a crate::translator::rtyper::rtyper::LowLevelFunction>,
+    /// Result ids whose producer is `ValueType::Unsigned`, captured before
+    /// `r_uint` / `intmask` identity aliases erase that annotation.
+    /// `prefix_unsigned_binop` reads the pre-alias operands against this set.
+    unsigned_vars: std::collections::HashSet<u64>,
 }
 
 /// RPython: `jtransform.py` `vable_flags` values — the `flags` dict
@@ -986,7 +990,8 @@ fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
 
 /// Variables that hold an immutable array: each is the result of a
 /// `FieldRead` whose field has `IR_IMMUTABLE_ARRAY` rank
-/// (`rclass.py _parse_field_list` `name[*]`).  Computed once per graph.
+/// (`rclass.py _parse_field_list` `name[*]`), or an items-base accessor
+/// result / block phi carrying one.  Computed once per graph.
 fn collect_immutable_array_vars(
     graph: &FunctionGraph,
     cc: Option<&crate::call::CallControl>,
@@ -1006,6 +1011,56 @@ fn collect_immutable_array_vars(
             if rank.is_array() && rank.is_immutable() {
                 if let Some(result) = op.result.clone() {
                     set.insert(result);
+                }
+            }
+        }
+    }
+    // The items-base accessor returns the same header pointer, and a block
+    // phi fed only by such pointers still names that array.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                let (Some(result), crate::model::OpKind::Call { target, args, .. }) =
+                    (&op.result, &op.kind)
+                else {
+                    continue;
+                };
+                if !Transformer::call_target_is_items_block_accessor(target) {
+                    continue;
+                }
+                let Some(arg) = args.first().and_then(|arg| arg.as_variable()) else {
+                    continue;
+                };
+                if set.contains(arg) && set.insert(result.clone()) {
+                    changed = true;
+                }
+            }
+            for (slot, input) in block.inputargs.iter().enumerate() {
+                if set.contains(input) {
+                    continue;
+                }
+                let mut preds = 0usize;
+                let mut all_immutable = true;
+                for src in &graph.blocks {
+                    for link in &src.exits {
+                        if link.target != block.id {
+                            continue;
+                        }
+                        preds += 1;
+                        let carried = link
+                            .args
+                            .get(slot)
+                            .and_then(|arg| arg.as_variable())
+                            .is_some_and(|var| set.contains(var));
+                        if !carried {
+                            all_immutable = false;
+                        }
+                    }
+                }
+                if preds > 0 && all_immutable && set.insert(input.clone()) {
+                    changed = true;
                 }
             }
         }
@@ -1386,6 +1441,137 @@ fn reversed_comparison_binop(name: &str) -> &str {
         "uint_gt" => "uint_lt",
         "uint_ge" => "uint_le",
         other => other,
+    }
+}
+
+/// Producers whose result is an unsigned machine word: `r_uint`,
+/// `ConstUInt`, and any op whose result bank is `ValueType::Unsigned`
+/// (including unsigned `wrapping_add`). `getkind(Unsigned) == 'int'`, so
+/// the op name is the only place the signedness survives.
+fn kind_produces_unsigned(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::ConstUInt(_) | OpKind::ConstUInt128(_) => true,
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. }
+        | OpKind::LoadStatic { ty, .. } => *ty == ValueType::Unsigned,
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. }
+        | OpKind::RawLoad { item_ty, .. } => *item_ty == ValueType::Unsigned,
+        OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. }
+        | OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. } => *result_ty == ValueType::Unsigned,
+        _ => false,
+    }
+}
+
+/// `IntegerRepr.opprefix` is `uint_` for `lltype.Unsigned`. Record every
+/// result of an unsigned producer, then any phi that receives only those
+/// words. Collected before identity folds so a later `r_uint` alias does
+/// not drop the operand out of the set.
+fn collect_unsigned_vars(graph: &FunctionGraph) -> std::collections::HashSet<u64> {
+    let mut unsigned = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let Some(result) = &op.result
+                && kind_produces_unsigned(&op.kind)
+            {
+                unsigned.insert(result.id());
+            }
+        }
+    }
+    loop {
+        let mut grew = false;
+        for block in &graph.blocks {
+            if block.inputargs.is_empty() {
+                continue;
+            }
+            let incoming: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|pred| &pred.exits)
+                .filter(|link| link.target == block.id)
+                .collect();
+            if incoming.is_empty() {
+                continue;
+            }
+            for (slot, arg) in block.inputargs.iter().enumerate() {
+                if unsigned.contains(&arg.id()) {
+                    continue;
+                }
+                let all_unsigned = incoming.iter().all(|link| {
+                    link.args
+                        .get(slot)
+                        .and_then(|link_arg| link_arg.as_variable())
+                        .is_some_and(|var| unsigned.contains(&var.id()))
+                });
+                if all_unsigned {
+                    unsigned.insert(arg.id());
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    unsigned
+}
+
+/// After `_rewrite_symmetric`, rename `lt`/`le`/`gt`/`ge` to `uint_*`
+/// when both pre-alias operands are unsigned, and `rshift` when the
+/// shifted value is (`lloperation.py` `uint_rshift` count stays signed).
+/// `eq`/`ne` and wrapping add/sub/mul stay `int_*`. `uint_floordiv` /
+/// `uint_mod` are not emitted (`blackhole.py` has neither).
+fn prefix_unsigned_binop(
+    original: &SpaceOperation,
+    op: SpaceOperation,
+    unsigned: &std::collections::HashSet<u64>,
+) -> SpaceOperation {
+    let OpKind::BinOp { op: name, .. } = &op.kind else {
+        return op;
+    };
+    if !matches!(name.as_str(), "lt" | "le" | "gt" | "ge" | "rshift") {
+        return op;
+    }
+    let OpKind::BinOp {
+        lhs: orig_lhs,
+        rhs: orig_rhs,
+        ..
+    } = &original.kind
+    else {
+        return op;
+    };
+    let lhs_unsigned = unsigned.contains(&orig_lhs.id());
+    let rhs_unsigned = unsigned.contains(&orig_rhs.id());
+    // `lloperation.py` `uint_rshift` is `(r_uint, int)`: the count stays
+    // signed. Ordered compares need both sides (`IntegerRepr.opprefix`).
+    let apply = match name.as_str() {
+        "rshift" => lhs_unsigned,
+        _ => lhs_unsigned && rhs_unsigned,
+    };
+    if !apply {
+        return op;
+    }
+    let OpKind::BinOp {
+        op: name,
+        lhs,
+        rhs,
+        result_ty,
+    } = op.kind
+    else {
+        return op;
+    };
+    SpaceOperation {
+        result: op.result,
+        kind: OpKind::BinOp {
+            op: format!("uint_{name}"),
+            lhs,
+            rhs,
+            result_ty,
+        },
     }
 }
 
@@ -1972,6 +2158,7 @@ impl<'a> Transformer<'a> {
             calls_classified: 0,
             analysis_cache: crate::call::AnalysisCache::default(),
             excmatch: None,
+            unsigned_vars: std::collections::HashSet::new(),
         }
     }
 
@@ -2070,6 +2257,11 @@ impl<'a> Transformer<'a> {
         // symbolic residual no host symbol backs.
         crate::codewriter::iter_lower::lower_iterators(&mut rewritten);
 
+        // Before `r_uint` is folded to identity. Later blocks still name
+        // the pre-alias result; `remap_op` would otherwise show the signed
+        // source word.
+        self.unsigned_vars = collect_unsigned_vars(&rewritten);
+
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
         drop_guarded_gc_write_barriers(&mut rewritten);
@@ -2142,6 +2334,7 @@ impl<'a> Transformer<'a> {
             // `rewrite_op_<name>` for the symmetric ops, so it runs before
             // any other rewriting can look at the operands.
             let op = rewrite_symmetric(graph, op);
+            let op = prefix_unsigned_binop(original_op, op, &self.unsigned_vars);
             let rewritten = self.rewrite_operation(&op, graph_name, graph);
             count_before_last_operation = Some(new_ops.len());
             match rewritten {
@@ -5361,6 +5554,34 @@ impl<'a> Transformer<'a> {
         //                           [v_inst, descr, descr1], None),
         //            op1]       # op1 = getfield_*_pure
         // Mutable fields stay as plain `getfield_gc_*`.
+        // `ItemsBlock.capacity` is the GcArray length header (`len(items)`,
+        // rlist.py `_ll_list_resize_hint`). `list.obj_capacity` already
+        // lowers that word to `arraylen_gc`. A struct `getfield` of the same
+        // offset is not an always-pure opcode, so a tuple length read stays
+        // in the peeled loop. `TypedItemsBlock.capacity` is a different
+        // array and is left alone.
+        if field.name == "capacity"
+            && field
+                .owner_root
+                .as_deref()
+                .is_some_and(|owner| owner.rsplit("::").next() == Some("ItemsBlock"))
+        {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                return RewriteResult::Keep;
+            };
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: "rewrite: getfield(ItemsBlock.capacity) → arraylen_gc".to_string(),
+            });
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ArrayLen {
+                    base: base.clone(),
+                    array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                    nolength: false,
+                },
+            }]);
+        }
         let rank = self
             .callcontrol
             .as_deref()
@@ -5579,6 +5800,16 @@ impl<'a> Transformer<'a> {
             }]);
         }
         RewriteResult::Keep
+    }
+
+    fn call_target_is_items_block_accessor(target: &crate::model::CallTarget) -> bool {
+        let crate::model::CallTarget::FunctionPath { segments, .. } = target else {
+            return false;
+        };
+        matches!(
+            segments.last().map(String::as_str),
+            Some("items_block_items_base" | "items_block_items_ptr")
+        )
     }
 
     /// RPython: rewrite_op_getarrayitem
@@ -6278,10 +6509,10 @@ impl<'a> Transformer<'a> {
         // otherwise consume it, so fold both through the same identity alias
         // used for no-op coercions (`jtransform.py::_noop_rewrite`).
         //
-        // Aliasing loses the marker's Unsigned annotation, which is why this
-        // sits here and not earlier: the rtyper runs before jtransform and has
-        // already picked `uint_lt` over `int_lt` wherever the annotation
-        // mattered.  Both spellings name the same machine word.
+        // Aliasing drops the marker's Unsigned annotation. Ordered compares
+        // and `rshift` recover it in `prefix_unsigned_binop` from the
+        // pre-alias operands (`IntegerRepr.opprefix` is `uint_`). `eq`/`ne`
+        // stay `int_*`: both spellings are the same machine word.
         if let CallTarget::FunctionPath { segments, .. } = target
             && let [head @ .., leaf] = segments.as_slice()
             && head == ["rpython", "rlib", "rarithmetic"]

@@ -55,7 +55,7 @@ def main():
 
     # a hot loop keeps the routed result stable once the access is compiled
     seen = set()
-    for _ in range(30000):
+    for _ in range(180000):
         seen.add(getattr(m, "ddesc"))
     print("hot", sorted(seen))
 

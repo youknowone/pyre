@@ -28,9 +28,9 @@
 import sys
 
 NAME = 'abcdef'
-WARM = 5000
-REPEAT = 2500
-MID_REPEAT = 300
+WARM = 75000
+REPEAT = 37500
+MID_REPEAT = 4500
 
 
 def inner(x):

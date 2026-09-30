@@ -31,7 +31,7 @@ def run(raise_inside):
         abs()
 
 
-for _ in range(30):
+for _ in range(900):
     run(False)
 run(True)
 print("ok", len(seen))

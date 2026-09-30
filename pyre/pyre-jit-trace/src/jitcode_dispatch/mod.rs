@@ -2146,7 +2146,130 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     pub live_after_jit_pc: usize,
 }
 
+/// Locals of one frame that is live on this trace.
+pub(crate) enum ReceiverTraceLocals {
+    /// The portal virtualizable's `locals_cells_stack_w` boxes.
+    Portal,
+    /// One inline frame's own slot map. Missing slots are not listed.
+    Inline(Vec<(i64, OpRef, majit_ir::Value)>),
+}
+
+fn inline_shadow_slots(shadow: &CalleeLocalsShadow) -> Vec<(i64, OpRef, majit_ir::Value)> {
+    let mut slots: Vec<(i64, OpRef, majit_ir::Value)> = shadow
+        .opref
+        .iter()
+        .filter(|(_, opref)| !opref.is_none())
+        .map(|(&slot, &opref)| {
+            let value = shadow
+                .concrete
+                .get(&slot)
+                .map(|entry| entry.value)
+                .unwrap_or(majit_ir::Value::Void);
+            (slot, opref, value)
+        })
+        .collect();
+    slots.sort_by_key(|(slot, _, _)| *slot);
+    slots
+}
+
+fn inline_shadow_matches(shadow: &CalleeLocalsShadow, obj: OpRef, concrete: usize) -> bool {
+    (shadow.frame_box != OpRef::NONE && shadow.frame_box == obj)
+        || (concrete != 0 && shadow.concrete_frame == concrete)
+}
+
 impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
+    /// The frame on this trace — portal virtualizable or any inline level —
+    /// whose box or concrete address is `obj` / `concrete`.
+    pub(crate) fn receiver_trace_locals(
+        &self,
+        obj: OpRef,
+        concrete: usize,
+    ) -> Option<ReceiverTraceLocals> {
+        let hit = |shadow: &CalleeLocalsShadow| -> Option<ReceiverTraceLocals> {
+            inline_shadow_matches(shadow, obj, concrete)
+                .then(|| ReceiverTraceLocals::Inline(inline_shadow_slots(shadow)))
+        };
+        if let Some(found) = self
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .and_then(&hit)
+        {
+            return Some(found);
+        }
+        let session = self.session.borrow();
+        for frame in &session.framestack {
+            if let Some(live) = frame.live.as_ref()
+                && let Some(found) = live
+                    .frame_state
+                    .borrow()
+                    .callee_shadow
+                    .as_ref()
+                    .and_then(&hit)
+            {
+                return Some(found);
+            }
+            for parent in &frame.parents {
+                let Some(state) = parent.frame_state.as_ref() else {
+                    continue;
+                };
+                if let Some(found) = state.borrow().callee_shadow.as_ref().and_then(&hit) {
+                    return Some(found);
+                }
+            }
+        }
+        for helper in &session.helper_live {
+            if let Some(found) = helper
+                .frame_state
+                .borrow()
+                .callee_shadow
+                .as_ref()
+                .and_then(&hit)
+            {
+                return Some(found);
+            }
+        }
+        drop(session);
+        let vable_box = self.trace_ctx.standard_virtualizable_box();
+        let vable_ptr = self.trace_ctx.standard_virtualizable_ptr();
+        let heap_ptr = self
+            .trace_ctx
+            .virtualizable_heap_ptr()
+            .map(|ptr| ptr as usize);
+        let vref_box = (concrete != 0)
+            .then(|| self.trace_ctx.virtualref_virtual_for_object_ptr(concrete))
+            .flatten();
+        let portal = vable_box == Some(obj)
+            || vable_ptr == Some(concrete)
+            || heap_ptr == Some(concrete)
+            || vref_box.is_some_and(|red| vable_box == Some(red) || red == obj);
+        if portal {
+            return Some(ReceiverTraceLocals::Portal);
+        }
+        // The executing inline frame's `f_back` is still on this trace. When
+        // that caller is the loop portal, its locals are the virtualizable
+        // boxes even if the traceback names the live object and the vable
+        // cell names the snapshot copy.
+        let inline = current_inline_concrete_frame();
+        if inline != 0 && concrete != 0 {
+            let raw = unsafe { (*(inline as *const pyre_interpreter::PyFrame)).f_backref };
+            if !raw.is_null() {
+                let caller = if unsafe {
+                    majit_metainterp::virtualref::ptr_is_virtual_ref(raw as *const u8)
+                } {
+                    unsafe { majit_metainterp::virtualref::vref_forced(raw as *const u8) as usize }
+                } else {
+                    raw as usize
+                };
+                if caller == concrete && (vable_box.is_some() || vable_ptr.is_some()) {
+                    return Some(ReceiverTraceLocals::Portal);
+                }
+            }
+        }
+        None
+    }
+
     /// The standing exception, read from the one session-wide slot
     /// (`metainterp.last_exc_value`, `pyjitpl.py opimpl_last_exc_value`).
     fn last_exc_value(&self) -> Option<OpRef> {
@@ -3310,7 +3433,18 @@ impl DispatchError {
             let loc = std::panic::Location::caller();
             eprintln!("[lb-site] {}:{} pc={pc}", loc.file(), loc.line());
         }
-        Self::callee_inline_abort(pc, false)
+        // Most call sites have no MIFrame session, so they cannot see the
+        // per-frame effect delta `fbw_decline_inline_callee` reads.  An
+        // in-flight consume those sites still have to honor: a generator,
+        // map, dict/set iterator, itertools iterator, or user `__next__`
+        // has no cursor to roll back, and re-entering the CALL runs
+        // `__next__` again.  `convert_and_run_from_pyjitpl` continues the
+        // framestack instead.  A journaled cursor stays replayable here
+        // unless a body effect already stands.
+        let blackhole_required = fbw_state::fbw_foriter_unjournaled_consume()
+            || (fbw_state::fbw_foriter_inflight_active()
+                && fbw_state::fbw_foriter_any_body_effect_signal());
+        Self::callee_inline_abort(pc, blackhole_required)
     }
 
     /// Classify a nested residual decline by whether the aborting MIFrame has
@@ -4487,35 +4621,29 @@ fn label_operand_offset(key: &str) -> Option<usize> {
     None
 }
 
-/// Does the `except` handler at `catch_target` flow back into this frame's loop
-/// (reaching a `jit_merge_point` back-edge), rather than returning out of the
-/// frame (`*_return`)?
-///
-/// Sole caller: [`decline_inline_caller_frame_for_catch_marker`].  The
-/// exception-edge bridge router itself does NOT consult this — it routes on the
-/// `catch_exception` alone, the way `finishframe_exception`
-/// (`pyjitpl.py`) does, and a handler that returns out of the frame is
-/// `finishframe`'s ordinary case (`pyjitpl.py`).
-///
-/// What the predicate still gates is INLINING a CLOSURE callee at a caller's
-/// in-try CALL.  A non-rejoining handler is an `except E as e` body, and the
-/// callee's free variables resolve through cells that body's implicit cleanup
-/// stores `None` into and then clears; the inlined read answers `None`
-/// (`synth/exception_as_cell_cleanup`, dynasm).  A callee with no free
-/// variables cannot reach a caller cell and is inlined either way.
-///
-/// Bounded forward reachability from `catch_target`, following `goto`/
-/// `goto_if_not` successors: `true` as soon as any path reaches a
-/// `jit_merge_point`; `false` if every reachable path terminates at a `*_return`
-/// (or the scan hits an un-followed control op / the bound, which conservatively
-/// declines).
-pub(crate) fn exc_handler_rejoins_loop(code: &[u8], catch_target: usize) -> bool {
+/// How the `except` handler at a `catch_exception` target leaves the frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExcHandlerShape {
+    /// Reaches `jit_merge_point`.
+    Rejoins,
+    /// A path returns out of the frame (`*_return`).
+    Returns,
+    /// Clears state and `reraise`s, and no path returns.
+    Reraise,
+    /// Switch, budget, or a scan that proved neither.
+    Unproven,
+}
+
+/// Bounded forward reachability from `catch_target`.
+pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerShape {
     let mut visited = std::collections::HashSet::new();
     let mut work = vec![catch_target];
     let mut budget = 4096usize;
+    let mut saw_return = false;
+    let mut saw_reraise = false;
     while let Some(pc) = work.pop() {
         if budget == 0 {
-            return false;
+            return ExcHandlerShape::Unproven;
         }
         budget -= 1;
         if !visited.insert(pc) {
@@ -4525,35 +4653,39 @@ pub(crate) fn exc_handler_rejoins_loop(code: &[u8], catch_target: usize) -> bool
             continue;
         };
         if op.key.starts_with("jit_merge_point") {
-            return true;
+            return ExcHandlerShape::Rejoins;
         }
         if matches!(
             op.key,
             "ref_return/r" | "int_return/i" | "float_return/f" | "void_return/"
         ) {
-            // Frame-return terminal on this path; do not enqueue successors.
+            saw_return = true;
+            continue;
+        }
+        if op.key.starts_with("reraise") {
+            saw_reraise = true;
             continue;
         }
         match op.key {
             "goto/L" => work.push(read_label(code, &op, 0)),
             // Every member of the family spells its label as the FINAL
             // operand (`iL`, `iiL`, `rL`, `rrL`, `ffL`), so the operand index
-            // is one less than the argcode count -- 1 for the plain `iL` this
-            // used to hard-code.  Naming a single key here left a fused
-            // branch's taken arm off the worklist, which this walk reads as
-            // "that block is unreachable" rather than as a decline.
+            // is one less than the argcode count.
             key if key.starts_with("goto_if_not") && op.argcodes.ends_with('L') => {
                 work.push(read_label(code, &op, op.argcodes.len() - 1));
                 work.push(op.next_pc);
             }
-            key if key.starts_with("switch") => {
-                // Multi-target dispatch not followed; leave this path un-proven
-                // (routing declines unless another path rejoins the loop).
-            }
+            key if key.starts_with("switch") => return ExcHandlerShape::Unproven,
             _ => work.push(op.next_pc),
         }
     }
-    false
+    if saw_return {
+        ExcHandlerShape::Returns
+    } else if saw_reraise {
+        ExcHandlerShape::Reraise
+    } else {
+        ExcHandlerShape::Unproven
+    }
 }
 
 /// True when a path reachable from `position` reads the walker's active
@@ -6505,8 +6637,17 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                             // instance). `_get_list_of_active_boxes` reads
                             // `registers_r[index]` for every live color with
                             // no further test, so encode that register.
+                            //
+                            // A bridge inputarg left in the color after the
+                            // virtualizable slot moved on is not that value.
+                            // The merge point publishes the shadow box
+                            // (`reached_loop_header` `live_arg_boxes +=
+                            // virtualizable_boxes`). Naming the stale
+                            // inputarg makes the loop cut decline a box the
+                            // entry contract does not carry. Fall through
+                            // and let the shadow arm below choose.
                             let reg = regs_r.get_box(color).unwrap_or(OpRef::NONE);
-                            if reg != OpRef::NONE {
+                            if reg != OpRef::NONE && !reg.is_input_arg() {
                                 active.push(reg);
                                 continue;
                             }
@@ -6607,8 +6748,23 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                         let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
                         let walk_real =
                             walk_box.filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
+                        let shadow_real =
+                            vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
                         let guard_pc_proves_slot = guard_owned_slot == Some(s_idx);
-                        if guard_pc_proves_slot {
+                        // A bridge inputarg left in the color is not the
+                        // stack temp. The merge point's loop inputargs are
+                        // the shadow boxes; naming the inputarg makes the
+                        // loop cut decline it. A NULL shadow still loses to
+                        // the register (`nested_break_not_hot`).
+                        if let (Some(w), Some(s)) = (walk_real, shadow_real) {
+                            if w != s && w.is_input_arg() {
+                                s
+                            } else if guard_pc_proves_slot {
+                                w
+                            } else {
+                                s
+                            }
+                        } else if guard_pc_proves_slot {
                             walk_real.or(vbox).unwrap_or_else(fallback)
                         } else if shadow_is_real {
                             vbox.unwrap_or_else(fallback)
@@ -6631,9 +6787,23 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                         // temp — a `raise` whose operand color doubled as
                         // `self` then resumed publishing `self` as the
                         // exception.
+                        //
+                        // A bridge inputarg left in the register after the
+                        // virtualizable slot moved on is not that temp. The
+                        // merge point publishes the shadow box
+                        // (`reached_loop_header` `live_arg_boxes +=
+                        // virtualizable_boxes`), and `CutTrace` treats that
+                        // box as a loop inputarg. Naming the stale inputarg
+                        // instead makes the loop cut decline a box the entry
+                        // contract does not carry.
                         let walk_real =
                             walk_box.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
-                        walk_real.or(vbox).unwrap_or_else(fallback)
+                        let shadow_real =
+                            vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
+                        match (walk_real, shadow_real) {
+                            (Some(w), Some(s)) if w != s && w.is_input_arg() => s,
+                            _ => walk_real.or(vbox).unwrap_or_else(fallback),
+                        }
                     }
                 }
                 // `semantic_idx` is `None`: this Ref color names no live
@@ -6664,7 +6834,22 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                 // mapped arm above uses.  Under the walker (gate-off) each PC
                 // owns a depth-narrowed marker, so this arm never fires.
                 None => match regs_r.get_box(color) {
-                    Some(v) if v != OpRef::NONE => v,
+                    // A produced box is live at this marker even though the
+                    // color names no frame slot.
+                    Some(v) if v != OpRef::NONE && !v.is_input_arg() => v,
+                    // A bridge inputarg that the virtualizable shadow still
+                    // holds is one of the merge point's loop inputargs.
+                    // One the shadow has replaced is a stale color: the
+                    // decoder drops a slot-less color, and leaving the old
+                    // inputarg in the snapshot makes the loop cut decline
+                    // a box the entry contract does not carry.
+                    Some(v)
+                        if v.is_input_arg()
+                            && (0..trace_ctx.virtualizable_boxes_len().unwrap_or(0))
+                                .any(|i| trace_ctx.virtualizable_box_at(i) == Some(v)) =>
+                    {
+                        v
+                    }
                     _ => OpRef::const_ptr(majit_ir::GcRef(0)),
                 },
                 _ => fallback(),
@@ -7227,6 +7412,10 @@ struct InflightForiter {
     item: pyre_object::PyObjectRef,
     body: InflightForiterBody,
     body_effect_since_consume: bool,
+    /// [`fbw_bridge_iter_journal_capture`] pushed a cursor for this consume.
+    /// False for a generator, `map`, dict/set iterator, itertools, or user
+    /// `__next__`: entry replay would call `__next__` again.
+    consume_journaled: bool,
     /// The walk re-reached this FOR_ITER's consume after the item's body ran
     /// (a NEW `for_iter_next` attempt was dispatched for the same body).
     /// A completed entry must never be re-delivered — its body already ran
@@ -14313,7 +14502,7 @@ fn handle<Sym: WalkSym>(
                 })
                 .flatten();
             if let Some(callee_code) = callee_code {
-                let callee_key = crate::driver::make_green_key(
+                let callee_key = crate::driver::make_green_key_typed(
                     callee_code as *const (),
                     next_instr,
                     is_being_profiled,
@@ -14326,7 +14515,7 @@ fn handle<Sym: WalkSym>(
                 ];
                 let red_types = [Type::Ref, Type::Ref];
                 if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
-                    callee_key,
+                    &callee_key,
                     &greenboxes,
                     &red_types,
                 ) {
@@ -14363,7 +14552,7 @@ fn handle<Sym: WalkSym>(
                         })
                         .flatten();
                     if let Some(callee_code) = callee_code {
-                        let callee_key = crate::driver::make_green_key(
+                        let callee_key = crate::driver::make_green_key_typed(
                             callee_code as *const (),
                             next_instr,
                             is_being_profiled,
@@ -14376,7 +14565,7 @@ fn handle<Sym: WalkSym>(
                         ];
                         let red_types = [Type::Ref, Type::Ref];
                         if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
-                            callee_key,
+                            &callee_key,
                             &greenboxes,
                             &red_types,
                         ) {

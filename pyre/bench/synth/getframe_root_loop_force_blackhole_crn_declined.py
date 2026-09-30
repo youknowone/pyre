@@ -12,7 +12,7 @@ import sys
 def main():
     total = 0
     names = set()
-    for i in range(20000):
+    for i in range(600000):
         fr = sys._getframe(0)
         names.add(len(fr.f_locals))
         total += i

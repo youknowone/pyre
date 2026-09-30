@@ -16,7 +16,7 @@
 #
 # Guarding it post-drive is NOT sufficient and this fixture also pins that: a
 # post-drive decline discards a region the drive already executed and hands it
-# back to the replay, which turned 199990000 into 200005595.
+# back to the replay, which turned sum(range(20000)) == 199990000 into 200005595.
 #
 # This shape is also the one that exposed the two defects behind that NULL. The
 # image seeded only the colors live at the build pc rather than the whole
@@ -48,7 +48,7 @@ import sys
 def main():
     total = 0
     names = set()
-    for i in range(20000):
+    for i in range(600000):
         fr = sys._getframe(0)
         names.add(fr.f_code.co_name)
         total += i

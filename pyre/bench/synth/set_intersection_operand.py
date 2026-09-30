@@ -33,7 +33,7 @@ def iu(a, b):
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(160000))
     # self longer than the other -> the other's object survives
     m("iu_int_float", lambda: iu({1, 2}, [1.0]))
     m("and_int_float", lambda: s({1, 2} & {1.0}))

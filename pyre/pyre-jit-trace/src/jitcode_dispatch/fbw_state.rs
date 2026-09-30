@@ -1204,32 +1204,36 @@ fn fbw_bridge_cursor_journal_push(
     });
 }
 
-/// Snapshot `iter`'s cursor before a bridge/retrace walk advances it eagerly,
-/// so [`fbw_bridge_iter_journal_rollback`] can put it back on a walk that does
-/// not commit.  The range and zip FOR_ITER specializations journal their own
-/// advance; this is the same snapshot for every advance that reaches the
-/// generic `for_iter_next` residual instead.
+/// Whether [`fbw_bridge_iter_journal_capture`] can record `iter`.
 ///
-/// Journals the three kinds whose successful advance moves only a cursor.  For
-/// every other kind — a generator, a user `__next__`, an itertools iterator, a
-/// sequence iterator reading through `__getitem__` — the advance is
-/// irreversible and nothing is recorded, so a walk that does not commit still
-/// loses the item it consumed.  A machine-word `range` is absent because it
-/// never reaches this residual: `try_walker_specialize_for_iter_next` folds it
-/// and journals the fold's own advance.
-pub(crate) fn fbw_bridge_iter_journal_capture(iter: pyre_object::PyObjectRef) {
+/// List, list-reverse, and tuple iterators move only a cursor.  A generator,
+/// `map`, dict/set iterator, itertools iterator, or user `__next__` does not:
+/// nothing is recorded, and entry replay would call `__next__` again.
+/// `try_walker_specialize_for_iter_next` folds a machine-word `range` before
+/// this residual and journals that fold's own advance.
+pub(crate) fn fbw_bridge_iter_journalable(iter: pyre_object::PyObjectRef) -> bool {
     if iter.is_null() {
-        return;
+        return false;
+    }
+    unsafe {
+        pyre_object::is_list_iter(iter)
+            || pyre_object::is_list_reverse_iter(iter)
+            || pyre_object::is_tuple_iter(iter)
+    }
+}
+
+/// Snapshot `iter`'s cursor.  Returns whether a cursor entry was pushed.
+pub(crate) fn fbw_bridge_iter_journal_capture(iter: pyre_object::PyObjectRef) -> bool {
+    if !fbw_bridge_iter_journalable(iter) {
+        return false;
     }
     unsafe {
         let kind = if pyre_object::is_list_iter(iter) {
             BridgeIterKind::List
         } else if pyre_object::is_list_reverse_iter(iter) {
             BridgeIterKind::ListReverse
-        } else if pyre_object::is_tuple_iter(iter) {
-            BridgeIterKind::Tuple
         } else {
-            return;
+            BridgeIterKind::Tuple
         };
         let (pre_seq, pre_index) = match kind {
             BridgeIterKind::List => (
@@ -1247,6 +1251,7 @@ pub(crate) fn fbw_bridge_iter_journal_capture(iter: pyre_object::PyObjectRef) {
         };
         fbw_bridge_cursor_journal_push(kind, iter, pre_seq, pre_index);
     }
+    true
 }
 
 /// Non-commit epilogue for a bridge/retrace recording walk: restore each
@@ -1324,17 +1329,23 @@ pub(crate) fn fbw_bridge_iter_journal_clear() {
 pub(crate) fn fbw_foriter_inflight_capture(
     item: pyre_object::PyObjectRef,
     body: InflightForiterBody,
+    consume_journaled: bool,
 ) {
     FBW_FORITER_INFLIGHT.with(|c| {
         let mut stack = c.borrow_mut();
         // The "body effect since consume" window restarts at each consume:
         // only effects committed after THIS consume can double on a re-run of
         // THIS iteration's body (Finding #1).  A fresh entry starts clear.
+        // `consume_journaled` is the cursor snapshot from
+        // [`fbw_bridge_iter_journal_capture`] (or a range/zip fold's own push).
+        // An unjournaled consume is not replay-safe: `convert_and_run_from_pyjitpl`
+        // has to continue the frame, because entry replay calls `__next__` again.
         let entry = InflightForiter {
             item,
             body,
             body_effect_since_consume: false,
             body_completed: false,
+            consume_journaled,
         };
         let Some(_body_pc) = inflight_foriter_body_pc(body) else {
             // An unresolvable native coordinate cannot identify an existing
@@ -1359,6 +1370,13 @@ pub(crate) fn fbw_foriter_inflight_capture(
 /// counts as a body effect committed after the consume (Finding #1).
 pub(crate) fn fbw_foriter_inflight_active() -> bool {
     FBW_FORITER_INFLIGHT.with(|c| !c.borrow().is_empty())
+}
+
+/// An in-flight consume whose cursor [`fbw_bridge_iter_journal_capture`] did
+/// not record.  Entry replay would call `__next__` again;
+/// `convert_and_run_from_pyjitpl` continues the frame instead.
+pub(crate) fn fbw_foriter_unjournaled_consume() -> bool {
+    FBW_FORITER_INFLIGHT.with(|c| c.borrow().iter().any(|entry| !entry.consume_journaled))
 }
 
 /// Mark the in-flight entry for `body` body-completed: a NEW
@@ -1592,6 +1610,12 @@ thread_local! {
     /// reference, so it is not a GC root area the way the stash itself is.
     static FORITER_INFLIGHT_PENDING: std::cell::Cell<Option<(usize, usize)>> =
         const { std::cell::Cell::new(None) };
+    /// `consume_journaled` of the entry [`fbw_foriter_inflight_take`] last
+    /// handed out.  [`fbw_foriter_report_refused_header`] reads it: a journaled
+    /// cursor that [`fbw_bridge_iter_journal_rollback`] restored is re-read,
+    /// not lost.
+    static FORITER_INFLIGHT_PENDING_JOURNALED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 fn census_report_pending(outcome: super::ForiterInflightOutcome) {
@@ -1609,6 +1633,7 @@ pub fn fbw_foriter_report_delivered() {
     // The delivered item owns the advanced cursor.  Drop the pre-advance
     // snapshot so a later refuse cannot roll this consume back.
     fbw_bridge_iter_journal_clear();
+    FORITER_INFLIGHT_PENDING_JOURNALED.with(|slot| slot.set(false));
     census_report_pending(super::ForiterInflightOutcome::Delivered);
 }
 
@@ -1623,8 +1648,15 @@ pub fn fbw_foriter_report_refused_header() {
     // refusal below restores the cursor on the same reasoning, but only on its
     // no-committed-effect half: re-consuming re-runs the body, which would
     // double an effect that already stands on the live heap.
+    //
+    // A journaled cursor that this rollback (or the bridge epilogue's earlier
+    // one) put back is re-read by the resume, not lost.  An unjournaled consume
+    // has nothing to restore, so its item is dropped.
+    let journaled = FORITER_INFLIGHT_PENDING_JOURNALED.with(|slot| slot.replace(false));
     fbw_bridge_iter_journal_rollback();
-    crate::trace::fbw_diag::record_foriter_item_dropped();
+    if !journaled {
+        crate::trace::fbw_diag::record_foriter_item_dropped();
+    }
     census_report_pending(super::ForiterInflightOutcome::RefusedHeader);
 }
 
@@ -1752,6 +1784,7 @@ pub fn fbw_foriter_inflight_take(
     // header check, and counting the take as a delivery is what let a refusal
     // read as a success. Park the key for whichever of the two reports runs.
     FORITER_INFLIGHT_PENDING.with(|slot| slot.set(key));
+    FORITER_INFLIGHT_PENDING_JOURNALED.with(|slot| slot.set(stash.consume_journaled));
     if fbw_debug_abort_enabled() {
         eprintln!(
             "[fbw-foriter] deliver item=0x{:x} body_pc={} store_journal_len={store_len} \
@@ -1795,7 +1828,7 @@ mod foriter_delivery_tests {
     fn the_take_alone_records_no_outcome() {
         reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
 
         assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
 
@@ -1817,7 +1850,7 @@ mod foriter_delivery_tests {
     fn a_push_at_the_header_is_the_only_delivery() {
         reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
         assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
 
         fbw_foriter_report_delivered();
@@ -1834,7 +1867,7 @@ mod foriter_delivery_tests {
     fn a_header_refusal_is_not_a_delivery() {
         reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
         assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
 
         let before = dropped_tally();
@@ -1855,7 +1888,7 @@ mod foriter_delivery_tests {
     fn an_r1_refusal_is_its_own_column() {
         reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
         fbw_mark_foriter_body_effect_since_consume();
 
         let before = dropped_tally();
@@ -1879,8 +1912,8 @@ mod foriter_delivery_tests {
         reset();
         let outer = 1usize as pyre_object::PyObjectRef;
         let inner = 2usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(outer, InflightForiterBody::Py(6));
-        fbw_foriter_inflight_capture(inner, InflightForiterBody::Py(35));
+        fbw_foriter_inflight_capture(outer, InflightForiterBody::Py(6), false);
+        fbw_foriter_inflight_capture(inner, InflightForiterBody::Py(35), false);
 
         // Parked at the OUTER header, so the inner entry is the one destroyed.
         assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((outer, 6)));
@@ -1898,7 +1931,7 @@ mod foriter_delivery_tests {
     fn recorded_but_unexecuted_residual_keeps_consumed_item_for_replay() {
         fbw_store_journal_reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
         fbw_mark_unjournaled_effect(ResidualDecline::Symbolic);
 
         assert!(!fbw_foriter_any_body_effect_signal());
@@ -1938,8 +1971,8 @@ mod foriter_delivery_tests {
         fbw_store_journal_reset();
         let outer = 1usize as pyre_object::PyObjectRef;
         let inner = 2usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(outer, InflightForiterBody::Py(6));
-        fbw_foriter_inflight_capture(inner, InflightForiterBody::Py(35));
+        fbw_foriter_inflight_capture(outer, InflightForiterBody::Py(6), false);
+        fbw_foriter_inflight_capture(inner, InflightForiterBody::Py(35), false);
 
         // Parked at the OUTER header (pc 5), whose fallthrough body pc is 6.
         assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((outer, 6)));
@@ -1955,8 +1988,8 @@ mod foriter_delivery_tests {
         fbw_store_journal_reset();
         let older = 1usize as pyre_object::PyObjectRef;
         let newer = 2usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(older, InflightForiterBody::Py(6));
-        fbw_foriter_inflight_capture(newer, InflightForiterBody::Py(35));
+        fbw_foriter_inflight_capture(older, InflightForiterBody::Py(6), false);
+        fbw_foriter_inflight_capture(newer, InflightForiterBody::Py(35), false);
 
         assert_eq!(fbw_foriter_inflight_take(0, 0, 99), Some((newer, 35)));
 
@@ -2005,7 +2038,7 @@ mod foriter_delivery_tests {
     fn a_rolled_back_namespace_binding_refuses_consumed_item_delivery() {
         fbw_store_journal_reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
         fbw_namespace_store_mark_rolled_back();
 
         assert!(fbw_namespace_store_rolled_back());
@@ -2022,7 +2055,7 @@ mod foriter_delivery_tests {
     fn executed_body_effect_still_refuses_consumed_item_delivery() {
         fbw_store_journal_reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
         fbw_mark_foriter_body_effect_since_consume();
 
         assert!(fbw_foriter_any_body_effect_signal());
@@ -2745,11 +2778,15 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
         // `fbw_foriter_inflight_take` refuses that very item, and the legacy
         // path then drops it.  Arm the conversion on the same signal the
         // refusal reads, so the item is carried forward instead of lost.
+        // An unjournaled consume is the same hole with the body-effect signal
+        // clear: entry replay calls `__next__` again.
+        // `convert_and_run_from_pyjitpl` continues the framestack instead.
         let blackhole_required = session
             .framestack
             .last()
             .is_some_and(|frame| fbw_executed_effect_count() != frame.entry_executed_effects)
-            || (fbw_foriter_inflight_active() && fbw_foriter_any_body_effect_signal());
+            || (fbw_foriter_inflight_active()
+                && (fbw_foriter_any_body_effect_signal() || fbw_foriter_unjournaled_consume()));
         (outer_resume, stack_overrides, blackhole_required)
     };
     FBW_ABORT_OUTER_RESUME.with(|c| c.set(outer_resume));

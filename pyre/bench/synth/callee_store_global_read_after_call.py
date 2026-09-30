@@ -3,7 +3,7 @@
 # reload the global after the call even though the module-dict binding and its
 # quasi-immutable version did not change.
 MOD = 999983
-COUNT = 15797
+COUNT = 473910
 VALUE = 48
 FLAG = 1
 

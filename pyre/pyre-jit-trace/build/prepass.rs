@@ -1120,6 +1120,14 @@ fn real_main() {
                     "opcode_ops",
                     "compare_value_from_tag",
                 ]),
+                // `W_FastListIterObject.descr_next` is residual `jit_next`.
+                // The portal never calls this split, so the descent looks the
+                // body up by this one graph key.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "baseobjspace",
+                    "list_iter_descr_next",
+                ]),
             ],
             jit_drivers: vec![
                 majit_translate::JitDriverSpec {

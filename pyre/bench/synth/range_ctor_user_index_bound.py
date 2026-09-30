@@ -6,7 +6,7 @@
 # `compute_range_length` (functional.py:42-53) on the recorded path: the
 # step-sign guard, the emptiness guard and the overflow guards all come from
 # the source's own conditionals.
-N = 40000
+N = 240000
 
 
 class Index:
@@ -29,4 +29,4 @@ def main():
 
 
 main()
-# Expected: 188564
+# Expected: 1131421

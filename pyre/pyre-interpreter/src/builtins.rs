@@ -3440,7 +3440,7 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         make_module_builtin_function("sorted", crate::app_functional::__majit_wrap_builtin_sorted)
     });
     crate::module_ns_get_or_insert_with(ns, "iter", || {
-        make_module_builtin_function("iter", builtin_iter)
+        make_module_builtin_function("iter", __majit_wrap_builtin_iter)
     });
     crate::module_ns_get_or_insert_with(ns, "next", || {
         make_module_builtin_function("next", builtin_next)
@@ -4132,7 +4132,7 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         make_module_builtin_function("divmod", builtin_divmod)
     });
     crate::module_ns_get_or_insert_with(ns, "pow", || {
-        make_module_builtin_function("pow", builtin_pow)
+        make_module_builtin_function("pow", __majit_wrap_builtin_pow)
     });
     crate::module_ns_get_or_insert_with(ns, "hex", || {
         make_module_builtin_function("hex", builtin_hex)
@@ -7206,6 +7206,11 @@ pub(crate) fn type_of_object(obj: PyObjectRef) -> PyObjectRef {
     if let Some(tp) = crate::typedef::r#type(obj) {
         return tp.as_ptr();
     }
+    type_of_object_unnamed(obj)
+}
+
+#[majit_macros::dont_look_inside]
+fn type_of_object_unnamed(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
         return crate::typedef::gettypeobject(&pyre_object::pyobject::NONE_TYPE);
     }
@@ -13845,6 +13850,44 @@ pub(crate) fn super_check(
          or subtype of type ({start_type_name})."
     )))
 }
+
+/// `operation.py iter`. An omitted sentinel (`w_sentinel is None` — the
+/// unwrapped default, not an explicit `None`) is `space.iter`. Two arguments
+/// are `iter_sentinel`: a non-callable raises, otherwise
+/// `_CallableIterator(callable_, sentinel)`. Keywords are rejected by the
+/// same binding `builtin_iter` runs (`iter()` takes no keyword arguments);
+/// an empty `**{}` is not a sentinel.
+pub fn __majit_wrap_builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_iter(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_builtin_iter_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_builtin_iter"),
+        func: __majit_wrap_builtin_iter,
+    };
+
+/// `operation.py _CallableIterator.__iter__` — return self. A keyword or a
+/// surplus positional is the positional-only binding's TypeError, not a
+/// second body.
+pub fn __majit_wrap_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 1 {
+        crate::gateway::check_declared_positional_arity("__iter__", 1, args)?;
+    }
+    Ok(args[0])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_iter_self_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_iter_self"),
+        func: __majit_wrap_iter_self,
+    };
 
 /// `iter(obj)` / `iter(callable, sentinel)` — PyPy:
 /// `module/__builtin__/operation.py` iter
@@ -24823,6 +24866,23 @@ pub(crate) fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     crate::baseobjspace::divmod(args[0], args[1])
 }
 
+/// `operation.py pow` — `space.pow(w_base, w_exp, w_mod)` with
+/// `w_mod=WrappedDefault(None)`. Binding, including `mod=`, stays in
+/// [`builtin_pow`]; three ints then reach `descroperation::pow3`, the int
+/// `descr_pow`, and `_pow_mod`.
+pub fn __majit_wrap_builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_pow(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_builtin_pow_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_builtin_pow"),
+        func: __majit_wrap_builtin_pow,
+    };
+
 /// `pow(base, exp[, mod])` — pypy/interpreter/baseobjspace.py pow row.
 fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `pow(base, exp, mod=None)`: all positional-or-keyword; at most three.
@@ -24840,11 +24900,10 @@ fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         crate::PyError::type_error("pow() missing required argument 'exp' (pos 2)")
     })?;
     kwarg_reject_unknown(kwargs, &["base", "exp", "mod"], "pow")?;
-    let modulus = bind_pos_or_kw(pos, kwargs, 2, "mod", "pow", 3)?;
-    match modulus {
-        Some(m) if !unsafe { pyre_object::is_none(m) } => crate::baseobjspace::pow3(base, exp, m),
-        _ => crate::baseobjspace::pow(base, exp),
-    }
+    // `WrappedDefault(None)`: an omitted modulus arrives as `w_None`, and
+    // `descroperation.py pow` turns that into the two-argument form.
+    let modulus = bind_pos_or_kw(pos, kwargs, 2, "mod", "pow", 3)?.unwrap_or_else(w_none);
+    crate::objspace::descroperation::pow3(base, exp, modulus)
 }
 
 /// Coerce `obj` to a `BigInt` through the index protocol (`space.index`), so

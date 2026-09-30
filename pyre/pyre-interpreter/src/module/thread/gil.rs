@@ -8,7 +8,6 @@
 //! which yields the GIL every `sys.getcheckinterval()` bytecodes.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::executioncontext::{
     AsyncAction, AsyncActionControl, AsyncActionOps, ExecutionContext, PeriodicAsyncAction,
@@ -90,27 +89,24 @@ pub(super) fn walk_action_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     }
 }
 
-/// gil.py `GILThreadLocals.gil_ready`, quasi-immutable and "changed (to
-/// True) only if it was really False before". It belongs to the object space,
-/// and pyre runs one per process, so the space slot is a process-global. Its
-/// writer holds the GIL, which is what upstream's plain attribute assignment
-/// relies on too.
-static GIL_READY: AtomicBool = AtomicBool::new(false);
-
 /// gil.py `GILThreadLocals.setup_threads` — "enable threads in the object
 /// space, if they haven't already been". Returns whether this call is the one
 /// that set them up, which is a property of the space and not of the calling
 /// thread.
+///
+/// The flag itself is `pyre_object::gil_ready` (`gil_ready?`). This function
+/// still allocates before publishing, and the publish invalidates traces
+/// that folded the zero.
 pub fn setup_threads(ec: &mut ExecutionContext) -> bool {
     debug_assert!(
         majit_gc::rgil::am_i_holding_the_gil(),
         "setup_threads needs the GIL"
     );
-    let first = !GIL_READY.load(Ordering::Acquire);
+    let first = !pyre_object::gil_ready::gil_ready_is_set();
     if first {
-        // gil.py:29-31 allocates before publishing the flag.
+        // gil.py `setup_threads` allocates before publishing the flag.
         majit_gc::rgil::allocate();
-        GIL_READY.store(true, Ordering::Release);
+        pyre_object::gil_ready::publish_gil_ready();
     }
     initialize(ec);
     first
@@ -119,5 +115,5 @@ pub fn setup_threads(ec: &mut ExecutionContext) -> bool {
 /// gil.py `GILThreadLocals.threads_initialized`, reached through
 /// `os_thread.py threads_initialized(space)`.
 pub fn threads_initialized() -> bool {
-    GIL_READY.load(Ordering::Acquire)
+    pyre_object::gil_ready::gil_ready_is_set()
 }

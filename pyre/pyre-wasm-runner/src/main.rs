@@ -364,6 +364,13 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     // belongs to the wasm host boundary; the shared frontend optimizer and IR
     // are unchanged.
     config.cranelift_opt_level(OptLevel::SpeedAndSize);
+    // `ru_utime` sums every Cranelift worker. A bridge-heavy fixture
+    // compiles dozens of few-kilobyte modules; the pool's extra user time
+    // is what `inline_bignum_bridge_twoclamp` spent above dynasm (measured
+    // 0.57s -> 0.36s, compile wall unchanged at ~120ms). One thread keeps
+    // that user time on the compile itself. The main module arrives from
+    // `.cwasm`, so this does not redo its cached compile.
+    config.parallel_compilation(false);
     // JIT trace modules emit `return_call_indirect` to chain a loop-closing bridge
     // back into its loop at constant stack depth (the tail-call proposal).
     config.wasm_tail_call(true);

@@ -1,6 +1,6 @@
 # CALL_INTRINSIC_1/UnaryPositive in a hot FOR_ITER body. This is one of the two
 # variants with a codewriter residual; the other variants remain gate declines.
-N = 40000
+N = 1200000
 
 
 def main():
@@ -11,4 +11,4 @@ def main():
 
 
 main()
-# Expected: 799980000
+# Expected: 719999400000

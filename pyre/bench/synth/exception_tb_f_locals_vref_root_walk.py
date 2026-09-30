@@ -24,7 +24,7 @@
 # five trace shapes observed on dynasm, cranelift, and wasm, so an interpreted
 # fallback cannot make this test pass vacuously.
 
-N = 15000
+N = 90000
 
 
 def mid(i):

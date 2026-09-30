@@ -28,6 +28,6 @@ except ImportError:
 acc = 0
 # The graph is declined on its first recording attempts and then blacklisted;
 # this count clears both the tracing threshold and that decline sequence.
-for i in range(100):
+for i in range(3000):
     acc = (acc + f(i)) % M
 print(acc)

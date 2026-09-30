@@ -4727,6 +4727,56 @@ pub fn type_call_instantiate_with_kwargs(
 /// Type call without a PyFrame.
 /// PyPy: typeobject.py descr_call
 fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+    // One-argument `type(x)` is `type_call_special_case` before any
+    // allocation. The instantiation tail is a separate graph.
+    if let Some(result) = type_call_special_case(w_type, args, false) {
+        return match result {
+            Ok(value) => value,
+            Err(error) => {
+                set_call_error(error);
+                PY_NULL
+            }
+        };
+    }
+    type_descr_call_instantiate(w_type, args)
+}
+
+/// Gateway the tracer enters for one-argument `type(x)`.
+///
+/// `StdObjSpace.type`: promote the RPython class (`ob_type`, the storage
+/// layout) and then `getclass`. The app-level `w_class` is not the word
+/// promoted — a polymorphic iteration retraces once per class.
+pub fn __majit_wrap_type_query(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    if args.len() != 1 {
+        return Err(PyError::type_error("type() takes 1 or 3 arguments"));
+    }
+    Ok(type_query(args[0]))
+}
+
+fn type_query(w_obj: PyObjectRef) -> PyObjectRef {
+    if !w_obj.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(w_obj))
+    {
+        let ob_type = unsafe { (*w_obj).ob_type };
+        let _ = majit_metainterp::jit::promote(ob_type);
+    }
+    // `W_Root.getclass` — `typedef::type`, traced. The unnamed fallback
+    // inside `type_of_object` is only the pre-init layout with no class.
+    crate::builtins::type_of_object(w_obj)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_type_query_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_type_query"),
+        func: __majit_wrap_type_query,
+    };
+
+#[majit_macros::dont_look_inside]
+fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     // typeobject.py descr_call keeps `w_type`, every argument, and the new
     // instance live across both Python calls.  In translated RPython the GC
     // transform reloads these from shadow-stack slots after `__new__`; Rust

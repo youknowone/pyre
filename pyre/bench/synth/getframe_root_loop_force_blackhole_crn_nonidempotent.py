@@ -11,8 +11,8 @@
 # post-drive decline are invisible once the frame is restored: the local comes
 # back with the undo, and re-running `set.add` of the same string changes
 # nothing.  A list append does not have that property.  With the CRN arm forced
-# to decline, that sibling prints its correct 199990000 while this file prints
-# 20005 appends for 20000 iterations — one extra per declined drive.
+# to decline, that sibling prints its correct 199990000 while a 20000-iteration run of this shape printed
+# 20005 appends — one extra per declined drive.
 #
 # That is the measurement behind `adopt_blackhole_crn`: a decline taken after
 # the drive cannot be repaired by any frame-level undo, because the residual
@@ -25,7 +25,7 @@ import sys
 def main():
     total = 0
     seen = []
-    for i in range(20000):
+    for i in range(600000):
         fr = sys._getframe(0)
         seen.append(fr.f_code.co_name)
         total += i

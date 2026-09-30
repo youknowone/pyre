@@ -359,11 +359,10 @@ pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
     }
     unsafe {
         // Trust a specialised `w_class` for every object, exception or not.
-        // The generic `EXCEPTION_TYPE` stub is *not* the real class — only
+        // The generic `EXCEPTION_TYPE` stub is not the real class — only
         // then walk the `ExcKind` registry (`lookup_exc_class_for_kind`).
-        // Checking the stub after the field read (instead of `is_exception`
-        // first) keeps `type()` of ints/lists/specialised exceptions off
-        // the `ll_isinstance` range walk.
+        // Checking the stub after the field read keeps `type()` of
+        // ints/lists/specialised exceptions off the `ll_isinstance` range walk.
         let w_class = (*obj).w_class;
         if !w_class.is_null() {
             let exc_stub =
@@ -382,10 +381,9 @@ pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
         if !w_class.is_null() {
             return NonNull::new(w_class);
         }
-        // Fallback for objects created before init_typeobjects (None, True,
-        // False, Ellipsis, NotImplemented). These are `static`s in RODATA,
-        // so writing to (*obj).w_class would SIGBUS — just look it up via
-        // gettypefor(), which reads an AtomicPtr on the PyType.
+        // Objects created before init_typeobjects (None, True, False,
+        // Ellipsis, NotImplemented) are `static`s in RODATA, so writing
+        // `(*obj).w_class` would SIGBUS. `gettypefor` reads the `PyType`.
         let tp = (*obj).ob_type;
         gettypefor(tp)
     }
@@ -1109,6 +1107,24 @@ pub fn init_typeobjects() {
         reg.insert(
             &pyre_object::interp_sre::SRE_SCANNER_TYPE as *const PyType as usize,
             sre_scanner_type as usize,
+        );
+
+        // `_sre.SRE_Template` — `sre.c template_spec`. Not added to the module
+        // dict (`CREATE_TYPE` keeps it in module state). Immutable and not
+        // instantiable.
+        let sre_template_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
+            "_sre.SRE_Template",
+            crate::module::_sre::interp_sre::init_sre_template_type,
+            object_type,
+        ));
+        mark_cpython_heap_type(sre_template_type, true);
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(sre_template_type, false);
+            pyre_object::w_type_set_disallow_instantiation(sre_template_type);
+        }
+        reg.insert(
+            &pyre_object::interp_sre::SRE_TEMPLATE_TYPE as *const PyType as usize,
+            sre_template_type as usize,
         );
 
         // bytearray — PyPy: bytearrayobject.py, bases=(object,)
@@ -30496,8 +30512,16 @@ fn coroutine_get_frame(args: &[PyObjectRef]) -> crate::PyResult {
     // CPython 3.14 releases a temporary coroutine immediately after
     // `f().cr_frame`; schedule pyre's tracing-GC equivalent for the next
     // opcode, when the getter receiver is no longer rooted by LOAD_ATTR.
+    // A running coroutine stays rooted by its executing frame and an
+    // exhausted one has nothing left to finalize, so neither can be observed
+    // through that pass.
+    let obj = args[1];
+    let observable = unsafe {
+        !pyre_object::generator::w_generator_is_running(obj)
+            && !pyre_object::generator::w_generator_is_exhausted(obj)
+    };
     let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
-    if !ec.is_null() {
+    if observable && !ec.is_null() {
         unsafe { (*ec).finalize_discarded_coroutine_after_frame_get() };
     }
     Ok(frame)
@@ -31544,7 +31568,7 @@ fn init_callable_iterator_type(ns: PyObjectRef) {
     for (name, function) in [
         (
             "__iter__",
-            crate::baseobjspace::iter_self_method as fn(&[PyObjectRef]) -> crate::PyResult,
+            crate::builtins::__majit_wrap_iter_self as fn(&[PyObjectRef]) -> crate::PyResult,
         ),
         ("__next__", crate::baseobjspace::iter_next_method),
         (

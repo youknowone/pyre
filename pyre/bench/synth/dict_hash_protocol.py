@@ -25,7 +25,7 @@ class RaisingHash:
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(225000))
     # fromkeys must run the hash protocol: a raising __hash__ propagates
     m("fromkeys_raising_hash", lambda: dict.fromkeys([RaisingHash()]))
     m("fromkeys_raising_hash_2nd", lambda: dict.fromkeys([1, RaisingHash()]))

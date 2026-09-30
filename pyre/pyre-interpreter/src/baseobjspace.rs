@@ -18249,32 +18249,70 @@ fn groupby_step(obj: PyObjectRef) -> Result<(), PyError> {
     Ok(())
 }
 
+/// `iterobject.py` `W_FastListIterObject.descr_next`. Read the list's
+/// current length on every step so appends are observed and removals can
+/// end iteration. Exhaustion clears the source reference. A negative cursor
+/// is the `__setstate__` exhausted sentinel; it keeps the source list so an
+/// in-range `__setstate__` can revive the iterator.
+unsafe fn list_iter_descr_next(obj: PyObjectRef) -> PyResult {
+    let seq = pyre_object::w_list_iter_seq(obj);
+    if seq.is_null() {
+        return Err(PyError::stop_iteration());
+    }
+    let index = pyre_object::w_list_iter_index(obj);
+    if index < 0 {
+        return Err(PyError::stop_iteration());
+    }
+    // `gil.py` `GILThreadLocals.gil_ready` (`_immutable_fields_ =
+    // ['gil_ready?']`). While that word is still 0 the process has no
+    // other thread (`setup_threads` publishes it before `spawn`), so the
+    // stripe lock `w_list_getitem` holds is not taken. A trace that folded
+    // the zero fails `GUARD_NOT_INVALIDATED` on publication and retraces
+    // with the acquire/release calls. The lock body stays
+    // `dont_look_inside`; only the untaken call is absent from the trace.
+    let ready = pyre_object::gil_ready::gil_ready_word();
+    // A contended stripe parks in `before_external_block`, and the inner get
+    // boxes an int or a float. Both collect. The pins stay up through that
+    // get and the iterator update; the iterator is read back after the get.
+    // The zero arm stays free of the bracket, so a trace of an unpublished
+    // `gil_ready` does not residualize it.
+    let lock_roots: Option<pyre_object::gc_roots::RootScope>;
+    let root_base;
+    let (lock, seq) = if ready == 0 {
+        lock_roots = None;
+        root_base = 0;
+        (0, seq)
+    } else {
+        lock_roots = Some(pyre_object::gc_roots::push_roots());
+        root_base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::publish_roots(&[obj, seq]);
+        pyre_object::gc_roots::normalize_roots(root_base, 2);
+        let seq = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let lock = pyre_object::w_list_lock_acquire(seq);
+        (lock, pyre_object::gc_roots::shadow_stack_get(root_base + 1))
+    };
+    let item = pyre_object::w_list_getitem_inner(seq, pyre_object::seq_index_to_i64(index));
+    if lock != 0 {
+        pyre_object::w_list_lock_release(lock);
+    }
+    let obj = if lock_roots.is_some() {
+        pyre_object::gc_roots::shadow_stack_get(root_base)
+    } else {
+        obj
+    };
+    if let Some(item) = item {
+        pyre_object::w_list_iter_set_index(obj, index + 1);
+        return Ok(item);
+    }
+    pyre_object::w_list_iter_set_seq(obj, PY_NULL);
+    Err(PyError::stop_iteration())
+}
+
 /// `next(iterator)` — PyPy: space.next(w_iter)
 pub fn next(obj: PyObjectRef) -> PyResult {
     unsafe {
-        // iterobject.py W_FastListIterObject.descr_next — read the list's
-        // current length on every step so appends are observed and removals
-        // can end iteration. Exhaustion clears the source reference.
         if pyre_object::is_list_iter(obj) {
-            let seq = pyre_object::w_list_iter_seq(obj);
-            if seq.is_null() {
-                return Err(PyError::stop_iteration());
-            }
-            let index = pyre_object::w_list_iter_index(obj);
-            // A negative cursor is the `__setstate__` exhausted sentinel; it
-            // keeps the source list so an in-range `__setstate__` can revive
-            // the iterator, unlike running off the end.
-            if index < 0 {
-                return Err(PyError::stop_iteration());
-            }
-            if let Some(item) =
-                pyre_object::w_list_getitem(seq, pyre_object::seq_index_to_i64(index))
-            {
-                pyre_object::w_list_iter_set_index(obj, index + 1);
-                return Ok(item);
-            }
-            pyre_object::w_list_iter_set_seq(obj, PY_NULL);
-            return Err(PyError::stop_iteration());
+            return list_iter_descr_next(obj);
         }
         // iterobject.py W_ReverseSeqIterObject.descr_next. A list mutation
         // that removes the current index exhausts the iterator; growth at the

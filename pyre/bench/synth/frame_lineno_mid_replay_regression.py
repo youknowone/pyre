@@ -32,7 +32,7 @@
 # blackhole replaying a `setfield_vable_i` at the neighbouring offset.
 import sys
 
-N = 4000
+N = 120000
 
 
 def caller_offset():
