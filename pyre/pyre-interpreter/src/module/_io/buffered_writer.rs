@@ -74,6 +74,8 @@ pub struct W_BufferedWriter {
     readable: bool,
     writable: bool,
     lock: usize,
+    // interp_iobase.py W_IOBase.w_dict — null until getdict.
+    pub(crate) w_dict: PyObjectRef,
 }
 
 impl Default for W_BufferedWriter {
@@ -93,6 +95,7 @@ impl Default for W_BufferedWriter {
             readable: false,
             writable: false,
             lock: 0,
+            w_dict: PY_NULL,
         }
     }
 }

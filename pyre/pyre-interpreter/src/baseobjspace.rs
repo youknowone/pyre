@@ -5914,6 +5914,10 @@ pub fn getdict(mut obj: PyObjectRef) -> PyResult {
     if unsafe { pyre_object::is_exception(obj) } {
         return Ok(unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) });
     }
+    // interp_iobase.py W_IOBase.getdict
+    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+        return Ok(unsafe { crate::module::_io::iobase_getdict(obj) });
+    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => return Ok(pyre_object::PY_NULL),
@@ -6069,6 +6073,12 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
         require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::interp_exceptions::w_exception_setdict(obj, w_dict) };
         return Ok(());
+    }
+    // [3.14-spec] AttributeError ↔ pypy TypeError (W_Root.setdict); both refuse the write
+    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+        return Err(PyError::attribute_error(
+            "attribute '__dict__' of '_io._IOBase' objects is not writable",
+        ));
     }
     // W_TypeObject and Module keep their namespace mappings as readonly
     // attributes.  Their Python class/metaclass may itself inherit a regular
@@ -6235,10 +6245,23 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
             )
         };
     }
+    // interp_iobase.py W_IOBase.getdictvalue — a null w_dict is a miss
+    // and does not allocate the dictionary.
+    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+        return unsafe { crate::module::_io::iobase_getdictvalue(obj, name) };
+    }
     // `getdict` can run `_thread._local` Python and allocate.  After a
     // red `has_mapdict_storage` the descent scan cannot prove the
     // mapdict arm, so keep this fallback off the look-inside graph.
     getdictvalue_via_dict(obj, name)
+}
+
+/// `interp_iobase.py W_IOBase.w_dict` without allocating it.
+/// `Some(PY_NULL)` is a typed IO payload whose dictionary has not been
+/// created; `None` is every other layout.
+fn iobase_peek_dict(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let slot = unsafe { crate::module::_io::iobase_payload_dict_slot(obj) }?;
+    Some(unsafe { *slot })
 }
 
 /// Non-mapdict arm of [`getdictvalue`]: materialise the instance dict
@@ -7560,7 +7583,13 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         // against whatever each colliding bucket holds, so a stored non-string
         // key can run a user `__eq__` that raises, and the swallowing spelling
         // would read that back as an absent attribute.
-        let w_dict = pyre_object::with_roots!(obj, w_name, w_type => getdict_backing(obj))?;
+        // interp_iobase.py W_IOBase.getdictvalue reads w_dict without
+        // allocating it. A surrogate name still probes that dict when
+        // one already exists.
+        let w_dict = match iobase_peek_dict(obj) {
+            Some(w_dict) => w_dict,
+            None => pyre_object::with_roots!(obj, w_name, w_type => getdict_backing(obj))?,
+        };
         if !w_dict.is_null()
             && let Some(v) = pyre_object::with_roots!(obj, w_type => finditem(w_dict, w_name))?
             && !v.is_null()
@@ -9656,7 +9685,14 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
     // prefix selected by `typedef.py:175-187`. The early descriptor-protocol
     // block does not cover every such receiver, so perform the corresponding
     // `MapdictDictSupport.getdict` lookup here as well.
-    let w_dict = getdict_backing(obj)?;
+    //
+    // interp_iobase.py W_IOBase.getdictvalue already ran in the hasdict
+    // block above. `getdict` here would allocate an empty `w_dict` on a miss.
+    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let w_dict = match iobase_peek_dict(obj) {
+        Some(w_dict) => w_dict,
+        None => getdict_backing(obj)?,
+    };
     obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     if !w_dict.is_null() {
         // `w_dict` may use MapDictStrategy, whose storage is the backing
@@ -12336,6 +12372,10 @@ pub unsafe fn bound_method_attr_fast_path_wtf8(
     let owes_shadow_guard = is_instance(w_obj) || pyre_object::is_exception(w_obj);
     if owes_shadow_guard {
         unsafe { instance_dict_does_not_shadow_wtf8(w_obj, name)? };
+    } else if iobase_peek_dict(w_obj).is_some() {
+        // interp_iobase.py W_IOBase.getdictvalue leaves a null w_dict
+        // untouched. No tracer guard covers the slot, so the fold declines.
+        return None;
     } else if !pyre_object::with_roots!(w_type => getdict_backing_native(w_obj)).is_null() {
         return None;
     }

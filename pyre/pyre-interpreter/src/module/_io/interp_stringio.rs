@@ -19,6 +19,8 @@ pub struct W_StringIO {
     readuniversal: bool,
     readtranslate: bool,
     w_decoder: PyObjectRef,
+    // interp_iobase.py W_IOBase.w_dict — null until getdict.
+    pub(crate) w_dict: PyObjectRef,
 }
 
 impl Default for W_StringIO {
@@ -33,6 +35,7 @@ impl Default for W_StringIO {
             readuniversal: false,
             readtranslate: false,
             w_decoder: PY_NULL,
+            w_dict: PY_NULL,
         }
     }
 }

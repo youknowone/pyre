@@ -22,6 +22,8 @@ pub struct W_WinConsoleIO {
     finalizing: bool,
     blksize: i64,
     smallbuf: [u8; SMALLBUF],
+    // interp_iobase.py W_IOBase.w_dict — null until getdict.
+    pub(crate) w_dict: PyObjectRef,
 }
 
 impl Default for W_WinConsoleIO {
@@ -35,6 +37,7 @@ impl Default for W_WinConsoleIO {
             finalizing: false,
             blksize: super::DEFAULT_BUFFER_SIZE,
             smallbuf: [0; SMALLBUF],
+            w_dict: PY_NULL,
         }
     }
 }

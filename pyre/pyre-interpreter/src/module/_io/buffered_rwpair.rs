@@ -10,6 +10,8 @@ use super::DEFAULT_BUFFER_SIZE;
 pub struct W_BufferedRWPair {
     w_reader: PyObjectRef,
     w_writer: PyObjectRef,
+    // interp_iobase.py W_IOBase.w_dict — null until getdict.
+    pub(crate) w_dict: PyObjectRef,
 }
 
 impl Default for W_BufferedRWPair {
@@ -18,6 +20,7 @@ impl Default for W_BufferedRWPair {
             ob: PyObject::default(),
             w_reader: PY_NULL,
             w_writer: PY_NULL,
+            w_dict: PY_NULL,
         }
     }
 }

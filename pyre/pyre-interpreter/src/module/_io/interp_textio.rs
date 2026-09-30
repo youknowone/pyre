@@ -294,6 +294,8 @@ pub struct W_TextIOWrapper {
     seekable_flag: bool,
     telling: bool,
     encoding_start_of_stream: bool,
+    // interp_iobase.py W_IOBase.w_dict — null until getdict.
+    pub(crate) w_dict: PyObjectRef,
 }
 
 impl Default for W_TextIOWrapper {
@@ -322,6 +324,7 @@ impl Default for W_TextIOWrapper {
             seekable_flag: false,
             telling: false,
             encoding_start_of_stream: false,
+            w_dict: PY_NULL,
         }
     }
 }

@@ -40,6 +40,91 @@ pub(crate) fn is_stringio(obj: PyObjectRef) -> bool {
     W_StringIO::from_obj(obj).is_some()
 }
 
+/// Address of `interp_iobase.py W_IOBase.w_dict` when `obj` is one of the
+/// typed IO payloads. Subclass instances keep the base typeptr
+/// (`store_subclass_tag` writes `w_class` only), so the typeptr check
+/// covers them.
+///
+/// # Safety
+/// `obj` is null or a live object. The returned pointer is the field of
+/// that object and is valid for the object's lifetime.
+pub(crate) unsafe fn iobase_payload_dict_slot(obj: PyObjectRef) -> Option<*mut PyObjectRef> {
+    if obj.is_null() {
+        return None;
+    }
+    unsafe {
+        if let Some(inst) = W_BytesIO::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_StringIO::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_TextIOWrapper::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_BufferedReader::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_BufferedWriter::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_BufferedRandom::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_BufferedRWPair::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        if let Some(inst) = W_WinConsoleIO::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        None
+    }
+}
+
+/// `interp_iobase.py W_IOBase.getdict`. Allocates `w_dict` on the first call.
+///
+/// # Safety
+/// `obj` must be a payload [`iobase_payload_dict_slot`] recognises.
+pub(crate) unsafe fn iobase_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let slot = iobase_payload_dict_slot(obj).expect("typed IO payload");
+        if !(*slot).is_null() {
+            return *slot;
+        }
+        // The dict allocation can collect. Pin the receiver and re-resolve
+        // the field from the forwarded address before the store. The stored
+        // dict may be young, so the old payload takes the write barrier.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let w_dict = w_dict_new();
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let slot = iobase_payload_dict_slot(obj).expect("typed IO payload");
+        *slot = w_dict;
+        pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        w_dict
+    }
+}
+
+/// `interp_iobase.py W_IOBase.getdictvalue`. A null `w_dict` is a miss and
+/// does not allocate the dictionary.
+///
+/// # Safety
+/// `obj` must be a payload [`iobase_payload_dict_slot`] recognises.
+pub(crate) unsafe fn iobase_getdictvalue(
+    obj: PyObjectRef,
+    attr: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    unsafe {
+        let slot = iobase_payload_dict_slot(obj).expect("typed IO payload");
+        if (*slot).is_null() {
+            return Ok(None);
+        }
+        crate::baseobjspace::finditem_str(*slot, attr)
+    }
+}
+
 // CPython 3.14 raised the public and constructor default from 8 KiB to
 // 128 KiB.  Keep one module-owned value shared by every buffered type.
 pub(crate) const DEFAULT_BUFFER_SIZE: i64 = 128 * 1024;

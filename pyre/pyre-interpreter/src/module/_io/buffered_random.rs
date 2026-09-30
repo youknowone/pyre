@@ -25,6 +25,8 @@ pub struct W_BufferedRandom {
     readable: bool,
     writable: bool,
     lock: usize,
+    // interp_iobase.py W_IOBase.w_dict — null until getdict.
+    pub(crate) w_dict: PyObjectRef,
 }
 
 impl Default for W_BufferedRandom {
@@ -44,6 +46,7 @@ impl Default for W_BufferedRandom {
             readable: false,
             writable: false,
             lock: 0,
+            w_dict: PY_NULL,
         }
     }
 }

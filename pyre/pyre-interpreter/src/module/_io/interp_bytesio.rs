@@ -14,6 +14,8 @@ pub struct W_BytesIO {
     buffer: PyObjectRef,
     pos: i64,
     closed: bool,
+    // interp_iobase.py W_IOBase.w_dict — null until getdict.
+    pub(crate) w_dict: PyObjectRef,
 }
 
 impl Default for W_BytesIO {
@@ -23,6 +25,7 @@ impl Default for W_BytesIO {
             buffer: PY_NULL,
             pos: AT_END,
             closed: false,
+            w_dict: PY_NULL,
         }
     }
 }
@@ -573,5 +576,74 @@ impl W_BytesIO {
             super::call_method_result(own_dict, "update", &[w_dict])?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytesio_iobase_w_dict_skips_instance_dict() {
+        crate::test_hooks::install_hash_hook();
+        unsafe {
+            assert!(
+                W_BYTESIO_GC_PTR_OFFSETS.contains(&std::mem::offset_of!(W_BytesIO, w_dict)),
+                "pyre_class ptr_offsets must include w_dict"
+            );
+            let obj = W_BytesIO::allocate_stable(W_BytesIO::default());
+            assert!(!crate::objspace::std::mapdict::has_mapdict_storage(obj));
+            assert!(crate::baseobjspace::getdictvalue_native(obj, "x").is_none());
+            assert!(W_BytesIO::from_obj(obj).unwrap().w_dict.is_null());
+            let addr = obj as usize;
+            assert!(
+                !crate::objspace::std::mapdict::INSTANCE_DICT
+                    .lock()
+                    .contains_key(&addr)
+            );
+
+            let value = pyre_object::w_int_new(1);
+            assert!(crate::baseobjspace::setdictvalue(obj, "x", value).unwrap());
+            assert!(
+                !crate::objspace::std::mapdict::INSTANCE_DICT
+                    .lock()
+                    .contains_key(&addr)
+            );
+            let inst = W_BytesIO::from_obj(obj).unwrap();
+            assert!(!inst.w_dict.is_null());
+            assert_eq!(
+                pyre_object::w_dict_getitem_str(inst.w_dict, "x"),
+                Some(value)
+            );
+            assert_eq!(
+                crate::baseobjspace::getdictvalue_native(obj, "x"),
+                Some(value)
+            );
+            let w_dict = crate::baseobjspace::getdict(obj).unwrap();
+            assert_eq!(w_dict, W_BytesIO::from_obj(obj).unwrap().w_dict);
+            assert_eq!(crate::baseobjspace::getdict(obj).unwrap(), w_dict);
+
+            let refused = "attribute '__dict__' of '_io._IOBase' objects is not writable";
+            for replacement in [pyre_object::w_dict_new(), pyre_object::w_int_new(5)] {
+                let err = crate::baseobjspace::setdict(obj, replacement).unwrap_err();
+                assert_eq!(err.kind, crate::PyErrorKind::AttributeError);
+                assert_eq!(err.message_text(), refused);
+            }
+            assert_eq!(W_BytesIO::from_obj(obj).unwrap().w_dict, w_dict);
+            assert!(
+                !crate::objspace::std::mapdict::INSTANCE_DICT
+                    .lock()
+                    .contains_key(&addr)
+            );
+
+            crate::baseobjspace::object_delattr(obj, "x").unwrap();
+            assert!(crate::baseobjspace::getdictvalue_native(obj, "x").is_none());
+            assert_eq!(W_BytesIO::from_obj(obj).unwrap().w_dict, w_dict);
+            assert!(
+                !crate::objspace::std::mapdict::INSTANCE_DICT
+                    .lock()
+                    .contains_key(&addr)
+            );
+        }
     }
 }
