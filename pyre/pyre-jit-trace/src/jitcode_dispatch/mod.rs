@@ -4457,6 +4457,20 @@ pub fn step<Sym: WalkSym>(
     result
 }
 
+/// `force_finish_trace` asks `debug_merge_point` to segment once
+/// `history.length()` passes `trace_limit * 0.8`. One lowered opcode can
+/// record more ops than that window, so `is_too_long`
+/// (`blackhole_if_trace_too_long`) fires between merge points and the cut
+/// never runs. Keep going until the next `debug_merge_point` unless the
+/// trace has already grown well past the limit.
+fn trace_too_long_defers_to_segment_cut(ctx: &majit_metainterp::TraceCtx) -> bool {
+    if !ctx.force_finish_trace() {
+        return false;
+    }
+    let limit = ctx.trace_limit();
+    ctx.num_ops() <= limit.saturating_mul(2).saturating_add(512)
+}
+
 /// `pyjitpl.py` `_interpret` raises `SwitchToBlackhole(ABORT_TOO_LONG)`
 /// before `perform_call` / `newframe` once `history.length()` has passed
 /// `trace_limit`. Opening a portal frame after that point makes
@@ -4468,6 +4482,9 @@ pub(crate) fn abort_before_portal_entry_if_too_long<Sym: WalkSym>(
     pc: usize,
 ) -> Result<(), DispatchError> {
     if !ctx.trace_ctx.is_too_long() {
+        return Ok(());
+    }
+    if trace_too_long_defers_to_segment_cut(ctx.trace_ctx) {
         return Ok(());
     }
     let latched = residual_call::latch_abort_blackhole(ctx, pc, "pre-portal");
@@ -4688,7 +4705,7 @@ pub fn walk<Sym: WalkSym>(
         // translated helper. Deferring the check until the helper returns
         // records past `trace_limit` and can `newframe` a callee that
         // `find_biggest_function` then names, which upstream never entered.
-        if ctx.trace_ctx.is_too_long() {
+        if ctx.trace_ctx.is_too_long() && !trace_too_long_defers_to_segment_cut(ctx.trace_ctx) {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their
             // frame transition: in particular, `SubRaise` may enter this

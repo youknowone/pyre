@@ -1,8 +1,8 @@
-# pyre-check: max-pypy-ratio=1.8
+# pyre-check: max-pypy-ratio=1.75
 #
-# Floor is 1.8 / 6 = 0.30x. ubuntu dynasm read 0.3x vs 0.86s pypy
-# (run 35369416982) and missed the 2.1-derived 0.35x floor. 1.8 fits
-# that reading; the same run's cranelift was 1.7x. Two loops + three
+# Floor is 1.75 / 6 = 0.2917x. Ubuntu dynasm run 36712656278 read 0.296x
+# (0.24s vs pypy 0.81s) and missed the 1.8-derived 0.30x floor. Cranelift
+# on the earlier fitting run was 1.7x, under 1.75. Two loops + three
 # bridges; not over-tracing.
 #
 # A recursion deeper than the inline unroll bound, driven from a loop body.

@@ -6192,6 +6192,17 @@ impl<M: Clone> MetaInterp<M> {
                 // appended `virtualizable_boxes` onto `original_boxes`. Attach
                 // here so `Trace(max_num_inputargs)` sees the full cap.
                 ctx.attach_live_byte_recorder();
+                // `prepare_trace_segmenting` writes `JC_FORCE_FINISH` through
+                // `current_merge_points[0]`. The seed below copies
+                // `green_key_values`; without them the hash form files a
+                // comparekey-less cell `should_force_finish_tracing_for_key`
+                // never reads, and the next attempt retraces instead of
+                // segmenting (`debug_merge_point`).
+                if let Some(key) =
+                    Self::with_typed_decision_key(entry_hash, green_key_raw, |key| key.clone())
+                {
+                    ctx.set_green_key_values(key);
+                }
                 // pyjitpl.py `_compile_and_run_once` — see `setup_tracing`.
                 ctx.seed_compile_and_run_once_merge_point();
                 // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
@@ -6300,11 +6311,17 @@ impl<M: Clone> MetaInterp<M> {
         // installed from the hash alone is one no typed lookup can match, so
         // the next typed writer of the same greens mints a sibling and the
         // two halves of one loop land on different cells.
-        let hot = match green_key_values.as_ref() {
+        // Clone the decision key out of the thread-local before any later
+        // `with_typed_decision_key` overwrites it. `setup_tracing` stores it
+        // on the seed merge point so `prepare_trace_segmenting` writes
+        // `JC_FORCE_FINISH` on the cell `bound_reached` reads.
+        let typed_values = match green_key_values {
+            Some(key) => Some(key),
+            None => Self::with_typed_decision_key(green_key, green_key_raw, |key| key.clone()),
+        };
+        let hot = match typed_values.as_ref() {
             Some(key) => Some(self.warm_state.force_start_tracing_for_key(key)),
-            None => Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-                self.warm_state.force_start_tracing_for_key(key)
-            }),
+            None => None,
         }
         .unwrap_or_else(|| self.warm_state.force_start_tracing(green_key));
         match hot {
@@ -6318,12 +6335,9 @@ impl<M: Clone> MetaInterp<M> {
                 // to `make_green_key(green_key_raw)`, which a minted cell key
                 // does not, so feeding a resolved key back in fails that
                 // assertion on exactly the chained-cell case this supports.
-                let green_key = match green_key_values.as_ref() {
+                let green_key = match typed_values.as_ref() {
                     Some(key) => self.warm_state.cell_key_for(key),
-                    None => Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-                        self.warm_state.cell_key_for(key)
-                    })
-                    .flatten(),
+                    None => None,
                 }
                 .unwrap_or(green_key);
                 // warmstate.py bound_reached: jitcounter.decay_all_counters()
@@ -6332,7 +6346,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.setup_tracing(
                     green_key,
                     green_key_raw,
-                    green_key_values,
+                    typed_values,
                     driver_descriptor,
                     live_values,
                 )
