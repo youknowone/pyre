@@ -15086,18 +15086,9 @@ impl<M: Clone> MetaInterp<M> {
         // `CompileLoopVersionDescr.handle_fail` is
         // `assert 0, "this guard must never fail"` and never reaches
         // `must_compile`. Pyre has no descr-keyed `handle_fail`, so every
-        // guard exit arrives here: refuse before `jitcounter.tick`. Debug
-        // builds assert; release logs and declines.
+        // guard exit arrives here, ahead of `jitcounter.tick`.
         if descr_fd.loop_version() {
-            crate::debug::log_one(
-                "jit-summary",
-                "CompileLoopVersionDescr.handle_fail: this guard must never fail",
-            );
-            debug_assert!(
-                false,
-                "CompileLoopVersionDescr.handle_fail: this guard must never fail"
-            );
-            return (false, owning_key);
+            panic!("CompileLoopVersionDescr.handle_fail: this guard must never fail");
         }
         // `compile.py:741` `status = self.status` — direct field read on
         // the resume-guard descr.  `descr_fd` is the live `FailDescr`
@@ -24170,7 +24161,10 @@ mod metainterp_static_data_tests {
         ));
         assert_eq!(meta.framestack.len(), 2);
         assert_eq!(meta.framestack.current_mut().int_values[0], Some(41));
-        let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
+        let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
+            "recursive_call_v/iIRFIRF",
+            34,
+        )]);
         assert_eq!(
             meta.run_blackhole_interp_to_cancel_tracing(
                 SwitchToBlackhole::bad_loop(),
@@ -24228,7 +24222,10 @@ mod metainterp_static_data_tests {
                 meta.interpret(&mut Sym, 0),
                 crate::TraceAction::Abort
             ));
-            let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
+            let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                34,
+            )]);
             let outcome = meta.run_blackhole_interp_to_cancel_tracing(
                 SwitchToBlackhole {
                     reason: counters::ABORT_ESCAPE,
@@ -24308,7 +24305,10 @@ mod metainterp_static_data_tests {
         let on_enter = |frame_ptr: i64| entered.borrow_mut().push(frame_ptr);
         let on_leave = |frame_ptr: i64| left.borrow_mut().push(frame_ptr);
         let per_frame = [(0x1000, 0), (0x2000, 0)];
-        let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
+        let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
+            "recursive_call_v/iIRFIRF",
+            34,
+        )]);
         let _ = meta.run_blackhole_interp_to_cancel_tracing(
             SwitchToBlackhole::bad_loop(),
             &mut builder,

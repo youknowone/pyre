@@ -26,7 +26,7 @@ impl BackEdgeBhBuilder {
     fn lease() -> Self {
         let builder = BACK_EDGE_BH_BUILDER
             .with(|c| c.borrow_mut().take())
-            .unwrap_or_else(|| Box::new(crate::blackhole::build_inline_call_only_bh_builder()));
+            .unwrap_or_else(|| Box::new(crate::blackhole::build_inline_call_only_bh_builder(&[])));
         Self(Some(builder))
     }
 }

@@ -228,13 +228,18 @@ pub(crate) fn rewrite_jit_merge_point(
         Some(ConcreteType::GcRef) => crate::model::ValueType::Ref(None),
         Some(ConcreteType::Float) => crate::model::ValueType::Float,
         Some(ConcreteType::Void) => crate::model::ValueType::Void,
-        // Pre-rtyper `returnvar` has no concretetype. A declared source
-        // result is the portal's `PyResult` reference; a fixture graph
-        // leaves `return_type` empty and returns void.
-        Some(ConcreteType::Unknown) | None if graph.return_type.is_some() => {
-            crate::model::ValueType::Ref(None)
-        }
-        Some(ConcreteType::Unknown) | None => crate::model::ValueType::Void,
+        // Pre-rtyper `returnvar` has no concretetype: `PORTALFUNC.RESULT`
+        // is then the portal's declared source result type. A fixture
+        // graph leaves `return_type` empty and returns void.
+        Some(ConcreteType::Unknown) | None => match graph.return_type.as_deref() {
+            None | Some("()") => crate::model::ValueType::Void,
+            Some(
+                "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+                | "bool" | "char",
+            ) => crate::model::ValueType::Int,
+            Some("f32" | "f64") => crate::model::ValueType::Float,
+            Some(_) => crate::model::ValueType::Ref(None),
+        },
     };
     let result = if matches!(result_ty, crate::model::ValueType::Void) {
         None

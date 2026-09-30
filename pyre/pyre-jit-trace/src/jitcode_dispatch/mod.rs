@@ -3899,12 +3899,15 @@ fn take_banked(
     Some(slot)
 }
 
-fn opref_as_i64<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, op: OpRef) -> i64 {
+/// The word a green's box carries, or `None` when the walk has no value
+/// for it: `_opimpl_recursive_call` reads its greens off `Const` boxes
+/// (`verify_green_args`), so a valueless green is not a key.
+fn opref_known_i64<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, op: OpRef) -> Option<i64> {
     match ctx.trace_ctx.concrete_of_opref(op) {
-        Some(majit_ir::Value::Int(n)) => n,
-        Some(majit_ir::Value::Ref(g)) => g.0 as i64,
-        Some(majit_ir::Value::Float(n)) => n.to_bits() as i64,
-        _ => 0,
+        Some(majit_ir::Value::Int(n)) => Some(n),
+        Some(majit_ir::Value::Ref(g)) => Some(g.0 as i64),
+        Some(majit_ir::Value::Float(n)) => Some(n.to_bits() as i64),
+        _ => None,
     }
 }
 
@@ -3977,7 +3980,10 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         ) else {
             return Ok(None);
         };
-        green_values.push(opref_as_i64(ctx, opref));
+        let Some(value) = opref_known_i64(ctx, opref) else {
+            return Ok(None);
+        };
+        green_values.push(value);
         green_types.push(*spec);
         green_ops.push(opref);
     }
@@ -3997,11 +4003,11 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     }
     let green_key =
         majit_ir::GreenKey::with_types(green_values.clone(), green_types.iter().copied());
-    let pycode_key = greens_r
-        .first()
-        .copied()
-        .map(|op| opref_as_i64(ctx, op) as usize)
-        .unwrap_or(0);
+    // `if warmrunnerstate.inlining:` gates the inline and the assembler arm
+    // alike; with it off, `do_recursive_call(assembler_call=False)` runs.
+    if !driver.meta_interp_mut().warm_state_mut().inlining() {
+        return Ok(None);
+    }
     let max_unroll = driver
         .meta_interp_mut()
         .warm_state_mut()
@@ -4010,12 +4016,26 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         .meta_interp_mut()
         .warm_state_mut()
         .can_inline_callable_for_key(&green_key);
-    let count = if pycode_key == 0 {
-        0
-    } else {
-        fbw_state::fbw_inline_recursion_count(ctx, pycode_key)
-    };
-    // `pyjitpl.py` `count >= memmgr.max_unroll_recursion` → `dont_trace_here`.
+    let portal_index = portal_mainjitcode_index(jd_index);
+    // `for f in self.metainterp.framestack`: count the frames running the
+    // target driver's `mainjitcode` whose `greenkey` equals these greens,
+    // green by green (`same_constant`).
+    let count = portal_index.map_or(0, |index| {
+        driver
+            .meta_interp()
+            .framestack
+            .frames
+            .iter()
+            .filter(|f| f.jitcode.index() == index)
+            .filter(|f| {
+                f.greenkey
+                    .as_ref()
+                    .and_then(|(_, key)| key.as_ref())
+                    .is_some_and(|key| *key == green_key)
+            })
+            .count()
+    });
+    // `count >= memmgr.max_unroll_recursion` → `dont_trace_here`.
     if can_inline && count >= max_unroll {
         driver
             .meta_interp_mut()
@@ -4024,7 +4044,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     }
     let inline = can_inline && count < max_unroll;
     if inline {
-        if let Some(index) = portal_mainjitcode_index(jd_index) {
+        if let Some(index) = portal_index {
             if let Some(body) = sub_jitcode_body_by_index(index) {
                 let int_args: Vec<OpRef> = greens_i
                     .iter()
@@ -4050,13 +4070,13 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     .map(|op| opref_concrete(ctx.trace_ctx.concrete_of_opref(*op)))
                     .collect();
                 // `pyjitpl.py newframe`: portal_call_depth, call_ids, ENTER_PORTAL_FRAME.
-                // After the call bridge has already crossed `trace_limit`,
-                // do not open the callee's portal frame first.
-                abort_before_portal_entry_if_too_long(ctx, op.pc)?;
                 let subwalk_jd = crate::state::note_inline_subwalk_start(
                     (green_key.get_uhash(), Some(green_key.clone())),
                     ctx.trace_ctx.get_trace_position(),
                 );
+                // `_interpret` checks the length once `perform_call` has
+                // pushed the callee frame and before its first instruction.
+                abort_before_portal_entry_if_too_long(ctx, op.pc)?;
                 let walked = match inline_call::run_sub_jitcode_walk(
                     ctx,
                     op.pc,
@@ -4086,17 +4106,20 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         }
     }
     // `do_recursive_call(assembler_call=True)` → `direct_assembler_call`.
-    let greenboxes: Vec<majit_ir::Value> = green_ops
+    // "verify that we have all green args, needed to make sure that
+    // assembler that we call is still correct"
+    {
+        let meta = driver.meta_interp();
+        let jd = &meta.staticdata.jitdrivers_sd[jd_index];
+        majit_metainterp::MIFrame::verify_green_args(jd, &green_ops);
+    }
+    let greenboxes: Vec<majit_ir::Value> = green_values
         .iter()
         .zip(green_types.iter())
-        .map(|(opref, spec)| match majit_ir::green_type_to_ir(*spec) {
-            majit_ir::Type::Int => majit_ir::Value::Int(opref_as_i64(ctx, *opref)),
-            majit_ir::Type::Float => {
-                majit_ir::Value::Float(f64::from_bits(opref_as_i64(ctx, *opref) as u64))
-            }
-            majit_ir::Type::Ref => {
-                majit_ir::Value::Ref(majit_ir::GcRef(opref_as_i64(ctx, *opref) as usize))
-            }
+        .map(|(value, spec)| match majit_ir::green_type_to_ir(*spec) {
+            majit_ir::Type::Int => majit_ir::Value::Int(*value),
+            majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(*value as u64)),
+            majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(*value as usize)),
             majit_ir::Type::Void => majit_ir::Value::Void,
         })
         .collect();
@@ -4112,21 +4135,9 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         return Ok(None);
     };
     let funcbox = ctx.trace_ctx.const_int(adr);
-    let mut allboxes = Vec::with_capacity(
-        1 + greens_i.len()
-            + greens_r.len()
-            + greens_f.len()
-            + reds_i.len()
-            + reds_r.len()
-            + reds_f.len(),
+    let allboxes = recursive_call_allboxes(
+        funcbox, call_descr, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
     );
-    allboxes.push(funcbox);
-    allboxes.extend_from_slice(greens_i);
-    allboxes.extend_from_slice(greens_r);
-    allboxes.extend_from_slice(greens_f);
-    allboxes.extend_from_slice(reds_i);
-    allboxes.extend_from_slice(reds_r);
-    allboxes.extend_from_slice(reds_f);
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     // Concrete portal runner first (`do_recursive_call`), then the
     // recorded op is `CALL_ASSEMBLER` (`direct_assembler_call`).
@@ -4150,6 +4161,13 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
             let recorded =
                 ctx.trace_ctx
                     .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+            // `do_residual_call` step 5: invalidate the heapcache on the
+            // CALL_MAY_FORCE just recorded.
+            ctx.trace_ctx.heapcache_invalidate_caches_varargs(
+                call_opcode,
+                Some(call_descr.get_extra_info()),
+                &allboxes,
+            );
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
@@ -4175,7 +4193,9 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         }
         _ => unreachable!("dst_bank matched above"),
     };
-    if recorded != OpRef::NONE && concrete != 0 {
+    // `make_result_of_lastop(resbox)`: the executed result is the op's
+    // value whatever its bits (zero, +0.0 and null included).
+    if recorded != OpRef::NONE && raised == 0 {
         let value = match dst_bank {
             'i' => majit_ir::Value::Int(concrete),
             'f' => majit_ir::Value::Float(f64::from_bits(concrete as u64)),
@@ -4188,6 +4208,19 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     }
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    // `direct_assembler_call` returns the target driver's virtualizable red
+    // box; `do_residual_call` records `KEEPALIVE` on it after
+    // `GUARD_NOT_FORCED`.
+    let vablebox = {
+        let meta = driver.meta_interp();
+        let jd = &meta.staticdata.jitdrivers_sd[jd_index];
+        usize::try_from(jd.index_of_virtualizable)
+            .ok()
+            .and_then(|index| red_ops.get(index).copied())
+    };
+    if let Some(vablebox) = vablebox {
+        ctx.trace_ctx.record_op(OpCode::Keepalive, &[vablebox]);
+    }
     if raised != 0 {
         let exc = ctx.trace_ctx.const_ref(raised);
         let exc_concrete = crate::state::ConcreteValue::Ref(raised as pyre_object::PyObjectRef);
@@ -4201,6 +4234,44 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+}
+
+/// `do_residual_call`'s `_build_allboxes`: the portal runner's arguments in
+/// `descr.get_arg_types()` order, demuxed out of the three register banks.
+#[allow(clippy::too_many_arguments)]
+fn recursive_call_allboxes(
+    funcbox: OpRef,
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    greens_i: &[OpRef],
+    greens_r: &[OpRef],
+    greens_f: &[OpRef],
+    reds_i: &[OpRef],
+    reds_r: &[OpRef],
+    reds_f: &[OpRef],
+) -> Vec<OpRef> {
+    let banks = [
+        (greens_i, Type::Int),
+        (greens_r, Type::Ref),
+        (greens_f, Type::Float),
+        (reds_i, Type::Int),
+        (reds_r, Type::Ref),
+        (reds_f, Type::Float),
+    ];
+    let argboxes: Vec<OpRef> = banks
+        .iter()
+        .flat_map(|(ops, _)| ops.iter().copied())
+        .collect();
+    let argbox_types: Vec<Type> = banks
+        .iter()
+        .flat_map(|(ops, ty)| std::iter::repeat_n(*ty, ops.len()))
+        .collect();
+    build_allboxes(
+        funcbox,
+        &argboxes,
+        &argbox_types,
+        call_descr.arg_types(),
+        None,
+    )
 }
 
 fn finish_recursive_inline<Sym: WalkSym>(
@@ -4334,21 +4405,9 @@ fn dispatch_recursive_call<Sym: WalkSym>(
         return Ok(done);
     }
     let funcbox = ctx.trace_ctx.const_int(adr);
-    let mut allboxes = Vec::with_capacity(
-        1 + greens_i.len()
-            + greens_r.len()
-            + greens_f.len()
-            + reds_i.len()
-            + reds_r.len()
-            + reds_f.len(),
+    let allboxes = recursive_call_allboxes(
+        funcbox, call_descr, &greens_i, &greens_r, &greens_f, &reds_i, &reds_r, &reds_f,
     );
-    allboxes.push(funcbox);
-    allboxes.extend(greens_i);
-    allboxes.extend(greens_r);
-    allboxes.extend(greens_f);
-    allboxes.extend(reds_i);
-    allboxes.extend(reds_r);
-    allboxes.extend(reds_f);
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     let recorded = ctx
         .trace_ctx
@@ -4363,6 +4422,13 @@ fn dispatch_recursive_call<Sym: WalkSym>(
         Some((op.next_pc, dst_bank, dst)),
         false,
     )?;
+    // `do_residual_call` step 5: invalidate the heapcache on the
+    // CALL_MAY_FORCE executed above.
+    ctx.trace_ctx.heapcache_invalidate_caches_varargs(
+        call_opcode,
+        Some(call_descr.get_extra_info()),
+        &allboxes,
+    );
     let raised = match exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
@@ -4458,11 +4524,10 @@ pub fn step<Sym: WalkSym>(
 }
 
 /// `pyjitpl.py` `_interpret` raises `SwitchToBlackhole(ABORT_TOO_LONG)`
-/// before `perform_call` / `newframe` once `history.length()` has passed
-/// `trace_limit`. Opening a portal frame after that point makes
-/// `find_biggest_function` name a callee the trace had already overflowed
-/// before entering, so the next attempt drops the inline and compiles the
-/// caller. Upstream leaves that caller on `prepare_trace_segmenting`.
+/// after the step that ran `perform_call` / `newframe` once
+/// `history.length()` has passed `trace_limit`, with the callee frame on
+/// the stack for `find_biggest_function` and before the callee's first
+/// instruction.
 pub(crate) fn abort_before_portal_entry_if_too_long<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
