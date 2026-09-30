@@ -7116,9 +7116,23 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // any dunder at all.
                 let seeded_callee_resume =
                     callable_guard_op.is_constant() && (try_multiframe || strict_seed);
+                // The handler exemption below was measured on a CALL entry
+                // (`blackhole_inlined_callee_local_after_escape_declined`).
+                // A seeded frame does not widen that exemption.
                 foriter_dirty_seeded_resume_admit = entry_is_call_boundary && seeded_callee_resume;
-                let foriter_dirty_bound = entry_is_call_boundary
-                    && (bound_method.is_some() || seeded_callee_resume)
+                // A seeded callee frame resumes inside the callee, so the
+                // caller's opcode is not re-executed and does not have to be
+                // a boundary the flush can name.  `perform_call`
+                // (`pyjitpl.py`) pushes that MIFrame for every callee
+                // `can_inline_callable` admits.  This is what lets a mutating
+                // `__format__` inline at FORMAT_WITH_SPEC: the opcode pops
+                // both operands, `entry_is_call_boundary` stays false so a
+                // non-str result still declines to the residual, and the
+                // `self.calls += 1` store is `Dirty`.  An unseeded bound
+                // method still needs the boundary, because its flush replays
+                // the entry opcode.
+                let foriter_dirty_bound = (seeded_callee_resume
+                    || (entry_is_call_boundary && bound_method.is_some()))
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !pyre_interpreter::code_is_self_recursive(callee_code);
                 if !foriter_dirty_bound && fbw_inline_diag_enabled() {
@@ -14595,10 +14609,13 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
             inline_attr_cell_guard(w_class, "__format__", method)
         })),
         None,
-        // FORMAT_WITH_SPEC pops both of its operands, so the abort rewind
-        // cannot re-execute it from the stack it had: only a `Clean` body is
-        // admitted from here, and a bad effect-free result declines to the
-        // residual, which raises `descroperation.py format`'s TypeError.
+        // FORMAT_WITH_SPEC pops both operands, so this stays false: a
+        // non-str result has no CALL boundary to latch and declines to the
+        // residual, which raises `descroperation.py` `format`'s TypeError.
+        // A mutating body still inlines.  `foriter_dirty_bound` admits it
+        // once `strict_seed` gives the callee its own frame, and
+        // `perform_call` (`pyjitpl.py`) resumes inside that frame rather
+        // than re-executing this opcode.
         false,
         // `__format__` returning a non-string is a TypeError the interpreter
         // raises; the plumbing guards the inlined result is a string so that
