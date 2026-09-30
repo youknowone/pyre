@@ -1,6 +1,6 @@
 {
   "darwin": {
-    "base": "a665db908454b9b6c2369f0596a205d1b19c7d91",
+    "base": "8145b7a605ec384d54011efcd3c8fdf49e837b0e",
     "brackets_reaching_no_collection": 10,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
@@ -21,9 +21,9 @@
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ],
-    "unread_brackets": 362,
-    "unresolved_collecting_calls": 10883,
-    "unresolved_collecting_calls_fns": 2111
+    "unread_brackets": 387,
+    "unresolved_collecting_calls": 10891,
+    "unresolved_collecting_calls_fns": 2112
   },
   "linux": {
     "base": "66046ac2d53275769790ab940b60ecd91adfea42",
@@ -47,7 +47,7 @@
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ],
-    "unread_brackets": 362,
+    "unread_brackets": 387,
     "unresolved_collecting_calls": 10883,
     "unresolved_collecting_calls_fns": 2111
   }
