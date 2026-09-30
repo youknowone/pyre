@@ -3828,7 +3828,8 @@ pub fn trace_and_compile_from_bridge(
     if bridge_bail_stage() == 2 {
         return BridgeResolution::ResumeBlackhole;
     }
-    let Some((_, resume_pc, num_resume_frames, resume_coords)) = decoded_resume else {
+    let Some((_, resume_pc, num_resume_frames, resume_coords, direct_virtuals)) = decoded_resume
+    else {
         return BridgeResolution::ResumeBlackhole;
     };
     let is_multiframe_resume = num_resume_frames > 1;
@@ -3889,8 +3890,10 @@ pub fn trace_and_compile_from_bridge(
             // `decode_and_restore_guard_failure` has already walked this
             // guard's resume data applying every write — `replay_pending_fields`
             // for the deferred stores, `ResumeVableMode::GuardFailureSync` for
-            // the virtualizable — so the replay owes recording only.
+            // the virtualizable — so the replay owes recording only, and
+            // names the objects that walk allocated for the virtuals.
             false,
+            &direct_virtuals,
         )
     };
     if !started {

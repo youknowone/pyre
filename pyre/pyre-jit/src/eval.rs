@@ -14163,7 +14163,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     meta: &crate::jit::state::PyreMeta,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
-) -> Option<(Vec<Value>, usize, usize, Vec<(usize, usize)>)> {
+) -> Option<(Vec<Value>, usize, usize, Vec<(usize, usize)>, Vec<i64>)> {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit] exit-layout trace_id={} fail_idx={} source_op={:?} rd_numb={} recovery={} resume_layout={}",
@@ -14215,12 +14215,10 @@ pub(crate) fn decode_and_restore_guard_failure(
             typed.iter().take(6).collect::<Vec<_>>()
         );
     }
-    // resume.py + 993 parity: `_prepare_next_section` already
-    // materializes rd_virtuals lazily via `materialize_virtual_from_rd`.
-    // Replay pending fields against the original exit slots plus that
-    // shared virtual cache; do not run the legacy pyre-only
-    // `recovery_layout` materialization pass here.
-    replay_pending_fields(&dead_frame_typed, exit_layout, &mut pending_virtuals_cache);
+    // resume.py keeps one `virtuals_cache` per reader: the sections below
+    // and the pending-field replay (`build_resumed_frames`) materialize
+    // into the same cache as the typed rebuild above, so every reader of
+    // this guard names one object per virtual.
 
     // resume.py rebuild_from_resumedata + pyjitpl.py:3400-3430
     // rebuild_state_after_failure parity: decode rd_numb to reconstruct
@@ -14264,7 +14262,24 @@ pub(crate) fn decode_and_restore_guard_failure(
             storage.rd_consts(),
             exit_layout,
             ResumeVableMode::GuardFailureSync,
+            &mut pending_virtuals_cache,
         )
+    };
+    // The objects this reader allocated, by virtual number, for the bridge
+    // tracer's recording reader to stamp on the `NEW` it records for each
+    // (`ResumeDataBoxReader.allocate_with_vtable` returns the allocated
+    // object on its box). Only ref virtuals are objects; the rest stay 0.
+    let direct_virtuals: Vec<i64> = {
+        let count = exit_layout
+            .storage
+            .as_deref()
+            .map_or(0, |storage| storage.rd_virtuals.len());
+        (0..count)
+            .map(|vidx| match pending_virtuals_cache.get(&vidx) {
+                Some(Value::Ref(gcref)) => gcref.0 as i64,
+                _ => 0,
+            })
+            .collect()
     };
 
     // virtualizable.py write_from_resume_data_partial: write fields from resumedata to frame.
@@ -14358,7 +14373,13 @@ pub(crate) fn decode_and_restore_guard_failure(
             .iter()
             .map(|f| (f.code as usize, f.py_pc))
             .collect();
-        Some((typed, resume_pc, resumed_frames.len(), coords))
+        Some((
+            typed,
+            resume_pc,
+            resumed_frames.len(),
+            coords,
+            direct_virtuals,
+        ))
     } else {
         None
     }
@@ -14666,6 +14687,9 @@ fn build_resumed_frames(
     rd_consts: &[majit_ir::Const],
     exit_layout: &CompiledExitLayout,
     vable_mode: ResumeVableMode,
+    // resume.py `virtuals_cache`: shared with the typed rebuild that ran
+    // before this walk, so a virtual both consume is one object.
+    virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Vec<crate::call_jit::ResumedFrame> {
     use majit_ir::resumedata::rebuild_from_numbering;
 
@@ -14696,8 +14720,6 @@ fn build_resumed_frames(
             frames.len()
         );
     }
-    let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
-
     // resume.py consume_vref_and_vable parity:
     // Reconstruct header [frame_ptr, ni, code, vsd, ns] from vable_values.
     fn resolve_rebuilt_value(
@@ -14753,7 +14775,7 @@ fn build_resumed_frames(
             &dead_frame_typed,
             exit_layout,
             &mut values,
-            &mut virtuals_cache,
+            virtuals_cache,
         );
         all_values.push(values);
     }
@@ -14770,7 +14792,7 @@ fn build_resumed_frames(
             all_values.len()
         );
     }
-    replay_pending_fields(&dead_frame_typed, exit_layout, &mut virtuals_cache);
+    replay_pending_fields(&dead_frame_typed, exit_layout, virtuals_cache);
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[dynasm-debug] after replay_pending_fields");
     }
@@ -14795,7 +14817,7 @@ fn build_resumed_frames(
                 &vable_values[i],
                 &dead_frame_typed,
                 exit_layout,
-                &mut virtuals_cache,
+                virtuals_cache,
             )
         })
         .collect();

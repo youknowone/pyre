@@ -3602,6 +3602,7 @@ impl<M: Clone> MetaInterp<M> {
                 ia.set_value(Value::Ref(r));
             }
         }
+        trace_ctx.walk_bridge_direct_virtual_refs(&mut visitor);
         // pyjitpl.py — `initialize_virtualizable` /
         // `force_start_tracing` / `setup_tracing` snapshot inputarg
         // constants into `initial_inputarg_consts`. Each is an inline-const
@@ -19148,9 +19149,11 @@ impl<M: Clone> MetaInterp<M> {
         // `registers_*` holds the box. The `*_values` mirror is
         // `box.getref_base()` when the reader stamped a concrete, and
         // the guard's rooted address when only the applying half has one.
-        // A virtual the reader built without an allocator has no object
-        // yet: its mirror stays `None`. A null mirror would be read as a
-        // known constant and folded into a residual call's argument.
+        // A virtual the recording reader built carries the object the
+        // direct reader allocated for it (`bridge_direct_virtual`); one
+        // it has no object for keeps `None` rather than a null mirror,
+        // which would be read as a known constant and folded into a
+        // residual call's argument.
         fn virtual_box_bits(ctx: &crate::TraceCtx, opref: OpRef, root: Option<i64>) -> Option<i64> {
             match ctx.concrete_of_opref(opref) {
                 Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as i64),

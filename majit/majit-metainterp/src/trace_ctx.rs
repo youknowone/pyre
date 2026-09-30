@@ -784,6 +784,14 @@ pub struct TraceCtx {
     /// the box the first `getvirtual_ptr` allocated instead of emitting
     /// a second `NEW`.
     bridge_virtual_ops: Vec<Option<OpRef>>,
+    /// The object the direct reader allocated for each virtual of the
+    /// guard this bridge resumes, by virtual number (0: none). Upstream's
+    /// `ResumeDataBoxReader` allocates through `execute_new_with_vtable`,
+    /// so its box holds the object; here the direct reader has already
+    /// allocated it, and the recording reader stamps that object onto the
+    /// `NEW` it records so the box names the object the interpreter holds.
+    /// Walked by `walk_active_trace_refs` until the stamp happens.
+    bridge_direct_virtuals: Vec<i64>,
     /// `resume.py` `rebuild_from_resumedata` storage, parked so
     /// `consume_boxes` can `getvirtual_ptr` after `start_bridge_tracing`
     /// returns. `None` outside a bridge.
@@ -2140,6 +2148,7 @@ impl TraceCtx {
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_virtual_ops: Vec::new(),
+            bridge_direct_virtuals: Vec::new(),
             bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
             bridge_grab_seeded: false,
@@ -2228,6 +2237,7 @@ impl TraceCtx {
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_virtual_ops: Vec::new(),
+            bridge_direct_virtuals: Vec::new(),
             bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
             bridge_grab_seeded: false,
@@ -2280,6 +2290,34 @@ impl TraceCtx {
             self.bridge_virtual_ops.resize(vidx + 1, None);
         }
         self.bridge_virtual_ops[vidx] = Some(op);
+    }
+
+    /// The direct reader's objects for this bridge's virtuals, by virtual
+    /// number; 0 where the direct reader allocated none.
+    pub fn set_bridge_direct_virtuals(&mut self, objects: Vec<i64>) {
+        self.bridge_direct_virtuals = objects;
+    }
+
+    /// The object the direct reader allocated for virtual `vidx`, if any.
+    pub fn bridge_direct_virtual(&self, vidx: usize) -> Option<i64> {
+        match self.bridge_direct_virtuals.get(vidx) {
+            Some(0) | None => None,
+            Some(address) => Some(*address),
+        }
+    }
+
+    /// Forward the direct reader's virtual objects still parked here.
+    pub fn walk_bridge_direct_virtual_refs(
+        &mut self,
+        visitor: &mut impl FnMut(&mut majit_ir::GcRef),
+    ) {
+        for slot in self.bridge_direct_virtuals.iter_mut() {
+            if *slot != 0 {
+                let mut gcref = majit_ir::GcRef(*slot as usize);
+                visitor(&mut gcref);
+                *slot = gcref.0 as i64;
+            }
+        }
     }
 
     /// Guard resume storage for `consume_boxes`'s `getvirtual_ptr`.
