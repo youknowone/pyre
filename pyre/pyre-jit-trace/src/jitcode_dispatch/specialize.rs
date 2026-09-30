@@ -18604,7 +18604,7 @@ fn orthodox_list_setitem_body_and_sym<Sym: WalkSym>(
 /// walk the lock-free body, journal the displaced element.
 ///
 /// Returns `Ok(None)` when the body is missing or the walk hits an unlowered
-/// helper so the hand-emitted store fold can still serve the site.
+/// helper. The generic residual then serves the site.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -18788,24 +18788,16 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// strategy-dispatched list store inline
-/// for the object-, int-, and float-storage list strategies with a non-negative
-/// concrete index (and a type-matching value for the unboxed strategies): `guard_class LIST` +
-/// `guard_value(strategy)` + unbox index + `IntLt` bounds guard + unbox
-/// value + the strategy's `setarrayitem_gc`.
+/// STORE_SUBSCR on an exact list with a non-negative in-bounds int index.
+/// Object storage accepts any value; int storage requires an exact non-bool
+/// int; float storage requires a float-strategy item.
 ///
-/// Prefers an orthodox sub-walk of `w_list_setitem_inner` (the lock-free
-/// body, same split as `w_list_append_inner`).  The hand-emitted store
-/// remains the fallback when that body is missing or does not finish.
-///
-/// No residual execution: the recorded `setarrayitem_gc` performs the
-/// mutation at runtime (the void residual was likewise not walk-executed —
-/// `try_execute_residual_call_via_executor` skips Void results), so the walk's
-/// concrete state is unchanged relative to the generic leg. Long values,
-/// strategy mismatches, negative indices, and
-/// non-`list[int]` operands fall through to the generic `CALL_MAY_FORCE`
-/// record (`Ok(None)`), preserving Python `__setitem__` semantics.
-pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
+/// Walks `w_list_setitem_inner` (the lock-free body, same split as
+/// `w_list_append_inner`). A missing body or an unfinished walk returns
+/// `Ok(None)` so the generic `CALL_MAY_FORCE` residual serves the site.
+/// Negative indices, list subclasses, and strategy mismatches stay on that
+/// residual.
+pub(crate) fn try_walker_orthodox_store_subscr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
@@ -18829,7 +18821,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
     // matching value type (int storage ← W_IntObject, float storage ←
     // W_FloatObject). This is jtransform.py `do_resizable_list_setitem`'s
     // kind=`r` arm, not a separate object-list shortcut.
-    let (sid, index, concrete_len) = unsafe {
+    let (sid, index) = unsafe {
         // A bool index is fine: bool shares int's `intval`, unboxed below via
         // its own &BOOL_TYPE guard.  A bool *value* into int storage must still
         // route through the generic path — PyPy's IntegerListStrategy rejects a
@@ -18854,9 +18846,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         // Object storage keeps the value boxed, so a subclass survives it; the
         // unboxed strategies write the raw payload and would drop the subclass
         // identity the read-back must return.  `is_int`/`is_float` read
-        // `ob_type`, which a subclass shares, so they alone do not establish
-        // that -- and `walker_numeric_builtin_class` below answers with the
-        // canonical class, which such a value does not carry.
+        // `ob_type`, which a subclass shares, so exactness is a separate check.
         let sid = if pyre_object::w_list_uses_object_storage(list_obj) {
             0i64
         } else if !pyre_object::is_exact_builtin_instance(value_obj) {
@@ -18881,169 +18871,12 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         } else {
             return Ok(None);
         };
-        (sid, index, concrete_len)
+        (sid, index)
     };
 
-    if try_walker_orthodox_list_setitem(
+    try_walker_orthodox_list_setitem(
         ctx, op_pc, list_op, key_op, value_op, list_obj, key_obj, value_obj, sid, index,
-    )?
-    .is_some()
-    {
-        return Ok(Some(()));
-    }
-
-    // emit the specialized IR (walker-native)
-    // Exact `w_class` first: it implies the LIST vtable, so GuardClass skips.
-    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        list_op,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
-    )?;
-    if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
-        let type_const = ctx.trace_ctx.const_int(list_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(list_op, list_type_addr);
-
-    // guard_value(strategy == sid): getfield strategy + GuardValue + replace_box.
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        list_op,
-        crate::descr::list_strategy_descr(),
-    );
-    let sid_const = ctx.trace_ctx.const_int(sid);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, sid_const);
-
-    // Unbox the index operand.  bool shares int's `intval`, so a bool index
-    // guards its own &BOOL_TYPE.
-    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
-    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
-    ctx.trace_ctx
-        .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
-
-    // Object storage keeps the inline `length` field (rlist.py); int/float
-    // storage read the typed items-array length field.
-    let len_descr = match sid {
-        0 => crate::descr::list_length_descr(),
-        1 => crate::descr::list_int_items_len_descr(),
-        2 => crate::descr::list_float_items_len_descr(),
-        _ => unreachable!(),
-    };
-    let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
-    walker_emit_index_bounds_guards(ctx, op_pc, raw_index, index, lenbox, concrete_len)?;
-
-    // Store the reference directly for ObjectListStrategy; only the typed
-    // strategies unwrap their payload.  The object arm is what keeps Python
-    // 3.14's `lst[i] is value` guarantee while removing the opaque
-    // STORE_SUBSCR helper from hot loops.
-    if sid == 0 {
-        let block = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            list_op,
-            crate::descr::list_items_descr(),
-        );
-        crate::state::trace_items_block_setitem_value(ctx.trace_ctx, block, raw_index, value_op);
-    } else if sid == 1 {
-        let block = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            list_op,
-            crate::descr::list_int_items_block_descr(),
-        );
-        // The value is a true W_IntObject (the gate excludes bool from int
-        // storage), so it unboxes through the plain INT_TYPE guard.
-        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-        let raw = walker_unbox_int_exact(
-            ctx,
-            op_pc,
-            value_op,
-            int_type_addr,
-            crate::descr::int_intval_descr(),
-            walker_numeric_builtin_class(value_obj),
-        )?;
-        let elem = unsafe { pyre_object::w_int_get_value(value_obj) };
-        ctx.trace_ctx
-            .set_opref_concrete(raw, majit_ir::Value::Int(elem));
-        crate::state::trace_int_block_setitem_value(ctx.trace_ctx, block, raw_index, raw);
-    } else {
-        let block = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            list_op,
-            crate::descr::list_float_items_block_descr(),
-        );
-        let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-        walker_guard_exact_w_class(
-            ctx,
-            op_pc,
-            value_op,
-            walker_numeric_builtin_class(value_obj),
-        )?;
-        let raw = walker_unbox_float(ctx, op_pc, value_op, float_type_addr)?;
-        let elem = unsafe { pyre_object::w_float_get_value(value_obj) };
-        ctx.trace_ctx
-            .set_opref_concrete(raw, majit_ir::Value::Float(elem));
-        // A float subclass instance is `W_FloatObjectUser` (`FLOAT_USER_TYPE`),
-        // so the `FLOAT_TYPE` unbox guard already rejects it.
-        // `FloatListStrategy.is_correct_type` also rejects a retagged
-        // `w_class`. Pin the canonical class the same way the list operand
-        // is pinned above, so such an instance side-exits to the generic
-        // residual.
-        walker_guard_exact_w_class(
-            ctx,
-            op_pc,
-            value_op,
-            pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE),
-        )?;
-        walker_guard_float_not_nan(ctx, op_pc, raw)?;
-        crate::state::trace_float_block_setitem_value(ctx.trace_ctx, block, raw_index, raw);
-    }
-
-    // Tracing is execution (pyjitpl.py execute_and_record): apply the
-    // store to the concrete list now, so the walk's own region — and a
-    // walk-end commit that hands the END state to the interpreter with no
-    // replay — sees the mutation exactly once.  The displaced element goes
-    // into the undo log first: a walk that does NOT commit returns to the
-    // legacy replay, which re-executes the region and must find the
-    // pre-walk heap (see `FBW_STORE_JOURNAL`).
-    let Some(displaced) = (unsafe { pyre_object::w_list_getitem(list_obj, index) }) else {
-        unreachable!(
-            "store_subscr specialization: in-bounds index {index} has no element \
-             (strategy/bounds gates above admitted it)"
-        );
-    };
-    // For typed storage `w_list_getitem` boxes the displaced int/float; that
-    // allocation can run a minor collection and move the operands. Object
-    // storage returns its exact existing reference without allocation. Re-read the
-    // forwarded refs from the shadow before touching the heap.  (The
-    // freshly boxed `displaced` itself cannot move before the journal
-    // push roots it — nothing below allocates.)
-    let (Some(list_obj), Some(key_obj), Some(value_obj)) = (
-        walker_concrete_ref_object(ctx, list_op),
-        walker_concrete_ref_object(ctx, key_op),
-        walker_concrete_ref_object(ctx, value_op),
-    ) else {
-        unreachable!(
-            "store_subscr specialization: operand concrete vanished from the shadow \
-             across the displaced-element boxing"
-        );
-    };
-    fbw_store_journal_push(list_obj, key_obj, displaced);
-    let stored = unsafe { pyre_object::w_list_setitem(list_obj, index, value_obj) };
-    debug_assert!(
-        stored,
-        "store_subscr specialization: in-bounds store failed"
-    );
-    Ok(Some(()))
+    )
 }
 
 /// Walker-native `GetIter` for an exact machine-word `range`.
