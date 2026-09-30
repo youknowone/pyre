@@ -16859,6 +16859,79 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `raise X` without `from` lowers the cause operand to const `PY_NULL`.
+/// A live non-null Ref is an explicit cause and stays on the residual,
+/// which also writes `__cause__` and `__suppress_context__`.
+fn raise_varargs_cause_is_absent<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    cause_op: OpRef,
+) -> bool {
+    let cause_concrete = read_ref_var_list_concrete(code, op, 1, ctx);
+    match cause_concrete.get(2) {
+        Some(ConcreteValue::Ref(p)) => p.is_null(),
+        Some(ConcreteValue::Null) | None => matches!(
+            ctx.trace_ctx.box_value(cause_op),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
+        ),
+        _ => false,
+    }
+}
+
+/// `chain_exceptions` skips the write when `space.is_w(w_value, w_context)`.
+///
+/// `except E as e: raise e` raises the instance already being handled.
+/// `normalize_raise_varargs_jit` is `MayForce` because its other arm calls
+/// the exception class; this arm never does. Guard `sys_exc_value` against
+/// the raised box so a later iteration that chains a different exception
+/// side-exits to that residual.
+fn try_trace_reraise_of_handled_instance<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    let exc_op = r_args[1];
+    if !raise_varargs_cause_is_absent(ctx, code, op, r_args[2]) {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let Some(ConcreteValue::Ref(exc)) = arg_concretes.get(1).copied() else {
+        return Ok(None);
+    };
+    if exc.is_null() || unsafe { !pyre_object::is_exception(exc) } {
+        return Ok(None);
+    }
+    // `chain_context` reads `get_sys_exception`. `sys_exc_info` returns the
+    // `sys_exc_value` slot whenever that slot is set, which is the field
+    // the guard below reads. A null slot whose logical exception lives on
+    // a generator stays on the residual.
+    let active = pyre_interpreter::eval::get_current_exception();
+    if active.is_null() || !std::ptr::eq(active, exc) {
+        return Ok(None);
+    }
+    let Some(ec) = walker_ensure_execution_context(ctx) else {
+        return Ok(None);
+    };
+    let active_op = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    if exc_op != active_op {
+        let same = ctx.trace_ctx.record_op(OpCode::PtrEq, &[exc_op, active_op]);
+        ctx.trace_ctx
+            .set_opref_concrete(same, majit_ir::Value::Int(1));
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[same])?;
+    }
+    ctx.trace_ctx
+        .set_opref_concrete(exc_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', exc_op)?;
+    Ok(Some(()))
+}
+
 pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -16870,41 +16943,20 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
         return Ok(None);
     }
     let exc_op = r_args[1];
-    // Take (remove) the inline-built marker: a second raise of the same
-    // object (whose `w_context` is now stamped) must take the residual
-    // path so its runtime `attach_raise_cause` keeps the existing
-    // `__context__` and avoids the self-cycle.
+    // The inline-built marker is this OpRef's first `raise` of an exception
+    // `try_walker_trace_exception_new` just allocated. A different OpRef —
+    // `except E as e: raise e` — is not that allocation. `chain_exceptions`
+    // then skips the write when the raised instance is the one already
+    // being handled.
     if !fbw_built_exc_take(exc_op) {
-        return Ok(None);
+        return try_trace_reraise_of_handled_instance(ctx, code, op, r_args, dst);
     }
     // Explicit `raise X from Y` (concrete non-null cause) keeps the
     // residual: `attach_raise_cause` sets both `__cause__` and
     // `__suppress_context__`, which the inline `__context__` store alone
     // does not reproduce.  Re-insert the marker so the raise still routes
     // through the residual (the marker was consumed above).
-    //
-    // `raise X` without a cause lowers the cause operand to a const
-    // `PY_NULL` (`ConstPtr(GcRef(0))`), whose concrete shadow is
-    // `ConcreteValue::Null` (constant pool slots carry no `Ref` shadow);
-    // `raise X from Y` passes a live non-null Ref.  Treat the const-null
-    // operand AND a `ConcreteValue::Null`/`Ref(null)` shadow all as "no
-    // cause"; any concrete non-null Ref is an explicit cause.
-    let cause_op = r_args[2];
-    let cause_concrete = read_ref_var_list_concrete(code, op, 1, ctx);
-    let cause_is_null = match cause_concrete.get(2) {
-        Some(ConcreteValue::Ref(p)) => p.is_null(),
-        Some(ConcreteValue::Null) | None => {
-            // No live concrete: the operand is "no cause" only if it is a
-            // const PY_NULL.  A non-const opref with an unknown concrete
-            // is conservatively treated as a possible cause (decline).
-            matches!(
-                ctx.trace_ctx.box_value(cause_op),
-                Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
-            )
-        }
-        _ => false,
-    };
-    if !cause_is_null {
+    if !raise_varargs_cause_is_absent(ctx, code, op, r_args[2]) {
         fbw_built_exc_insert(exc_op);
         return Ok(None);
     }
