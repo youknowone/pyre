@@ -3860,9 +3860,13 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     // slots were tuple element refs.  `f(*some_list)` is ordinary Python, so
     // pin the concrete to a real tuple the way the `kwnames` path does before
     // reading the field.
+    // `fixedview` (`objspace.py`) reads storage only when `_uses_tuple_iter`
+    // holds. A tuple subclass that overrides `__iter__` does not, so only an
+    // exact tuple (the specialised arity-2 variants included) is unpacked
+    // here. Anything else stays a residual and runs its iterator.
     let starargs_obj = match arg_concretes[2] {
         ConcreteValue::Ref(starargs)
-            if !starargs.is_null() && unsafe { pyre_object::is_tuple(starargs) } =>
+            if !starargs.is_null() && unsafe { pyre_object::is_exact_tuple(starargs) } =>
         {
             starargs
         }
@@ -8822,14 +8826,33 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // installs the whole box list, so seed every local the symbolic
         // frame above got from `param_boxes` — a `*args` callee's packed
         // vararg tuple is one of them, and a frame short of it publishes
-        // that name as unbound to any residual the sub-walk runs.  Root
-        // each freshly boxed argument immediately: `ConcreteValue::to_pyobj`
-        // can allocate, and a later argument must not collect an earlier
-        // one before the frame constructor takes ownership of the slice.
+        // that name as unbound to any residual the sub-walk runs.
+        // Root every argument the frame constructor will own before any of
+        // them is boxed. `to_pyobj` allocates for an int or a float, and that
+        // collection moves a kwargs dict or a vararg tuple that is still only
+        // a raw pointer later in `callee_arg_concretes`.
         let arg_roots = pyre_object::gc_roots::push_roots();
-        let arg_root_base = pyre_object::gc_roots::shadow_stack_len();
-        for concrete in callee_arg_concretes.iter().take(seeded_locals).copied() {
-            let _ = pyre_object::gc_roots::pin_root(concrete.to_pyobj());
+        let mut raw_args = Vec::with_capacity(seeded_locals);
+        let mut box_later = Vec::new();
+        for (i, concrete) in callee_arg_concretes
+            .iter()
+            .take(seeded_locals)
+            .copied()
+            .enumerate()
+        {
+            match concrete {
+                ConcreteValue::Ref(obj) => raw_args.push(obj),
+                ConcreteValue::Null => raw_args.push(pyre_object::PY_NULL),
+                ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => {
+                    raw_args.push(pyre_object::PY_NULL);
+                    box_later.push(i);
+                }
+            }
+        }
+        let arg_root_base = arg_roots.pin_roots(&raw_args);
+        for i in box_later {
+            let boxed = callee_arg_concretes[i].to_pyobj();
+            pyre_object::gc_roots::shadow_stack_set(arg_root_base + i, boxed);
         }
         let concrete_args: Vec<pyre_object::PyObjectRef> = (0..seeded_locals)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(arg_root_base + i))
