@@ -607,6 +607,19 @@ mod tests {
     }
 
     #[test]
+    fn marker_path_keeps_oopspec_impl_body_local_parent() {
+        let functions = HashSet::from(["rordereddict::<Impl>::lookup".to_string()]);
+        assert_eq!(
+            marker_path_to_fn_path(
+                "pyre_object::rordereddict::<Impl>::lookup::oopspec_lookup",
+                "oopspec_",
+                &functions,
+            ),
+            "rordereddict::<Impl>::lookup"
+        );
+    }
+
+    #[test]
     fn immutable_entry_list_parses_every_rank_suffix() {
         // The payload shape `#[jit_immutable_fields]` writes into
         // `_immutable_fields_<Struct>`: the declared entries joined by

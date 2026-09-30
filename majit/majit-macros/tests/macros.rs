@@ -855,6 +855,15 @@ mod jit_module {
         pub fn marked_not_in_trace(x: i64) -> i64 {
             x + 1
         }
+
+        pub struct LookupDict;
+
+        impl LookupDict {
+            #[oopspec("ordereddict.lookup")]
+            pub fn lookup(&self, _hash: u64, _key: &i64) -> Option<usize> {
+                None
+            }
+        }
     }
 
     /// RPython attribute-name parity for `oopspec`.  `rlib/jit.py
@@ -870,6 +879,7 @@ mod jit_module {
 
         assert_eq!(oopspec_marked_isconstant, "jit.isconstant(value)");
         assert_eq!(oopspec_marked_not_in_trace, "jit.not_in_trace()");
+        assert_eq!(LookupDict.lookup(1, &2), None);
     }
 }
 

@@ -676,6 +676,11 @@ where
     ///
     /// Returns the slot holding `key`.
     ///
+    /// `@jit.oopspec('ordereddict.lookup')` (`ll_dict_lookup`,
+    /// `ll_call_lookup_function`). The spec is the bare name: Rust's
+    /// parameters are `(self, hash, key)`, and `global_marker_str`
+    /// harvests only the spec string.
+    ///
     /// # A comparison that mutates this dict
     ///
     /// `ll_dict_lookup` carries a `d.paranoia` branch (1093-1098) that restarts
@@ -695,6 +700,7 @@ where
     /// to fold.  What this owes that path is only that a reshape mid-probe
     /// cannot panic, hence the checked reads below; the value they produce is
     /// thrown away.
+    #[majit_macros::oopspec("ordereddict.lookup")]
     fn lookup<Q>(&self, hash: u64, key: &Q) -> Option<usize>
     where
         Q: Equivalent<K> + ?Sized,

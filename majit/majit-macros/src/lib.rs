@@ -2924,13 +2924,18 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
     let spec_value = spec.value();
-    // RPython attribute-name parity: `rlib/jit.py func.oopspec =
-    // spec`.  Emit a module-level `pub const oopspec_<NAME>: &'static str
-    // = spec` next to the wrapper.  Skip for methods (`self`-receiver) —
-    // see `rpython_attribute_const_for`'s receiver guard for the same
-    // reasoning.
+    // RPython attribute-name parity: `rlib/jit.py func.oopspec = spec`.
+    // `harvest_hints_from_llbcs` keys a global whose leaf starts with
+    // `oopspec_`. A free function can carry that const beside the item.
+    // An inherent method cannot: a trait impl rejects a foreign associated
+    // item (`rpython_attribute_const_for`). Charon promotes a body-local
+    // const under `<method>::oopspec_<method>`, and `marker_path_to_fn_path`
+    // binds that parent when it is the function path. Emit the body-local
+    // const for every item, and keep the module-level const for free
+    // functions so the existing external name stays visible.
+    let body_name = format_ident!("oopspec_{}", sig.ident);
     let oopspec_const = if sig.receiver().is_none() {
-        let const_name = format_ident!("oopspec_{}", sig.ident);
+        let const_name = body_name.clone();
         Some(quote! {
             #[doc(hidden)]
             #[allow(non_upper_case_globals)]
@@ -2948,6 +2953,9 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             #[allow(dead_code)]
             const _MAJIT_OOPSPEC: &str = #spec_value;
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals, dead_code)]
+            const #body_name: &'static str = #spec_value;
             #block
         }
 
