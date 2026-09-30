@@ -190,8 +190,13 @@ fn emit_pair_tuple_item<Sym: WalkSym>(
 }
 
 /// Pin every ref already stored in `concretes`, run `body`, then copy the
-/// collector's forwarded slots back. `body` may allocate (`wrapint` does).
-fn with_arg_refs_pinned<T>(concretes: &mut [ConcreteValue], body: impl FnOnce() -> T) -> T {
+/// collector's forwarded slots back. `body` may allocate (`wrapint` does),
+/// and it reads the forwarded pointers: the copy it was called with can
+/// already have moved inside `pin_roots`.
+fn with_arg_refs_pinned<T>(
+    concretes: &mut [ConcreteValue],
+    body: impl FnOnce(&mut [ConcreteValue]) -> T,
+) -> T {
     let mut live = Vec::new();
     let mut slots = Vec::new();
     for (i, concrete) in concretes.iter().copied().enumerate() {
@@ -204,13 +209,52 @@ fn with_arg_refs_pinned<T>(concretes: &mut [ConcreteValue], body: impl FnOnce() 
     }
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&live);
-    let result = body();
-    for (i, slot) in slots {
-        if let ConcreteValue::Ref(obj) = &mut concretes[i] {
-            *obj = pyre_object::gc_roots::shadow_stack_get(base + slot);
+    let refresh = |concretes: &mut [ConcreteValue]| {
+        for &(i, slot) in &slots {
+            if let ConcreteValue::Ref(obj) = &mut concretes[i] {
+                *obj = pyre_object::gc_roots::shadow_stack_get(base + slot);
+            }
+        }
+    };
+    refresh(concretes);
+    let result = body(concretes);
+    refresh(concretes);
+    result
+}
+
+fn refresh_rooted_refs(concretes: &mut [ConcreteValue], slots: &[Option<usize>]) {
+    for (concrete, slot) in concretes.iter_mut().zip(slots) {
+        if let (ConcreteValue::Ref(obj), Some(slot)) = (concrete, *slot) {
+            *obj = pyre_object::gc_roots::shadow_stack_get(slot);
         }
     }
-    result
+}
+
+fn refresh_varkw_concretes(extras: &mut [VarkwExtra], slots: &[Option<usize>]) {
+    for (extra, slot) in extras.iter_mut().zip(slots) {
+        if let (ConcreteValue::Ref(obj), Some(slot)) = (&mut extra.concrete, *slot) {
+            *obj = pyre_object::gc_roots::shadow_stack_get(slot);
+        }
+    }
+}
+
+/// Publish `obj` on `roots` and point `slots[index]` at that word. A later
+/// pin can move every earlier word, so both slices are re-read afterwards.
+fn adopt_rooted_ref(
+    roots: &pyre_object::gc_roots::RootScope,
+    concretes: &mut [ConcreteValue],
+    slots: &mut [Option<usize>],
+    varkw: &mut [VarkwExtra],
+    varkw_slots: &[Option<usize>],
+    index: usize,
+    obj: pyre_object::PyObjectRef,
+) {
+    let _ = roots.pin_root(obj);
+    if let Some(entry) = slots.get_mut(index) {
+        *entry = Some(pyre_object::gc_roots::shadow_stack_len() - 1);
+    }
+    refresh_rooted_refs(concretes, slots);
+    refresh_varkw_concretes(varkw, varkw_slots);
 }
 
 /// The [`DefaultsRepr`] a tuple of this exact `ob_type` stores its elements
@@ -260,14 +304,26 @@ unsafe fn positional_defaults_for_inline(
     let repr = defaults_repr_of(unsafe { (*tuple).ob_type })?;
     let ndefaults = unsafe { pyre_object::w_tuple_len(tuple) };
     let first_defaulted = nparams.checked_sub(ndefaults)?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let tuple_slot = roots.base();
+    let _ = roots.pin_root(tuple);
+    // The tuple pin occupies `tuple_slot`; boxed elements follow it.
+    let values_base = tuple_slot + 1;
     let mut values = Vec::with_capacity(missing.len());
     for &param_index in missing {
         let tuple_index = param_index.checked_sub(first_defaulted)?;
+        // `Cls_ii` / `Cls_ff` box a fresh int or float. Re-read the tuple and
+        // pin each box before the next `w_tuple_getitem`.
+        let tuple = roots.get(tuple_slot);
         let value = unsafe { pyre_object::w_tuple_getitem(tuple, tuple_index as i64) }?;
+        let _ = roots.pin_root(value);
         values.push((param_index, tuple_index, value));
     }
+    for (offset, entry) in values.iter_mut().enumerate() {
+        entry.2 = roots.get(values_base + offset);
+    }
     Some(PositionalDefaultsInline {
-        tuple,
+        tuple: roots.get(tuple_slot),
         repr,
         len: ndefaults,
         values,
@@ -3905,7 +3961,19 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     };
     let starargs = r_args[2];
     let items_descr = crate::descr::tuple_wrappeditems_descr();
-    let (mut args, mut concretes, star) = if let Some(block) = ctx
+    // Lives across the uncached `w_tuple_getitem` loop and the `**` bind
+    // below it. `Cls_ii` / `Cls_ff` box on each read, and the bind can
+    // allocate while those boxes are still only in a `Vec`.
+    let extract_roots = pyre_object::gc_roots::push_roots();
+    let kwargs_slot = if let Some(obj) = kwargs {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = extract_roots.pin_root(obj);
+        Some(slot)
+    } else {
+        None
+    };
+    let mut extracted_base: Option<usize> = None;
+    let (mut args, mut concretes, mut star) = if let Some(block) = ctx
         .trace_ctx
         .heapcache_getfield_cached(starargs, items_descr.index())
     {
@@ -3941,9 +4009,16 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
         if !arity_fits(npos) {
             return None;
         }
+        let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = extract_roots.pin_root(starargs_obj);
+        let values_base = pyre_object::gc_roots::shadow_stack_len();
+        extracted_base = Some(values_base);
         let mut values = Vec::with_capacity(npos);
         for index in 0..npos {
-            values.push(unsafe { pyre_object::w_tuple_getitem(starargs_obj, index as i64) }?);
+            let tuple = extract_roots.get(tuple_slot);
+            let item = unsafe { pyre_object::w_tuple_getitem(tuple, index as i64) }?;
+            let _ = extract_roots.pin_root(item);
+            values.push(item);
         }
         let concretes = values.iter().map(|&v| ConcreteValue::Ref(v)).collect();
         (
@@ -3956,11 +4031,41 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
             }),
         )
     };
+    // Cached elements are already boxes. Pin them before the bind: interning
+    // a parameter name can collect, and these are not on `extract_roots` yet.
+    let cached_pin = if extracted_base.is_none() {
+        let live: Vec<pyre_object::PyObjectRef> = concretes
+            .iter()
+            .filter_map(|concrete| match concrete {
+                ConcreteValue::Ref(obj) if !obj.is_null() => Some(*obj),
+                _ => None,
+            })
+            .collect();
+        let base = extract_roots.pin_roots(&live);
+        Some((base, live.len()))
+    } else {
+        None
+    };
     let Some(kwargs) = kwargs else {
+        if let Some(base) = extracted_base {
+            rehome_extracted_star(&extract_roots, base, &mut concretes, star.as_mut());
+        }
+        rehome_cached_star(&extract_roots, cached_pin, &mut concretes);
         return Some((args, concretes, star, None));
     };
-    let star_kwargs =
-        unsafe { fbw_bind_star_kwargs(r_args[3], kwargs, w_code, args.len(), nparams) }?;
+    let kwargs_live = kwargs_slot.map(|slot| extract_roots.get(slot)).unwrap_or(kwargs);
+    let mut star_kwargs =
+        unsafe { fbw_bind_star_kwargs(r_args[3], kwargs_live, w_code, args.len(), nparams) }?;
+    let bound_live: Vec<pyre_object::PyObjectRef> =
+        star_kwargs.bound.iter().map(|entry| entry.2).collect();
+    let bound_base = extract_roots.pin_roots(&bound_live);
+    for (offset, entry) in star_kwargs.bound.iter_mut().enumerate() {
+        entry.2 = extract_roots.get(bound_base + offset);
+    }
+    if let Some(base) = extracted_base {
+        rehome_extracted_star(&extract_roots, base, &mut concretes, star.as_mut());
+    }
+    rehome_cached_star(&extract_roots, cached_pin, &mut concretes);
     args.resize(nparams, OpRef::NONE);
     concretes.resize(nparams, ConcreteValue::Null);
     for &(index, _, value) in &star_kwargs.bound {
@@ -3969,6 +4074,45 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
         concretes[index] = ConcreteValue::Ref(value);
     }
     Some((args, concretes, star, Some(star_kwargs)))
+}
+
+fn rehome_cached_star(
+    roots: &pyre_object::gc_roots::RootScope,
+    pin: Option<(usize, usize)>,
+    concretes: &mut [ConcreteValue],
+) {
+    let Some((base, len)) = pin else {
+        return;
+    };
+    if len == 0 {
+        return;
+    }
+    let mut offset = 0;
+    for concrete in concretes.iter_mut() {
+        if let ConcreteValue::Ref(obj) = concrete
+            && !obj.is_null()
+        {
+            *obj = roots.get(base + offset);
+            offset += 1;
+        }
+    }
+}
+
+fn rehome_extracted_star(
+    roots: &pyre_object::gc_roots::RootScope,
+    base: usize,
+    concretes: &mut [ConcreteValue],
+    star: Option<&mut StarArgsInline>,
+) {
+    let Some(star) = star else {
+        return;
+    };
+    for (offset, value) in star.values.iter_mut().enumerate() {
+        *value = roots.get(base + offset);
+        if let Some(ConcreteValue::Ref(obj)) = concretes.get_mut(offset) {
+            *obj = *value;
+        }
+    }
 }
 
 /// Bind the keywords of the `**` mapping `kwargs` to the parameters of
@@ -4017,12 +4161,20 @@ unsafe fn fbw_bind_star_kwargs(
         return None;
     }
     let posonly = unsafe { (*raw).posonlyarg_count } as usize;
-    let mut bound = Vec::new();
-    for (index, name) in varnames[..nparams]
+    // Copy the names out before any interning. `get_interned_wtf8` can
+    // collect, and `varnames` is a borrow of the code object.
+    let names: Vec<(usize, String)> = varnames[..nparams]
         .iter()
         .enumerate()
         .skip(npos.max(posonly))
-    {
+        .map(|(index, name)| (index, name.as_str().to_string()))
+        .collect();
+    let roots = pyre_object::gc_roots::push_roots();
+    let kwargs_slot = roots.base();
+    let _ = roots.pin_root(kwargs);
+    let mut bound = Vec::new();
+    let mut value_slots = Vec::new();
+    for (index, name) in names {
         // The name is baked into the lookup, so it has to be the canonical
         // object a collection cannot move.  Parameter names are interned when
         // the code object is built; one that is not declines rather than
@@ -4031,14 +4183,21 @@ unsafe fn fbw_bind_star_kwargs(
         if majit_gc::can_move(majit_ir::GcRef(name_obj as usize)) {
             return None;
         }
+        let kwargs = roots.get(kwargs_slot);
         if let Some(value) = unsafe {
             pyre_object::dictmultiobject::w_dict_lookup_or_null_unicode_strategy(kwargs, name_obj)
         } {
+            value_slots.push(pyre_object::gc_roots::shadow_stack_len());
+            let _ = roots.pin_root(value);
             bound.push((index, name_obj, value));
         }
     }
+    for (entry, slot) in bound.iter_mut().zip(&value_slots) {
+        entry.2 = roots.get(*slot);
+    }
     // A key no parameter took is either unknown or names a parameter the
     // positional fill already bound.
+    let kwargs = roots.get(kwargs_slot);
     if bound.len() != unsafe { pyre_object::dictmultiobject::w_dict_len(kwargs) } {
         return None;
     }
@@ -6747,11 +6906,61 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // placeholders in `callee_args` are replaced after the eligibility checks.
     star_args: Option<StarArgsInline>,
     // The keywords a `**kwargs` callee collects into its mapping.
-    varkw_extra: Vec<VarkwExtra>,
+    mut varkw_extra: Vec<VarkwExtra>,
     // A `f(**mapping)` dict the named parameters are read from; its
     // placeholders in `callee_args` are replaced after the eligibility checks.
     star_kwargs: Option<StarKwargsInline>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // Argument boxes and surplus keyword values stay reachable across every
+    // allocation this inline records (`wrapint`, the kwargs dict, a default
+    // box). The shadow slots, not the `Vec` copies, are what a collection
+    // forwards.
+    let _arg_roots = pyre_object::gc_roots::push_roots();
+    let mut arg_root_slots = Vec::with_capacity(callee_arg_concretes.len());
+    {
+        let mut live = Vec::new();
+        for concrete in callee_arg_concretes.iter().copied() {
+            if let ConcreteValue::Ref(obj) = concrete
+                && !obj.is_null()
+            {
+                arg_root_slots.push(Some(live.len()));
+                live.push(obj);
+            } else {
+                arg_root_slots.push(None);
+            }
+        }
+        let base = _arg_roots.pin_roots(&live);
+        for slot in &mut arg_root_slots {
+            if let Some(offset) = *slot {
+                *slot = Some(base + offset);
+            }
+        }
+        refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
+    }
+    let mut varkw_root_slots = Vec::with_capacity(varkw_extra.len());
+    {
+        let mut live = Vec::new();
+        for extra in &varkw_extra {
+            if let ConcreteValue::Ref(obj) = extra.concrete
+                && !obj.is_null()
+            {
+                varkw_root_slots.push(Some(live.len()));
+                live.push(obj);
+            } else {
+                varkw_root_slots.push(None);
+            }
+        }
+        if !live.is_empty() {
+            let base = _arg_roots.pin_roots(&live);
+            for slot in &mut varkw_root_slots {
+                if let Some(offset) = *slot {
+                    *slot = Some(base + offset);
+                }
+            }
+            refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
+            refresh_varkw_concretes(&mut varkw_extra, &varkw_root_slots);
+        }
+    }
     let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
@@ -6855,8 +7064,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         };
         callee_args.resize(nparams, OpRef::NONE);
         callee_arg_concretes.resize(nparams, ConcreteValue::Null);
+        arg_root_slots.resize(nparams, None);
         for &(param_index, _, value) in &defaults.values {
-            callee_arg_concretes[param_index] = ConcreteValue::Ref(value);
+            adopt_rooted_ref(
+                &_arg_roots,
+                &mut callee_arg_concretes,
+                &mut arg_root_slots,
+                &mut varkw_extra,
+                &varkw_root_slots,
+                param_index,
+                value,
+            );
         }
         Some(defaults)
     };
@@ -7870,6 +8088,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let _ = pyre_object::gc_roots::pin_root(callee_globals_obj);
     let inline_code_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+    refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
+    refresh_varkw_concretes(&mut varkw_extra, &varkw_root_slots);
     if let Some(star) = star_args {
         // `space.fixedview(w_stararg)` -> `w_obj.tolist()`: the class guard
         // re-proves the layout the resolve picked the reads for, and an exact
@@ -7907,13 +8127,24 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 );
             }
         } else {
-            for (index, &value) in star.values.iter().enumerate() {
-                let (elem, concrete) = with_arg_refs_pinned(&mut callee_arg_concretes, || {
+            for index in 0..star.values.len() {
+                let (elem, concrete) = with_arg_refs_pinned(&mut callee_arg_concretes, |concretes| {
+                    let ConcreteValue::Ref(value) = concretes[index] else {
+                        unreachable!("unpacked star element is a ref");
+                    };
                     emit_pair_tuple_item(ctx, op.pc, star.starargs_op, star.repr, index, value)
                 })?;
                 callee_args[index] = elem;
-                if let Some(concrete) = concrete {
-                    callee_arg_concretes[index] = concrete;
+                if let Some(ConcreteValue::Ref(obj)) = concrete {
+                    adopt_rooted_ref(
+                        &_arg_roots,
+                        &mut callee_arg_concretes,
+                        &mut arg_root_slots,
+                        &mut varkw_extra,
+                        &varkw_root_slots,
+                        index,
+                        obj,
+                    );
                 }
             }
         }
@@ -7970,7 +8201,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             .set_opref_concrete(len_op, majit_ir::Value::Int(kw.bound.len() as i64));
         let expected = ctx.trace_ctx.const_int(kw.bound.len() as i64);
         walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[len_op, expected])?;
-        for &(index, name, value) in &kw.bound {
+        for &(index, name, _) in &kw.bound {
+            let value = match arg_root_slots.get(index).copied().flatten() {
+                Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
+                None => match callee_arg_concretes.get(index).copied() {
+                    Some(ConcreteValue::Ref(obj)) if !obj.is_null() => obj,
+                    _ => continue,
+                },
+            };
             let name_op = ctx.trace_ctx.const_ref(name as i64);
             let value_op = ctx.trace_ctx.call_ref_typed_with_effect(
                 crate::helpers::jit_dict_exact_unicode_lookup_or_null as *const (),
@@ -8360,20 +8598,32 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 }
             }
             DefaultsRepr::PairObject | DefaultsRepr::PairInt => {
-                for (param_index, tuple_index, value) in defaults.values {
-                    let (elem, concrete) = with_arg_refs_pinned(&mut callee_arg_concretes, || {
-                        emit_pair_tuple_item(
-                            ctx,
-                            op.pc,
-                            defaults_op,
-                            defaults.repr,
-                            tuple_index,
-                            value,
-                        )
-                    })?;
+                for (param_index, tuple_index, _) in defaults.values {
+                    let (elem, concrete) =
+                        with_arg_refs_pinned(&mut callee_arg_concretes, |concretes| {
+                            let ConcreteValue::Ref(value) = concretes[param_index] else {
+                                unreachable!("defaulted parameter is a ref");
+                            };
+                            emit_pair_tuple_item(
+                                ctx,
+                                op.pc,
+                                defaults_op,
+                                defaults.repr,
+                                tuple_index,
+                                value,
+                            )
+                        })?;
                     callee_args[param_index] = elem;
-                    if let Some(concrete) = concrete {
-                        callee_arg_concretes[param_index] = concrete;
+                    if let Some(ConcreteValue::Ref(obj)) = concrete {
+                        adopt_rooted_ref(
+                            &_arg_roots,
+                            &mut callee_arg_concretes,
+                            &mut arg_root_slots,
+                            &mut varkw_extra,
+                            &varkw_root_slots,
+                            param_index,
+                            obj,
+                        );
                     }
                 }
             }
@@ -8491,6 +8741,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // values are already live objects; pin them before that, then read
         // the slots the collector rewrites. A raw copy in
         // `callee_arg_concretes` would otherwise keep the pre-move address.
+        refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
+        refresh_varkw_concretes(&mut varkw_extra, &varkw_root_slots);
         let mut live = Vec::new();
         let mut concrete_slots = Vec::new();
         for (i, concrete) in callee_arg_concretes.iter().copied().enumerate() {
