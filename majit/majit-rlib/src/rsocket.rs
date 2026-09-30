@@ -456,6 +456,28 @@ pub fn connect(fd: INT, addr: &[u8]) -> Result<(), CSocketError> {
     Ok(())
 }
 
+/// `send`. A negative return is `CSocketError`.
+#[cfg(unix)]
+pub fn send(fd: INT, buf: &[u8], flags: INT) -> Result<isize, CSocketError> {
+    let sent = unsafe { crate::_rsocket_rffi::send(fd, buf.as_ptr().cast(), buf.len(), flags) };
+    if sent < 0 {
+        return Err(last_error());
+    }
+    Ok(sent as isize)
+}
+
+/// `recv`. A negative return is `CSocketError`. The count is the number of
+/// bytes written into `buf`.
+#[cfg(unix)]
+pub fn recv(fd: INT, buf: &mut [u8], flags: INT) -> Result<usize, CSocketError> {
+    let read =
+        unsafe { crate::_rsocket_rffi::socketrecv(fd, buf.as_mut_ptr().cast(), buf.len(), flags) };
+    if read < 0 {
+        return Err(last_error());
+    }
+    Ok(read as usize)
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
@@ -787,5 +809,21 @@ mod tests {
             assert_eq!(connect(-1, &addr).expect_err("bad fd").errno, libc::EBADF);
         }
         accepted.join().expect("accepted");
+    }
+
+    #[test]
+    fn send_and_recv_round_trip() {
+        let (a, b) = socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0).expect("pair");
+        assert_eq!(send(a, b"hello", 0).expect("send"), 5);
+        let mut buf = [0u8; 8];
+        assert_eq!(recv(b, &mut buf[..2], 0).expect("partial"), 2);
+        assert_eq!(&buf[..2], b"he");
+        assert_eq!(recv(b, &mut buf, 0).expect("rest"), 3);
+        assert_eq!(&buf[..3], b"llo");
+        let mut bad = [0u8; 1];
+        assert_eq!(send(-1, b"x", 0).expect_err("send").errno, libc::EBADF);
+        assert_eq!(recv(-1, &mut bad, 0).expect_err("recv").errno, libc::EBADF);
+        close(a).expect("close a");
+        close(b).expect("close b");
     }
 }

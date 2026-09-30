@@ -3120,7 +3120,7 @@ pub(crate) fn socket_fd(
 /// handed back rather than turned into an exception.  `_ssl`'s record pump
 /// already released the interpreter for the whole exchange, so the unix body
 /// calls `libc::send` and reads the live `errno`.  Socket methods go through
-/// `rffi::send`, the releasing `llexternal`.
+/// `rsocket.send`, the releasing `llexternal`.
 #[cfg(any(unix, windows))]
 pub(crate) fn socket_send_raw(
     fd: rffi::Socket,
@@ -3185,13 +3185,9 @@ pub(crate) fn socket_send_bytes(
         let outcome = {
             #[cfg(unix)]
             {
-                let sent = unsafe {
-                    rffi::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags)
-                };
-                if sent >= 0 {
-                    Ok(sent)
-                } else {
-                    Err(rffi::last_error_code())
+                match majit_rlib::rsocket::send(fd, buf, flags) {
+                    Ok(sent) => Ok(sent),
+                    Err(error) => Err(error.errno),
                 }
             }
             #[cfg(windows)]
@@ -3224,13 +3220,9 @@ pub(crate) fn socket_recv_bytes(
         let outcome = {
             #[cfg(unix)]
             {
-                let read = unsafe {
-                    rffi::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), flags)
-                };
-                if read >= 0 {
-                    Ok(read as usize)
-                } else {
-                    Err(rffi::last_error_code())
+                match majit_rlib::rsocket::recv(fd, buf, flags) {
+                    Ok(read) => Ok(read),
+                    Err(error) => Err(error.errno),
                 }
             }
             #[cfg(windows)]
@@ -5225,6 +5217,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         if let Some(deadline) = deadline {
                             socket_wait_writable_until(fd, deadline)?;
                         }
+                        #[cfg(unix)]
+                        let (n, errno) = match majit_rlib::rsocket::send(fd, &buf[off..], flags) {
+                            Ok(sent) => (sent, 0),
+                            Err(error) => (-1, error.errno),
+                        };
+                        #[cfg(windows)]
                         let (n, errno) = socket_call(|| {
                             rffi::send(
                                 fd,
@@ -5542,23 +5540,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 };
                 let fd = socket_fd(_roots.get(args_base))?;
                 socket_wait_readable(_roots.get(args_base), fd)?;
-                let got = loop {
-                    let (r, errno) = socket_call(|| {
-                        rffi::recv(fd, slot.as_mut_ptr() as *mut libc::c_void, nbytes, flags)
-                    });
-                    if r >= 0 {
-                        break r;
-                    }
-                    if !rffi::error_is_interrupted(errno) {
-                        return Err(socket_io_err_for_operation(
-                            _roots.get(args_base),
-                            std::io::Error::from_raw_os_error(errno),
-                        ));
-                    }
-                    // EINTR: deliver a pending signal, then retry
-                    // (`converted_error` eintr_retry).
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                };
+                let got = socket_recv_bytes(_roots.get(args_base), fd, &mut slot[..nbytes], flags)?;
                 Ok(pyre_object::w_int_new(got as i64))
             }),
         )
