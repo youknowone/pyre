@@ -19485,7 +19485,7 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
             let storage =
                 crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, index_op);
             let wrap: extern "C" fn(i64) -> i64 =
-                pyre_object::unicodeobject::__majit_call_target_w_str_from_storage;
+                pyre_object::unicodeobject::__majit_call_target_jit_w_str_from_storage;
             ctx.trace_ctx.call_ref_typed_with_effect(
                 wrap as *const (),
                 &[storage],
