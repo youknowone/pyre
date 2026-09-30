@@ -4227,24 +4227,52 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         }
     }
     let field_index = descr.index();
+    let field_name = descr_field_name(&descr);
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
-        // `_opimpl_getfield_gc_any_pureornot` compares `executor.execute`
-        // with `currfieldbox.getref_base()` and returns the cached box.
-        // That check is a debug assert. A stale ref — a field store the
-        // cache missed, or a nursery address reused after the forwarding
-        // stub was overwritten — must not abort. Drop the hit and record
-        // the load; `getfield_now_known` replaces the entry.
-        // `box_value` is `currfieldbox.getref_base()` (const pool,
-        // virtualizable shadow, frontend `value`).
-        if !ref_heapcache_hit_is_stale(ctx, obj, &descr, cached) {
-            // `profiler.count_ops(rop.GETFIELD_GC_I, HEAPCACHED_OPS)` —
-            // the opnum is the `GETFIELD_GC_I` literal for every arm.
-            ctx.profiler().count_ops(
-                OpCode::GetfieldGcI,
-                majit_metainterp::counters::HEAPCACHED_OPS,
-            );
-            return cached;
+        // `_opimpl_getfield_gc_any_pureornot` cache-hit sanity check (ref arm).
+        // `box_value(cached)` resolves the upstream
+        // `currfieldbox.getref_base()` payload through the full chain
+        // (const pool, standard-virtualizable shadow, the frontend
+        // object's `value` field).
+        let expected_ref = match ctx.box_value(cached) {
+            Some(majit_ir::Value::Ref(r)) => Some(r),
+            _ => None,
+        };
+        if let Some(cached_ref) = expected_ref {
+            if cached_ref != majit_ir::GcRef::NO_CONCRETE {
+                if let Some(struct_ptr) = concrete_gc_ptr(ctx, obj) {
+                    let struct_ptr =
+                        majit_gc::gc_current_object_address(struct_ptr as usize) as i64;
+                    if let Some(majit_ir::Value::Ref(loaded)) =
+                        ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref)
+                    {
+                        // `getref_base()` is a GC pointer; a nursery
+                        // collection forwards it. The heapcache word is
+                        // a raw copy and is not rewritten, so compare
+                        // after `gc_current_object_address`.
+                        let loaded_now =
+                            majit_ir::GcRef(majit_gc::gc_current_object_address(loaded.0));
+                        let cached_now =
+                            majit_ir::GcRef(majit_gc::gc_current_object_address(cached_ref.0));
+                        assert_eq!(
+                            loaded_now, cached_now,
+                            "_opimpl_getfield_gc_any_pureornot sanity \
+                             check (ref): loaded {:#x} != cached {:#x} \
+                             (field_index={field_index}, field={field_name}, struct_ptr=\
+                             {struct_ptr:#x})",
+                            loaded_now.0, cached_now.0,
+                        );
+                    }
+                }
+            }
         }
+        // `_opimpl_getfield_gc_any_pureornot` hardcodes `GETFIELD_GC_I` regardless
+        // of the rop variant (`_i` / `_r` / `_f`); pyre matches.
+        ctx.profiler().count_ops(
+            OpCode::GetfieldGcI,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
+        return cached;
     }
     if descr.is_quasi_immutable() {
         if ctx.heap_cache().is_quasi_immut_known(field_index, obj) {
