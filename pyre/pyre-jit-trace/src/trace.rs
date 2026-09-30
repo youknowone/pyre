@@ -7029,6 +7029,15 @@ fn full_body_walk_trace<Sym: WalkSym>(
     if matches!(journals, WalkJournals::Reset) {
         crate::jitcode_dispatch::fbw_store_journal_reset();
         crate::jitcode_dispatch::fbw_bridge_iter_journal_clear();
+        // `fbw_exit_last_instr_rollback` restores only frames a writer noted.
+        // `LiveLastInstrGuard` publishes the executing opcode and, once an
+        // escape flush names the frame, leaves that value behind, so an abort
+        // resumes one opcode past the call and drops the iteration. Snapshot
+        // the live portal before those writes. First write per frame wins, so
+        // this pre-walk coordinate is what the non-commit epilogue restores; a
+        // commit drops the undo and keeps the end coordinate. A continuation
+        // (`WalkJournals::Keep`) leaves the note the drain already holds.
+        crate::jitcode_dispatch::fbw_note_last_instr_undo(sym.live_vable_frame_addr());
     }
     // A bridge resumes mid-loop from a guard failure; its input args are the
     // guard's resumedata, already seeded into the bridge sym by
