@@ -96,6 +96,7 @@ struct SwitchState {
 #[allow(unused_assignments, unused_variables)]
 fn dispatch_skip(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
     let mut driver: JitDriver<SkipState> = JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         SKIP.compiles.fetch_add(1, Ordering::Relaxed);
         *SKIP.body.lock() = opcodes.to_vec();
@@ -140,6 +141,7 @@ fn dispatch_skip(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
 #[allow(unused_assignments, unused_variables)]
 fn dispatch_work(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
     let mut driver: JitDriver<WorkState> = JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         WORKED.compiles.fetch_add(1, Ordering::Relaxed);
         *WORKED.body.lock() = opcodes.to_vec();
@@ -189,6 +191,7 @@ fn dispatch_work(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
 #[allow(unused_assignments, unused_variables)]
 fn dispatch_exit(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
     let mut driver: JitDriver<ExitState> = JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         EXITED.compiles.fetch_add(1, Ordering::Relaxed);
         *EXITED.body.lock() = opcodes.to_vec();
@@ -237,6 +240,7 @@ fn dispatch_exit(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
 #[allow(unused_assignments, unused_variables)]
 fn dispatch_switch(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
     let mut driver: JitDriver<SwitchState> = JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         SWITCHED.compiles.fetch_add(1, Ordering::Relaxed);
         *SWITCHED.body.lock() = opcodes.to_vec();

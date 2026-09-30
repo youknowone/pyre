@@ -147,6 +147,7 @@ const DEFAULT_THRESHOLD: u32 = 3;
 pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlcState> =
         majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     driver.set_on_compile_loop(|_green_key, _ops_before, ops_after, opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
         LAST_OPS_AFTER.store(ops_after, Ordering::Relaxed);

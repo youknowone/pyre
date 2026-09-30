@@ -52,6 +52,7 @@ fn mainloop(
 ) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TinyFrameState> =
         majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     // Every counter the tier gate reads, plus the last body's op count and
     // shape, off the driver callbacks. `Census::begin` is what opens a window
     // over them.

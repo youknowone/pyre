@@ -77,6 +77,7 @@ struct StackState {
 pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<StackState> =
         majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     // Count compiled loops so the residual-count test can assert the
     // single-pass close actually ran. Mirrors tl's SPIKE_COMPILES hook.
     //

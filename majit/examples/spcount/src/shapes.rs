@@ -36,6 +36,7 @@ struct ScalarState {
 pub fn scalar_mainloop(program: &Code, n: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<ScalarState> =
         majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     majit_metainterp::embed::Census::install(&mut driver);
     let mut pc: usize = 0;
     let stacksize: i32 = 0;
@@ -173,6 +174,7 @@ pub fn walk_mainloop(program: &Code, n: i64, threshold: u32) -> (i64, f64) {
     let links = link_chain(n as usize);
     let mut driver: majit_metainterp::JitDriver<WalkState> =
         majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     majit_metainterp::embed::Census::install(&mut driver);
     let mut pc: usize = 0;
     let stacksize: i32 = 0;

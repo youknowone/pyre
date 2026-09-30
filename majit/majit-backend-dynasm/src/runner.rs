@@ -392,6 +392,18 @@ struct RanFrame {
     num_slots: usize,
 }
 
+/// Frame allocated the same way [`alloc_entry_jitframe`] allocates the
+/// entry (`llmodel.py` `realloc_frame`: `jitframe.JITFRAME.allocate`).
+/// `free_jitframe_chain` frees every `jf_forward` node as a host block, so
+/// a realloc must not put a nursery object on a host chain.
+fn malloc_jitframe_like_entry(size_bytes: usize) -> *mut JitFrame {
+    if !majit_gc::collector_installed() {
+        malloc_host_jitframe(size_bytes)
+    } else {
+        with_gc_ll_descr(|gc| malloc_jitframe_no_collect(gc, size_bytes))
+    }
+}
+
 /// `gc_ll_descr.malloc_jitframe(frame_info)` (`llmodel.py`) for a
 /// compiled entry.
 ///
@@ -408,7 +420,7 @@ fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bo
     // that always answers "host block".
     if !majit_gc::collector_installed() {
         return (
-            malloc_host_jitframe(size_bytes),
+            malloc_jitframe_like_entry(size_bytes),
             false,
             EntryArgRoots::new(),
         );
@@ -1907,7 +1919,7 @@ pub unsafe extern "C" fn dynasm_realloc_frame(
             old_jf,
             expected_depth,
             base_ofs,
-            |size_bytes| with_gc_ll_descr(|gc| malloc_jitframe_no_collect(gc, size_bytes as usize)),
+            |size_bytes| malloc_jitframe_like_entry(size_bytes as usize),
             |new_jf| with_gc_ll_descr(|gc| jitframe_write_barrier(gc, new_jf)),
         )
     };

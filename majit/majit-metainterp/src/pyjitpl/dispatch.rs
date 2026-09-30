@@ -5476,6 +5476,130 @@ where
                 };
                 self.set_int_reg(dst, Some(opref), Some(reg_concrete));
             }
+            // ── BC_GETARRAYITEM_GC_F ──
+            //
+            // `opimpl_getarrayitem_gc_f` records
+            // `_do_getarrayitem_gc_any(rop.GETARRAYITEM_GC_F, ..., 'f')`.
+            // `opimpl_getarrayitem_gc_f_pure` folds a const array and a const
+            // index through `executor.wrap_constant` and otherwise records
+            // `_do_getarrayitem_gc_any(rop.GETARRAYITEM_GC_PURE_F, ..., 'f')`.
+            // `blackhole.py` aliases `bhimpl_getarrayitem_gc_f_pure` onto
+            // `bhimpl_getarrayitem_gc_f`, so the load, the heapcache, and the
+            // register write are one body; only the recorded opcode differs.
+            //
+            // Encoding (`jitcode/assembler.rs` `getarrayitem_gc_f`):
+            //   [opcode][array_reg u8][index_reg u8][descr_idx u16][dst u8]
+            // The element is one f64. The float register stores that f64's
+            // raw bits.
+            jitcode::insns::BC_GETARRAYITEM_GC_F | jitcode::insns::BC_GETARRAYITEM_GC_F_PURE => {
+                let (array_reg, index_reg, descr_idx, dst) = {
+                    let frame = self.frames.current_mut();
+                    let array_reg = frame.next_reg() as usize;
+                    let index_reg = frame.next_reg() as usize;
+                    let descr_idx = frame.next_u16() as usize;
+                    let dst = frame.next_reg() as usize;
+                    (array_reg, index_reg, descr_idx, dst)
+                };
+                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+                    return TraceAction::Abort;
+                };
+                let Some((base_size, itemsize, _is_signed)) =
+                    self.dispatch_array_geometry(descr_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (array_opref, array_addr) = self.read_ref_reg(array_reg);
+                let (index_opref, index_value) = self.read_int_reg(index_reg);
+                let opcode = if bytecode == jitcode::insns::BC_GETARRAYITEM_GC_F_PURE {
+                    OpCode::GetarrayitemGcPureF
+                } else {
+                    OpCode::GetarrayitemGcF
+                };
+                let descr_index = descr.index();
+                // `_do_getarrayitem_gc_any`: `heapcache.getarrayitem` before
+                // recording. A hit returns the cached box; a miss records and
+                // then `getarrayitem_now_known`.
+                let cached = ctx.heapcache_getarrayitem(array_opref, index_opref, descr_index);
+                let item_addr = (array_addr as usize)
+                    .wrapping_add(base_size)
+                    .wrapping_add((index_value as usize).wrapping_mul(itemsize));
+                if itemsize != 8 {
+                    panic!("getarrayitem_gc_f: unsupported itemsize {itemsize}");
+                }
+                // SAFETY: `array_addr` is the array data pointer held in the
+                // ref register and `index_value` selects an element. itemsize
+                // is 8, so this reads one f64 as raw bits.
+                let concrete = unsafe { *(item_addr as *const i64) };
+                // `opimpl_getarrayitem_gc_f_pure`: a const array and a const
+                // index bypass the heapcache and fold to `wrap_constant`.
+                // The plain read stays recorded; `GetarrayitemGcPureF` is what
+                // licenses the fold, same as `GetarrayitemGcPureI`.
+                let foldable = opcode == OpCode::GetarrayitemGcPureF
+                    && array_opref.is_constant()
+                    && index_opref.is_constant();
+                let (opref, reg_concrete) = if foldable {
+                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
+                    (ctx.const_float(concrete), concrete)
+                } else if let Some(cached) = cached {
+                    ctx.profiler()
+                        .count_ops(opcode, crate::pyjitpl::counters::HEAPCACHED_OPS);
+                    // `_do_getarrayitem_gc_any` `typ == 'f'`:
+                    // `ConstFloat(resvalue).same_constant(tobox.constbox())`,
+                    // which compares `longlong.extract_bits` so NaN payloads
+                    // match and `0.0` stays distinct from `-0.0`. A mismatch
+                    // records a fallback op, asserts in debug, and still
+                    // answers with the cached box. `clear_caches_not_necessary`
+                    // short-circuits a getarrayitem, so the heapcache entry
+                    // stays; `mark_escaped` still runs on the two inputs.
+                    // `None` (no stamped concrete) skips the check.
+                    let expected = match ctx.box_value(cached) {
+                        Some(majit_ir::Value::Float(f)) => Some(f.to_bits() as i64),
+                        _ => None,
+                    };
+                    let stale = matches!(expected, Some(exp) if exp != concrete);
+                    if stale {
+                        ctx.heapcache_invalidate_caches_varargs(
+                            opcode,
+                            None,
+                            &[array_opref, index_opref],
+                        );
+                        ctx.profiler()
+                            .count_ops(opcode, crate::counters::RECORDED_OPS);
+                        let _ =
+                            ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
+                        debug_assert!(
+                            false,
+                            "{:?} sanity check failed: \
+                             cached={:?} concrete={}",
+                            opcode, expected, concrete,
+                        );
+                    }
+                    let reg_concrete = if stale {
+                        expected.expect("stale only set when expected is Some")
+                    } else {
+                        concrete
+                    };
+                    (cached, reg_concrete)
+                } else {
+                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
+                    ctx.profiler()
+                        .count_ops(opcode, crate::counters::RECORDED_OPS);
+                    let opref =
+                        ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
+                    ctx.set_opref_concrete(
+                        opref,
+                        majit_ir::Value::Float(f64::from_bits(concrete as u64)),
+                    );
+                    ctx.heapcache_getarrayitem_now_known(
+                        array_opref,
+                        index_opref,
+                        descr_index,
+                        opref,
+                    );
+                    (opref, concrete)
+                };
+                self.set_float_reg(dst, Some(opref), Some(reg_concrete));
+            }
             // ── BC_GETARRAYITEM_GC_R ──
             //
             // Ref-result element read for a raw-pointer array (a
@@ -16913,6 +17037,72 @@ mod tests {
                 .unwrap_or_else(|| panic!("{want_op:?} must be recorded, never folded"));
             assert_eq!(op.get_value(), Some(want_value), "{want_op:?}");
         }
+    }
+
+    /// `opimpl_getarrayitem_gc_f` reads one f64 and
+    /// `_do_getarrayitem_gc_any` stores it with `getarrayitem_now_known`,
+    /// so a second read of the same array and constant index is the cached
+    /// box. Both destination float registers still hold the element's bits.
+    #[test]
+    fn jitcode_getarrayitem_gc_f_records_a_float_read_and_caches_it() {
+        let items: Box<[f64]> = Box::new([0.0, 2.5]);
+        let array_ptr = items.as_ptr() as i64;
+        let want = 2.5f64.to_bits() as i64;
+
+        let mut builder = JitCodeBuilder::new();
+        let descr = builder.add_raw_float_array_descr();
+        builder.load_const_i_value(0, 1);
+        builder.getarrayitem_gc_f(0, 0, 0, descr);
+        builder.getarrayitem_gc_f(1, 0, 0, descr);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let mut standalone = StandaloneFrameStack::new();
+        let mut frame = standalone
+            .frames
+            .take_frame(Arc::new(jitcode), 0, None, Some(&mut ctx));
+        frame.setup_call(&[(JitArgKind::Ref, OpRef::input_arg_ref(0), array_ptr)]);
+        standalone.frames.push(frame);
+
+        let runtime = ClosureRuntime::new(|_pc: usize| 0usize);
+        let mut sym = DummySym;
+        let mut machine = JitCodeMachine::with_framestack(&mut standalone.frames, &[], &[]);
+        for _ in 0..8 {
+            if machine
+                .frames
+                .frames
+                .last()
+                .is_some_and(|frame| frame.finished())
+            {
+                break;
+            }
+            let action = machine.execute_one_instruction(&mut ctx, &mut sym, &runtime);
+            assert!(
+                matches!(action, TraceAction::Continue),
+                "getarrayitem_gc_f walk: {action:?}"
+            );
+        }
+        let frame = machine
+            .frames
+            .frames
+            .last()
+            .expect("root frame still live after the two reads");
+        assert!(frame.finished(), "jitcode did not run to its end");
+        assert_eq!(frame.float_values[0], Some(want), "first read");
+        assert_eq!(frame.float_values[1], Some(want), "cached second read");
+        assert_eq!(
+            frame.float_regs[0], frame.float_regs[1],
+            "the second read must answer with the cached box"
+        );
+        drop(machine);
+
+        let recorder = ctx.into_recorder();
+        let opcodes: Vec<_> = recorder.ops().iter().map(|op| op.opcode).collect();
+        assert_eq!(opcodes, vec![OpCode::GetarrayitemGcF]);
+        assert_eq!(
+            recorder.ops()[0].get_value(),
+            Some(Value::Float(f64::from_bits(want as u64)))
+        );
     }
 
     #[test]

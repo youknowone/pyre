@@ -2834,7 +2834,48 @@ impl<S: JitState> JitDriver<S> {
     pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
         self.meta.backend_mut().set_gc_allocator(gc);
     }
+}
 
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// Whether this execution thread has installed the interpreter's compiled
+    /// tier collector.
+    ///
+    /// This is deliberately execution-context state: the collector owns only
+    /// temporary JITFRAMEs, deadframes are thread-confined, and no object
+    /// identity or root is duplicated. The native backend's active-GC slot has
+    /// the same execution-thread lifetime: dropping one of several JitDrivers
+    /// does not clear it. Once the interpreter's values move onto this heap,
+    /// its real collector replaces this temporary boundary.
+    static JITFRAME_GC_INSTALLED: core::cell::Cell<bool> = const {
+        core::cell::Cell::new(false)
+    };
+}
+
+/// Install the smallest collector the interpreter's compiled tier needs.
+///
+/// RPython's `gc_ll_descr.malloc_jitframe` allocates every entry frame as a
+/// typed GC object. The interpreter's compiled tier constructs no heap object
+/// yet, so its collector needs exactly that one type. Installation is once per
+/// execution thread because the selected native backend owns its active
+/// allocator there.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn install_jitframe_gc<S: JitState>(driver: &mut JitDriver<S>) {
+    JITFRAME_GC_INSTALLED.with(|installed| {
+        if installed.get() {
+            return;
+        }
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        crate::register_active_backend_jitframe_gc_type(&mut gc);
+        driver.set_gc_allocator(Box::new(gc));
+        installed.set(true);
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn install_jitframe_gc<S: JitState>(_driver: &mut JitDriver<S>) {}
+
+impl<S: JitState> JitDriver<S> {
     /// Route compiled `New` / `NewWithVtable` through the installed GC
     /// allocator instead of the backend's `malloc` stub.
     ///

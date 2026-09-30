@@ -65,6 +65,7 @@ const NEWSTR: u8 = 7;
 pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlaState> =
         majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     // Every counter the tier gate reads, plus the last body's op count and
     // shape, off the driver callbacks. `Census::begin` opens a window over them.
     Census::install(&mut driver);

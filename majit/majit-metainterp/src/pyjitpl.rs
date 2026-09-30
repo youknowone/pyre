@@ -8464,11 +8464,13 @@ impl<M: Clone> MetaInterp<M> {
         );
         crate::logger::log_loop_from_trace(&trace.ops, &constants);
 
-        // PyPy: pyjitpl.py:3016-3017 gates unrolling on `unroll` in
-        // warmstate.enable_opts. MAJIT_NO_UNROLL remains a diagnostic override.
+        // `pyjitpl.py can_use_unroll` gates unrolling on
+        // `cpu.supports_guard_gc_type` and `unroll` in warmstate.enable_opts.
+        // MAJIT_NO_UNROLL remains a diagnostic override.
         let no_unroll_reason = crate::unroll_skip_reason(
             crate::no_unroll_enabled(),
             self.warm_state.get_enable_opts(),
+            majit_gc::supports_guard_gc_type(),
         )
         .or_else(|| {
             // rlib/jit.py `disable_unrolling`: "after how many operations we

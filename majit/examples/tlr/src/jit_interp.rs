@@ -69,6 +69,7 @@ const DEFAULT_THRESHOLD: u32 = 3;
 fn mainloop(program: &Bytecode, initial_a: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlrState> =
         majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::install_jitframe_gc(&mut driver);
     // Every counter the tier gate reads, plus the last body's op count and
     // shape, off the driver callbacks. `Census::begin` opens a window over them.
     Census::install(&mut driver);
