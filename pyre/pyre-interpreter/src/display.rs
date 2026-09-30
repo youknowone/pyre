@@ -2054,16 +2054,10 @@ fn unicode_err_int_repr(slot: &Result<i64, Wtf8Buf>) -> Wtf8Buf {
 /// object directly, so an out-of-range or negative `start` raises
 /// `IndexError` there.
 fn unicode_err_index_in_range(start: i64, end: i64, len: usize) -> bool {
-    let Some(next) = start.checked_add(1) else {
-        return false;
-    };
-    if end != next {
-        return false;
-    }
-    let Ok(len_i) = i64::try_from(len) else {
-        return start >= 0 && end >= 0;
-    };
-    start >= 0 && start < len_i && end >= 0 && end <= len_i
+    // `start < len` bounds `start` below the object length before
+    // `start + 1` is evaluated, so the sum cannot leave the range.
+    let len = len as i64;
+    start >= 0 && start < len && end >= 0 && end <= len && end == start + 1
 }
 
 /// `end - 1` for the plural message: matches PyPy's `self.end - 1`.
