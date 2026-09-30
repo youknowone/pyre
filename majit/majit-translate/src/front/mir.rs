@@ -8360,6 +8360,15 @@ impl<'a> Lowering<'a> {
                 {
                     self.prebuilt_once_value_locals.push(dest_local);
                 }
+                // `let q = p` keeps the cell ABI. `gc_mut_ref_param_root`
+                // otherwise only names the original parameter local.
+                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                    && !self.multi_assigned_locals.contains(&dest_local)
+                    && let PlaceKind::Local(src_local) = src.kind
+                    && self.gc_mut_ref_params.contains(&(src_local as usize))
+                {
+                    self.gc_mut_ref_params.insert(dest_local);
+                }
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
