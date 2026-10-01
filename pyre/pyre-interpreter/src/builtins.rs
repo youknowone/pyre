@@ -21923,6 +21923,11 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         fileio.set_closefd(closefd);
         if let Some(fd) = file_get_fd(opened) {
             fileio.set_fd(fd);
+        } else {
+            // Path-backed wasm open has no fd; mark the typed payload open
+            // so `fd < 0` does not look closed.
+            let _ =
+                crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(false));
         }
         if let Ok(name) = crate::baseobjspace::getattr_str(opened, "name") {
             fileio.set_name(name);
@@ -21992,7 +21997,25 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 fn file_is_closed(mut self_obj: PyObjectRef) -> bool {
     if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
-        return fileio.closed();
+        if fileio.fd() >= 0 {
+            return false;
+        }
+        // wasm path-backed FileIO has no descriptor; contents live in
+        // `__file_data__`. `W_FileIO._closed` is `fd < 0`, which would treat
+        // that successful open as closed.
+        if pyre_object::with_roots!(self_obj => {
+            crate::baseobjspace::getattr_str(self_obj, "__file_data__")
+        })
+        .is_ok()
+        {
+            return pyre_object::with_roots!(self_obj => {
+                crate::baseobjspace::getattr_str(self_obj, "__file_closed__")
+            })
+            .ok()
+            .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
+            .unwrap_or(false);
+        }
+        return true;
     }
     for name in ["__file_closed__", "closed"] {
         if let Ok(value) =
@@ -22008,6 +22031,8 @@ fn file_set_closed(mut self_obj: PyObjectRef, closed: bool) -> Result<(), crate:
     if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
         if closed {
             fileio.set_fd(-1);
+            let _ =
+                crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(true));
         }
         return Ok(());
     }
