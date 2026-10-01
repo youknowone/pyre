@@ -15247,10 +15247,8 @@ fn getarrayitem_gc_headerless_const_index_stamps_the_byte() {
     let mut regs_r = distinct_const_refs(&mut tc, 8);
     let mut regs_i = distinct_const_ints(&mut tc, 8);
     regs_r[2] = tc.const_ref(ptr);
-    let idx = tc.record_op(
-        majit_ir::OpCode::IntAdd,
-        &[tc.const_int(0), tc.const_int(0)],
-    );
+    let zero = tc.const_int(0);
+    let idx = tc.record_op(majit_ir::OpCode::IntAdd, &[zero, zero]);
     tc.set_opref_concrete(idx, majit_ir::Value::Int(0));
     regs_i[3] = idx;
     let session = std::cell::RefCell::new(WalkSession::default());

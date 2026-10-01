@@ -80,6 +80,35 @@ fn value_as_float_bits(value: Value) -> i64 {
     }
 }
 
+/// Heapcache key for one field access resolved from a `BhDescr::Field`.
+///
+/// `fielddescrof` copies the parent field's slot onto a `Vec` or fat-pointer
+/// part and then reads the other word (`.data`, `.len`, `.buf`).  `HeapCache`
+/// keys the read by `Descr::index()`, so those two words must not both answer
+/// with that slot.  A part the slot does not describe passes `u32::MAX`, the
+/// unassigned sentinel `ensure_heapcache_index` replaces with a unique key.
+/// Every other access keeps `index_in_parent`, including a part whose slot
+/// still describes the word.
+fn heapcache_index_for_split_part(
+    index_in_parent: Option<usize>,
+    parent: &majit_jitcode::jitcode::BhSizeSpec,
+    name: &str,
+    offset: usize,
+    field_size: usize,
+    field_type: majit_ir::value::Type,
+) -> u32 {
+    let split_part = name.ends_with(".data") || name.ends_with(".len") || name.ends_with(".buf");
+    let slot_describes_access = index_in_parent.is_some_and(|index| {
+        parent.all_fielddescrs.get(index).is_some_and(|spec| {
+            spec.offset == offset && spec.field_size == field_size && spec.field_type == field_type
+        })
+    });
+    if split_part && index_in_parent.is_some() && !slot_describes_access {
+        return u32::MAX;
+    }
+    index_in_parent.unwrap_or(0) as u32
+}
+
 /// Mirror a serialized `BhFieldSpec` onto a `SimpleFieldDescrSpec` so
 /// `make_simple_descr_group_keyed` can rebuild the runtime
 /// `SizeDescr.all_fielddescrs` / per-field `FieldDescr` group with the
@@ -383,7 +412,14 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             *is_immutable,
                             *is_quasi_immutable,
                             *field_flag,
-                            index_in_parent.unwrap_or(0) as u32,
+                            heapcache_index_for_split_part(
+                                *index_in_parent,
+                                p,
+                                name,
+                                *offset,
+                                *field_size,
+                                *field_type,
+                            ),
                             false,
                             *index_in_parent,
                         );
@@ -482,7 +518,14 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         *is_immutable,
                         *is_quasi_immutable,
                         *field_flag,
-                        index_in_parent.unwrap_or(0) as u32,
+                        heapcache_index_for_split_part(
+                            *index_in_parent,
+                            p,
+                            name,
+                            *offset,
+                            *field_size,
+                            *field_type,
+                        ),
                         false,
                         *index_in_parent,
                     );

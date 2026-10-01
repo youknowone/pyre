@@ -7597,6 +7597,219 @@ mod tests {
         assert_eq!(size.all_fielddescrs()[1].field_name(), "Cell.value");
     }
 
+    use majit_ir::descr::ArrayFlag;
+    use majit_jitcode::jitcode::{BhDescr, BhFieldSpec, BhSizeSpec};
+
+    fn fat_parent(type_id: u64, field_size: usize) -> std::sync::Arc<BhSizeSpec> {
+        std::sync::Arc::new(BhSizeSpec {
+            size: 232,
+            type_id,
+            vtable: 0,
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: vec![BhFieldSpec {
+                index: 0,
+                field_key: "localspluskinds".into(),
+                name: "CodeObject.localspluskinds".into(),
+                offset: 216,
+                field_size,
+                field_type: Type::Ref,
+                field_flag: ArrayFlag::Pointer,
+                is_field_signed: false,
+                is_immutable: true,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: None,
+            }],
+        })
+    }
+
+    fn bh_field(
+        parent: &std::sync::Arc<BhSizeSpec>,
+        name: &str,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        field_flag: ArrayFlag,
+        index_in_parent: Option<usize>,
+    ) -> DescrRef {
+        make_descr_from_bh(&BhDescr::Field {
+            offset,
+            field_size,
+            field_type,
+            field_flag,
+            is_field_signed: false,
+            is_immutable: true,
+            is_quasi_immutable: false,
+            index_in_parent,
+            parent: Some(std::sync::Arc::clone(parent)),
+            name: name.into(),
+            owner: "CodeObject".into(),
+        })
+    }
+
+    /// `fielddescrof` stamps one parent slot on both fat-pointer words.
+    /// `HeapCache` keys by `Descr::index()`, so the words need different keys
+    /// when that slot does not describe both accesses.
+    #[test]
+    fn make_descr_from_bh_fat_parts_do_not_share_heapcache_index() {
+        let wide = fat_parent(0xFA70_DA7A_0000_0001, 16);
+        let data = bh_field(
+            &wide,
+            "localspluskinds.data",
+            216,
+            8,
+            Type::Ref,
+            ArrayFlag::Pointer,
+            Some(0),
+        );
+        let len = bh_field(
+            &wide,
+            "localspluskinds.len",
+            224,
+            8,
+            Type::Int,
+            ArrayFlag::Unsigned,
+            Some(0),
+        );
+        assert_ne!(data.index(), len.index());
+        assert_ne!(data.index(), 0);
+        assert_ne!(len.index(), 0);
+        assert_eq!(data.as_field_descr().unwrap().offset(), 216);
+        assert_eq!(len.as_field_descr().unwrap().offset(), 224);
+
+        // The data word is the parent field itself. It keeps the slot so a
+        // read of the field and a read of `.data` stay one cache entry.
+        let exact = fat_parent(0xFA70_DA7A_0000_0002, 8);
+        let data = bh_field(
+            &exact,
+            "localspluskinds.data",
+            216,
+            8,
+            Type::Ref,
+            ArrayFlag::Pointer,
+            Some(0),
+        );
+        let len = bh_field(
+            &exact,
+            "localspluskinds.len",
+            224,
+            8,
+            Type::Int,
+            ArrayFlag::Unsigned,
+            Some(0),
+        );
+        assert_eq!(data.index(), 0);
+        assert_ne!(len.index(), 0);
+        assert_ne!(data.index(), len.index());
+
+        // A stale slot on a field that is not a split part keeps the position.
+        // Only the suffixed vec/fat accesses move.
+        let stale_parent = std::sync::Arc::new(BhSizeSpec {
+            size: 32,
+            type_id: 0xFA70_DA7A_0000_0003,
+            vtable: 0,
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: vec![BhFieldSpec {
+                index: 0,
+                field_key: "buffer".into(),
+                name: "Owner.buffer".into(),
+                offset: 16,
+                field_size: 8,
+                field_type: Type::Ref,
+                field_flag: ArrayFlag::Pointer,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: None,
+            }],
+        });
+        let count = bh_field(
+            &stale_parent,
+            "count",
+            24,
+            8,
+            Type::Int,
+            ArrayFlag::Unsigned,
+            Some(0),
+        );
+        assert_eq!(count.index(), 0);
+    }
+
+    /// The tracing pool resolves a field through `field_descr_ref_from_bh`,
+    /// not `make_descr_from_bh`.  The same two fat-pointer words have to
+    /// leave that path with different `Descr::index()` values, because that
+    /// is the key `HeapCache` consults while the walk records the read.
+    #[test]
+    fn field_descr_ref_from_bh_fat_parts_do_not_share_heapcache_index() {
+        fn walk(
+            parent: &std::sync::Arc<BhSizeSpec>,
+            name: &str,
+            offset: usize,
+            field_size: usize,
+            field_type: Type,
+            field_flag: ArrayFlag,
+        ) -> DescrRef {
+            majit_metainterp::field_descr_ref_from_bh(&BhDescr::Field {
+                offset,
+                field_size,
+                field_type,
+                field_flag,
+                is_field_signed: false,
+                is_immutable: true,
+                is_quasi_immutable: false,
+                index_in_parent: Some(0),
+                parent: Some(std::sync::Arc::clone(parent)),
+                name: name.into(),
+                owner: "CodeObject".into(),
+            })
+            .1
+        }
+
+        let wide = fat_parent(0xFA70_DA7A_0000_0004, 16);
+        let data = walk(
+            &wide,
+            "localspluskinds.data",
+            216,
+            8,
+            Type::Ref,
+            ArrayFlag::Pointer,
+        );
+        let len = walk(
+            &wide,
+            "localspluskinds.len",
+            224,
+            8,
+            Type::Int,
+            ArrayFlag::Unsigned,
+        );
+        assert_ne!(data.index(), len.index());
+        assert_ne!(data.index(), 0);
+        assert_ne!(len.index(), 0);
+
+        let exact = fat_parent(0xFA70_DA7A_0000_0005, 8);
+        let data = walk(
+            &exact,
+            "localspluskinds.data",
+            216,
+            8,
+            Type::Ref,
+            ArrayFlag::Pointer,
+        );
+        let len = walk(
+            &exact,
+            "localspluskinds.len",
+            224,
+            8,
+            Type::Int,
+            ArrayFlag::Unsigned,
+        );
+        assert_eq!(data.index(), 0);
+        assert_ne!(len.index(), data.index());
+    }
+
     /// A build-time `setarrayitem_gc` on a list's int block and the walker's
     /// own `getarrayitem_gc_i` name one ArrayDescr, or the heap cache keeps
     /// the pre-store read alive across the store.
@@ -8741,6 +8954,46 @@ fn field_descr_from_bh_field(
     arc
 }
 
+/// Heapcache identity for one `BhDescr::Field` access.
+///
+/// `heaptracker.get_fielddescr_index_in` numbers a field by its slot, and
+/// `HeapCache` keys a read by `Descr::index()`.  `fielddescrof` keeps that
+/// slot on a `Vec` or fat-pointer part, then moves the offset and suffixes
+/// the name (`.data`, `.len`, `.buf`).  The two words then share one index,
+/// so the length box is what a later read of the data word returns.
+///
+/// A suffixed part whose parent slot does not describe this access takes
+/// `stable_field_index` instead.  A part that still describes the slot keeps
+/// the position, and so does every access that is not one of those parts.
+fn heapcache_index_for_field_access(
+    index_in_parent: Option<usize>,
+    parent: Option<&majit_jitcode::jitcode::BhSizeSpec>,
+    name: &str,
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    is_field_signed: bool,
+) -> u32 {
+    let slot_describes_access = match (index_in_parent, parent) {
+        (Some(index), Some(parent_spec)) => {
+            parent_spec.all_fielddescrs.get(index).is_some_and(|spec| {
+                spec.offset == offset
+                    && spec.field_size == field_size
+                    && spec.field_type == field_type
+            })
+        }
+        _ => false,
+    };
+    let split_part = name.ends_with(".data") || name.ends_with(".len") || name.ends_with(".buf");
+    if parent.is_some() && index_in_parent.is_some() && split_part && !slot_describes_access {
+        return stable_field_index(offset, field_size, field_type, is_field_signed);
+    }
+    match index_in_parent {
+        Some(index) => index as u32,
+        None => stable_field_index(offset, field_size, field_type, is_field_signed),
+    }
+}
+
 fn bh_field_cache_key(owner: &str, name: &str) -> String {
     if owner.is_empty() {
         return name.to_string();
@@ -9354,10 +9607,20 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                 // the scheme the runtime-minted field descrs already use: its
                 // `FIELD_DESCR_TAG` is disjoint from the positional numbers,
                 // and two fields of one object cannot share an offset.
-                index: match index_in_parent {
-                    Some(index) => *index as u32,
-                    None => stable_field_index(*offset, *field_size, *field_type, *is_field_signed),
-                },
+                //
+                // A fat-pointer part is numbered and still not that position:
+                // `fielddescrof` copies the parent slot, then reads a different
+                // word.  `heapcache_index_for_field_access` keeps the position
+                // only when the slot describes the access.
+                index: heapcache_index_for_field_access(
+                    *index_in_parent,
+                    parent.as_deref(),
+                    name,
+                    *offset,
+                    *field_size,
+                    *field_type,
+                    *is_field_signed,
+                ),
                 field_key,
                 name: full_name,
                 offset: *offset,
