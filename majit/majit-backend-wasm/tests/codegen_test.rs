@@ -12348,6 +12348,51 @@ fn test_oracle_f64_param_on_int_descr_keeps_trampoline() {
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
         assert!(indirect_calls.is_empty());
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(
+                op,
+                wasmparser::Operator::I64ExtendI32S
+            )),
+            0
+        );
+    });
+}
+
+#[test]
+fn test_trampolined_narrow_signed_int_sign_extends() {
+    let encoded = majit_backend_wasm::encode_func_sig(
+        &[majit_backend_wasm::FuncSigVal::F64],
+        Some(majit_backend_wasm::FuncSigVal::I32),
+    );
+    with_table_sig(42, Some(encoded), || {
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+        let call = {
+            let op = Op::new(
+                OpCode::CallI,
+                &[rb(OpRef::const_int(42)), rb(OpRef::input_arg_int(0))],
+            );
+            op.pos().set(OpRef::int_op(1));
+            op.setdescr(std::sync::Arc::new(majit_ir::descr::SimpleCallDescr::new(
+                0,
+                vec![Type::Int],
+                Type::Int,
+                true,
+                4,
+                EffectInfo::default(),
+            )));
+            op
+        };
+        let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(
+                op,
+                wasmparser::Operator::I64ExtendI32S
+            )),
+            1
+        );
     });
 }
 

@@ -3769,6 +3769,21 @@ fn widen_direct_call_result(sink: &mut PeepSink<'_, '_>, op: &Op, result_ty: Opt
     }
 }
 
+/// Host `jit_call` stores an i32 result zero-extended. `load_result` then
+/// sign-extends a signed int narrower than a word. The wasm C ABI already
+/// extended a 1- or 2-byte return to i32, so one `i64.extend_i32_s` covers it.
+fn sign_extend_trampolined_int(sink: &mut PeepSink<'_, '_>, op: &Op) {
+    let narrow_signed = op.getdescr().is_some_and(|descr| {
+        descr.as_call_descr().is_some_and(|cd| {
+            cd.result_type() == Type::Int && cd.is_result_signed() && cd.result_size() < 8
+        })
+    });
+    if narrow_signed {
+        sink.i32_wrap_i64();
+        sink.i64_extend_i32_s();
+    }
+}
+
 /// If `op` is a residual CALL whose ABI is uniformly i64 (all Int/Ref args and
 /// an Int/Ref result), return its argument count — eligible for a direct
 /// `call_indirect` of type `(i64×n) -> i64`. `None` keeps the `jit_call`
@@ -10510,6 +10525,8 @@ fn build_function(
                         sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
                         if value_types.ty(vi) == ValType::F64 {
                             sink.f64_reinterpret_i64();
+                        } else {
+                            sign_extend_trampolined_int(&mut sink, op);
                         }
                         sink.local_set(value_types.local(vi));
                     }

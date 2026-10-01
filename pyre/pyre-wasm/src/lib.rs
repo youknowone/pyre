@@ -204,11 +204,26 @@ fn blackhole_residual_call(
     args: &[i64],
     classes: &[majit_backend::call_stub::ArgClass],
     result: char,
+    result_signed: bool,
+    result_size: usize,
 ) -> Option<i64> {
     if let Some(value) = direct_sig_call(func_ptr, args) {
-        return Some(value);
+        return Some(majit_backend_wasm::widen_reflected_result(
+            func_ptr,
+            value,
+            result,
+            result_signed,
+            result_size,
+        ));
     }
-    majit_backend_wasm::residual_host_call(func_ptr, args, classes, result)
+    majit_backend_wasm::residual_host_call(
+        func_ptr,
+        args,
+        classes,
+        result,
+        result_signed,
+        result_size,
+    )
 }
 
 // Host clock for the native-host (`wasm-host`) build.
