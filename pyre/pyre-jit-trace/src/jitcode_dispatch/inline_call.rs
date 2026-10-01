@@ -208,9 +208,21 @@ struct KwonlyDefaultInline {
 }
 
 /// `_match_signature` allocates a fresh kwargs dict on every call
-/// (`space.newdict(kwargs=True)` / `w_dict_new_kwargs`).
-extern "C" fn jit_empty_kwargs_dict() -> i64 {
-    pyre_object::dictmultiobject::w_dict_new_kwargs() as i64
+/// (`space.newdict(kwargs=True)` / `w_dict_new_kwargs`). Record that
+/// allocator, not a walker-private wrapper.
+pub(crate) fn record_fresh_kwargs_dict(trace_ctx: &mut majit_metainterp::TraceCtx) -> OpRef {
+    let dict_op = crate::helpers::emit_trace_call_ref_typed(
+        trace_ctx,
+        pyre_object::dictmultiobject::w_dict_new_kwargs as *const (),
+        &[],
+        &[],
+    );
+    let concrete = pyre_object::dictmultiobject::w_dict_new_kwargs();
+    trace_ctx.set_opref_concrete(
+        dict_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+    );
+    dict_op
 }
 
 /// What the record-time resolve proved about `Function.w_kw_defs`, carried to
@@ -2727,18 +2739,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if has_varkeywords {
         // `_match_signature` does `space.newdict(kwargs=True)` on every call.
         // The dict is mutable, so it cannot be the shared empty constant.
-        let dict_op = crate::helpers::emit_trace_call_ref_typed(
-            ctx.trace_ctx,
-            jit_empty_kwargs_dict as *const (),
-            &[],
-            &[],
-        );
-        let concrete = pyre_object::dictmultiobject::w_dict_new_kwargs();
-        ctx.trace_ctx.set_opref_concrete(
-            dict_op,
-            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-        );
-        param_boxes.push(dict_op);
+        param_boxes.push(record_fresh_kwargs_dict(ctx.trace_ctx));
     }
 
     // `ec` is the portal's second red (`interp_jit.py reds=['frame', 'ec']`).

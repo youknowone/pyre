@@ -1114,6 +1114,32 @@ fn execution_context_recovery_records_a_non_elidable_call() {
     assert!(!call_descr.get_extra_info().check_can_raise(false));
 }
 
+/// A `**kwargs` local is the dict `_match_signature` allocates with
+/// `space.newdict(kwargs=True)`. The recorded call is that allocator.
+#[test]
+fn fresh_kwargs_dict_records_match_signature_allocator() {
+    let mut tc = fresh_trace_ctx();
+    let ops_before = tc.num_ops();
+    let dict_op = super::inline_call::record_fresh_kwargs_dict(&mut tc);
+    assert_eq!(tc.num_ops(), ops_before + 1);
+    let call_op = tc.ops().last().expect("recorded call");
+    assert_eq!(call_op.opcode, majit_ir::OpCode::CallR);
+    let func = call_op.getarglist()[0].to_opref();
+    let majit_ir::Value::Int(addr) = tc.box_value(func).expect("func const") else {
+        panic!("allocator address is a constant int");
+    };
+    assert_eq!(
+        addr as usize,
+        pyre_object::dictmultiobject::w_dict_new_kwargs as *const () as usize
+    );
+    let majit_ir::Value::Ref(majit_ir::GcRef(bits)) = tc.box_value(dict_op).expect("concrete dict")
+    else {
+        panic!("the traced dict is a ref");
+    };
+    let obj = bits as pyre_object::PyObjectRef;
+    assert_eq!(unsafe { pyre_object::dictmultiobject::w_dict_len(obj) }, 0);
+}
+
 /// The globals guard reads a frame's namespace override with a plain
 /// `GETFIELD_GC_R` on the live `debugdata` box, so the descr it uses has to
 /// name `FrameDebugData.w_globals` and has to stay mutable: `pyframe.py

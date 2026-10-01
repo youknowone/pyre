@@ -1628,7 +1628,7 @@ pub fn w_dict_new_instance() -> PyObjectRef {
 /// this allocator so the first unicode setitem promotes the dict
 /// directly to `KwargsDictStrategy` (skipping the regular
 /// `UnicodeDictStrategy` intermediate).
-pub fn w_dict_new_kwargs() -> PyObjectRef {
+pub extern "C" fn w_dict_new_kwargs() -> PyObjectRef {
     alloc_dict_object(
         W_DictObject {
             ob_header: PyObject {
