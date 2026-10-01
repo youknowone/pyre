@@ -3539,33 +3539,37 @@ fn wasm_sig_to_typed(sig: &crate::WasmSig) -> TypedResidualSig {
     )
 }
 
-/// True when `real` differs from `expected` only by i32 where the descr has
-/// i64. f32 is not this case.
-fn i32_abi_variance(expected: &TypedResidualSig, real: &TypedResidualSig) -> bool {
+/// True when `real` differs from `expected` only by a narrower wasm spelling
+/// of the same descr slot: i32 for an i64, or f32 for an f64 or for i64 bits.
+fn table_type_variance(expected: &TypedResidualSig, real: &TypedResidualSig) -> bool {
     if expected.0.len() != real.0.len() || expected.1.is_some() != real.1.is_some() {
         return false;
     }
-    if real.0.contains(&ValType::F32) || real.1 == Some(ValType::F32) {
-        return false;
-    }
     for (want, got) in expected.0.iter().zip(&real.0) {
-        match (*want, *got) {
-            (a, b) if a == b => {}
-            (ValType::I64, ValType::I32) => {}
-            _ => return false,
+        if !narrow_valtype(*want, *got) {
+            return false;
         }
     }
     match (expected.1, real.1) {
-        (a, b) if a == b => true,
-        (Some(ValType::I64), Some(ValType::I32)) => true,
+        (None, None) => true,
+        (Some(want), Some(got)) => narrow_valtype(want, got),
         _ => false,
     }
 }
 
+fn narrow_valtype(want: ValType, got: ValType) -> bool {
+    matches!(
+        (want, got),
+        (a, b) if a == b
+            || (want == ValType::I64 && matches!(got, ValType::I32 | ValType::F32))
+            || (want == ValType::F64 && got == ValType::F32)
+    )
+}
+
 /// `_genop_call` emits `CallDescr.get_arg_types` / `get_result_type` /
-/// `get_result_size`. On wasm the same descr is the type only when the
-/// callee's table entry agrees, or differs solely by i32 for an Int/Ref.
-/// A slot the table does not hold (a host import) keeps `jit_call`.
+/// `get_result_size`. The descr is the call type. A constant callee may
+/// narrow that to the table's i32 or f32 spelling. A slot the table does
+/// not hold (a host import) keeps `jit_call`.
 fn residual_callee_direct_emit_sig_at(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -3576,21 +3580,17 @@ fn residual_callee_direct_emit_sig_at(
         return None;
     };
     if !func_ptr.is_constant() {
-        // The index is computed. The descr is still the type; a host that
-        // cannot see the table (native tests) emits it. The guest bounces,
-        // because a dynamic index is not known to be a function of this type.
-        return (!cfg!(target_arch = "wasm32")).then(|| expected.clone());
+        // The descr is the type, the same call the native backends emit.
+        // A constant callee below may narrow that to the table's i32 or f32.
+        return Some(expected.clone());
     }
     let addr = resolve_const_bits(constants, func_ptr);
     match crate::residual_target_sig(addr) {
         Some(real) => {
-            if real.has_f32() {
-                return None;
-            }
             let real_typed = wasm_sig_to_typed(&real);
             if real_typed == *expected {
                 Some(expected.clone())
-            } else if i32_abi_variance(expected, &real_typed) {
+            } else if table_type_variance(expected, &real_typed) {
                 Some(real_typed)
             } else {
                 None
@@ -3717,6 +3717,17 @@ fn emit_typed_residual_call(
                 emit_resolve(sink, constants, value_types, arg.to_opref());
                 sink.i32_wrap_i64();
             }
+            ValType::F32 => {
+                let arg = arg.to_opref();
+                if arg.ty() == Some(Type::Float) {
+                    emit_resolve_f64(sink, constants, value_types, arg);
+                    sink.f32_demote_f64();
+                } else {
+                    emit_resolve(sink, constants, value_types, arg);
+                    sink.i32_wrap_i64();
+                    sink.f32_reinterpret_i32();
+                }
+            }
             _ => {
                 emit_resolve(sink, constants, value_types, arg.to_opref());
             }
@@ -3726,6 +3737,36 @@ fn emit_typed_residual_call(
     sink.i32_wrap_i64();
     emit_push_site(sink, site_gcmap, op_idx);
     sink.call_indirect(0, type_idx);
+}
+
+/// `callbuilder.py` `load_result`: a result narrower than a word is sign- or
+/// zero-extended from `result_size`. An i32 wasm result whose descr is a full
+/// word zero-extends (wasm32 pointer / `usize`). An f32 float promotes; an f32
+/// whose descr is an int is a singlefloat bit pattern.
+fn widen_direct_call_result(sink: &mut PeepSink<'_, '_>, op: &Op, result_ty: Option<ValType>) {
+    match result_ty {
+        Some(ValType::I32) => {
+            let signed = op.getdescr().is_some_and(|descr| {
+                descr.as_call_descr().is_some_and(|cd| {
+                    cd.result_type() == Type::Int && cd.is_result_signed() && cd.result_size() < 8
+                })
+            });
+            if signed {
+                sink.i64_extend_i32_s();
+            } else {
+                sink.i64_extend_i32_u();
+            }
+        }
+        Some(ValType::F32) => {
+            if op.result_type() == Type::Float {
+                sink.f64_promote_f32();
+            } else {
+                sink.i32_reinterpret_f32();
+                sink.i64_extend_i32_u();
+            }
+        }
+        _ => {}
+    }
 }
 
 /// If `op` is a residual CALL whose ABI is uniformly i64 (all Int/Ref args and
@@ -8654,21 +8695,7 @@ fn build_function(
                         type_idx,
                     );
                     if has_result {
-                        if *result_ty == Some(ValType::I32) {
-                            // `get_call_descr` records result signedness.
-                            // Unsigned ints and refs zero-extend.
-                            let signed = op.opcode == OpCode::CondCallValueI
-                                && op.getdescr().is_some_and(|descr| {
-                                    descr
-                                        .as_call_descr()
-                                        .is_some_and(|cd| cd.is_result_signed())
-                                });
-                            if signed {
-                                sink.i64_extend_i32_s();
-                            } else {
-                                sink.i64_extend_i32_u();
-                            }
-                        }
+                        widen_direct_call_result(&mut sink, op, *result_ty);
                         sink.local_set(value_types.local(vi));
                     } else if result_ty.is_some() {
                         sink.drop();
@@ -10378,17 +10405,13 @@ fn build_function(
                     );
                     // A void callee leaves nothing on the stack, so there is
                     // neither a local to home it in nor a value to drop.
-                    // i32 results zero-extend, matching the host trampoline's
-                    // `(*v as u32) as i64`.
                     let homed = if result_ty.is_none() {
                         None
                     } else if is_void_op {
                         sink.drop();
                         None
                     } else if !OpRef::raw_is_constant(vi) {
-                        if *result_ty == Some(ValType::I32) {
-                            sink.i64_extend_i32_u();
-                        }
+                        widen_direct_call_result(&mut sink, op, *result_ty);
                         sink.local_set(value_types.local(vi));
                         Some(vi)
                     } else {

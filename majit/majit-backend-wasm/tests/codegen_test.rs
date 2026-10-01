@@ -12227,9 +12227,104 @@ fn test_oracle_i32_call_lowers_with_wrap_and_zero_extend() {
 }
 
 #[test]
-fn test_oracle_f32_mismatch_keeps_trampoline_even_if_vouched() {
+fn test_oracle_f32_int_bits_call_indirect() {
     let encoded = majit_backend_wasm::encode_func_sig(
         &[majit_backend_wasm::FuncSigVal::F32],
+        Some(majit_backend_wasm::FuncSigVal::I64),
+    );
+    with_table_sig(42, Some(encoded), || {
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+        let call = {
+            let op = Op::new(
+                OpCode::CallI,
+                &[rb(OpRef::const_int(42)), rb(OpRef::input_arg_int(0))],
+            );
+            op.pos().set(OpRef::int_op(1));
+            op.setdescr(majit_ir::descr::make_call_descr(
+                vec![Type::Int],
+                Type::Int,
+                EffectInfo::default(),
+            ));
+            op
+        };
+        let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+        let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+        assert_eq!(indirect_calls.len(), 1);
+        assert_eq!(
+            function_type(&bytes, indirect_calls[0].0 as usize),
+            (
+                vec![wasmparser::ValType::F32],
+                vec![wasmparser::ValType::I64]
+            )
+        );
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(
+                op,
+                wasmparser::Operator::F32ReinterpretI32
+            )),
+            1
+        );
+    });
+}
+
+#[test]
+fn test_oracle_f32_float_promotes_on_the_direct_call() {
+    let encoded = majit_backend_wasm::encode_func_sig(
+        &[majit_backend_wasm::FuncSigVal::F32],
+        Some(majit_backend_wasm::FuncSigVal::F32),
+    );
+    with_table_sig(42, Some(encoded), || {
+        let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
+        let call = {
+            let op = Op::new(
+                OpCode::CallF,
+                &[rb(OpRef::const_int(42)), rb(OpRef::input_arg_float(0))],
+            );
+            op.pos().set(OpRef::float_op(1));
+            op.setdescr(majit_ir::descr::make_call_descr(
+                vec![Type::Float],
+                Type::Float,
+                EffectInfo::default(),
+            ));
+            op
+        };
+        let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::float_op(1))])];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+        let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+        assert_eq!(indirect_calls.len(), 1);
+        assert_eq!(
+            function_type(&bytes, indirect_calls[0].0 as usize),
+            (
+                vec![wasmparser::ValType::F32],
+                vec![wasmparser::ValType::F32]
+            )
+        );
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(
+                op,
+                wasmparser::Operator::F32DemoteF64
+            )),
+            1
+        );
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(
+                op,
+                wasmparser::Operator::F64PromoteF32
+            )),
+            1
+        );
+    });
+}
+
+#[test]
+fn test_oracle_f64_param_on_int_descr_keeps_trampoline() {
+    let encoded = majit_backend_wasm::encode_func_sig(
+        &[majit_backend_wasm::FuncSigVal::F64],
         Some(majit_backend_wasm::FuncSigVal::I64),
     );
     with_table_sig(42, Some(encoded), || {
