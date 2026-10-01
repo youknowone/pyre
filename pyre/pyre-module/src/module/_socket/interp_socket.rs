@@ -4449,7 +4449,8 @@ pub fn __majit_wrap_socket_bind(
     let (storage, slen) = pack_inet_addr("bind", family, proto, w_addr)?;
     #[cfg(unix)]
     {
-        let bytes = std::slice::from_raw_parts(&storage as *const _ as *const u8, slen as usize);
+        let bytes =
+            unsafe { std::slice::from_raw_parts(&storage as *const _ as *const u8, slen as usize) };
         majit_rlib::rsocket::bind(fd, bytes).map_err(rsocket_os_error)?;
         return Ok(pyre_object::w_none());
     }
@@ -4645,19 +4646,22 @@ pub fn __majit_wrap_socket_setsockopt(
     }
     #[cfg(unix)]
     {
-        if pyre_object::is_int(val) {
-            let v = pyre_object::w_int_get_value(val) as libc::c_int;
-            majit_rlib::rsocket::setsockopt(fd, level, name, &v.to_ne_bytes())
-                .map_err(rsocket_os_error)?;
-        } else if pyre_object::bytesobject::is_bytes_like(val) {
-            // Copied before the call: `setsockopt` releases the
-            // interpreter, and the bytes object can move.
-            let data = pyre_object::bytesobject::bytes_like_data(val).to_vec();
-            majit_rlib::rsocket::setsockopt(fd, level, name, &data).map_err(rsocket_os_error)?;
-        } else {
-            return Err(pyre_interpreter::PyError::type_error(
-                "setsockopt: value must be int or bytes-like",
-            ));
+        unsafe {
+            if pyre_object::is_int(val) {
+                let v = pyre_object::w_int_get_value(val) as libc::c_int;
+                majit_rlib::rsocket::setsockopt(fd, level, name, &v.to_ne_bytes())
+                    .map_err(rsocket_os_error)?;
+            } else if pyre_object::bytesobject::is_bytes_like(val) {
+                // Copied before the call: `setsockopt` releases the
+                // interpreter, and the bytes object can move.
+                let data = pyre_object::bytesobject::bytes_like_data(val).to_vec();
+                majit_rlib::rsocket::setsockopt(fd, level, name, &data)
+                    .map_err(rsocket_os_error)?;
+            } else {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "setsockopt: value must be int or bytes-like",
+                ));
+            }
         }
         return Ok(pyre_object::w_none());
     }
