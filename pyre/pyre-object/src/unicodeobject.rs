@@ -2079,6 +2079,80 @@ mod tests {
         assert_eq!(get_interned_wtf8(value), Some(canonical));
     }
 
+    thread_local! {
+        static MANAGED_ALLOCS: std::cell::RefCell<Vec<usize>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn record_managed_alloc(_type_id: u32, payload_size: usize) -> *mut u8 {
+        let layout = std::alloc::Layout::from_size_align(payload_size.max(1), 8)
+            .expect("managed intern probe layout");
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            MANAGED_ALLOCS.with(|slots| slots.borrow_mut().push(ptr as usize));
+        }
+        ptr
+    }
+
+    fn managed_alloc_is_owned(addr: usize) -> bool {
+        MANAGED_ALLOCS.with(|slots| slots.borrow().contains(&addr))
+    }
+
+    /// A miss through `intern_wtf8_value` stores `InternSlot::Weak` once the
+    /// string is GC-owned. `box_str_constant` keeps `InternSlot::Immortal`.
+    #[test]
+    fn managed_miss_is_weak_and_constant_intern_stays_immortal() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        struct ClearProbe;
+        impl Drop for ClearProbe {
+            fn drop(&mut self) {
+                crate::gc_hook::clear_gc_owns_object_hook();
+                crate::lowlevel_string::clear_lowlevel_str_gc_type_id();
+                MANAGED_ALLOCS.with(|slots| slots.borrow_mut().clear());
+            }
+        }
+        let _clear = ClearProbe;
+        assert!(
+            crate::gc_interp::enabled(),
+            "managed intern falls back to immortal while gc_interp is off"
+        );
+        crate::lowlevel_string::set_lowlevel_str_gc_type_id(1);
+        crate::gc_hook::register_gc_alloc_hook(record_managed_alloc);
+        crate::gc_hook::register_gc_owns_object_hook(managed_alloc_is_owned);
+
+        let miss = Wtf8::new("__pyre_managed_miss_weak_slot_9c1e__");
+        assert!(get_interned_wtf8(miss).is_none());
+        let managed = intern_wtf8_value(miss);
+        assert!(crate::gc_hook::try_gc_owns_object(managed as *mut u8));
+        {
+            let table = STRING_INTERN_TABLE.lock();
+            match table.get(miss) {
+                Some(InternSlot::Weak(wref)) => {
+                    assert_ne!(*wref, 0);
+                    assert_eq!(intern_slot_alive(&InternSlot::Weak(*wref)), Some(managed));
+                    println!("managed miss stored as a weak value");
+                }
+                Some(InternSlot::Immortal(_)) => {
+                    panic!("managed miss stored as immortal");
+                }
+                None => panic!("managed miss was not stored"),
+            }
+        }
+
+        let constant = Wtf8::new("__pyre_constant_immortal_slot_9c1e__");
+        let boxed = box_str_constant(constant);
+        assert!(!crate::gc_hook::try_gc_owns_object(boxed as *mut u8));
+        let table = STRING_INTERN_TABLE.lock();
+        match table.get(constant) {
+            Some(InternSlot::Immortal(addr)) => {
+                assert_eq!(*addr, boxed as usize);
+                println!("constant intern remaining immortal");
+            }
+            Some(InternSlot::Weak(_)) => panic!("constant intern stored as weak"),
+            None => panic!("constant intern was not stored"),
+        }
+    }
+
     #[test]
     fn test_jit_string_helpers_share_str_semantics() {
         let a = w_str_new("ab");

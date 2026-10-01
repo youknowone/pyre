@@ -3344,3 +3344,31 @@ assert b == bytearray(b"abcdef\x01\x02"), b
         "derived memoryviews must share the root's export",
     );
 }
+
+/// `sys.intern` on a miss stores a weak managed string. A later collection
+/// must keep that string while a strong reference lives, and a builtin
+/// `interp2app` reached through the declaration container must still run.
+#[test]
+fn intern_and_declaration_roots_survive_collection() {
+    run_on_worker(
+        r#"
+import gc
+import sys
+
+name = "pyre-intern-survives-collection-9c1e"
+first = sys.intern(name)
+assert sys.intern(name) is first
+gc.collect()
+assert sys.intern(name) is first, "intern miss was not the same object after collect"
+assert first + "!" == name + "!"
+
+add = int.__add__
+gc.collect()
+assert int.__add__ is add
+assert add(1, 2) == 3
+"#,
+        "intern_and_declaration_roots.py",
+        "intern identity and declaration interior",
+        "intern or declaration root did not survive collection",
+    );
+}
