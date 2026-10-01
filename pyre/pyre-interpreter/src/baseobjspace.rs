@@ -21028,7 +21028,7 @@ pub fn generatorentry_fnaddrs() -> Vec<(&'static str, i64)> {
     vec![
         (
             "pyre_object::gc_roots::push_roots",
-            pyre_object::gc_roots::push_roots as *const () as usize as i64,
+            pyre_object::gc_roots::push_roots_jit_abi as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::generator_send_ex_body",

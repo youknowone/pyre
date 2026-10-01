@@ -72,7 +72,7 @@
 //! forwarded.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 
 use crate::pyobject::PyObjectRef;
@@ -640,12 +640,175 @@ pub fn root_scope_close(scope: &RootScope) {
 /// execute the matching `pop_roots(hop, livevars)`. See the module
 /// docstring for the multi-phase plan.
 ///
-/// Residualised: `RootScope` is one word (`save_point`), which the residual
-/// ABI can carry.  `rlib/jit.py` `@dont_look_inside`.
+/// `rlib/jit.py` `@dont_look_inside`. The residual entry is
+/// [`push_roots_jit_abi`]: `bh_call_r` stores the result register as a
+/// `GcRef`, and the lowered `Drop` passes that word to
+/// [`root_scope_close`], which loads `save_point` through the pointer.
+/// This function returns the guard by value; that integer is not the word
+/// the residual call carries.
 #[inline]
 #[majit_macros::dont_look_inside]
 pub fn push_roots() -> RootScope {
     RootScope::new()
+}
+
+/// How many closed brackets one thread keeps warm.
+///
+/// A compiled loop opens one bracket per call. Recycling that box keeps
+/// the allocation off the allocator after warmup. The cap is the nesting
+/// a trace actually reaches; a deeper peak frees instead of retaining it.
+const ROOT_SCOPE_BRIDGE_FREELIST_CAP: usize = 8;
+
+struct RootScopeBridge {
+    /// Boxes whose `RootScope` is still open. The residual result word is
+    /// one of these pointers.
+    live: Vec<*mut RootScope>,
+    /// Allocations whose guard has already run. The next push writes a new
+    /// guard into one.
+    freelist: Vec<*mut RootScope>,
+}
+
+/// Frees bridge boxes at thread exit. Initialized after
+/// [`ROOT_SCOPE_BRIDGE`] so this destructor runs while that key is still
+/// alive. It must not run [`RootScope::drop`]: [`ROOT_STACK`] may already
+/// be gone, and the guard's close truncates that stack.
+struct RootScopeBridgeOwner;
+
+impl Drop for RootScopeBridgeOwner {
+    fn drop(&mut self) {
+        let _ = ROOT_SCOPE_BRIDGE.try_with(|state| {
+            let mut state = state.borrow_mut();
+            for ptr in state.live.drain(..) {
+                // SAFETY: `push_roots_jit_abi` allocated `ptr`. Skipping
+                // `RootScope::drop` leaves any pins for `RootStackOwner`;
+                // the stack key may already have freed its buffer.
+                unsafe { free_root_scope_allocation(ptr) };
+            }
+            for ptr in state.freelist.drain(..) {
+                // SAFETY: the guard was dropped when the box was recycled,
+                // so the allocation is uninitialized. `ManuallyDrop` does
+                // not drop it again.
+                unsafe { free_root_scope_allocation(ptr) };
+            }
+        });
+    }
+}
+
+thread_local! {
+    /// Ownership of the boxes [`push_roots_jit_abi`] returns.
+    ///
+    /// Per-thread because [`RootScope`] is `!Send` and the bracket it
+    /// closes is [`ROOT_STACK`]. This is the residual allocation, not a
+    /// map from trace boxes to heap facts.
+    static ROOT_SCOPE_BRIDGE: RefCell<RootScopeBridge> = const {
+        RefCell::new(RootScopeBridge {
+            live: Vec::new(),
+            freelist: Vec::new(),
+        })
+    };
+
+    static ROOT_SCOPE_BRIDGE_OWNER: RootScopeBridgeOwner = const { RootScopeBridgeOwner };
+}
+
+/// Free a box from [`push_roots_jit_abi`] without running its guard.
+///
+/// # Safety
+/// `ptr` came from `Box::<RootScope>::into_raw` in this module.
+unsafe fn free_root_scope_allocation(ptr: *mut RootScope) {
+    // SAFETY: the caller allocated `ptr` as `Box<RootScope>`.
+    // `ManuallyDrop` skips `RootScope::drop`.
+    unsafe {
+        drop(Box::from_raw(ptr as *mut std::mem::ManuallyDrop<RootScope>));
+    }
+}
+
+fn bridge_touch_owner() {
+    // The state key first, then its owner. Thread-local destructors run
+    // in reverse initialization order, and the owner frees through the state.
+    ROOT_SCOPE_BRIDGE.with(|_| ());
+    let _ = ROOT_SCOPE_BRIDGE_OWNER.try_with(|_| ());
+}
+
+fn alloc_root_scope_box(scope: RootScope) -> *mut RootScope {
+    ROOT_SCOPE_BRIDGE.with(|state| {
+        let mut state = state.borrow_mut();
+        let ptr = match state.freelist.pop() {
+            Some(ptr) => {
+                // SAFETY: the freelist only holds a box whose guard was
+                // `drop_in_place`d. The allocation is still the right size
+                // and is uninitialized.
+                unsafe { std::ptr::write(ptr, scope) };
+                ptr
+            }
+            None => Box::into_raw(Box::new(scope)),
+        };
+        state.live.push(ptr);
+        ptr
+    })
+}
+
+fn take_live_root_scope_box(ptr: *mut RootScope) -> bool {
+    ROOT_SCOPE_BRIDGE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(pos) = state.live.iter().rposition(|live| *live == ptr) else {
+            return false;
+        };
+        state.live.swap_remove(pos);
+        true
+    })
+}
+
+fn recycle_root_scope_box(ptr: *mut RootScope) {
+    // The bridge borrow is released before this. `RootScope::drop` calls
+    // `root_scope_close`, not this jit entry, so it must not re-enter the
+    // `RefCell`.
+    // SAFETY: `ptr` is a live box `take_live_root_scope_box` just removed.
+    // The guard runs once.
+    unsafe { std::ptr::drop_in_place(ptr) };
+    ROOT_SCOPE_BRIDGE.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.freelist.len() < ROOT_SCOPE_BRIDGE_FREELIST_CAP {
+            state.freelist.push(ptr);
+        } else {
+            // SAFETY: `drop_in_place` already ran the guard.
+            unsafe { free_root_scope_allocation(ptr) };
+        }
+    });
+}
+
+/// Word-ABI residual for [`push_roots`].
+///
+/// The result is a pointer to the guard. [`root_scope_close_jit_abi`]
+/// frees that pointer after the bracket truncates. `#[dont_look_inside]`
+/// on [`push_roots`] is what keeps the call residual; this body is the
+/// allocation the tracer must not enter.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn push_roots_jit_abi() -> i64 {
+    bridge_touch_owner();
+    let scope = push_roots();
+    alloc_root_scope_box(scope) as usize as i64
+}
+
+/// Word-ABI residual for [`root_scope_close`].
+///
+/// A word this bridge allocated is dropped, which truncates the shadow
+/// stack once. Any other non-null word is a guard the caller still owns
+/// (a stack `RootScope`); closing it truncates and does not free that
+/// memory. Null is the unset result register.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_close_jit_abi(word: i64) {
+    if word == 0 {
+        return;
+    }
+    let ptr = word as usize as *mut RootScope;
+    if take_live_root_scope_box(ptr) {
+        recycle_root_scope_box(ptr);
+    } else {
+        // SAFETY: the residual's ref argument is the guard a lowered
+        // `Drop` already holds. Null was rejected above. A pointer this
+        // bridge allocated was taken out of `live` and does not reach here.
+        unsafe { root_scope_close(&*ptr) };
+    }
 }
 
 /// A set of freshly allocated items held as GC roots while the rest of the
@@ -1497,6 +1660,66 @@ mod tests {
             assert_eq!(roots.get(before + 1) as usize, 0x5678);
         }
         assert_eq!(shadow_stack_len(), before);
+    }
+
+    /// The residual word is a pointer `root_scope_close_jit_abi` frees.
+    /// Nested brackets close innermost first, and a recycled box records
+    /// the save point of the push that reused it.
+    #[test]
+    fn push_roots_jit_abi_nested_brackets_restore_the_shadow_stack() {
+        let before = shadow_stack_len();
+        let outer = push_roots_jit_abi();
+        let _ = pin_root(dummy(1));
+        let inner = push_roots_jit_abi();
+        let _ = pin_root(dummy(2));
+        assert_eq!(shadow_stack_len(), before + 2);
+        root_scope_close_jit_abi(inner);
+        assert_eq!(shadow_stack_len(), before + 1);
+        root_scope_close_jit_abi(outer);
+        assert_eq!(shadow_stack_len(), before);
+
+        let again = push_roots_jit_abi();
+        assert_eq!(again, outer, "the freelist recycles the last closed box");
+        let _ = pin_root(dummy(3));
+        assert_eq!(shadow_stack_len(), before + 1);
+        root_scope_close_jit_abi(again);
+        assert_eq!(shadow_stack_len(), before);
+    }
+
+    /// A stack guard is not one of the bridge's boxes. Closing the word
+    /// truncates; `Drop` truncates again and does not free the guard.
+    #[test]
+    fn root_scope_close_jit_abi_truncates_a_stack_guard_without_freeing_it() {
+        let before = shadow_stack_len();
+        let scope = push_roots();
+        let _ = pin_root(dummy(1));
+        assert_eq!(shadow_stack_len(), before + 1);
+        let word = &scope as *const RootScope as usize as i64;
+        root_scope_close_jit_abi(word);
+        assert_eq!(shadow_stack_len(), before);
+        assert_eq!(scope.base(), before);
+        drop(scope);
+        assert_eq!(shadow_stack_len(), before);
+    }
+
+    #[test]
+    fn root_scope_close_jit_abi_ignores_a_null_word() {
+        let before = shadow_stack_len();
+        root_scope_close_jit_abi(0);
+        assert_eq!(shadow_stack_len(), before);
+    }
+
+    /// An unclosed bracket must not run `RootScope::drop` while the
+    /// thread-local stack is being torn down.
+    #[test]
+    fn push_roots_jit_abi_thread_exit_frees_an_unclosed_bracket() {
+        std::thread::spawn(|| {
+            let word = push_roots_jit_abi();
+            let _ = pin_root(dummy(1));
+            let _ = word;
+        })
+        .join()
+        .expect("bridge owner dropped the unclosed bracket");
     }
 
     /// `pin_root` appends, the matching `Drop` truncates back to the

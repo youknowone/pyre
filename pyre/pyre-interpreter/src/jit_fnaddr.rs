@@ -1527,15 +1527,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::shadow_stack_cell_truncate",
         pyre_object::gc_roots::shadow_stack_cell_truncate,
     );
-    // The bracket's close, which a lowered `Drop` of the guard calls with the
-    // guard itself: one word in, nothing out, and the truncate above behind
-    // it.  A crate that carries no declaration of the guard's fields cannot
-    // spell the close as those two reads, so it names this instead.
-    pa1(
+    // `push_roots` returns `RootScope` by value. `bh_call_r` stores that
+    // result register as a GcRef, and the lowered `Drop` passes the same
+    // word to `root_scope_close`, which reads `save_point` through it.
+    // The bridges are that pointer; the raw functions are not.
+    cpa0(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        pyre_object::gc_roots::push_roots_jit_abi,
+    );
+    cpa1(
         &mut entries,
         "pyre_object::gc_roots::root_scope_close",
         "pyre_object::root_scope_close",
-        pyre_object::gc_roots::root_scope_close,
+        pyre_object::gc_roots::root_scope_close_jit_abi,
     );
     cpa2(
         &mut entries,
