@@ -542,6 +542,12 @@ pub unsafe fn walk_enrolled_code_roots(
             &mut *(&mut code.co_consts_w as *mut *mut pyre_object::FixedObjectArray
                 as *mut majit_ir::GcRef),
         );
+        // `pycode.py _immutable_fields_ co_names_w[*]`. The array's own
+        // trace names the interned strings.
+        visitor(
+            &mut *(&mut code.co_names_w as *mut *mut pyre_object::FixedObjectArray
+                as *mut majit_ir::GcRef),
+        );
         // mapdict.py CacheEntry.w_method is the cache's sole GC
         // reference. PyPy traces it as part of the live PyCode; do the same
         // here now that managed code wrappers reach this direct-field walker.
