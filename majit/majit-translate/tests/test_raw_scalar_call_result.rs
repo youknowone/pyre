@@ -13,8 +13,9 @@
 //! scalar-pointer parameter materializes an address first
 //! (`RawMalloc` / `RawStore` / `RawFree`). `history.py` `getkind` banks
 //! that parameter as `int`, and `Rvalue::Ref` aliases the pointee word.
-//! A mutable raw parameter copies the written word back into the
-//! borrowed local.
+//! Two borrows of one place share that address. A mutable raw parameter
+//! copies the written word back into the borrowed place, including a
+//! field projection.
 
 use majit_charon_reader::ullbc::NameSeg;
 use majit_charon_reader::{FunDecl, Llbc};
@@ -757,4 +758,513 @@ fn raw_scalar_address_spill_leaves_other_arguments_as_the_word() {
             op_lines(&graph)
         );
     }
+}
+
+enum BorrowAlias {
+    /// `&word` passed twice.
+    SamePlace,
+    /// `&left` and `&right`.
+    TwoInputs,
+    /// `let copy = word; f(&word, &copy)` — one word, two places.
+    CopiedPlace,
+}
+
+fn probe_graph(type_decls: Value, fun_decls: Value, name: &str) -> FunctionGraph {
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": type_decls,
+            "fun_decls": fun_decls,
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    lower_function(&llbc, name).unwrap_or_else(|err| panic!("lower {name}: {err}"))
+}
+
+fn probe_parts() -> (
+    Value,
+    Value,
+    impl Fn(&[&str]) -> Value,
+    impl Fn(u64, Option<&str>, &Value) -> Value,
+) {
+    let span = json!({"data": {"file_id": 0,
+        "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let span_meta = span.clone();
+    let meta = move |path: &[&str]| {
+        json!({
+            "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+            "span": span_meta, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let span_local = span.clone();
+    let local = move |index: u64, name: Option<&str>, ty: &Value| json!({"index": index, "name": name, "span": span_local, "ty": ty});
+    (
+        span,
+        json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []}),
+        meta,
+        local,
+    )
+}
+
+fn lower_two_borrows(alias: BorrowAlias) -> FunctionGraph {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let ret = i64_ty();
+    let borrowed = borrow_ty(&word, "Shared");
+    let ptr = raw_ptr(&word, "Const");
+    let (arg_count, inputs, locals, statements, call_args, ret_local, ret_ty) = match alias {
+        BorrowAlias::SamePlace => {
+            let borrow_a = place(2, &borrowed);
+            let borrow_b = place(3, &borrowed);
+            let word_place = place(1, &word);
+            (
+                1u64,
+                vec![word.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("word"), &word),
+                    local(2, None, &borrowed),
+                    local(3, None, &borrowed),
+                    local(4, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow_a.clone(), {"Ref": {
+                        "place": word_place.clone(), "kind": "Shared", "ptr_metadata": null
+                    }}]}}),
+                    json!({"span": span, "kind": {"Assign": [borrow_b.clone(), {"Ref": {
+                        "place": word_place, "kind": "Shared", "ptr_metadata": null
+                    }}]}}),
+                ],
+                vec![json!({"Move": borrow_a}), json!({"Move": borrow_b})],
+                1u64,
+                word.clone(),
+            )
+        }
+        BorrowAlias::TwoInputs => {
+            let left = place(1, &word);
+            let right = place(2, &word);
+            let borrow_left = place(3, &borrowed);
+            let borrow_right = place(4, &borrowed);
+            (
+                2,
+                vec![word.clone(), word.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("left"), &word),
+                    local(2, Some("right"), &word),
+                    local(3, None, &borrowed),
+                    local(4, None, &borrowed),
+                    local(5, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow_left.clone(), {"Ref": {
+                        "place": left, "kind": "Shared", "ptr_metadata": null
+                    }}]}}),
+                    json!({"span": span, "kind": {"Assign": [borrow_right.clone(), {"Ref": {
+                        "place": right, "kind": "Shared", "ptr_metadata": null
+                    }}]}}),
+                ],
+                vec![json!({"Move": borrow_left}), json!({"Move": borrow_right})],
+                1,
+                word.clone(),
+            )
+        }
+        BorrowAlias::CopiedPlace => {
+            let word_place = place(1, &word);
+            let copy = place(2, &word);
+            let borrow_word = place(3, &borrowed);
+            let borrow_copy = place(4, &borrowed);
+            (
+                1,
+                vec![word.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("word"), &word),
+                    local(2, Some("copy"), &word),
+                    local(3, None, &borrowed),
+                    local(4, None, &borrowed),
+                    local(5, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [
+                        copy.clone(),
+                        {"Use": [{"Copy": word_place.clone()}, "Yes"]}
+                    ]}}),
+                    json!({"span": span, "kind": {"Assign": [borrow_word.clone(), {"Ref": {
+                        "place": word_place, "kind": "Shared", "ptr_metadata": null
+                    }}]}}),
+                    json!({"span": span, "kind": {"Assign": [borrow_copy.clone(), {"Ref": {
+                        "place": copy, "kind": "Shared", "ptr_metadata": null
+                    }}]}}),
+                ],
+                vec![json!({"Move": borrow_word}), json!({"Move": borrow_copy})],
+                1,
+                word.clone(),
+            )
+        }
+    };
+    let dest = place(locals.len() as u64 - 1, &ret);
+    let fun = |id: u64, name: &[&str], inputs: Vec<Value>, body: Value| {
+        json!({
+            "def_id": id,
+            "item_meta": meta(name),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": ret.clone()},
+            "body": body
+        })
+    };
+    let caller = fun(
+        0,
+        &["probe", "write_hash"],
+        inputs,
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": arg_count, "locals": locals}, "body": [
+            {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": call_args, "dest": dest},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(ret_local, &ret_ty)}, "Yes"]}
+            ]}}], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}),
+    );
+    let sink = fun(
+        1,
+        &["probe", "sink_pair"],
+        vec![ptr.clone(), ptr],
+        json!("Opaque"),
+    );
+    probe_graph(json!([]), json!([caller, sink]), "write_hash")
+}
+
+fn malloc_ptrs(graph: &FunctionGraph) -> Vec<majit_translate::flowspace::model::Variable> {
+    raw_ops(graph, |kind| matches!(kind, OpKind::RawMalloc { .. }))
+        .into_iter()
+        .map(|op| {
+            match &op.kind {
+                OpKind::RawMalloc { owner, zero: false } if owner == "Tuple<i64>" => {}
+                other => panic!("spill owner is Tuple<i64>, got {other:?}"),
+            }
+            op.result.clone().expect("RawMalloc result")
+        })
+        .collect()
+}
+
+fn assert_const_spills(
+    graph: &FunctionGraph,
+    ptrs: &[majit_translate::flowspace::model::Variable],
+) {
+    let stores = raw_ops(graph, |kind| matches!(kind, OpKind::RawStore { .. }));
+    assert_eq!(
+        stores.len(),
+        ptrs.len(),
+        "one store per address\n{}",
+        op_lines(graph)
+    );
+    let frees = raw_ops(graph, |kind| matches!(kind, OpKind::RawFree { .. }));
+    assert_eq!(
+        frees.len(),
+        ptrs.len(),
+        "one free per address\n{}",
+        op_lines(graph)
+    );
+    assert!(
+        raw_ops(graph, |kind| matches!(kind, OpKind::RawLoad { .. })).is_empty(),
+        "a const parameter is not written back\n{}",
+        op_lines(graph)
+    );
+    let call = sink_call(graph);
+    let call_block = graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| std::ptr::eq(&op.kind, call))
+        })
+        .expect("call block");
+    let pos = |pred: &dyn Fn(&OpKind) -> bool| {
+        call_block
+            .operations
+            .iter()
+            .position(|op| pred(&op.kind))
+            .expect("op")
+    };
+    let call_at = pos(&|kind| std::ptr::eq(kind, call));
+    let first_free = call_block
+        .operations
+        .iter()
+        .position(|op| matches!(op.kind, OpKind::RawFree { .. }))
+        .expect("free");
+    let last_store = call_block
+        .operations
+        .iter()
+        .rposition(|op| matches!(op.kind, OpKind::RawStore { .. }))
+        .expect("store");
+    assert!(last_store < call_at && call_at < first_free);
+}
+
+#[test]
+fn two_borrows_of_one_local_share_the_spill_address() {
+    let graph = lower_two_borrows(BorrowAlias::SamePlace);
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "one address for one place\n{}",
+        op_lines(&graph)
+    );
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_eq!(call_arg(call, 1), &ptrs[0]);
+    match &raw_ops(&graph, |kind| matches!(kind, OpKind::RawStore { .. }))[0].kind {
+        OpKind::RawStore { value, base, .. }
+            if base == &ptrs[0] && value == input_var(&graph, "word") => {}
+        other => panic!("the store writes the borrowed word, got {other:?}"),
+    }
+    assert_const_spills(&graph, &ptrs);
+}
+
+#[test]
+fn borrows_of_two_locals_keep_distinct_spill_addresses() {
+    let graph = lower_two_borrows(BorrowAlias::TwoInputs);
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(
+        ptrs.len(),
+        2,
+        "two places, two addresses\n{}",
+        op_lines(&graph)
+    );
+    assert_ne!(&ptrs[0], &ptrs[1]);
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_eq!(call_arg(call, 1), &ptrs[1]);
+    let stores = raw_ops(&graph, |kind| matches!(kind, OpKind::RawStore { .. }));
+    match (&stores[0].kind, &stores[1].kind) {
+        (
+            OpKind::RawStore {
+                base: base0,
+                value: value0,
+                ..
+            },
+            OpKind::RawStore {
+                base: base1,
+                value: value1,
+                ..
+            },
+        ) if base0 == &ptrs[0]
+            && base1 == &ptrs[1]
+            && value0 == input_var(&graph, "left")
+            && value1 == input_var(&graph, "right") => {}
+        other => panic!("each store writes its own local, got {other:?}"),
+    }
+    assert_const_spills(&graph, &ptrs);
+}
+
+#[test]
+fn copied_local_keeps_a_distinct_spill_address() {
+    let graph = lower_two_borrows(BorrowAlias::CopiedPlace);
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(
+        ptrs.len(),
+        2,
+        "a copy is a different place even when the word aliases\n{}",
+        op_lines(&graph)
+    );
+    assert_ne!(&ptrs[0], &ptrs[1]);
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_eq!(call_arg(call, 1), &ptrs[1]);
+    let word = input_var(&graph, "word");
+    for store in raw_ops(&graph, |kind| matches!(kind, OpKind::RawStore { .. })) {
+        match &store.kind {
+            OpKind::RawStore { value, .. } if value == word => {}
+            other => panic!("both stores write the aliased word, got {other:?}"),
+        }
+    }
+    assert_const_spills(&graph, &ptrs);
+}
+
+fn lower_field_out() -> FunctionGraph {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let ret = i64_ty();
+    let empty_g = generics.clone();
+    let pair_ty = json!({"Adt": {"id": 0, "generics": empty_g}});
+    let borrowed = borrow_ty(&word, "Mut");
+    let field = json!({
+        "kind": {"Projection": [place(1, &pair_ty), {"Field": [null, 0]}]},
+        "ty": word
+    });
+    let borrow = place(2, &borrowed);
+    let pair_decl = json!({
+        "def_id": 0,
+        "item_meta": meta(&["probe", "Pair"]),
+        "kind": {"Struct": [{"name": "word", "ty": word, "attr_info": null}]}
+    });
+    let fun = |id: u64, name: &[&str], inputs: Vec<Value>, body: Value| {
+        json!({
+            "def_id": id,
+            "item_meta": meta(name),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": ret.clone()},
+            "body": body
+        })
+    };
+    let caller = fun(
+        0,
+        &["probe", "write_hash"],
+        vec![pair_ty.clone()],
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": 1, "locals": [
+            local(0, None, &ret),
+            local(1, Some("pair"), &pair_ty),
+            local(2, None, &borrowed),
+            local(3, None, &ret)
+        ]}, "body": [
+            {"statements": [
+                {"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                    "place": field, "kind": "Mut", "ptr_metadata": null
+                }}]}}
+            ], "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [{"Move": borrow}], "dest": place(3, &ret)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(3, &ret)}, "Yes"]}
+            ]}}], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}),
+    );
+    let sink = fun(
+        1,
+        &["probe", "sink_pair"],
+        vec![raw_ptr(&word, "Mut")],
+        json!("Opaque"),
+    );
+    probe_graph(json!([pair_decl]), json!([caller, sink]), "write_hash")
+}
+
+#[test]
+fn mut_borrow_of_struct_field_writes_the_word_back() {
+    let graph = lower_field_out();
+    let pair = input_var(&graph, "pair");
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "one spill for the field\n{}",
+        op_lines(&graph)
+    );
+    let ptr = &ptrs[0];
+    let reads = raw_ops(&graph, |kind| matches!(kind, OpKind::FieldRead { .. }));
+    assert_eq!(reads.len(), 1, "one field read\n{}", op_lines(&graph));
+    let read_var = reads[0].result.as_ref().expect("FieldRead result");
+    match &reads[0].kind {
+        OpKind::FieldRead {
+            base,
+            field,
+            ty: ValueType::Int,
+            ..
+        } if base == pair
+            && field.name == "word"
+            && field.owner_root.as_deref() == Some("Pair") => {}
+        other => panic!("the spill reads pair.word, got {other:?}"),
+    }
+    match &raw_ops(&graph, |kind| matches!(kind, OpKind::RawStore { .. }))[0].kind {
+        OpKind::RawStore {
+            base,
+            value,
+            item_ty: ValueType::Int,
+            itemsize: 8,
+            is_item_signed: true,
+            ..
+        } if base == ptr && value == read_var => {}
+        other => panic!("the store writes the field read, got {other:?}"),
+    }
+    let call = sink_call(&graph);
+    assert_eq!(
+        call_arg(call, 0),
+        ptr,
+        "the raw parameter receives the address"
+    );
+    let loads = raw_ops(&graph, |kind| matches!(kind, OpKind::RawLoad { .. }));
+    assert_eq!(
+        loads.len(),
+        1,
+        "the mutable parameter reloads\n{}",
+        op_lines(&graph)
+    );
+    let loaded = loads[0].result.as_ref().expect("RawLoad result");
+    match &loads[0].kind {
+        OpKind::RawLoad {
+            base,
+            item_ty: ValueType::Int,
+            itemsize: 8,
+            is_item_signed: true,
+            ..
+        } if base == ptr => {}
+        other => panic!("reload reads the spill, got {other:?}"),
+    }
+    let writes = raw_ops(&graph, |kind| matches!(kind, OpKind::FieldWrite { .. }));
+    assert_eq!(
+        writes.len(),
+        1,
+        "the word is written back\n{}",
+        op_lines(&graph)
+    );
+    match &writes[0].kind {
+        OpKind::FieldWrite {
+            base,
+            field,
+            value,
+            ty: ValueType::Int,
+        } if base == pair
+            && field.name == "word"
+            && field.owner_root.as_deref() == Some("Pair")
+            && value.as_variable() == Some(loaded) => {}
+        other => panic!("FieldWrite must store the reload into pair.word, got {other:?}"),
+    }
+    let call_block = graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| std::ptr::eq(&op.kind, call))
+        })
+        .expect("call block");
+    let pos = |pred: &dyn Fn(&OpKind) -> bool| {
+        call_block
+            .operations
+            .iter()
+            .position(|op| pred(&op.kind))
+            .expect("op in the call block")
+    };
+    let read_at = pos(&|kind| matches!(kind, OpKind::FieldRead { .. }));
+    let malloc_at = pos(&|kind| matches!(kind, OpKind::RawMalloc { .. }));
+    let store_at = pos(&|kind| matches!(kind, OpKind::RawStore { .. }));
+    let call_at = pos(&|kind| std::ptr::eq(kind, call));
+    let load_at = pos(&|kind| matches!(kind, OpKind::RawLoad { .. }));
+    let write_at = pos(&|kind| matches!(kind, OpKind::FieldWrite { .. }));
+    let free_at = pos(&|kind| matches!(kind, OpKind::RawFree { .. }));
+    assert!(
+        read_at < malloc_at
+            && malloc_at < store_at
+            && store_at < call_at
+            && call_at < load_at
+            && load_at < write_at
+            && write_at < free_at,
+        "field read, spill, call, reload, field write, free\n{}",
+        op_lines(&graph)
+    );
 }

@@ -54,7 +54,9 @@
 //!     lifetimes). A call that passes that alias into a raw
 //!     scalar-pointer parameter materializes an address first
 //!     (`RawMalloc` / `RawStore`): `history.py` `getkind` of a raw
-//!     `Ptr` is the address, not the pointee word.
+//!     `Ptr` is the address, not the pointee word. Aliases of one
+//!     place share that address. A mutable parameter writes the word
+//!     back into the place, including a field or element projection.
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
 //!   - `Aggregate` — a named struct is its fields (`OptVirtualize.make_vstruct`):
@@ -146,7 +148,21 @@ struct RawScalarBorrowSpill {
 struct RawScalarReload {
     ptr: Variable,
     copy_out: bool,
-    arg_local: Option<usize>,
+    /// Borrowed place, after peeling `&mut *p` reborrows. `None` when
+    /// the borrow temporary has more than one referent. Aliases of one
+    /// place share `ptr`.
+    place: Option<Place>,
+    item_ty: ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+}
+
+/// One raw address covering every argument that borrows the same place.
+struct RawScalarAddressGroup {
+    indices: Vec<usize>,
+    word: Variable,
+    place: Option<Place>,
+    copy_out: bool,
     item_ty: ValueType,
     itemsize: usize,
     is_item_signed: bool,
@@ -9725,9 +9741,12 @@ impl<'a> Lowering<'a> {
     }
 
     /// Store the aliased word into a fresh raw address and pass that
-    /// address. The malloc is `OpKind::RawMalloc` so `_rewrite_raw_malloc`
-    /// emits the fixed-size residual; a direct call of
-    /// `ll_raw_malloc_fixedsize` would look inside the helper.
+    /// address. Borrows of one place share the address. A copied local
+    /// is a different place (`let y = x` still aliases the word, and
+    /// `&x` with `&y` stay two addresses). The malloc is
+    /// `OpKind::RawMalloc` so `_rewrite_raw_malloc` emits the fixed-size
+    /// residual; a direct call of `ll_raw_malloc_fixedsize` would look
+    /// inside the helper.
     fn install_raw_scalar_address_call(
         &mut self,
         mir_bb: usize,
@@ -9740,14 +9759,14 @@ impl<'a> Lowering<'a> {
             return Vec::new();
         }
         let fun_id = spills[0].fun_id;
-        let plan = {
+        let groups = {
             let OpKind::Call { target, args, .. } = &*op_kind else {
                 return Vec::new();
             };
             if !self.call_target_is_fun(target, fun_id) || args.len() != resolved_args.len() {
                 return Vec::new();
             }
-            let mut plan = Vec::new();
+            let mut groups: Vec<RawScalarAddressGroup> = Vec::new();
             for spill in spills {
                 if spill.fun_id != fun_id {
                     continue;
@@ -9758,22 +9777,37 @@ impl<'a> Lowering<'a> {
                 if arg != &resolved_args[spill.index] {
                     continue;
                 }
-                plan.push((
-                    spill.index,
-                    resolved_args[spill.index].clone(),
-                    arg_locals.get(spill.index).copied().flatten(),
-                    spill.copy_out,
-                    spill.item_ty.clone(),
-                    spill.itemsize,
-                    spill.is_item_signed,
-                ));
+                let place =
+                    self.resolved_borrow_place(arg_locals.get(spill.index).copied().flatten());
+                if let Some(group) = groups.iter_mut().find(|group| {
+                    raw_scalar_groups_share(
+                        group,
+                        place.as_ref(),
+                        &spill.item_ty,
+                        spill.itemsize,
+                        spill.is_item_signed,
+                    )
+                }) {
+                    group.indices.push(spill.index);
+                    group.copy_out |= spill.copy_out;
+                    continue;
+                }
+                groups.push(RawScalarAddressGroup {
+                    indices: vec![spill.index],
+                    word: resolved_args[spill.index].clone(),
+                    place,
+                    copy_out: spill.copy_out,
+                    item_ty: spill.item_ty.clone(),
+                    itemsize: spill.itemsize,
+                    is_item_signed: spill.is_item_signed,
+                });
             }
-            plan
+            groups
         };
         let bb_id = self.block_id[mir_bb];
         let mut reloads = Vec::new();
         let mut replacements = Vec::new();
-        for (index, word, arg_local, copy_out, item_ty, itemsize, is_item_signed) in plan {
+        for group in groups {
             let ptr = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -9796,20 +9830,22 @@ impl<'a> Lowering<'a> {
                 kind: OpKind::RawStore {
                     base: ptr.clone(),
                     offset,
-                    value: word,
-                    item_ty: item_ty.clone(),
-                    itemsize,
-                    is_item_signed,
+                    value: group.word,
+                    item_ty: group.item_ty.clone(),
+                    itemsize: group.itemsize,
+                    is_item_signed: group.is_item_signed,
                 },
             });
-            replacements.push((index, ptr.clone()));
+            for index in group.indices {
+                replacements.push((index, ptr.clone()));
+            }
             reloads.push(RawScalarReload {
                 ptr,
-                copy_out,
-                arg_local,
-                item_ty,
-                itemsize,
-                is_item_signed,
+                copy_out: group.copy_out,
+                place: group.place,
+                item_ty: group.item_ty,
+                itemsize: group.itemsize,
+                is_item_signed: group.is_item_signed,
             });
         }
         let OpKind::Call { args, .. } = op_kind else {
@@ -9821,38 +9857,83 @@ impl<'a> Lowering<'a> {
         reloads
     }
 
-    /// Read a mutable raw out-parameter back into the borrowed local,
-    /// then free the spill. A shared borrow or a `*const` parameter
-    /// is not written back. Python exceptions ride the success edge,
-    /// which is this block; the unwind edge is dropped.
-    fn reload_raw_scalar_addresses(&mut self, mir_bb: usize, reloads: &[RawScalarReload]) {
+    /// Place a borrow temporary names, after peeling `&mut *p`.
+    /// `None` when that temporary is missing or was assigned more than once.
+    fn resolved_borrow_place(&self, arg_local: Option<usize>) -> Option<Place> {
+        let local = arg_local?;
+        Some(self.concrete_borrow_place(self.argument_borrow_place(local)?))
+    }
+
+    fn emit_raw_scalar_word_load(&mut self, mir_bb: usize, reload: &RawScalarReload) -> Variable {
         let bb_id = self.block_id[mir_bb];
+        let offset = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(offset.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let loaded = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::RawLoad {
+                base: reload.ptr.clone(),
+                offset,
+                item_ty: reload.item_ty.clone(),
+                itemsize: reload.itemsize,
+                is_item_signed: reload.is_item_signed,
+            },
+        });
+        loaded
+    }
+
+    /// Read a mutable raw out-parameter back into the borrowed place,
+    /// then free the spill. A field or element projection is written
+    /// with `emit_projection_write`. A borrow temporary with more than
+    /// one referent is not written back. A shared borrow or a `*const`
+    /// parameter is not written back. Python exceptions ride the success
+    /// edge, which is this block; the unwind edge is dropped.
+    fn reload_raw_scalar_addresses(
+        &mut self,
+        mir_bb: usize,
+        reloads: &[RawScalarReload],
+    ) -> Result<(), LowerError> {
         for reload in reloads {
             if reload.copy_out
-                && let Some(index) = self.borrowed_primitive_local(reload.arg_local)
+                && let Some(place) = reload.place.clone()
             {
-                let offset = self
-                    .graph
-                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                    result: Some(offset.clone()),
-                    kind: OpKind::ConstInt(0),
-                });
-                let loaded = self
-                    .graph
-                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                    result: Some(loaded.clone()),
-                    kind: OpKind::RawLoad {
-                        base: reload.ptr.clone(),
-                        offset,
-                        item_ty: reload.item_ty.clone(),
-                        itemsize: reload.itemsize,
-                        is_item_signed: reload.is_item_signed,
-                    },
-                });
-                self.local_var[index] = Some(loaded);
+                let ty = clone_tyref(&place.ty);
+                match place.kind {
+                    PlaceKind::Local(index) => {
+                        let index = index as usize;
+                        if !(self.local_decl_is_primitive(index) && index < self.local_var.len()) {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: raw scalar out-parameter write-back is not a primitive local"
+                            )));
+                        }
+                        let loaded = self.emit_raw_scalar_word_load(mir_bb, reload);
+                        self.local_var[index] = Some(loaded);
+                    }
+                    PlaceKind::Projection(inner, elem) => {
+                        let loaded = self.emit_raw_scalar_word_load(mir_bb, reload);
+                        self.emit_projection_write(
+                            mir_bb,
+                            *inner,
+                            elem,
+                            LinkArg::Value(loaded),
+                            &ty,
+                        )?;
+                    }
+                    PlaceKind::Global { .. } | PlaceKind::Unknown => {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: raw scalar out-parameter write-back is not a primitive local or a projection"
+                        )));
+                    }
+                }
             }
+            let bb_id = self.block_id[mir_bb];
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::RawFree {
@@ -9860,20 +9941,7 @@ impl<'a> Lowering<'a> {
                 },
             });
         }
-    }
-
-    /// The primitive local a borrow temporary names, when that borrow
-    /// was recorded as one place. Copies that alias the same word stay
-    /// on the pre-call variable.
-    fn borrowed_primitive_local(&self, arg_local: Option<usize>) -> Option<usize> {
-        let local = arg_local?;
-        let place = self.argument_borrow_place(local)?;
-        let place = self.concrete_borrow_place(place);
-        let PlaceKind::Local(index) = place.kind else {
-            return None;
-        };
-        let index = index as usize;
-        (self.local_decl_is_primitive(index) && index < self.local_var.len()).then_some(index)
+        Ok(())
     }
 
     fn argument_borrow_place(&self, local: usize) -> Option<Place> {
@@ -20108,7 +20176,7 @@ impl<'a> Lowering<'a> {
         self.copy_out_gc_mut_ref(mir_bb, &gc_mut_ref_copies);
         // Reload before `edge_args` so the successor sees the word the
         // callee wrote through the raw out-parameter.
-        self.reload_raw_scalar_addresses(mir_bb, &raw_scalar_reloads);
+        self.reload_raw_scalar_addresses(mir_bb, &raw_scalar_reloads)?;
         // Narrow a classdef-less registered-ADT call result to
         // `SomeInstance(root)` (see `result_narrow_root` above).  Identity at
         // jitcode (`__cast_instance_intrinsic` → cast_pointer → `same_as`), so
@@ -36148,6 +36216,45 @@ fn clone_projection_elem(e: &ProjectionElem) -> ProjectionElem {
     match e {
         ProjectionElem::Atom(s) => ProjectionElem::Atom(s.clone()),
         ProjectionElem::Tagged(v) => ProjectionElem::Tagged(v.clone()),
+    }
+}
+
+/// Same borrowed place, ignoring the place's type. A `Use` copy is a
+/// different local even when it aliases the word. An unresolved borrow
+/// does not alias another unresolved borrow.
+fn raw_scalar_groups_share(
+    group: &RawScalarAddressGroup,
+    place: Option<&Place>,
+    item_ty: &ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+) -> bool {
+    let (Some(group_place), Some(place)) = (group.place.as_ref(), place) else {
+        return false;
+    };
+    places_alias(group_place, place)
+        && group.item_ty == *item_ty
+        && group.itemsize == itemsize
+        && group.is_item_signed == is_item_signed
+}
+
+fn places_alias(a: &Place, b: &Place) -> bool {
+    match (&a.kind, &b.kind) {
+        (PlaceKind::Local(left), PlaceKind::Local(right)) => left == right,
+        (
+            PlaceKind::Projection(left_inner, left_elem),
+            PlaceKind::Projection(right_inner, right_elem),
+        ) => places_alias(left_inner, right_inner) && projection_elems_alias(left_elem, right_elem),
+        (PlaceKind::Global { id: left, .. }, PlaceKind::Global { id: right, .. }) => left == right,
+        _ => false,
+    }
+}
+
+fn projection_elems_alias(a: &ProjectionElem, b: &ProjectionElem) -> bool {
+    match (a, b) {
+        (ProjectionElem::Atom(left), ProjectionElem::Atom(right)) => left == right,
+        (ProjectionElem::Tagged(left), ProjectionElem::Tagged(right)) => left == right,
+        _ => false,
     }
 }
 
