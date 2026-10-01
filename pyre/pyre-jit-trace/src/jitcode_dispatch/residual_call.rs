@@ -7821,8 +7821,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // #62: specialize STORE_SUBSCR `list[int] = value` (int / float storage,
-    // in-bounds, type-matching) to the walker-native `setarrayitem_raw` form,
+    // STORE_SUBSCR `list[int] = value` walks `w_list_setitem_inner`,
     // eliding the `CALL_MAY_FORCE` that would force the virtualizable every
     // iteration.  Falls through to the generic residual otherwise (SAFE).
     // Full-body walks only: the eager store rides `FBW_STORE_JOURNAL`,
@@ -7831,11 +7830,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'v'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::StoreSubscr
     {
-        if spec_gate(SpecFold::StoreSubscr, || {
-            try_walker_specialize_store_subscr(ctx, op.pc, &r_args)
-        })?
-        .is_some()
-        {
+        if try_walker_orthodox_store_subscr(ctx, op.pc, &r_args)?.is_some() {
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         // #171 setslice inline: `target[const_slice] = source` for a

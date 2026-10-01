@@ -2828,6 +2828,24 @@ pub fn ll_list_obj_set_len(l: &mut W_ListObject, n: usize) {
     l.set_length_relaxed(n);
 }
 
+/// `ll_length` for AsciiListStrategy. The length word sits at the same
+/// offset as `ascii_items`; the oopspec reads that word.
+#[majit_macros::oopspec("list.ascii_len(l)")]
+pub fn ll_list_ascii_length(l: &W_ListObject) -> usize {
+    l.ascii_items.len()
+}
+
+/// `ll_getitem_fast` for AsciiListStrategy: the erased `STR` payload at a
+/// known-in-bounds index. The oopspec is `getfield_gc_r(ascii_items.block)`
+/// plus `getarrayitem_gc_r`.
+#[majit_macros::oopspec("list.ascii_getitem(l, index)")]
+pub fn ll_list_ascii_getitem_fast(
+    l: &W_ListObject,
+    index: usize,
+) -> *const crate::unicodeobject::UnicodeValueStorage {
+    l.ascii_items[index]
+}
+
 /// `ll_getitem_fast` for the Object strategy: a GC-ref read at a
 /// known-in-bounds index (`ll_pop_default`'s read, rlist.py).
 #[majit_macros::oopspec("list.obj_getitem(l, index)")]
@@ -2988,9 +3006,11 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
             Some(w_bytes_from_block(list.bytes_items[idx]))
         }
         ListStrategy::Ascii => {
-            let len = list.ascii_items.len() as i64;
+            let len = ll_list_ascii_length(list) as i64;
             let idx = ll_getitem_index(index, len)?;
-            Some(w_str_from_storage(list.ascii_items[idx] as *mut _))
+            Some(w_str_from_storage(
+                ll_list_ascii_getitem_fast(list, idx) as *mut _
+            ))
         }
     }
 }
