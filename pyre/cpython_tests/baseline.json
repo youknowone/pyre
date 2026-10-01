@@ -254,8 +254,7 @@
       "dynasm": "SKIP"
     },
     "test.test_complex": {
-      "dynasm": "FAIL",
-      "reason": "descr__new__ matches PyPy: no complex-argument DeprecationWarning, and an imag __complex__ is accepted"
+      "dynasm": "PASS"
     },
     "test.test_concurrent_futures": {
       "dynasm": "FAIL"
