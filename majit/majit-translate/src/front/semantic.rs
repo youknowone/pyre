@@ -346,6 +346,39 @@ impl StructFieldRegistry {
             .is_some_and(|rows| matches!(rows, [(name, _)] if name == "__discriminant"))
     }
 
+    /// The registry key of the discriminant-only enum base `owner` names.
+    ///
+    /// `lookup_fields` accepts a crate-prefixed or generic spelling, but the
+    /// class cache keys the string it is given.  Returning the registered
+    /// key (`pyopcode::StepResult`) rather than the ctor's longer spelling
+    /// (`pyre_interpreter::pyopcode::StepResult`) makes both intern to one
+    /// `ClassDef`.
+    pub fn enum_base_registry_key(&self, owner: &str) -> Option<String> {
+        let stripped = majit_ir::descr::strip_generic_args(owner);
+        let owner = stripped.as_ref();
+        let is_disc = |rows: &[(String, String)]| {
+            matches!(rows, [(name, _)] if name == "__discriminant")
+        };
+        if self.fields.get(owner).is_some_and(|rows| is_disc(rows)) {
+            return Some(owner.to_string());
+        }
+        let receiver_leaf = owner.rsplit("::").next().unwrap_or(owner);
+        let canonical = majit_ir::descr::canonical_struct_name(receiver_leaf);
+        if canonical != receiver_leaf
+            && self
+                .fields
+                .get(&canonical)
+                .is_some_and(|rows| is_disc(rows))
+        {
+            return Some(canonical);
+        }
+        let key = self.unique_suffix_owner_key(owner)?.to_string();
+        self.fields
+            .get(&key)
+            .filter(|rows| is_disc(rows))
+            .map(|_| key)
+    }
+
     /// Whether `owner` itself, or one of its enum variants, declares
     /// `field_name`.
     ///

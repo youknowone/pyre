@@ -4014,6 +4014,32 @@ pub fn add_knowntypedata(
 /// Intersection of the two tables: a variable survives only if both
 /// branches refined it, and the resulting annotation is the union of
 /// the two refinements.
+fn instance_class_name(s: &SomeValue) -> Option<String> {
+    let SomeValue::Instance(inst) = s else {
+        return None;
+    };
+    inst.classdef.as_ref().map(|cd| cd.borrow().name.clone())
+}
+
+/// When two discriminant refinements are the same variant leaf and only
+/// one spelling is monomorphized, keep that spelling.
+fn prefer_instantiated_variant(s1: &SomeValue, s2: &SomeValue) -> Option<SomeValue> {
+    let n1 = instance_class_name(s1)?;
+    let n2 = instance_class_name(s2)?;
+    let bare_leaf = |n: &str| -> String {
+        let leaf = n.rsplit("::").next().unwrap_or(n);
+        leaf.split('<').next().unwrap_or(leaf).to_string()
+    };
+    if bare_leaf(&n1) != bare_leaf(&n2) {
+        return None;
+    }
+    match (n1.contains('<'), n2.contains('<')) {
+        (true, false) => Some(s1.clone()),
+        (false, true) => Some(s2.clone()),
+        _ => None,
+    }
+}
+
 pub fn merge_knowntypedata(ktd1: &KnownTypeData, ktd2: &KnownTypeData) -> KnownTypeData {
     let mut r: KnownTypeData = std::collections::HashMap::new();
     for (case, constraints) in ktd1 {
@@ -4024,6 +4050,12 @@ pub fn merge_knowntypedata(ktd1: &KnownTypeData, ktd2: &KnownTypeData) -> KnownT
             let Some(s2) = other.get(v) else { continue };
             if let Ok(u) = unionof([s1, s2]) {
                 r.entry(*case).or_default().insert(Rc::clone(v), u);
+            } else if let Some(kept) = prefer_instantiated_variant(s1, s2) {
+                // `Result::Ok` and `Result<T,E>::Ok` do not union, but they
+                // are one variant.  Keeping the instantiation preserves the
+                // match-arm payload; dropping it makes `__pos_0` meet on the
+                // enum base.
+                r.entry(*case).or_default().insert(Rc::clone(v), kept);
             }
         }
     }

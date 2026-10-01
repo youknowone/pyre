@@ -3129,6 +3129,23 @@ impl ClassDef {
         if let Some(sv) = s_value {
             newattr.s_value = sv;
         }
+        // A discriminant-only enum base does not own variant payloads.
+        // `locate_attribute` on that base still generalizes `__pos_N`, and
+        // pulling every variant's payload into one attribute unions
+        // `PyError` with `Integer`.  Leave a payload that does not union
+        // on its variant.
+        let payload_on_enum_base = attr.starts_with("__pos_") && {
+            let cd = this.borrow();
+            let name = cd.name.clone();
+            let bk = cd.bookkeeper.upgrade();
+            drop(cd);
+            bk.is_some_and(|bk| {
+                bk.struct_fields
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|reg| reg.is_enum_base(&name))
+            })
+        };
 
         let mut constant_sources: Vec<(Rc<RefCell<ClassDef>>, AttrSource)> = Vec::new();
 
@@ -3139,8 +3156,13 @@ impl ClassDef {
             // ordering: a failed union must not delete shared ClassDef state.
             let existing = subdef.borrow().attrs.get(attr).cloned();
             if let Some(subattr) = existing {
-                newattr.merge(&subattr, this)?;
-                subdef.borrow_mut().attrs.remove(attr);
+                match newattr.merge(&subattr, this) {
+                    Ok(()) => {
+                        subdef.borrow_mut().attrs.remove(attr);
+                    }
+                    Err(e) if !payload_on_enum_base => return Err(e),
+                    Err(_) => {}
+                }
             }
             // accumulate attr_sources from all subclasses.
             let taken = subdef.borrow_mut().attr_sources.remove(attr);

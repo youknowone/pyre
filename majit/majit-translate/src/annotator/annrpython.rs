@@ -747,31 +747,44 @@ impl RPythonAnnotator {
     /// driver passes owned `Variable` references while processing a
     /// block, so this is called with `&mut v` there.
     pub fn setbinding(&self, arg: &mut Variable, s_value: SomeValue) {
-        {
+        let stored = {
             let annotation_ref = arg.annotation.borrow();
             if let Some(s_old) = annotation_ref.as_ref()
                 && !s_value.contains(s_old)
             {
-                // upstream: `log.WARNING(...); assert False`.
-                // Lattice widening contract — a binding cannot move
-                // backwards.
-                let where_ = self.bookkeeper.current_position_key().map(|pk| {
-                    let gname = pk
-                        .graph()
-                        .map(|g| g.borrow().name.clone())
-                        .unwrap_or_default();
-                    format!(" graph={gname} op_index={}", pk.op_index)
-                });
-                panic!(
-                    "setbinding: new value does not contain old ({:?} ⊄ {:?}) var={}{}",
-                    s_value,
-                    **s_old,
-                    arg.name(),
-                    where_.unwrap_or_default()
-                );
+                // A pyre-only discriminant refinement can name two variant
+                // classes that do not contain each other (`Result::Ok`
+                // versus `Result<T,E>::Ok`).  Their integer union drops the
+                // arm whose payloads do not meet, and that join contains
+                // the old binding.  Store the join.  A union that fails, or
+                // a join that still does not contain the old value, is the
+                // upstream assert.
+                let _guard = super::listdef::SideEffectFreeGuard::enter();
+                let widened = super::model::union(&s_value, s_old).ok().filter(|u| u.contains(s_old));
+                drop(_guard);
+                if let Some(widened) = widened {
+                    widened
+                } else {
+                    let where_ = self.bookkeeper.current_position_key().map(|pk| {
+                        let gname = pk
+                            .graph()
+                            .map(|g| g.borrow().name.clone())
+                            .unwrap_or_default();
+                        format!(" graph={gname} op_index={}", pk.op_index)
+                    });
+                    panic!(
+                        "setbinding: new value does not contain old ({:?} ⊄ {:?}) var={}{}",
+                        s_value,
+                        **s_old,
+                        arg.name(),
+                        where_.unwrap_or_default()
+                    );
+                }
+            } else {
+                s_value
             }
-        }
-        *arg.annotation.borrow_mut() = Some(Rc::new(s_value));
+        };
+        *arg.annotation.borrow_mut() = Some(Rc::new(stored));
     }
 
     /// RPython `warning(self, msg, pos=None)` (annrpython.py-...).
@@ -3490,6 +3503,116 @@ mod tests {
             }
         };
         assert!(matches!(bound, Some(SomeValue::Float(_))));
+    }
+
+    #[test]
+    fn setbinding_widens_incompatible_discriminant_arms() {
+        use super::super::model::{add_knowntypedata, ExitCaseKey, SomeInstance};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let left = bk
+            .getuniqueclassdef(&bk.intern_class_by_qualname("Left"))
+            .expect("Left");
+        let right = bk
+            .getuniqueclassdef(&bk.intern_class_by_qualname("Right"))
+            .expect("Right");
+        let recv = Rc::new(Variable::named("recv"));
+        let arm = |classdef| {
+            let mut ktd = super::super::model::KnownTypeData::new();
+            add_knowntypedata(
+                &mut ktd,
+                ExitCaseKey::Int(0),
+                std::slice::from_ref(&recv),
+                SomeValue::Instance(SomeInstance::new(
+                    Some(classdef),
+                    false,
+                    std::collections::BTreeMap::new(),
+                )),
+            );
+            let mut si = SomeInteger::new(true, false);
+            si.set_knowntypedata(ktd);
+            SomeValue::Integer(si)
+        };
+        let mut v = Variable::named("disc");
+        ann.setbinding(&mut v, arm(left));
+        ann.setbinding(&mut v, arm(right));
+        let bound = v.annotation.borrow().as_ref().map(|rc| (**rc).clone());
+        match bound {
+            Some(SomeValue::Integer(si)) => {
+                assert!(
+                    si.knowntypedata.is_none(),
+                    "incompatible variant arms drop out of the join"
+                );
+            }
+            other => panic!("expected an integer binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setbinding_keeps_instantiated_variant_over_template() {
+        use super::super::model::{add_knowntypedata, ExitCaseKey, SomeInstance};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let template = bk
+            .getuniqueclassdef(&bk.intern_class_by_qualname("Result::Ok"))
+            .expect("template");
+        let inst = bk
+            .getuniqueclassdef(
+                &bk.intern_class_by_qualname("result::Result<StepResult,PyError>::Ok"),
+            )
+            .expect("inst");
+        let recv = Rc::new(Variable::named("recv"));
+        let arm = |classdef| {
+            let mut ktd = super::super::model::KnownTypeData::new();
+            add_knowntypedata(
+                &mut ktd,
+                ExitCaseKey::Int(0),
+                std::slice::from_ref(&recv),
+                SomeValue::Instance(SomeInstance::new(
+                    Some(classdef),
+                    false,
+                    std::collections::BTreeMap::new(),
+                )),
+            );
+            let mut si = SomeInteger::new(true, false);
+            si.set_knowntypedata(ktd);
+            SomeValue::Integer(si)
+        };
+        let mut v = Variable::named("disc");
+        ann.setbinding(&mut v, arm(inst.clone()));
+        ann.setbinding(&mut v, arm(template));
+        let name = {
+            let bound = v.annotation.borrow();
+            let Some(SomeValue::Integer(si)) = bound.as_ref().map(|rc| rc.as_ref()) else {
+                panic!("expected integer");
+            };
+            let ktd = si.knowntypedata.as_ref().expect("refinement kept");
+            let inner = ktd.get(&ExitCaseKey::Int(0)).expect("case 0");
+            let s = inner.get(&recv).expect("receiver");
+            match s {
+                SomeValue::Instance(inst) => inst
+                    .classdef
+                    .as_ref()
+                    .expect("class")
+                    .borrow()
+                    .name
+                    .clone(),
+                other => panic!("expected instance, got {other:?}"),
+            }
+        };
+        assert!(
+            name.contains('<'),
+            "join keeps the instantiated variant, got {name}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "setbinding: new value does not contain old")]
+    fn setbinding_still_rejects_a_real_type_clash() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let mut v = Variable::named("v");
+        ann.setbinding(&mut v, SomeValue::Integer(SomeInteger::default()));
+        ann.setbinding(&mut v, super::super::model::s_str0());
     }
 
     #[test]

@@ -2169,9 +2169,22 @@ impl Bookkeeper {
         variant_name: &str,
     ) -> HostObject {
         let canon_root = majit_ir::descr::canonical_struct_name(enum_root);
-        let base_host = self.intern_class_by_qualname(&canon_root);
+        // Field reads spell the crate-stripped template
+        // (`pyopcode::StepResult`).  A monomorphized or crate-qualified
+        // root (`pyre_interpreter::pyopcode::StepResult<*mut PyObject>`)
+        // subclasses that template so the variant unions with the field.
+        let template = {
+            let bare = canon_root.split('<').next().unwrap_or(&canon_root);
+            crate::front::mir::strip_crate_prefix(bare)
+        };
+        let template_host = self.intern_class_by_qualname(&template);
+        let enum_host = if canon_root == template {
+            template_host
+        } else {
+            self.intern_class_by_qualname_with_bases(&canon_root, vec![template_host])
+        };
         let variant_path = format!("{canon_root}::{variant_name}");
-        self.intern_class_by_qualname_with_bases(&variant_path, vec![base_host])
+        self.intern_class_by_qualname_with_bases(&variant_path, vec![enum_host])
     }
 
     /// Build the discriminant→variant narrowing `knowntypedata` for a
@@ -2549,10 +2562,58 @@ impl Bookkeeper {
                 // `struct_fields` key including the variant keys, would mint
                 // the variant base-less, and first-mint-wins would freeze
                 // that, dropping the subclass link the narrowing relies on.
-                if let Some((parent, _variant)) = lookup.rsplit_once("::") {
+                //
+                // A monomorphized variant (`StepResult<*mut PyObject>::Continue`)
+                // is the same sum type as the template.  The registry keys the
+                // template, not the `<…>` suffix, so strip the suffix before
+                // the parent test or the variant is minted base-less and a
+                // later `__pos_0` write cannot commonbase with the enum.
+                let lookup_for_enum = majit_ir::descr::strip_generic_args(&lookup);
+                if let Some((parent, _variant)) = lookup_for_enum.rsplit_once("::") {
                     let parent_leaf = parent.rsplit("::").next().unwrap_or(parent);
-                    if reg.is_enum_base(parent) && !seen.contains(parent_leaf) {
-                        return Some(parent.to_string());
+                    if !seen.contains(parent_leaf) {
+                        // The ctor spells the crate (`pyre_interpreter::pyopcode::
+                        // StepResult`); the registry often has only the
+                        // crate-relative key (`pyopcode::StepResult`) or the
+                        // bare leaf.  Parent to that registered key, not the
+                        // longer spelling, or the two intern as distinct classes.
+                        let mut candidate = parent;
+                        loop {
+                            let spelled = if candidate.starts_with("pyre_interpreter::")
+                                || candidate.starts_with("pyre_object::")
+                                || candidate.starts_with("pyre_module::")
+                                || candidate.starts_with("pyre_jit::")
+                            {
+                                crate::front::mir::strip_crate_prefix(candidate)
+                            } else {
+                                candidate.to_string()
+                            };
+                            // The field annotation interns the crate-stripped
+                            // spelling.  Parent to that string, not the longer
+                            // registry key, or the two ClassDefs stay siblings.
+                            let in_variant_table = self
+                                .enum_variant_by_discriminant
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|map| {
+                                    map.contains_key(candidate)
+                                        || map.contains_key(spelled.as_str())
+                                        || map.keys().any(|k| {
+                                            crate::front::mir::strip_crate_prefix(k) == spelled
+                                        })
+                                });
+                            if in_variant_table
+                                || reg.enum_base_registry_key(candidate).is_some()
+                                || reg.is_enum_base(candidate)
+                                || reg.is_enum_base(&spelled)
+                            {
+                                return Some(spelled);
+                            }
+                            match candidate.split_once("::") {
+                                Some((_, rest)) => candidate = rest,
+                                None => break,
+                            }
+                        }
                     }
                 }
                 // A generic enum instantiation (`Option<X>`, `Result<T,E>`) and
@@ -2567,6 +2628,22 @@ impl Bookkeeper {
                 // is the discriminant-only root (its only row is
                 // `__discriminant`), so it carries no payload attr the
                 // per-instantiation `__pos_N` writes could conflict on.
+                if lookup.contains('<') {
+                    let stripped = majit_ir::descr::strip_generic_args(&lookup);
+                    // Field annotations use the crate-stripped spelling
+                    // (`pyopcode::StepResult` via `strip_crate_prefix`).
+                    // Parent the monomorphized class to that spelling so a
+                    // `StepResult<*mut PyObject>::Continue` value unions
+                    // with the field's class.
+                    let spelled = crate::front::mir::strip_crate_prefix(stripped.as_ref());
+                    let spelled_leaf = spelled.rsplit("::").next().unwrap_or(&spelled);
+                    let is_enum = reg.is_enum_base(stripped.as_ref())
+                        || reg.is_enum_base(&spelled)
+                        || reg.enum_base_registry_key(stripped.as_ref()).is_some();
+                    if is_enum && spelled != lookup && !seen.contains(spelled_leaf) {
+                        return Some(spelled);
+                    }
+                }
                 if reg.is_enum_base(&lookup) {
                     let stripped = majit_ir::descr::strip_generic_args(&lookup);
                     let bare_leaf = stripped.rsplit("::").next().unwrap_or(&stripped);
@@ -3617,6 +3694,31 @@ impl Bookkeeper {
         }
     }
 
+    /// Classdef for a prebuilt instance.
+    ///
+    /// Ordinary instances keep `getuniqueclassdef(x.__class__)`. A folded
+    /// unit-variant constant (`StepResult<*mut PyObject>::Continue`) is
+    /// re-interned as the enum variant so it subclasses the discriminant-only
+    /// class field reads already use.
+    fn classdef_for_prebuilt_instance(
+        self: &Rc<Self>,
+        class_obj: &crate::flowspace::model::HostObject,
+    ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
+        let qualname = class_obj.qualname();
+        if let Some((owner, variant)) = qualname.rsplit_once('.') {
+            let mut segments: Vec<String> = owner.split('.').map(str::to_string).collect();
+            segments.push(variant.to_string());
+            if crate::translator::rtyper::unit_variant_fold::is_synthetic_unit_variant_path(
+                &segments,
+            ) {
+                let enum_root = owner.replace('.', "::");
+                let host = self.intern_enum_variant_host(&enum_root, variant);
+                return self.getuniqueclassdef(&host);
+            }
+        }
+        self.getuniqueclassdef(class_obj)
+    }
+
     /// Input is a flowspace [`ConstValue`] — the Rust-side counterpart
     /// to upstream's Python constant. Primitive branches (bool / int /
     /// float / str / char / unicode / bytearray / tuple / None) are
@@ -3966,7 +4068,12 @@ impl Bookkeeper {
             // upstream bookkeeper.py:341-342:
             //     if hasattr(x, '_cleanup_'): x._cleanup_()
             call_cleanup_method(obj)?;
-            let classdef = self.getuniqueclassdef(class_obj)?;
+            // A unit-variant singleton is folded to a prebuilt instance whose
+            // class host is minted from the dotted ctor path with no bases
+            // (`unit_variant_fold::intern_unit_variant_prebuilt_instance`).
+            // Field reads of the same enum use the discriminant-only class, so
+            // the instance must annotate as the variant that subclasses it.
+            let classdef = self.classdef_for_prebuilt_instance(class_obj)?;
             super::classdesc::ClassDef::see_instance(&classdef, obj)?;
             let mut inst = super::model::SomeInstance::new(
                 Some(classdef),
@@ -5327,6 +5434,128 @@ mod tests {
             ),
             other => panic!("expected SomeInstance(variant), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn generic_enum_variant_shares_a_base_with_the_unsuffixed_enum() {
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        // Only the crate-relative key is registered.  A bare `StepResult`
+        // beside it would make the suffix match ambiguous.
+        for base in ["pyopcode::StepResult"] {
+            reg.fields.insert(
+                base.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+        }
+        reg.fields.insert(
+            "pyre_interpreter::pyopcode::StepResult::Continue".to_string(),
+            vec![],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+        let variant_host = bk.intern_enum_variant_host(
+            "pyre_interpreter::pyopcode::StepResult<*mut PyObject>",
+            "Continue",
+        );
+        let variant = bk
+            .getuniqueclassdef(&variant_host)
+            .expect("generic Continue registers");
+        let short = bk
+            .getuniqueclassdef_for_struct_root("pyopcode::StepResult")
+            .expect("unsuffixed StepResult registers");
+        assert!(
+            variant.borrow().issubclass(&short),
+            "generic Continue must subclass the registered pyopcode::StepResult"
+        );
+        let dotted = bk.intern_class_by_qualname(
+            "pyre_interpreter.pyopcode.StepResult<*mut PyObject>.Continue",
+        );
+        let dotted_cd = bk
+            .getuniqueclassdef(&dotted)
+            .expect("dotted Continue registers");
+        assert!(
+            dotted_cd.borrow().issubclass(&short),
+            "dotted ctor spelling must subclass pyopcode::StepResult"
+        );
+        let common = crate::annotator::classdesc::ClassDef::commonbase(&variant, &short)
+            .expect("Continue and pyopcode::StepResult share a base");
+        assert!(
+            Rc::ptr_eq(&common, &short),
+            "common base must be the registered enum class"
+        );
+        let s_variant = SomeValue::Instance(SomeInstance::new(
+            Some(variant),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_short = SomeValue::Instance(SomeInstance::new(
+            Some(short),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        assert!(
+            crate::annotator::model::union(&s_variant, &s_short).is_ok(),
+            "setattr of Continue onto the unsuffixed enum must union"
+        );
+    }
+
+    #[test]
+    fn unit_variant_prebuilt_continue_unions_with_stepresult_field() {
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::flowspace::model::ConstValue;
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyopcode::StepResult".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "pyopcode::StepResult<*mut PyObject>::Continue".to_string(),
+            vec![],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+        let instance = crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+            "pyre_interpreter.pyopcode.StepResult<*mut PyObject>.Continue",
+            Some(0),
+        )
+        .expect("prebuilt Continue");
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(instance))
+            .expect("prebuilt Continue annotates");
+        let short = bk
+            .getuniqueclassdef_for_struct_root("pyopcode::StepResult")
+            .expect("field class");
+        let SomeValue::Instance(si) = s else {
+            panic!("expected SomeInstance, got {s:?}");
+        };
+        let variant = si.classdef.expect("classdef");
+        assert!(
+            variant.borrow().issubclass(&short),
+            "folded Continue must subclass pyopcode::StepResult"
+        );
+        let s_variant = SomeValue::Instance(SomeInstance::new(
+            Some(variant),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_short = SomeValue::Instance(SomeInstance::new(
+            Some(short),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        assert!(
+            crate::annotator::model::union(&s_variant, &s_short).is_ok(),
+            "setattr of folded Continue onto the enum field must union"
+        );
     }
 
     #[test]
