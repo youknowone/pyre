@@ -899,10 +899,11 @@ fn call_collects(call: &HelperCallFact, collecting: &HashSet<u64>) -> bool {
 
 /// True when a collecting call can run after a pin on the way to the return.
 ///
-/// `collecting` is [`CallGraph::reaching`](super::framework::CallGraph::reaching)
-/// of [`COLLECTING_SEEDS`](super::framework::COLLECTING_SEEDS). A wrapper such
-/// as `w_weakref_new` is not itself a seed; it still collects when its id is
-/// in that set.
+/// `collecting` is the [`COLLECTING_SEEDS`](super::framework::COLLECTING_SEEDS)
+/// plus each seed's direct callers. A wrapper such as `w_weakref_new` is not
+/// itself a seed; the call to it still collects. The transitive caller cone
+/// does not: a function that can reach a seed only through another wrapper
+/// is not a collecting call.
 fn collects_after_pin(body: &HelperBodyFact, collecting: &HashSet<u64>) -> bool {
     if body.block_calls.is_empty() {
         let mut seen_pin = false;
@@ -1243,7 +1244,12 @@ fn pin_helper_summaries(
         bodies.insert(id, fact);
     }
     let (seeds, _) = cg.seeds_for(super::framework::COLLECTING_SEEDS);
-    let collecting = cg.reaching(&seeds);
+    let mut collecting = seeds.clone();
+    for id in &seeds {
+        if let Some(callers) = cg.callers.get(id) {
+            collecting.extend(callers.iter().copied());
+        }
+    }
     summarize_pin_helpers(&bodies, &collecting)
 }
 
