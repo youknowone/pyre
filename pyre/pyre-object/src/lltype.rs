@@ -321,7 +321,7 @@ pub fn for_each_type_object_fnaddr(
 /// residual call.
 ///
 /// Expanded beside every accessor — `#[pyre_methods]`, `py_class!`,
-/// `py_class_typed!`, and the hand-written `_csv::dialect_class` one — so each
+/// and `py_class_typed!` — so each
 /// registration carries whatever `cfg` gates its module already carries.  A
 /// central list could not: the accessors sit behind nested gates, and one that
 /// fell behind would silently drop an address rather than fail to build.

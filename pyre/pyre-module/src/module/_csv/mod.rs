@@ -231,7 +231,7 @@ fn fetch(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
 }
 
 fn is_csv_dialect(obj: PyObjectRef) -> Result<bool, PyError> {
-    pyre_interpreter::baseobjspace::isinstance(obj, dialect_class::type_object())
+    pyre_interpreter::baseobjspace::isinstance(obj, type_object())
 }
 
 enum BuildOutcome {
@@ -344,94 +344,72 @@ fn char_obj(cp: u32) -> PyObjectRef {
     pyre_object::w_str_new_managed(&s)
 }
 
-fn opt_char_obj(cp: Option<u32>) -> PyObjectRef {
+/// `interp_csv.py` `NOT_SET`. A code point is never negative.
+const NOT_SET: i32 = -1;
+
+fn codepoint_field(cp: Option<u32>) -> i32 {
     match cp {
-        Some(c) => char_obj(c),
-        None => pyre_object::w_none(),
+        Some(c) => c as i32,
+        None => NOT_SET,
     }
 }
 
-/// Materialise a `DialectConfig` as a `_csv.Dialect` instance. The canonical
-/// values are kept in private slots (`_csv_*`); the public `delimiter` /
-/// `quotechar` / ... names are read-only GetSetProperties (see
-/// `dialect_class`) that surface them — matching the read-only
-/// `interp_attrproperty` / GetSetProperty layout of `W_Dialect.typedef`.
-fn config_to_dialect(cfg: &DialectConfig) -> Result<PyObjectRef, PyError> {
-    let d = pyre_object::w_instance_new(dialect_class::type_object());
+fn codepoint_obj(cp: i32) -> PyObjectRef {
+    if cp == NOT_SET {
+        pyre_object::w_none()
+    } else {
+        char_obj(cp as u32)
+    }
+}
+
+/// `interp_csv.py` `_build_dialect` materialises a `W_Dialect`. `cls` is the
+/// requested subtype (`W_Dialect___new__`); reader/writer construction passes
+/// the exact `_csv.Dialect` type.
+fn config_to_dialect(cfg: &DialectConfig, cls: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let w_line = pyre_object::w_str_new_managed(&cfg.lineterminator);
     let _roots = gc_roots::push_roots();
-    let slot = gc_roots::shadow_stack_len();
-    let _ = gc_roots::pin_root(d);
-    let set = |name: &str, val: PyObjectRef| -> Result<(), PyError> {
-        let d = gc_roots::shadow_stack_get(slot);
-        pyre_interpreter::baseobjspace::setattr_str(d, name, val)?;
-        Ok(())
-    };
-    set("_csv_delimiter", char_obj(cfg.delimiter))?;
-    set(
-        "_csv_doublequote",
-        pyre_object::w_bool_from(cfg.doublequote),
-    )?;
-    set("_csv_escapechar", opt_char_obj(cfg.escapechar))?;
-    set(
-        "_csv_lineterminator",
-        pyre_object::w_str_new_managed(&cfg.lineterminator),
-    )?;
-    set("_csv_quotechar", opt_char_obj(cfg.quotechar))?;
-    set("_csv_quoting", pyre_object::w_int_new(cfg.quoting))?;
-    set(
-        "_csv_skipinitialspace",
-        pyre_object::w_bool_from(cfg.skipinitialspace),
-    )?;
-    set("_csv_strict", pyre_object::w_bool_from(cfg.strict))?;
-    Ok(gc_roots::shadow_stack_get(slot))
+    let _ = gc_roots::pin_root(cls);
+    let _ = gc_roots::pin_root(w_line);
+    let cls_slot = gc_roots::shadow_stack_len() - 2;
+    let line_slot = cls_slot + 1;
+    let obj = W_Dialect::allocate_instance(
+        W_Dialect {
+            delimiter: cfg.delimiter as i32,
+            doublequote: cfg.doublequote,
+            escapechar: codepoint_field(cfg.escapechar),
+            quotechar: codepoint_field(cfg.quotechar),
+            quoting: cfg.quoting,
+            skipinitialspace: cfg.skipinitialspace,
+            strict: cfg.strict,
+            ..W_Dialect::default()
+        },
+        gc_roots::shadow_stack_get(cls_slot),
+    );
+    let _ = gc_roots::pin_root(obj);
+    let obj_slot = line_slot + 1;
+    let obj = gc_roots::shadow_stack_get(obj_slot);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    let dialect = W_Dialect::from_obj(obj).expect("a fresh _csv.Dialect has the Dialect layout");
+    dialect.lineterminator = gc_roots::shadow_stack_get(line_slot);
+    Ok(gc_roots::shadow_stack_get(obj_slot))
 }
 
-fn read_char_field(d: PyObjectRef, name: &str) -> Result<Option<u32>, PyError> {
-    let v = pyre_interpreter::baseobjspace::getattr_str(d, name)?;
-    if unsafe { pyre_object::is_none(v) } {
-        return Ok(None);
-    }
-    if unsafe { pyre_object::is_str(v) } {
-        let mut cps = unsafe { pyre_object::w_str_get_wtf8(v) }.code_points();
-        if let Some(cp) = cps.next()
-            && cps.next().is_none()
-        {
-            return Ok(Some(cp.to_u32()));
-        }
-    }
-    Ok(None)
-}
-
-/// Recover the internal `DialectConfig` from a `_csv.Dialect` instance's
-/// private slots — used by the reader/writer hot paths.
-fn derive_config(mut d: PyObjectRef) -> Result<DialectConfig, PyError> {
-    let delimiter =
-        pyre_object::with_roots!(d => read_char_field(d, "_csv_delimiter"))?.unwrap_or(',' as u32);
-    let quotechar = pyre_object::with_roots!(d => read_char_field(d, "_csv_quotechar"))?;
-    let escapechar = pyre_object::with_roots!(d => read_char_field(d, "_csv_escapechar"))?;
-    let w_doublequote = pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::getattr_str(d, "_csv_doublequote"))?;
-    let doublequote =
-        pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::is_true(w_doublequote))?;
-    let w_skipinitialspace = pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::getattr_str(d, "_csv_skipinitialspace"))?;
-    let skipinitialspace =
-        pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::is_true(w_skipinitialspace))?;
-    let w_strict = pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::getattr_str(d, "_csv_strict"))?;
-    let strict = pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::is_true(w_strict))?;
-    let quoting = {
-        let v = pyre_object::with_roots!(d => pyre_interpreter::baseobjspace::getattr_str(d, "_csv_quoting"))?;
-        if unsafe { pyre_object::is_int(v) } {
-            unsafe { pyre_object::w_int_get_value(v) }
-        } else {
-            QUOTE_MINIMAL
-        }
-    };
-    let lineterminator = {
-        let v = pyre_interpreter::baseobjspace::getattr_str(d, "_csv_lineterminator")?;
-        if unsafe { pyre_object::is_str(v) } {
-            pyre_interpreter::baseobjspace::str_utf8_w(v)?.to_string()
-        } else {
-            "\r\n".to_string()
-        }
+/// Reader/writer hot path: the fields `W_Dialect` stores directly.
+fn derive_config(d: PyObjectRef) -> Result<DialectConfig, PyError> {
+    let dialect = W_Dialect::from_obj(d)
+        .ok_or_else(|| PyError::type_error("_csv.Dialect instance expected"))?;
+    let delimiter = dialect.delimiter as u32;
+    let doublequote = dialect.doublequote;
+    let escapechar = (dialect.escapechar != NOT_SET).then_some(dialect.escapechar as u32);
+    let quotechar = (dialect.quotechar != NOT_SET).then_some(dialect.quotechar as u32);
+    let quoting = dialect.quoting;
+    let skipinitialspace = dialect.skipinitialspace;
+    let strict = dialect.strict;
+    let w_line = dialect.lineterminator;
+    let lineterminator = if unsafe { pyre_object::is_str(w_line) } {
+        pyre_interpreter::baseobjspace::str_utf8_w(w_line)?.to_string()
+    } else {
+        "\r\n".to_string()
     };
     Ok(DialectConfig {
         delimiter,
@@ -505,135 +483,137 @@ fn lookup_registered_dialect(name: PyObjectRef) -> Result<PyObjectRef, PyError> 
 
 // ── `_csv.Dialect` type ──
 
-mod dialect_class {
-    use super::*;
+/// `interp_csv.py` `W_Dialect`. A user subclass is `typedef.py`
+/// `_getusercls`, allocated by `allocate_instance`.
+#[pyre_interpreter::pyre_class("_csv.Dialect", user_layout)]
+#[derive(Default)]
+pub struct W_Dialect {
+    pub delimiter: i32,
+    pub doublequote: bool,
+    pub escapechar: i32,
+    pub lineterminator: PyObjectRef,
+    pub quotechar: i32,
+    pub quoting: i64,
+    pub skipinitialspace: bool,
+    pub strict: bool,
+}
 
-    // Each public dialect attribute is a read-only GetSetProperty reading the
-    // corresponding `_csv_*` private slot (`interp_csv.py` GetSetProperty /
-    // interp_attrproperty); a plain instance attribute would be writable and
-    // deletable, which the type forbids.
-    // GetSetProperty fget callbacks receive `(descriptor_self, w_obj)`, so the
-    // dialect instance is at `args[1]`.
-    macro_rules! dialect_getter {
-        ($fn:ident, $slot:literal) => {
-            fn $fn(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-                pyre_interpreter::baseobjspace::getattr_str(args[1], $slot)
-            }
-        };
-    }
-    dialect_getter!(get_delimiter, "_csv_delimiter");
-    dialect_getter!(get_doublequote, "_csv_doublequote");
-    dialect_getter!(get_escapechar, "_csv_escapechar");
-    dialect_getter!(get_lineterminator, "_csv_lineterminator");
-    dialect_getter!(get_quotechar, "_csv_quotechar");
-    dialect_getter!(get_quoting, "_csv_quoting");
-    dialect_getter!(get_skipinitialspace, "_csv_skipinitialspace");
-    dialect_getter!(get_strict, "_csv_strict");
-
-    /// `W_Dialect___new__` — build the dialect from the optional template +
-    /// format options; with no template a default (excel-like) dialect.
-    fn dialect_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        let template = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+#[pyre_interpreter::pyre_methods(
+    doc = "CSV dialect\n\nThe Dialect type records CSV parsing and generation options.\n"
+)]
+impl W_Dialect {
+    /// `W_Dialect___new__`.
+    #[staticmethod]
+    fn __new__(
+        cls: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] dialect: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] delimiter: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] doublequote: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] escapechar: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] lineterminator: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] quotechar: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] quoting: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] skipinitialspace: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] strict: PyObjectRef,
+    ) -> Result<PyObjectRef, PyError> {
+        pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
         let outcome = build_dialect_config(
-            template,
-            pyre_object::PY_NULL,
-            pyre_object::PY_NULL,
-            pyre_object::PY_NULL,
-            pyre_object::PY_NULL,
-            pyre_object::PY_NULL,
-            pyre_object::PY_NULL,
-            pyre_object::PY_NULL,
-            pyre_object::PY_NULL,
+            dialect,
+            delimiter,
+            doublequote,
+            escapechar,
+            lineterminator,
+            quotechar,
+            quoting,
+            skipinitialspace,
+            strict,
         )?;
         match outcome {
-            BuildOutcome::Existing(d) => Ok(d),
-            BuildOutcome::Config(cfg) => config_to_dialect(&cfg),
+            BuildOutcome::Existing(d) if std::ptr::eq(cls, type_object()) => Ok(d),
+            BuildOutcome::Existing(d) => {
+                let cfg = derive_config(d)?;
+                config_to_dialect(&cfg, cls)
+            }
+            BuildOutcome::Config(cfg) => config_to_dialect(&cfg, cls),
         }
     }
 
-    pub fn type_object() -> PyObjectRef {
-        // Process-global immortal type object (see `make_builtin_type`).
-        static CELL: pyre_object::gc_roots::RootedOnceRef =
-            pyre_object::gc_roots::RootedOnceRef::new();
-        CELL.get_or_init(|| {
-            let tp = pyre_interpreter::typedef::make_builtin_type("_csv.Dialect", |ns| {
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                        ns,
-                        "__new__",
-                        pyre_interpreter::typedef::make_new_descr(dialect_new),
-                    )
-                };
-                // `dialect_new` does all the work; a no-op `__init__`
-                // keeps the template argument from reaching
-                // `object.__init__`.
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                        ns,
-                        "__init__",
-                        pyre_interpreter::make_builtin_function("__init__", |_| {
-                            Ok(pyre_object::w_none())
-                        }),
-                    )
-                };
-                // `W_Dialect.reduce_ex_w` — dialects are not picklable
-                // (and so not copyable).
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                        ns,
-                        "__reduce_ex__",
-                        pyre_interpreter::make_builtin_function("__reduce_ex__", |_| {
-                            Err(PyError::type_error("can't pickle _csv.Dialect objects"))
-                        }),
-                    )
-                };
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                        ns,
-                        "__reduce__",
-                        pyre_interpreter::make_builtin_function("__reduce__", |_| {
-                            Err(PyError::type_error("can't pickle _csv.Dialect objects"))
-                        }),
-                    )
-                };
-                for (name, getter) in [
-                    (
-                        "delimiter",
-                        get_delimiter as fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>,
-                    ),
-                    ("doublequote", get_doublequote),
-                    ("escapechar", get_escapechar),
-                    ("lineterminator", get_lineterminator),
-                    ("quotechar", get_quotechar),
-                    ("quoting", get_quoting),
-                    ("skipinitialspace", get_skipinitialspace),
-                    ("strict", get_strict),
-                ] {
-                    unsafe {
-                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                            ns,
-                            name,
-                            pyre_interpreter::typedef::make_getset_descriptor_named(
-                                pyre_interpreter::make_builtin_function(name, getter),
-                                name,
-                            ),
-                        )
-                    };
-                }
-            });
-            // CPython 3.14 Modules/_csv.c:csv_exec uses
-            // PyType_FromModuleAndSpec; Dialect_Type_spec is immutable.
-            pyre_interpreter::typedef::mark_cpython_heap_type(tp, true);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
+    /// `__new__` already consumed the format options. The same arguments are
+    /// still presented to `__init__`.
+    fn __init__(&mut self, _args: &[PyObjectRef]) -> Result<(), PyError> {
+        Ok(())
     }
 
-    // Publish this accessor's residual-call address so the JIT's
-    // `dont_look_inside` residual for `type_object` resolves through
-    // `jit_trace_fnaddrs`, mirroring the `#[pyre_methods]`-generated
-    // accessors.
-    ::pyre_object::register_type_object_fnaddr!();
+    /// `W_Dialect.reduce_ex_w`.
+    fn __reduce_ex__(&self, _protocol: PyObjectRef) -> Result<PyObjectRef, PyError> {
+        Err(PyError::type_error("can't pickle _csv.Dialect objects"))
+    }
+
+    /// Same refusal as `reduce_ex_w` when the caller asks for `__reduce__`.
+    fn __reduce__(&self) -> Result<PyObjectRef, PyError> {
+        Err(PyError::type_error("can't pickle _csv.Dialect objects"))
+    }
+
+    #[getter]
+    fn delimiter(&self) -> PyObjectRef {
+        codepoint_obj(self.delimiter)
+    }
+
+    #[getter]
+    fn doublequote(&self) -> bool {
+        self.doublequote
+    }
+
+    #[getter]
+    fn escapechar(&self) -> PyObjectRef {
+        codepoint_obj(self.escapechar)
+    }
+
+    #[getter]
+    fn lineterminator(&self) -> PyObjectRef {
+        self.lineterminator
+    }
+
+    #[getter]
+    fn quotechar(&self) -> PyObjectRef {
+        codepoint_obj(self.quotechar)
+    }
+
+    #[getter]
+    fn quoting(&self) -> i64 {
+        self.quoting
+    }
+
+    #[getter]
+    fn skipinitialspace(&self) -> bool {
+        self.skipinitialspace
+    }
+
+    #[getter]
+    fn strict(&self) -> bool {
+        self.strict
+    }
+}
+
+/// The GC types this module owns. Appended after every earlier module so
+/// established module tids stay put. The builtin is registered before its
+/// `_getusercls` child.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    let pyre_class = ModuleGcLayout::PyreClass {
+        memory_pressure_offset: None,
+    };
+    types.push(ModuleGcType {
+        descriptor: <W_Dialect as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: pyre_class,
+        destructor: None,
+    });
+    types.push(ModuleGcType {
+        descriptor: &W_DIALECT_USER_PYRE_CLASS_DESCRIPTOR,
+        layout: pyre_class,
+        destructor: None,
+    });
 }
 
 // ── `_csv.reader` ──
@@ -1175,7 +1155,7 @@ fn resolve_dialect(
     )?;
     match outcome {
         BuildOutcome::Existing(d) => Ok(d),
-        BuildOutcome::Config(cfg) => config_to_dialect(&cfg),
+        BuildOutcome::Config(cfg) => config_to_dialect(&cfg, type_object()),
     }
 }
 
@@ -1219,7 +1199,7 @@ fn field_size_limit_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 pyre_interpreter::py_module! {
     "_csv",
     interpleveldefs: {
-        "Dialect" => dialect_class::type_object(),
+        "Dialect" => type_object(),
         "__version__" => pyre_object::w_str_new("1.0"),
     },
     int_constants: {

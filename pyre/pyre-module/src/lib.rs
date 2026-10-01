@@ -474,6 +474,7 @@ fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
         not(target_arch = "wasm32")
     ))]
     module::_cffi_backend::gc_types(&mut types);
+    module::_csv::gc_types(&mut types);
     types
 }
 
@@ -1171,21 +1172,19 @@ mod tests {
         );
     }
 
-    /// The `_csv::dialect_class::type_object` accessor is hand-written (not
-    /// `#[pyre_methods]` / `py_class!`), yet the front recognizer stamps every
-    /// `type_object` accessor `dont_look_inside`.  It must still publish a
-    /// residual address, or a traced `_csv.Dialect` type lookup residualizes to
-    /// a symbolic fnaddr and inline JIT descent aborts.
+    /// `_csv.Dialect`'s `type_object` accessor is `dont_look_inside`. It must
+    /// publish a residual address, or a traced type lookup residualizes to a
+    /// symbolic fnaddr and inline JIT descent aborts.
     #[test]
-    fn jit_trace_fnaddrs_covers_hand_written_csv_dialect_type_object() {
+    fn jit_trace_fnaddrs_covers_csv_dialect_type_object() {
         let bindings: HashMap<&'static str, i64> =
             pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
         assert!(
-            bindings.contains_key("pyre_module::module::_csv::dialect_class::type_object"),
-            "hand-written _csv::dialect_class::type_object must publish a residual fnaddr",
+            bindings.contains_key("pyre_module::module::_csv::type_object"),
+            "_csv.Dialect type_object must publish a residual fnaddr",
         );
         assert!(
-            bindings.contains_key("module::_csv::dialect_class::type_object"),
+            bindings.contains_key("module::_csv::type_object"),
             "the crate-stripped alias must resolve too",
         );
     }
