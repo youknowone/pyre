@@ -162,7 +162,7 @@ pub use finish_descrs::{
     propagate_exception_handle_fail,
 };
 pub use jitframe::JitFrameInfo;
-pub use llmodel::{FailArgSource, get_int_value, get_int_value_direct};
+pub use llmodel::{FailArgSource, fail_arg_source_from_frame, get_int_value, get_int_value_direct};
 pub use model::{
     cpu_subclassrange_min_offset, read_vtable_subclass_range, set_cpu_subclassrange_min_offset,
 };

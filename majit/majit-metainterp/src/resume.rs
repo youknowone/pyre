@@ -855,12 +855,11 @@ impl ResumeStorage {
     /// `AbstractVirtualInfo` objects once, at compile time, in
     /// `ResumeDataVirtualAdder.finish`.
     ///
-    /// Pyre records `RdVirtualInfo` on the guard and reshapes it for the
-    /// reader, so the reshape lands here instead. It is a pure function of
-    /// `rd_virtuals` — the tagged `fieldnums` stay tagged and every descriptor
-    /// is cloned as-is — and `rd_virtuals` is immutable once the guard owns it,
-    /// so the result is built on the first resume off this guard and shared by
-    /// every later one rather than rebuilt per failure.
+    /// This `OnceLock` reshapes `rd_virtuals` for one `ResumeStorage` value.
+    /// `from_fail_descr` builds a fresh storage, so the list that outlives
+    /// that value is [`guard_virtual_infos`], stored beside `rd_virtuals` on
+    /// the guard. The reshape is a pure function of `rd_virtuals`: the tagged
+    /// `fieldnums` stay tagged and every descriptor is cloned as-is.
     ///
     /// Nothing in the result is a GC reference: the field sources are
     /// numbering tags, and the descriptors, type ids, known-class vtable words
@@ -1696,6 +1695,71 @@ pub fn rd_virtual_to_virtual_info(
     _num_virtuals: usize,
 ) -> VirtualInfo {
     virtual_info_from_rd(rd)
+}
+
+/// `resume.py` `ResumeDataVirtualAdder._number_virtuals` stores
+/// `storage.rd_virtuals` once. Resume reads that list
+/// (`AbstractResumeDataReader._prepare_virtuals`).
+pub(crate) enum GuardVirtualInfos<'a> {
+    Cached(&'a [VirtualInfo]),
+    Fresh(Vec<VirtualInfo>),
+}
+
+impl GuardVirtualInfos<'_> {
+    pub(crate) fn as_slice(&self) -> &[VirtualInfo] {
+        match self {
+            Self::Cached(slice) => slice,
+            Self::Fresh(infos) => infos.as_slice(),
+        }
+    }
+}
+
+fn shaped_virtual_infos<'a>(fd: &'a dyn majit_ir::FailDescr) -> Option<&'a [VirtualInfo]> {
+    let infos = fd
+        .shaped_virtuals_any()?
+        .downcast_ref::<Vec<VirtualInfo>>()?;
+    if infos.is_empty() {
+        None
+    } else {
+        Some(infos.as_slice())
+    }
+}
+
+/// The guard's decoded virtual infos. The first resume that sees a
+/// non-empty `rd_virtuals` stores the decoding on the descr; later
+/// resumes borrow it. A descr that cannot store the box returns
+/// [`GuardVirtualInfos::Fresh`].
+pub(crate) fn guard_virtual_infos<'a>(
+    fd: &'a dyn majit_ir::FailDescr,
+) -> Option<GuardVirtualInfos<'a>> {
+    if let Some(infos) = shaped_virtual_infos(fd) {
+        return Some(GuardVirtualInfos::Cached(infos));
+    }
+    let built = {
+        match fd.rd_virtuals() {
+            Some(rds) if !rds.is_empty() => rds
+                .iter()
+                .map(|rd| virtual_info_from_rd(rd))
+                .collect::<Vec<_>>(),
+            _ => return None,
+        }
+    };
+    match fd.cache_shaped_virtuals(Box::new(built)) {
+        Ok(()) => {
+            let infos = shaped_virtual_infos(fd).expect("shaped virtuals were just stored");
+            Some(GuardVirtualInfos::Cached(infos))
+        }
+        Err(boxed) => match boxed.downcast::<Vec<VirtualInfo>>() {
+            Ok(infos) => {
+                if infos.is_empty() {
+                    None
+                } else {
+                    Some(GuardVirtualInfos::Fresh(*infos))
+                }
+            }
+            Err(_) => None,
+        },
+    }
 }
 
 /// The conversion itself.
@@ -5168,6 +5232,40 @@ mod tests {
 
     use super::*;
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+
+    #[test]
+    fn orthodox_resume_shaped_virtuals_are_built_once() {
+        let descr = majit_backend::make_resume_guard_descr_typed(vec![]);
+        let fd = descr.as_fail_descr().expect("resume guard");
+        fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
+            majit_ir::RdVirtualInfo::VRawSliceInfo {
+                offset: 3,
+                fieldnums: vec![],
+            },
+        )]));
+        let first = super::guard_virtual_infos(fd).expect("virtuals");
+        let second = super::guard_virtual_infos(fd).expect("virtuals");
+        assert_eq!(first.as_slice().as_ptr(), second.as_slice().as_ptr());
+        assert!(matches!(
+            first.as_slice()[0],
+            VirtualInfo::VRawSlice { offset: 3, .. }
+        ));
+        drop(first);
+        drop(second);
+        fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
+            majit_ir::RdVirtualInfo::VRawSliceInfo {
+                offset: 4,
+                fieldnums: vec![],
+            },
+        )]));
+        let third = super::guard_virtual_infos(fd).expect("rebuilt");
+        assert!(matches!(
+            third.as_slice()[0],
+            VirtualInfo::VRawSlice { offset: 4, .. }
+        ));
+        let fourth = super::guard_virtual_infos(fd).expect("cached rebuild");
+        assert_eq!(third.as_slice().as_ptr(), fourth.as_slice().as_ptr());
+    }
 
     #[test]
     fn resume_register_box_pairs_failargs_and_consts_and_skips_holes() {
