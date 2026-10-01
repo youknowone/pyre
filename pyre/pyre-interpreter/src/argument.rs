@@ -141,6 +141,22 @@ pub fn contains_w_names(w_key: PyObjectRef, keys_w: &[PyObjectRef]) -> bool {
 /// `keywords_w` is the parallel value list, kept in the signature for
 /// upstream parity but unused in the duplicate check (only the names
 /// matter).
+///
+/// `@jit.look_inside_iff(lambda ...:
+///     jit.isconstant(len(keyword_names_w) and
+///     jit.isconstant(existingkeywords_w)))`.
+fn check_not_duplicate_kwargs_iff(
+    existingkeywords_w: &[PyObjectRef],
+    keyword_names_w: &[PyObjectRef],
+    _keywords_w: &[PyObjectRef],
+    _w_function: PyObjectRef,
+) -> bool {
+    let names_and_existing =
+        keyword_names_w.len() != 0 && majit_rlib::jit::isconstant(existingkeywords_w);
+    majit_rlib::jit::isconstant(&names_and_existing)
+}
+
+#[majit_macros::look_inside_iff(check_not_duplicate_kwargs_iff)]
 pub fn check_not_duplicate_kwargs(
     existingkeywords_w: &[PyObjectRef],
     keyword_names_w: &[PyObjectRef],

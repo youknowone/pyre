@@ -401,6 +401,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "argument.py look_inside_iff unroll_safe(Arguments.unpack)",
     ),
     (
+        "_orig_check_not_duplicate_kwargs",
+        "argument.py look_inside_iff unroll_safe(_check_not_duplicate_kwargs)",
+    ),
+    (
         "_orig__dict_merge_loop",
         "pyopcode.py look_inside_iff unroll_safe(_dict_merge_loop)",
     ),
