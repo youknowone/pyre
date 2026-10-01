@@ -8856,6 +8856,95 @@ impl<'a> Transformer<'a> {
                     ],
                 )
             }
+            "list.ascii_capacity" => {
+                // Capacity is `len(l.items)` (`rlist.py` `_ll_list_resize_ge`),
+                // an ARRAY length. Same decomposition as `list.obj_capacity`;
+                // the block is AsciiListStrategy's erased `STR` array.
+                let l = args.first()?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.ascii_capacity → getfield_gc_r(ascii_items.block) + arraylen_gc(block)",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new(
+                                    "ascii_items.block",
+                                    Some(LIST_OWNER.to_string()),
+                                ),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayLen {
+                                base: block,
+                                array_type_id: Some(
+                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                ),
+                                nolength: false,
+                            },
+                        },
+                    ],
+                )
+            }
+            "list.ascii_set_len" => {
+                let l = args.first()?.clone();
+                let n = args.get(1)?.clone();
+                (
+                    "list.ascii_set_len → setfield_gc_i(ascii_items.len)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldWrite {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "ascii_items.len",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            value: crate::model::LinkArg::Value(n),
+                            ty: ValueType::Int,
+                        },
+                    }],
+                )
+            }
+            "list.ascii_setitem" => {
+                let l = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let value = args.get(2)?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.ascii_setitem → getfield_gc_r(ascii_items.block) + setarrayitem_gc_r",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new(
+                                    "ascii_items.block",
+                                    Some(LIST_OWNER.to_string()),
+                                ),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayWrite {
+                                base: block,
+                                index,
+                                value: crate::model::LinkArg::Value(value),
+                                item_ty: ValueType::Ref(None),
+                                array_type_id: Some(
+                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                ),
+                                nolength: false,
+                            },
+                        },
+                    ],
+                )
+            }
             "list.obj_getitem" => {
                 let l = args.first()?.clone();
                 let index = args.get(1)?.clone();
@@ -24160,6 +24249,162 @@ mod tests {
             other => panic!("expected FieldWrite, got {other:?}"),
         }
         assert_eq!(ops[0].result, None);
+    }
+
+    /// `list.ascii_set_len(l, n)` lowers to `setfield_gc_i(ascii_items.len)`.
+    #[test]
+    fn handle_list_call_ascii_set_len_lowers_to_len_field_write() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_ascii_set_len");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let n = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.ascii_set_len",
+                &op,
+                &[l.clone(), n.clone()],
+                &mut graph,
+                "list_ascii_set_len",
+            )
+            .expect("list.ascii_set_len must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "ascii_items.len");
+                assert_eq!(value.as_variable(), Some(&n));
+                assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, None);
+    }
+
+    /// `list.ascii_setitem(l, i, v)` lowers to `getfield_gc_r(ascii_items.block)`
+    /// feeding `setarrayitem_gc_r` of the erased `STR` array.
+    #[test]
+    fn handle_list_call_ascii_setitem_lowers_to_block_plus_setarrayitem() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_ascii_setitem");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.ascii_setitem",
+                &op,
+                &[l.clone(), index.clone(), value.clone()],
+                &mut graph,
+                "list_ascii_setitem",
+            )
+            .expect("list.ascii_setitem must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 2);
+        let block = match &ops[0].kind {
+            OpKind::FieldRead { base, field, .. } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "ascii_items.block");
+                ops[0].result.clone().expect("block result var")
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        };
+        match &ops[1].kind {
+            OpKind::ArrayWrite {
+                base,
+                index: idx,
+                value: written,
+                item_ty,
+                array_type_id,
+                nolength,
+            } => {
+                assert_eq!(base, &block);
+                assert_eq!(idx, &index);
+                assert_eq!(written.as_variable(), Some(&value));
+                assert!(matches!(item_ty, ValueType::Ref(None)));
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+                );
+                assert!(!nolength);
+            }
+            other => panic!("expected ArrayWrite, got {other:?}"),
+        }
+        assert_eq!(ops[1].result, None);
+    }
+
+    /// `list.ascii_capacity(l)` lowers to `getfield_gc_r(ascii_items.block)`
+    /// plus `arraylen_gc` on that erased `STR` block.
+    #[test]
+    fn handle_list_call_ascii_capacity_lowers_to_block_arraylen() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_ascii_capacity");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.ascii_capacity",
+                &op,
+                std::slice::from_ref(&l),
+                &mut graph,
+                "list_ascii_capacity",
+            )
+            .expect("list.ascii_capacity must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 2);
+        let block = match &ops[0].kind {
+            OpKind::FieldRead {
+                base, field, ty, ..
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "ascii_items.block");
+                assert!(matches!(ty, ValueType::Ref(_)));
+                ops[0].result.clone().expect("block read has a result")
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        };
+        match &ops[1].kind {
+            OpKind::ArrayLen {
+                base,
+                array_type_id,
+                nolength,
+            } => {
+                assert_eq!(base, &block);
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+                );
+                assert!(!*nolength, "the block carries its length header");
+            }
+            other => panic!("expected ArrayLen, got {other:?}"),
+        }
+        assert_eq!(ops[1].result, Some(result));
     }
 
     /// `list.int_set_items(l, items)` lowers to `setfield_gc_r(l,

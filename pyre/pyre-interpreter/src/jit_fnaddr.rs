@@ -3321,6 +3321,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::ll_list_float_resize_hint_really",
         pyre_object::listobject::__majit_call_target_ll_list_float_resize_hint_really,
     );
+    cpa3(
+        &mut entries,
+        "pyre_object::listobject::ll_list_ascii_resize_hint_really",
+        "pyre_object::ll_list_ascii_resize_hint_really",
+        pyre_object::listobject::__majit_call_target_ll_list_ascii_resize_hint_really,
+    );
     let object_push: unsafe fn(&mut pyre_object::W_ListObject, pyre_object::PyObjectRef) =
         pyre_object::W_ListObject::object_push;
     up2(
@@ -5928,6 +5934,24 @@ mod tests {
             pyre_object::listobject::ll_list_obj_resize_hint_really;
         assert_ne!(
             obj_hint, raw_hint as *const () as usize as i64,
+            "CondCall must bind the word-ABI adapter, not the Rust fn"
+        );
+
+        let ascii_hint =
+            pyre_object::listobject::__majit_call_target_ll_list_ascii_resize_hint_really
+                as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::listobject::ll_list_ascii_resize_hint_really"],
+            ascii_hint
+        );
+        assert_eq!(
+            bindings["pyre_object::ll_list_ascii_resize_hint_really"],
+            ascii_hint
+        );
+        let raw_ascii: unsafe fn(pyre_object::PyObjectRef, usize, bool) =
+            pyre_object::listobject::ll_list_ascii_resize_hint_really;
+        assert_ne!(
+            ascii_hint, raw_ascii as *const () as usize as i64,
             "CondCall must bind the word-ABI adapter, not the Rust fn"
         );
     }

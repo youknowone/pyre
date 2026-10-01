@@ -1813,6 +1813,7 @@ two-phase-never-a-subject	pyre_object::listobject::<Impl>::object_remove
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::object_resize_capacity
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::sync_allocated
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::try_object_resize_capacity
+two-phase-never-a-subject	pyre_object::listobject::_orig_ll_list_ascii_resize_hint_really
 two-phase-never-a-subject	pyre_object::listobject::_orig_ll_list_float_resize_hint_really
 two-phase-never-a-subject	pyre_object::listobject::_orig_ll_list_int_resize_hint_really
 two-phase-never-a-subject	pyre_object::listobject::_orig_ll_list_obj_resize_hint_really
@@ -1820,6 +1821,8 @@ two-phase-never-a-subject	pyre_object::listobject::alloc_range_state
 two-phase-never-a-subject	pyre_object::listobject::install_range_state
 two-phase-never-a-subject	pyre_object::listobject::int_or_float_encode_int
 two-phase-never-a-subject	pyre_object::listobject::int_or_float_encode_item
+two-phase-never-a-subject	pyre_object::listobject::ll_list_ascii_resize_ge
+two-phase-never-a-subject	pyre_object::listobject::ll_list_ascii_resize_hint_really
 two-phase-never-a-subject	pyre_object::listobject::ll_list_float_resize_ge
 two-phase-never-a-subject	pyre_object::listobject::ll_list_float_resize_hint_really
 two-phase-never-a-subject	pyre_object::listobject::ll_list_int_resize_ge
