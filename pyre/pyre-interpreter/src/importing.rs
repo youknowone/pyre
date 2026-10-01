@@ -6185,9 +6185,16 @@ fn rpython_str_slice_prefix(value: &str, stop: i64) -> &str {
 /// `space.getbuiltinmodule('_frozen_importlib')` then that module's
 /// `_handle_fromlist`, or null when the binding is absent.
 ///
+/// Null also when `__getattribute__` is not `Module.descr_getattribute`,
+/// or when `_handle_fromlist` is a data descriptor on the type.
+/// `descr_getattribute` runs `object_getattribute` before the instance
+/// dict, so a raw dict read would skip that override. The caller stays
+/// on [`dunder_import_package_fromlist`], which resolves the name with
+/// `findattr_result` (`space.call_method`).
+///
 /// The name literals stay here, the same way [`module_dict_cell_get_path`]
 /// keeps `"__path__"`. A comparison `begin_callback_free_probe` refuses
-/// answers null, and the caller stays on [`dunder_import_package_fromlist`].
+/// answers null.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(crate) fn bootstrap_handle_fromlist() -> PyObjectRef {
     pyre_object::dict_eq_hook::begin_callback_free_probe();
@@ -6207,6 +6214,13 @@ unsafe fn bootstrap_handle_fromlist_lookup() -> PyObjectRef {
         w_bootstrap
     };
     if w_bootstrap.is_null() || !pyre_object::is_module(w_bootstrap) {
+        return pyre_object::PY_NULL;
+    }
+    let w_type = (*w_bootstrap).w_class;
+    if w_type.is_null()
+        || crate::baseobjspace::module_getattribute_if_not_from_default(w_type).is_some()
+        || crate::baseobjspace::type_lookup_is_data_descr(w_type, "_handle_fromlist")
+    {
         return pyre_object::PY_NULL;
     }
     let dict = pyre_object::w_module_get_w_dict(w_bootstrap);
