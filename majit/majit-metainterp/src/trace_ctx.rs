@@ -7054,6 +7054,35 @@ mod tests {
             .is_none());
     }
 
+    /// `executor.py` `do_getarrayitem_gc_*` is chosen by the item opnum.
+    /// A caller bank that is not `item_type()` must not read the word.
+    #[test]
+    fn array_sanity_load_refuses_a_caller_bank_that_is_not_the_item_type() {
+        let cpu = SanityTestCpu {
+            int_value: 0x1111,
+            ref_value: majit_ir::GcRef(0x2222),
+            float_value: 1.25,
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.set_cpu(Some(&cpu));
+        let int_items = majit_ir::descr::make_array_descr_full(1, 0, 8, 8, Type::Int);
+        assert_eq!(
+            int_items.as_array_descr().map(|a| a.item_type()),
+            Some(Type::Int)
+        );
+        assert!(ctx
+            .array_sanity_load(0xCAFE_BABE, 0, &int_items, Type::Ref)
+            .is_none());
+        let ref_items = majit_ir::descr::make_array_descr_full(1, 0, 8, 8, Type::Ref);
+        assert_eq!(
+            ref_items.as_array_descr().map(|a| a.item_type()),
+            Some(Type::Ref)
+        );
+        assert!(ctx
+            .array_sanity_load(0xCAFE_BABE, 0, &ref_items, Type::Int)
+            .is_none());
+    }
+
     /// An array descr with no `lendescr` describes an array that
     /// carries no length word — `raw_carray_descrof`'s shape.  The
     /// sanity load must decline it, which is the state its three
