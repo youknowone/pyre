@@ -4396,13 +4396,21 @@ pub fn load_super_attr_value(
             "LOAD_SUPER_ATTR name index {name_idx} out of range"
         )));
     };
+    // `w_code_getname_w_or_new` interns and can collect.  The code body is not
+    // a GC object; the frame and the three objects the lookup still needs are.
+    // Anchor before the intern and pass `live()` — `descriptor.py`
+    // `_get_self_location` reads that frame afterwards.
+    let frame_anchor = unsafe { FrameAnchor::from_raw(frame) };
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.publish(&[global_super, self_obj, cls]);
     let w_name = unsafe { crate::pycode::w_code_getname_w_or_new(w_code, name_idx, name) };
     let (self_is_cell, class_slot) = crate::builtins::bare_super_frame_layout_words(code);
     load_super_attr_value_w(
-        global_super,
-        self_obj,
-        cls,
-        frame,
+        roots.get(base),
+        roots.get(base + 1),
+        roots.get(base + 2),
+        frame_anchor.live(),
         w_name,
         is_two_arg,
         self_is_cell,
