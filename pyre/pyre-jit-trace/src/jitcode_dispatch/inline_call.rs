@@ -7571,6 +7571,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // in the recorded op / gcref table.  Movability does not decide it.
         callee_args.truncate(nparams);
         callee_arg_concretes.truncate(nparams);
+        // The surplus elements' root slots must leave with them. A later
+        // refresh zips this slice with the concretes, and the vararg index
+        // is about to be reused for the tuple.
+        arg_root_slots.truncate(nparams);
         Some((surplus_ops, concrete))
     } else {
         None
@@ -7580,18 +7584,41 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // the tuple's own slot moves out past the keyword-only block.
     if let Some(resolved) = kwonly_defaults.as_ref() {
         for kwonly in &resolved.values {
+            let index = callee_args.len();
             callee_args.push(OpRef::NONE);
-            callee_arg_concretes.push(ConcreteValue::Ref(kwonly.value));
+            callee_arg_concretes.push(ConcreteValue::Null);
+            arg_root_slots.push(None);
+            adopt_rooted_ref(
+                &_arg_roots,
+                &mut callee_arg_concretes,
+                &mut arg_root_slots,
+                &mut varkw_extra,
+                &varkw_root_slots,
+                index,
+                kwonly.value,
+            );
         }
     }
     if let Some((_, concrete)) = vararg_surplus.as_ref() {
+        let index = callee_args.len();
         callee_args.push(OpRef::NONE);
-        callee_arg_concretes.push(ConcreteValue::Ref(*concrete));
+        callee_arg_concretes.push(ConcreteValue::Null);
+        arg_root_slots.push(None);
+        adopt_rooted_ref(
+            &_arg_roots,
+            &mut callee_arg_concretes,
+            &mut arg_root_slots,
+            &mut varkw_extra,
+            &varkw_root_slots,
+            index,
+            *concrete,
+        );
     }
     // The `**kwargs` mapping is built at the emit, which fills both halves.
     if varkw_slot.is_some() {
         callee_args.push(OpRef::NONE);
         callee_arg_concretes.push(ConcreteValue::Null);
+        arg_root_slots.push(None);
     }
     let vararg_index = nparams + kwonly_count;
     let varkw_index = vararg_index + usize::from(vararg_slot.is_some());
