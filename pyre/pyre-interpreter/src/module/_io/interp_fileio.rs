@@ -135,10 +135,15 @@ impl W_FileIO {
 impl W_FileIO {
     #[staticmethod]
     fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        crate::typedef::check_user_subclass(type_object(), cls)?;
+        // `check_user_subclass` can collect. The slot is the live word;
+        // this pin's argument is not read again.
         let _roots = pyre_object::gc_roots::push_roots();
         let cls_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(cls);
+        crate::typedef::check_user_subclass(
+            type_object(),
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        )?;
         let obj = W_FileIO::allocate_instance(
             W_FileIO::default(),
             pyre_object::gc_roots::shadow_stack_get(cls_slot),
