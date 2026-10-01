@@ -14090,6 +14090,11 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let pre_fold_virtualrefs = ctx.trace_ctx.snapshot_virtualref_boxes();
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
+    // A decline below returns to the residual, which re-executes the dunder.
+    // Journal entries pushed after this mark are undone there
+    // (`fbw_effect_journal_rollback_since`); the walk can still commit, so
+    // `fbw_store_journal_rollback` does not.
+    let journal_mark = fbw_effect_journal_mark();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     // Copied out before the descent takes `ctx` mutably; the region state is
     // the session's, not this frame's.
@@ -14149,6 +14154,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let refused_a_commit = rewind_guard.as_ref().is_some_and(|g| g.refused());
     drop(rewind_guard);
     if refused_a_commit {
+        fbw_effect_journal_rollback_since(journal_mark);
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx
             .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
@@ -14161,6 +14167,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let Some(inlined) = (match descent {
         Ok(inlined) => inlined,
         Err(err) => {
+            fbw_effect_journal_rollback_since(journal_mark);
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
             ctx.trace_ctx.heap_cache_mut().reset();
@@ -14170,6 +14177,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
             ));
         }
     }) else {
+        fbw_effect_journal_rollback_since(journal_mark);
         decline!(format_args!(
             "callee inline of {}.{dunder} declined",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
@@ -14206,6 +14214,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
                 && !unjournaled_before
                 && !fbw_has_unjournaled_effect()
             {
+                fbw_effect_journal_rollback_since(journal_mark);
                 ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
                 ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
                 ctx.trace_ctx.heap_cache_mut().reset();
@@ -14356,6 +14365,11 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let pre_fold_virtualrefs = ctx.trace_ctx.snapshot_virtualref_boxes();
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
+    // A decline below returns to the residual, which re-executes the dunder.
+    // Journal entries pushed after this mark are undone there
+    // (`fbw_effect_journal_rollback_since`); the walk can still commit, so
+    // `fbw_store_journal_rollback` does not.
+    let journal_mark = fbw_effect_journal_mark();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     // Copied out before the descent takes `ctx` mutably; the region state is
     // the session's, not this frame's.
@@ -14415,6 +14429,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let refused_a_commit = rewind_guard.as_ref().is_some_and(|g| g.refused());
     drop(rewind_guard);
     if refused_a_commit {
+        fbw_effect_journal_rollback_since(journal_mark);
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx
             .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
@@ -14422,6 +14437,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         return Ok(None);
     }
     let Some(inlined) = descent? else {
+        fbw_effect_journal_rollback_since(journal_mark);
         return Ok(None);
     };
 
@@ -14448,6 +14464,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
                 && !unjournaled_before
                 && !fbw_has_unjournaled_effect()
             {
+                fbw_effect_journal_rollback_since(journal_mark);
                 ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
                 ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
                 ctx.trace_ctx.heap_cache_mut().reset();
