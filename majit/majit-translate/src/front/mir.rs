@@ -32435,7 +32435,7 @@ fn regular_call_is_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool 
         .is_some_and(|fd| is_object_items_block_base_accessor(fd.item_meta.name_path().as_str()))
 }
 
-fn regular_call_name_path(reg: &RegularCall, llbc: &Llbc) -> Option<String> {
+pub fn regular_call_name_path(reg: &RegularCall, llbc: &Llbc) -> Option<String> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
@@ -34139,22 +34139,36 @@ impl<'a> RootStackAnalyzer<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        if let Some(&known) = self.state.scope_constructors.borrow().get(id) {
+        self.fn_returns_owned_scope(*id)
+    }
+
+    /// Whether `id`'s body opens a bracket and returns its guard inside the
+    /// result. A declaration with no body in this artefact answers from the
+    /// constructors published by the crate that defined it.
+    fn fn_returns_owned_scope(&self, id: u64) -> bool {
+        if let Some(&known) = self.state.scope_constructors.borrow().get(&id) {
             return known;
         }
-        let answer = self
-            .llbc
-            .fn_by_id(*id)
-            .and_then(|fd| fd.unstructured())
-            .is_some_and(|body| {
-                body_returns_owned_scope(self.llbc, &body, &|reg| {
-                    regular_call_name_path(reg, self.llbc)
-                })
-            });
+        // A cycle does not return a scope through itself. A direct
+        // `push_roots` in this body is still seen below.
+        self.state.scope_constructors.borrow_mut().insert(id, false);
+        let answer = match self.llbc.fn_by_id(id) {
+            Some(fd) => match fd.unstructured() {
+                Some(body) => body_returns_owned_scope(
+                    self.llbc,
+                    &body,
+                    &|reg| regular_call_name_path(reg, self.llbc),
+                    &|reg| self.call_returns_owned_scope(reg),
+                ),
+                None => scope_owning_key(self.llbc, fd)
+                    .is_some_and(|key| self.llbc.scope_owning_constructor(&key)),
+            },
+            None => false,
+        };
         self.state
             .scope_constructors
             .borrow_mut()
-            .insert(*id, answer);
+            .insert(id, answer);
         answer
     }
 
@@ -34567,6 +34581,7 @@ fn body_returns_owned_scope(
     llbc: &Llbc,
     body: &Unstructured,
     name_of: &impl Fn(&RegularCall) -> Option<String>,
+    returns_owned: &impl Fn(&RegularCall) -> bool,
 ) -> bool {
     let guards: bit_set::BitSet = body
         .body
@@ -34574,7 +34589,8 @@ fn body_returns_owned_scope(
         .filter_map(|bb| match bb.term(llbc) {
             Ok(TermKind::Call { call, .. }) => match (&call.func, &call.dest.kind) {
                 (CallFunc::Regular(reg), PlaceKind::Local(dest))
-                    if name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path)) =>
+                    if name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path))
+                        || returns_owned(reg) =>
                 {
                     Some(*dest as usize)
                 }
@@ -36017,6 +36033,46 @@ fn record_root_slot_getter_reads(
 /// crate from there is answered by its body instead of being assumed to
 /// touch the stack.  Paths that name several bodies (`<Impl>::new`) are
 /// listed if any of them touches.
+/// Every local body that opens a bracket and returns its guard inside the
+/// result, by path. Published to artefacts linked after this one, so a
+/// body-less `RootedItems::new` there is the guard its caller holds.
+/// `ReturnAdt::leaf` for a body that opens a bracket and returns that guard.
+///
+/// `<Impl>::new` is not a unique path: several constructors in one module
+/// render the same way. The return ADT's own path tells them apart, and an
+/// importing crate sees that ADT on the body-less declaration.
+pub fn scope_owning_key(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+    let leaf = fd.item_meta.name_path();
+    let leaf = leaf.rsplit("::").next()?;
+    let adt_id = match &fd.signature.output {
+        TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id)?,
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v)?,
+    };
+    let adt = llbc.type_by_id(adt_id)?.item_meta.name_path();
+    Some(format!("{adt}::{leaf}"))
+}
+
+pub fn harvest_scope_owning_paths(llbc: &Llbc) -> Vec<String> {
+    let root_state = RootStackState::new(llbc);
+    let analyzer = RootStackAnalyzer::new(llbc, &root_state);
+    let mut owning: Vec<String> = llbc
+        .iter_local_fns()
+        .filter(|fd| fd.body.is_some() && analyzer.fn_returns_owned_scope(fd.def_id))
+        .filter_map(|fd| scope_owning_key(llbc, fd))
+        .collect();
+    owning.sort();
+    owning.dedup();
+    owning
+}
+
+/// Whether the body at `id` returns a root-bracket guard, including a
+/// body-less declaration answered from [`Llbc::scope_owning_constructor`].
+pub fn fn_returns_owned_scope(llbc: &Llbc, id: u64) -> bool {
+    let root_state = RootStackState::new(llbc);
+    let analyzer = RootStackAnalyzer::new(llbc, &root_state);
+    analyzer.fn_returns_owned_scope(id)
+}
+
 pub fn harvest_root_stack_touching_paths(llbc: &Llbc) -> Vec<String> {
     let root_state = RootStackState::new(llbc);
     let analyzer = RootStackAnalyzer::new(llbc, &root_state);

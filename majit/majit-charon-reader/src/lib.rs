@@ -96,6 +96,11 @@ pub struct Llbc {
     /// the bodies among them that can leave the shadow stack changed.
     /// Empty until the translator publishes them.
     root_stack_effects: parking_lot::RwLock<(Vec<String>, Vec<String>)>,
+    /// Paths of bodies that open a root bracket and return its guard inside
+    /// the result. Harvested from linked artefacts whose bodies are visible,
+    /// so an importing crate can answer `call_returns_owned_scope` for a
+    /// declaration Charon left body-less. Sorted. Empty until published.
+    scope_owning_constructors: parking_lot::RwLock<Vec<String>>,
     /// Dedup id of `register_eval_override`'s first parameter, resolved
     /// once from every `FunDecl` this artefact carries (local and
     /// external). `None` once the scan has finished without a match.
@@ -288,6 +293,7 @@ impl Llbc {
             foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
             eval_hook_graphs: parking_lot::RwLock::new(Vec::new()),
             root_stack_effects: parking_lot::RwLock::new((Vec::new(), Vec::new())),
+            scope_owning_constructors: parking_lot::RwLock::new(Vec::new()),
             eval_fn_type_id: std::sync::OnceLock::new(),
             trait_assoc_index: std::sync::OnceLock::new(),
             drop_impl_owners: std::sync::OnceLock::new(),
@@ -364,6 +370,22 @@ impl Llbc {
     /// Whether any other artefact's root-stack effects were published here.
     pub fn has_root_stack_effects(&self) -> bool {
         !self.root_stack_effects.read().0.is_empty()
+    }
+
+    /// Publish constructors harvested from linked artefacts that open a root
+    /// bracket and hand its guard back inside the value they return.
+    pub fn set_scope_owning_constructors(&self, mut paths: Vec<String>) {
+        paths.sort();
+        paths.dedup();
+        *self.scope_owning_constructors.write() = paths;
+    }
+
+    /// Whether `path` was published by [`Self::set_scope_owning_constructors`].
+    pub fn scope_owning_constructor(&self, path: &str) -> bool {
+        self.scope_owning_constructors
+            .read()
+            .binary_search_by(|p| p.as_str().cmp(path))
+            .is_ok()
     }
 
     /// Dedup id of `register_eval_override`'s parameter type.

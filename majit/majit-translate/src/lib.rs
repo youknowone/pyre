@@ -261,13 +261,16 @@ fn build_semantic_program_via_active_frontend(
             // published, so a call into one of them reads that body's answer.
             let mut root_stack_crates: Vec<String> = Vec::new();
             let mut root_stack_touching: Vec<String> = Vec::new();
+            let mut scope_owning_constructors: Vec<String> = Vec::new();
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 prof.mark(&format!("    harvest {p}"));
                 crate_names.push(llbc.crate_name().to_string());
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
+                llbc.set_scope_owning_constructors(scope_owning_constructors.clone());
                 root_stack_touching.extend(front::mir::harvest_root_stack_touching_paths(&llbc));
+                scope_owning_constructors.extend(front::mir::harvest_scope_owning_paths(&llbc));
                 root_stack_crates.push(llbc.crate_name().to_string());
                 discovered.extend(front::mir::discover_transparent_scalar_kinds(&llbc));
                 duplicate_leaf_facts.absorb(front::mir::DuplicateLeafFacts::discover(&llbc));
@@ -322,6 +325,7 @@ fn build_semantic_program_via_active_frontend(
                     llbc.set_eval_hook_graphs(eval_hook_graphs.clone());
                 }
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
+                llbc.set_scope_owning_constructors(scope_owning_constructors.clone());
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);
