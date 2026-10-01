@@ -10045,9 +10045,9 @@ impl<'a> Lowering<'a> {
         Ok(copies)
     }
 
-    /// Residual / `dont_look_inside` callees take the word. A caller that
-    /// already holds a cell unwraps `value` so the ABI is the pointer, then
-    /// writes the (possibly updated) word back.
+    /// Residual / `dont_look_inside` callees take the pointer word. A caller
+    /// that already holds a cell unwraps `value` and passes that pointer.
+    /// The callee writes through the pointer; it does not assign the word.
     fn unwrap_residual_gc_mut_ref(
         &mut self,
         mir_bb: usize,
@@ -10100,7 +10100,11 @@ impl<'a> Lowering<'a> {
         Ok(copies)
     }
 
-    fn copy_out_gc_mut_ref(&mut self, mir_bb: usize, copies: &[GcMutRefCopy]) {
+    fn copy_out_gc_mut_ref(
+        &mut self,
+        mir_bb: usize,
+        copies: &[GcMutRefCopy],
+    ) -> Result<(), LowerError> {
         for copy in copies {
             match copy {
                 GcMutRefCopy::Local { cell, root, local } => {
@@ -10110,18 +10114,21 @@ impl<'a> Lowering<'a> {
                 GcMutRefCopy::Place { cell, root, place } => {
                     let loaded = self.emit_gc_mut_ref_field_read(mir_bb, cell.clone(), root);
                     let PlaceKind::Projection(inner, elem) = &place.kind else {
-                        continue;
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: GC reference copy-out place is not a projection"
+                        )));
                     };
-                    let _ = self.emit_projection_write(
+                    self.emit_projection_write(
                         mir_bb,
                         clone_place(inner),
                         elem.clone(),
                         LinkArg::Value(loaded),
                         &place.ty,
-                    );
+                    )?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Parameters where the callee wants a raw address and the operand
@@ -20679,7 +20686,7 @@ impl<'a> Lowering<'a> {
             result: Some(result_var.clone()),
             kind: op_kind,
         });
-        self.copy_out_gc_mut_ref(mir_bb, &gc_mut_ref_copies);
+        self.copy_out_gc_mut_ref(mir_bb, &gc_mut_ref_copies)?;
         // Reload before `edge_args` so the successor sees the word the
         // callee wrote through the raw out-parameter.
         self.reload_raw_scalar_addresses(mir_bb, &raw_scalar_reloads)?;

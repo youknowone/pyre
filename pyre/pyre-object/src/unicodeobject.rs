@@ -857,15 +857,33 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
         }
     }
     let value = unsafe { w_str_get_wtf8(obj) }.to_owned();
+    // `w_weakref_new` collects. The weakref stores the forwarded target;
+    // this local does not, unless it sits on the shadow stack.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let slot = intern_store(obj);
-    let mut table = STRING_INTERN_TABLE.lock();
-    if let Some(existing) = table.get(&value).and_then(intern_slot_alive) {
-        return existing;
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let weak_slot = matches!(slot, InternSlot::Weak(_));
+    {
+        let mut table = STRING_INTERN_TABLE.lock();
+        if let Some(existing) = table.get(&value).and_then(intern_slot_alive) {
+            return existing;
+        }
+        if weak_slot {
+            INTERN_WEAK_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        table.insert(value, slot);
     }
-    if matches!(slot, InternSlot::Weak(_)) {
-        INTERN_WEAK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // The table object is old. A minor traces an old extra root's pointer,
+    // not its custom-trace children, unless the write barrier remembered it.
+    if weak_slot {
+        let table_obj = INTERN_TABLE_OBJ.load(Ordering::Acquire);
+        if table_obj != 0 {
+            crate::gc_hook::try_gc_write_barrier(table_obj as *mut u8);
+        }
     }
-    table.insert(value, slot);
     obj
 }
 
@@ -874,9 +892,8 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// [`intern_exact_str`] answers the same question for a caller that already
 /// holds an object. A miss from characters still allocates an immortal exact
-/// str. `newtext` is GC-managed upstream because `co_names_w` is a traced
-/// list (`pycode.py _immutable_fields_ co_names_w[*]`). This `co_names_w` is
-/// a host `Vec<AtomicPtr>`, so a managed miss is not forwarded.
+/// str. `newtext` is GC-managed upstream. A managed miss moves, and host
+/// tables still store `W_UnicodeObject.value` as their own key.
 #[majit_macros::dont_look_inside]
 pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
     {

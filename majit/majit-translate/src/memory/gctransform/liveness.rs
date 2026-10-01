@@ -865,7 +865,7 @@ fn direct_pinned_params(body: &HelperBodyFact) -> HashSet<usize> {
 fn call_is_collecting(name: &str) -> bool {
     crate::memory::gctransform::framework::COLLECTING_SEEDS
         .iter()
-        .any(|seed| name == *seed || name.ends_with(seed) || name.contains(seed))
+        .any(|seed| name == *seed || name.ends_with(&format!("::{seed}")))
 }
 
 /// Local 0 holds a pin result or a slot read, following single-assignment
@@ -904,20 +904,35 @@ fn collects_after_pin(body: &HelperBodyFact) -> bool {
         return false;
     }
     let n = body.block_calls.len();
-    let mut pin_blocks = Vec::new();
+    let mut stack = Vec::new();
     for (b, indices) in body.block_calls.iter().enumerate() {
+        let mut pin_at = None;
         for &i in indices {
             let name = &body.calls[i].callee_name;
             if is_pin_fn(name) || reads_root_slot(name) {
-                pin_blocks.push(b);
+                pin_at = Some(i);
                 break;
             }
         }
+        let Some(pin_at) = pin_at else {
+            continue;
+        };
+        for &i in indices {
+            if i <= pin_at {
+                continue;
+            }
+            let name = &body.calls[i].callee_name;
+            if call_is_collecting(name) && !is_pin_fn(name) && !reads_root_slot(name) {
+                return true;
+            }
+        }
+        if let Some(succ) = body.successors.get(b) {
+            stack.extend(succ.iter().copied());
+        }
     }
-    if pin_blocks.is_empty() {
+    if stack.is_empty() {
         return false;
     }
-    let mut stack = pin_blocks;
     let mut seen = vec![false; n];
     while let Some(b) = stack.pop() {
         if seen[b] {
