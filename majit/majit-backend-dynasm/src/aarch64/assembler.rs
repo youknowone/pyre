@@ -248,6 +248,8 @@ pub(crate) fn build_propagate_exception_path(
         ; str x17, [x16]
         ; mov x0, x29
         ; ldp x19, x20, [sp, #16]
+        ; ldp x21, x22, [sp, #32]
+        ; ldr d8, [sp, #56]
         ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
         ; ret
     );
@@ -640,10 +642,13 @@ pub struct AssemblerARM64<'a> {
     /// `_build_malloc_slowpath('fixed')` and used by both fixed-size and
     /// varsize-frame nursery probes.
     malloc_slowpath_fixed: usize,
+    /// Back-edge label, bound after `LoopPins`. `ll_loop_code` stays on
+    /// the entry so a bridge executes the pin moves.
+    pending_loop_hot: Option<DynamicLabel>,
 }
 
 /// How many `movz`/`movk` words `codebuilder.py gen_load_int` emits.
-fn imm_mov_count(val: i64) -> u32 {
+pub(crate) fn imm_mov_count(val: i64) -> u32 {
     if val < 0 {
         if val >= -65536 {
             return 1;
@@ -868,6 +873,7 @@ impl<'a> AssemblerARM64<'a> {
             gcref_table: Vec::new(),
             float_pool: Vec::new(),
             malloc_slowpath_fixed,
+            pending_loop_hot: None,
         }
     }
 
@@ -1443,6 +1449,13 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; stp x29, x30, [sp, -(CALL_FRAME_SIZE as i32)]!
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
+            // x21/x22 are outside all_regs. A loop parks wide integer
+            // immediates there. The overflow return already reloads this pair.
+            ; stp x21, x22, [sp, #32]
+            // d8 is outside all_vfp_regs. A loop parks one float immediate
+            // there so the body does not reload it. The byte at [sp,#56]
+            // sits above the thread-local slot.
+            ; str d8, [sp, #56]
             // assembler.py:1128-1129: spill the thread-local base the entry
             // received in x1, then take the jitframe out of x0.
             ; str x1, [sp, #SAVED_THREADLOCAL_OFS]
@@ -1496,6 +1509,7 @@ impl<'a> AssemblerARM64<'a> {
                 ; mov x0, x29
                 ; ldp x19, x20, [sp, #16]
                 ; ldp x21, x22, [sp, #32]
+                ; ldr d8, [sp, #56]
                 ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
                 ; ret
                 ; =>continue_label
@@ -1515,6 +1529,8 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mov x0, x29
             ; ldp x19, x20, [sp, #16]   // restore callee-saved regs
+            ; ldp x21, x22, [sp, #32]
+            ; ldr d8, [sp, #56]
             ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
             ; ret
         );
@@ -2271,7 +2287,22 @@ impl<'a> AssemblerARM64<'a> {
 
         // ── Emit code from regalloc decisions ──
         for ra_op in &ra_ops {
+            if let RegAllocOp::LoopPins { moves } = ra_op {
+                for (src, dst) in moves {
+                    self.regalloc_mov(src, dst);
+                }
+                if let Some(hot) = self.pending_loop_hot.take() {
+                    dynasm!(self.mc ; =>hot);
+                }
+                continue;
+            }
+            if let Some(hot) = self.pending_loop_hot.take() {
+                dynasm!(self.mc ; =>hot);
+            }
             match ra_op {
+                RegAllocOp::LoopPins { .. } => {
+                    continue;
+                }
                 RegAllocOp::Skip => {
                     // Dead operation — skip.
                     continue;
@@ -3522,6 +3553,8 @@ impl<'a> AssemblerARM64<'a> {
                     );
                 }
                 dynasm!(self.mc ; =>label);
+                let hot = self.mc.new_dynamic_label();
+                self.pending_loop_hot = Some(hot);
                 if let Some(descr) = label_descr {
                     let stored_arglocs = arglocs
                         .iter()
@@ -3537,7 +3570,7 @@ impl<'a> AssemblerARM64<'a> {
                     descr.set_target_arglocs(stored_arglocs);
                     descr.set_ll_loop_code(self.mc.offset().0);
                     if let Some(id) = loop_target_id(op) {
-                        self.target_tokens_currently_compiling.insert(id, label);
+                        self.target_tokens_currently_compiling.insert(id, hot);
                     }
                     if let Some(descr_ref) = op.getdescr() {
                         self.compiled_target_tokens.push(descr_ref.clone());
