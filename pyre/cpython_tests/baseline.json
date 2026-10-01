@@ -255,7 +255,7 @@
     },
     "test.test_complex": {
       "dynasm": "FAIL",
-      "reason": "descr__new__ matches PyPy: no complex-argument DeprecationWarning, an imag __complex__ is accepted, and TypeError text is unpackcomplex's"
+      "reason": "descr__new__ matches PyPy: no complex-argument DeprecationWarning, and an imag __complex__ is accepted"
     },
     "test.test_concurrent_futures": {
       "dynasm": "FAIL"

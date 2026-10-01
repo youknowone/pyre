@@ -25585,16 +25585,45 @@ fn complex_space_float(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
     crate::baseobjspace::float_w(obj)
 }
 
-fn complex_argument_type_error(obj: PyObjectRef, firstarg: bool) -> crate::PyError {
+/// Wording for a value that is not a complex component.
+///
+/// `Unpack` is `unpackcomplex` (`complex_coerce`, cmath): a quoted type name,
+/// "first argument" or "second argument". `bytes` and `str` stay
+/// `complex number expected`. `Constructor` is `complex()`: a lone positional
+/// says `argument must be a string or a number`, and `real` / `imag` say
+/// `argument '<slot>' must be a real number`, with the type name unquoted.
+#[derive(Clone, Copy)]
+enum ComplexArgError {
+    Unpack { firstarg: bool },
+    Constructor { slot: Option<&'static str> },
+}
+
+fn complex_argument_type_error(obj: PyObjectRef, style: ComplexArgError) -> crate::PyError {
     let name = crate::type_methods::arg_type_name(obj);
-    if firstarg {
-        crate::PyError::type_error(format!(
-            "complex() first argument must be a string or a number, not '{name}'"
-        ))
-    } else {
-        crate::PyError::type_error(format!(
-            "complex() second argument must be a number, not '{name}'"
-        ))
+    let msg = match style {
+        ComplexArgError::Unpack { firstarg: true } => {
+            format!("complex() first argument must be a string or a number, not '{name}'")
+        }
+        ComplexArgError::Unpack { firstarg: false } => {
+            format!("complex() second argument must be a number, not '{name}'")
+        }
+        ComplexArgError::Constructor { slot: None } => {
+            format!("complex() argument must be a string or a number, not {name}")
+        }
+        ComplexArgError::Constructor { slot: Some(slot) } => {
+            format!("complex() argument '{slot}' must be a real number, not {name}")
+        }
+    };
+    crate::PyError::type_error(msg)
+}
+
+fn complex_text_rejected(obj: PyObjectRef, style: ComplexArgError) -> crate::PyError {
+    match style {
+        ComplexArgError::Unpack { .. } => crate::PyError::type_error(format!(
+            "complex number expected, got '{}'",
+            crate::type_methods::arg_type_name(obj)
+        )),
+        ComplexArgError::Constructor { .. } => complex_argument_type_error(obj, style),
     }
 }
 
@@ -25602,7 +25631,7 @@ fn complex_argument_type_error(obj: PyObjectRef, firstarg: bool) -> crate::PyErr
 ///
 /// `complexobject.py unpackcomplex` with `firstarg=True`.
 pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
-    unpack_complex(obj, true)
+    unpack_complex(obj, ComplexArgError::Unpack { firstarg: true })
 }
 
 /// `complexobject.py unpackcomplex`.
@@ -25610,9 +25639,8 @@ pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
 /// An exact complex keeps both lanes. `__complex__` runs next. `__index__`
 /// (`space.index`, then `space.float` of that int) runs before a complex
 /// subclass's lanes and before `space.float`. `bytes` and `unicode` are
-/// rejected before that float. A `TypeError` from the float becomes the
-/// `firstarg` message.
-fn unpack_complex(obj: PyObjectRef, firstarg: bool) -> Result<(f64, f64), crate::PyError> {
+/// rejected before that float. A `TypeError` from the float becomes `style`.
+fn unpack_complex(obj: PyObjectRef, style: ComplexArgError) -> Result<(f64, f64), crate::PyError> {
     use pyre_object::*;
     unsafe {
         if is_exact_type(obj, &COMPLEX_TYPE) {
@@ -25657,15 +25685,12 @@ fn unpack_complex(obj: PyObjectRef, firstarg: bool) -> Result<(f64, f64), crate:
         }
     }
     if unsafe { is_str(obj) || pyre_object::is_bytes(obj) } {
-        return Err(crate::PyError::type_error(format!(
-            "complex number expected, got '{}'",
-            crate::type_methods::arg_type_name(obj)
-        )));
+        return Err(complex_text_rejected(obj, style));
     }
     match complex_space_float(obj) {
         Ok(value) => Ok((value, 0.0)),
         Err(error) if error.kind == crate::PyErrorKind::TypeError => {
-            Err(complex_argument_type_error(obj, firstarg))
+            Err(complex_argument_type_error(obj, style))
         }
         Err(error) => Err(error),
     }
@@ -25679,6 +25704,13 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     kwarg_reject_unknown(kwargs, &["real", "imag"], "complex")?;
     let w_real = resolve_pos_or_kw(pos.first().copied(), kwargs, "real", "complex", 1)?;
     let mut w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
+    // A lone positional stays unnamed. A keyword `real`, or any call that
+    // also passes `imag`, names the slot.
+    let real_error = if w_imag.is_some() || kwarg_get(kwargs, "real").is_some() {
+        ComplexArgError::Constructor { slot: Some("real") }
+    } else {
+        ComplexArgError::Constructor { slot: None }
+    };
 
     // `descr__new__`: no second argument and an exact complex real is that
     // object. A subclass constructor copies the lanes after this returns.
@@ -25689,23 +25721,25 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
         return Ok(a);
     }
 
-    // `descr__new__`: a text real is parsed, and a second argument is refused.
+    // `descr__new__`: a text real is parsed. A second argument is a TypeError
+    // that names `real`.
     if let Some(mut a) = w_real
         && unsafe { is_str(a) }
     {
         if w_imag.is_some() {
-            return Err(crate::PyError::type_error(
-                "complex() can't take second arg if first is a string",
-            ));
+            return Err(complex_argument_type_error(a, real_error));
         }
         // `unicode_to_decimal_w` runs before underscore removal and parsing,
         // including strict surrogate rejection.
         let s = pyre_object::with_roots!(a => unicode_to_decimal_w(a))?;
-        // `_remove_underscores` and a failed parse both raise this.
+        // An underscore that is not between digits keeps the original repr.
+        // A later parse failure is `complex() arg is a malformed string`.
         let Some(cleaned) = strip_numeric_underscores(&s) else {
-            return Err(crate::PyError::value_error(
-                "complex() arg is a malformed string",
-            ));
+            let source_repr = unsafe { crate::display::py_repr_wtf8(a)? };
+            return Err(crate::PyError::value_error(crate::display::wtf8_format!(
+                "could not convert string to complex: ",
+                source_repr
+            )));
         };
         let (r, i) = parse_complex_str(&cleaned).ok_or_else(|| {
             crate::PyError::new(
@@ -25720,7 +25754,7 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             let has_imag = w_imag.is_some();
             let imag_roots = pyre_object::gc_roots::push_roots();
             let imag_slot = imag_roots.pin_roots(&[w_imag.unwrap_or(pyre_object::PY_NULL)]);
-            let value = pyre_object::with_roots!(a => unpack_complex(a, true))?;
+            let value = pyre_object::with_roots!(a => unpack_complex(a, real_error))?;
             w_imag = has_imag.then(|| imag_roots.get(imag_slot));
             drop(imag_roots);
             value
@@ -25728,7 +25762,10 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
         None => (0.0, 0.0),
     };
     if let Some(mut b) = w_imag {
-        let (br, bi) = pyre_object::with_roots!(b => unpack_complex(b, false))?;
+        let (br, bi) = pyre_object::with_roots!(b => unpack_complex(
+            b,
+            ComplexArgError::Constructor { slot: Some("imag") }
+        ))?;
         // `descr__new__` subtracts a nonzero imaginary lane, then adds the
         // other real lane onto a nonzero imaginary lane or else assigns it.
         // `-0.0 != 0.0` is false, so a negative zero is assigned.
@@ -26933,21 +26970,63 @@ mod tests {
         let err = builtin_complex(&[w_none()]).unwrap_err();
         assert_eq!(
             err.message_text(),
-            "complex() first argument must be a string or a number, not 'NoneType'"
+            "complex() argument must be a string or a number, not NoneType"
         );
         let err = builtin_complex(&[w_int_new(0), w_none()]).unwrap_err();
         assert_eq!(
             err.message_text(),
-            "complex() second argument must be a number, not 'NoneType'"
+            "complex() argument 'imag' must be a real number, not NoneType"
         );
         let err = builtin_complex(&[w_str_new("1"), w_int_new(0)]).unwrap_err();
         assert_eq!(
             err.message_text(),
-            "complex() can't take second arg if first is a string"
+            "complex() argument 'real' must be a real number, not str"
+        );
+        let err = builtin_complex(&[pyre_object::dictmultiobject::w_dict_new()]).unwrap_err();
+        assert_eq!(
+            err.message_text(),
+            "complex() argument must be a string or a number, not dict"
+        );
+        let err = builtin_complex(&[w_int_new(0), pyre_object::dictmultiobject::w_dict_new()])
+            .unwrap_err();
+        assert_eq!(
+            err.message_text(),
+            "complex() argument 'imag' must be a real number, not dict"
+        );
+        let named_real = pyre_object::dictmultiobject::w_dict_new();
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                named_real,
+                "__pyre_kw__",
+                pyre_object::kw_marker::w_kw_marker_sentinel(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                named_real,
+                "real",
+                pyre_object::dictmultiobject::w_dict_new(),
+            );
+        }
+        let err = builtin_complex(&[named_real]).unwrap_err();
+        assert_eq!(
+            err.message_text(),
+            "complex() argument 'real' must be a real number, not dict"
         );
         let bytes = pyre_object::bytesobject::w_bytes_from_bytes(b"1");
         let err = builtin_complex(&[bytes]).unwrap_err();
-        assert_eq!(err.message_text(), "complex number expected, got 'bytes'");
+        assert_eq!(
+            err.message_text(),
+            "complex() argument must be a string or a number, not bytes"
+        );
+        let coerced = complex_coerce(pyre_object::dictmultiobject::w_dict_new()).unwrap_err();
+        assert_eq!(
+            coerced.message_text(),
+            "complex() first argument must be a string or a number, not 'dict'"
+        );
+        let coerced_bytes = complex_coerce(bytes).unwrap_err();
+        assert_eq!(
+            coerced_bytes.message_text(),
+            "complex number expected, got 'bytes'"
+        );
 
         let with_complex = crate::typedef::make_builtin_type("WithComplexForImag", |ns| unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -27018,18 +27097,24 @@ mod tests {
         let malformed = builtin_complex(&[w_str_new("1__0")]).unwrap_err();
         assert_eq!(
             malformed.message_text(),
+            "could not convert string to complex: '1__0'"
+        );
+        let empty = builtin_complex(&[w_str_new("")]).unwrap_err();
+        assert_eq!(empty.message_text(), "complex() arg is a malformed string");
+        let kept_underscore = builtin_complex(&[w_str_new("1_2+")]).unwrap_err();
+        assert_eq!(
+            kept_underscore.message_text(),
             "complex() arg is a malformed string"
         );
 
         let assigned = crate::baseobjspace::setattr(z, w_str_new("real"), w_float_new(0.0));
-        assert_eq!(
-            assigned.unwrap_err().message_text(),
-            "readonly attribute 'real'"
-        );
+        assert_eq!(assigned.unwrap_err().message_text(), "readonly attribute");
         let deleted = crate::baseobjspace::delattr(z, w_str_new("real"));
+        assert_eq!(deleted.unwrap_err().message_text(), "readonly attribute");
+        let deleted_imag = crate::baseobjspace::delattr(z, w_str_new("imag"));
         assert_eq!(
-            deleted.unwrap_err().message_text(),
-            "cannot delete 'real' attribute of immutable type '?'"
+            deleted_imag.unwrap_err().message_text(),
+            "readonly attribute"
         );
         let descr = unsafe { crate::baseobjspace::lookup(z, "real") }.unwrap();
         let mismatch =

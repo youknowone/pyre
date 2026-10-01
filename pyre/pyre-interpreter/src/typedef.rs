@@ -2223,27 +2223,9 @@ fn complex_imag_property_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     complex_lane_property_get(args, true)
 }
 
-/// `GetSetProperty.readonly_attribute` for a named descriptor.
-fn complex_real_property_set(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Err(crate::PyError::attribute_error("readonly attribute 'real'"))
-}
-
-fn complex_imag_property_set(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Err(crate::PyError::attribute_error("readonly attribute 'imag'"))
-}
-
-/// `descr_property_del` with no `fdel`: `%N` is `getname`, which is `?`
-/// when the instance has no `__name__`.
-fn complex_real_property_del(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Err(crate::PyError::attribute_error(
-        "cannot delete 'real' attribute of immutable type '?'",
-    ))
-}
-
-fn complex_imag_property_del(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Err(crate::PyError::attribute_error(
-        "cannot delete 'imag' attribute of immutable type '?'",
-    ))
+/// Assignment and deletion of `real` / `imag` both raise this.
+fn complex_lane_readonly(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::attribute_error("readonly attribute"))
 }
 
 /// `complexobject.py complexwprop` fget: `space.newfloat` of the named lane.
@@ -2276,20 +2258,16 @@ fn patch_complex_realimag_descriptors() {
     if complex_type.is_null() || !crate::type_dict_has_storage(complex_type) {
         return;
     }
-    for (name, doc, getter, setter, deleter) in [
+    for (name, doc, getter) in [
         (
             "real",
             "the real part of a complex number",
             complex_real_property_get as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
-            complex_real_property_set as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
-            complex_real_property_del as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
         ),
         (
             "imag",
             "the imaginary part of a complex number",
             complex_imag_property_get,
-            complex_imag_property_set,
-            complex_imag_property_del,
         ),
     ] {
         crate::type_dict_store(
@@ -2297,8 +2275,8 @@ fn patch_complex_realimag_descriptors() {
             name,
             make_getset_property_full(
                 make_builtin_function_with_arity(name, getter, 2),
-                make_builtin_function_with_arity(name, setter, 3),
-                make_builtin_function_with_arity(name, deleter, 2),
+                make_builtin_function_with_arity(name, complex_lane_readonly, 3),
+                make_builtin_function_with_arity(name, complex_lane_readonly, 2),
                 pyre_object::w_str_new(doc),
                 complex_type,
                 Some(name),
