@@ -701,6 +701,27 @@ pub trait Repr: Debug + std::any::Any {
         None
     }
 
+    /// RPython `FunctionReprBase.get_s_signatures(self, shape)` (rpbc.py).
+    ///
+    /// `rtype_hlinvoke` calls this on the `Repr` returned by
+    /// `get_r_implfunc`. The default is the missing-method failure;
+    /// `FunctionRepr` forwards to `FunctionReprBase`.
+    fn get_s_signatures(
+        &self,
+        _shape: &crate::flowspace::argument::CallShape,
+    ) -> Result<
+        Vec<(
+            Vec<crate::annotator::model::SomeValue>,
+            crate::annotator::model::SomeValue,
+        )>,
+        TyperError,
+    > {
+        Err(TyperError::message(format!(
+            "{} has no get_s_signatures",
+            self.repr_string()
+        )))
+    }
+
     /// RPython `Repr.convert_const(self, value)` (`rmodel.py`).
     ///
     /// ```python

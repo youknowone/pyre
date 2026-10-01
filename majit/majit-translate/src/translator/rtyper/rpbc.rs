@@ -2002,6 +2002,19 @@ impl Repr for FunctionRepr {
         Some(&self.base.s_pbc)
     }
 
+    fn get_s_signatures(
+        &self,
+        shape: &crate::flowspace::argument::CallShape,
+    ) -> Result<
+        Vec<(
+            Vec<crate::annotator::model::SomeValue>,
+            crate::annotator::model::SomeValue,
+        )>,
+        TyperError,
+    > {
+        self.base.get_s_signatures(shape)
+    }
+
     /// RPython `FunctionRepr.convert_desc(self, funcdesc)`
     /// (rpbc.py):
     ///
@@ -2326,6 +2339,19 @@ impl Repr for FunctionsPBCRepr {
     /// supply `subset_of=r_func.s_pbc` when narrowing per-call SomePBC.
     fn pbc_s_pbc(&self) -> Option<&SomePBC> {
         Some(&self.base.s_pbc)
+    }
+
+    fn get_s_signatures(
+        &self,
+        shape: &crate::flowspace::argument::CallShape,
+    ) -> Result<
+        Vec<(
+            Vec<crate::annotator::model::SomeValue>,
+            crate::annotator::model::SomeValue,
+        )>,
+        TyperError,
+    > {
+        self.base.get_s_signatures(shape)
     }
 
     /// RPython `FunctionsPBCRepr.convert_desc(self, funcdesc)`
@@ -3575,6 +3601,19 @@ impl Repr for SmallFunctionSetPBCRepr {
     /// SmallFunctionSetPBCRepr.
     fn pbc_s_pbc(&self) -> Option<&SomePBC> {
         Some(&self.base.s_pbc)
+    }
+
+    fn get_s_signatures(
+        &self,
+        shape: &crate::flowspace::argument::CallShape,
+    ) -> Result<
+        Vec<(
+            Vec<crate::annotator::model::SomeValue>,
+            crate::annotator::model::SomeValue,
+        )>,
+        TyperError,
+    > {
+        self.base.get_s_signatures(shape)
     }
 
     /// RPython `SmallFunctionSetPBCRepr._setup_repr(self)`
