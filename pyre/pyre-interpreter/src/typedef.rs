@@ -6281,10 +6281,34 @@ fn iterable_uses_base_iter(obj: PyObjectRef, base_type: &pyre_object::PyType) ->
     if std::ptr::eq(obj_type.as_ptr() as *const _, base as *const _) {
         return true;
     }
-    let obj_iter = unsafe { crate::baseobjspace::lookup_in_type(obj_type.as_ptr(), "__iter__") };
-    let base_iter = unsafe { crate::baseobjspace::lookup_in_type(base, "__iter__") };
-    match (obj_iter, base_iter) {
-        (Some(a), Some(b)) => std::ptr::eq(a, b),
+    // `lookup_in_type` can collect. `base` is live across the first call
+    // and the descriptor it returns is live across the second. The pinned
+    // words are read back from their slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(base);
+    let obj_iter_slot = {
+        let obj_iter =
+            unsafe { crate::baseobjspace::lookup_in_type(obj_type.as_ptr(), "__iter__") };
+        match obj_iter {
+            Some(found) => {
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(found);
+                Some(slot)
+            }
+            None => None,
+        }
+    };
+    let base_iter = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            pyre_object::gc_roots::shadow_stack_get(base_slot),
+            "__iter__",
+        )
+    };
+    match (obj_iter_slot, base_iter) {
+        (Some(slot), Some(found_base)) => {
+            std::ptr::eq(pyre_object::gc_roots::shadow_stack_get(slot), found_base)
+        }
         _ => false,
     }
 }

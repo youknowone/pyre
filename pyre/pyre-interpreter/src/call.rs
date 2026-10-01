@@ -5325,9 +5325,20 @@ fn call_metaclass_with_kwargs(
                 call_args.push(*v);
                 names.push(*k);
             }
+            // `resolve_kwargs` reaches `store_collected_keyword`. The slot
+            // is the live word; this pin's argument is not read again.
+            let new_fn_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(new_fn);
             let kwarg_names = pyre_object::w_tuple_new(names);
-            match resolve_kwargs(new_fn, &call_args, kwarg_names) {
-                Ok(resolved) => call_user_function_resolved_frameless(new_fn, &resolved),
+            match resolve_kwargs(
+                pyre_object::gc_roots::shadow_stack_get(new_fn_slot),
+                &call_args,
+                kwarg_names,
+            ) {
+                Ok(resolved) => call_user_function_resolved_frameless(
+                    pyre_object::gc_roots::shadow_stack_get(new_fn_slot),
+                    &resolved,
+                ),
                 Err(e) => {
                     set_call_error(e);
                     PY_NULL
@@ -5385,10 +5396,21 @@ fn call_metaclass_with_kwargs(
                 call_args.push(*v);
                 names.push(*k);
             }
+            // Same slot discipline as `__new__`: `init_fn` is not read again
+            // after the pin.
+            let init_fn_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(init_fn);
             let kwarg_names = pyre_object::w_tuple_new(names);
-            match resolve_kwargs(init_fn, &call_args, kwarg_names) {
+            match resolve_kwargs(
+                pyre_object::gc_roots::shadow_stack_get(init_fn_slot),
+                &call_args,
+                kwarg_names,
+            ) {
                 Ok(resolved) => {
-                    let res = call_user_function_resolved_frameless(init_fn, &resolved);
+                    let res = call_user_function_resolved_frameless(
+                        pyre_object::gc_roots::shadow_stack_get(init_fn_slot),
+                        &resolved,
+                    );
                     if res.is_null() {
                         return PY_NULL;
                     }
