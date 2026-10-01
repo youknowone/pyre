@@ -6778,8 +6778,8 @@ struct IndexElemAlias {
 ///
 /// `getinteriorfield` (`rewrite_op_getinteriorfield`) addresses
 /// `entries[index].field` from the GcArray object. The descr adds
-/// `gc_typed_array_items_base`, so the base is that object, not the item
-/// pointer `entries_item_ptr` / `entry_ptr` return.
+/// `get_array_token`'s items offset (`array_items_base`), so the base is
+/// that object, not the item pointer `entries_item_ptr` / `entry_ptr` return.
 #[derive(Clone)]
 enum InteriorHeader {
     /// The add base is already the array object, or `entries_item_ptr`'s
@@ -8859,8 +8859,8 @@ impl<'a> Lowering<'a> {
     /// `FieldRead entries` descriptor for an `entry_ptr` receiver.
     ///
     /// The field is looked up by name on the struct, not taken as index 0.
-    /// `resolve_adt_field` peels `&RDict`, so the result is the `*mut Entry`
-    /// header `getinteriorfield` adds `gc_typed_array_items_base` to.
+    /// `resolve_adt_field` peels `&RDict`, so the result is the `*mut
+    /// GcEntries` header `getinteriorfield` adds `array_items_base` to.
     fn entries_field_descriptor(&self, recv_ty: &TyRef) -> Option<(FieldDescriptor, ValueType)> {
         let index = struct_field_index_named(recv_ty, self.llbc, "entries")?;
         let payload = serde_json::json!([null, index]);
@@ -32318,7 +32318,7 @@ fn struct_field_index_named(ty: &TyRef, llbc: &Llbc, name: &str) -> Option<usize
 ///
 /// `get_array_descr` keys one ARRAY lltype, and `nolength` is a property of
 /// that lltype. `interiorfielddescrof_keyed` mints the length-prefixed
-/// shape (`!nolength`, items at `gc_typed_array_items_base`). A `[T]`
+/// shape (`!nolength`, items at `array_items_base`). A `[T]`
 /// spelling is an item run (`nolength_from_array_type_id`), so it cannot
 /// share an atid with that mint. `GcArray<T>` stays length-prefixed and
 /// `extract_element_type_from_str` still peels it to `T`.
@@ -71185,7 +71185,7 @@ mod tests {
     }
 
     /// `entry_ptr(&dict).add(i)` recovers the `entries` header.
-    /// `getinteriorfield` adds `gc_typed_array_items_base`, so the interior
+    /// `getinteriorfield` adds `array_items_base`, so the interior
     /// base is that `FieldRead`, not the item pointer the call returns.
     /// `prune_dead_phis` drops an unread item-pointer phi; the lock is that
     /// the interior base is the field-read result and not an inputarg.

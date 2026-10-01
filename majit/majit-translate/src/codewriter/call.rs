@@ -3504,16 +3504,16 @@ impl CallControl {
     }
 
     /// Byte offset of the first item of a `GcTypedArray` — the flat
-    /// `{ len: usize, items: [u8; 0] }` block the guard-resume / blackhole
-    /// materialiser (`allocate_array_struct`) produces and that interior-field
-    /// struct arrays address. Its items always begin at
-    /// `GC_TYPED_ARRAY_ITEMS_OFFSET`, the bare length word, regardless of the
-    /// element's alignment — the opposite of [`Self::array_items_base`], whose
-    /// unboxed `i64` / `f64` list storage (`TypedItemsBlock`) is element-aligned.
-    /// The two coincide on a 64-bit word and diverge on a 32-bit one, where an
-    /// 8-byte element rounds past the 4-byte word: routing a struct array
-    /// through the element-aligned rule would stride its materialised block a
-    /// half-word late.
+    /// `{ len: usize, items: [u8; 0] }` block `allocate_array_struct`
+    /// produces. Items begin at `GC_TYPED_ARRAY_ITEMS_OFFSET`, the bare
+    /// length word, whatever the element's alignment.
+    /// `setinteriorfield` adds this offset itself.
+    ///
+    /// A length-prefixed `GcArray<T>` descr does not use this helper.
+    /// `get_interiorfield_descr` calls `get_array_descr` (`descr.py`), and
+    /// `symbolic.get_array_token` places items at [`Self::array_items_base`]:
+    /// the length word rounded up to `T`'s alignment. That is where
+    /// `GcEntries.items` sits (`length: usize`, then `[Entry; 0]`).
     fn gc_typed_array_items_base(&self) -> usize {
         self.array_header_size
     }
@@ -4406,7 +4406,15 @@ impl CallControl {
                 }
                 let field_descr = found?;
                 let item_size = compute_struct_size(self, &elem_name);
-                let base_size = self.gc_typed_array_items_base();
+                // `get_interiorfield_descr` (`descr.py`) builds on
+                // `get_array_descr`, so this mint and `arraydescrof_concrete`
+                // share one basesize: `symbolic.get_array_token`'s items
+                // offset. `array_items_base` is that offset. `GcEntries`
+                // places `[Entry; 0]` there, and `Entry.f_hash` (`u64`)
+                // rounds a 4-byte length word up to 8. `get_array_descr`
+                // keys the cache on the atid alone.
+                let base_size =
+                    self.array_items_base(self.array_header_size, Some(&elem_name), item_size);
                 let array_id = majit_ir::descr::path_hash(array_str);
                 let member = majit_ir::effectinfo::DescrSetMember::InteriorField {
                     array_id,
@@ -11396,15 +11404,14 @@ mod tests {
         assert_eq!(cc.array_items_base(4, Some("u8"), 1), 4);
     }
 
-    /// The two runtime typed-array blocks disagree on where items start, and a
-    /// descr's base must match the block it addresses. `TypedItemsBlock`
-    /// (unboxed list int/float storage) is element-aligned via
-    /// [`CallControl::array_items_base`]; `GcTypedArray` (the resume/blackhole
-    /// materialiser and interior-field struct arrays) is flat at the length
-    /// word via [`CallControl::gc_typed_array_items_base`]. The rules coincide
-    /// on a 64-bit word and part ways on a 32-bit one — the C5 regression was
-    /// routing a struct array through the element-aligned rule, invisible to a
-    /// host-only assertion because both land on 8 here.
+    /// The two runtime blocks disagree on where items start. `TypedItemsBlock`
+    /// (unboxed list int/float storage) and a length-prefixed `GcArray<T>`
+    /// descr are element-aligned via [`CallControl::array_items_base`].
+    /// `GcTypedArray` (the resume/blackhole materialiser) is flat at the
+    /// length word via [`CallControl::gc_typed_array_items_base`]. The rules
+    /// coincide on a 64-bit word and part ways on a 32-bit one, where an
+    /// 8-byte element rounds past the 4-byte word. A host-only comparison of
+    /// the two helpers at `target_word_size()` cannot see that split.
     #[test]
     fn typed_block_and_gc_typed_array_bases_diverge_on_a_narrow_word() {
         let cc = CallControl::new();
@@ -11423,6 +11430,57 @@ mod tests {
         // stays flat at 4.
         assert_eq!(cc.array_items_base(4, Some("i64"), 8), 8);
         assert_ne!(cc.array_items_base(4, Some("i64"), 8), 4);
+    }
+
+    /// `get_interiorfield_descr` and `get_array_descr` (`descr.py`) share one
+    /// basesize. With a 4-byte length word, an `Entry` whose widest field is
+    /// `u64` starts at 8 (`array_items_base`). Minting the interior descr
+    /// first is the `effectinfo.py` order (`add_interiorfield`, then the
+    /// synthesized array effect); both must agree or `get_array_descr`
+    /// rejects the shared atid.
+    #[test]
+    fn interiorfield_base_matches_arraydescrof_on_a_narrow_word() {
+        use majit_ir::value::Type;
+
+        let elem = "overaligned_entry::Entry";
+        let atid = format!("GcArray<{elem}>");
+        let sid = majit_ir::descr::StructId::from_canonical(elem);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (elem.to_string(), Some(sid)),
+            ]));
+        let layout = StructLayout::from_type_strings(
+            &[("f_hash".into(), "u64".into())],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(layout.fields[0].size, 8);
+
+        let mut cc = CallControl::new();
+        cc.array_header_size = 4;
+        cc.set_known_struct_names(std::collections::HashSet::from([elem.to_string()]));
+        let mut rows = crate::front::StructFieldRegistry::default();
+        rows.fields
+            .insert(elem.to_string(), vec![("f_hash".into(), "u64".into())]);
+        cc.set_struct_fields(rows);
+        cc.set_struct_layout(sid, layout);
+
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid.clone()), "f_hash")
+            .expect("interior field descr");
+        let interior = descr.as_interior_field_descr().expect("InteriorFieldDescr");
+        assert_eq!(interior.array_descr().base_size(), 8);
+        assert_eq!(
+            cc.array_items_base(4, Some(elem), interior.array_descr().item_size()),
+            8
+        );
+
+        let array = cc.arraydescrof(2, &Some(atid), Type::Ref, Some(0));
+        let array = array.as_array_descr().expect("ArrayDescr");
+        assert_eq!(array.base_size(), 8);
+        assert_eq!(array.len_descr().map(|fd| fd.offset()), Some(0));
     }
 
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the
