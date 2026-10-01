@@ -457,11 +457,12 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
             {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
     );
+    let params = vec![flag.clone(), sink_param.clone()];
     let sink = fun(
         1,
         &["probe", "sink_pair"],
-        vec![flag, sink_param.clone()],
-        json!("Opaque"),
+        params.clone(),
+        idle_body(&ret, &params),
     );
     let file = json!({"charon_version": "0.1.201", "has_errors": false, "translated": {
         "crate_name": "probe", "type_decls": [], "fun_decls": [caller, sink],
@@ -957,11 +958,12 @@ fn lower_two_borrows(alias: BorrowAlias) -> FunctionGraph {
             {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
     );
+    let params = vec![ptr.clone(), ptr.clone()];
     let sink = fun(
         1,
         &["probe", "sink_pair"],
-        vec![ptr.clone(), ptr],
-        json!("Opaque"),
+        params.clone(),
+        idle_body(&ret, &params),
     );
     probe_graph(json!([]), json!([caller, sink]), "write_hash")
 }
@@ -1166,11 +1168,12 @@ fn lower_field_out() -> FunctionGraph {
             {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
     );
+    let params = vec![raw_ptr(&word, "Mut")];
     let sink = fun(
         1,
         &["probe", "sink_pair"],
-        vec![raw_ptr(&word, "Mut")],
-        json!("Opaque"),
+        params.clone(),
+        idle_body(&ret, &params),
     );
     probe_graph(json!([pair_decl]), json!([caller, sink]), "write_hash")
 }
@@ -1296,7 +1299,7 @@ fn lower_returned_address_with(
     extra_decls: &[Value],
     carrier_path: Option<&str>,
 ) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
-    lower_returned_address_sink(result_ty, extra_decls, carrier_path, None)
+    lower_returned_address_sink(result_ty, extra_decls, carrier_path, None, &[])
 }
 
 fn lower_returned_address_sink(
@@ -1304,6 +1307,7 @@ fn lower_returned_address_sink(
     extra_decls: &[Value],
     carrier_path: Option<&str>,
     sink_body: Option<&Value>,
+    extra_funs: &[Value],
 ) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
     let (span, generics, meta, local) = probe_parts();
     let word = i64_ty();
@@ -1350,8 +1354,12 @@ fn lower_returned_address_sink(
         &["probe", "sink_pair"],
         vec![ptr.clone()],
         result_ty,
-        sink_body.cloned().unwrap_or_else(|| json!("Opaque")),
+        sink_body
+            .cloned()
+            .unwrap_or_else(|| idle_body(result_ty, &[ptr.clone()])),
     );
+    let mut fun_decls = vec![caller, sink];
+    fun_decls.extend(extra_funs.iter().cloned());
     let mut type_decls = vec![json!({
         "def_id": 0,
         "item_meta": meta(&["core", "option", "Option"]),
@@ -1365,7 +1373,7 @@ fn lower_returned_address_sink(
         "translated": {
             "crate_name": "probe",
             "type_decls": type_decls,
-            "fun_decls": [caller, sink],
+            "fun_decls": fun_decls,
             "global_decls": [],
             "trait_decls": [],
             "trait_impls": []
@@ -1734,14 +1742,14 @@ fn assign_scalar_cast(dest: u64, src: u64, src_ty: &Value, dest_ty: &Value) -> V
 }
 
 fn assert_sink_escapes(result_ty: &Value, sink_body: &Value) {
-    let err = lower_returned_address_sink(result_ty, &[], None, Some(sink_body))
+    let err = lower_returned_address_sink(result_ty, &[], None, Some(sink_body), &[])
         .expect_err("a returned spill address must not lower");
     let msg = err.to_string();
     assert!(msg.contains("spill address would escape"), "{msg}");
 }
 
 fn assert_sink_frees(result_ty: &Value, sink_body: &Value) {
-    let graph = lower_returned_address_sink(result_ty, &[], None, Some(sink_body))
+    let graph = lower_returned_address_sink(result_ty, &[], None, Some(sink_body), &[])
         .unwrap_or_else(|err| panic!("a status result must still free the spill: {err}"));
     assert!(
         ops(&graph).any(|op| matches!(op.kind, OpKind::RawMalloc { .. })),
@@ -1811,29 +1819,102 @@ fn callee_body_that_does_not_return_the_address_still_frees() {
     assert_sink_frees(&word, &body);
 }
 
+fn idle_body(output: &Value, inputs: &[Value]) -> Value {
+    let (span, _, _, local) = probe_parts();
+    let mut locals = vec![local(0, None, output)];
+    for (index, ty) in inputs.iter().enumerate() {
+        locals.push(local((index + 1) as u64, None, ty));
+    }
+    json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": inputs.len() as u64, "locals": locals},
+        "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}}]
+    }})
+}
+
+fn probe_fun(id: u64, name: &[&str], inputs: Vec<Value>, output: &Value, body: Value) -> Value {
+    let (_, _, meta, _) = probe_parts();
+    json!({
+        "def_id": id,
+        "item_meta": meta(name),
+        "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+        "body": body
+    })
+}
+
+fn call_into_return(result: &Value, ptr: &Value, callee: u64) -> Value {
+    let (span, generics, _, _) = probe_parts();
+    let mut body = sink_unstructured(result, ptr, vec![]);
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": callee}, "generics": generics}},
+                "args": [{"Move": place(1, ptr)}], "dest": place(0, result)},
+            "target": 1, "on_unwind": 2
+        }}}},
+        {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    body
+}
+
+fn assign_binop(op: &str, src_ty: &Value) -> Value {
+    let (span, _, _, _) = probe_parts();
+    let word = i64_ty();
+    json!({"span": span, "kind": {"Assign": [
+        place(0, &word),
+        {"BinaryOp": [op, {"Copy": place(1, src_ty)}, {"Const": null}]}
+    ]}})
+}
+
 #[test]
 fn status_from_a_call_still_frees_the_spill() {
-    let (span, generics, _, local) = probe_parts();
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");
-    let mut body = sink_unstructured(&word, &ptr, vec![]);
-    body["Unstructured"]["locals"]["locals"]
-        .as_array_mut()
-        .expect("locals")
-        .push(local(2, Some("status"), &word));
-    let blocks = body["Unstructured"]["body"].as_array_mut().expect("blocks");
-    blocks.insert(
-        0,
-        json!({"statements": [], "terminator": {"span": span, "kind": {"Call": {
-            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
-                "args": [{"Move": place(1, &ptr)}], "dest": place(2, &word)},
-            "target": 1, "on_unwind": 2
-        }}}}),
+    let body = call_into_return(&word, &ptr, 2);
+    let helper = probe_fun(
+        2,
+        &["probe", "write_narrowed"],
+        vec![ptr.clone()],
+        &word,
+        idle_body(&word, &[ptr]),
     );
-    blocks[1]["statements"] = json!([{"span": span, "kind": {"Assign": [
-        place(0, &word),
-        {"Use": [{"Copy": place(2, &word)}, "Yes"]}
-    ]}}]);
-    blocks.push(json!({"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}));
-    assert_sink_frees(&word, &body);
+    let graph = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
+        .unwrap_or_else(|err| panic!("a status result must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn opaque_scalar_result_is_not_lowered() {
+    let body = json!("Opaque");
+    assert_sink_escapes(&u64_ty(), &body);
+}
+
+#[test]
+fn call_of_opaque_into_the_return_slot_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let result = u64_ty();
+    let body = call_into_return(&result, &ptr, 2);
+    let expose = probe_fun(2, &["probe", "expose"], vec![ptr], &result, json!("Opaque"));
+    let err = lower_returned_address_sink(&result, &[], None, Some(&body), &[expose])
+        .expect_err("a call that may return the address must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn pointer_comparison_still_frees_the_spill() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let body = sink_unstructured(&i64_ty(), &ptr, vec![assign_binop("Eq", &ptr)]);
+    assert_sink_frees(&i64_ty(), &body);
+}
+
+#[test]
+fn pointer_bitand_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let body = sink_unstructured(&i64_ty(), &ptr, vec![assign_binop("BitAnd", &ptr)]);
+    assert_sink_escapes(&i64_ty(), &body);
 }

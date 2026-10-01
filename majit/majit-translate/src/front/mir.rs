@@ -10380,7 +10380,9 @@ impl<'a> Lowering<'a> {
     /// replaced through the types nested inside that field.
     /// `PhantomData<T>` has no such field. A `TypeVar` with no argument
     /// stays unclassified. A callee that casts this address into its
-    /// return slot returns the same bits as an integer.
+    /// return slot returns the same bits as an integer, and so does a
+    /// callee with no body and a call whose callee returns those bits.
+    /// A comparison is a status.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -38140,17 +38142,50 @@ fn substitute_spill_value(
 /// The callee returns the spill address as a scalar. `p as usize` is a
 /// cast of the pointer parameter into the return slot, and
 /// `usize as *const i64` reads those bits back (`getkind` banks a raw
-/// `Ptr` as `int`). A status word assigned from somewhere else, and an
-/// opaque body with no cast to follow, stay a scalar result.
+/// `Ptr` as `int`). A comparison such as `p == null` is a status.
+/// A call writes that address when its callee returns it. A callee
+/// with no unstructured body can return the bits, so that call stays
+/// unlowered.
 fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBorrowSpill]) -> bool {
-    let Some(body) = llbc.fn_by_id(fun_id).and_then(FunDecl::unstructured) else {
-        return false;
-    };
-    let mut carrying: Vec<u64> = spills
+    let entry: Vec<u64> = spills
         .iter()
         .filter(|spill| spill.fun_id == fun_id)
         .map(|spill| spill.index as u64 + 1)
         .collect();
+    if entry.is_empty() {
+        return false;
+    }
+    function_returns_spill_address(llbc, fun_id, &entry, &mut Vec::new())
+}
+
+fn function_returns_spill_address(
+    llbc: &Llbc,
+    fun_id: u64,
+    entry: &[u64],
+    stack: &mut Vec<u64>,
+) -> bool {
+    if stack.contains(&fun_id) {
+        return true;
+    }
+    let Some(fd) = llbc.fn_by_id(fun_id) else {
+        return true;
+    };
+    let Some(body) = fd.unstructured() else {
+        return true;
+    };
+    stack.push(fun_id);
+    let escapes = unstructured_returns_spill_address(llbc, &body, entry, stack);
+    stack.pop();
+    escapes
+}
+
+fn unstructured_returns_spill_address(
+    llbc: &Llbc,
+    body: &Unstructured,
+    entry: &[u64],
+    stack: &mut Vec<u64>,
+) -> bool {
+    let mut carrying = entry.to_vec();
     let mut grew = true;
     while grew {
         grew = false;
@@ -38159,13 +38194,16 @@ fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBor
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
                     continue;
                 };
-                let Some(dest) = place_root_local(&place) else {
-                    continue;
-                };
-                if carrying.contains(&dest) || !rvalue_carries_spill_address(&rvalue, &carrying) {
-                    continue;
+                let carries = rvalue_carries_spill_address(&rvalue, &carrying);
+                if mark_spill_address(&mut carrying, &place, carries) {
+                    grew = true;
                 }
-                carrying.push(dest);
+            }
+            let Ok(TermKind::Call { call, .. }) = block.term(llbc) else {
+                continue;
+            };
+            let carries = call_result_carries_spill_address(llbc, &call, &carrying, stack);
+            if mark_spill_address(&mut carrying, &call.dest, carries) {
                 grew = true;
             }
         }
@@ -38173,14 +38211,56 @@ fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBor
     carrying.contains(&0)
 }
 
+fn mark_spill_address(carrying: &mut Vec<u64>, place: &Place, carries: bool) -> bool {
+    let Some(dest) = place_root_local(place) else {
+        return false;
+    };
+    if carrying.contains(&dest) || !carries {
+        return false;
+    }
+    carrying.push(dest);
+    true
+}
+
+fn call_result_carries_spill_address(
+    llbc: &Llbc,
+    call: &CallPayload,
+    carrying: &[u64],
+    stack: &mut Vec<u64>,
+) -> bool {
+    let entry: Vec<u64> = call
+        .args
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| operand_carries_spill_address(op, carrying))
+        .map(|(index, _)| index as u64 + 1)
+        .collect();
+    if entry.is_empty() {
+        return false;
+    }
+    let CallFunc::Regular(reg) = &call.func else {
+        return true;
+    };
+    match &reg.kind {
+        CallKind::Fun(FunId::Regular { id }) => {
+            function_returns_spill_address(llbc, *id, &entry, stack)
+        }
+        CallKind::Fun(FunId::Other(_))
+        | CallKind::Trait(_)
+        | CallKind::Ptr(_)
+        | CallKind::Unknown => true,
+    }
+}
+
 fn rvalue_carries_spill_address(rvalue: &Rvalue, carrying: &[u64]) -> bool {
     match rvalue {
         Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => {
             operand_carries_spill_address(op, carrying)
         }
-        Rvalue::BinaryOp(_, lhs, rhs) => {
-            operand_carries_spill_address(lhs, carrying)
-                || operand_carries_spill_address(rhs, carrying)
+        Rvalue::BinaryOp(op, lhs, rhs) => {
+            !binop_is_comparison(op)
+                && (operand_carries_spill_address(lhs, carrying)
+                    || operand_carries_spill_address(rhs, carrying))
         }
         Rvalue::Aggregate(_, ops) => ops
             .iter()
@@ -38195,6 +38275,13 @@ fn rvalue_carries_spill_address(rvalue: &Rvalue, carrying: &[u64]) -> bool {
             false
         }
     }
+}
+
+fn binop_is_comparison(op: &serde_json::Value) -> bool {
+    matches!(
+        binop_label(op).ok().as_deref(),
+        Some("eq" | "ne" | "lt" | "le" | "gt" | "ge")
+    )
 }
 
 fn operand_carries_spill_address(op: &Operand, carrying: &[u64]) -> bool {
