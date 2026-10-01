@@ -2428,10 +2428,6 @@ fn split_head_args(ty: &str) -> (&str, &str) {
     }
 }
 
-fn type_leaf(head: &str) -> &str {
-    head.rsplit("::").next().unwrap_or(head)
-}
-
 /// Split `A,B<C,D>,(E,F)` on commas that are not inside `<>` or `()`.
 fn split_top_level(args: &str) -> Vec<String> {
     let mut out = Vec::new();
