@@ -13395,13 +13395,12 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     // this fixture.
 }
 
-/// `_interpret` calls `blackhole_if_trace_too_long` after every
-/// `run_one_step`, including a translated helper MIFrame. The caller here is
-/// one `inline_call_r_v/dR` followed by its terminator, walked with the limit
-/// already crossed, so the helper's own first instruction is where the limit
-/// fires — not after the helper has returned to its caller.
+/// A translated helper has no Python blackhole entry. The limit check waits
+/// for the enclosing Python step: aborting on the helper's own instruction
+/// retraces the same overflow once per helper op. The caller here is one
+/// `inline_call_r_v/dR` followed by its terminator, already over the limit.
 #[test]
-fn helper_descent_checks_the_limit_on_its_own_instructions() {
+fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
     fn walk_past_the_limit(
         transparent_helper_subwalk: bool,
     ) -> Result<(DispatchOutcome, usize), DispatchError> {
@@ -13495,19 +13494,18 @@ fn helper_descent_checks_the_limit_on_its_own_instructions() {
         walk(&caller_code, 0, &mut wc)
     }
 
-    // The helper body runs inside the caller's first step and is already over
-    // `trace_limit`, so its own `void_return/` (pc 0 of that JitCode) is the
-    // instruction `blackhole_if_trace_too_long` refuses. The caller's flag
-    // does not defer that check.
-    assert_eq!(
-        walk_past_the_limit(false),
-        Err(DispatchError::TraceTooLong { pc: 0, ops: 1 }),
-        "the helper MIFrame aborts on its own first instruction",
+    // The helper body is already over `trace_limit` and does not abort on its
+    // own `void_return/`. The enclosing frame, when it is a real Python walk,
+    // aborts at the `inline_call` once the helper has returned. A caller that
+    // is itself a transparent helper defers too and finishes.
+    let enclosing = walk_past_the_limit(false);
+    assert!(
+        matches!(enclosing, Err(DispatchError::TraceTooLong { pc: 0, .. })),
+        "the enclosing frame aborts after the helper returns: {enclosing:?}"
     );
-    assert_eq!(
-        walk_past_the_limit(true),
-        Err(DispatchError::TraceTooLong { pc: 0, ops: 1 }),
-        "a helper descent does not finish its body past trace_limit",
+    assert!(
+        walk_past_the_limit(true).is_ok(),
+        "a transparent caller finishes the helper past trace_limit"
     );
 }
 

@@ -4755,12 +4755,22 @@ pub fn walk<Sym: WalkSym>(
         if let DispatchOutcome::SegmentTrace { .. } = outcome {
             return Ok((outcome, pc));
         }
-        // `_interpret` calls `run_one_step` then `blackhole_if_trace_too_long`
-        // for whatever MIFrame is current, including an inlined callee and a
-        // translated helper. Deferring the check until the helper returns
-        // records past `trace_limit` and can `newframe` a callee that
-        // `find_biggest_function` then names, which upstream never entered.
-        if ctx.trace_ctx.is_too_long() {
+        // A translated builtin gateway is transparent to the Python MIFrame
+        // stack and has no blackhole entry point of its own. Its bytecode is
+        // one implementation detail of the enclosing Python CALL step, so do
+        // not split the trace in the middle of it: doing so would have to pair
+        // helper registers with a Python JitCode's red-frame register. Finish
+        // the helper and let the enclosing Python `walk()` perform this same
+        // post-step limit check at its real per-frame coordinate, matching
+        // RPython's one-red-frame ownership.
+        //
+        // The exemption defers the abort, it does not drop it. `is_too_long`
+        // is a `num_ops > trace_limit` comparison over the shared `TraceCtx`,
+        // so it still holds when the helper returns and the enclosing frame
+        // runs this check. Aborting inside the helper is what turns one
+        // overflow into a retrace storm: the helper has no merge point that
+        // can close a segment, and the tokenless cell keeps counting.
+        if !ctx.fbw_mode.transparent_helper_subwalk && ctx.trace_ctx.is_too_long() {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their
             // frame transition: in particular, `SubRaise` may enter this
