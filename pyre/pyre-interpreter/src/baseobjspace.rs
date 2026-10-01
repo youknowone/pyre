@@ -6085,7 +6085,7 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
     // (interp_iobase.py W_IOBase uses descr_set_dict → this method).
     if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
         return Err(PyError::type_error(format!(
-            "attribute '__dict__' of '{}' objects is not writable",
+            "attribute '__dict__' of {} objects is not writable",
             object_functionstr_type_name(obj),
         )));
     }

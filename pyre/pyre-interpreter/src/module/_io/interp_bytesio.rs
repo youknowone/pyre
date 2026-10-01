@@ -624,10 +624,14 @@ mod tests {
             assert_eq!(w_dict, W_BytesIO::from_obj(obj).unwrap().w_dict);
             assert_eq!(crate::baseobjspace::getdict(obj).unwrap(), w_dict);
 
-            let refused = "attribute '__dict__' of '_io._IOBase' objects is not writable";
+            // baseobjspace.py W_Root.setdict — TypeError, %T is the receiver.
+            // This fixture's allocate_stable carrier has no initialized
+            // W_TypeObject, so %T is `object`. A live BytesIO prints
+            // `_io.BytesIO` (baseobjspace.py W_Root.setdict).
+            let refused = "attribute '__dict__' of object objects is not writable";
             for replacement in [pyre_object::w_dict_new(), pyre_object::w_int_new(5)] {
                 let err = crate::baseobjspace::setdict(obj, replacement).unwrap_err();
-                assert_eq!(err.kind, crate::PyErrorKind::AttributeError);
+                assert_eq!(err.kind, crate::PyErrorKind::TypeError);
                 assert_eq!(err.message_text(), refused);
             }
             assert_eq!(W_BytesIO::from_obj(obj).unwrap().w_dict, w_dict);
