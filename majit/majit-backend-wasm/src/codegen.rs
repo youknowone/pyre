@@ -1340,6 +1340,45 @@ fn emit_jit_call(sink: &mut PeepSink<'_, '_>, jit_call_idx: u32) {
     sink.call(jit_call_idx);
 }
 
+/// `assembler.py` raw call through the host trampoline. `home` is the result
+/// value to fill; `None` drops the result the way `COND_CALL_N` does.
+fn emit_residual_trampoline_call(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    jit_call: u32,
+    func: OpRef,
+    call_args: &[OpRef],
+    site_gcmap: &[i64],
+    op_idx: usize,
+    op: &Op,
+    home: Option<u32>,
+) {
+    emit_call_area_addr(sink);
+    emit_resolve(sink, constants, value_types, func);
+    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+    emit_call_area_addr(sink);
+    sink.i64_const(call_args.len() as i64);
+    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+    for (i, arg) in call_args.iter().enumerate() {
+        emit_call_area_addr(sink);
+        emit_resolve(sink, constants, value_types, *arg);
+        sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
+    }
+    emit_push_site(sink, site_gcmap, op_idx);
+    emit_jit_call(sink, jit_call);
+    if let Some(vi) = home {
+        emit_call_area_addr(sink);
+        sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
+        if value_types.ty(vi) == ValType::F64 {
+            sink.f64_reinterpret_i64();
+        } else {
+            sign_extend_trampolined_int(sink, op);
+        }
+        sink.local_set(value_types.local(vi));
+    }
+}
+
 /// Emit a width-correct integer load. The element address (i32) must be on
 /// the stack; the result is an i64, sign- or zero-extended from `size`
 /// bytes. Word-sized fields are 4 bytes on wasm32 (`isize`/`usize`/pointer),
@@ -4032,9 +4071,8 @@ fn direct_helper_i64_arity(
 /// Keep this in lockstep with the individual emission arms below: the uniform
 /// i64, typed float, and true-void residual families, `CallMallocNursery*`,
 /// and write barriers are direct when the call descr and the callee's table
-/// type agree. A `COND_CALL` whose descr does not establish that signature
-/// declines. A mismatch, a host import, and string allocation retain the
-/// trampoline for ordinary calls.
+/// type agree. A mismatch, a host import, and string allocation retain the
+/// trampoline, `COND_CALL` included.
 fn has_trampoline_calls(
     inputargs: &[InputArgRc],
     ops: &[Op],
@@ -8528,8 +8566,8 @@ fn build_function(
                 // skip; CALL. The predicate is arg 0, the callee is arg 1, and
                 // the rest are the call's own arguments. The call descr's
                 // word, true-void, or table signature is a direct
-                // `call_indirect`. A descr the table does not confirm
-                // declines the trace.
+                // `call_indirect`. A descr the table does not confirm uses
+                // the host trampoline.
                 //
                 // `do_conditional_call` asserts the callee forces no virtual or
                 // virtualizable, so unlike the CALL arm this needs no force
@@ -8598,9 +8636,24 @@ fn build_function(
                     if result_ty.is_some() {
                         sink.drop();
                     }
+                } else if op.getdescr().is_some() {
+                    let jit_call = jit_call_idx.expect("COND_CALL needs jit_call");
+                    let arg_refs: Vec<OpRef> = call_args.iter().map(|arg| arg.to_opref()).collect();
+                    emit_residual_trampoline_call(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        jit_call,
+                        func,
+                        &arg_refs,
+                        &site_gcmap,
+                        op_idx,
+                        op,
+                        None,
+                    );
                 } else {
                     return Err(BackendError::Unsupported(
-                        "wasm codegen: COND_CALL has no direct residual signature".into(),
+                        "wasm codegen: COND_CALL has no call descr".into(),
                     ));
                 }
                 // COND_CALL sits inside the CALL opcode range, so a Ref living
@@ -8715,9 +8768,24 @@ fn build_function(
                     } else if result_ty.is_some() {
                         sink.drop();
                     }
+                } else if op.getdescr().is_some() {
+                    let jit_call = jit_call_idx.expect("COND_CALL_VALUE needs jit_call");
+                    let arg_refs: Vec<OpRef> = call_args.iter().map(|arg| arg.to_opref()).collect();
+                    emit_residual_trampoline_call(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        jit_call,
+                        func,
+                        &arg_refs,
+                        &site_gcmap,
+                        op_idx,
+                        op,
+                        has_result.then_some(vi),
+                    );
                 } else {
                     return Err(BackendError::Unsupported(
-                        "wasm codegen: COND_CALL_VALUE has no direct residual signature".into(),
+                        "wasm codegen: COND_CALL_VALUE has no call descr".into(),
                     ));
                 }
                 // Only the arm that called can have collected, so the reload
@@ -10486,31 +10554,8 @@ fn build_function(
                     }
                 } else {
                     let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
-
                     let call_args = &op.getarglist()[func_ofs + 1..];
-
-                    // Store func_ptr to call area
-                    emit_call_area_addr(&mut sink);
-                    emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
-                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-
-                    // Store num_args
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(call_args.len() as i64);
-                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-
-                    // Store each arg
-                    for (i, arg) in call_args.iter().enumerate() {
-                        emit_call_area_addr(&mut sink);
-                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                        sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
-                    }
-
-                    // Call trampoline
-                    emit_push_site(&mut sink, &site_gcmap, op_idx);
-                    emit_jit_call(&mut sink, jit_call);
-
-                    // Read result (for non-void calls)
+                    let arg_refs: Vec<OpRef> = call_args.iter().map(|arg| arg.to_opref()).collect();
                     let is_void = matches!(
                         op.opcode,
                         OpCode::CallN
@@ -10520,16 +10565,19 @@ fn build_function(
                             | OpCode::CallReleaseGilN
                             | OpCode::CallLoopinvariantN
                     );
-                    if !OpRef::raw_is_constant(vi) && !is_void {
-                        emit_call_area_addr(&mut sink);
-                        sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
-                        if value_types.ty(vi) == ValType::F64 {
-                            sink.f64_reinterpret_i64();
-                        } else {
-                            sign_extend_trampolined_int(&mut sink, op);
-                        }
-                        sink.local_set(value_types.local(vi));
-                    }
+                    let home = (!OpRef::raw_is_constant(vi) && !is_void).then_some(vi);
+                    emit_residual_trampoline_call(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        jit_call,
+                        func_ptr_ref,
+                        &arg_refs,
+                        &site_gcmap,
+                        op_idx,
+                        op,
+                        home,
+                    );
                     // Mirror the direct path: a trampoline residual call may force and collect.
                     read_real_errno(&mut sink);
                     if can_collect {
