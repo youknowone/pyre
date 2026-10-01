@@ -7114,11 +7114,36 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // bound in practice: a third Python frame residualized however
                 // straight-line it was, which is a two-deep helper called from
                 // any dunder at all.
-                let seeded_callee_resume =
-                    callable_guard_op.is_constant() && (try_multiframe || strict_seed);
+                // A closure's green key is `Function.code` (`function.py`
+                // `getcode`), not the function object.  `guards_the_callee_function`
+                // reads that field and threads the cells as red getfields, so a
+                // `def` inside the caller — a fresh function on every call, one
+                // code object — can inline.  The predicate is that flag, not
+                // `has_closure` alone: a guard operand that is not the callee
+                // still pins identity (`GuardValue`), and a fresh function
+                // fails that guard on every call.  A non-closure operand keeps
+                // the constant screen: dropping it inlined `self.cb(...)`
+                // wherever the callable really varied.
+                let seeded_callee_resume = (try_multiframe || strict_seed)
+                    && (callable_guard_op.is_constant()
+                        || (has_closure && guards_the_callee_function));
+                // The handler exemption below was measured on a CALL entry
+                // (`blackhole_inlined_callee_local_after_escape_declined`).
+                // A seeded frame does not widen that exemption.
                 foriter_dirty_seeded_resume_admit = entry_is_call_boundary && seeded_callee_resume;
-                let foriter_dirty_bound = entry_is_call_boundary
-                    && (bound_method.is_some() || seeded_callee_resume)
+                // A seeded callee frame resumes inside the callee, so the
+                // caller's opcode is not re-executed and does not have to be
+                // a boundary the flush can name.  `perform_call`
+                // (`pyjitpl.py`) pushes that MIFrame for every callee
+                // `can_inline_callable` admits.  This is what lets a mutating
+                // `__format__` inline at FORMAT_WITH_SPEC: the opcode pops
+                // both operands, `entry_is_call_boundary` stays false so a
+                // non-str result still declines to the residual, and the
+                // `self.calls += 1` store is `Dirty`.  An unseeded bound
+                // method still needs the boundary, because its flush replays
+                // the entry opcode.
+                let foriter_dirty_bound = (seeded_callee_resume
+                    || (entry_is_call_boundary && bound_method.is_some()))
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !pyre_interpreter::code_is_self_recursive(callee_code);
                 if !foriter_dirty_bound && fbw_inline_diag_enabled() {
@@ -14065,6 +14090,11 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let pre_fold_virtualrefs = ctx.trace_ctx.snapshot_virtualref_boxes();
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
+    // A decline below returns to the residual, which re-executes the dunder.
+    // Journal entries pushed after this mark are undone there
+    // (`fbw_effect_journal_rollback_since`); the walk can still commit, so
+    // `fbw_store_journal_rollback` does not.
+    let journal_mark = fbw_effect_journal_mark();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     // Copied out before the descent takes `ctx` mutably; the region state is
     // the session's, not this frame's.
@@ -14124,6 +14154,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let refused_a_commit = rewind_guard.as_ref().is_some_and(|g| g.refused());
     drop(rewind_guard);
     if refused_a_commit {
+        fbw_effect_journal_rollback_since(journal_mark);
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx
             .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
@@ -14136,6 +14167,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let Some(inlined) = (match descent {
         Ok(inlined) => inlined,
         Err(err) => {
+            fbw_effect_journal_rollback_since(journal_mark);
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
             ctx.trace_ctx.heap_cache_mut().reset();
@@ -14145,6 +14177,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
             ));
         }
     }) else {
+        fbw_effect_journal_rollback_since(journal_mark);
         decline!(format_args!(
             "callee inline of {}.{dunder} declined",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
@@ -14181,6 +14214,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
                 && !unjournaled_before
                 && !fbw_has_unjournaled_effect()
             {
+                fbw_effect_journal_rollback_since(journal_mark);
                 ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
                 ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
                 ctx.trace_ctx.heap_cache_mut().reset();
@@ -14331,6 +14365,11 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let pre_fold_virtualrefs = ctx.trace_ctx.snapshot_virtualref_boxes();
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
+    // A decline below returns to the residual, which re-executes the dunder.
+    // Journal entries pushed after this mark are undone there
+    // (`fbw_effect_journal_rollback_since`); the walk can still commit, so
+    // `fbw_store_journal_rollback` does not.
+    let journal_mark = fbw_effect_journal_mark();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     // Copied out before the descent takes `ctx` mutably; the region state is
     // the session's, not this frame's.
@@ -14390,6 +14429,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let refused_a_commit = rewind_guard.as_ref().is_some_and(|g| g.refused());
     drop(rewind_guard);
     if refused_a_commit {
+        fbw_effect_journal_rollback_since(journal_mark);
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx
             .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
@@ -14397,6 +14437,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         return Ok(None);
     }
     let Some(inlined) = descent? else {
+        fbw_effect_journal_rollback_since(journal_mark);
         return Ok(None);
     };
 
@@ -14423,6 +14464,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
                 && !unjournaled_before
                 && !fbw_has_unjournaled_effect()
             {
+                fbw_effect_journal_rollback_since(journal_mark);
                 ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
                 ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
                 ctx.trace_ctx.heap_cache_mut().reset();
@@ -14595,10 +14637,13 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
             inline_attr_cell_guard(w_class, "__format__", method)
         })),
         None,
-        // FORMAT_WITH_SPEC pops both of its operands, so the abort rewind
-        // cannot re-execute it from the stack it had: only a `Clean` body is
-        // admitted from here, and a bad effect-free result declines to the
-        // residual, which raises `descroperation.py format`'s TypeError.
+        // FORMAT_WITH_SPEC pops both operands, so this stays false: a
+        // non-str result has no CALL boundary to latch and declines to the
+        // residual, which raises `descroperation.py` `format`'s TypeError.
+        // A mutating body still inlines.  `foriter_dirty_bound` admits it
+        // once `strict_seed` gives the callee its own frame, and
+        // `perform_call` (`pyjitpl.py`) resumes inside that frame rather
+        // than re-executing this opcode.
         false,
         // `__format__` returning a non-string is a TypeError the interpreter
         // raises; the plumbing guards the inlined result is a string so that

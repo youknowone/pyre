@@ -15058,6 +15058,72 @@ fn try_walker_specialize_builtin_divmod_long_int<Sym: WalkSym>(
 /// declines it (`OrthodoxSubWalkTraceUnsupported`) and the method-call form
 /// records the append as a residual call instead of baking the hash as a code
 /// address and branching to garbage.
+fn list_append_resume_declines(error: &DispatchError) -> bool {
+    matches!(
+        error,
+        DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
+            | DispatchError::GuardResumeCoordinateUnavailable { .. }
+            | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
+            | DispatchError::GuardSnapshotVableUntyped { .. }
+    )
+}
+
+fn rollback_list_append_attempt<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+    list: pyre_object::PyObjectRef,
+    len_before: usize,
+    allocated_before: isize,
+    promote_journal_before: usize,
+) {
+    ctx.trace_ctx.cut_trace(pre_fold_pos);
+    ctx.trace_ctx.heap_cache_mut().reset();
+    // `w_list_uses_empty_storage` at entry is not "this attempt pushed a
+    // promotion". `orthodox_list_append_commit` pushes
+    // `fbw_append_promote_journal_push` only after the strategy switch, and
+    // the callable guards above can decline before that. Popping here used
+    // to assert on an empty journal or drop another list's entry.
+    let promoted = fbw_append_promote_journal_len() > promote_journal_before;
+    while fbw_append_promote_journal_len() > promote_journal_before {
+        fbw_append_promote_journal_rollback_newest();
+    }
+    // The promotion clear restored Empty. The caller's pointer can be the
+    // pre-move reference (`w_list_switch_to_strategy_for` may relocate), so
+    // it is not a safe target for a length store.
+    if !promoted && unsafe { pyre_object::w_list_len(list) } > len_before {
+        fbw_rewind_unjournaled_list_append(list, len_before, allocated_before);
+    }
+}
+
+/// `Ok(false)` rolls the attempt back to the residual.  A resume coordinate
+/// the inlined callee cannot name is that decline; anything else still aborts
+/// the walk.
+fn list_append_capture_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+    list: pyre_object::PyObjectRef,
+    len_before: usize,
+    allocated_before: isize,
+    promote_journal_before: usize,
+) -> Result<bool, DispatchError> {
+    match walker_capture_snapshot_for_last_guard(ctx, op_pc) {
+        Ok(()) => Ok(true),
+        Err(error) if list_append_resume_declines(&error) => {
+            rollback_list_append_attempt(
+                ctx,
+                pre_fold_pos,
+                list,
+                len_before,
+                allocated_before,
+                promote_journal_before,
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -15110,24 +15176,35 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     let sym = unsafe { &*sym_ptr };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    // Mirror the commit's own promotion predicate exactly: a rollback must
-    // undo a promotion only when one was performed, or it would pop another
-    // list's journal entry.
-    let promoted_empty = unsafe { pyre_object::w_list_uses_empty_storage(inner_self) };
+    // Sampled before any guard. The commit promotes and may store before a
+    // later resume decline; these are the rewind inputs for that decline.
+    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(inner_self) };
+    let promote_journal_before = fbw_append_promote_journal_len();
 
     // ── tentative commit ──
     let callable_op = r_args[0];
     let value_op = r_args[2];
 
     // Pin the callable to `list.append`: guard_class METHOD + guard_value on
-    // the stable function slot (these guards resume via the full-body path at
-    // `op.pc`, ignoring the call-site fields set below).
+    // the stable function slot.  `list_append_capture_guard` uses
+    // `walker_capture_snapshot_for_last_guard`, so an inlined callee resumes
+    // at its Python CALL and a top frame resumes at this op.
     let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
     if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
         let type_const = ctx.trace_ctx.const_int(method_type_addr);
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        if !list_append_capture_guard(
+            ctx,
+            op.pc,
+            pre_fold_pos,
+            inner_self,
+            len_before,
+            allocated_before,
+            promote_journal_before,
+        )? {
+            return Ok(None);
+        }
     }
     ctx.trace_ctx
         .heap_cache_mut()
@@ -15140,7 +15217,17 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     let func_const = ctx.trace_ctx.const_ref(inner_func as i64);
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[func_ref, func_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    if !list_append_capture_guard(
+        ctx,
+        op.pc,
+        pre_fold_pos,
+        inner_self,
+        len_before,
+        allocated_before,
+        promote_journal_before,
+    )? {
+        return Ok(None);
+    }
     ctx.trace_ctx
         .heap_cache_mut()
         .replace_box(func_ref, func_const);
@@ -15157,15 +15244,18 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     );
     match commit_result {
         Ok(()) => {}
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error) if list_append_resume_declines(&error) => {
             if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
+                eprintln!("[decline-why] LIST-APPEND-SUBWALK {}", error.variant_name());
             }
-            ctx.trace_ctx.cut_trace(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            if promoted_empty {
-                fbw_append_promote_journal_rollback_last(inner_self);
-            }
+            rollback_list_append_attempt(
+                ctx,
+                pre_fold_pos,
+                inner_self,
+                len_before,
+                allocated_before,
+                promote_journal_before,
+            );
             return Ok(None);
         }
         Err(error) => return Err(error),
@@ -16420,10 +16510,8 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     let sym = unsafe { &*sym_ptr };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    // Mirror the commit's own promotion predicate exactly: a rollback must
-    // undo a promotion only when one was performed, or it would pop another
-    // list's journal entry.
-    let promoted_empty = unsafe { pyre_object::w_list_uses_empty_storage(list) };
+    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
+    let promote_journal_before = fbw_append_promote_journal_len();
 
     // ── tentative commit ──
     // The receiver list OpRef + value OpRef are the residual's Ref operands.
@@ -16432,15 +16520,18 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     );
     match commit_result {
         Ok(()) => {}
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error) if list_append_resume_declines(&error) => {
             if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
+                eprintln!("[decline-why] LIST-APPEND-SUBWALK {}", error.variant_name());
             }
-            ctx.trace_ctx.cut_trace(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            if promoted_empty {
-                fbw_append_promote_journal_rollback_last(list);
-            }
+            rollback_list_append_attempt(
+                ctx,
+                pre_fold_pos,
+                list,
+                len_before,
+                allocated_before,
+                promote_journal_before,
+            );
             return Ok(None);
         }
         Err(error) => return Err(error),

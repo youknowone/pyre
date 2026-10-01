@@ -957,14 +957,73 @@ pub(crate) fn fbw_append_promote_journal_push(list: pyre_object::PyObjectRef) {
     FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().push(list));
 }
 
-/// Undo the most recent Empty-to-typed list promotion when its speculative
-/// append fold is locally declined.
-pub(crate) fn fbw_append_promote_journal_rollback_last(list: pyre_object::PyObjectRef) {
-    FBW_APPEND_PROMOTE_JOURNAL.with(|j| {
-        let popped = j.borrow_mut().pop();
-        assert_eq!(popped, Some(list));
-    });
+pub(crate) fn fbw_append_promote_journal_len() -> usize {
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow().len())
+}
+
+/// Undo the newest Empty-to-typed promotion this attempt pushed.
+///
+/// `orthodox_list_append_commit` pushes that entry only after the strategy
+/// switch. A guard snapshot can fail earlier, and the list can move during
+/// the switch, so the rollback pops the journal's own pointer instead of
+/// asserting it still equals the pre-commit reference.
+pub(crate) fn fbw_append_promote_journal_rollback_newest() {
+    let Some(list) = FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().pop()) else {
+        return;
+    };
     unsafe { pyre_object::listobject::w_list_clear(list) };
+}
+
+/// Shrink a list a declined append sub-walk already grew, when that growth
+/// never reached `fbw_list_journal_push_append`.
+///
+/// The success path of `orthodox_list_append_commit` re-reads the length so
+/// it does not store twice. A resume decline returns before that re-read, and
+/// the residual fall-through appends again. Absolute `set_len` matches one
+/// arm of `fbw_store_journal_rollback`.
+pub(crate) fn fbw_rewind_unjournaled_list_append(
+    list: pyre_object::PyObjectRef,
+    length_before: usize,
+    allocated_before: isize,
+) {
+    unsafe {
+        let current = pyre_object::w_list_len(list);
+        if current <= length_before {
+            return;
+        }
+        let list_ref = &mut *(list as *mut pyre_object::listobject::W_ListObject);
+        match list_ref.strategy {
+            pyre_object::listobject::ListStrategy::Object => {
+                for index in length_before..current {
+                    pyre_object::listobject::ll_list_obj_setitem_fast(
+                        list_ref,
+                        index,
+                        pyre_object::pyobject::PY_NULL,
+                    );
+                }
+                pyre_object::listobject::ll_list_obj_set_len(list_ref, length_before);
+            }
+            pyre_object::listobject::ListStrategy::Integer => {
+                pyre_object::listobject::ll_list_int_set_len(list_ref, length_before);
+            }
+            pyre_object::listobject::ListStrategy::IntOrFloat => {
+                pyre_object::listobject::w_list_int_or_float_set_len(list, length_before);
+            }
+            pyre_object::listobject::ListStrategy::Float => {
+                pyre_object::listobject::ll_list_float_set_len(list_ref, length_before);
+            }
+            pyre_object::listobject::ListStrategy::Empty
+            | pyre_object::listobject::ListStrategy::Size
+            | pyre_object::listobject::ListStrategy::SimpleRange
+            | pyre_object::listobject::ListStrategy::Range
+            | pyre_object::listobject::ListStrategy::Bytes
+            | pyre_object::listobject::ListStrategy::Ascii => {
+                crate::trace::fbw_diag::bump(crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED);
+                return;
+            }
+        }
+        pyre_object::listobject::w_list_set_allocated(list, allocated_before);
+    }
 }
 
 /// Record the `intvalue` a walked eager `IntMutableCell` store displaces,
@@ -2063,6 +2122,295 @@ mod foriter_delivery_tests {
 
         fbw_store_journal_reset();
     }
+
+    #[test]
+    fn effect_journal_rollback_since_keeps_an_earlier_append() {
+        use pyre_object::listobject::{w_list_can_append_without_realloc, w_list_len};
+        use pyre_object::{w_int_new, w_list_append};
+
+        fbw_store_journal_reset();
+        let list =
+            pyre_object::listobject::w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        unsafe { w_list_append(list, w_int_new(4)) };
+        let len0 = unsafe { w_list_len(list) };
+        let alloc0 = unsafe { pyre_object::listobject::w_list_allocated(list) };
+        assert!(unsafe { w_list_can_append_without_realloc(list) });
+
+        fbw_list_journal_push_append(list, len0, alloc0);
+        unsafe { w_list_append(list, w_int_new(5)) };
+        let mark = fbw_effect_journal_mark();
+        let len1 = unsafe { w_list_len(list) };
+        let alloc1 = unsafe { pyre_object::listobject::w_list_allocated(list) };
+        fbw_list_journal_push_append(list, len1, alloc1);
+        unsafe { w_list_append(list, w_int_new(6)) };
+        assert_eq!(unsafe { w_list_len(list) }, len0 + 2);
+        assert_eq!(fbw_executed_effect_count(), 2);
+
+        fbw_effect_journal_rollback_since(mark);
+        assert_eq!(unsafe { w_list_len(list) }, len0 + 1);
+        assert_eq!(fbw_executed_effect_count(), 1);
+        assert_eq!(
+            fbw_journaled_effect_lens().1,
+            1,
+            "the append journaled before the mark stays"
+        );
+
+        fbw_store_journal_rollback();
+        assert_eq!(unsafe { w_list_len(list) }, len0);
+    }
+}
+
+/// Lengths of the journals [`fbw_binop_rewind_refuse_commit`] leaves in
+/// place, sampled before a descent that may later decline to a residual.
+#[derive(Clone, Copy)]
+pub(crate) struct FbwEffectJournalMark {
+    stores: usize,
+    list_effects: usize,
+    promotes: usize,
+    cells: usize,
+}
+
+pub(crate) fn fbw_effect_journal_mark() -> FbwEffectJournalMark {
+    FbwEffectJournalMark {
+        stores: fbw_store_journal_len(),
+        list_effects: FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()),
+        promotes: fbw_append_promote_journal_len(),
+        cells: FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()),
+    }
+}
+
+fn fbw_unbump_executed_effects(n: usize) {
+    if n == 0 {
+        return;
+    }
+    FBW_EXECUTED_EFFECT_COUNT.with(|c| {
+        let count = c.get().saturating_sub(n);
+        c.set(count);
+        if fbw_debug_abort_enabled() {
+            eprintln!("[fbw-effect-unbump] n={n} count={count}");
+        }
+    });
+}
+
+fn undo_store_journal_entry(
+    list: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+    displaced: pyre_object::PyObjectRef,
+) {
+    let restored = unsafe {
+        let index = pyre_object::w_int_get_value(key);
+        pyre_object::w_list_setitem(list, index, displaced)
+    };
+    if !restored {
+        // Only reachable when another eagerly executed residual
+        // shrank the list after the store — a shape the replay
+        // already cannot undo (the residual re-runs).  Surface it
+        // under the debug gate instead of corrupting silently.
+        crate::trace::fbw_diag::bump(crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED);
+        if fbw_debug_abort_enabled() {
+            eprintln!("[fbw-store-journal] rollback failed (index out of bounds)");
+        }
+    }
+}
+
+fn undo_list_effect_entry(entry: FbwListEffect) {
+    unsafe {
+        let (list, length_before, allocated_before) = match entry {
+            FbwListEffect::Append {
+                list,
+                length_before,
+                allocated_before,
+            } => (list, length_before, allocated_before),
+            FbwListEffect::PopEnd {
+                list,
+                length_before,
+                w_item,
+            } => {
+                let list_ref = &mut *(list as *mut pyre_object::listobject::W_ListObject);
+                match list_ref.strategy {
+                    pyre_object::listobject::ListStrategy::Integer => {
+                        pyre_object::listobject::ll_list_int_set_len(list_ref, length_before);
+                        pyre_object::listobject::ll_list_int_setitem_fast(
+                            list_ref,
+                            length_before - 1,
+                            pyre_object::w_int_get_value(w_item),
+                        );
+                    }
+                    pyre_object::listobject::ListStrategy::Object => {
+                        // A later ordinary append of a non-int can switch
+                        // the popped Integer list to Object storage, seeded
+                        // only from the post-pop prefix. Restore into that
+                        // live block rather than the discarded int block.
+                        pyre_object::listobject::ll_list_obj_set_len(list_ref, length_before);
+                        pyre_object::listobject::ll_list_obj_setitem_fast(
+                            list_ref,
+                            length_before - 1,
+                            w_item,
+                        );
+                    }
+                    pyre_object::listobject::ListStrategy::IntOrFloat => {
+                        pyre_object::listobject::w_list_int_or_float_set_len(list, length_before);
+                        if !pyre_object::listobject::w_list_int_or_float_setitem(
+                            list,
+                            length_before - 1,
+                            w_item,
+                        ) {
+                            crate::trace::fbw_diag::bump(
+                                crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED,
+                            );
+                        }
+                    }
+                    pyre_object::listobject::ListStrategy::Float
+                    | pyre_object::listobject::ListStrategy::Empty
+                    | pyre_object::listobject::ListStrategy::Size
+                    | pyre_object::listobject::ListStrategy::SimpleRange
+                    | pyre_object::listobject::ListStrategy::Range
+                    | pyre_object::listobject::ListStrategy::Bytes
+                    | pyre_object::listobject::ListStrategy::Ascii => {
+                        crate::trace::fbw_diag::bump(
+                            crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED,
+                        );
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-list-effect-journal] PopEnd rollback failed (invalid strategy)"
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+        };
+        let list_ref = &mut *(list as *mut pyre_object::listobject::W_ListObject);
+        match list_ref.strategy {
+            pyre_object::listobject::ListStrategy::Object => {
+                // The appended element is a GC ptr and the items block is
+                // scanned over [0..capacity], so null the vacated slot
+                // before shrinking (ll_pop_default: ll_setitem_fast(index,
+                // ll_null_item) then _ll_resize_le) — otherwise the slot at
+                // `length_before` holds a stale ref past the logical length.
+                pyre_object::listobject::ll_list_obj_setitem_fast(
+                    list_ref,
+                    length_before,
+                    pyre_object::pyobject::PY_NULL,
+                );
+                pyre_object::listobject::ll_list_obj_set_len(list_ref, length_before);
+            }
+            pyre_object::listobject::ListStrategy::Integer => {
+                pyre_object::listobject::ll_list_int_set_len(list_ref, length_before);
+            }
+            pyre_object::listobject::ListStrategy::IntOrFloat => {
+                pyre_object::listobject::w_list_int_or_float_set_len(list, length_before);
+            }
+            // Float items are non-ptr f64 scalars (no stale GC ref to
+            // clear, unlike the Object slot), so rewinding the length
+            // field suffices.
+            pyre_object::listobject::ListStrategy::Float => {
+                pyre_object::listobject::ll_list_float_set_len(list_ref, length_before);
+            }
+            // Empty never enters the append journal (no spare-capacity
+            // fold path records it); nothing to rewind.
+            pyre_object::listobject::ListStrategy::Empty => {}
+            pyre_object::listobject::ListStrategy::Size => {}
+            // BaseRangeListStrategy append materialises before the
+            // append, so compact range storage is never journalled.
+            pyre_object::listobject::ListStrategy::SimpleRange => {}
+            pyre_object::listobject::ListStrategy::Range => {}
+            // Bytes append does not enter this journal until the
+            // walker has a BytesBlock store emitter.
+            pyre_object::listobject::ListStrategy::Bytes => {}
+            pyre_object::listobject::ListStrategy::Ascii => {}
+        }
+        pyre_object::listobject::w_list_set_allocated(list, allocated_before);
+    }
+}
+
+fn undo_cell_store_entry(entry: FbwCellStore) {
+    unsafe {
+        match entry {
+            FbwCellStore::Int { cell, before } => {
+                if fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-cell-journal] rollback cell=0x{:x} {} -> {before}",
+                        cell as usize,
+                        (*(cell as *const pyre_object::celldict::IntMutableCell)).intvalue
+                    );
+                }
+                (*(cell as *mut pyre_object::celldict::IntMutableCell)).intvalue = before;
+            }
+            FbwCellStore::Obj { cell, before } => {
+                if fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-cell-journal] rollback-obj cell=0x{:x} -> 0x{:x}",
+                        cell as usize, before as usize
+                    );
+                }
+                // A minor collection can run between the speculative
+                // store's barrier and rollback, so restoring a young
+                // `before` needs its own barrier.
+                pyre_object::celldict::object_mutable_cell_write_barrier(cell as *mut u8);
+                (*(cell as *mut pyre_object::celldict::ObjectMutableCell)).w_value = before;
+            }
+        }
+    }
+}
+
+/// Undo journaled effects pushed after `mark`.
+///
+/// `fbw_binop_rewind_refuse_commit` does not refuse `store_journal`,
+/// `list_append`, `list_pop_end`, or `cell_store_journal`. A later refusal
+/// still returns from the `BINARY_OP` / `COMPARE_OP` descent, and that
+/// descent's caller falls through to `binary_value_from_tag` (or the
+/// compare residual). The outer walk can then `fbw_store_journal_commit`,
+/// which drops the undo log and keeps the eager write, so the residual
+/// applies it a second time. Rewinding only the suffix leaves an effect
+/// the enclosing frame journaled before this descent.
+pub(crate) fn fbw_effect_journal_rollback_since(mark: FbwEffectJournalMark) {
+    let mut bumped = 0usize;
+    FBW_STORE_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while entries.len() > mark.stores {
+            let Some([list, key, displaced]) = entries.pop() else {
+                break;
+            };
+            bumped += 1;
+            undo_store_journal_entry(list, key, displaced);
+        }
+    });
+    FBW_LIST_EFFECT_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while entries.len() > mark.list_effects {
+            let Some(entry) = entries.pop() else {
+                break;
+            };
+            bumped += 1;
+            undo_list_effect_entry(entry);
+        }
+    });
+    // The length rewind above already shrank a promoted list back to 0.
+    // `w_list_clear` restores Empty strategy for the promotions this
+    // descent pushed. An earlier promotion stays on the log.
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while entries.len() > mark.promotes {
+            if let Some(list) = entries.pop() {
+                unsafe { pyre_object::listobject::w_list_clear(list) };
+            }
+        }
+    });
+    FBW_CELL_STORE_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while entries.len() > mark.cells {
+            let Some(entry) = entries.pop() else {
+                break;
+            };
+            bumped += 1;
+            undo_cell_store_entry(entry);
+        }
+    });
+    // Each popped store, list effect, and cell push bumped the odometer
+    // once. A promotion push does not. The residual that re-executes the
+    // dunder bumps for itself.
+    fbw_unbump_executed_effects(bumped);
 }
 
 /// Non-commit epilogue: restore each displaced element in reverse push
@@ -2080,20 +2428,7 @@ pub(crate) fn fbw_store_journal_rollback() {
     FBW_STORE_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
         while let Some([list, key, displaced]) = entries.pop() {
-            let restored = unsafe {
-                let index = pyre_object::w_int_get_value(key);
-                pyre_object::w_list_setitem(list, index, displaced)
-            };
-            if !restored {
-                // Only reachable when another eagerly executed residual
-                // shrank the list after the store — a shape the replay
-                // already cannot undo (the residual re-runs).  Surface it
-                // under the debug gate instead of corrupting silently.
-                crate::trace::fbw_diag::bump(crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED);
-                if fbw_debug_abort_enabled() {
-                    eprintln!("[fbw-store-journal] rollback failed (index out of bounds)");
-                }
-            }
+            undo_store_journal_entry(list, key, displaced);
         }
     });
     // Undo eager list effects in reverse push order. Append entries record
@@ -2103,126 +2438,7 @@ pub(crate) fn fbw_store_journal_rollback() {
     FBW_LIST_EFFECT_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
         while let Some(entry) = entries.pop() {
-            unsafe {
-                let (list, length_before, allocated_before) = match entry {
-                    FbwListEffect::Append {
-                        list,
-                        length_before,
-                        allocated_before,
-                    } => (list, length_before, allocated_before),
-                    FbwListEffect::PopEnd {
-                        list,
-                        length_before,
-                        w_item,
-                    } => {
-                        let list_ref = &mut *(list as *mut pyre_object::listobject::W_ListObject);
-                        match list_ref.strategy {
-                            pyre_object::listobject::ListStrategy::Integer => {
-                                pyre_object::listobject::ll_list_int_set_len(
-                                    list_ref,
-                                    length_before,
-                                );
-                                pyre_object::listobject::ll_list_int_setitem_fast(
-                                    list_ref,
-                                    length_before - 1,
-                                    pyre_object::w_int_get_value(w_item),
-                                );
-                            }
-                            pyre_object::listobject::ListStrategy::Object => {
-                                // A later ordinary append of a non-int can switch
-                                // the popped Integer list to Object storage, seeded
-                                // only from the post-pop prefix. Restore into that
-                                // live block rather than the discarded int block.
-                                pyre_object::listobject::ll_list_obj_set_len(
-                                    list_ref,
-                                    length_before,
-                                );
-                                pyre_object::listobject::ll_list_obj_setitem_fast(
-                                    list_ref,
-                                    length_before - 1,
-                                    w_item,
-                                );
-                            }
-                            pyre_object::listobject::ListStrategy::IntOrFloat => {
-                                pyre_object::listobject::w_list_int_or_float_set_len(
-                                    list,
-                                    length_before,
-                                );
-                                if !pyre_object::listobject::w_list_int_or_float_setitem(
-                                    list,
-                                    length_before - 1,
-                                    w_item,
-                                ) {
-                                    crate::trace::fbw_diag::bump(
-                                        crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED,
-                                    );
-                                }
-                            }
-                            pyre_object::listobject::ListStrategy::Float
-                            | pyre_object::listobject::ListStrategy::Empty
-                            | pyre_object::listobject::ListStrategy::Size
-                            | pyre_object::listobject::ListStrategy::SimpleRange
-                            | pyre_object::listobject::ListStrategy::Range
-                            | pyre_object::listobject::ListStrategy::Bytes
-                            | pyre_object::listobject::ListStrategy::Ascii => {
-                                crate::trace::fbw_diag::bump(
-                                    crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED,
-                                );
-                                if fbw_debug_abort_enabled() {
-                                    eprintln!(
-                                        "[fbw-list-effect-journal] PopEnd rollback failed (invalid strategy)"
-                                    );
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                };
-                let list_ref = &mut *(list as *mut pyre_object::listobject::W_ListObject);
-                match list_ref.strategy {
-                    pyre_object::listobject::ListStrategy::Object => {
-                        // The appended element is a GC ptr and the items block is
-                        // scanned over [0..capacity], so null the vacated slot
-                        // before shrinking (ll_pop_default: ll_setitem_fast(index,
-                        // ll_null_item) then _ll_resize_le) — otherwise the slot at
-                        // `length_before` holds a stale ref past the logical length.
-                        pyre_object::listobject::ll_list_obj_setitem_fast(
-                            list_ref,
-                            length_before,
-                            pyre_object::pyobject::PY_NULL,
-                        );
-                        pyre_object::listobject::ll_list_obj_set_len(list_ref, length_before);
-                    }
-                    pyre_object::listobject::ListStrategy::Integer => {
-                        pyre_object::listobject::ll_list_int_set_len(list_ref, length_before);
-                    }
-                    pyre_object::listobject::ListStrategy::IntOrFloat => {
-                        pyre_object::listobject::w_list_int_or_float_set_len(
-                            list,
-                            length_before,
-                        );
-                    }
-                    // Float items are non-ptr f64 scalars (no stale GC ref to
-                    // clear, unlike the Object slot), so rewinding the length
-                    // field suffices.
-                    pyre_object::listobject::ListStrategy::Float => {
-                        pyre_object::listobject::ll_list_float_set_len(list_ref, length_before);
-                    }
-                    // Empty never enters the append journal (no spare-capacity
-                    // fold path records it); nothing to rewind.
-                    pyre_object::listobject::ListStrategy::Empty => {}
-                    pyre_object::listobject::ListStrategy::Size => {}
-                    // BaseRangeListStrategy append materialises before the
-                    // append, so compact range storage is never journalled.
-                    pyre_object::listobject::ListStrategy::SimpleRange => {}
-                    pyre_object::listobject::ListStrategy::Range => {}
-                    // Bytes append does not enter this journal until the
-                    // walker has a BytesBlock store emitter.
-                    pyre_object::listobject::ListStrategy::Bytes => {}
-                    pyre_object::listobject::ListStrategy::Ascii => {}
-                }
-                pyre_object::listobject::w_list_set_allocated(list, allocated_before);
-            }
+            undo_list_effect_entry(entry);
         }
     });
     // The length rewind above already shrank the list back to length 0.
@@ -2242,33 +2458,7 @@ pub(crate) fn fbw_store_journal_rollback() {
     FBW_CELL_STORE_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
         while let Some(entry) = entries.pop() {
-            unsafe {
-                match entry {
-                    FbwCellStore::Int { cell, before } => {
-                        if fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-cell-journal] rollback cell=0x{:x} {} -> {before}",
-                                cell as usize,
-                                (*(cell as *const pyre_object::celldict::IntMutableCell)).intvalue
-                            );
-                        }
-                        (*(cell as *mut pyre_object::celldict::IntMutableCell)).intvalue = before;
-                    }
-                    FbwCellStore::Obj { cell, before } => {
-                        if fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-cell-journal] rollback-obj cell=0x{:x} -> 0x{:x}",
-                                cell as usize, before as usize
-                            );
-                        }
-                        // A minor collection can run between the speculative
-                        // store's barrier and rollback, so restoring a young
-                        // `before` needs its own barrier.
-                        pyre_object::celldict::object_mutable_cell_write_barrier(cell as *mut u8);
-                        (*(cell as *mut pyre_object::celldict::ObjectMutableCell)).w_value = before;
-                    }
-                }
-            }
+            undo_cell_store_entry(entry);
         }
     });
     // Restore `sys_exc_value` to its pre-walk value.  Replaying in reverse
@@ -4456,8 +4646,9 @@ pub(crate) fn fbw_callee_body_has_binary_op_residual(
 /// specialization performs the write inside the resolver and reaches no other
 /// hook.  The journaled four — `store_journal`, `list_append`,
 /// `list_pop_end`, `cell_store_journal` — need no refusal: they move the
-/// odometer, so the entry's all-clear reading fails and it aborts instead of
-/// cutting, and [`fbw_store_journal_rollback`] undoes them on that exit.
+/// odometer. A descent that then returns to the residual rewinds that suffix
+/// with [`fbw_effect_journal_rollback_since`]. A descent that aborts the
+/// walk is undone by [`fbw_store_journal_rollback`] instead.
 pub(crate) fn fbw_binop_rewind_refuse_commit<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,

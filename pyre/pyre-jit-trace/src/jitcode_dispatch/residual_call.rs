@@ -8007,15 +8007,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // `FBW_LIST_EFFECT_JOURNAL`, whose commit/rollback epilogues run on FBW walk
     // ends (same lifecycle as the STORE_SUBSCR store journal).
     //
-    // Restrict to the top full-body frame: inside an inlined callee sub-walk
-    // (`fbw_mode.inline_subwalk`) the fold's gating guards collapse
-    // their resume to the caller's CALL boundary (`entry_py_pc` /
-    // `outer_active_boxes`), which re-executes the whole caller iteration on a
-    // guard failure — doubling any caller side effect sequenced before the
-    // inlined call (e.g. a `STORE_ATTR` ahead of an inlined `push(lst, x)`).
-    // An inlined append falls back to the generic residual, which resumes
-    // *past* the call (after_residual_call) and so re-runs nothing extra.
-    //
     // Both loop and function-entry (no-loop) traces are eligible.  A
     // no-loop helper compiled from entry (e.g. `def push(a, v): a.append(v)`
     // called in a hot loop) traces with `header_pc == 0`; its spare-capacity
@@ -8028,12 +8019,22 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // does not, verified by a two-list alternating-receiver append stress
     // (any wrong receiver box corrupts the cross-checked lists) and the
     // parity suite folding function-entry helper appends on both backends.
+    // Inside an inlined callee the same descent runs only when
+    // `walker_inline_guard_resumes_in_callee` holds.  `w_list_append_inner`
+    // is a transparent helper: `walker_capture_transparent_helper_snapshot`
+    // resumes at the paused Python CALL from
+    // `compute_inline_helper_call_entry_frame`, so a guard re-executes that
+    // call rather than the caller's earlier stores.  A shorter parent chain
+    // still collapses onto `entry_py_pc` / `outer_active_boxes` and stays on
+    // the residual, whose resume is past the call.
     // #171 ORTHODOX descent: descend the real `w_list_append` body,
     // recording its array ops native.
     // A recognition or body-sub-walk decline falls through to the generic
-    // residual below. Gated to top full-body frames, not inside a sub-walk.
+    // residual below.
+    let list_append_inline_ok =
+        !ctx.fbw_mode.inline_subwalk || walker_inline_guard_resumes_in_callee(ctx);
     if ctx.is_authoritative_executor
-        && !ctx.fbw_mode.inline_subwalk
+        && list_append_inline_ok
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && try_walker_orthodox_list_append(ctx, code, op, &r_args, dst)?.is_some()
@@ -8047,10 +8048,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // list is the peeked receiver, the value the popped operand — no
     // bound-method callable), so it arrives with `dst_bank == 'v'`.  Fold it
     // through the same `w_list_append` descent as the CallFn method-call form.
-    // Gated to top full-body frames, not inside a sub-walk (same
-    // caller-side-effect doubling concern as the CallFn form).
+    // Same inline resume gate as the CallFn form (`list_append_inline_ok`).
     if ctx.is_authoritative_executor
-        && !ctx.fbw_mode.inline_subwalk
+        && list_append_inline_ok
         && dst_bank == 'v'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::ListAppendValue
     {
