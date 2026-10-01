@@ -248,6 +248,9 @@ fn scalar_pointer_params_match_int_callers() {
             | OpKind::BinOp { result_ty, .. },
         ) => int_family(result_ty),
         Some(OpKind::RawLoad { item_ty, .. }) => int_family(item_ty),
+        // `&mut keyhash` is spilled to a raw address. `_rewrite_raw_malloc`
+        // types that word Int, the same bank as `hash_out`.
+        Some(OpKind::RawMalloc { .. }) => true,
         other => panic!("caller must pass hash_out as int, producer {other:?}"),
     };
     assert!(passed_int, "caller passes hash_out as int");
