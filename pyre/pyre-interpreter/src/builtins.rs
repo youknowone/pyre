@@ -23466,16 +23466,17 @@ fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
         if !dirty {
             return Ok(());
         }
-        if let (Ok(name), Ok(mut mode)) = (
-            pyre_object::with_roots!(obj => crate::baseobjspace::getattr_str(obj, "__file_name__")),
-            pyre_object::with_roots!(obj => crate::baseobjspace::getattr_str(obj, "__file_mode__")),
-        ) {
+        let name =
+            pyre_object::with_roots!(obj => crate::baseobjspace::getattr_str(obj, "__file_name__"));
+        // Typed W_FileIO keeps the mode on its fields. `file_mode_string`
+        // reads those, then `__file_mode__` for a dict-backed stream.
+        let mode_s = pyre_object::with_roots!(obj => file_mode_string(obj));
+        if let Ok(name) = name {
+            if mode_s.is_empty() {
+                return Ok(());
+            }
             let name_s = unsafe {
-                pyre_object::with_roots!(mode, obj => crate::baseobjspace::str_utf8_w(name))?
-                    .to_string()
-            };
-            let mode_s = unsafe {
-                pyre_object::with_roots!(obj => crate::baseobjspace::str_utf8_w(mode))?.to_string()
+                pyre_object::with_roots!(obj => crate::baseobjspace::str_utf8_w(name))?.to_string()
             };
             let data = pyre_object::with_roots!(obj => file_get_data(obj));
             let append = mode_s.contains('a');
