@@ -968,6 +968,34 @@ enum ReturnClass {
     Other,
 }
 
+/// `Result<i64, …>` / `Result<bool, …>` / `Result<f64, …>`: the `Ok`
+/// payload is a machine scalar. Other spellings stay shells.
+fn result_spelling_ok_is_scalar(spelling: &str) -> bool {
+    let Some(args) = generic_args_body(spelling) else {
+        return false;
+    };
+    let Some(ok) = split_top_level_args(args).into_iter().next() else {
+        return false;
+    };
+    matches!(
+        type_leaf(ok),
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "bool"
+            | "f32"
+            | "f64"
+    )
+}
+
 fn scalar_result_kind(ty: &ValueType) -> Option<char> {
     match ty {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::SingleFloat => {
@@ -1279,7 +1307,10 @@ fn split_result_shell_return(
             true,
         )
         .expect("ok payload read");
-    graph.set_return(ok_bb, Some(payload));
+    graph.set_return(ok_bb, Some(payload.clone()));
+    // The returnblock inputarg is still the `Result` shell. A fresh phi
+    // carries `T`, so the rtyper does not keep the shell's `Ref`.
+    separate_payload_from_shell(graph, ok_bb.0, &payload, &[], false)?;
 
     let err_payload = graph
         .push_op_var(
@@ -1358,6 +1389,14 @@ fn unwrap_forwarded_carrier_returns(
                 else {
                     continue;
                 };
+                // A scalar `Ok` (`space.index_w`'s `i64`) is split later
+                // by `unwrap_returned_scalar_result_shells`, which types
+                // the payload as that scalar. Splitting it here types
+                // `__pos_0` as `Ref` (`RESULT_OK_TEMPLATE`) and the CFG
+                // return stays `r` against `FUNC.RESULT=i`.
+                if result_spelling_ok_is_scalar(&found) {
+                    continue;
+                }
                 if let Some(prev) = &base
                     && prev != &found
                 {
