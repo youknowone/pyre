@@ -31,8 +31,9 @@ fn nursery_spec_folds_gc_type_size() {
         &[],
         &[
             "alloc_exception_nursery",
+            "allocate_exception",
             "w_exception_new_empty_impl",
-            "w_exception_new_empty_extended_impl",
+            "w_exception_new_empty_extended_for_class",
         ],
     )
     .expect("interp exception graphs lower");
