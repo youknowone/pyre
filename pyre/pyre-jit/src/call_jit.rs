@@ -5055,23 +5055,64 @@ fn fill_positional_defaults_for_jit_call<'a>(
     Cow::Owned(full)
 }
 
+/// Locals `createframe` stores, matched the way `funccall` matches them.
+///
+/// `def f(*args)` has one local, and that local is the packed tuple.
+/// Copying the raw positional into it makes `len(args)` raise
+/// `TypeError` on the int. A mismatch still uses the defaults-only
+/// slice: the assembler entry has no error return, and the previous
+/// frame shape is what that path already ran.
+fn scope_args_for_jit_callee(
+    callable: PyObjectRef,
+    w_code: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Vec<PyObjectRef> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(2 + args.len());
+    live.push(callable);
+    live.push(w_code);
+    live.extend_from_slice(args);
+    let base = roots.pin_roots(&live);
+    let callable = roots.get(base);
+    let w_code = roots.get(base + 1);
+    let mut positional = Vec::with_capacity(args.len());
+    for i in 0..args.len() {
+        positional.push(roots.get(base + 2 + i));
+    }
+    let code_ref = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
+    };
+    if let Ok(filled) =
+        pyre_interpreter::call::fill_user_function_args(callable, code_ref, &positional)
+    {
+        return filled;
+    }
+    let callable = roots.get(base);
+    let w_code = roots.get(base + 1);
+    positional.clear();
+    for i in 0..args.len() {
+        positional.push(roots.get(base + 2 + i));
+    }
+    fill_positional_defaults_for_jit_call(callable, w_code, &positional).into_owned()
+}
+
+/// Self-recursive entries have the caller's code and no function object,
+/// so defaults stay unbound here. `pack_varargs` still builds the
+/// `*args` / `**kwargs` locals `createframe` writes.
+fn scope_args_for_jit_code(code: *const (), args: &[PyObjectRef]) -> Vec<PyObjectRef> {
+    let code_ref = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(code as PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    pyre_interpreter::call::pack_varargs(code_ref, args.to_vec())
+}
+
 fn create_callee_frame_impl_1_boxed(
-    _caller_frame: i64,
+    caller_frame: i64,
     callable: PyObjectRef,
     boxed_arg: PyObjectRef,
 ) -> i64 {
-    let w_code = unsafe { pyre_interpreter::getcode(callable) };
-    let w_globals = unsafe { function_get_globals_obj(callable) };
-    let one_arg = [boxed_arg];
-    let args = fill_positional_defaults_for_jit_call(callable, w_code, &one_arg);
-    let args = args.as_ref();
-
-    alloc_callee_frame(
-        w_code as *const (),
-        args,
-        w_globals,
-        pyre_interpreter::call::getexecutioncontext(),
-    ) as i64
+    create_callee_frame_impl(caller_frame, callable as i64, &[boxed_arg])
 }
 
 fn create_self_recursive_callee_frame_impl_1_boxed(
@@ -5081,13 +5122,18 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let func_code = caller.pycode;
     let w_globals = caller.get_w_globals();
-    let execution_context = pyre_interpreter::call::getexecutioncontext();
-
     // Read before the call: `alloc_callee_frame` resolves `__builtins__`, which
     // can run a user `__getitem__` and so collect.  What this line reports is
     // the operand the trace passed; `locals` below is the frame's own.
     let passed_arg = boxed_arg as usize;
-    let frame_ptr = alloc_callee_frame(func_code, &[boxed_arg], w_globals, execution_context);
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[func_code as PyObjectRef, w_globals, boxed_arg]);
+    let execution_context = pyre_interpreter::call::getexecutioncontext();
+    let func_code = roots.get(base) as *const ();
+    let w_globals = roots.get(base + 1);
+    let boxed_arg = roots.get(base + 2);
+    let frame_ptr =
+        alloc_matched_self_recursive_frame(func_code, w_globals, &[boxed_arg], execution_context);
     if majit_metainterp::majit_log_enabled() {
         let f = unsafe { &*frame_ptr };
         eprintln!(
@@ -5099,11 +5145,21 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
 }
 
 fn create_callee_frame_impl(_caller_frame: i64, callable: i64, args: &[PyObjectRef]) -> i64 {
-    create_callee_frame_in_ctx(
-        pyre_interpreter::call::getexecutioncontext(),
-        callable as PyObjectRef,
-        args,
-    )
+    // `getexecutioncontext` can allocate the thread's first context. Pin
+    // first, or that allocation forwards `callable` and the positionals
+    // before the match below sees them.
+    let roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(1 + args.len());
+    live.push(callable as PyObjectRef);
+    live.extend_from_slice(args);
+    let base = roots.pin_roots(&live);
+    let execution_context = pyre_interpreter::call::getexecutioncontext();
+    let callable = roots.get(base);
+    let mut positional = Vec::with_capacity(args.len());
+    for i in 0..args.len() {
+        positional.push(roots.get(base + 1 + i));
+    }
+    create_callee_frame_in_ctx(execution_context, callable, &positional)
 }
 
 /// [`create_callee_frame_impl`] with the execution context passed directly.
@@ -5118,12 +5174,50 @@ fn create_callee_frame_in_ctx(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> i64 {
+    // `fill_user_function_args` allocates the `*args` tuple. The code and
+    // globals `createframe` stores are reloaded from these pins: the words
+    // captured before that allocation are not live across it.
+    let roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(1 + args.len());
+    live.push(callable);
+    live.extend_from_slice(args);
+    let base = roots.pin_roots(&live);
+    let callable = roots.get(base);
+    let mut positional = Vec::with_capacity(args.len());
+    for i in 0..args.len() {
+        positional.push(roots.get(base + 1 + i));
+    }
+    let w_code = unsafe { pyre_interpreter::getcode(callable) };
+    let filled = scope_args_for_jit_callee(callable, w_code, &positional);
+    let callable = roots.get(base);
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
     let w_globals = unsafe { function_get_globals_obj(callable) };
-    let args = fill_positional_defaults_for_jit_call(callable, w_code, args);
-    let args = args.as_ref();
+    alloc_callee_frame(w_code as *const (), &filled, w_globals, execution_context) as i64
+}
 
-    alloc_callee_frame(w_code as *const (), args, w_globals, execution_context) as i64
+/// Self-recursive entries carry code and globals as raw words. Pin them
+/// across `pack_varargs` and reread, same as [`create_callee_frame_in_ctx`].
+fn alloc_matched_self_recursive_frame(
+    func_code: *const (),
+    w_globals: PyObjectRef,
+    args: &[PyObjectRef],
+    execution_context: *const pyre_interpreter::PyExecutionContext,
+) -> *mut PyFrame {
+    let roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(2 + args.len());
+    live.push(func_code as PyObjectRef);
+    live.push(w_globals);
+    live.extend_from_slice(args);
+    let base = roots.pin_roots(&live);
+    let mut positional = Vec::with_capacity(args.len());
+    for i in 0..args.len() {
+        positional.push(roots.get(base + 2 + i));
+    }
+    let func_code = roots.get(base) as *const ();
+    let filled = scope_args_for_jit_code(func_code, &positional);
+    let func_code = roots.get(base) as *const ();
+    let w_globals = roots.get(base + 1);
+    alloc_callee_frame(func_code, &filled, w_globals, execution_context)
 }
 
 #[majit_macros::dont_look_inside]
@@ -5179,11 +5273,16 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
     let caller = unsafe { &*(caller_frame) };
     let func_code = caller.pycode;
     let w_globals = caller.get_w_globals();
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[func_code as PyObjectRef, w_globals]);
+    let boxed_at = roots.pin_roots(&[pyre_object::intobject::w_int_new(raw_int_arg)]);
     let execution_context = pyre_interpreter::call::getexecutioncontext();
+    let func_code = roots.get(base) as *const ();
+    let w_globals = roots.get(base + 1);
+    let boxed = roots.get(boxed_at);
 
-    let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
-
-    let frame_ptr = alloc_callee_frame(func_code, &[boxed], w_globals, execution_context);
+    let frame_ptr =
+        alloc_matched_self_recursive_frame(func_code, w_globals, &[boxed], execution_context);
     if majit_metainterp::majit_log_enabled() {
         let f = unsafe { &*frame_ptr };
         eprintln!(
@@ -5205,7 +5304,11 @@ pub extern "C" fn jit_create_callee_frame_1_raw_int(
     callable: PyObjectRef,
     raw_int_arg: i64,
 ) -> i64 {
-    let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[callable]);
+    let boxed_at = roots.pin_roots(&[pyre_object::intobject::w_int_new(raw_int_arg)]);
+    let callable = roots.get(base);
+    let boxed = roots.get(boxed_at);
     create_callee_frame_impl_1_boxed(caller_frame, callable, boxed)
 }
 
