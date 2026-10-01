@@ -2905,26 +2905,27 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     // `w_qualname` (`w_code_name_obj`). Every app-level reader uses it.
     // `CodeObject.obj_name` stays the compiler UTF-8 mirror JIT debug names
     // read; a lone surrogate is not written into it.
-    // A lone-surrogate name is kept as a str object and read again after the
-    // field parsers below, which allocate. Publish both slots before either
-    // parser runs so the name survives `co_qualname` and the qualname survives
-    // nothing earlier — the name parser is the first of the two.
+    // A lone-surrogate name is kept as a str object. `read_code_str` and the
+    // field parsers below allocate, so each surrogate is published with
+    // `pin_root` (`framework.py` `push_roots` writes that livevar) before the
+    // next parser runs, and read back from its slot afterwards.
     let _name_roots = pyre_object::gc_roots::push_roots();
-    let surrogate_base = _name_roots.pin_roots(&[pyre_object::PY_NULL, pyre_object::PY_NULL]);
-    let mut has_surrogate_name = false;
-    let mut has_surrogate_qualname = false;
+    let mut name_slot: Option<usize> = None;
+    let mut qual_slot: Option<usize> = None;
     if let Some(v) = get("co_name") {
         if unsafe { pyre_object::is_str(v) } && unsafe { !pyre_object::w_str_is_utf8(v) } {
-            has_surrogate_name = true;
-            _name_roots.set(surrogate_base, v);
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = _name_roots.pin_root(v);
+            name_slot = Some(slot);
         } else {
             code.obj_name = unsafe { read_code_str(v, "co_name")? };
         }
     }
     if let Some(v) = get("co_qualname") {
         if unsafe { pyre_object::is_str(v) } && unsafe { !pyre_object::w_str_is_utf8(v) } {
-            has_surrogate_qualname = true;
-            _name_roots.set(surrogate_base + 1, v);
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = _name_roots.pin_root(v);
+            qual_slot = Some(slot);
         } else {
             code.qualname = unsafe { read_code_str(v, "co_qualname")? };
         }
@@ -3004,10 +3005,14 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     );
 
     let mut result = box_code_object_with_firstlineno(code, firstlineno_raw);
-    let w_name =
-        has_surrogate_name.then(|| pyre_object::gc_roots::shadow_stack_get(surrogate_base));
-    let w_qualname =
-        has_surrogate_qualname.then(|| pyre_object::gc_roots::shadow_stack_get(surrogate_base + 1));
+    let w_name = match name_slot {
+        Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
+        None => None,
+    };
+    let w_qualname = match qual_slot {
+        Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
+        None => None,
+    };
     result = install_code_name_objects(result, w_name, w_qualname);
     unsafe { set_filename_bytes(result, filename_bytes) };
     unsafe { set_co_code_bytes(result, co_code_bytes) };

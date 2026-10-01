@@ -8216,6 +8216,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && try_walker_orthodox_complex_call(ctx, code, op, funcptr, &r_args, call_descr, dst)?
+            .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && try_walker_orthodox_str_call(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -9348,6 +9356,17 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
                         )
                     })?
+                    .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                // `complexobject.py complexwprop`: `real` / `imag` box the
+                // lane with `space.newfloat`. The mapdict fold declines a
+                // member descriptor, so descend that getter here.
+                if let Some(attr_name) = attr_name.as_deref()
+                    && try_walker_orthodox_complex_member(
+                        ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
+                    )?
                     .is_some()
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));

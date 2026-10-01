@@ -66,10 +66,21 @@ impl crate::lltype::GcType for W_ComplexObjectUser {
 
 /// Allocate a new W_ComplexObject on the heap.
 ///
-/// Routes through [`crate::lltype::malloc_typed`], the typed unified
-/// allocation lowering, mirroring `complexobject.c complex_subtype_from_doubles`
-/// / `PyComplex_FromCComplex`.
+/// Routes through [`newcomplex`], the typed unified allocation lowering,
+/// mirroring `complexobject.c complex_subtype_from_doubles` /
+/// `PyComplex_FromCComplex`.
+#[inline]
 pub fn w_complex_new(real: f64, imag: f64) -> PyObjectRef {
+    newcomplex(real, imag)
+}
+
+/// `complexobject.py descr__new__`'s `W_ComplexObject(real, imag)`.
+///
+/// Own graph so `fuse_boxing_alloc` rewrites the `malloc_typed` cluster to
+/// `new_with_vtable` + payload `setfield`. Looked inside: a
+/// `@dont_look_inside` would residualise the constructor PyPy traces.
+#[inline(never)]
+pub fn newcomplex(real: f64, imag: f64) -> PyObjectRef {
     crate::lltype::malloc_typed(W_ComplexObject {
         ob_header: PyObject {
             ob_type: &COMPLEX_TYPE as *const PyType,
@@ -78,6 +89,21 @@ pub fn w_complex_new(real: f64, imag: f64) -> PyObjectRef {
         real,
         imag,
     }) as PyObjectRef
+}
+
+/// `complexobject.py complexwprop` fget for `real`: `space.newfloat(realval)`.
+///
+/// The interpreter's `member_descriptor` path stays on `w_float_new`, which
+/// allocates on the collector heap. This leaf is the traced read.
+#[inline(never)]
+pub fn complex_descr_get_real(obj: PyObjectRef) -> PyObjectRef {
+    crate::newfloat(unsafe { w_complex_get_real(obj) })
+}
+
+/// `complexobject.py complexwprop` fget for `imag`: `space.newfloat(imagval)`.
+#[inline(never)]
+pub fn complex_descr_get_imag(obj: PyObjectRef) -> PyObjectRef {
+    crate::newfloat(unsafe { w_complex_get_imag(obj) })
 }
 
 /// Allocate a `W_ComplexObjectUser` for a `complex` subclass instance, on the
@@ -156,6 +182,12 @@ mod tests {
             assert!(!is_float(obj));
             assert_eq!(w_complex_get_real(obj), 3.0);
             assert_eq!(w_complex_get_imag(obj), 4.0);
+        }
+        let real = complex_descr_get_real(obj);
+        let imag = complex_descr_get_imag(obj);
+        unsafe {
+            assert_eq!(crate::w_float_get_value(real), 3.0);
+            assert_eq!(crate::w_float_get_value(imag), 4.0);
         }
     }
 

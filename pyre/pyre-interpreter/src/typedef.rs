@@ -3561,6 +3561,57 @@ fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(tag_subclass_instance(obj, sub))
 }
 
+/// Seed `newcomplex` into the builtin-wrapper closure.
+///
+/// The published `complex.__new__` stays [`complex_descr_new`]. This leaf
+/// exists so the wrapper family reaches `complexobject::newcomplex`.
+pub fn __majit_wrap_complex_newcomplex(
+    _args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    Ok(pyre_object::complexobject::newcomplex(0.0, 0.0))
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_complex_newcomplex,
+    __majit_wrap_complex_newcomplex
+);
+
+/// Seed `complex_descr_get_real` into the builtin-wrapper closure.
+pub fn __majit_wrap_complex_descr_get_real(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    if let Some(&obj) = args.first()
+        && !obj.is_null()
+        && unsafe { pyre_object::is_complex(obj) }
+    {
+        return Ok(pyre_object::complexobject::complex_descr_get_real(obj));
+    }
+    Ok(pyre_object::w_none())
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_complex_descr_get_real,
+    __majit_wrap_complex_descr_get_real
+);
+
+/// Seed `complex_descr_get_imag` into the builtin-wrapper closure.
+pub fn __majit_wrap_complex_descr_get_imag(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    if let Some(&obj) = args.first()
+        && !obj.is_null()
+        && unsafe { pyre_object::is_complex(obj) }
+    {
+        return Ok(pyre_object::complexobject::complex_descr_get_imag(obj));
+    }
+    Ok(pyre_object::w_none())
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_complex_descr_get_imag,
+    __majit_wrap_complex_descr_get_imag
+);
+
 /// Build a builtin type's `__new__` entry.
 ///
 /// `add_tp_new_wrapper` stores `PyCFunction_NewEx(tp_new_methoddef, type)`
