@@ -1321,6 +1321,23 @@ fn report_symbolic_residual_call_target(
     TraceAction::Abort
 }
 
+/// Refuse a residual call whose target address is null.
+///
+/// A path hash is refused above. Address 0 is the same hole with no hash:
+/// recording it compiles a call of address 0. Decline the trace so the
+/// interpreter runs the call.
+fn refuse_null_residual_call_target(ctx: &mut TraceCtx, arg_classes: &str) -> TraceAction {
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "residual call target is null (arg classes {arg_classes:?}); refusing the trace"
+        );
+    }
+    ctx.symbolic_residual_abort = true;
+    SYMBOLIC_RESIDUAL_TRACE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TraceAction::Abort
+}
+
 /// A walk-local `Dynamic` arrives as a small integer in a Ref register,
 /// not a live cell. Residual-calling a helper that drops `Union` through
 /// that address is `EXC_BAD_ACCESS`. Abort the walk the same way an
@@ -8794,18 +8811,17 @@ where
                             Some(&calldescr.arg_classes),
                         );
                     }
-                    let concrete = if concrete_ptr.is_null() {
-                        0
-                    } else {
-                        unsafe {
-                            majit_backend::call_stub::bh_call_i_by_classes(
-                                concrete_ptr as usize,
-                                &calldescr.arg_classes,
-                                Some(&raw_i),
-                                Some(&raw_r),
-                                Some(&raw_f),
-                            )
-                        }
+                    if concrete_ptr.is_null() {
+                        return refuse_null_residual_call_target(ctx, &calldescr.arg_classes);
+                    }
+                    let concrete = unsafe {
+                        majit_backend::call_stub::bh_call_i_by_classes(
+                            concrete_ptr as usize,
+                            &calldescr.arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        )
                     };
                     if let Some(action) = host_requested_walk_abort(
                         ctx,
@@ -9148,18 +9164,17 @@ where
                             Some(&calldescr.arg_classes),
                         );
                     }
-                    let concrete = if concrete_ptr.is_null() {
-                        0
-                    } else {
-                        unsafe {
-                            majit_backend::call_stub::bh_call_i_by_classes(
-                                concrete_ptr as usize,
-                                &calldescr.arg_classes,
-                                Some(&raw_i),
-                                Some(&raw_r),
-                                Some(&raw_f),
-                            )
-                        }
+                    if concrete_ptr.is_null() {
+                        return refuse_null_residual_call_target(ctx, &calldescr.arg_classes);
+                    }
+                    let concrete = unsafe {
+                        majit_backend::call_stub::bh_call_i_by_classes(
+                            concrete_ptr as usize,
+                            &calldescr.arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        )
                     };
                     if let Some(action) = host_requested_walk_abort(
                         ctx,
@@ -9443,18 +9458,17 @@ where
                             Some(&calldescr.arg_classes),
                         );
                     }
-                    let concrete = if concrete_ptr.is_null() {
-                        0.0f64
-                    } else {
-                        unsafe {
-                            majit_backend::call_stub::bh_call_f_by_classes(
-                                concrete_ptr as usize,
-                                &calldescr.arg_classes,
-                                Some(&raw_i),
-                                Some(&raw_r),
-                                Some(&raw_f),
-                            )
-                        }
+                    if concrete_ptr.is_null() {
+                        return refuse_null_residual_call_target(ctx, &calldescr.arg_classes);
+                    }
+                    let concrete = unsafe {
+                        majit_backend::call_stub::bh_call_f_by_classes(
+                            concrete_ptr as usize,
+                            &calldescr.arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        )
                     };
                     // pyjitpl.py — vrefs_after_residual_call
                     // (see void arm for the explanation; gated on
@@ -10643,18 +10657,17 @@ where
                         Some(&arg_classes),
                     );
                 }
-                let concrete = if concrete_ptr.is_null() {
-                    0
-                } else {
-                    unsafe {
-                        majit_backend::call_stub::bh_call_i_by_classes(
-                            concrete_ptr as usize,
-                            &arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        )
-                    }
+                if concrete_ptr.is_null() {
+                    return refuse_null_residual_call_target(ctx, &arg_classes);
+                }
+                let concrete = unsafe {
+                    majit_backend::call_stub::bh_call_i_by_classes(
+                        concrete_ptr as usize,
+                        &arg_classes,
+                        Some(&raw_i),
+                        Some(&raw_r),
+                        Some(&raw_f),
+                    )
                 };
                 if let Some(action) =
                     host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
@@ -10770,18 +10783,17 @@ where
                 }
                 // 3. execute (pyjitpl.py, tp == 'r') — `executor.execute_varargs`
                 //    → `cpu.bh_call_r` / leftover `bh_call_i_by_classes`.
-                let concrete = if concrete_ptr.is_null() {
-                    0
-                } else {
-                    unsafe {
-                        majit_backend::call_stub::bh_call_i_by_classes(
-                            concrete_ptr as usize,
-                            &arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        )
-                    }
+                if concrete_ptr.is_null() {
+                    return refuse_null_residual_call_target(ctx, &arg_classes);
+                }
+                let concrete = unsafe {
+                    majit_backend::call_stub::bh_call_i_by_classes(
+                        concrete_ptr as usize,
+                        &arg_classes,
+                        Some(&raw_i),
+                        Some(&raw_r),
+                        Some(&raw_f),
+                    )
                 };
                 if let Some(action) =
                     host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
@@ -10897,18 +10909,17 @@ where
                 }
                 // 3. execute (pyjitpl.py, tp == 'f') — leftover wrappers
                 //    return packed i64 bits (`f64::to_bits`); `cpu.bh_call_i`.
-                let concrete = if concrete_ptr.is_null() {
-                    0
-                } else {
-                    unsafe {
-                        majit_backend::call_stub::bh_call_i_by_classes(
-                            concrete_ptr as usize,
-                            &arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        )
-                    }
+                if concrete_ptr.is_null() {
+                    return refuse_null_residual_call_target(ctx, &arg_classes);
+                }
+                let concrete = unsafe {
+                    majit_backend::call_stub::bh_call_i_by_classes(
+                        concrete_ptr as usize,
+                        &arg_classes,
+                        Some(&raw_i),
+                        Some(&raw_r),
+                        Some(&raw_f),
+                    )
                 };
                 if let Some(action) =
                     host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
