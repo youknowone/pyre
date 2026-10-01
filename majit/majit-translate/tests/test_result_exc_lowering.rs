@@ -1138,12 +1138,15 @@ fn lock_locked_returns_the_bool_word() {
 /// diamond and `catch_and_rewrap` rebuilds the shell. The break arm still
 /// returned `Result::from_residual`. That call only raises; reminting it
 /// to `i64` makes the CFG return `void` while `FUNC.RESULT` is `i`
-/// (`func_result_kind`, `history.getkind`). The arm must raise the carrier.
+/// (`func_result_kind`, `history.getkind`). The arm raises the carrier.
+/// `lower_error_carrier_edges` then stores `pyerror_to_exc_object` of
+/// that value; the front graph does not.
 #[test]
 fn getindex_w_index_from_residual_raises() {
     use majit_translate::model::{LinkArg, ValueType};
     let path = "pyre_interpreter::baseobjspace::getindex_w_index";
-    let g = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower: {e}"));
+    let g =
+        lower_function_to_runtime_edges(interp(), path).unwrap_or_else(|e| panic!("lower: {e}"));
     let mut reachable = vec![false; g.blocks.len()];
     let mut stack = vec![g.startblock.0];
     while let Some(block) = stack.pop() {
@@ -1244,12 +1247,14 @@ fn getindex_w_index_from_residual_raises() {
 /// `eval_loop` uses `decode_instruction_forward(code, pc)?`. The callee's
 /// error is `BytecodeCorruption` and the function returns `PyError` through
 /// `impl From<BytecodeCorruption> for PyError`. `FromResidual::from_residual`
-/// is `Err(From::from(e))`, so the raise takes that `from` result.
+/// is `Err(From::from(e))`, so the raised carrier is that `from` result.
+/// `lower_error_carrier_edges` wraps it in `pyerror_to_exc_object`.
 #[test]
 fn eval_loop_converts_bytecode_corruption_before_raising() {
     use majit_translate::model::LinkArg;
     let path = "pyre_interpreter::eval::eval_loop";
-    let g = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower: {e}"));
+    let g =
+        lower_function_to_runtime_edges(interp(), path).unwrap_or_else(|e| panic!("lower: {e}"));
     let mut reachable = vec![false; g.blocks.len()];
     let mut stack = vec![g.startblock.0];
     while let Some(block) = stack.pop() {
