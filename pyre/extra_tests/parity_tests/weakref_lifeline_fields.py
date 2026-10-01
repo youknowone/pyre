@@ -122,9 +122,13 @@ def make_code():
 def make_fileio():
     fd, name = tempfile.mkstemp()
     os.close(fd)
-    handle = io.FileIO(name, "rb")
-    os.unlink(name)
-    return handle
+    # Windows rejects unlink while FileIO still has the file open
+    # (WinError 32). Drop the name after `exercise` has collected it.
+    make_fileio.names.append(name)
+    return io.FileIO(name, "rb")
+
+
+make_fileio.names = []
 
 
 def make_alias():
@@ -176,7 +180,15 @@ exercise(lambda: io.BufferedWriter(io.BytesIO()))
 exercise(lambda: io.BufferedRandom(io.BytesIO()))
 exercise(lambda: io.BufferedRWPair(io.BytesIO(), io.BytesIO()))
 exercise(lambda: io.TextIOWrapper(io.BytesIO()))
-exercise(make_fileio)
+try:
+    exercise(make_fileio)
+finally:
+    while make_fileio.names:
+        name = make_fileio.names.pop()
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
 exercise(make_alias)
 exercise(lambda: type("LifelineUser", (), {})())
 exercise(lambda: ListSub())
