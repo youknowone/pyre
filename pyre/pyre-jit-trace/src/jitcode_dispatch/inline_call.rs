@@ -14662,8 +14662,30 @@ fn descend_generatorentry<Sym: WalkSym>(
     // `GUARD_NOT_FORCED` and `handle_possible_exception`.
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[iter_op]);
     if raised != 0 {
+        // `pyopcode.py` `FOR_ITER`: `e.match(space, space.w_StopIteration)`
+        // ends the loop.  This resume replaces `jit_next`, which returns
+        // null for that match and does not publish it.  Surfacing it as
+        // `SubRaise` delivers the exception to the generator's PEP 479
+        // wrapper (`generator.py` `_leak_stopiteration`).
+        let exc_obj = raised as pyre_object::PyObjectRef;
+        if pyre_interpreter::exception_object_matches_stop_iteration(exc_obj) {
+            ctx.trace_ctx.set_opref_concrete(
+                ca_result,
+                majit_ir::Value::Ref(majit_ir::GcRef(0)),
+            );
+            ctx.clear_last_exc_value();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+            if let Some(cb) = crate::callbacks::try_get() {
+                (cb.drain_backend_jit_exc)();
+            }
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardNoException, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        }
         // A returning generator raises `StopIteration` out of `send_ex`.
-        // The executor already returned that exception word.
+        // The executor already returned that exception word.  Anything that
+        // is not StopIteration still propagates.
         let exc = ctx.trace_ctx.const_ref(raised);
         let exc_concrete = ConcreteValue::Ref(raised as pyre_object::PyObjectRef);
         ctx.set_last_exc_value(exc, exc_concrete);

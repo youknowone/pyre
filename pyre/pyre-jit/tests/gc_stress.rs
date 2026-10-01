@@ -877,6 +877,41 @@ assert result == 300, result
     );
 }
 
+/// `pyopcode.py` `FOR_ITER` absorbs `StopIteration`. A generator loop that
+/// yields from a nested generator must keep doing that after the loop is
+/// traced: the inner generator's return is exhaustion, not
+/// `RuntimeError("generator raised StopIteration")`.
+#[test]
+fn generator_for_iter_absorbs_inner_stopiteration() {
+    const PROGRAM: &str = r#"
+def inner():
+    yield 1
+    yield 2
+
+def outer():
+    for y in inner():
+        yield y
+
+def run():
+    n = 0
+    while n < 2000:
+        got = list(outer())
+        if got != [1, 2]:
+            return got
+        n = n + 1
+    return "OK"
+
+result = run()
+assert result == "OK", result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<generator_for_iter_absorbs_inner_stopiteration>",
+        "nested generator FOR_ITER absorption",
+        "generator FOR_ITER leaked StopIteration",
+    );
+}
+
 /// A `bytes` / `bytearray` object's `data` buffer is a GC-managed leaf storage
 /// box (off-GC storage): `bytes_object_custom_trace` /
 /// `bytearray_object_custom_trace` grey it through the `data` field slot, and
