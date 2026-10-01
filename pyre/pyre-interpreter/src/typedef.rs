@@ -21383,8 +21383,8 @@ fn init_complex_type(ns: PyObjectRef) {
                         }
                         // Reuse complex.__new__'s exact-base identity and subclass
                         // allocation.  The constructor's numeric-only path runs
-                        // __complex__, __float__, then __index__ without parsing
-                        // text because those inputs were rejected above.
+                        // __complex__, then __index__, then __float__, and does
+                        // not parse text because those inputs were rejected above.
                         complex_descr_new(&[args[0], value])
                     },
                     2,

@@ -25502,10 +25502,108 @@ fn parse_complex_str(raw: &str) -> Option<(f64, f64)> {
     rustpython_literal::complex::parse_str(raw)
 }
 
+/// Payload of a bool, or of an exact machine int, long, or float.
+///
+/// `descroperation.py index` returns an `isinstance` int before any user
+/// call, and `descr__new__` of float reads an exact float payload. A strict
+/// int, long, or float subclass is `None` so the caller can still honor
+/// `__index__` or `__float__`.
+fn exact_builtin_complex_real(obj: PyObjectRef) -> Option<Result<f64, crate::PyError>> {
+    use pyre_object::*;
+    unsafe {
+        if is_bool(obj) {
+            return Some(Ok(w_bool_get_value(obj) as i64 as f64));
+        }
+        if is_int(obj) && is_exact_builtin_instance(obj) {
+            return Some(Ok(w_int_get_value(obj) as f64));
+        }
+        if is_long(obj) && is_exact_builtin_instance(obj) {
+            return Some(match int_payload_as_f64(obj) {
+                Some(value) => value,
+                None => Err(crate::PyError::type_error("must be real number, not int")),
+            });
+        }
+        if is_float(obj) && is_exact_builtin_instance(obj) {
+            return Some(Ok(w_float_get_value(obj)));
+        }
+    }
+    None
+}
+
+/// `unpackcomplex`'s `space.float_w(space.float(space.index(w)))`.
+///
+/// `descroperation.py _index` returns an `isinstance` int without calling
+/// `__index__`. `index` then strips a strict subclass to a base int, so a
+/// subclass `__float__` or `__index__` does not run. Any other object calls
+/// `__index__`.
+fn complex_index_to_real(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
+    use pyre_object::*;
+    let indexed = if unsafe { is_bool(obj) || is_int(obj) || is_long(obj) } {
+        unsafe { pyre_object::with_roots!(obj => crate::baseobjspace::int_as_base(obj)) }
+    } else {
+        pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj))?
+    };
+    match int_payload_as_f64(indexed) {
+        Some(value) => value,
+        None => Err(crate::PyError::type_error(format!(
+            "__index__ returned non-int (type {})",
+            crate::type_methods::arg_type_name(indexed)
+        ))),
+    }
+}
+
+/// `descr__new__` `float` (`descroperation.py`) plus `float_w`.
+///
+/// A float subclass shares the float layout. `float_w` reads that payload
+/// and would skip an overridden `__float__`, so the override is called
+/// first. This is not `float()`: no `__index__` and no string parsing.
+fn complex_space_float(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
+    use pyre_object::*;
+    if unsafe { is_float(obj) && !is_exact_builtin_instance(obj) } {
+        let Some(method) = (unsafe { crate::baseobjspace::lookup(obj, "__float__") }) else {
+            return Err(unsafe {
+                crate::PyError::from_exc_object(crate::baseobjspace::float_w_must_be_real(obj))
+            });
+        };
+        let w_type = crate::typedef::r#type(obj)
+            .map(|w_type| w_type.as_ptr())
+            .unwrap_or(obj);
+        let w_result = unsafe {
+            pyre_object::with_roots!(obj => {
+                crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])
+            })?
+        };
+        if unsafe { is_float(w_result) } {
+            return Ok(unsafe { w_float_get_value(w_result) });
+        }
+        return Err(unsafe {
+            crate::PyError::from_exc_object(crate::baseobjspace::float_w_returned_non_float(
+                obj, w_result,
+            ))
+        });
+    }
+    crate::baseobjspace::float_w(obj)
+}
+
+/// Real component of a non-complex `unpackcomplex` operand.
+///
+/// `__index__` wins over `__float__`. Strings are not parsed.
+fn complex_real_number(obj: PyObjectRef) -> Result<f64, crate::PyError> {
+    if let Some(value) = exact_builtin_complex_real(obj) {
+        return value;
+    }
+    if unsafe { crate::baseobjspace::lookup(obj, "__index__").is_some() } {
+        return complex_index_to_real(obj);
+    }
+    complex_space_float(obj)
+}
+
 /// Coerce a value to `(real, imag)` for `complex()` construction.
 ///
-/// `int`/`bool`/`float` become a real-only pair; a `complex` keeps both
-/// components; an instance is asked for `__complex__` then `__float__`.
+/// `complexobject.py unpackcomplex`: an exact complex keeps both lanes;
+/// `__complex__` runs next; `__index__` (`space.index`, then `space.float`
+/// of that int) runs before a complex subclass's lanes and before
+/// `space.float`.
 pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
     use pyre_object::*;
     unsafe {
@@ -25513,9 +25611,9 @@ pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
             return Ok((w_complex_get_real(obj), w_complex_get_imag(obj)));
         }
     }
-    // CPython 3.14 try_complex_special_method runs before the complex-subclass
-    // fallback, so a subclass override is honored instead of reading its raw
-    // lanes.  The inherited complex.__complex__ returns an exact base value.
+    // `try_complex_special_method` runs before the complex-subclass fallback,
+    // so a subclass override is honored instead of reading its raw lanes.
+    // The inherited `complex.__complex__` returns an exact base value.
     if let Some(w_type) = crate::typedef::r#type(obj)
         && let Some(w_complex) =
             unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__complex__") }
@@ -25539,36 +25637,25 @@ pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
             crate::type_methods::arg_type_name(res)
         )));
     }
+    if let Some(value) = exact_builtin_complex_real(obj) {
+        return Ok((value?, 0.0));
+    }
+    // `__index__` before a complex subclass's lanes and before `__float__`.
+    if unsafe { crate::baseobjspace::lookup(obj, "__index__").is_some() } {
+        return Ok((complex_index_to_real(obj)?, 0.0));
+    }
     unsafe {
         if is_complex(obj) {
             return Ok((w_complex_get_real(obj), w_complex_get_imag(obj)));
         }
-        if is_bool(obj) {
-            return Ok((w_bool_get_value(obj) as i64 as f64, 0.0));
-        }
-        if is_int(obj) && is_exact_builtin_instance(obj) {
-            return Ok((w_int_get_value(obj) as f64, 0.0));
-        }
-        if is_long(obj) {
-            // `float_w` applies the same exactness rule to the payload arms,
-            // so a strict subclass overriding `__float__` is honored there.
-            return Ok((crate::baseobjspace::float_w(obj)?, 0.0));
-        }
-        if is_float(obj) {
-            return Ok((w_float_get_value(obj), 0.0));
-        }
     }
-    // `complexobject.py unpackcomplex`: after `__complex__`, conversion uses
-    // the real-number protocol.  Reuse float's `__float__` then `__index__`
-    // ladder so an index-only object is accepted without admitting strings.
     if unsafe { is_str(obj) || pyre_object::is_bytes(obj) || pyre_object::is_bytearray(obj) } {
         return Err(crate::PyError::type_error(format!(
             "must be real number, not {}",
             crate::type_methods::arg_type_name(obj)
         )));
     }
-    let w_float = builtin_float(&[obj])?;
-    Ok((unsafe { w_float_get_value(w_float) }, 0.0))
+    Ok((complex_space_float(obj)?, 0.0))
 }
 
 /// `complex(real=0, imag=0)` — complexobject.c complex_new.
@@ -25692,8 +25779,10 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             if !unsafe { complex_constructor_has_real_protocol(b) } {
                 return Err(complex_constructor_argument_error("imag", b));
             }
-            let converted = builtin_float(&[b])?;
-            (unsafe { w_float_get_value(converted) }, 0.0)
+            // `unpackcomplex` on the imaginary operand: `__index__` before
+            // `__float__`. A complex operand took the lane path above.
+            let real_part = complex_real_number(b)?;
+            (real_part, 0.0)
         };
         // CPython 3.14 `complex_new_impl`: the real lane always uses ordinary
         // IEEE subtraction. A complex-valued first operand combines its
@@ -26891,6 +26980,123 @@ mod tests {
             unsafe { w_complex_get_imag(result).to_bits() },
             (-0.0f64).to_bits()
         );
+    }
+
+    #[test]
+    fn test_complex_prefers_index_over_float() {
+        crate::typedef::init_typeobjects();
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static INDEX_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static FLOAT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        let user_type = crate::typedef::make_builtin_type("IdxAndFloat", |ns| unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__index__",
+                make_builtin_function("__index__", |_| {
+                    INDEX_CALLS.fetch_add(1, Ordering::Relaxed);
+                    Ok(w_int_new(3))
+                }),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__float__",
+                make_builtin_function("__float__", |_| {
+                    FLOAT_CALLS.fetch_add(1, Ordering::Relaxed);
+                    Ok(w_float_new(7.0))
+                }),
+            );
+        });
+        let obj = pyre_object::objectobject::w_instance_new(user_type);
+        INDEX_CALLS.store(0, Ordering::Relaxed);
+        FLOAT_CALLS.store(0, Ordering::Relaxed);
+        let result = builtin_complex(&[obj]).unwrap();
+        assert_eq!(INDEX_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(FLOAT_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(unsafe { w_complex_get_real(result) }, 3.0);
+        assert_eq!(unsafe { w_complex_get_imag(result) }, 0.0);
+
+        INDEX_CALLS.store(0, Ordering::Relaxed);
+        FLOAT_CALLS.store(0, Ordering::Relaxed);
+        let imag = builtin_complex(&[w_float_new(1.5), obj]).unwrap();
+        assert_eq!(INDEX_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(FLOAT_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(unsafe { w_complex_get_real(imag) }, 1.5);
+        assert_eq!(unsafe { w_complex_get_imag(imag) }, 3.0);
+
+        let float_only = crate::typedef::make_builtin_type("FloatOnlyForComplex", |ns| unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__float__",
+                make_builtin_function("__float__", |_| Ok(w_float_new(7.0))),
+            );
+        });
+        let floated =
+            builtin_complex(&[pyre_object::objectobject::w_instance_new(float_only)]).unwrap();
+        assert_eq!(unsafe { w_complex_get_real(floated) }, 7.0);
+        assert_eq!(unsafe { w_complex_get_imag(floated) }, 0.0);
+
+        let int_type = crate::typedef::gettypefor(&pyre_object::INT_TYPE)
+            .unwrap()
+            .as_ptr();
+        let sub = crate::typedef::make_builtin_type_with_base(
+            "IntPayloadForComplex",
+            |ns| unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__index__",
+                    make_builtin_function("__index__", |_| {
+                        INDEX_CALLS.fetch_add(1, Ordering::Relaxed);
+                        Ok(w_int_new(5))
+                    }),
+                );
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__float__",
+                    make_builtin_function("__float__", |_| {
+                        FLOAT_CALLS.fetch_add(1, Ordering::Relaxed);
+                        Ok(w_float_new(8.0))
+                    }),
+                );
+            },
+            int_type,
+        );
+        let inst = crate::typedef::tag_subclass_instance(
+            pyre_object::intobject::w_int_subclass_new(1),
+            sub,
+        );
+        INDEX_CALLS.store(0, Ordering::Relaxed);
+        FLOAT_CALLS.store(0, Ordering::Relaxed);
+        let from_sub = builtin_complex(&[inst]).unwrap();
+        assert_eq!(INDEX_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(FLOAT_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(unsafe { w_complex_get_real(from_sub) }, 1.0);
+
+        let float_type = crate::typedef::gettypefor(&pyre_object::FLOAT_TYPE)
+            .unwrap()
+            .as_ptr();
+        let fsub = crate::typedef::make_builtin_type_with_base(
+            "FloatOverrideForComplex",
+            |ns| unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__float__",
+                    make_builtin_function("__float__", |_| {
+                        FLOAT_CALLS.fetch_add(1, Ordering::Relaxed);
+                        Ok(w_float_new(1.5))
+                    }),
+                );
+            },
+            float_type,
+        );
+        let finst = crate::typedef::tag_subclass_instance(
+            pyre_object::floatobject::w_float_subclass_new(9.0),
+            fsub,
+        );
+        FLOAT_CALLS.store(0, Ordering::Relaxed);
+        let from_float = builtin_complex(&[finst]).unwrap();
+        assert_eq!(FLOAT_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(unsafe { w_complex_get_real(from_float) }, 1.5);
     }
 
     #[test]
