@@ -3276,19 +3276,12 @@ pub fn deref_name_and_kind(code: &CodeObject, idx: usize) -> (&str, bool) {
     let cell_slot = idx - nvarnames;
     let npure = npure_cellvars(code);
     if cell_slot < npure {
-        let name = code
-            .cellvars
-            .iter()
-            .filter(|c| {
-                let cs: &str = c.as_ref();
-                !code.varnames.iter().any(|v| {
-                    let vs: &str = v.as_ref();
-                    vs == cs
-                })
-            })
-            .nth(cell_slot)
-            .map(|c| c.as_ref())
-            .unwrap_or("");
+        let ci = nth_pure_cellvar_index(code, cell_slot);
+        let name = if ci < code.cellvars.len() {
+            code.cellvars[ci].as_ref()
+        } else {
+            ""
+        };
         (name, false)
     } else {
         let free_idx = cell_slot - npure;

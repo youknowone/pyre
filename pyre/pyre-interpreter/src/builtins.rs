@@ -5510,9 +5510,9 @@ fn builtin_abs_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 }
 
 /// operation.py `abs` → `space.abs`.  An exact machine int (short of
-/// `i64::MIN`, which `ovfcheck` promotes to a long), an exact float or an
-/// exact complex runs its `descr_abs` leaf; every other shape runs
-/// `builtin_abs`.
+/// `i64::MIN`, which `ovfcheck` promotes to a long) or an exact float boxes
+/// the magnitude with `w_int_new` / `w_float_new`.  An exact complex and
+/// every other shape run `builtin_abs`.
 pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 1 {
         let w_val = args[0];
@@ -5520,12 +5520,11 @@ pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
             if is_exact_builtin_instance(w_val) && is_int(w_val) {
                 let value = w_int_get_value(w_val);
                 if value != i64::MIN {
-                    return crate::objspace::descroperation::_int_abs(value);
+                    let magnitude = if value < 0 { 0i64.wrapping_sub(value) } else { value };
+                    return Ok(w_int_new(magnitude));
                 }
             } else if is_exact_builtin_instance(w_val) && is_float(w_val) {
-                return crate::objspace::descroperation::_float_abs(w_float_get_value(w_val));
-            } else if is_exact_builtin_instance(w_val) && pyre_object::is_complex(w_val) {
-                return crate::objspace::descroperation::complex_abs(w_val);
+                return Ok(w_float_new(w_float_get_value(w_val).abs()));
             }
         }
     }

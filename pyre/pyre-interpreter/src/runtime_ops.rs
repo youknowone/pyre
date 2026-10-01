@@ -1581,8 +1581,26 @@ pub extern "C" fn jit_sequence_getitem(seq: PyObjectRef, index: i64) -> PyObject
 }
 
 pub fn unpack_sequence_exact(
+    seq: PyObjectRef,
+    count: usize,
+) -> Result<Vec<PyObjectRef>, PyError> {
+    unpack_sequence_collected(seq, count, false)
+}
+
+/// Same collection as [`unpack_sequence_exact`], but the returned vec is in
+/// TOS order: the last element is first, so a forward push leaves the first
+/// element on top.
+pub fn unpack_sequence_exact_tos(
+    seq: PyObjectRef,
+    count: usize,
+) -> Result<Vec<PyObjectRef>, PyError> {
+    unpack_sequence_collected(seq, count, true)
+}
+
+fn unpack_sequence_collected(
     mut seq: PyObjectRef,
     count: usize,
+    tos_order: bool,
 ) -> Result<Vec<PyObjectRef>, PyError> {
     // Fast path only for exact built-in sequence types. Subclasses and other
     // instances may define custom `__iter__` that must be honored.
@@ -1630,9 +1648,7 @@ pub fn unpack_sequence_exact(
             let _ = pyre_object::gc_roots::pin_root(sequence_getitem(seq(), idx)?);
         }
         let mut items = Vec::with_capacity(count);
-        for index in 0..count {
-            items.push(pyre_object::gc_roots::shadow_stack_get(items_base + index));
-        }
+        push_shadow_slots(&mut items, items_base, count, tos_order);
         return Ok(items);
     }
     // Fallback: iteration protocol (handles type objects with metaclass __iter__, etc.)
@@ -1701,12 +1717,22 @@ pub fn unpack_sequence_exact(
         )));
     }
     let mut items = Vec::with_capacity(pulled);
-    for index in 0..pulled {
-        items.push(pyre_object::gc_roots::shadow_stack_get(
-            root_base + 1 + index,
-        ));
-    }
+    push_shadow_slots(&mut items, root_base + 1, pulled, tos_order);
     Ok(items)
+}
+
+fn push_shadow_slots(items: &mut Vec<PyObjectRef>, base: usize, count: usize, tos_order: bool) {
+    if tos_order {
+        let mut index = count;
+        while index > 0 {
+            index -= 1;
+            items.push(pyre_object::gc_roots::shadow_stack_get(base + index));
+        }
+    } else {
+        for index in 0..count {
+            items.push(pyre_object::gc_roots::shadow_stack_get(base + index));
+        }
+    }
 }
 
 /// UNPACK_EX — split `value` for `a, *b, c = value` into `before` head
