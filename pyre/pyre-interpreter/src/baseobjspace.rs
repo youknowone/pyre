@@ -6081,11 +6081,13 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
         unsafe { pyre_object::interp_exceptions::w_exception_setdict(obj, w_dict) };
         return Ok(());
     }
-    // [3.14-spec] AttributeError ↔ pypy TypeError (W_Root.setdict); both refuse the write
+    // W_Root.setdict — typed IO payloads have no setdict override
+    // (interp_iobase.py W_IOBase uses descr_set_dict → this method).
     if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
-        return Err(PyError::attribute_error(
-            "attribute '__dict__' of '_io._IOBase' objects is not writable",
-        ));
+        return Err(PyError::type_error(format!(
+            "attribute '__dict__' of '{}' objects is not writable",
+            object_functionstr_type_name(obj),
+        )));
     }
     // W_TypeObject and Module keep their namespace mappings as readonly
     // attributes.  Their Python class/metaclass may itself inherit a regular

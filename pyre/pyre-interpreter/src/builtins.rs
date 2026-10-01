@@ -21929,6 +21929,9 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         } else {
             fileio.set_name(pyre_object::gc_roots::shadow_stack_get(file_slot));
         }
+        // interp_fileio.py descr_init: every successful open resets
+        // blksize to DEFAULT_BUFFER_SIZE, then overrides when st_blksize > 1.
+        fileio.set_blksize(crate::module::_io::DEFAULT_BUFFER_SIZE);
         if let Some(blksize) = fileio_stat_field(opened, "__file_stat_blksize__") {
             if blksize > 1 {
                 fileio.set_blksize(blksize);
