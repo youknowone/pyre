@@ -2049,7 +2049,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         _ => None,
     };
     // `finishframe` nulls `last_exc_value` before `make_result_of_lastop`
-    // on the caller. This bridge's grab is that value. With it still set,
+    // on the caller. This bridge's grab is that value, and the seed above
+    // copied it into `current_exc_*` as well. `POP_EXCEPT` does not write
+    // those slots, so the mirror here is still the grab, not an outer
+    // exception the handler restored. With the grab still set,
     // `seed_standing_exception_for_walk` keeps the carrier copy and
     // `dispatch_via_miframe` resumes the caller at its handler.
     if subwalk_result.is_some()

@@ -1698,6 +1698,40 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         return None;
     }
 
+    // Deepest recipe only (`child_result` is the middle `finishframe`
+    // path; `handler_entry` is an already-routed ChangeFrame). A paused
+    // caller must keep its no-exception continuation when the callee
+    // handled the raise and returned.
+    let route_exc_edge = handler_entry.is_none()
+        && child_result.is_none()
+        && ctx.is_bridge_trace
+        && ctx.bridge_source_is_exception_guard()
+        && !ctx.bridge_exception_resume_prepared()
+        && !root_sym.last_exc_box().is_none()
+        && !root_sym.last_exc_value().is_null();
+    let routed_catch = if route_exc_edge {
+        find_catch_for_exc_resume(callee_code, entry)
+    } else {
+        None
+    };
+    if route_exc_edge && routed_catch.is_none() {
+        // `finishframe_exception` pops a frame whose bytecode has no
+        // `catch_exception`. Walking `entry` records the no-exception
+        // fallthrough; `finishframe` then clears the pending exception
+        // and the paused caller never sees it. `dispatch_via_miframe`
+        // aborts with `ExcEdgeNoInFrameCatch` for that missing catch on
+        // the live frame. A carrier still has paused callers, so surface
+        // `SubRaise` and let `drive_carrier_finishframe_exception` walk
+        // them. A no-exception failure leaves `route_exc_edge` false.
+        return Some(Ok((
+            DispatchOutcome::SubRaise {
+                exc: root_sym.last_exc_box(),
+                exc_concrete: ConcreteValue::Ref(root_sym.last_exc_value()),
+            },
+            entry,
+        )));
+    }
+
     // Install the ROOT sym as the snapshot sym (NOT the callee's) so in-callee
     // guards snapshot the paused root.
     let root_sym_ptr = root_sym as *const Sym;
@@ -1757,23 +1791,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             root_sym.frame(),
         )?;
     }
-
-    // Deepest recipe only (`child_result` is the middle `finishframe`
-    // path; `handler_entry` is an already-routed ChangeFrame). A paused
-    // caller must keep its no-exception continuation when the callee
-    // handled the raise and returned.
-    let route_exc_edge = handler_entry.is_none()
-        && child_result.is_none()
-        && ctx.is_bridge_trace
-        && ctx.bridge_source_is_exception_guard()
-        && !ctx.bridge_exception_resume_prepared()
-        && !root_sym.last_exc_box().is_none()
-        && !root_sym.last_exc_value().is_null();
-    let routed_catch = if route_exc_edge {
-        find_catch_for_exc_resume(callee_code, entry)
-    } else {
-        None
-    };
 
     let outcome = {
         let mut sub_wc = WalkContext {

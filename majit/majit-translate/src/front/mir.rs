@@ -31694,6 +31694,18 @@ fn call_is_result_try_branch(func: &CallFunc, llbc: &Llbc) -> bool {
     })
 }
 
+/// `Result::expect` on a whole local. `unwrap` is a different leaf: it
+/// still observes the `Result`.
+fn call_is_result_expect(func: &CallFunc, llbc: &Llbc) -> bool {
+    let CallFunc::Regular(reg) = func else {
+        return false;
+    };
+    let Some(path) = regular_call_name_path(reg, llbc) else {
+        return false;
+    };
+    path_leaf_is(&path, "expect") && path.split("::").any(|seg| seg == "result")
+}
+
 fn rvalue_copied_local(rvalue: &Rvalue) -> Option<usize> {
     let Rvalue::Use(op, _) = rvalue else {
         return None;
@@ -31704,9 +31716,11 @@ fn rvalue_copied_local(rvalue: &Rvalue) -> Option<usize> {
 /// The `divmod` `Result` is still a `Result` for its consumer.
 ///
 /// Local 0 is the function return place (`return this.int_divmod(...)`).
-/// `core::result::<Impl>::branch` is `?` (`RBigInt::floordiv`). Copies and
-/// moves of the whole local count. `Result::expect` does not, so the
-/// always-`Ok` pair residual still binds there.
+/// `core::result::<Impl>::branch` is `?` (`RBigInt::floordiv`). A whole-local
+/// `Rvalue::Use` copy extends the alias set and is not itself a consumer.
+/// `Result::expect` on that alias is the always-`Ok` pair residual. An
+/// aggregate, another helper, a discriminant read, or a projected place
+/// still observes the `Result`, so tuple lowering declines.
 fn divmod_result_observed_as_result(body: &Unstructured, llbc: &Llbc, dest_local: usize) -> bool {
     let mut alias = vec![dest_local];
     let mut grew = true;
@@ -31735,12 +31749,120 @@ fn divmod_result_observed_as_result(body: &Unstructured, llbc: &Llbc, dest_local
         return true;
     }
     body.body.iter().any(|bb| {
-        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
-            return false;
-        };
-        call_is_result_try_branch(&call.func, llbc)
-            && operand_local(call.args.first()).is_some_and(|arg| alias.contains(&arg))
+        bb.statements
+            .iter()
+            .any(|stmt| stmt_observes_divmod_result(stmt, &alias))
+            || bb
+                .term_ref(llbc)
+                .is_ok_and(|term| term_observes_divmod_result(term, llbc, &alias))
     })
+}
+
+fn stmt_observes_divmod_result(
+    stmt: &majit_charon_reader::ullbc::Statement,
+    alias: &[usize],
+) -> bool {
+    let Ok(kind) = stmt.stmt_kind_ref() else {
+        return false;
+    };
+    match kind {
+        StmtKind::Assign(place, rvalue) => {
+            if rvalue_is_alias_copy(rvalue, alias) && matches!(place.kind, PlaceKind::Local(_)) {
+                return false;
+            }
+            rvalue_mentions_alias(rvalue, alias)
+                || (place_root_in_alias(place, alias) && !matches!(place.kind, PlaceKind::Local(_)))
+        }
+        StmtKind::Assert(assert) => operand_mentions_alias(&assert.cond, alias),
+        StmtKind::StorageLive(_)
+        | StmtKind::StorageDead(_)
+        | StmtKind::Borrowck(_)
+        | StmtKind::PlaceMention(_)
+        | StmtKind::Unknown => false,
+    }
+}
+
+fn term_observes_divmod_result(term: &TermKind, llbc: &Llbc, alias: &[usize]) -> bool {
+    match term {
+        TermKind::Switch { discr, .. } => operand_mentions_alias(discr, alias),
+        TermKind::Assert { assert, .. } => operand_mentions_alias(&assert.cond, alias),
+        TermKind::Call { call, .. } => call_observes_divmod_result(call, llbc, alias),
+        TermKind::Return
+        | TermKind::UnwindResume
+        | TermKind::Abort(_)
+        | TermKind::Goto { .. }
+        | TermKind::Drop { .. }
+        | TermKind::Unknown => false,
+    }
+}
+
+/// A call observes the `Result` when an alias is an operand and the callee
+/// is not `Result::expect` on that whole local. `Result::branch` (`?`) is
+/// an observation. The call that defines the destination does not mention it.
+fn call_observes_divmod_result(call: &CallPayload, llbc: &Llbc, alias: &[usize]) -> bool {
+    let mut receiver_only = false;
+    for (index, arg) in call.args.iter().enumerate() {
+        if !operand_mentions_alias(arg, alias) {
+            continue;
+        }
+        let whole_receiver =
+            index == 0 && operand_local(Some(arg)).is_some_and(|local| alias.contains(&local));
+        if !whole_receiver {
+            return true;
+        }
+        receiver_only = true;
+    }
+    if let CallFunc::Dynamic(op) = &call.func
+        && operand_mentions_alias(op, alias)
+    {
+        return true;
+    }
+    receiver_only
+        && (call_is_result_try_branch(&call.func, llbc) || !call_is_result_expect(&call.func, llbc))
+}
+
+fn place_root_local(place: &Place) -> Option<usize> {
+    match &place.kind {
+        PlaceKind::Local(id) => Some(*id as usize),
+        PlaceKind::Projection(inner, _) => place_root_local(inner),
+        PlaceKind::Global { .. } | PlaceKind::Unknown => None,
+    }
+}
+
+fn place_root_in_alias(place: &Place, alias: &[usize]) -> bool {
+    place_root_local(place).is_some_and(|id| alias.contains(&id))
+}
+
+fn operand_mentions_alias(op: &Operand, alias: &[usize]) -> bool {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => place_root_in_alias(place, alias),
+        Operand::Const(_) => false,
+    }
+}
+
+fn rvalue_is_alias_copy(rvalue: &Rvalue, alias: &[usize]) -> bool {
+    rvalue_copied_local(rvalue).is_some_and(|src| alias.contains(&src))
+}
+
+fn rvalue_mentions_alias(rvalue: &Rvalue, alias: &[usize]) -> bool {
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::ShallowInitBox(op, _) => operand_mentions_alias(op, alias),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            operand_mentions_alias(lhs, alias) || operand_mentions_alias(rhs, alias)
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            place_root_in_alias(place, alias)
+        }
+        Rvalue::Aggregate(_, operands) => {
+            operands.iter().any(|op| operand_mentions_alias(op, alias))
+        }
+        Rvalue::Discriminant(place) | Rvalue::Len(place) => place_root_in_alias(place, alias),
+        Rvalue::Repeat(op, _, _, _) => operand_mentions_alias(op, alias),
+        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => false,
+    }
 }
 
 fn regular_call_fun_decl_id(kind: &CallKind) -> Option<u64> {
