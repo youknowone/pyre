@@ -925,6 +925,20 @@ pub fn init_typeobjects() {
             classmethod_type as usize,
         );
 
+        // instancemethod — PyPy: cpyext/classobject.py InstanceMethod
+        let instancemethod_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
+            "instancemethod",
+            init_instancemethod_type,
+            object_type,
+        ));
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(instancemethod_type, false);
+        }
+        reg.insert(
+            &pyre_object::instancemethod::INSTANCEMETHOD_TYPE as *const PyType as usize,
+            instancemethod_type as usize,
+        );
+
         // property — PyPy: descriptor.py W_Property, bases=(object,)
         reg.insert(
             &pyre_object::descriptor::PROPERTY_TYPE as *const PyType as usize,
@@ -15147,6 +15161,9 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
         pyre_object::MEMBER_CLASSMETHOD_FUNCTION => {
             Ok(unsafe { pyre_object::function::w_classmethod_get_func(obj) })
         }
+        pyre_object::MEMBER_INSTANCEMETHOD_FUNCTION => {
+            Ok(unsafe { pyre_object::instancemethod::w_instancemethod_get_func(obj) })
+        }
         pyre_object::MEMBER_PROPERTY_FGET => {
             let value = unsafe { pyre_object::descriptor::w_property_get_fget(obj) };
             Ok(if value.is_null() {
@@ -18804,6 +18821,196 @@ fn init_staticmethod_type(ns: PyObjectRef) {
     ] {
         let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
             .expect("staticmethod TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
+}
+
+fn instancemethod_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { pyre_object::instancemethod::is_instancemethod(obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a 'instancemethod' object"
+        )));
+    }
+    Ok(obj)
+}
+
+/// `classobject.py InstanceMethod.getname` on the wrapped callable: `__name__`,
+/// or `"?"` when that lookup fails.
+fn instancemethod_func_name(func: PyObjectRef) -> String {
+    match crate::baseobjspace::getattr_str(func, "__name__") {
+        Ok(name) => crate::baseobjspace::utf8_w(name)
+            .map(|text| text.to_string())
+            .unwrap_or_else(|_| "?".to_string()),
+        Err(_) => "?".to_string(),
+    }
+}
+
+fn instancemethod_type_name(obj: PyObjectRef) -> String {
+    crate::typedef::r#type(obj)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// `classobject.py InstanceMethod.descr_new`. The type is not a base class, so
+/// the requested subtype is ignored. A non-callable is `TypeError`.
+fn instancemethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "instancemethod() takes no keyword arguments",
+        ));
+    }
+    if positional.is_empty() {
+        return Err(crate::PyError::type_error(
+            "instancemethod.__new__(): not enough arguments",
+        ));
+    }
+    let supplied = positional.len().saturating_sub(1);
+    if supplied != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "instancemethod expected 1 argument, got {supplied}"
+        )));
+    }
+    let function = positional[1];
+    if !crate::baseobjspace::callable_w(function) {
+        return Err(crate::PyError::type_error(format!(
+            "instancemethod expected a callable, got {}",
+            instancemethod_type_name(function)
+        )));
+    }
+    Ok(pyre_object::instancemethod::w_instancemethod_new(function))
+}
+
+/// `classobject.py InstanceMethod.descr_get`: `None` yields the function,
+/// an instance yields `Method(function, obj)`.
+fn instancemethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "instancemethod.__get__() takes no keyword arguments",
+        ));
+    }
+    let im = instancemethod_require(positional.first().copied().unwrap_or(PY_NULL), "__get__")?;
+    let obj = positional.get(1).copied().unwrap_or(PY_NULL);
+    let function = unsafe { pyre_object::instancemethod::w_instancemethod_get_func(im) };
+    if obj.is_null() || unsafe { pyre_object::is_none(obj) } {
+        return Ok(function);
+    }
+    Ok(pyre_object::w_method_new(function, obj, PY_NULL))
+}
+
+/// `classobject.py InstanceMethod.descr_call`: `space.call_args(w_function, __args__)`.
+fn instancemethod_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let im = instancemethod_require(positional.first().copied().unwrap_or(PY_NULL), "__call__")?;
+    let function = unsafe { pyre_object::instancemethod::w_instancemethod_get_func(im) };
+    let call_args = positional.get(1..).unwrap_or(&[]);
+    if !crate::builtins::has_real_kwargs(kwargs) {
+        return crate::call::call_function_impl_result(function, call_args);
+    }
+    let keyword_args: Vec<(Wtf8Buf, PyObjectRef)> = unsafe {
+        pyre_object::w_dict_str_entries(kwargs.unwrap())
+            .into_iter()
+            .filter(|(name, _)| name != "__pyre_kw__")
+            .map(|(name, value)| (Wtf8Buf::from_string(name), value))
+            .collect()
+    };
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "instancemethod call has no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, function, call_args, &keyword_args)
+    })
+}
+
+/// `classobject.py InstanceMethod.descr_repr` via `W_Root.getrepr`.
+fn instancemethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let im = instancemethod_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = roots.base();
+    let _ = roots.pin_root(im);
+    let function =
+        unsafe { pyre_object::instancemethod::w_instancemethod_get_func(roots.get(slot)) };
+    let name = instancemethod_func_name(function);
+    let live = roots.get(slot);
+    let addr = pyre_object::gc_hook::gc_identity_hash(live as usize);
+    let text = format!("<<instancemethod {name}> at 0x{addr:x}>");
+    Ok(pyre_object::w_str_new_managed(&text))
+}
+
+fn instancemethod_forward_attr(args: &[PyObjectRef], name: &'static str) -> crate::PyResult {
+    let im = instancemethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
+    let function = unsafe { pyre_object::instancemethod::w_instancemethod_get_func(im) };
+    crate::baseobjspace::getattr_str(function, name)
+}
+
+fn instancemethod_name_get(args: &[PyObjectRef]) -> crate::PyResult {
+    instancemethod_forward_attr(args, "__name__")
+}
+
+fn instancemethod_module_get(args: &[PyObjectRef]) -> crate::PyResult {
+    instancemethod_forward_attr(args, "__module__")
+}
+
+fn instancemethod_doc_get(args: &[PyObjectRef]) -> crate::PyResult {
+    instancemethod_forward_attr(args, "__doc__")
+}
+
+/// `classobject.py InstanceMethod.typedef`.
+fn init_instancemethod_type(ns: PyObjectRef) {
+    let name_getter = make_builtin_function_with_arity("__name__", instancemethod_name_get, 2);
+    let module_getter =
+        make_builtin_function_with_arity("__module__", instancemethod_module_get, 2);
+    let doc_getter = make_builtin_function_with_arity("__doc__", instancemethod_doc_get, 2);
+    let entries = [
+        ("__new__", make_new_descr(instancemethod_descr_new)),
+        (
+            "__call__",
+            make_builtin_function("__call__", instancemethod_descr_call),
+        ),
+        (
+            "__get__",
+            make_builtin_function("__get__", instancemethod_descr_get),
+        ),
+        (
+            "__repr__",
+            make_builtin_function("__repr__", instancemethod_descr_repr),
+        ),
+        (
+            "__func__",
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_INSTANCEMETHOD_FUNCTION,
+                "__func__".to_owned(),
+                PY_NULL,
+            ),
+        ),
+        (
+            "__name__",
+            make_getset_descriptor_named(name_getter, "__name__"),
+        ),
+        (
+            "__module__",
+            make_getset_descriptor_named(module_getter, "__module__"),
+        ),
+        (
+            "__doc__",
+            make_getset_descriptor_named(doc_getter, "__doc__"),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    for (name, text_signature) in [
+        ("__new__", "($type, function, /)"),
+        ("__repr__", "($self, /)"),
+        ("__call__", "($self, /, *args, **kwargs)"),
+        ("__get__", "($self, instance, owner=None, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("instancemethod TypeDef callable was just installed");
         unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }

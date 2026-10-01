@@ -119,6 +119,18 @@ PyAPI_FUNC(PyObject *) _PyTimeZone_FromTimeZone(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) _PyTime_FromTime(int, int, int, int, PyObject *, PyTypeObject *);
 PyAPI_FUNC(PyObject *) _PyTime_FromTimeAndFold(int, int, int, int, PyObject *, int, PyTypeObject *);
 
+/* cpyext/classobject.rs */
+PyAPI_FUNC(PyObject *) PyInstanceMethod_Function(PyObject *);
+PyAPI_FUNC(PyObject *) PyInstanceMethod_New(PyObject *);
+
+/* cpyext/codecs.rs */
+PyAPI_FUNC(PyObject *) PyCodec_Decode(PyObject *, const char *, const char *);
+PyAPI_FUNC(PyObject *) PyCodec_Decoder(const char *);
+PyAPI_FUNC(PyObject *) PyCodec_Encode(PyObject *, const char *, const char *);
+PyAPI_FUNC(PyObject *) PyCodec_Encoder(const char *);
+PyAPI_FUNC(PyObject *) PyCodec_IncrementalDecoder(const char *, const char *);
+PyAPI_FUNC(PyObject *) PyCodec_IncrementalEncoder(const char *, const char *);
+
 /* cpyext/complexobject.rs */
 PyAPI_FUNC(Py_complex) PyComplex_AsCComplex(PyObject *);
 PyAPI_FUNC(int) PyComplex_Check(PyObject *);
@@ -509,6 +521,12 @@ PyAPI_FUNC(void) _PyErr_BadInternalCall(const char *, int);
 PyAPI_FUNC(void) _PyErr_ChainExceptions1(PyObject *);
 PyAPI_FUNC(void) _PyPyre_WriteUnraisable(PyObject *, PyObject *);
 PyAPI_FUNC(void) _Py_FatalErrorFunc(const char *, const char *);
+
+/* cpyext/pyfile.rs */
+PyAPI_FUNC(PyObject *) PyFile_FromFd(int, const char *, const char *, int, const char *, const char *, const char *, int);
+PyAPI_FUNC(PyObject *) PyFile_GetLine(PyObject *, int);
+PyAPI_FUNC(int) PyFile_WriteObject(PyObject *, PyObject *, int);
+PyAPI_FUNC(int) PyFile_WriteString(const char *, PyObject *);
 
 /* cpyext/pymem.rs */
 PyAPI_FUNC(void *) PyMem_Calloc(size_t, size_t);

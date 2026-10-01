@@ -514,6 +514,7 @@ type_mirrors! {
     PyGetSetDescr_Type => builtin_type(&pyre_object::typedef::GETSET_DESCRIPTOR_TYPE),
     PyMemberDescr_Type => builtin_type(&pyre_object::typedef::MEMBER_TYPE),
     PyMethodDescr_Type => method_descriptor_type(),
+    PyInstanceMethod_Type => builtin_type(&pyre_object::instancemethod::INSTANCEMETHOD_TYPE),
     PyMethod_Type => builtin_type(&pyre_object::function::METHOD_TYPE),
     PyProperty_Type => builtin_type(&pyre_object::descriptor::PROPERTY_TYPE),
     PyStaticMethod_Type => builtin_type(&pyre_object::function::STATICMETHOD_TYPE),

@@ -307,6 +307,8 @@ struct PyMemberDef {
 #define Py_NE 3
 #define Py_GT 4
 #define Py_GE 5
+/* No string quotes etc. `PyFile_WriteObject` writes `str` when this is set. */
+#define Py_PRINT_RAW 1
 
 /* Heap types.  Only single inheritance is supported: a spec naming more than
    one base is rejected rather than silently losing the rest. */

@@ -33,6 +33,7 @@ pub mod gc_storage;
 pub mod generator;
 pub mod gil_ready;
 pub mod identitydict;
+pub mod instancemethod;
 pub mod int_array;
 pub mod interp_array;
 pub mod interp_exceptions;
