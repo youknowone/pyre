@@ -6239,18 +6239,15 @@ pub fn getdictvalue_native(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> 
 /// key whose hash collides can run a user `__eq__`, and the raw accessor
 /// reports that as an ordinary miss — the attribute would look absent.
 fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
+    // interp_iobase.py W_IOBase.getdictvalue — a typed IO payload owns
+    // `w_dict` (`typedef.hasdict`), so `_getusercls` does not mix in
+    // `MapdictDictSupport`. A null `w_dict` is a miss and does not allocate.
+    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+        return unsafe { crate::module::_io::iobase_getdictvalue(obj, name) };
+    }
     // mapdict.py `MapdictDictSupport.getdictvalue` overrides the
-    // `W_Root` default for every mapdict carrier:
-    //
-    // ```python
-    // def getdictvalue(self, space, attrname):
-    //     return self._get_mapdict_map().read(self, attrname, DICT)
-    // ```
-    //
-    // Reading through `getdict` instead would materialise the
-    // `("dict", SPECIAL)` wrapper and change the instance's map — see
-    // [`setdictvalue`]. A typedef that already owns `__dict__` is not a
-    // `MapdictDictSupport` (`typedef.py` `_getusercls`).
+    // `W_Root` default for every mapdict carrier whose typedef does not
+    // already own `__dict__`.
     if unsafe {
         crate::objspace::std::mapdict::has_mapdict_storage(obj)
             && !crate::objspace::std::mapdict::typedef_owns_dict(obj)
@@ -6261,11 +6258,6 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
                 rustpython_wtf8::Wtf8::new(name),
             )
         };
-    }
-    // interp_iobase.py W_IOBase.getdictvalue — a null w_dict is a miss
-    // and does not allocate the dictionary.
-    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
-        return unsafe { crate::module::_io::iobase_getdictvalue(obj, name) };
     }
     // `getdict` can run `_thread._local` Python and allocate.  After a
     // red `has_mapdict_storage` the descent scan cannot prove the

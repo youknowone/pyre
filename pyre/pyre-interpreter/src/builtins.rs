@@ -21893,18 +21893,31 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let opened_base = pyre_object::gc_roots::pin_roots(&[self_obj, opened]);
     let self_obj = pyre_object::gc_roots::shadow_stack_get(opened_base);
     let opened = pyre_object::gc_roots::shadow_stack_get(opened_base + 1);
-    for name in [
-        "__file_data__",
-        "__file_pos__",
-        "__file_name__",
-        "__file_mode__",
-        "__file_binary__",
-        "__file_fd__",
-        "__file_dirty__",
-        "name",
-        "encoding",
-        "errors",
-    ] {
+    // interp_fileio.py `descr_init` writes W_FileIO fields. The wasm
+    // path-backed open has no fd and keeps the bytes on the instance dict.
+    let typed = crate::module::_io::W_FileIO::from_obj(self_obj).is_some();
+    let copy_names: &[&str] = if typed {
+        &[
+            "__file_data__",
+            "__file_pos__",
+            "__file_name__",
+            "__file_dirty__",
+        ]
+    } else {
+        &[
+            "__file_data__",
+            "__file_pos__",
+            "__file_name__",
+            "__file_mode__",
+            "__file_binary__",
+            "__file_fd__",
+            "__file_dirty__",
+            "name",
+            "encoding",
+            "errors",
+        ]
+    };
+    for name in copy_names {
         if let Ok(value) = crate::baseobjspace::getattr_str(opened, name) {
             crate::baseobjspace::setattr_str(self_obj, name, value)?;
         }

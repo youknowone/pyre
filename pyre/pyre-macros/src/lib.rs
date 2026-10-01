@@ -1864,7 +1864,11 @@ fn expand_pyre_class(
                             ::pyre_object::pyobject::get_instantiate(&#pytype_static),
                         )
                     {
-                        return Self::allocate_stable(payload);
+                        let obj = Self::allocate_stable(payload);
+                        // objspace.py `allocate_instance`: hasuserdel types
+                        // enqueue the fresh instance after the malloc.
+                        ::pyre_object::gc_hook::maybe_register_finalizer(obj);
+                        return obj;
                     }
                     let _roots = ::pyre_object::gc_roots::push_roots();
                     let __refs = [w_subtype, #(payload.#ptr_field_idents),*];

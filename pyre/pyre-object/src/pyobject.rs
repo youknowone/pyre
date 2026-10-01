@@ -284,8 +284,10 @@ pub unsafe fn read_weakref_lifeline(obj: PyObjectRef) -> PyObjectRef {
     unsafe { *((obj as *const u8).add(off) as *const PyObjectRef) }
 }
 
-/// Store `value` into the `_lifeline_` slot, then run the write barrier.
-/// The slot is a traced `PyObjectRef`, so the barrier roots `obj`.
+/// Store `value` into the `_lifeline_` slot.
+///
+/// `framework.py` `transform_generic_set` emits the write barrier on the
+/// receiver, then the bare store.
 ///
 /// # Safety
 /// Same as [`read_weakref_lifeline`].
@@ -293,10 +295,10 @@ pub unsafe fn read_weakref_lifeline(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn write_weakref_lifeline(obj: PyObjectRef, value: PyObjectRef) {
     let off = unsafe { (*(*obj).ob_type).weakref_offset };
     debug_assert!(off != 0);
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     unsafe {
         *((obj as *mut u8).add(off) as *mut PyObjectRef) = value;
     }
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// The builtin class whose typedef and payload layout `tp` uses: `tp`'s
