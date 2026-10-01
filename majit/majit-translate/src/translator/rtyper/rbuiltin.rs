@@ -141,11 +141,9 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///   * rbuiltin.py — `reversed` (need `Repr::newiter` trait
 ///     method + iterator repr family)
 ///   * rbuiltin.py — `object.__init__` is trivial and landed.
-///     `EnvironmentError.__init__` / `WindowsError.__init__` need
-///     `InstanceRepr::setfield` (rclass.py) to lower the
-///     `r_self.setfield(v_self, 'errno' / 'strerror' / 'filename' /
-///     'winerror', ...)` calls; until that helper lands the qualname
-///     `HostObject`s stay unregistered.
+///     `EnvironmentError.__init__` stores `errno` / `strerror` /
+///     `filename` through `InstanceRepr::setfield`.
+///     `WindowsError.__init__` still needs its `winerror` store.
 ///   * rbuiltin.py — `objectmodel.hlinvoke` (PBC-callable
 ///     dispatch)
 ///   * rbuiltin.py — `range` / `xrange` / `enumerate`
@@ -239,6 +237,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
         ("object.__init__", rtype_object__init__),
+        // rbuiltin.py — `EnvironmentError.__init__` field stores.
+        ("EnvironmentError.__init__", rtype_EnvironmentError__init__),
         // rbuiltin.py:286-297 — registered only when the host exposes
         // WindowsError.__init__; HOST_ENV lookup preserves that conditional.
         ("WindowsError.__init__", rtype_WindowsError__init__),
@@ -1806,14 +1806,99 @@ pub fn rtype_builtin_reversed(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usiz
 /// RPython `@typer_for(EnvironmentError.__init__) def
 /// rtype_EnvironmentError__init__(hop)` (rbuiltin.py).
 ///
-/// The line-by-line port needs `InstanceRepr::setfield` for `errno`,
-/// `strerror`, and `filename` assignment.
+/// ```python
+/// hop.exception_cannot_occur()
+/// v_self = hop.args_v[0]
+/// r_self = hop.args_r[0]
+/// if hop.nb_args <= 2:
+///     v_errno = hop.inputconst(lltype.Signed, 0)
+///     if hop.nb_args == 2:
+///         v_strerror = hop.inputarg(rstr.string_repr, arg=1)
+///         r_self.setfield(v_self, 'strerror', v_strerror, hop.llops)
+/// else:
+///     v_errno = hop.inputarg(lltype.Signed, arg=1)
+///     v_strerror = hop.inputarg(rstr.string_repr, arg=2)
+///     r_self.setfield(v_self, 'strerror', v_strerror, hop.llops)
+///     if hop.nb_args >= 4:
+///         v_filename = hop.inputarg(rstr.string_repr, arg=3)
+///         r_self.setfield(v_self, 'filename', v_filename, hop.llops)
+/// r_self.setfield(v_self, 'errno', v_errno, hop.llops)
+/// ```
 #[allow(non_snake_case)]
 pub fn rtype_EnvironmentError__init__(
-    _hop: &HighLevelOp,
+    hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
-    Err(rbuiltin_deferred("rtype_EnvironmentError__init__"))
+    use crate::translator::rtyper::rclass::InstanceRepr;
+    use crate::translator::rtyper::rstr::string_repr;
+    use crate::translator::rtyper::rtyper::ConvertedTo;
+
+    hop.exception_cannot_occur()?;
+    if hop.nb_args() == 0 {
+        return Err(TyperError::message(
+            "rtype_EnvironmentError__init__: missing self",
+        ));
+    }
+    // `genop` refuses a raw `args_v` entry. `inputarg` is the identity
+    // conversion when the source repr is already this instance.
+    let r_any = hop.args_r.borrow()[0].clone().ok_or_else(|| {
+        TyperError::message("rtype_EnvironmentError__init__: missing self repr")
+    })?;
+    let raw = std::sync::Arc::into_raw(r_any);
+    if unsafe { (*raw).type_id() } != std::any::TypeId::of::<InstanceRepr>() {
+        let _ = unsafe { std::sync::Arc::from_raw(raw) };
+        return Err(TyperError::message(
+            "rtype_EnvironmentError__init__: self is not an InstanceRepr",
+        ));
+    }
+    let r_self = unsafe { std::sync::Arc::from_raw(raw as *const () as *const InstanceRepr) };
+    let v_self = hop.inputarg(ConvertedTo::Repr(r_self.as_ref()), 0)?;
+    let nb = hop.nb_args();
+    let signed = LowLevelType::Signed;
+    let (v_errno, v_strerror, v_filename) = if nb <= 2 {
+        let v_errno = Hlvalue::Constant(HighLevelOp::inputconst(&signed, &ConstValue::Int(0))?);
+        let v_strerror = if nb == 2 {
+            let r_str = string_repr();
+            Some(hop.inputarg(ConvertedTo::Repr(r_str.as_ref()), 1)?)
+        } else {
+            None
+        };
+        (v_errno, v_strerror, None)
+    } else {
+        let r_str = string_repr();
+        let v_errno = hop.inputarg(ConvertedTo::from(&signed), 1)?;
+        let v_strerror = hop.inputarg(ConvertedTo::Repr(r_str.as_ref()), 2)?;
+        let v_filename = if nb >= 4 {
+            Some(hop.inputarg(ConvertedTo::Repr(r_str.as_ref()), 3)?)
+        } else {
+            None
+        };
+        (v_errno, Some(v_strerror), v_filename)
+    };
+    let flags = crate::translator::rtyper::rclass::Flags::new();
+    let mut llops = hop.llops.borrow_mut();
+    if let Some(v_strerror) = v_strerror {
+        r_self.setfield(
+            v_self.clone(),
+            "strerror",
+            v_strerror,
+            &mut llops,
+            false,
+            &flags,
+        )?;
+    }
+    if let Some(v_filename) = v_filename {
+        r_self.setfield(
+            v_self.clone(),
+            "filename",
+            v_filename,
+            &mut llops,
+            false,
+            &flags,
+        )?;
+    }
+    r_self.setfield(v_self, "errno", v_errno, &mut llops, false, &flags)?;
+    Ok(None)
 }
 
 /// RPython conditional `@typer_for(WindowsError.__init__) def
@@ -5050,14 +5135,62 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
+    fn rtype_EnvironmentError_init_stores_errno_zero_for_a_bare_self() {
+        use crate::annotator::classdesc::{Attribute, ClassDef};
+        use crate::annotator::model::{SomeInstance, SomeInteger};
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let classdef = ClassDef::new_standalone("EnvironmentError", None);
+        let mut errno = Attribute::new("errno");
+        errno.s_value = SomeValue::Integer(SomeInteger::new(false, false));
+        errno.readonly = false;
+        classdef
+            .borrow_mut()
+            .attrs
+            .insert("errno".to_string(), errno);
+        let r_self = getinstancerepr(&hop.rtyper, Some(&classdef), Flavor::Gc).expect("repr");
+        Repr::setup(r_self.as_ref()).expect("setup");
+        let v_self = Variable::new();
+        v_self.set_concretetype(Some(r_self.lowleveltype().clone()));
+        let r_dyn: std::sync::Arc<dyn Repr> = r_self;
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_self));
+        hop.args_s.borrow_mut().push(SomeValue::Instance(SomeInstance::new(
+            Some(classdef),
+            false,
+            std::collections::BTreeMap::new(),
+        )));
+        hop.args_r.borrow_mut().push(Some(r_dyn));
+
+        rtype_EnvironmentError__init__(&hop, &HashMap::new()).expect("rtype");
+        let ops = hop.llops.borrow();
+        let store = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "setfield")
+            .expect("errno setfield");
+        assert_eq!(store.args.len(), 3);
+        let Hlvalue::Constant(name) = &store.args[1] else {
+            panic!("field name must be a constant");
+        };
+        assert_eq!(name.value, ConstValue::ByteStr(b"inst_errno".to_vec()));
+        let Hlvalue::Constant(errno) = &store.args[2] else {
+            panic!("errno must be a constant");
+        };
+        assert_eq!(errno.value, ConstValue::Int(0));
+    }
+
+    #[test]
     fn deferred_rbuiltin_parity_surface_reports_missing_rtype_operation() {
         let hop = dummy_hop();
         let typers: &[(&str, BuiltinTyperFn)] = &[
             ("rtype_builtin_reversed", rtype_builtin_reversed),
-            (
-                "rtype_EnvironmentError__init__",
-                rtype_EnvironmentError__init__,
-            ),
             ("rtype_WindowsError__init__", rtype_WindowsError__init__),
             ("rtype_hlinvoke", rtype_hlinvoke),
             ("rtype_dict_constructor", rtype_dict_constructor),
