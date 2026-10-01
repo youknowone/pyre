@@ -1083,9 +1083,9 @@ fn is_ptr_add_path(segments: &[String]) -> bool {
 }
 
 /// Operand of a pointer-arithmetic Call that produced `var`, if any.
-/// The front's `items_block_items_base` accessor aliases to its receiver;
-/// a leftover `ptr::add` / `wrapping_add` of that receiver still names
-/// the array header in arg 0.
+/// The front's `items_block_items_base` accessor aliases to its receiver,
+/// so a call to it names the array header in arg 0; so does a leftover
+/// `ptr::add` / `wrapping_add` of that receiver.
 fn ptr_arith_base_operand(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -1103,7 +1103,12 @@ fn ptr_arith_base_operand(
             else {
                 continue;
             };
-            if args.len() == 2 && is_ptr_add_path(segments) {
+            if (args.len() == 2 && is_ptr_add_path(segments))
+                || (args.len() == 1
+                    && crate::front::mir::items_block_accessor_returns_its_block(
+                        &segments.join("::"),
+                    ))
+            {
                 return args.first()?.as_variable().cloned();
             }
         }
@@ -7831,62 +7836,46 @@ impl<'a> Transformer<'a> {
     ///                                 argtypes, resulttype,
     ///                                 EffectInfo.EF_ELIDABLE_CANNOT_RAISE)
     /// ```
-    ///
-    /// `OopSpecIndex` is an enum, so each row names both the `OS_STREQ_*`
-    /// index and its `_OS_offset_uni` twin.
     fn register_stroruni_equal_extra_helpers(&mut self, kind: &StrOrUniKind) {
         use majit_ir::value::Type::{Int, Ref};
         // SoU and CHR are Ref and Int on the pyre side.
-        let rows: [(OopSpecIndex, OopSpecIndex, &str, &[majit_ir::value::Type]); 7] = [
+        let rows: [(OopSpecIndex, &str, &[majit_ir::value::Type]); 7] = [
             (
                 OopSpecIndex::StreqSliceChecknull,
-                OopSpecIndex::UnieqSliceChecknull,
                 "str.eq_slice_checknull",
                 &[Ref, Int, Int, Ref],
             ),
             (
                 OopSpecIndex::StreqSliceNonnull,
-                OopSpecIndex::UnieqSliceNonnull,
                 "str.eq_slice_nonnull",
                 &[Ref, Int, Int, Ref],
             ),
             (
                 OopSpecIndex::StreqSliceChar,
-                OopSpecIndex::UnieqSliceChar,
                 "str.eq_slice_char",
                 &[Ref, Int, Int, Int],
             ),
-            (
-                OopSpecIndex::StreqNonnull,
-                OopSpecIndex::UnieqNonnull,
-                "str.eq_nonnull",
-                &[Ref, Ref],
-            ),
+            (OopSpecIndex::StreqNonnull, "str.eq_nonnull", &[Ref, Ref]),
             (
                 OopSpecIndex::StreqNonnullChar,
-                OopSpecIndex::UnieqNonnullChar,
                 "str.eq_nonnull_char",
                 &[Ref, Int],
             ),
             (
                 OopSpecIndex::StreqChecknullChar,
-                OopSpecIndex::UnieqChecknullChar,
                 "str.eq_checknull_char",
                 &[Ref, Int],
             ),
-            (
-                OopSpecIndex::StreqLengthok,
-                OopSpecIndex::UnieqLengthok,
-                "str.eq_lengthok",
-                &[Ref, Ref],
-            ),
+            (OopSpecIndex::StreqLengthok, "str.eq_lengthok", &[Ref, Ref]),
         ];
-        for (str_index, uni_index, othername, argtypes) in rows {
-            let otherindex = if matches!(kind, StrOrUniKind::Unicode) {
-                uni_index
-            } else {
-                str_index
-            };
+        // `builtin_func_for_spec` specializes each helper on its `ll_args`,
+        // so the UNICODE rows name UNICODE-typed bodies. The host binds the
+        // `_ll_*_str_eq_*` names to bodies over STR `chars` only, which leaves
+        // every `OS_UNIEQ_*` helper unbound.
+        if matches!(kind, StrOrUniKind::Unicode) {
+            return;
+        }
+        for (otherindex, othername, argtypes) in rows {
             self._register_extra_helper(
                 otherindex,
                 othername,
@@ -18073,6 +18062,17 @@ mod tests {
     /// (`IR_IMMUTABLE_ARRAY`) makes the element read `getarrayitem_gc_*_pure`.
     #[test]
     fn getarrayitem_from_star_field_is_pure() {
+        assert_star_field_item_read_is_pure(false);
+    }
+
+    /// `w_tuple_getitem_known` reads `items_block_items_base(t.wrappeditems)[i]`:
+    /// the accessor returns its block, so the read keeps the `[*]` origin.
+    #[test]
+    fn getarrayitem_through_items_base_accessor_of_star_field_is_pure() {
+        assert_star_field_item_read_is_pure(true);
+    }
+
+    fn assert_star_field_item_read_is_pure(through_accessor: bool) {
         use crate::call::CallControl;
         use crate::model::{FieldDescriptor, ImmutableRank};
 
@@ -18117,10 +18117,29 @@ mod tests {
                 true,
             )
             .unwrap();
+        let base = if through_accessor {
+            graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Call {
+                        target: CallTarget::function_path([
+                            "pyre_object",
+                            "object_array",
+                            "items_block_items_base",
+                        ]),
+                        args: vec![crate::model::LinkArg::from(arr)],
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .unwrap()
+        } else {
+            arr
+        };
         graph.push_op_var(
             graph.startblock,
             OpKind::ArrayRead {
-                base: arr,
+                base,
                 index,
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
@@ -21983,6 +22002,46 @@ mod tests {
     #[test]
     fn stroruni_equal_skips_extra_helpers_the_host_has_not_bound() {
         stroruni_equal_lowering_case(false);
+    }
+
+    /// The host's `_ll_*_str_eq_*` bodies read STR `chars`; a UNICODE
+    /// operand gets no `OS_UNIEQ_*` row even when those names are bound.
+    #[test]
+    fn stroruni_equal_on_unicode_registers_no_unieq_helper() {
+        use crate::call::CallControl;
+        use crate::parse::CallPath;
+
+        let mut cc = CallControl::new();
+        for (i, name) in [
+            "_ll_4_str_eq_slice_checknull",
+            "_ll_4_str_eq_slice_nonnull",
+            "_ll_4_str_eq_slice_char",
+            "_ll_2_str_eq_nonnull",
+            "_ll_2_str_eq_nonnull_char",
+            "_ll_2_str_eq_checknull_char",
+            "_ll_2_str_eq_lengthok",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            cc.register_function_fnaddr(CallPath::from_segments([name]), 0x1000 + i as i64);
+        }
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        transformer.register_stroruni_equal_extra_helpers(&StrOrUniKind::Unicode);
+        drop(transformer);
+        for oopspec in [
+            OopSpecIndex::UnieqSliceChecknull,
+            OopSpecIndex::UnieqSliceNonnull,
+            OopSpecIndex::UnieqSliceChar,
+            OopSpecIndex::UnieqNonnull,
+            OopSpecIndex::UnieqNonnullChar,
+            OopSpecIndex::UnieqChecknullChar,
+            OopSpecIndex::UnieqLengthok,
+            OopSpecIndex::StreqNonnull,
+        ] {
+            assert!(!cc.callinfocollection.has_oopspec(oopspec), "{oopspec:?}");
+        }
     }
 
     fn stroruni_equal_lowering_case(bind_helpers: bool) {

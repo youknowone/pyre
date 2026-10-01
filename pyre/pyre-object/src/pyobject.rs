@@ -285,6 +285,23 @@ pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
     unsafe { class_word_is_exact_builtin(obj, (*obj).w_class) }
 }
 
+/// [`is_exact_builtin_instance`] for a caller that holds a live object, as
+/// every `W_Root` argument of the object space is: no null test is made, so
+/// none is recorded when the JIT traces the caller.
+///
+/// # Safety
+/// `obj` must be a valid non-null `PyObjectRef`.
+#[inline]
+pub unsafe fn is_exact_builtin_instance_nonnull(obj: PyObjectRef) -> bool {
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return true;
+    }
+    if unsafe { typeptr_is_exact_builtin(obj) } {
+        return true;
+    }
+    unsafe { class_word_is_exact_builtin(obj, (*obj).w_class) }
+}
+
 /// A builtin with a `_getusercls` class (`typedef.py`
 /// `get_unique_interplevel_subclass`) stamps that class as the typeptr of
 /// every user subclass instance, so its own typeptr proves exactness and

@@ -57,10 +57,9 @@ pub const TUPLE_HASH_UNSET: i64 = -1;
 /// Layout mirrors `pypy/objspace/std/tupleobject.py W_TupleObject` after
 /// RPython translation:
 /// `{wrappeditems: Ptr(GcArray(OBJECTPTR)), _hash_cache: Signed}`.
-/// `_immutable_fields_ = ['wrappeditems[*]']` is reflected via
-/// `immutable: true` on the `wrappeditems` field descr; the array
-/// items are loaded as `getfield_gc_pure_r` and the array length
-/// comes from `arraylen_gc` against the GcArray header.
+/// `_immutable_fields_ = ['wrappeditems[*]']`: the field read is pure,
+/// and so is every item read through the array it produced; the array
+/// length comes from `arraylen_gc` against the GcArray header.
 #[repr(C)]
 #[majit_macros::jit_immutable_fields("wrappeditems[*]")]
 pub struct W_TupleObject {
@@ -266,22 +265,27 @@ pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
 #[majit_macros::dont_look_inside]
 pub fn w_tuple_new_from_slice(items: &[PyObjectRef]) -> PyObjectRef {
     if items.len() == 2 {
-        // PyPy can use `_ff` here because its object space gives plain floats
-        // value identity.  Pyre follows Python 3.14 pointer identity: `(x, x)`
-        // must contain the exact `x` object, not two freshly boxed copies.
-        //
-        // This interception is also the ONLY reason the `_ff` layout has no
-        // producer.  `makespecialisedtuple2` below still builds one for a
-        // plain-float pair, and this is its sole non-test caller, so deleting
-        // the branch to restore the upstream shape does not merely change a
-        // tuple's layout — it makes the walker's `ff` specialisation arm live,
-        // which documents itself as unreachable.  Retire them together.
-        if unsafe { is_plain_float_strict(items[0]) && is_plain_float_strict(items[1]) } {
-            return w_specialised_tuple_oo_new(items[0], items[1]);
-        }
-        return makespecialisedtuple2(items[0], items[1]);
+        return wraptuple2(items[0], items[1]);
     }
     w_tuple_new_array_backed_impl(items, get_instantiate(&TUPLE_TYPE), false)
+}
+
+/// tupleobject.py `wraptuple2`, the body of `space.newtuple2`.
+pub fn wraptuple2(w_a: PyObjectRef, w_b: PyObjectRef) -> PyObjectRef {
+    // PyPy can use `_ff` here because its object space gives plain floats
+    // value identity.  Pyre follows Python 3.14 pointer identity: `(x, x)`
+    // must contain the exact `x` object, not two freshly boxed copies.
+    //
+    // This interception is also the ONLY reason the `_ff` layout has no
+    // producer.  `makespecialisedtuple2` below still builds one for a
+    // plain-float pair, and this is its sole non-test caller, so deleting
+    // the branch to restore the upstream shape does not merely change a
+    // tuple's layout — it makes the walker's `ff` specialisation arm live,
+    // which documents itself as unreachable.  Retire them together.
+    if unsafe { is_plain_float_strict(w_a) && is_plain_float_strict(w_b) } {
+        return w_specialised_tuple_oo_new(w_a, w_b);
+    }
+    makespecialisedtuple2(w_a, w_b)
 }
 
 /// Word-ABI residual of a 1-tuple.
@@ -626,20 +630,30 @@ pub unsafe fn is_plain_float_strict(obj: PyObjectRef) -> bool {
 /// # Safety
 /// `obj` must point to a valid tuple of any of the four variants.
 pub unsafe fn w_tuple_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
-    // rlist.py `ll_getitem` (`func is dum_checkidx`): one unsigned
-    // `r_uint(index) >= r_uint(length)` test. A failing index is either
-    // negative or out of range; add `length` and test again, then
-    // `intmask` the adjusted index.
-    let length = w_tuple_len(obj) as i64;
-    let mut index_u = index as u64;
-    let length_u = length as u64;
-    if index_u >= length_u {
-        index_u = index_u.wrapping_add(length_u);
-        if index_u >= length_u {
+    let ob_type = (*obj).ob_type;
+    let index = if std::ptr::eq(ob_type, &TUPLE_TYPE)
+        || std::ptr::eq(ob_type, &crate::pyobject::TUPLE_USER_TYPE)
+    {
+        // `W_TupleObject.getitem`: `self.wrappeditems[index]` under
+        // `except IndexError`, i.e. rlist `ll_getitem` with `dum_checkidx`.
+        let length = w_tuple_len(obj) as u64;
+        let mut index = index as u64;
+        if index >= length {
+            index = index.wrapping_add(length);
+            if index >= length {
+                return None;
+            }
+        }
+        index as usize
+    } else {
+        // `specialisedtupleobject.py getitem`.
+        let index = if index < 0 { index + 2 } else { index };
+        if index != 0 && index != 1 {
             return None;
         }
-    }
-    Some(w_tuple_getitem_known(obj, index_u as usize))
+        index as usize
+    };
+    Some(w_tuple_getitem_known(obj, index))
 }
 
 /// Internal: read a tuple item at a known-in-bounds index. Splitting

@@ -219,6 +219,7 @@ mod tests {
             "[f64]",
             "&[u8]",
             "GcArray<i64>",
+            "GcArray<rordereddict_entries::Entry>",
             "majit::object_ref_gcarray",
         ] {
             assert!(
@@ -244,6 +245,7 @@ mod tests {
             "[i64;4]",
             "[i64; 4]",
             "[*mut PyObject]",
+            "[rordereddict_entries::Entry]",
             "*const i64",
             "*mut Point",
         ] {

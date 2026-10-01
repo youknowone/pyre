@@ -1702,13 +1702,18 @@ pub(crate) unsafe fn subclass_special_override(
 /// generic tail, which consults `__bool__` then `__len__`, where the call
 /// exceptions — and the non-bool-`__bool__` TypeError — propagate.
 pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
+    // objspace.py is_true: a shortcut for performance.
+    if unsafe { is_bool(obj) } {
+        return Ok(unsafe { w_bool_get_value(obj) });
+    }
     // descroperation.py is_true — `__bool__` (anywhere in the MRO) is consulted
     // before `__len__`.  An exact builtin's `__bool__` / `__len__` are the
     // inherited builtin slots, so its truthiness is computed by layout in
     // `is_true_slot`; any other object (builtin subclass or user instance)
     // takes the `lookup` path, where an inherited builtin `__bool__` is still
-    // found and wins over an overridden `__len__`.
-    if unsafe { is_exact_builtin_instance(obj) } {
+    // found and wins over an overridden `__len__`.  `obj` is a live W_Root,
+    // as upstream's `w_obj` is, so no null test precedes the class read.
+    if unsafe { is_exact_builtin_instance_nonnull(obj) } {
         return is_true_slot(obj);
     }
     is_true_lookup(obj)

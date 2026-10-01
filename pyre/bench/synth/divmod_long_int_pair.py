@@ -1,15 +1,16 @@
-# pyre-check: spec-folds=builtin_divmod,builtin_divmod_long_int
-# `divmod(long, int)` at a traced call site. `_int_divmod` keeps the divisor
-# unwrapped and calls `rbigint.int_divmod`, whose rtyped return is a two-item
-# `GcStruct`: the walker emits one elidable call plus two `getfield_gc_r`, then
-# boxes both halves and builds the specialised object pair. That is three GC
+# pyre-check: spec-folds=builtin_divmod_descent
+# `divmod(long, int)` at a traced call site. The call descends `space.divmod`
+# into `_int_divmod`, which keeps the divisor unwrapped and calls
+# `rbigint.int_divmod`; its rtyped return is a two-item `GcStruct`, so the
+# trace holds one elidable call plus two `getfield_gc_r`, then boxes both
+# halves and builds the pair through `makespecialisedtuple2`. That is three GC
 # allocations per iteration, all inside the loop — an operand varies at every
 # site so the elidable cannot be hoisted out, and the halves stay live across
 # the following iteration's allocations.
-# Two hot loops cover the sibling folds: `builtin_divmod` on exact ints and
-# `binary_op_long_int_div` for bigint `//` and `%` by a machine int.  The fold
-# census verifies all three directly, so the loops need only compile and check
-# their results.
+# Two hot loops cover the siblings: `builtin_divmod_descent` on exact ints and
+# `binary_op_descent` for bigint `//` and `%` by a machine int.  The fold
+# census verifies the divmod row directly, so the loops need only compile and
+# check their results.
 
 
 try:

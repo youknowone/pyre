@@ -1,7 +1,6 @@
-# pyre-check: max-pypy-ratio=12
-# pypy's exec time here sits at the startup-subtraction floor, so the printed
-# ratio is not a measurement; the ceiling is fitted to the slowest of nine
-# local readings across the three backends plus headroom.
+# No `max-pypy-ratio`: pypy's exec time sits on the startup-subtraction floor,
+# so the printed ratio compares process spawn rather than the mirror. The
+# printed mismatch count and the jitstats baseline gate this fixture.
 #
 # Folding `frame.f_locals` mirrors the virtualizable shadow into the live
 # `locals_cells_stack_w` array, because pyre answers the attribute with a 3.14

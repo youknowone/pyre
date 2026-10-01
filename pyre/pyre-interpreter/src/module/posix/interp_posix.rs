@@ -4128,10 +4128,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             let _ = pyre_object::gc_roots::pin_root(v);
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(1_000_000_000));
-            let split = crate::builtins::builtin_divmod(&[
+            let split = crate::baseobjspace::divmod(
                 pyre_object::gc_roots::shadow_stack_get(v_slot),
                 pyre_object::gc_roots::shadow_stack_get(ns_slot),
-            ])?;
+            )?;
             let split_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(split);
             let (w_sec, w_nsec) = unsafe {

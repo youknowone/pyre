@@ -3320,14 +3320,7 @@ pub fn call_with_kwargs_in_ctx(
     pos_args: &[PyObjectRef],
     kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> PyResult {
-    call_with_minted_keyword_names(
-        execution_context,
-        callable,
-        pos_args,
-        kwargs,
-        true,
-        std::ptr::null_mut(),
-    )
+    call_with_minted_keyword_names(execution_context, callable, pos_args, kwargs, true)
 }
 
 /// Mint one exact `str` per host name (`w_str_from_wtf8_managed`, the
@@ -3335,13 +3328,15 @@ pub fn call_with_kwargs_in_ctx(
 /// rooted for the whole call: `w_str_from_wtf8_managed` collects, so the
 /// callable, the positionals and the values are published before the first
 /// mint, and every word is re-read after the last one.
+///
+/// [`call_with_kwargs`] has no C-profile arm, so the delegate receives a
+/// null profile frame. The mint is the collecting call on this path.
 fn call_with_minted_keyword_names(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     pos_args: &[PyObjectRef],
     kwargs: &[(Wtf8Buf, PyObjectRef)],
     dispatch_metaclass_call: bool,
-    profile_frame: *mut PyFrame,
 ) -> PyResult {
     let npos = pos_args.len();
     let nkw = kwargs.len();
@@ -3371,7 +3366,7 @@ fn call_with_minted_keyword_names(
         &keyword_names_w,
         &keywords_w,
         dispatch_metaclass_call,
-        profile_frame,
+        std::ptr::null_mut(),
     )
 }
 

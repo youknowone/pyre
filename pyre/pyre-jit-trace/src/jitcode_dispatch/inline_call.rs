@@ -1541,6 +1541,10 @@ fn known_int_result(
         "int_ne/ii>i" => Some(bool_word(int(0)? != int(1)?)),
         "int_gt/ii>i" => Some(bool_word(int(0)? > int(1)?)),
         "int_ge/ii>i" => Some(bool_word(int(0)? >= int(1)?)),
+        "uint_lt/ii>i" => Some(bool_word((int(0)? as u64) < (int(1)? as u64))),
+        "uint_le/ii>i" => Some(bool_word((int(0)? as u64) <= (int(1)? as u64))),
+        "uint_gt/ii>i" => Some(bool_word((int(0)? as u64) > (int(1)? as u64))),
+        "uint_ge/ii>i" => Some(bool_word((int(0)? as u64) >= (int(1)? as u64))),
         _ => None,
     }
 }
