@@ -21,6 +21,7 @@ pub mod bytearrayobject;
 pub mod bytesobject;
 pub mod capsule;
 pub mod cdatetime;
+pub mod classobject;
 pub mod codecs;
 pub mod complexobject;
 pub mod contextvars;
@@ -966,6 +967,7 @@ pub fn ensure_linked() {
     listobject::ensure_linked();
     dictobject::ensure_linked();
     capsule::ensure_linked();
+    classobject::ensure_linked();
     codecs::ensure_linked();
     import_::ensure_linked();
     number::ensure_linked();

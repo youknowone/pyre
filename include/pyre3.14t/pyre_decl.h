@@ -119,6 +119,10 @@ PyAPI_FUNC(PyObject *) _PyTimeZone_FromTimeZone(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) _PyTime_FromTime(int, int, int, int, PyObject *, PyTypeObject *);
 PyAPI_FUNC(PyObject *) _PyTime_FromTimeAndFold(int, int, int, int, PyObject *, int, PyTypeObject *);
 
+/* cpyext/classobject.rs */
+PyAPI_FUNC(PyObject *) PyInstanceMethod_Function(PyObject *);
+PyAPI_FUNC(PyObject *) PyInstanceMethod_New(PyObject *);
+
 /* cpyext/codecs.rs */
 PyAPI_FUNC(PyObject *) PyCodec_Decode(PyObject *, const char *, const char *);
 PyAPI_FUNC(PyObject *) PyCodec_Decoder(const char *);

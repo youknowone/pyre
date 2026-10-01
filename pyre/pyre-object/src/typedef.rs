@@ -598,6 +598,8 @@ pub const MEMBER_TRACEBACK_FRAME: u32 = MEMBER_DIRECT_FLAG | 62;
 /// `Py_READONLY` there, writable through `descr_set_tb_lasti` in PyPy; the
 /// setter is not wired here, for the reason `init_pytraceback_type` records.
 pub const MEMBER_TRACEBACK_LASTI: u32 = MEMBER_DIRECT_FLAG | 63;
+/// `instancemethod.__func__`, the callable stored by `InstanceMethod`.
+pub const MEMBER_INSTANCEMETHOD_FUNCTION: u32 = MEMBER_DIRECT_FLAG | 64;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

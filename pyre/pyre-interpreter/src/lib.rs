@@ -1204,6 +1204,17 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         subclass_range_alias(179, typed::<crate::module::_io::W_WinConsoleIO>()),
+        // Registered after every platform-gated interpreter class.
+        subclass_range_alias(
+            if cfg!(target_arch = "wasm32") {
+                177
+            } else if WINDOWS_CONSOLE_IO {
+                180
+            } else {
+                179
+            },
+            typed::<pyre_object::instancemethod::InstanceMethod>(),
+        ),
     ];
     aliases.extend(module_subclass_range_aliases());
     aliases
@@ -1219,11 +1230,11 @@ const WINDOWS_CONSOLE_IO: bool = cfg!(all(windows, feature = "host_env", not(fea
 /// not depend on which modules are linked; the module classes follow in the
 /// order [`module_gc_types`] lists them.
 pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
-    177
+    178
 } else if WINDOWS_CONSOLE_IO {
-    180
+    181
 } else {
-    179
+    180
 };
 
 /// The GC classes of builtin modules, in `build_gc` order: those of this
@@ -1271,6 +1282,15 @@ pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
         hierarchy
     };
     let mut active = core.to_vec();
+    // Registered after the platform tail, before the module classes.
+    let instancemethod_id = if cfg!(target_arch = "wasm32") {
+        177
+    } else if WINDOWS_CONSOLE_IO {
+        180
+    } else {
+        179
+    };
+    active.push((instancemethod_id, Some(0)));
     active.extend(
         module_gc_types()
             .iter()

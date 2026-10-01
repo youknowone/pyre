@@ -96,6 +96,7 @@
 #include "pycapsule.h"
 #include "code.h"
 #include "funcobject.h"
+#include "classobject.h"
 #include "frameobject.h"
 #include "fileobject.h"
 #include "codecs.h"

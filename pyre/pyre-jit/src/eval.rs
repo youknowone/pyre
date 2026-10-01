@@ -4306,6 +4306,14 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_io::W_WinConsoleIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // `instancemethod` is unconditional and last, so the posix and console
+    // ids above stay put and only the module boundary moves.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::instancemethod::InstanceMethod
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // The classes `pyre-module` registers close the rclass census, numbered
     // from `MODULE_FIRST_TYPE_ID` in the order its hooks list them.
     assert_eq!(
