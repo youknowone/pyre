@@ -118,7 +118,10 @@ impl<'a> BridgeVirtualCache<'a> {
             bool,
         ) -> majit_ir::DescrRef,
     ) -> Self {
-        Self {
+        // The recording walk still allocates concrete virtuals. Their
+        // addresses have to sit in a registered root slice before a later
+        // allocation can collect them; `executing` does the same.
+        let mut cache = Self {
             virtuals_ptr_cache: vec![None; size],
             virtuals_int_cache: vec![None; size],
             concrete_ptr_cache: vec![None; size],
@@ -127,9 +130,17 @@ impl<'a> BridgeVirtualCache<'a> {
             executing: None,
             fail_values: &[],
             fail_ref_roots: Vec::new(),
-            concrete_roots: Vec::new(),
+            concrete_roots: vec![0i64; size],
             roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
+        };
+        if size > 0 {
+            // SAFETY: `concrete_roots` is heap-allocated at a fixed address,
+            // never resized after this point, and unregistered by `Drop`.
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut cache.concrete_roots);
+            }
         }
+        cache
     }
 
     /// `ResumeDataBoxReader`: the same walk, applying each write through
@@ -266,6 +277,7 @@ impl<'a> BridgeVirtualCache<'a> {
         if i < self.concrete_ptr_cache.len() {
             self.concrete_ptr_cache[i] = Some(v);
         }
+        self.set_concrete_root(i, v.0 as i64);
     }
 
     pub fn get_concrete_int(&self, i: usize) -> Option<i64> {
