@@ -28,37 +28,12 @@ from rpython.rlib.rjitlog import rjitlog as jl
 from rpython.rlib import rgc, rmmap
 
 
-def _mov_count(value):
-    """How many instructions `gen_load_int` emits for `value`."""
-    if value < 0:
-        if value >= -65536:
-            return 1
-        n = 1
-        value = value >> 16
-        shift = 16
-        while shift < 64:
-            if (value & 0xFFFF) != 0xFFFF:
-                n += 1
-            shift += 16
-            value >>= 16
-        return n
-    n = 1
-    value = value >> 16
-    while value:
-        n += 1
-        value >>= 16
-    return n
-
-
 class AssemblerARM64(ResOpAssembler):
     def __init__(self, cpu, translate_support_code=False):
         ResOpAssembler.__init__(self, cpu, translate_support_code)
         self.failure_recovery_code = [0, 0, 0, 0]
         self.wb_slowpath = [0, 0, 0, 0, 0]
         self.stack_check_slowpath = 0
-        # (pos, rt, payload, kind). kind 0: x-reg bits, kind 1: d-reg
-        # whose payload is the address of an 8-byte float constant.
-        self.pending_literals = []
 
     @rgc.no_release_gil
     def assemble_loop(self, jd_id, unique_id, logger, loopname, inputargs,
@@ -1031,7 +1006,6 @@ class AssemblerARM64(ResOpAssembler):
         for tok in self.pending_guards:
             #generate the exit stub and the encoded representation
             tok.pos_recovery_stub = self.generate_quick_failure(tok)
-        self._flush_literal_pool()
 
     def reserve_gcref_table(self, allgcrefs):
         gcref_table_size = len(allgcrefs) * WORD
@@ -1186,10 +1160,8 @@ class AssemblerARM64(ResOpAssembler):
 
     def _assemble(self, regalloc, inputargs, operations):
         #self.guard_success_cc = c.cond_none
-        self.pending_literals = []
         regalloc.compute_hint_frame_locations(operations)
         self._walk_operations(inputargs, operations, regalloc)
-        self._flush_literal_pool()
         #assert self.guard_success_cc == c.cond_none
         frame_depth = regalloc.get_final_frame_depth()
         jump_target_descr = regalloc.jump_target_descr
@@ -1269,49 +1241,10 @@ class AssemblerARM64(ResOpAssembler):
         assert (loc.is_core_reg() and value.is_imm()
                     or loc.is_vfp_reg() and value.is_imm_float())
         if value.is_imm():
-            intval = value.getint()
-            # Three or four movz/movk sit on the hot path (the signal
-            # address, a wide class pointer). One PC-relative literal.
-            if _mov_count(intval) >= 3:
-                pos = self.mc.currpos()
-                self.mc.LDR_r_literal(loc.value, 0)
-                self.pending_literals.append((pos, loc.value, intval, 0))
-            else:
-                self.mc.gen_load_int(loc.value, intval)
+            self.mc.gen_load_int(loc.value, value.getint())
         elif value.is_imm_float():
-            # The constant lives in the data block. Materialising that
-            # address with movz/movk and then LDR makes fmul wait on the
-            # address math. A literal load is one instruction.
-            pos = self.mc.currpos()
-            self.mc.LDR_d_literal(loc.value, 0)
-            self.pending_literals.append((pos, loc.value, value.getint(), 1))
-
-    def _flush_literal_pool(self):
-        pending = self.pending_literals
-        if not pending:
-            return
-        self.pending_literals = []
-        # The loop falls off its last instruction only on a trace that
-        # does not jump. Branch over the pool either way.
-        after_b = self.mc.currpos() + 4
-        pad = (8 - (after_b % 8)) % 8
-        self.mc.B_ofs(4 + pad + len(pending) * 8)
-        for _ in range(pad // 4):
-            self.mc.NOP()
-        for pos, rt, payload, kind in pending:
-            pool = self.mc.currpos()
-            if kind == 1:
-                src = rffi.cast(rffi.CArrayPtr(rffi.UCHAR), payload)
-                for i in range(8):
-                    self.mc.writechar(chr(src[i]))
-            else:
-                bits = r_uint(payload)
-                for i in range(8):
-                    self.mc.writechar(chr((bits >> (8 * i)) & 0xFF))
-            offset = pool - pos
-            base = 0b01011100 if kind == 1 else 0b01011000
-            word = (base << 24) | ((0x7ffff & (offset >> 2)) << 5) | rt
-            self.mc.overwrite32(pos, word)
+            self.mc.gen_load_int(r.ip0.value, value.getint())
+            self.mc.LDR_di(loc.value, r.ip0.value, 0)
 
     def _mov_stack_to_loc(self, prev_loc, loc):
         offset = prev_loc.value
