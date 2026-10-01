@@ -8750,6 +8750,59 @@ impl<'a> Transformer<'a> {
                     }],
                 )
             }
+            "list.bytes_len" => {
+                let l = args.first()?.clone();
+                (
+                    "list.bytes_len → getfield_gc_i(bytes_items.len)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldRead {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "bytes_items.len",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            ty: ValueType::Int,
+                            pure: false,
+                        },
+                    }],
+                )
+            }
+            "list.bytes_getitem" => {
+                let l = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.bytes_getitem → getfield_gc_r(bytes_items.block) + getarrayitem_gc_r",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new(
+                                    "bytes_items.block",
+                                    Some(LIST_OWNER.to_string()),
+                                ),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayRead {
+                                base: block,
+                                index,
+                                item_ty: ValueType::Ref(None),
+                                array_type_id: Some(
+                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                ),
+                                nolength: false,
+                                pure: false,
+                            },
+                        },
+                    ],
+                )
+            }
             "list.ascii_len" => {
                 let l = args.first()?.clone();
                 (

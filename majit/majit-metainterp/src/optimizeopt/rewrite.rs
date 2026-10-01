@@ -942,6 +942,7 @@ impl OptRewrite {
             let expected = ctx.get_constant_int_box(&op.arg(1));
             if let Some(expected) = expected {
                 if known_class == expected {
+                    // rewrite.py:403-404: known class matches — drop the guard.
                     return OptimizationResult::Remove;
                 }
                 // rewrite.py:404-407: known class mismatch is a
