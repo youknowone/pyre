@@ -33,7 +33,7 @@
     "frames_across_collecting": 0,
     "frames_across_collecting_fns": 0,
     "frames_unresolved_calls": 31,
-    "short_brackets": 2,
+    "short_brackets": 6,
     "stale_pins": 3,
     "tier15_calls": 0,
     "tier15_calls_fns": 0,
@@ -47,7 +47,7 @@
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ],
-    "unread_brackets": 389,
+    "unread_brackets": 419,
     "unresolved_collecting_calls": 10883,
     "unresolved_collecting_calls_fns": 2111
   }
