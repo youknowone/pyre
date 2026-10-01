@@ -1,5 +1,6 @@
-# pyre-check: skip-backends=cranelift
-# cranelift runs the core build, which has no `pyre-module` and so no `math`.
+# pyre-check: requires-modules=math
+# A core cranelift build has no `pyre-module`, so it has no `math`.
+# Skip that build by the missing module. A build that links `math` still runs.
 # pyre-check: jitstats-band=guard_failures=16
 # guard_failures measured 347 on macOS arm64, 345 on ubuntu and 335 on
 # windows (CI run 36401570302) for the same source.
