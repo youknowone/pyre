@@ -860,14 +860,16 @@ pub fn register_depth_bump(f: DepthBumpFn) {
 /// user-function call.  Shared by `call_user_function_with_eval`,
 /// `call_user_function_plain_with_ctx` and `call_user_function_with_args`
 /// so all positional-only entries apply the same
-/// `function.py` _flat_pycall_defaults + `argument.py:170-338`
-/// _match_signature subset (positional-only — no kwargs path).
+/// `function.py` `_flat_pycall_defaults` + `argument.py` `_match_signature`
+/// subset (positional-only — no kwargs path). The JIT callee-frame helpers
+/// go through the same function: `createframe` stores this slice straight
+/// into locals, and a `*args` parameter is one of those locals.
 ///
 /// Raises TypeError on too-many positional args (no `*args` to absorb
 /// overflow) and on missing required positional / keyword-only args after
-/// defaults application, mirroring `argument.py` ArgErrTooMany and
-/// `argument.py` ArgErrMissing.
-fn fill_user_function_args(
+/// defaults application, mirroring `argument.py` `ArgErrTooMany` and
+/// `argument.py` `ArgErrMissing`.
+pub fn fill_user_function_args(
     callable: PyObjectRef,
     code_ref: &crate::CodeObject,
     args: &[PyObjectRef],
@@ -5334,8 +5336,8 @@ fn call_metaclass_with_kwargs(
 }
 
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.
-/// PyPy: argument.py _match_signature varargs/varkeywords packing
-fn pack_varargs(code: &crate::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjectRef> {
+/// PyPy: `argument.py` `_match_signature` varargs/varkeywords packing.
+pub fn pack_varargs(code: &crate::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjectRef> {
     let nparams = (code.arg_count + code.kwonlyarg_count) as usize;
     let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
     let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);

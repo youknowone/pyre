@@ -4263,6 +4263,22 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyframe_pop,
     );
 
+    // `PyFrame::clear_references` is the loop in `PyFrame.descr_clear`.
+    // `look_inside_graph` leaves that loop residual, and
+    // `generator_frame_is_finished` calls it while a bridge can still be
+    // recording the generator's return. PyPy's `getfunctionptr` publishes a
+    // real address for the same residual; both CallPath spellings are
+    // required, as for `PyFrame::pop` above. It is not an operand-stack
+    // accessor: the walk may execute it against the live frame.
+    let pyframe_clear_references: fn(&mut crate::pyframe::PyFrame) =
+        crate::pyframe::PyFrame::clear_references;
+    pa1(
+        &mut entries,
+        "pyre_interpreter::pyframe::PyFrame::clear_references",
+        "pyre_interpreter::PyFrame::clear_references",
+        pyframe_clear_references,
+    );
+
     // `stack_underflow_error` deliberately remains unpublished: its `&str`
     // argument is a two-word aggregate with no one-word residual-call ABI.
 
@@ -6703,6 +6719,18 @@ mod tests {
         );
         assert_eq!(bindings["pyre_interpreter::PyFrame::nlocals"], nlocals);
 
+        let clear_references: fn(&mut crate::pyframe::PyFrame) =
+            crate::pyframe::PyFrame::clear_references;
+        let clear_references = clear_references as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pyframe::PyFrame::clear_references"],
+            clear_references
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::PyFrame::clear_references"],
+            clear_references
+        );
+
         let get_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_current_exception;
         let get_exc = get_exc as *const () as usize as i64;
         assert_eq!(
@@ -6927,6 +6955,10 @@ mod tests {
         assert!(is_pyframe_operand_stack_accessor(pop as usize));
         let nlocals = bindings["pyre_interpreter::pyframe::PyFrame::nlocals"];
         assert!(!is_pyframe_operand_stack_accessor(nlocals as usize));
+        let clear_references = bindings["pyre_interpreter::pyframe::PyFrame::clear_references"];
+        assert!(!is_pyframe_operand_stack_accessor(
+            clear_references as usize
+        ));
         assert!(!is_pyframe_operand_stack_accessor(0));
     }
 
