@@ -10359,10 +10359,12 @@ impl<'a> Lowering<'a> {
     /// when it is a raw pointer or a reference, including the `Ok` or
     /// `Some` payload. `identity(&x) -> *const i64` would then deref a
     /// freed allocation. A status word (`hash_out` returns `i64`) is not
-    /// this address.
+    /// this address. Each peel is classified on the next iteration. A
+    /// wrapper still in hand when the bound is hit is this address: the
+    /// walk did not reach a non-wrapper.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut ty = clone_tyref(ty);
-        for _ in 0..4 {
+        for _ in 0..8 {
             if tyref_is_raw_pointer(&ty, self.llbc) || output_type_is_ref(&ty, self.llbc) {
                 return true;
             }
@@ -10376,7 +10378,7 @@ impl<'a> Lowering<'a> {
             }
             return false;
         }
-        false
+        true
     }
 
     /// Place a borrow temporary names, after peeling `&mut *p`.

@@ -315,6 +315,26 @@ fn raw_ptr(pointee: &Value, kind: &str) -> Value {
     json!({"RawPtr": [pointee, kind]})
 }
 
+fn option_of(inner: &Value) -> Value {
+    json!({"Adt": {
+        "id": 0,
+        "generics": {
+            "regions": [],
+            "types": [inner],
+            "const_generics": [],
+            "trait_refs": []
+        }
+    }})
+}
+
+fn nest_option(inner: Value, depth: usize) -> Value {
+    let mut ty = inner;
+    for _ in 0..depth {
+        ty = option_of(&ty);
+    }
+    ty
+}
+
 fn borrow_ty(pointee: &Value, kind: &str) -> Value {
     json!({"Ref": ["Erased", pointee, kind]})
 }
@@ -1270,7 +1290,9 @@ fn mut_borrow_of_struct_field_writes_the_word_back() {
     );
 }
 
-fn lower_returned_address() -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+fn lower_returned_address(
+    result_ty: &Value,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
     let (span, generics, meta, local) = probe_parts();
     let word = i64_ty();
     let borrowed = borrow_ty(&word, "Shared");
@@ -1288,12 +1310,12 @@ fn lower_returned_address() -> Result<FunctionGraph, majit_translate::front::mir
         0,
         &["probe", "write_hash"],
         vec![word.clone()],
-        &ptr,
+        result_ty,
         json!({"Unstructured": {"span": span, "locals": {"arg_count": 1, "locals": [
-            local(0, None, &ptr),
+            local(0, None, result_ty),
             local(1, Some("word"), &word),
             local(2, None, &borrowed),
-            local(3, None, &ptr)
+            local(3, None, result_ty)
         ]}, "body": [
             {"statements": [
                 {"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
@@ -1301,12 +1323,12 @@ fn lower_returned_address() -> Result<FunctionGraph, majit_translate::front::mir
                 }}]}}
             ], "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                    "args": [{"Move": borrow}], "dest": place(3, &ptr)},
+                    "args": [{"Move": borrow}], "dest": place(3, result_ty)},
                 "target": 1, "on_unwind": 2
             }}}},
             {"statements": [{"span": span, "kind": {"Assign": [
-                place(0, &ptr),
-                {"Use": [{"Copy": place(3, &ptr)}, "Yes"]}
+                place(0, result_ty),
+                {"Use": [{"Copy": place(3, result_ty)}, "Yes"]}
             ]}}], "terminator": {"span": span, "kind": "Return"}},
             {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
@@ -1315,7 +1337,7 @@ fn lower_returned_address() -> Result<FunctionGraph, majit_translate::front::mir
         1,
         &["probe", "sink_pair"],
         vec![ptr.clone()],
-        &ptr,
+        result_ty,
         json!("Opaque"),
     );
     let file = json!({
@@ -1323,7 +1345,12 @@ fn lower_returned_address() -> Result<FunctionGraph, majit_translate::front::mir
         "has_errors": false,
         "translated": {
             "crate_name": "probe",
-            "type_decls": [],
+            "type_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["core", "option", "Option"]),
+                "kind": "Opaque",
+                "src": "Normal"
+            }],
             "fun_decls": [caller, sink],
             "global_decls": [],
             "trait_decls": [],
@@ -1336,7 +1363,33 @@ fn lower_returned_address() -> Result<FunctionGraph, majit_translate::front::mir
 
 #[test]
 fn returned_spill_address_is_not_lowered() {
-    let err = lower_returned_address().expect_err("a returned spill address must not lower");
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let err = lower_returned_address(&ptr).expect_err("a returned spill address must not lower");
     let msg = err.to_string();
     assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn returned_pointer_under_four_options_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let err = lower_returned_address(&nest_option(ptr, 4))
+        .expect_err("a pointer under four Options must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn returned_i64_under_four_options_still_frees_the_spill() {
+    let graph = lower_returned_address(&nest_option(i64_ty(), 4))
+        .expect("a status word under four Options still lowers");
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawMalloc { .. })),
+        "the spill is allocated\n{}",
+        op_lines(&graph)
+    );
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
 }
