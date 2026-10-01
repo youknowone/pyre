@@ -1,9 +1,9 @@
-# pyre-check: max-pypy-ratio=1.75
+# pyre-check: max-pypy-ratio=1.55
 #
-# Floor is 1.75 / 6 = 0.2917x. Ubuntu dynasm run 36712656278 read 0.296x
-# (0.24s vs pypy 0.81s) and missed the 1.8-derived 0.30x floor. Cranelift
-# on the earlier fitting run was 1.7x, under 1.75. Two loops + three
-# bridges; not over-tracing.
+# Floor is 1.55 / 6 = 0.258x. Ubuntu dynasm run 36933540506 read exec
+# 0.22s vs pypy 0.82s and missed the 1.75 floor (0.2917x). Ubuntu
+# cranelift on that run was 1.5x; windows dynasm 0.9x; macos dynasm 0.8x
+# and cranelift 1.1x. Two loops + three bridges; not over-tracing.
 #
 # A recursion deeper than the inline unroll bound, driven from a loop body.
 #
