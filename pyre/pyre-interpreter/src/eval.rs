@@ -457,6 +457,23 @@ pub unsafe fn method_cache_custom_trace(
     }
 }
 
+/// Interior fields of a `malloc_typed` declaration. The object has no GC
+/// header, so this does not pass `value` to `visitor`.
+pub unsafe fn trace_declaration_interiors(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if value.is_null() {
+        return;
+    }
+    unsafe {
+        walk_raw_function_roots(value, visitor);
+        walk_raw_getset_roots(value, visitor);
+        walk_raw_wrapped_function_roots(value, visitor);
+        walk_raw_immortal_roots(value, visitor);
+    }
+}
+
 unsafe fn walk_raw_function_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -1533,6 +1550,7 @@ fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) 
 /// Stored in a process-global fn-pointer cell (#396); calling again with
 /// the same fn pointer is idempotent.
 pub fn register_interpreter_global_root_walker() {
+    pyre_object::typedef::set_declaration_interior_walk(trace_declaration_interiors);
     majit_gc::shadow_stack::register_extra_root_walker(
         walk_interpreter_global_roots,
         "interpreter_global_roots",

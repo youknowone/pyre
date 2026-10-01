@@ -5213,6 +5213,16 @@ fn build_gc() -> Box<MiniMarkGC> {
         .without_app_level_typedef(),
     );
     pyre_interpreter::baseobjspace::set_method_cache_gc_type_id(method_cache_tid);
+    // `typedef.py` `TypeDef.rawdict`. After the method cache so that id
+    // stays put. The trace visits GC-owned values and immortal interiors.
+    let declaration_tid = gc.register_type(
+        majit_gc::trace::TypeInfo::with_custom_trace(
+            std::mem::size_of::<usize>(),
+            pyre_object::typedef::declaration_container_custom_trace,
+        )
+        .without_app_level_typedef(),
+    );
+    pyre_object::typedef::set_declaration_container_gc_type_id(declaration_tid);
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(
@@ -5722,6 +5732,7 @@ pub fn init_gc_subsystem() {
     majit_rlib::rbigint::initialize_rbigint_parts_cache();
     PYRE_OBJECT_HOOKS_INSTALLED.call_once(install_pyre_object_hooks);
     pyre_interpreter::baseobjspace::publish_method_cache_container();
+    pyre_object::typedef::publish_declaration_container();
     // The root walkers belong to the same bootstrap as the collector they feed:
     // interpreter startup builds every builtin type object and its namespace
     // dict before the first Python frame exists, and `walk_builtin_type_dicts_gc`
