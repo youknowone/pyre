@@ -3,6 +3,10 @@
 //! `pygraph_initial_block` already records that parameter as `Int`.
 //! `CallControl::getcalldescr` compares the two.
 //!
+//! `IntArray::base` and `FloatArray::base` return the GC block header,
+//! so those calls stay `Ref`. An integer cast to a non-byte raw scalar
+//! stays in the int bank.
+//!
 //! A byte pointer stays `Ref`: pyre erases a GC reference to `*mut u8`.
 
 use majit_charon_reader::ullbc::NameSeg;
@@ -126,6 +130,21 @@ fn find_method<'a>(llbc: &'a Llbc, leaf: &str, owner: &str) -> &'a FunDecl {
         .unwrap_or_else(|| panic!("missing {owner}::{leaf}"))
 }
 
+fn find_exact<'a>(llbc: &'a Llbc, path: &str) -> &'a FunDecl {
+    llbc.iter_local_fns()
+        .find(|fd| fd.item_meta.name_path() == path)
+        .unwrap_or_else(|| panic!("missing {path}"))
+}
+
+fn call_results_named<'a>(graph: &'a FunctionGraph, leaf: &str) -> Vec<&'a ValueType> {
+    ops(graph)
+        .filter_map(|op| {
+            let (ty, name) = call_result(&op.kind)?;
+            (name == Some(leaf)).then_some(ty)
+        })
+        .collect()
+}
+
 fn assert_returned_call(graph: &FunctionGraph, leaf: &str) {
     match root_op(graph, &returned_var(graph)).and_then(call_result) {
         Some((ValueType::Int, Some(got))) if got == leaf => {}
@@ -151,6 +170,101 @@ fn call_returned_raw_scalar_pointer_is_int() {
     )
     .expect("lower SpaceActionFlag::ticker_addr");
     assert_returned_call(&producer, "ticker_addr");
+}
+
+#[test]
+fn typed_array_base_call_stays_ref() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted");
+    let context = LowerContext::new(&llbc);
+    for path in [
+        "pyre_object::int_array::<Impl>::index",
+        "pyre_object::float_array::<Impl>::index",
+    ] {
+        let graph = lower_fun_decl(&context, find_exact(&llbc, path)).unwrap_or_else(|err| {
+            panic!("lower {path}: {err}");
+        });
+        let bases = call_results_named(&graph, "base");
+        assert!(
+            !bases.is_empty(),
+            "{path} must call base, ops in {}",
+            graph.name
+        );
+        assert!(
+            bases.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
+            "{path} base() stays the GC block Ref, got {bases:?}"
+        );
+    }
+}
+
+#[test]
+fn integer_cast_to_raw_scalar_stays_int() {
+    let llbc = Llbc::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-module.ullbc"
+    ))
+    .expect("pyre-module.ullbc is already extracted");
+    let context = LowerContext::new(&llbc);
+    let graph = lower_fun_decl(&context, find_method(&llbc, "as_ptr", "HashStateStorage"))
+        .expect("lower HashStateStorage::as_ptr");
+    let leaves: Vec<_> = ops(&graph)
+        .filter_map(|op| call_result(&op.kind).and_then(|(_, leaf)| leaf))
+        .collect();
+    assert!(
+        leaves.contains(&"cast_ptr_to_int"),
+        "the field address still crosses into the integer, got {leaves:?}"
+    );
+    assert!(
+        !leaves.contains(&"cast_int_to_ptr"),
+        "usize as *const usize stays in the int bank, got {leaves:?} in {}",
+        graph.name
+    );
+    match root_op(&graph, &returned_var(&graph)) {
+        Some(OpKind::BinOp { result_ty, .. })
+            if matches!(result_ty, ValueType::Int | ValueType::Unsigned) => {}
+        other => panic!(
+            "{} must return the aligned integer word, got {other:?}",
+            graph.name
+        ),
+    }
+
+    let widened = lower_fun_decl(
+        &context,
+        find_method(&llbc, "as_mut_ptr", "HashStateStorage"),
+    )
+    .expect("lower HashStateStorage::as_mut_ptr");
+    assert_returned_call(&widened, "as_ptr");
+}
+
+#[test]
+fn sizehint_i64_cast_stays_gcarray_write() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted");
+    let graph = lower_function(&llbc, "pyre_object::listobject::set_sizehint_state_value")
+        .expect("lower set_sizehint_state_value");
+    let raw_stores = ops(&graph)
+        .filter(|op| matches!(op.kind, OpKind::RawStore { .. }))
+        .count();
+    assert_eq!(
+        raw_stores, 0,
+        "set_sizehint_state_value must keep the GcArray write"
+    );
+    let ptr_to_int = call_results_named(&graph, "cast_ptr_to_int");
+    assert!(
+        ptr_to_int.is_empty(),
+        "*mut u8 as *mut i64 must not become cast_ptr_to_int, got {ptr_to_int:?}"
+    );
+    assert!(
+        ops(&graph).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::ArrayWrite {
+                    item_ty: ValueType::Int,
+                    array_type_id: Some(array_type_id),
+                    ..
+                } if array_type_id == "[i64]"
+            )
+        }),
+        "set_sizehint_state_value must write GcArray(Signed)"
+    );
 }
 
 #[test]

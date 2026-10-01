@@ -10086,6 +10086,19 @@ impl<'a> Lowering<'a> {
                     {
                         return Ok((None, orig));
                     }
+                    // An integer word cast to a non-byte raw scalar stays
+                    // in the int bank. `history.py` `getkind` banks a raw
+                    // `Ptr` as `int`, including `*mut f64`, so
+                    // `usize as *const usize` aliases that word. A `Ref`
+                    // source still reaches [`Self::ptr_cast_marker`], and
+                    // `*mut u8 as *mut i64` keeps the GcArray narrow.
+                    let dst_kind = if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                        && let Some(raw) = raw_scalar_address_value_type(dest_ty, self.llbc)
+                    {
+                        raw
+                    } else {
+                        dst_kind
+                    };
                     return Ok(
                         match src_kind
                             .as_ref()
@@ -14054,9 +14067,23 @@ impl<'a> Lowering<'a> {
         // `*mut u8`. A reference stays an address. Naming its pointee
         // here would retype a call-returned `&T` to the scalar, and
         // `*dest` is `rewrite_op_raw_load`.
+        //
+        // [`is_typed_array_base_adapter`] spells that same `*mut i64` /
+        // `*mut f64`, then [`is_items_block_base_ptr_add`] collapses the
+        // body onto the GC block header. `getkind` of a GC pointer is
+        // `ref`, so the call keeps the `Ref` [`tyref_to_value_type_with`]
+        // already recorded for that header.
+        let callee_returns_gc_block = match &call.func {
+            CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(is_typed_array_base_adapter),
+            _ => false,
+        };
         let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
             ValueType::Void
-        } else if let Some(raw) = raw_scalar_address_value_type(&call.dest.ty, self.llbc) {
+        } else if !callee_returns_gc_block
+            && let Some(raw) = raw_scalar_address_value_type(&call.dest.ty, self.llbc)
+        {
             raw
         } else {
             tyref_to_value_type_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
