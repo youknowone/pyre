@@ -14606,6 +14606,28 @@ impl<'a> Lowering<'a> {
                 let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
                 Some((owner_root, name, ty, owner_id))
             }
+            (TypeDeclKind::Opaque | TypeDeclKind::Unknown, None) => {
+                let field_name = self
+                    .llbc
+                    .published_struct_field(&name_path, field_idx)
+                    .or_else(|| {
+                        self.llbc
+                            .published_struct_field(&strip_crate_prefix(&name_path), field_idx)
+                    })?;
+                let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
+                    &name_path,
+                    self.tombstoned_leaves,
+                ));
+                let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
+                // The use-site place type types the FieldRead. This token
+                // only has to decline the inline-vec and fat-box rewrites.
+                Some((
+                    owner_root,
+                    field_name,
+                    TyRef::Other(serde_json::Value::Null),
+                    owner_id,
+                ))
+            }
             (TypeDeclKind::Enum(variants), Some(vidx)) => {
                 let variant = variants.get(vidx as usize)?;
                 let f = variant.fields.get(field_idx)?;
@@ -36050,6 +36072,38 @@ pub fn scope_owning_key(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     };
     let adt = llbc.type_by_id(adt_id)?.item_meta.name_path();
     Some(format!("{adt}::{leaf}"))
+}
+
+/// Field names of every struct body in this artefact, keyed by the full
+/// path and the crate-stripped path. An importing crate's `Opaque` view
+/// of the same type resolves `Field` index `i` through this list.
+pub fn harvest_struct_field_names(llbc: &Llbc) -> Vec<(String, Vec<String>)> {
+    let mut rows = Vec::new();
+    for td in llbc.iter_type_decls() {
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            continue;
+        };
+        if fields.is_empty() {
+            continue;
+        }
+        let names: Vec<String> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                field
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("__pos_{i}"))
+            })
+            .collect();
+        let path = td.item_meta.name_path();
+        let canonical = strip_crate_prefix(&path);
+        rows.push((path.clone(), names.clone()));
+        if canonical != path {
+            rows.push((canonical, names));
+        }
+    }
+    rows
 }
 
 pub fn harvest_scope_owning_paths(llbc: &Llbc) -> Vec<String> {

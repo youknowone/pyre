@@ -101,6 +101,11 @@ pub struct Llbc {
     /// so an importing crate can answer `call_returns_owned_scope` for a
     /// declaration Charon left body-less. Sorted. Empty until published.
     scope_owning_constructors: parking_lot::RwLock<Vec<String>>,
+    /// Struct field names in declaration order, keyed by type path.
+    /// Harvested where the body is a `Struct`, so a later crate whose
+    /// view of that type is `Opaque` can name field `i` instead of
+    /// aliasing the base. Sorted by path. Empty until published.
+    published_struct_fields: parking_lot::RwLock<Vec<(String, Vec<String>)>>,
     /// Dedup id of `register_eval_override`'s first parameter, resolved
     /// once from every `FunDecl` this artefact carries (local and
     /// external). `None` once the scan has finished without a match.
@@ -294,6 +299,7 @@ impl Llbc {
             eval_hook_graphs: parking_lot::RwLock::new(Vec::new()),
             root_stack_effects: parking_lot::RwLock::new((Vec::new(), Vec::new())),
             scope_owning_constructors: parking_lot::RwLock::new(Vec::new()),
+            published_struct_fields: parking_lot::RwLock::new(Vec::new()),
             eval_fn_type_id: std::sync::OnceLock::new(),
             trait_assoc_index: std::sync::OnceLock::new(),
             drop_impl_owners: std::sync::OnceLock::new(),
@@ -386,6 +392,23 @@ impl Llbc {
             .read()
             .binary_search_by(|p| p.as_str().cmp(path))
             .is_ok()
+    }
+
+    /// Publish struct field names harvested from linked artefacts. `rows`
+    /// is `(type path, field names in declaration order)`.
+    pub fn set_published_struct_fields(&self, mut rows: Vec<(String, Vec<String>)>) {
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.dedup_by(|a, b| a.0 == b.0);
+        *self.published_struct_fields.write() = rows;
+    }
+
+    /// Field `index` of a struct whose body this artefact does not have.
+    pub fn published_struct_field(&self, path: &str, index: usize) -> Option<String> {
+        let rows = self.published_struct_fields.read();
+        let slot = rows
+            .binary_search_by(|row| row.0.as_str().cmp(path))
+            .ok()?;
+        rows[slot].1.get(index).cloned()
     }
 
     /// Dedup id of `register_eval_override`'s parameter type.
