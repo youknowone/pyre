@@ -13945,6 +13945,257 @@ pub(crate) fn try_walker_orthodox_float_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+const NEWCOMPLEX_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::complexobject::newcomplex",
+    commit_label: "newcomplex_commit",
+    call_site_label: "newcomplex_call_site",
+    decline_tag: "NEWCOMPLEX-SUBWALK",
+};
+
+const COMPLEX_REAL_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::complexobject::complex_descr_get_real",
+    commit_label: "complex_real_commit",
+    call_site_label: "complex_real_call_site",
+    decline_tag: "COMPLEX-REAL-SUBWALK",
+};
+
+const COMPLEX_IMAG_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::complexobject::complex_descr_get_imag",
+    commit_label: "complex_imag_commit",
+    call_site_label: "complex_imag_call_site",
+    decline_tag: "COMPLEX-IMAG-SUBWALK",
+};
+
+fn walker_complex_decline<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pre: majit_metainterp::recorder::TracePosition,
+) -> Result<Option<()>, DispatchError> {
+    ctx.trace_ctx.cut_trace_with_snapshots(pre);
+    ctx.trace_ctx.heap_cache_mut().reset();
+    Ok(None)
+}
+
+/// `__complex__` or `__float__` wins over `__index__` in
+/// `complexobject.py unpackcomplex`.
+fn complex_arg_prefers_conversion_dunder(obj: pyre_object::PyObjectRef) -> bool {
+    let Some(w_type) = pyre_interpreter::typedef::r#type(obj) else {
+        return false;
+    };
+    unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(w_type.as_ptr(), "__complex__").is_some()
+            || pyre_interpreter::baseobjspace::lookup_in_type(w_type.as_ptr(), "__float__")
+                .is_some()
+    }
+}
+
+fn descend_newcomplex<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    raw: OpRef,
+    val: f64,
+    dst: usize,
+    pre: majit_metainterp::recorder::TracePosition,
+) -> Result<Option<()>, DispatchError> {
+    let imag = ctx.trace_ctx.const_float(0.0f64.to_bits() as i64);
+    if !matches!(
+        try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[],
+            &[],
+            &[(raw, val), (imag, 0.0)],
+            dst,
+            'r',
+            &NEWCOMPLEX_DESCENT,
+        )?,
+        Some(DispatchOutcome::Continue)
+    ) {
+        return walker_complex_decline(ctx, pre);
+    }
+    Ok(Some(()))
+}
+
+/// `complex(x)` for one positional on the canonical `complex` type.
+///
+/// `complexobject.py descr__new__`: an exact complex is returned unchanged.
+/// `unpackcomplex` then reads a bool, an exact machine int, or an exact
+/// float and allocates `W_ComplexObject`. A user `__index__` is the same
+/// inlined call `range` records, then that allocation. Float subclasses,
+/// `__complex__`, `__float__`, longs, strings, keywords, and a second
+/// argument stay on the residual.
+pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(arg_obj),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
+        return Ok(None);
+    }
+    let complex_type_obj =
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::COMPLEX_TYPE);
+    if !std::ptr::eq(concrete_callable, complex_type_obj) {
+        return Ok(None);
+    }
+    let arg_op = r_args[2];
+    enum Plan {
+        Identity,
+        Numeric { is_int: bool, val: f64 },
+        Index(IndexInlineCandidate),
+    }
+    let plan = unsafe {
+        if pyre_object::is_exact_type(arg_obj, &pyre_object::pyobject::COMPLEX_TYPE) {
+            Some(Plan::Identity)
+        } else if pyre_object::is_bool(arg_obj) {
+            Some(Plan::Numeric {
+                is_int: true,
+                val: pyre_object::w_bool_get_value(arg_obj) as i64 as f64,
+            })
+        } else if pyre_object::is_int(arg_obj) && pyre_object::is_exact_builtin_instance(arg_obj) {
+            Some(Plan::Numeric {
+                is_int: true,
+                val: pyre_object::w_int_get_value(arg_obj) as f64,
+            })
+        } else if pyre_object::is_float(arg_obj) && pyre_object::is_exact_builtin_instance(arg_obj)
+        {
+            Some(Plan::Numeric {
+                is_int: false,
+                val: pyre_object::w_float_get_value(arg_obj),
+            })
+        } else if pyre_object::is_long(arg_obj)
+            || pyre_object::is_float(arg_obj)
+            || pyre_object::is_complex(arg_obj)
+            || pyre_object::is_str(arg_obj)
+            || pyre_object::is_bytes(arg_obj)
+            || pyre_object::is_bytearray(arg_obj)
+            || complex_arg_prefers_conversion_dunder(arg_obj)
+        {
+            if fbw_inline_diag_enabled() {
+                eprintln!("[complex-call-decline] why=conversion-dunder-or-other-type");
+            }
+            None
+        } else {
+            match prepare_walker_inline_index(ctx, arg_op, arg_obj) {
+                Some(candidate) => Some(Plan::Index(candidate)),
+                None => {
+                    if fbw_inline_diag_enabled() {
+                        eprintln!("[complex-call-decline] why=index-prepare-none");
+                    }
+                    None
+                }
+            }
+        }
+    };
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+
+    let pre = ctx.trace_ctx.get_trace_position();
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+    match plan {
+        Plan::Identity => {
+            let complex_type_addr = &pyre_object::pyobject::COMPLEX_TYPE as *const _ as i64;
+            if !arg_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(arg_op) {
+                let type_const = ctx.trace_ctx.const_int(complex_type_addr);
+                ctx.trace_ctx
+                    .record_guard(OpCode::GuardClass, &[arg_op, type_const], 0);
+                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            }
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(arg_op, complex_type_addr);
+            walker_guard_exact_w_class(ctx, op.pc, arg_op, complex_type_obj)?;
+            write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', arg_op)?;
+            Ok(Some(()))
+        }
+        Plan::Numeric { is_int, val } => {
+            let raw =
+                walker_coerce_operand_to_float(ctx, op.pc, arg_op, arg_obj, is_int, val, false)?;
+            descend_newcomplex(ctx, op.pc, raw, val, dst, pre)
+        }
+        Plan::Index(candidate) => {
+            let Some((result, ConcreteValue::Ref(concrete))) = try_walker_inline_index(
+                ctx, op, code, funcptr, r_args, call_descr, dst, candidate,
+            )?
+            else {
+                return walker_complex_decline(ctx, pre);
+            };
+            if !walker_is_exact_machine_int_concrete(concrete) {
+                return walker_complex_decline(ctx, pre);
+            }
+            let val = unsafe { pyre_object::w_int_get_value(concrete) } as f64;
+            let raw =
+                walker_coerce_operand_to_float(ctx, op.pc, result, concrete, true, val, false)?;
+            descend_newcomplex(ctx, op.pc, raw, val, dst, pre)
+        }
+    }
+}
+
+/// `complex.real` / `complex.imag` on an exact complex.
+///
+/// `complexobject.py complexwprop` boxes the lane with `space.newfloat`.
+/// The traced leaf is `complex_descr_get_real` / `complex_descr_get_imag`.
+/// A subclass receiver stays on the residual `member_descriptor`.
+pub(crate) fn try_walker_orthodox_complex_member<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    name: &str,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let descent = match name {
+        "real" => &COMPLEX_REAL_DESCENT,
+        "imag" => &COMPLEX_IMAG_DESCENT,
+        _ => return Ok(None),
+    };
+    let Some(concrete) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    if unsafe { !pyre_object::is_exact_type(concrete, &pyre_object::pyobject::COMPLEX_TYPE) } {
+        return Ok(None);
+    }
+    let pre = ctx.trace_ctx.get_trace_position();
+    let complex_type_obj =
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::COMPLEX_TYPE);
+    let complex_type_addr = &pyre_object::pyobject::COMPLEX_TYPE as *const _ as i64;
+    if !obj.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(complex_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(obj, complex_type_addr);
+    walker_guard_exact_w_class(ctx, op_pc, obj, complex_type_obj)?;
+    if !matches!(
+        try_walker_orthodox_descent(ctx, op_pc, &[], &[(obj, concrete)], &[], dst, 'r', descent,)?,
+        Some(DispatchOutcome::Continue)
+    ) {
+        return walker_complex_decline(ctx, pre);
+    }
+    Ok(Some(()))
+}
+
 /// `str(i)` / `repr(i)` on an exact `int`: walk `intobject.py descr_str`.
 ///
 /// The generated body is `ll_int2dec` then `newutf8`. The residual it

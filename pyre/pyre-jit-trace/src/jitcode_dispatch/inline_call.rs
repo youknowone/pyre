@@ -673,11 +673,92 @@ pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
 /// have no app-visible effect: no branch, no live-heap write, and no residual
 /// outside `pure_helpers`.  Portal-frame vable traffic and constant/int boxing
 /// are local, so both callers pass those.
+fn flags_field_descr(callee_descr_refs: &[DescrRef], descr_index: usize) -> bool {
+    callee_descr_refs
+        .get(descr_index)
+        .and_then(|descr| descr.as_field_descr())
+        .is_some_and(|field| field.offset() == crate::frame_layout::PYFRAME_FLAGS_OFFSET)
+}
+
+/// `RETURN_VALUE` stores `frame_finished_execution` as
+/// `getfield flags; int_or FLAG_FRAME_FINISHED; setfield flags`
+/// immediately before `ref_return`. The bit is sticky, so sampling the
+/// body and then replaying the real call ORs the same bit.
+fn frame_finished_return_store(
+    body_code: &[u8],
+    op: &crate::jitcode_runtime::DecodedOp,
+    callee_descr_refs: &[DescrRef],
+    vable_reg: Option<u8>,
+    finished_or: Option<(u8, u8)>,
+) -> bool {
+    let Some((frame, value_reg)) = finished_or else {
+        return false;
+    };
+    if !op.argcodes.starts_with('r') {
+        return false;
+    }
+    let Some(&target_reg) = body_code.get(op.pc + 1) else {
+        return false;
+    };
+    let descr = super::decode_descr_index(body_code, op, 2);
+    vable_reg == Some(frame)
+        && target_reg == frame
+        && body_code.get(op.pc + 2).copied() == Some(value_reg)
+        && flags_field_descr(callee_descr_refs, descr)
+        && crate::jitcode_runtime::decode_op_at(body_code, op.next_pc)
+            .is_some_and(|next| next.key == "ref_return/r")
+}
+
+fn note_frame_finished_ops(
+    body_code: &[u8],
+    op: &crate::jitcode_runtime::DecodedOp,
+    callee_descr_refs: &[DescrRef],
+    num_regs_i: usize,
+    constants_i: &[i64],
+    flags_get: Option<(u8, u8)>,
+) -> (Option<(u8, u8)>, Option<(u8, u8)>) {
+    if op.key == "getfield_gc_i/rd>i" {
+        if let (Some(&frame), Some(&dst)) = (
+            body_code.get(op.pc + 1),
+            body_code.get(op.next_pc.wrapping_sub(1)),
+        ) {
+            let descr = super::decode_descr_index(body_code, op, 1);
+            if flags_field_descr(callee_descr_refs, descr) {
+                return (Some((frame, dst)), None);
+            }
+        }
+    } else if op.key == "int_or/ii>i" {
+        if let Some((frame, src)) = flags_get {
+            let a = body_code.get(op.pc + 1).copied();
+            let b = body_code.get(op.pc + 2).copied();
+            let dst = body_code.get(op.next_pc.wrapping_sub(1)).copied();
+            if let (Some(a), Some(b), Some(dst)) = (a, b, dst) {
+                let finished = i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED);
+                let a_const = body_int_operand_constant(a, num_regs_i, constants_i);
+                let b_const = body_int_operand_constant(b, num_regs_i, constants_i);
+                let ors_finished = (a == src && a_const.is_none() && b_const == Some(finished))
+                    || (b == src && b_const.is_none() && a_const == Some(finished));
+                if ors_finished {
+                    return (None, Some((frame, dst)));
+                }
+            }
+        }
+    }
+    (None, None)
+}
+
 fn body_sample_safe_with(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
     pure_helpers: &[majit_ir::RuntimeHelperKind],
+    num_regs_i: usize,
+    constants_i: &[i64],
 ) -> bool {
+    let mut flags_get: Option<(u8, u8)> = None;
+    let mut finished_or: Option<(u8, u8)> = None;
+    // First ref-slot accessor names the callee frame. A later `>r` that
+    // overwrites that register drops the identity, matching the replay scan.
+    let mut vable_reg: Option<u8> = None;
     let mut pc = 0usize;
     while pc < body_code.len() {
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
@@ -686,13 +767,27 @@ fn body_sample_safe_with(
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
             return false;
         }
+        let ref_slot_access = d.opname.starts_with("getarrayitem_vable_r")
+            || d.key.starts_with("setarrayitem_vable_r");
+        if ref_slot_access && d.argcodes.starts_with("ri") && vable_reg.is_none() {
+            vable_reg = body_code.get(d.pc + 1).copied();
+        }
         if d.opname.starts_with("residual_call") {
             let kind = residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs);
             if !kind.is_some_and(|kind| pure_helpers.contains(&kind)) {
                 return false;
             }
-        } else if d.opname.starts_with("setfield_gc")
-            || d.opname.starts_with("setarrayitem_gc")
+        } else if d.opname.starts_with("setfield_gc") {
+            if !frame_finished_return_store(
+                body_code,
+                &d,
+                callee_descr_refs,
+                vable_reg,
+                finished_or,
+            ) {
+                return false;
+            }
+        } else if d.opname.starts_with("setarrayitem_gc")
             || d.opname.starts_with("setinteriorfield_gc")
             || d.opname.starts_with("raw_store")
             || d.opname.starts_with("cond_call")
@@ -700,6 +795,20 @@ fn body_sample_safe_with(
             || d.opname.starts_with("inline_call")
         {
             return false;
+        }
+        (flags_get, finished_or) = note_frame_finished_ops(
+            body_code,
+            &d,
+            callee_descr_refs,
+            num_regs_i,
+            constants_i,
+            flags_get,
+        );
+        if d.argcodes.ends_with(">r")
+            && let Some(&dst) = body_code.get(d.next_pc.saturating_sub(1))
+            && vable_reg == Some(dst)
+        {
+            vable_reg = None;
         }
         pc = d.next_pc;
     }
@@ -712,6 +821,8 @@ fn body_sample_safe_with(
 pub(crate) fn exception_string_override_sample_safe(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
+    num_regs_i: usize,
+    constants_i: &[i64],
 ) -> bool {
     body_sample_safe_with(
         body_code,
@@ -720,6 +831,8 @@ pub(crate) fn exception_string_override_sample_safe(
             majit_ir::RuntimeHelperKind::LoadConst,
             majit_ir::RuntimeHelperKind::BoxInt,
         ],
+        num_regs_i,
+        constants_i,
     )
 }
 
@@ -736,7 +849,12 @@ pub(crate) fn exception_string_override_sample_safe(
 /// ordinary writing `__index__` never runs at all: it has to be refused before
 /// execution, because by the time the odometer could report it the write has
 /// already happened once.
-pub(crate) fn index_inline_sample_safe(body_code: &[u8], callee_descr_refs: &[DescrRef]) -> bool {
+pub(crate) fn index_inline_sample_safe(
+    body_code: &[u8],
+    callee_descr_refs: &[DescrRef],
+    num_regs_i: usize,
+    constants_i: &[i64],
+) -> bool {
     body_sample_safe_with(
         body_code,
         callee_descr_refs,
@@ -745,6 +863,8 @@ pub(crate) fn index_inline_sample_safe(body_code: &[u8], callee_descr_refs: &[De
             majit_ir::RuntimeHelperKind::BoxInt,
             majit_ir::RuntimeHelperKind::LoadAttr,
         ],
+        num_regs_i,
+        constants_i,
     )
 }
 
@@ -3848,9 +3968,17 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
                     .any(|op| op.opname == "abort_permanent"),
                 exc_override_straight_line: exception_string_override_straight_line(body.code),
                 exc_override_sample_safe: exception_string_override_sample_safe(
-                    body.code, descr_refs,
+                    body.code,
+                    descr_refs,
+                    body.num_regs_i,
+                    body.constants_i,
                 ),
-                index_sample_safe: index_inline_sample_safe(body.code, descr_refs),
+                index_sample_safe: index_inline_sample_safe(
+                    body.code,
+                    descr_refs,
+                    body.num_regs_i,
+                    body.constants_i,
+                ),
                 exc_override_has_nested_call: exception_string_override_has_nested_call(
                     body.code, descr_refs,
                 ),
@@ -11545,6 +11673,12 @@ pub(crate) struct IndexInlineCandidate {
 /// executed-effect odometer reports a write only after it has happened.  It also
 /// rejects a branch, so the odometer's verdict on the one recorded path speaks
 /// for every later execution as well.
+fn index_prepare_diag(why: &str) {
+    if fbw_inline_diag_enabled() {
+        eprintln!("[index-prepare-decline] why={why}");
+    }
+}
+
 pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     arg: OpRef,
@@ -11555,21 +11689,50 @@ pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
     // type_call`, `..._property_get`, `..._property_set` and
     // `..._subscr_getitem` all lead with this.
     if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk {
+        index_prepare_diag("not-authoritative-or-subwalk");
         return None;
     }
-    let (w_type, version_tag, method, attr_cell) =
-        unsafe { pyre_interpreter::baseobjspace::index_fast_path(concrete_arg) }?;
-    let (w_code, nparams, has_closure) = unsafe { resolve_inlinable_callee(method) }?;
+    let Some((w_type, version_tag, method, attr_cell)) =
+        (unsafe { pyre_interpreter::baseobjspace::index_fast_path(concrete_arg) })
+    else {
+        index_prepare_diag("index-fast-path");
+        return None;
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        index_prepare_diag("callee-not-inlinable");
+        return None;
+    };
     // `get_and_call_function(w_impl, w_obj)` supplies exactly `self`.
     if nparams != 1 || has_closure {
+        index_prepare_diag("arity-or-closure");
         return None;
     }
-    let body_facts = sub_jitcode_body_facts_for_code(w_code)?;
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        index_prepare_diag("no-body-facts");
+        return None;
+    };
     if body_facts.has_abort_permanent
         || body_facts.owns_loop_header
         || body_facts.contains_raise
         || !body_facts.index_sample_safe
     {
+        if fbw_inline_diag_enabled() {
+            let keys = (!body_facts.index_sample_safe)
+                .then(|| crate::state::sub_jitcode_body_for_code(w_code))
+                .flatten()
+                .map(|body| {
+                    crate::jitcode_runtime::decoded_ops(body.code)
+                        .map(|op| op.key)
+                        .collect::<Vec<_>>()
+                });
+            index_prepare_diag(&format!(
+                "body-facts abort={} loop={} raise={} sample_safe={} keys={keys:?}",
+                body_facts.has_abort_permanent,
+                body_facts.owns_loop_header,
+                body_facts.contains_raise,
+                body_facts.index_sample_safe,
+            ));
+        }
         return None;
     }
     // `index_inline_sample_safe` admits `LOAD_ATTR` because the residual covers
@@ -11597,6 +11760,7 @@ pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
                 .is_some()
         };
         if !plain_slot {
+            index_prepare_diag("load-attr-not-plain-slot");
             return None;
         }
         name_idx += 1;
@@ -11608,6 +11772,7 @@ pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
         .map(|jc| crate::state::portal_red_regs_at(jc).0)
         .unwrap_or(u16::MAX);
     if !callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_frame_reg) {
+        index_prepare_diag("fast-path");
         return None;
     }
     Some(IndexInlineCandidate {

@@ -4356,6 +4356,45 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
 }
 
 #[test]
+fn newcomplex_and_lane_getters_are_the_pypy_leaf() {
+    // complexobject.py `descr__new__` allocates `W_ComplexObject(real, imag)`.
+    // `complexwprop` then boxes one lane with `space.newfloat`. Both leaves
+    // have to be their own jitcode: the `complex()` walk descends `newcomplex`,
+    // and `LOAD_ATTR real`/`imag` descends the getter.
+    let newcomplex =
+        crate::jitcode_runtime::pathed_jitcode("pyre_object::complexobject::newcomplex")
+            .expect("newcomplex must be a discovered jitcode");
+    let newcomplex_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&newcomplex.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        newcomplex_ops.iter().any(|op| *op == "new_with_vtable"),
+        "newcomplex must lower to new_with_vtable; ops={newcomplex_ops:?}"
+    );
+    assert!(
+        !newcomplex_ops
+            .iter()
+            .any(|op| op.contains("residual") || *op == "residual_call"),
+        "fused newcomplex must not residualise malloc; ops={newcomplex_ops:?}"
+    );
+    assert!(
+        newcomplex_ops.len() < 32,
+        "fused newcomplex is New+setfields, not malloc_typed; ops={newcomplex_ops:?}"
+    );
+    for path in [
+        "pyre_object::complexobject::complex_descr_get_real",
+        "pyre_object::complexobject::complex_descr_get_imag",
+    ] {
+        let getter = crate::jitcode_runtime::pathed_jitcode(path)
+            .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
+        assert!(
+            !getter.code.is_empty(),
+            "{path} must carry assembled bytecode"
+        );
+    }
+}
+
+#[test]
 fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
     // `space.newutf8` / `W_UnicodeObject.__init__` (`objspace.py` /
     // `unicodeobject.py`): field stores after `malloc_typed_managed`,

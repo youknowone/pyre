@@ -3166,7 +3166,11 @@ const BODY_TRACKED_FRAME_SLOTS: usize = 256;
 /// Resolve a jitcode `i` operand to the immutable constant it names.  `None`
 /// when it indexes a live int register instead, whose value this static scan
 /// cannot know.
-fn body_int_operand_constant(ireg: u8, num_regs_i: usize, constants_i: &[i64]) -> Option<i64> {
+pub(crate) fn body_int_operand_constant(
+    ireg: u8,
+    num_regs_i: usize,
+    constants_i: &[i64],
+) -> Option<i64> {
     (ireg as usize)
         .checked_sub(num_regs_i)
         .and_then(|index| constants_i.get(index))
