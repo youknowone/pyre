@@ -21,7 +21,8 @@
 use majit_charon_reader::ullbc::NameSeg;
 use majit_charon_reader::{FunDecl, Llbc};
 use majit_translate::{
-    front::mir::{LowerContext, lower_fun_decl, lower_function},
+    ErrorCarrierSpec, HostStaticAddrs,
+    front::mir::{LowerContext, lower_fun_decl, lower_function, lower_function_with_static_addrs},
     model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType},
 };
 use serde_json::{Value, json};
@@ -1293,6 +1294,14 @@ fn mut_borrow_of_struct_field_writes_the_word_back() {
 fn lower_returned_address(
     result_ty: &Value,
 ) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    lower_returned_address_with(result_ty, &[], None)
+}
+
+fn lower_returned_address_with(
+    result_ty: &Value,
+    extra_decls: &[Value],
+    carrier_path: Option<&str>,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
     let (span, generics, meta, local) = probe_parts();
     let word = i64_ty();
     let borrowed = borrow_ty(&word, "Shared");
@@ -1340,17 +1349,19 @@ fn lower_returned_address(
         result_ty,
         json!("Opaque"),
     );
+    let mut type_decls = vec![json!({
+        "def_id": 0,
+        "item_meta": meta(&["core", "option", "Option"]),
+        "kind": "Opaque",
+        "src": "Normal"
+    })];
+    type_decls.extend(extra_decls.iter().cloned());
     let file = json!({
         "charon_version": "0.1.201",
         "has_errors": false,
         "translated": {
             "crate_name": "probe",
-            "type_decls": [{
-                "def_id": 0,
-                "item_meta": meta(&["core", "option", "Option"]),
-                "kind": "Opaque",
-                "src": "Normal"
-            }],
+            "type_decls": type_decls,
             "fun_decls": [caller, sink],
             "global_decls": [],
             "trait_decls": [],
@@ -1358,7 +1369,91 @@ fn lower_returned_address(
         }
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
-    lower_function(&llbc, "write_hash")
+    match carrier_path {
+        None => lower_function(&llbc, "write_hash"),
+        Some(path) => lower_function_with_static_addrs(
+            &llbc,
+            "write_hash",
+            HostStaticAddrs {
+                error_carrier: ErrorCarrierSpec {
+                    carrier_path: path,
+                    carrier_wrappers: &[],
+                    to_exc_object: None,
+                    from_exc_object: None,
+                },
+                ..HostStaticAddrs::default()
+            },
+        ),
+    }
+}
+
+fn adt_ty(id: u64, types: Vec<Value>) -> Value {
+    json!({"Adt": {
+        "id": id,
+        "generics": {
+            "regions": [],
+            "types": types,
+            "const_generics": [],
+            "trait_refs": []
+        }
+    }})
+}
+
+fn tuple_ty(types: Vec<Value>) -> Value {
+    json!({"Adt": {
+        "id": 99,
+        "builtin": "Tuple",
+        "generics": {
+            "regions": [],
+            "types": types,
+            "const_generics": [],
+            "trait_refs": []
+        }
+    }})
+}
+
+fn named_decl(id: u64, path: &[&str], kind: Value) -> Value {
+    let (_, _, meta, _) = probe_parts();
+    json!({
+        "def_id": id,
+        "item_meta": meta(path),
+        "kind": kind,
+        "src": "Normal"
+    })
+}
+
+fn field_decl(name: &str, ty: &Value) -> Value {
+    json!({"name": name, "ty": ty, "attr_info": null})
+}
+
+fn result_decl() -> Value {
+    named_decl(1, &["core", "result", "Result"], json!("Opaque"))
+}
+
+fn result_of(ok: &Value, err: &Value) -> Value {
+    adt_ty(1, vec![ok.clone(), err.clone()])
+}
+
+fn assert_spill_freed(result_ty: &Value, extra: &[Value], carrier: Option<&str>) {
+    let graph = lower_returned_address_with(result_ty, extra, carrier)
+        .unwrap_or_else(|err| panic!("a status result must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawMalloc { .. })),
+        "the spill is allocated\n{}",
+        op_lines(&graph)
+    );
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+fn assert_spill_escapes(result_ty: &Value, extra: &[Value], carrier: Option<&str>) {
+    let err = lower_returned_address_with(result_ty, extra, carrier)
+        .expect_err("a returned spill address must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
 }
 
 #[test]
@@ -1380,16 +1475,105 @@ fn returned_pointer_under_four_options_is_not_lowered() {
 
 #[test]
 fn returned_i64_under_four_options_still_frees_the_spill() {
-    let graph = lower_returned_address(&nest_option(i64_ty(), 4))
-        .expect("a status word under four Options still lowers");
-    assert!(
-        ops(&graph).any(|op| matches!(op.kind, OpKind::RawMalloc { .. })),
-        "the spill is allocated\n{}",
-        op_lines(&graph)
+    assert_spill_freed(&nest_option(i64_ty(), 4), &[], None);
+}
+
+#[test]
+fn returned_i64_under_nine_options_still_frees_the_spill() {
+    assert_spill_freed(&nest_option(i64_ty(), 9), &[], None);
+}
+
+#[test]
+fn returned_pointer_under_nine_options_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    assert_spill_escapes(&nest_option(ptr, 9), &[], None);
+}
+
+#[test]
+fn returned_err_pointer_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    assert_spill_escapes(&result_of(&i64_ty(), &ptr), &[result_decl()], None);
+}
+
+#[test]
+fn returned_ok_pointer_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    assert_spill_escapes(&result_of(&ptr, &i64_ty()), &[result_decl()], None);
+}
+
+#[test]
+fn returned_tuple_pointer_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    assert_spill_escapes(&tuple_ty(vec![i64_ty(), ptr]), &[], None);
+}
+
+#[test]
+fn returned_tuple_of_i64_still_frees_the_spill() {
+    assert_spill_freed(&tuple_ty(vec![i64_ty(), i64_ty()]), &[], None);
+}
+
+#[test]
+fn returned_struct_pointer_field_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let decl = named_decl(
+        1,
+        &["probe", "Hold"],
+        json!({"Struct": [field_decl("ptr", &ptr)]}),
     );
-    assert!(
-        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
-        "the spill is freed after the call\n{}",
-        op_lines(&graph)
+    assert_spill_escapes(&adt_ty(1, vec![]), &[decl], None);
+}
+
+#[test]
+fn returned_struct_i64_field_still_frees_the_spill() {
+    let decl = named_decl(
+        1,
+        &["probe", "Hold"],
+        json!({"Struct": [field_decl("word", &i64_ty())]}),
     );
+    assert_spill_freed(&adt_ty(1, vec![]), &[decl], None);
+}
+
+#[test]
+fn returned_enum_pointer_field_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let decl = named_decl(
+        1,
+        &["probe", "Hold"],
+        json!({"Enum": [
+            {"name": "Word", "fields": [field_decl("value", &i64_ty())]},
+            {"name": "Ptr", "fields": [field_decl("value", &ptr)]}
+        ]}),
+    );
+    assert_spill_escapes(&adt_ty(1, vec![]), &[decl], None);
+}
+
+#[test]
+fn returned_array_pointer_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    assert_spill_escapes(&json!({"Array": [ptr, null, null]}), &[], None);
+}
+
+#[test]
+fn returned_carrier_err_still_frees_the_spill() {
+    let carrier = "pyre_interpreter::error::PyError";
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let decl = named_decl(
+        2,
+        &["pyre_interpreter", "error", "PyError"],
+        json!({"Struct": [field_decl("obj", &ptr)]}),
+    );
+    let result = result_of(&i64_ty(), &adt_ty(2, vec![]));
+    assert_spill_freed(&result, &[result_decl(), decl], Some(carrier));
+}
+
+#[test]
+fn returned_non_carrier_struct_pointer_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let decl = named_decl(
+        2,
+        &["pyre_interpreter", "error", "PyError"],
+        json!({"Struct": [field_decl("obj", &ptr)]}),
+    );
+    let result = result_of(&i64_ty(), &adt_ty(2, vec![]));
+    assert_spill_escapes(&result, &[result_decl(), decl], None);
 }

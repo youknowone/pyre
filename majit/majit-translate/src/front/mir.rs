@@ -57,8 +57,9 @@
 //!     `Ptr` is the address, not the pointee word. Aliases of one
 //!     place share that address. A mutable parameter writes the word
 //!     back into the place, including a field or element projection.
-//!     The spill is freed at the call. A result that is a pointer or
-//!     a reference is not lowered: that address would outlive the free.
+//!     The spill is freed at the call. A result that carries a pointer
+//!     or a reference, including in a payload or a field, is not lowered:
+//!     that address would outlive the free.
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
 //!   - `Aggregate` — a named struct is its fields (`OptVirtualize.make_vstruct`):
@@ -10237,8 +10238,9 @@ impl<'a> Lowering<'a> {
     /// `&x` with `&y` stay two addresses). The malloc is
     /// `OpKind::RawMalloc` so `_rewrite_raw_malloc` emits the fixed-size
     /// residual; a direct call of `ll_raw_malloc_fixedsize` would look
-    /// inside the helper. A pointer or reference result can be this
-    /// address, so the call is left unlowered instead of freeing it.
+    /// inside the helper. A pointer or reference in the result, including
+    /// a payload or a field, can be this address, so the call is left
+    /// unlowered and the spill is not freed.
     fn install_raw_scalar_address_call(
         &mut self,
         mir_bb: usize,
@@ -10356,29 +10358,35 @@ impl<'a> Lowering<'a> {
     }
 
     /// The spill is freed on this block. The call result is that address
-    /// when it is a raw pointer or a reference, including the `Ok` or
-    /// `Some` payload. `identity(&x) -> *const i64` would then deref a
-    /// freed allocation. A status word (`hash_out` returns `i64`) is not
-    /// this address. Each peel is classified on the next iteration. A
-    /// wrapper still in hand when the bound is hit is this address: the
-    /// walk did not reach a non-wrapper.
+    /// when a raw pointer or a reference occurs anywhere the caller
+    /// receives it: the result itself, an `Option` or `Result` payload,
+    /// a tuple or array element, or a struct or enum field.
+    /// `identity(&x) -> *const i64` would then deref a freed allocation.
+    /// A status word (`hash_out` returns `i64`) is not this address, at
+    /// any nesting depth. A type already queued is not walked again; its
+    /// first visit already queued every payload.
+    ///
+    /// `dont_look_inside_return_token` projects `Result<T, E>` through
+    /// `T` when `E` is the error carrier. That `Err` rides
+    /// `BH_LAST_EXC_VALUE` and is not the call result.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
-        let mut ty = clone_tyref(ty);
-        for _ in 0..8 {
+        let mut pending = vec![clone_tyref(ty)];
+        let mut seen = Vec::new();
+        while let Some(ty) = pending.pop() {
+            let key = spill_ty_identity(&ty);
+            if seen.iter().any(|seen| seen == &key) {
+                continue;
+            }
+            seen.push(key);
             if tyref_is_raw_pointer(&ty, self.llbc) || output_type_is_ref(&ty, self.llbc) {
                 return true;
             }
-            if let Some(ok) = crate::front::result_exc::tyref_result_ok(&ty, self.llbc) {
-                ty = ok;
-                continue;
+            match spill_address_payloads(&ty, self.llbc, self.static_addrs.error_carrier) {
+                SpillPayloads::Unclassified => return true,
+                SpillPayloads::Types(types) => pending.extend(types),
             }
-            if let Some(payload) = crate::front::result_exc::tyref_option_payload(&ty, self.llbc) {
-                ty = payload;
-                continue;
-            }
-            return false;
         }
-        true
+        false
     }
 
     /// Place a borrow temporary names, after peeling `&mut *p`.
@@ -37879,6 +37887,127 @@ fn pointer_kind_is_mut(ty: &TyRef, llbc: &Llbc, key: &str, kind_index: usize) ->
         .and_then(|node| strip_ty_indirections(node, llbc))
         .and_then(|node| node.as_object()?.get(key)?.as_array()?.get(kind_index))
         .is_some_and(borrow_kind_is_exclusive)
+}
+
+/// Payloads of `ty` the caller receives as this value.
+///
+/// [`SpillPayloads::Unclassified`] is a wrapper whose payload did not
+/// parse, so the address may still be inside. An alias whose target is
+/// not a type contributes no payload. `dont_look_inside_return_token`
+/// projects `Result<T, E>` through `T` when `E` is the error carrier.
+enum SpillPayloads {
+    Types(Vec<TyRef>),
+    Unclassified,
+}
+
+fn spill_ty_identity(ty: &TyRef) -> String {
+    match ty {
+        TyRef::Dedup { id } => format!("#{id}"),
+        TyRef::Inline { value: (id, _) } => format!("*{id}"),
+        TyRef::Other(value) => value.to_string(),
+    }
+}
+
+fn spill_one_payload(slot: Option<&serde_json::Value>) -> SpillPayloads {
+    match slot.and_then(|slot| serde_json::from_value(slot.clone()).ok()) {
+        Some(ty) => SpillPayloads::Types(vec![ty]),
+        None => SpillPayloads::Unclassified,
+    }
+}
+
+fn spill_payloads_from_slots(slots: &[serde_json::Value]) -> SpillPayloads {
+    let mut types = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let Ok(ty) = serde_json::from_value(slot.clone()) else {
+            return SpillPayloads::Unclassified;
+        };
+        types.push(ty);
+    }
+    SpillPayloads::Types(types)
+}
+
+fn spill_address_payloads(
+    ty: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> SpillPayloads {
+    // The carrier's `Err` is not the call result. A nested
+    // `Result<T, Carrier>` is the same ABI for that `Err`.
+    if crate::front::result_exc::tyref_is_result_of_carrier(ty, llbc, spec) {
+        return match crate::front::result_exc::tyref_result_ok(ty, llbc) {
+            Some(ok) => SpillPayloads::Types(vec![ok]),
+            None => SpillPayloads::Unclassified,
+        };
+    }
+    if crate::front::result_exc::tyref_is_result(ty, llbc)
+        && let Some(ok) = crate::front::result_exc::tyref_result_ok(ty, llbc)
+        && let Some(err) = crate::front::result_exc::tyref_result_err(ty, llbc)
+    {
+        return SpillPayloads::Types(vec![ok, err]);
+    }
+    if crate::front::result_exc::tyref_is_option(ty, llbc)
+        && let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc)
+    {
+        return SpillPayloads::Types(vec![payload]);
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return SpillPayloads::Types(Vec::new());
+    };
+    if node.get("Array").is_some() || node.get("Slice").is_some() {
+        let key = if node.get("Array").is_some() {
+            "Array"
+        } else {
+            "Slice"
+        };
+        return spill_one_payload(
+            node.get(key)
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| arr.first()),
+        );
+    }
+    let Some(adt) = node.get("Adt").and_then(serde_json::Value::as_object) else {
+        return SpillPayloads::Types(Vec::new());
+    };
+    let mut types = Vec::new();
+    if let Some(id) = type_decl_ref_adt_id(adt)
+        && let Some(decl) = llbc.type_by_id(id)
+    {
+        match &decl.kind {
+            TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+                types.extend(fields.iter().map(|field| field.ty.clone()));
+            }
+            TypeDeclKind::Enum(variants) => {
+                types.extend(
+                    variants
+                        .iter()
+                        .flat_map(|variant| variant.fields.iter().map(|field| field.ty.clone())),
+                );
+            }
+            TypeDeclKind::Alias(body) => {
+                if let Ok(aliased) = serde_json::from_value(body.clone()) {
+                    types.push(aliased);
+                } else if let Some(aliased) = body.get("aliased_ty")
+                    && let Ok(aliased) = serde_json::from_value(aliased.clone())
+                {
+                    types.push(aliased);
+                }
+            }
+            TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
+        }
+    }
+    let Some(slots) = type_decl_ref_generics(adt, llbc)
+        .and_then(|generics| generics.get("types"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return SpillPayloads::Types(types);
+    };
+    match spill_payloads_from_slots(slots) {
+        SpillPayloads::Unclassified => SpillPayloads::Unclassified,
+        SpillPayloads::Types(args) => {
+            types.extend(args);
+            SpillPayloads::Types(types)
+        }
+    }
 }
 
 /// `output`, or the `Ok` payload of a `Result<T, PyError>`, is a raw
