@@ -836,29 +836,12 @@ pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     }
 }
 
-/// Return the process-wide canonical exact `str` for `obj`'s value.
+/// Insert `obj` as the canonical exact `str` for `value`.
 ///
-/// `baseobjspace.py new_interned_w_str`: keep `w_u` on a miss and
-/// `interned_strings.set` a weak value. A managed interned string is not an
-/// extra root.
-///
-/// # Safety
-/// `obj` must be an exact `str`.
-#[majit_macros::dont_look_inside]
-pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
-    debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
-    {
-        let table = STRING_INTERN_TABLE.lock();
-        if let Some(existing) = table
-            .get(unsafe { w_str_get_wtf8(obj) })
-            .and_then(intern_slot_alive)
-        {
-            return existing;
-        }
-    }
-    let value = unsafe { w_str_get_wtf8(obj) }.to_owned();
-    // `w_weakref_new` collects. The weakref stores the forwarded target;
-    // this local does not, unless it sits on the shadow stack.
+/// `baseobjspace.py` `interned_strings.set`: a GC-owned string is
+/// `ll_set_nonnull`'s weak value. `w_weakref_new` collects, so `obj` is
+/// pinned across that allocation and reloaded before the table stores it.
+fn publish_intern(value: Wtf8Buf, obj: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(obj);
@@ -887,13 +870,36 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
     obj
 }
 
+/// Return the process-wide canonical exact `str` for `obj`'s value.
+///
+/// `baseobjspace.py new_interned_w_str`: keep `w_u` on a miss and
+/// `interned_strings.set` a weak value. A managed interned string is not an
+/// extra root.
+///
+/// # Safety
+/// `obj` must be an exact `str`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
+    debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
+    {
+        let table = STRING_INTERN_TABLE.lock();
+        if let Some(existing) = table
+            .get(unsafe { w_str_get_wtf8(obj) })
+            .and_then(intern_slot_alive)
+        {
+            return existing;
+        }
+    }
+    let value = unsafe { w_str_get_wtf8(obj) }.to_owned();
+    publish_intern(value, obj)
+}
+
 /// `objspace.new_interned_str(s)` — the process-wide canonical exact `str` for
 /// `value`, built only when the value is not interned yet.
 ///
 /// [`intern_exact_str`] answers the same question for a caller that already
-/// holds an object. A miss from characters still allocates an immortal exact
-/// str. `newtext` is GC-managed upstream. A managed miss moves, and host
-/// tables still store `W_UnicodeObject.value` as their own key.
+/// holds an object. A miss allocates `newtext` (`w_str_from_wtf8_managed`)
+/// and stores a weak value. `box_str_constant` stays immortal.
 #[majit_macros::dont_look_inside]
 pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
     {
@@ -903,13 +909,8 @@ pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
         }
     }
     let value = value.to_owned();
-    let obj = w_str_from_wtf8(value.clone());
-    let mut table = STRING_INTERN_TABLE.lock();
-    if let Some(existing) = table.get(&value).and_then(intern_slot_alive) {
-        return existing;
-    }
-    table.insert(value, InternSlot::Immortal(obj as usize));
-    obj
+    let obj = w_str_from_wtf8_managed(value.clone());
+    publish_intern(value, obj)
 }
 
 /// [`intern_wtf8_value`] for a caller whose characters are already UTF-8.
