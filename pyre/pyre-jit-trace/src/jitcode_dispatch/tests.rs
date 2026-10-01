@@ -16164,6 +16164,71 @@ fn loop_header_stamps_seen_flag() {
     assert_eq!(wc.trace_ctx.num_ops(), 0, "loop_header records nothing");
 }
 
+/// A per-CodeObject portal body emits `loop_header` and no following
+/// `jit_merge_point`. The synthesized dispatch boundary must still run
+/// `opimpl_jit_merge_point`'s seen-header arm: a seeded merge point closes,
+/// so the trace does not keep recording iterations until
+/// `blackhole_if_trace_too_long`.
+#[test]
+fn synthesized_boundary_closes_a_loop_header_without_jit_merge_point() {
+    let green_key = crate::driver::make_green_key(std::ptr::null(), 0, false);
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[], green_key);
+    tc.seed_compile_and_run_once_merge_point();
+    tc.seen_loop_header_for_jdindex = 0;
+    tc.seen_loop_header_jit_pc = Some(4);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let outcome = try_close_after_explicit_loop_header(&mut wc, 8, 0, std::ptr::null(), false)
+        .expect("header close");
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+    match outcome {
+        Some(DispatchOutcome::CloseLoop {
+            loop_header_pc,
+            back_edge_marker_jit_pc,
+            ..
+        }) => {
+            assert_eq!(loop_header_pc, 0);
+            assert_eq!(back_edge_marker_jit_pc, Some(4));
+        }
+        other => panic!("expected CloseLoop, got {other:?}"),
+    }
+}
+
 #[test]
 fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
     let byte = *insns_opname_to_byte()

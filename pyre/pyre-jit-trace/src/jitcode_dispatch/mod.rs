@@ -9648,6 +9648,110 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
     {
         return create_segmented_trace(ctx, jit_pc, py_pc as usize, true);
     }
+    // The codewriter emits `loop_header` on a Python back-edge and the
+    // following dispatch's `jit_merge_point` is what `opimpl_jit_merge_point`
+    // consumes (`pyjitpl.py`). A per-CodeObject portal body has the header
+    // and not the marker, so this synthesized boundary is that following
+    // dispatch: register the header on the first crossing and close it on
+    // the next, instead of recording every later iteration until
+    // `blackhole_if_trace_too_long`.
+    let code_ptr = w_code as *const ();
+    try_close_after_explicit_loop_header(ctx, jit_pc, py_pc as usize, code_ptr, is_being_profiled)
+}
+
+/// `opimpl_jit_merge_point`'s `seen_loop_header` arm (`pyjitpl.py`), for a
+/// body whose `loop_header` is not followed by a `jit_merge_point` op.
+///
+/// The flag is consumed here either way. Leaving it set would make a later
+/// explicit marker close the outer trace at the wrong green pc. A nested
+/// portal (`portal_call_depth != 0`) or an inline sub-walk does not close:
+/// upstream returns from the frame and takes `do_recursive_call` instead of
+/// `reached_loop_header`.
+fn try_close_after_explicit_loop_header<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+    py_pc: usize,
+    code_ptr: *const (),
+    is_being_profiled: bool,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
+        return Ok(None);
+    }
+    let _jdindex = ctx.trace_ctx.seen_loop_header_for_jdindex;
+    ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
+    let back_edge_marker_jit_pc = ctx.trace_ctx.seen_loop_header_jit_pc.take();
+    let depth_zero = ctx
+        .trace_ctx
+        .portal_call_depth_fn
+        .as_ref()
+        .map(|depth| depth() == 0)
+        .unwrap_or(true);
+    if !ctx.is_top_level || !depth_zero {
+        return Ok(None);
+    }
+
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    let mut live_args = Vec::new();
+    if !sym_ptr.is_null() {
+        let sym = unsafe { &*sym_ptr };
+        let frame = sym.frame();
+        if !frame.is_none() {
+            live_args.push(frame);
+        }
+        let ec = sym.execution_context();
+        if !ec.is_none() {
+            live_args.push(ec);
+        }
+    }
+    live_args = append_virtualizable_boxes(ctx.trace_ctx, live_args);
+    {
+        use std::collections::HashSet;
+        let mut duplicates: HashSet<OpRef> = HashSet::new();
+        for i in 0..live_args.len() {
+            let opref = live_args[i];
+            if opref.is_constant() || !duplicates.insert(opref) {
+                let tp = ctx
+                    .trace_ctx
+                    .get_opref_type(opref)
+                    .unwrap_or(majit_ir::Type::Ref);
+                live_args[i] = ctx.trace_ctx.record_same_as(opref, tp);
+                if i >= 2 {
+                    ctx.trace_ctx.set_virtualizable_box_at(i - 2, live_args[i]);
+                }
+            }
+        }
+    }
+
+    let key = crate::driver::make_green_key(code_ptr, py_pc, is_being_profiled);
+    let typed = crate::driver::make_green_key_typed(code_ptr, py_pc, is_being_profiled);
+    if ctx
+        .trace_ctx
+        .has_merge_point_same_greenkey(key, Some(&typed), live_args.len())
+    {
+        return Ok(Some(DispatchOutcome::CloseLoop {
+            jump_args: live_args,
+            loop_header_pc: py_pc,
+            loop_header_marker_jit_pc: Some(jit_pc),
+            back_edge_pc: None,
+            back_edge_marker_jit_pc,
+        }));
+    }
+    let green_boxes: Vec<majit_metainterp::GreenBox> = live_args
+        .iter()
+        .map(|opref| {
+            let ty = ctx
+                .trace_ctx
+                .get_opref_type(*opref)
+                .unwrap_or(majit_ir::Type::Ref);
+            majit_metainterp::GreenBox::new(*opref, ty)
+        })
+        .collect();
+    ctx.trace_ctx.add_merge_point_with_key(
+        key,
+        Some(typed),
+        green_boxes,
+        py_pc,
+    );
     Ok(None)
 }
 
