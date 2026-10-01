@@ -842,9 +842,9 @@ impl CodeWriter {
         // FieldWrite bases that still carry Signed, Unknown, or Void so
         // regalloc colours them in the Ref bank and the assembler emits
         // `getfield_gc_*/rd>X` instead of the pyre-only `/id>X` form.
-        // A Signed base already stored in an int argument list keeps that
-        // cell; the access reads `cast_int_to_ptr` of it. Stamping the
-        // shared cell would put a ref in the int list.
+        // A Signed base that is also an int use keeps that cell; the
+        // access reads `cast_int_to_ptr` of it. Stamping the shared cell
+        // would put a ref in the int use.
         super::type_state::promote_gc_field_bases(rewritten_graph, Some(callcontrol));
         let mut regallocs = crate::codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",

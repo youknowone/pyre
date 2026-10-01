@@ -231,16 +231,19 @@ pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Varia
 /// `getarrayitem_raw`).  A Signed base on those ops is the same
 /// mis-banked GC pointer FieldRead had.
 ///
-/// A Signed base that `make_three_lists_from_vars` already stored in an
-/// int argument list keeps that cell. The list was split from the Signed
-/// kind, and `emit_list_of_kind` requires the cell to still say int.
-/// The access reads `cast_int_to_ptr` of the word, so regalloc colours a
-/// ref base and the call list keeps the Signed argument.
+/// A Signed base keeps its cell when the word is still an int at another
+/// use. `make_three_lists_from_vars` stores that word in an int argument
+/// list, and `emit_list_of_kind` requires the cell to still say int. A
+/// later block can also read the same word as Signed: `Variable::copy`
+/// gives the threaded inputarg its own concretetype cell, so stamping
+/// only the field base makes `insert_renamings` emit `int_copy` from a
+/// Ref register. The access reads `cast_int_to_ptr` of the word, so
+/// regalloc colours a ref base and every int use keeps the Signed cell.
 pub(crate) fn promote_gc_field_bases(
     graph: &mut FunctionGraph,
     callcontrol: Option<&crate::call::CallControl>,
 ) {
-    let int_args = int_argument_var_ids(graph);
+    let stay_int = signed_ids_that_must_stay_int(graph, callcontrol);
     let graph_name = graph.name.clone();
     let mut redirects: Vec<(usize, usize)> = Vec::new();
     for (block_index, block) in graph.blocks.iter().enumerate() {
@@ -252,7 +255,7 @@ pub(crate) fn promote_gc_field_bases(
                 continue;
             }
             if FunctionGraph::concretetype_of(base) == ConcreteType::Signed
-                && int_args.contains(&base.id())
+                && stay_int.contains(&base.id())
             {
                 redirects.push((block_index, op_index));
                 continue;
@@ -343,6 +346,113 @@ fn int_argument_var_ids(graph: &FunctionGraph) -> HashSet<u64> {
 fn extend_var_ids(ids: &mut HashSet<u64>, vars: &[Variable]) {
     for var in vars {
         ids.insert(var.id());
+    }
+}
+
+/// Signed variable ids whose cell must not become `GcRef`.
+///
+/// Int-list arguments are the call shape `emit_list_of_kind` checks.
+/// Every other Signed value that is not itself a GC access base is an
+/// int use too. A link ties the two ends of one word, so a base that
+/// flows to or from such a use keeps the Signed cell as well.
+fn signed_ids_that_must_stay_int(
+    graph: &FunctionGraph,
+    callcontrol: Option<&crate::call::CallControl>,
+) -> HashSet<u64> {
+    let gc_bases = signed_gc_base_ids(graph, callcontrol);
+    let mut stay = int_argument_var_ids(graph);
+    let mut ties: Vec<(Variable, Variable)> = Vec::new();
+    for block_index in 0..graph.blocks.len() {
+        match &graph.blocks[block_index].exitswitch {
+            Some(crate::model::ExitSwitch::Value(cond)) => {
+                stay.insert(cond.id());
+            }
+            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
+                for arg in args {
+                    stay.insert(arg.id());
+                }
+            }
+            _ => {}
+        }
+        for op in &graph.blocks[block_index].operations {
+            if let Some(result) = &op.result {
+                note_signed_non_base(result, &gc_bases, &mut stay);
+            }
+            for var in crate::inline::op_variable_refs(&op.kind) {
+                note_signed_non_base(&var, &gc_bases, &mut stay);
+            }
+        }
+        let exit_count = graph.blocks[block_index].exits.len();
+        for exit_index in 0..exit_count {
+            let target = graph.blocks[block_index].exits[exit_index].target;
+            let arg_count = graph.blocks[block_index].exits[exit_index].args.len();
+            for arg_index in 0..arg_count {
+                let Some(src) = graph.blocks[block_index].exits[exit_index].args[arg_index]
+                    .as_variable()
+                    .cloned()
+                else {
+                    continue;
+                };
+                let Some(input) = graph.blocks[target.0].inputargs.get(arg_index).cloned() else {
+                    continue;
+                };
+                note_signed_non_base(&src, &gc_bases, &mut stay);
+                note_signed_non_base(&input, &gc_bases, &mut stay);
+                ties.push((src, input));
+            }
+        }
+    }
+    let mut adj: HashMap<u64, Vec<Variable>> = HashMap::new();
+    for (src, input) in ties {
+        adj.entry(src.id()).or_default().push(input.clone());
+        adj.entry(input.id()).or_default().push(src);
+    }
+    let mut queue: Vec<u64> = stay.iter().copied().collect();
+    let mut index = 0;
+    while index < queue.len() {
+        let id = queue[index];
+        index += 1;
+        let Some(partners) = adj.get(&id) else {
+            continue;
+        };
+        for partner in partners {
+            if stay.contains(&partner.id()) {
+                continue;
+            }
+            if FunctionGraph::concretetype_of(partner) != ConcreteType::Signed {
+                continue;
+            }
+            stay.insert(partner.id());
+            queue.push(partner.id());
+        }
+    }
+    stay
+}
+
+fn signed_gc_base_ids(
+    graph: &FunctionGraph,
+    callcontrol: Option<&crate::call::CallControl>,
+) -> HashSet<u64> {
+    let mut ids = HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some((base, force_gc)) = gc_access_base(&op.kind, callcontrol) else {
+                continue;
+            };
+            if force_gc && FunctionGraph::concretetype_of(base) == ConcreteType::Signed {
+                ids.insert(base.id());
+            }
+        }
+    }
+    ids
+}
+
+fn note_signed_non_base(var: &Variable, gc_bases: &HashSet<u64>, stay: &mut HashSet<u64>) {
+    if gc_bases.contains(&var.id()) {
+        return;
+    }
+    if FunctionGraph::concretetype_of(var) == ConcreteType::Signed {
+        stay.insert(var.id());
     }
 }
 
@@ -621,6 +731,53 @@ mod tests {
             &op.kind,
             OpKind::InlineCall { args_i, .. } if args_i.iter().any(|arg| arg.id() == base.id())
         )));
+    }
+
+    #[test]
+    fn promote_gc_field_bases_casts_when_a_signed_base_flows_to_an_int_successor() {
+        let mut graph = FunctionGraph::new("base_flows_to_int");
+        let base = push_input(&mut graph, "p", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&read, ConcreteType::Signed);
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        let succ = args[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&succ, ConcreteType::Signed);
+        graph.set_return(next, Some(succ.clone()));
+        graph.set_goto(graph.startblock, next, vec![base.clone()]);
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "the predecessor cell stays Signed so the link copy is int-to-int"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&succ),
+            ConcreteType::Signed,
+            "the successor that is not a field base stays Signed"
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_int_to_ptr" && operand.id() == base.id()
+            )),
+            "the field access reads cast_int_to_ptr of the signed word"
+        );
     }
 
     #[test]
