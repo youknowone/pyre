@@ -3928,7 +3928,7 @@ fn portal_mainjitcode_index(jd_index: usize) -> Option<usize> {
             return crate::jitcode_runtime::portal_jitcode().map(|jc| jc.index());
         }
         1 => "baseobjspace::unpackiterable_portal",
-        2 => "baseobjspace::generatorentry_portal",
+        2 => crate::genentry_state::GENENTRY_PORTAL_KEY,
         _ => return None,
     };
     crate::jitcode_runtime::portal_jitcode_for_key(key).map(|jc| jc.index())
@@ -4073,6 +4073,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                 let subwalk_jd = crate::state::note_inline_subwalk_start(
                     (green_key.get_uhash(), Some(green_key.clone())),
                     ctx.trace_ctx.get_trace_position(),
+                    Some(index),
                 );
                 // `_interpret` checks the length once `perform_call` has
                 // pushed the callee frame and before its first instruction.

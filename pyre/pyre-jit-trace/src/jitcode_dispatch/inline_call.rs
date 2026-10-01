@@ -9208,6 +9208,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 )),
             ),
             sub_wc.trace_ctx.get_trace_position(),
+            None,
         );
         let result = {
             // #704 root-bridge self-recursive inline: exempt this callee body
@@ -13561,7 +13562,7 @@ fn descend_generatorentry<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let Some(canonical) =
-        crate::jitcode_runtime::portal_jitcode_for_key("baseobjspace::generatorentry_portal")
+        crate::jitcode_runtime::portal_jitcode_for_key(crate::genentry_state::GENENTRY_PORTAL_KEY)
     else {
         gen_resume_decline("several_yields");
         return Ok(None);

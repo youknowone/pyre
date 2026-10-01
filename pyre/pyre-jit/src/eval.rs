@@ -7941,7 +7941,7 @@ fn genentry_merge_point_jit(
         return None;
     }
     let Some(_canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
-        "baseobjspace::generatorentry_portal",
+        pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY,
     ) else {
         if std::env::var_os("PYRE_JD2_DEBUG").is_some() {
             eprintln!("[jd2] no portal jitcode");
@@ -7997,8 +7997,8 @@ fn genentry_counter_tick(green_key: u64) -> bool {
     warm.counter.tick(green_key, increment)
 }
 
-/// Enter the `generatorentry` portal. The extracted jitcode is
-/// `baseobjspace::generatorentry_portal`. A session that is already
+/// Enter the `generatorentry` portal. The registered main jitcode is
+/// [`pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY`]. A session that is already
 /// tracing is the caller's; this returns without nesting. The machine
 /// walk from `jit_merge_point` runs `generator_send_ex_body` through the
 /// generator frame to the yield, which finishes with the yielded value.
@@ -8020,7 +8020,7 @@ fn drive_generatorentry_trace(
     let _exc_scope = crate::call_jit::ResidualExceptionScope::park(dbg);
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
-        "baseobjspace::generatorentry_portal",
+        pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY,
     ) {
         Some(jc) => jc,
         None => {

@@ -3890,9 +3890,16 @@ pub(crate) fn note_root_trace_too_long(
 pub(crate) fn note_inline_subwalk_start(
     green_key: majit_metainterp::PortalGreenKey,
     _pos: majit_metainterp::recorder::TracePosition,
+    portal_index: Option<usize>,
 ) -> Option<usize> {
     let (driver, _) = crate::driver::try_driver_pair()?;
-    let canonical = crate::jitcode_runtime::portal_jitcode()?;
+    // `None` is the Python portal (driver 0). A recursive call passes the
+    // target driver's main jitcode so `newframe` does not stamp driver 0.
+    let index = match portal_index {
+        Some(index) => index,
+        None => crate::jitcode_runtime::portal_jitcode()?.index(),
+    };
+    let canonical = crate::jitcode_runtime::get_jitcode_by_index(index)?;
     let meta = driver.meta_interp_mut();
     if !meta.is_main_jitcode(&canonical) {
         return None;
@@ -3900,7 +3907,7 @@ pub(crate) fn note_inline_subwalk_start(
     let jd_no = canonical.jitdriver_sd()?;
     // pyjitpl.py `newframe(portal_code, greenkey)` — one owner for
     // portal_call_depth, call_ids, ENTER_PORTAL_FRAME, and the log.
-    let jitcode = crate::jitcode_runtime::portal_metainterp_jitcode()?;
+    let jitcode = crate::jitcode_runtime::get_runtime_jitcode_by_index(index)?;
     meta.newframe(jitcode, Some(green_key));
     majit_metainterp::mc_diag_bump(58);
     Some(jd_no)
