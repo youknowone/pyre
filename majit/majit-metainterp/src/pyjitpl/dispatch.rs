@@ -1329,9 +1329,7 @@ fn report_symbolic_residual_call_target(
 fn refuse_null_residual_call_target(ctx: &mut TraceCtx, arg_classes: &str) -> TraceAction {
     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!(
-            "residual call target is null (arg classes {arg_classes:?}); refusing the trace"
-        );
+        eprintln!("residual call target is null (arg classes {arg_classes:?}); refusing the trace");
     }
     ctx.symbolic_residual_abort = true;
     SYMBOLIC_RESIDUAL_TRACE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
