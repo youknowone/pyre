@@ -59740,13 +59740,13 @@ mod tests {
     fn object_items_pointer_names_its_element_list() {
         use super::object_ref_items_list_root;
 
-        let pyobject = struct_decl(
+        let object_decl = struct_decl(
             2,
             ident_path(&["pyobject", "PyObject"]),
             empty_fields(),
             false,
         );
-        let (llbc, _) = load_handle(vec![(2, pyobject)], serde_json::json!([]), 2);
+        let (llbc, _) = load_handle(vec![(2, object_decl)], serde_json::json!([]), 2);
         let items = TyRef::Other(serde_json::json!({
             "RawPtr": [
                 {"RawPtr": [

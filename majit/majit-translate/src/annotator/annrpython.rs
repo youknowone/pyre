@@ -2390,7 +2390,7 @@ impl RPythonAnnotator {
     /// `project_struct_field_type("PyObjectRef")` publishes. Absent
     /// until that struct is in the field registry, so a session that
     /// has not registered it keeps the flowspace annotation.
-    fn pyobject_struct_instance(
+    fn host_struct_instance(
         &self,
         can_be_none: bool,
         flags: std::collections::BTreeMap<String, bool>,
@@ -2491,7 +2491,7 @@ impl RPythonAnnotator {
             }
             return s_out;
         }
-        self.pyobject_struct_instance(can_be_none, flags)
+        self.host_struct_instance(can_be_none, flags)
             .unwrap_or(s_out)
     }
 
@@ -4894,7 +4894,7 @@ mod tests {
         )
     }
 
-    fn pyobject_classdef(ann: &RPythonAnnotator) -> Rc<RefCell<super::super::classdesc::ClassDef>> {
+    fn host_classdef(ann: &RPythonAnnotator) -> Rc<RefCell<super::super::classdesc::ClassDef>> {
         ann.bookkeeper
             .getuniqueclassdef_for_struct_root("pyobject::PyObject")
             .expect("PyObject struct root")
@@ -4918,7 +4918,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_exception_block_input_is_pyobject_struct_root() {
+    fn bare_exception_block_input_is_struct_root() {
         use super::super::model::SomeException;
         use crate::front::StructFieldRegistry;
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -4945,7 +4945,7 @@ mod tests {
 
         let (extravar, type_extravar, also, value) =
             follow_one_raise(&ann, exception_instance(&ann, "Exception"));
-        let pyobject = pyobject_classdef(&ann);
+        let host_class = host_classdef(&ann);
         assert_class_ptr_eq(&extravar, &exception, "bare extravar");
         assert!(
             matches!(type_extravar, SomeValue::TypeOf(_)),
@@ -4953,7 +4953,7 @@ mod tests {
             classdef_name(&type_extravar)
         );
         assert_class_ptr_eq(&also, &exception, "non-value Exception arg");
-        assert_class_ptr_eq(&value, &pyobject, "bare Exception block input");
+        assert_class_ptr_eq(&value, &host_class, "bare Exception block input");
 
         let (extravar, _, _, value) =
             follow_one_raise(&ann, exception_instance(&ann, "IndexError"));
@@ -4989,7 +4989,7 @@ mod tests {
             "catch-all extravar stays SomeException, got {}",
             classdef_name(&extravar)
         );
-        assert_class_ptr_eq(&value, &pyobject, "catch-all block input");
+        assert_class_ptr_eq(&value, &host_class, "catch-all block input");
 
         let lone = SomeValue::Exception(SomeException::new(vec![Rc::clone(&index)]));
         let (extravar, _, _, value) = follow_one_raise(&ann, lone);
