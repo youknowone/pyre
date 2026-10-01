@@ -1784,6 +1784,27 @@ impl Box {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_ENCODE_HOOK: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run once after the next `_encode`. The recorder test uses this to
+/// publish a forwarded ConstPtr slot the way `walk_const_ptr_refs`
+/// would during the pool growth inside that encode.
+#[cfg(test)]
+pub(crate) fn set_after_encode_hook_for_test(hook: Option<fn()>) {
+    AFTER_ENCODE_HOOK.with(|cell| cell.set(hook));
+}
+
+#[cfg(test)]
+fn fire_after_encode_hook() {
+    let hook = AFTER_ENCODE_HOOK.with(|cell| cell.get());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// opencoder.py: Trace — compact trace recording buffer.
 ///
 /// Literal port of `rpython/jit/metainterp/opencoder.py::Trace`. The state
@@ -2325,7 +2346,7 @@ impl Trace {
     /// `ConstInt` further splits on the SMALL_INT range
     /// (opencoder.py vs 609-622).
     pub(crate) fn _encode(&mut self, b: Box) -> i64 {
-        match b {
+        let tagged = match b {
             // opencoder.py:605-608 ConstInt within SMALL_INT range.
             Box::ConstInt(v) if (SMALL_INT_START..SMALL_INT_STOP).contains(&v) => {
                 Self::_encode_smallint(v)
@@ -2338,7 +2359,13 @@ impl Trace {
             Box::ConstPtr(addr) => self._encode_ptr(addr),
             // opencoder.py:633-638 AbstractResOp.get_position().
             Box::ResOp(p) => Self::_encode_box_position(p),
-        }
+        };
+        // A pool push above can minor-collect. The test hook stands in
+        // for `walk_const_ptr_refs` updating a later ConstPtr slot
+        // before the next argument is resolved.
+        #[cfg(test)]
+        fire_after_encode_hook();
+        tagged
     }
 
     // ── Snapshot writers (opencoder.py _list_of_boxes) ──
@@ -3016,10 +3043,27 @@ impl Trace {
         argboxes: &[Box],
         descr: Option<&majit_ir::DescrRef>,
     ) -> u32 {
+        self.record_op_resolved(opcode, argboxes.len(), descr, |i| argboxes[i])
+    }
+
+    /// `record_op`, resolving one argument at a time.
+    ///
+    /// `Trace::record_bytes` reads each ConstPtr from `const_ptr_table`
+    /// immediately before `_encode`. An earlier argument can grow
+    /// `_refs`, `_bigints`, or `_floats` and minor-collect.
+    /// `live_const_indexes` forwards the table; a `Box::ConstPtr` built
+    /// before that collection still holds the from-space address.
+    pub(crate) fn record_op_resolved(
+        &mut self,
+        opcode: OpCode,
+        nargs: usize,
+        descr: Option<&majit_ir::DescrRef>,
+        mut resolve_arg: impl FnMut(usize) -> Box,
+    ) -> u32 {
         let pos = self._index;
-        let old_pos = self._op_start(opcode, argboxes.len());
-        for &b in argboxes {
-            let tagged = self._encode(b);
+        let old_pos = self._op_start(opcode, nargs);
+        for i in 0..nargs {
+            let tagged = self._encode(resolve_arg(i));
             self.append_int(tagged);
         }
         self._op_end_descr(opcode, descr, old_pos);

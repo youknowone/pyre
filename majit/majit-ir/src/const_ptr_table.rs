@@ -39,7 +39,8 @@ static WAVE: AtomicU32 = AtomicU32::new(0);
 
 /// Next id `Wave::enter` publishes. Separate from `WAVE` so dropping a
 /// guard can restore the enclosing wave without reusing an id `marks`
-/// still holds. `0` is never issued.
+/// still holds. `0` is never issued. After the counter wraps, the next
+/// id is published only once `marks` has been cleared.
 static NEXT_WAVE: AtomicU32 = AtomicU32::new(1);
 
 impl Table {
@@ -163,10 +164,11 @@ pub fn intern(addr: GcRef) -> u32 {
 
 /// Open a forwarding wave. A second trace of the same slot in this
 /// wave does not call the visitor. Drop restores the enclosing wave.
-/// The id itself comes from [`NEXT_WAVE`] and is not reused, so the
-/// next collection still traces slots this one marked. The collector
-/// holds one guard across a root walk so `drag_out_root` writes each
-/// live `ConstPtr.value` once.
+/// The id itself comes from [`NEXT_WAVE`]. A wrapping `u32` would
+/// reissue an old generation while `marks` still holds it, and
+/// [`claim_wave`] would skip that slot; the wrap path zeros `marks`
+/// before publishing the next id. The collector holds one guard across
+/// a root walk so `drag_out_root` writes each live `ConstPtr.value` once.
 pub struct Wave {
     prev: u32,
 }
@@ -174,15 +176,36 @@ pub struct Wave {
 impl Wave {
     pub fn enter() -> Self {
         let prev = WAVE.load(Ordering::Relaxed);
-        let mut next = NEXT_WAVE.fetch_add(1, Ordering::Relaxed);
-        if next == 0 {
-            next = NEXT_WAVE.fetch_add(1, Ordering::Relaxed);
-            if next == 0 {
-                next = 1;
-            }
-        }
+        let next = alloc_wave_id();
         WAVE.store(next, Ordering::Relaxed);
         Wave { prev }
+    }
+}
+
+/// Publish the next nonzero generation.
+///
+/// `0` stays reserved for "no wave". The id `u32::MAX` is issued once;
+/// the caller that then observes `0` clears `Table::marks` while holding
+/// the table lock, then stores `1`. `claim_wave` takes that same lock, so
+/// it cannot treat a reissued generation as already traced.
+fn alloc_wave_id() -> u32 {
+    loop {
+        let cur = NEXT_WAVE.load(Ordering::Relaxed);
+        if cur == 0 {
+            let mut guard = table();
+            if NEXT_WAVE.load(Ordering::Relaxed) == 0 {
+                guard.marks.fill(0);
+                NEXT_WAVE.store(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+        let new = cur.wrapping_add(1);
+        if NEXT_WAVE
+            .compare_exchange(cur, new, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return cur;
+        }
     }
 }
 
@@ -376,5 +399,31 @@ mod tests {
             });
         }
         assert_eq!(resolve(idx), GcRef(0x6E6A_ED90_0200));
+    }
+
+    #[test]
+    fn wrapped_wave_id_does_not_skip_a_slot_marked_with_that_generation() {
+        let _serial = TEST_SERIAL.lock();
+        let addr = GcRef(0x6E6A_ED90_0A01);
+        let idx = intern(addr);
+        {
+            let mut guard = table();
+            let slot = idx as usize;
+            if slot >= guard.marks.len() {
+                guard.marks.resize(slot + 1, 0);
+            }
+            // Generation 1 is the id the wrap path publishes next.
+            guard.marks[slot] = 1;
+        }
+        NEXT_WAVE.store(0, Ordering::Relaxed);
+        {
+            let _wave = Wave::enter();
+            let mut visited = false;
+            trace_index(idx, &mut |slot| {
+                assert_eq!(slot.0, addr.0);
+                visited = true;
+            });
+            assert!(visited);
+        }
     }
 }

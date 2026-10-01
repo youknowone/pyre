@@ -3102,6 +3102,13 @@ fn tuple_finish(
     let base = roots.publish(&[a, b]);
     roots.normalize(base, 2);
     if p >= 0 {
+        // `tupleobject.py _descr_eq` returns false at the first element
+        // `eq_w` rejects, and `descr_ne` is `negate(descr_eq)`. A second
+        // element compare would call `__ne__`. Ordering still asks the
+        // elements (`_compare_tuples`).
+        if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+            return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
+        }
         roots.set(base, unsafe { tuple_compare_getitem(roots.get(base), p) });
         roots.set(base + 1, unsafe {
             tuple_compare_getitem(roots.get(base + 1), p)
@@ -8125,6 +8132,37 @@ mod tests {
     fn assert_compare_bool(a: PyObjectRef, b: PyObjectRef, op: CompareOp, expected: bool) {
         let result = compare(a, b, op).unwrap();
         assert_eq!(unsafe { w_bool_get_value(result) }, expected);
+    }
+
+    #[test]
+    fn tuple_equality_does_not_call_element_ne_after_eq_rejects() {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile::compile_exec(
+            "class Cell:\n    \
+             def __eq__(self, other):\n        \
+             return False\n    \
+             def __ne__(self, other):\n        \
+             return False\n\
+             class Ord:\n    \
+             def __eq__(self, other):\n        \
+             return False\n    \
+             def __lt__(self, other):\n        \
+             return True\n\
+             ne = (Cell(), 1, 2) != (Cell(), 1, 2)\n\
+             eq = (Cell(), 1, 2) == (Cell(), 1, 2)\n\
+             ordered = (Ord(),) < (Ord(),)\n",
+        )
+        .expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame.execute_frame(None, None).expect("execute");
+        let globals = frame.get_w_globals();
+        let ne = unsafe { pyre_object::w_dict_getitem_str(globals, "ne") }.expect("ne");
+        let eq = unsafe { pyre_object::w_dict_getitem_str(globals, "eq") }.expect("eq");
+        let ordered =
+            unsafe { pyre_object::w_dict_getitem_str(globals, "ordered") }.expect("ordered");
+        assert!(unsafe { w_bool_get_value(ne) });
+        assert!(!unsafe { w_bool_get_value(eq) });
+        assert!(unsafe { w_bool_get_value(ordered) });
     }
 
     #[test]

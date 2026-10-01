@@ -1117,22 +1117,30 @@ impl HeapCache {
             .filter(|&c| c != 0)
     }
 
-    /// `ConstPtr` in a value slot is a [`majit_ir::const_ptr_table`] index.
-    /// `history.py` `ConstPtr.value` is written once per wave. This walk
-    /// traces value slots the cache still names. The index is not an
-    /// address.
+    /// `ConstPtr` in this cache is a [`majit_ir::const_ptr_table`] index.
+    /// `history.py` `ConstPtr.value` is written once per wave.
+    /// `trace_const_ptr` traces that index and does not write the
+    /// `OpRef`, so a sorted `VecMap` key stays put while the referent
+    /// stays live. A lookup with the same index still hits.
     ///
-    /// Value slots (`replaced_with_const`, `loopinvariant_result`,
-    /// `CacheEntry` field values) are the ones a cache hit emits. Keys
-    /// (`cache_anything`, `cache_seen_allocation`, `quasiimmut_seen_refs`)
-    /// stay as they are: rewriting a key would break sorted `VecMap`
-    /// order, and a stale key misses and repopulates.
+    /// Holders are the value slots (`replaced_with_const`,
+    /// `loopinvariant_result`, `CacheEntry` field values) and the
+    /// `cache_anything` / `cache_seen_allocation` keys. An older
+    /// constant can remain a key after `last_const_box` moves on.
+    ///
+    /// `quasiimmut_seen_refs` stores `ConstPtr.getref_base` addresses
+    /// (`heapcache.py` `new_ref_dict`). Those words are not indexes.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
             // The word is an index. This cache is a live holder.
             slot.trace_const_ptr(visitor);
         }
         fn forward_entry(entry: &mut CacheEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
+            for map in [&entry.cache_anything, &entry.cache_seen_allocation] {
+                for key in map.keys() {
+                    key.trace_const_ptr(visitor);
+                }
+            }
             for value in entry.cache_anything.values_mut() {
                 forward(value, visitor);
             }
@@ -2571,8 +2579,15 @@ mod tests {
         assert_eq!(cache.get_known_class(obj), Some(cls_val));
     }
 
+    /// `Wave` is process-global. These tests each enter one.
+    fn const_ptr_walk_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap()
+    }
+
     #[test]
     fn test_walk_const_ptr_refs_forwards_replaced_with_const() {
+        let _lock = const_ptr_walk_lock();
         // history.py `ConstPtr`: one box, `value` written once. The cache
         // keeps the index. `const_ptr_table::walk` forwards the address;
         // the heapcache walk must not move it a second time.
@@ -2601,30 +2616,35 @@ mod tests {
     }
 
     #[test]
-    fn test_walk_const_ptr_refs_leaves_cache_keys_stale() {
-        // Cache *keys* are indexes, not addresses. Rewriting one would
-        // break sorted-VecMap order. A stale key misses and the cache
-        // repopulates. The heapcache walk must leave the index in place,
-        // so a later intern of a different address is a different key.
+    fn test_walk_const_ptr_refs_traces_cache_keys_without_rekeying() {
+        let _lock = const_ptr_walk_lock();
+        // The key word is the table index. `trace_const_ptr` keeps the
+        // referent alive and does not rewrite the `VecMap` key, so the
+        // original `OpRef` still hits and another address is another key.
         let mut cache = HeapCache::new();
-        let const_obj = OpRef::const_ptr(GcRef(0x2000));
+        let const_obj = OpRef::const_ptr(GcRef(0x96_0CAC_E010));
+        let index = const_obj.const_ptr_index().unwrap();
         let field = 7;
-        // A non-const cached value so the walk leaves the value slot alone
-        // and the assertions isolate the key's address.
+        // A non-const cached value, so the visitor runs for the key.
         cache.getfield_now_known(const_obj, field, OpRef::ref_op(20), IDENTITY_ORACLE);
 
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
         cache.walk_const_ptr_refs(&mut |gcref: &mut GcRef| {
             gcref.0 = gcref.0.wrapping_add(0x1_0000);
         });
 
-        // The entry is still keyed by the original (pre-move) address...
+        assert_eq!(const_obj.const_ptr_index(), Some(index));
+        assert_eq!(const_obj.as_const_ptr(), Some(GcRef(0x96_0CAD_E010)));
         assert_eq!(
             cache.getfield_cached(const_obj, field, IDENTITY_ORACLE),
             Some(OpRef::ref_op(20))
         );
-        // ...and was NOT re-keyed to the forwarded address.
         assert_eq!(
-            cache.getfield_cached(OpRef::const_ptr(GcRef(0x1_2000)), field, IDENTITY_ORACLE),
+            cache.getfield_cached(
+                OpRef::const_ptr(GcRef(0x96_0CAD_E010)),
+                field,
+                IDENTITY_ORACLE
+            ),
             None
         );
     }

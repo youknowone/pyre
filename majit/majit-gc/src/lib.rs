@@ -1119,6 +1119,14 @@ pub trait GcAllocator: Send {
         obj_addr
     }
 
+    /// `id_or_identityhash` without allocating a shadow.
+    ///
+    /// A root walk already holds the collector. `MiniMarkGC` reads an
+    /// existing shadow or forwarding pointer. A stub returns `obj_addr`.
+    fn id_or_identityhash_reentrant(&self, obj_addr: usize) -> usize {
+        obj_addr
+    }
+
     /// `gc.py self.write_barrier_descr = WriteBarrierDescr(self)`:
     /// the descriptor for the write barrier check. Defaulting to `None` is
     /// `gc.py GcLLDescr_boehm.write_barrier_descr = None` — a collector
@@ -1921,6 +1929,9 @@ impl GcAllocator for GcHandle {
     }
     fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
         gc_sync::gc_op(|gc| gc.id_or_identityhash(obj_addr))
+    }
+    fn id_or_identityhash_reentrant(&self, obj_addr: usize) -> usize {
+        gc_sync::gc_query_reentrant(|gc| gc.id_or_identityhash_reentrant(obj_addr))
     }
     fn get_write_barrier_descr(&self) -> Option<WriteBarrierDescr> {
         gc_sync::gc_query_reentrant(|gc| gc.get_write_barrier_descr())

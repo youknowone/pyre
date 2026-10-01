@@ -948,7 +948,10 @@ fn bh_alloc_struct(sizedescr: &majit_jitcode::jitcode::BhDescr) -> *mut libc::c_
     // `MAJIT_GC_STRESS_TRACE_ALLOC`: a minor before the blackhole
     // materializes a struct, so a resume constant captured as an address
     // dies here instead of in a later collection.
-    if majit_gc::gc_stress_trace_alloc_enabled() && majit_gc::gc_sync::is_initialized() {
+    if majit_gc::gc_stress_trace_alloc_enabled()
+        && majit_gc::gc_sync::is_initialized()
+        && !majit_gc::gc_sync::in_gc_op()
+    {
         majit_gc::gc_sync::gc_op(|g| g.do_collect_nursery());
     }
     let size = sizedescr.as_size();

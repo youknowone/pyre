@@ -10516,6 +10516,10 @@ impl GcAllocator for MiniMarkGC {
         self.id_or_identityhash(obj_addr)
     }
 
+    fn id_or_identityhash_reentrant(&self, obj_addr: usize) -> usize {
+        MiniMarkGC::id_or_identityhash_reentrant(self, obj_addr)
+    }
+
     unsafe fn add_root(&mut self, root: *mut GcRef) {
         unsafe { self.roots.add(root) };
     }

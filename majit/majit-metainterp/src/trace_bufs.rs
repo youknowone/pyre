@@ -414,7 +414,19 @@ impl<T: Copy> WordArray<T> {
             "word array index {index} len {}",
             self.len
         );
+        // Same barrier as `push`. A `GCREF` store into an old or
+        // external array has to be remembered; `set` is the other
+        // store on this array.
+        self.write_barrier_if_rooted();
         unsafe { *self.item_ptr().add(index) = value };
+    }
+
+    fn write_barrier_if_rooted(&self) {
+        if self.gc_ptrs
+            && let Some(guard) = &self.root
+        {
+            majit_gc::gc_write_barrier(guard.get());
+        }
     }
 
     fn addr(&self) -> *mut u8 {
@@ -435,11 +447,7 @@ impl<T: Copy> WordArray<T> {
         if self.len == self.cap {
             return self.grow_push(value);
         }
-        if self.gc_ptrs
-            && let Some(guard) = &self.root
-        {
-            majit_gc::gc_write_barrier(guard.get());
-        }
+        self.write_barrier_if_rooted();
         unsafe { *self.item_ptr().add(self.len) = value };
         self.len += 1;
         value

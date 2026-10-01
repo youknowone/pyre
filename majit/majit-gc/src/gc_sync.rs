@@ -600,10 +600,11 @@ pub fn gc_op<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
 /// cannot rule out because both borrows belong to the same thread. Only the
 /// GIL holder can reach it, so one plain global replaces per-thread state.
 ///
-/// The flag stays in release builds. `dynasm_id_or_identityhash` and the
-/// cranelift twin read [`in_gc_op`] to pick `gc_query_reentrant` while a
-/// root walk already holds this `&mut`. The assert that rejects a nested
-/// `gc_op` stays debug-only.
+/// The flag stays in release builds. `dynasm_id_or_identityhash`,
+/// `id_or_identityhash_via_active_runtime`, and `wasm_id_or_identityhash`
+/// read [`in_gc_op`] to pick `gc_query_reentrant` while a root walk already
+/// holds this `&mut`. The assert that rejects a nested `gc_op` stays
+/// debug-only.
 struct ReentryGuard;
 
 static IN_GC_OP: AtomicBool = AtomicBool::new(false);

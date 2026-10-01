@@ -997,9 +997,13 @@ impl Trace {
         if self.trb.is_none() {
             panic!("record_bytes requires attach_byte_buffer");
         }
-        // Hold the indexes before any nursery growth. `arg_to_box`
-        // snapshots `ConstPtr.value` afterwards, so the collection
-        // inside `reserve_ops_bytes` has already forwarded the slots.
+        // Hold the indexes before any nursery growth. Reserving the
+        // opcode bytes and encoding an earlier argument can both
+        // minor-collect (`reserve_ops_bytes`, `WordArray::push` on
+        // `_refs` / `_bigints` / `_floats`). The walk forwards these
+        // slots. Resolve each ConstPtr in the encode loop, after the
+        // previous argument's encode, so a prebuilt `Box::ConstPtr`
+        // does not keep the from-space address.
         let held = self.hold_const_indexes(args);
         if let Some(fail) = fail_args {
             self.hold_const_indexes(fail);
@@ -1027,16 +1031,17 @@ impl Trace {
             .as_mut()
             .expect("record_bytes requires attach_byte_buffer")
             .reserve_ops_bytes(reserve);
-        // history.py record0/1/2/3 take the boxes inline. JUMP and
-        // other N-ary ops exceed that 0–3 surface; eight OcBoxes stay
-        // off the process allocator.
-        let boxes: smallvec::SmallVec<[OcBox; 8]> =
-            args.iter().copied().map(|a| self.arg_to_box(a)).collect();
-        let trb = self
-            .trb
-            .as_mut()
-            .expect("record_bytes requires attach_byte_buffer");
-        let box_index = trb.record_op(opcode, &boxes, descr.as_ref());
+        let num_inputs = self.inputargs.len();
+        let box_index = {
+            let unique_to_box = self.unique_to_box.as_slice();
+            let trb = self
+                .trb
+                .as_mut()
+                .expect("record_bytes requires attach_byte_buffer");
+            trb.record_op_resolved(opcode, args.len(), descr.as_ref(), |i| {
+                Self::arg_to_box_mapped(args[i], num_inputs, unique_to_box)
+            })
+        };
         if opcode.result_type() != Type::Void {
             if self.unique_to_box.len() <= unique as usize {
                 self.unique_to_box.resize(unique as usize + 1, u32::MAX);
@@ -2583,6 +2588,53 @@ mod tests {
         let first = rec.ops()[0].clone();
         let (_, ops) = rec.into_parts();
         assert!(OpRc::ptr_eq(&first, &ops[0]));
+    }
+
+    thread_local! {
+        static BUMP_LATER_CONST: std::cell::Cell<(u32, usize)> =
+            const { std::cell::Cell::new((0, 0)) };
+    }
+
+    fn bump_later_const_slot() {
+        let (index, addr) = BUMP_LATER_CONST.with(|cell| cell.get());
+        majit_ir::const_ptr_table::set_slot(index, GcRef(addr));
+        crate::opencoder::set_after_encode_hook_for_test(None);
+    }
+
+    /// An earlier argument's `_encode` can grow a trace pool and
+    /// minor-collect before a later ConstPtr is encoded. The table slot
+    /// moves; the address has to be read after that encode, not copied
+    /// into a `Box::ConstPtr` ahead of it.
+    #[test]
+    fn later_const_ptr_is_reresolved_after_an_earlier_encode() {
+        struct Restore {
+            index: u32,
+            addr: GcRef,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::opencoder::set_after_encode_hook_for_test(None);
+                majit_ir::const_ptr_table::set_slot(self.index, self.addr);
+            }
+        }
+
+        // Private sentinel. A small address collides with another test's
+        // slot in this process-lifetime table.
+        let original = GcRef(0x96E2_2000);
+        let forwarded = GcRef(0x96E2_3000);
+        let later = OpRef::const_ptr(original);
+        let index = later.const_ptr_index().expect("non-null const ptr");
+        let _restore = Restore {
+            index,
+            addr: original,
+        };
+        let mut rec = Trace::new();
+        rec.attach_byte_buffer(Arc::new(crate::MetaInterpStaticData::new()));
+        BUMP_LATER_CONST.with(|cell| cell.set((index, forwarded.0)));
+        crate::opencoder::set_after_encode_hook_for_test(Some(bump_later_const_slot));
+        rec.record_op(OpCode::PtrEq, &[OpRef::const_int(1), later]);
+        let stored = rec.trb.as_ref().expect("byte buffer").current_ref(1);
+        assert_eq!(stored, forwarded.0 as u64);
     }
 
     #[test]

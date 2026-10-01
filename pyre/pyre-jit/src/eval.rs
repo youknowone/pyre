@@ -14642,13 +14642,81 @@ fn value_to_vable_array_item_bits(
     }
 }
 
+/// Root every copied Ref in resume order before any slot is boxed.
+///
+/// `value_to_vable_array_item_bits` calls `w_int_new` when an earlier
+/// Ref-typed item is still an int. That can minor-collect before a later
+/// `RebuiltValue::Const` is passed to `push_vable_resume_slot`. The
+/// constant table is forwarded; the `resolved_vable` copy is not, unless
+/// this pass already published it. A fail-arg `RebuiltValue::Box` is left
+/// for the `raw_values` reload. An int that still has to be boxed has no
+/// referent yet, so it is not a root here.
+fn pin_copied_vable_refs(
+    resolved_vable: &[Value],
+    vable_values: &[majit_ir::resumedata::RebuiltValue],
+    vinfo: &majit_metainterp::virtualizable::VirtualizableInfo,
+    array_lengths: &[usize],
+    pinned_at: &mut Vec<(usize, usize)>,
+) {
+    let mut cursor = 1usize;
+    let mut box_index = 0usize;
+    for field in &vinfo.static_fields {
+        pin_one_copied_vable_ref(
+            &resolved_vable[cursor],
+            &vable_values[cursor],
+            field.field_type,
+            box_index,
+            pinned_at,
+        );
+        cursor += 1;
+        box_index += 1;
+    }
+    for (array_index, array_field) in vinfo.array_fields.iter().enumerate() {
+        for _item in 0..array_lengths[array_index] {
+            pin_one_copied_vable_ref(
+                &resolved_vable[cursor],
+                &vable_values[cursor],
+                array_field.item_type,
+                box_index,
+                pinned_at,
+            );
+            cursor += 1;
+            box_index += 1;
+        }
+    }
+    debug_assert_eq!(cursor, resolved_vable.len());
+}
+
+fn pin_one_copied_vable_ref(
+    value: &Value,
+    rebuilt: &majit_ir::resumedata::RebuiltValue,
+    ty: majit_ir::Type,
+    box_index: usize,
+    pinned_at: &mut Vec<(usize, usize)>,
+) {
+    if ty != majit_ir::Type::Ref {
+        return;
+    }
+    if let majit_ir::resumedata::RebuiltValue::Box(_, majit_ir::Type::Ref) = rebuilt {
+        return;
+    }
+    let Value::Ref(referent) = value else {
+        return;
+    };
+    if referent.is_null() {
+        return;
+    }
+    let depth = majit_gc::shadow_stack::push(*referent);
+    pinned_at.push((box_index, depth));
+}
+
 fn sync_virtualizable_after_guard_failure(
     resolved_vable: &[Value],
     vable_values: &[majit_ir::resumedata::RebuiltValue],
     raw_values: &[i64],
     frame_u8: *mut u8,
     vinfo: &majit_metainterp::virtualizable::VirtualizableInfo,
-) {
+) -> *mut PyFrame {
     // `value_to_vable_array_item_bits` calls `w_int_new` for a Ref field
     // whose resume value is still an int. That allocation can minor-collect
     // between the length read and `write_boxes`. `FrameAnchor` is the slot
@@ -14703,9 +14771,22 @@ fn sync_virtualizable_after_guard_failure(
     // `(box index, raw_values index)` for a Ref fail arg. Filled after the
     // allocating loop: `ConstPtr.getref_base` is the rooted slot.
     let mut ref_box_at: Vec<(usize, usize)> = Vec::new();
-    // `(box index, shadow-stack depth)` for an int/float just boxed by
-    // `w_int_new` / `w_float_new`. A later boxing moves the earlier object.
-    let mut fresh_at: Vec<(usize, usize)> = Vec::new();
+    // `(box index, shadow-stack depth)` for a Ref address copied into
+    // `boxes`. `pin_copied_vable_refs` roots those copies before the first
+    // `w_int_new`. A Ref created during the loop is pinned from
+    // `push_vable_resume_slot` instead. Fail-arg boxes are absent: they
+    // are re-read from `raw_values`.
+    let mut pinned_at: Vec<(usize, usize)> = Vec::new();
+    // Root copied Refs before the first `w_int_new`. An earlier Ref-typed
+    // array item can still be an int, and that allocation can minor-collect
+    // before a later `RebuiltValue::Const` reaches `push_vable_resume_slot`.
+    pin_copied_vable_refs(
+        resolved_vable,
+        vable_values,
+        vinfo,
+        &array_lengths,
+        &mut pinned_at,
+    );
     let mut cursor = 1;
     for (field_index, field) in vinfo.static_fields.iter().enumerate() {
         let bits =
@@ -14713,23 +14794,19 @@ fn sync_virtualizable_after_guard_failure(
         push_vable_resume_slot(
             &mut boxes,
             &mut ref_box_at,
-            &mut fresh_at,
+            &mut pinned_at,
             cursor,
             vable_values,
             field.field_type,
             bits,
-            false,
         );
         cursor += 1;
     }
     for (array_index, array_field) in vinfo.array_fields.iter().enumerate() {
         let array_len = array_lengths[array_index];
         for item_index in 0..array_len {
-            let value = &resolved_vable[cursor];
-            let allocated = array_field.item_type == majit_ir::Type::Ref
-                && matches!(value, Value::Int(_) | Value::Float(_));
             let bits = value_to_vable_array_item_bits(
-                value,
+                &resolved_vable[cursor],
                 array_field.item_type,
                 array_index,
                 item_index,
@@ -14737,12 +14814,11 @@ fn sync_virtualizable_after_guard_failure(
             push_vable_resume_slot(
                 &mut boxes,
                 &mut ref_box_at,
-                &mut fresh_at,
+                &mut pinned_at,
                 cursor,
                 vable_values,
                 array_field.item_type,
                 bits,
-                allocated,
             );
             cursor += 1;
         }
@@ -14751,35 +14827,37 @@ fn sync_virtualizable_after_guard_failure(
     for &(index, raw_idx) in &ref_box_at {
         boxes[index] = raw_values.get(raw_idx).copied().unwrap_or(0);
     }
-    for &(index, depth) in &fresh_at {
+    for &(index, depth) in &pinned_at {
         boxes[index] = majit_gc::shadow_stack::get(depth).0 as i64;
     }
-    let frame_u8 = anchor.live() as *mut u8;
-    boxes.push(frame_u8 as i64);
+    let live = anchor.live();
+    boxes.push(live as i64);
 
     unsafe {
-        vinfo.write_boxes(frame_u8, &boxes);
-        let frame = &mut *(frame_u8 as *mut PyFrame);
+        vinfo.write_boxes(live as *mut u8, &boxes);
+        let frame = &mut *live;
         frame.clear_stack_above(frame.valuestackdepth);
     }
     majit_gc::shadow_stack::try_pop_to(pin_base);
+    live
 }
 
 /// One virtualizable slot in `resume.py` `rebuild_from_resumedata` order.
 ///
 /// A Ref `RebuiltValue::Box` is recorded and filled afterwards from
-/// `raw_values` (`DeadFrameRefRoots` / `ConstPtr.getref_base`). An int or
-/// float boxed by `w_int_new` / `w_float_new` is pinned for the same reason:
-/// the next boxing can move it before `write_boxes`.
+/// `raw_values` (`DeadFrameRefRoots` / `ConstPtr.getref_base`). A copied
+/// Ref is already pinned by `pin_copied_vable_refs`; pinning `bits` again
+/// would publish the pre-move copy `value_to_vable_array_item_bits` still
+/// holds. A Ref created by `w_int_new` in this call did not exist for that
+/// pass, so it is pinned here.
 fn push_vable_resume_slot(
     boxes: &mut Vec<i64>,
     ref_box_at: &mut Vec<(usize, usize)>,
-    fresh_at: &mut Vec<(usize, usize)>,
+    pinned_at: &mut Vec<(usize, usize)>,
     cursor: usize,
     vable_values: &[majit_ir::resumedata::RebuiltValue],
     ty: majit_ir::Type,
     bits: i64,
-    allocated: bool,
 ) {
     let index = boxes.len();
     if ty == majit_ir::Type::Ref {
@@ -14790,9 +14868,9 @@ fn push_vable_resume_slot(
             boxes.push(0);
             return;
         }
-        if allocated {
+        if bits != 0 && !pinned_at.iter().any(|&(pinned, _)| pinned == index) {
             let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(bits as usize));
-            fresh_at.push((index, depth));
+            pinned_at.push((index, depth));
         }
     }
     boxes.push(bits);
@@ -14987,7 +15065,7 @@ fn build_resumed_frames(
         .unwrap_or(0);
 
     // virtualizable.py read_boxes: ALL static fields in declared order.
-    let vable_pycode: *const () = resolved_vable
+    let mut vable_pycode: *const () = resolved_vable
         .get(code_idx)
         .map(|v| match v {
             Value::Ref(r) => r.as_usize() as *const (),
@@ -15016,23 +15094,21 @@ fn build_resumed_frames(
         let vinfo = crate::eval::driver_pair().1.clone();
         match vable_mode {
             ResumeVableMode::GuardFailureSync => {
-                sync_virtualizable_after_guard_failure(
+                let live = sync_virtualizable_after_guard_failure(
                     &resolved_vable,
                     &vable_values,
                     raw_values,
                     frame_u8,
                     &vinfo,
                 );
+                // `FrameAnchor` is the slot the collector rewrites. `pycode`
+                // on that frame is the resume ref `write_boxes` just stored,
+                // not the pre-sync copy.
+                if !live.is_null() {
+                    vable_frame_ptr = live;
+                    vable_pycode = unsafe { (*live).pycode as *const () };
+                }
             }
-        }
-        // `w_int_new` inside the sync can move the frame. The collector
-        // rewrites the rooted fail arg (`ConstPtr.getref_base`), which is
-        // what the sections below read for pycode and globals.
-        if let Some(majit_ir::resumedata::RebuiltValue::Box(idx, majit_ir::Type::Ref)) =
-            vable_values.first()
-        {
-            vable_frame_ptr = raw_values.get(*idx).copied().unwrap_or(0)
-                as *mut pyre_interpreter::pyframe::PyFrame;
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -15790,6 +15866,115 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn const_ref_vable_slot_is_pinned_across_later_boxing() {
+        use majit_ir::resumedata::RebuiltValue;
+
+        struct PinGuard(usize);
+        impl Drop for PinGuard {
+            fn drop(&mut self) {
+                majit_gc::shadow_stack::try_pop_to(self.0);
+            }
+        }
+
+        let guard = PinGuard(majit_gc::shadow_stack::depth());
+        let vable = [
+            RebuiltValue::Unassigned,
+            // Already-resolved `Const::Ref`. The bits are the referent, not
+            // the table index `Const::to_value` read.
+            RebuiltValue::Const(majit_ir::Const::Ref(1)),
+            RebuiltValue::Box(3, majit_ir::Type::Ref),
+        ];
+        let mut boxes = Vec::new();
+        let mut ref_box_at = Vec::new();
+        let mut pinned_at = Vec::new();
+
+        super::push_vable_resume_slot(
+            &mut boxes,
+            &mut ref_box_at,
+            &mut pinned_at,
+            0,
+            &vable,
+            majit_ir::Type::Ref,
+            0,
+        );
+        assert!(pinned_at.is_empty(), "a null ref is not a root");
+        assert_eq!(boxes, vec![0]);
+
+        super::push_vable_resume_slot(
+            &mut boxes,
+            &mut ref_box_at,
+            &mut pinned_at,
+            1,
+            &vable,
+            majit_ir::Type::Ref,
+            0x1000,
+        );
+        assert!(ref_box_at.is_empty());
+        assert_eq!(pinned_at, vec![(1, guard.0)]);
+        assert_eq!(majit_gc::shadow_stack::get(guard.0).0, 0x1000);
+
+        super::push_vable_resume_slot(
+            &mut boxes,
+            &mut ref_box_at,
+            &mut pinned_at,
+            2,
+            &vable,
+            majit_ir::Type::Ref,
+            0x2000,
+        );
+        assert_eq!(ref_box_at, vec![(2, 3)]);
+        assert_eq!(pinned_at.len(), 1, "a fail-arg box is re-read, not pinned");
+        assert_eq!(boxes, vec![0, 0x1000, 0]);
+    }
+
+    /// An earlier Ref slot that is still an int is boxed by `w_int_new`
+    /// inside `value_to_vable_array_item_bits`. The later Const ref has to
+    /// already be a shadow root at that point; `push_vable_resume_slot`
+    /// only sees it afterwards.
+    #[test]
+    fn later_const_ref_is_pinned_before_an_earlier_int_is_boxed() {
+        use majit_ir::resumedata::RebuiltValue;
+        use majit_metainterp::virtualizable::VirtualizableInfo;
+
+        struct PinGuard(usize);
+        impl Drop for PinGuard {
+            fn drop(&mut self) {
+                majit_gc::shadow_stack::try_pop_to(self.0);
+            }
+        }
+
+        let guard = PinGuard(majit_gc::shadow_stack::depth());
+        let mut vinfo = VirtualizableInfo::new(0);
+        vinfo.add_field("pycode", Type::Ref, 0);
+        vinfo.add_array_field(
+            "items",
+            Type::Ref,
+            8,
+            0,
+            0,
+            majit_ir::descr::make_array_descr(0, std::mem::size_of::<usize>(), Type::Ref),
+        );
+        let vable = [
+            RebuiltValue::Unassigned,
+            RebuiltValue::Const(majit_ir::Const::Ref(0)),
+            RebuiltValue::Const(majit_ir::Const::Int(7)),
+            RebuiltValue::Const(majit_ir::Const::Ref(1)),
+            RebuiltValue::Box(4, Type::Ref),
+        ];
+        let resolved = [
+            Value::Int(0),
+            Value::Ref(majit_ir::GcRef::NULL),
+            Value::Int(7),
+            Value::Ref(majit_ir::GcRef(0xABC0)),
+            Value::Ref(majit_ir::GcRef(0x2000)),
+        ];
+        let mut pinned_at = Vec::new();
+        super::pin_copied_vable_refs(&resolved, &vable, &vinfo, &[3], &mut pinned_at);
+        assert_eq!(pinned_at, vec![(2, guard.0)]);
+        assert_eq!(majit_gc::shadow_stack::get(guard.0).0, 0xABC0);
+    }
 
     #[test]
     fn opcode_method_name_underscores_numeric_suffixes() {
