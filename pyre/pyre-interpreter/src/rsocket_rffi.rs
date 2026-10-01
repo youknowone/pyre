@@ -241,32 +241,17 @@ pub fn gai_strerror(code: libc::c_int) -> String {
 #[cfg(unix)]
 pub fn hostname() -> std::io::Result<std::ffi::OsString> {
     use std::os::unix::ffi::OsStringExt;
-    let mut buf = [0u8; 256];
-    if unsafe {
-        majit_rlib::_rsocket_rffi::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len())
-    } != 0
-    {
-        return Err(std::io::Error::from_raw_os_error(
-            majit_rlib::rposix::get_saved_errno(),
-        ));
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    Ok(std::ffi::OsString::from_vec(buf[..end].to_vec()))
+    majit_rlib::rsocket::gethostname()
+        .map(std::ffi::OsString::from_vec)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.errno))
 }
 
 /// `sethostname`. The name is the raw bytes the caller already encoded.
+/// The syscall is `rsocket.sethostname`.
 #[cfg(unix)]
 pub fn sethostname(name: &[u8]) -> std::io::Result<()> {
-    let rc = unsafe {
-        majit_rlib::_rsocket_rffi::sethostname(name.as_ptr() as *const libc::c_char, name.len())
-    };
-    if rc != 0 {
-        Err(std::io::Error::from_raw_os_error(
-            majit_rlib::rposix::get_saved_errno(),
-        ))
-    } else {
-        Ok(())
-    }
+    majit_rlib::rsocket::sethostname(name)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.errno))
 }
 #[cfg(all(windows, feature = "host_env"))]
 pub fn hostname() -> std::io::Result<std::ffi::OsString> {
@@ -282,8 +267,9 @@ pub fn hostname() -> std::io::Result<std::ffi::OsString> {
 /// name stands for, or `None` when the database does not name it.
 #[cfg(unix)]
 pub fn protocol_by_name(name: &std::ffi::CStr) -> Option<libc::c_int> {
-    let entry = unsafe { majit_rlib::_rsocket_rffi::getprotobyname(name.as_ptr()) };
-    (!entry.is_null()).then(|| unsafe { (*entry).p_proto })
+    majit_rlib::rsocket::getprotobyname(name)
+        .ok()
+        .and_then(|proto| libc::c_int::try_from(proto).ok())
 }
 #[cfg(windows)]
 pub fn protocol_by_name(name: &std::ffi::CStr) -> Option<libc::c_int> {
@@ -292,57 +278,28 @@ pub fn protocol_by_name(name: &std::ffi::CStr) -> Option<libc::c_int> {
     (!entry.is_null()).then(|| unsafe { (*entry).p_proto as libc::c_int })
 }
 
-/// `inet_aton` — the lenient dotted-quad parser, returning the four address
-/// bytes in network order.  WinSock has no `inet_aton`; `inet_addr` accepts
-/// the same spellings and reports failure as `INADDR_NONE`, which is the
-/// substitution `socketmodule.c socket_inet_aton` makes without one.
+/// `inet_aton` — four address bytes in network order. The body is
+/// `rsocket.inet_aton`.
 #[cfg(unix)]
 pub fn inet_aton(text: &std::ffi::CStr) -> Option<[u8; 4]> {
-    let mut addr: libc::in_addr = unsafe { core::mem::zeroed() };
-    (unsafe { majit_rlib::_rsocket_rffi::inet_aton(text.as_ptr(), &mut addr) } != 0)
-        .then(|| addr.s_addr.to_ne_bytes())
+    majit_rlib::rsocket::inet_aton(text).ok()
 }
 #[cfg(windows)]
 pub fn inet_aton(text: &std::ffi::CStr) -> Option<[u8; 4]> {
-    // `INADDR_NONE` is both the failure report and the broadcast address, so
-    // the one spelling that collides is answered before the call — the
-    // substitution `rsocket.py`'s own `inet_addr` fallback makes.
-    if text.to_bytes() == b"255.255.255.255" {
-        return Some([0xff; 4]);
-    }
     init();
-    let addr = unsafe { ws::inet_addr(text.as_ptr() as *const u8) };
-    (addr != win_c::INADDR_NONE).then(|| addr.to_ne_bytes())
+    majit_rlib::rsocket::inet_aton(text).ok()
 }
 
-/// `inet_ntoa` — the dotted-quad spelling of four address bytes in network
-/// order.
+/// `inet_ntoa` — the dotted-quad spelling of four address bytes. The body is
+/// `rsocket.inet_ntoa`.
 #[cfg(unix)]
 pub fn inet_ntoa(packed: [u8; 4]) -> Option<String> {
-    let addr = libc::in_addr {
-        s_addr: u32::from_ne_bytes(packed),
-    };
-    let text = unsafe { majit_rlib::_rsocket_rffi::inet_ntoa(addr) };
-    (!text.is_null()).then(|| {
-        unsafe { std::ffi::CStr::from_ptr(text) }
-            .to_string_lossy()
-            .into_owned()
-    })
+    majit_rlib::rsocket::inet_ntoa(&packed).ok()
 }
 #[cfg(windows)]
 pub fn inet_ntoa(packed: [u8; 4]) -> Option<String> {
     init();
-    let addr = ws::IN_ADDR {
-        S_un: ws::IN_ADDR_0 {
-            S_addr: u32::from_ne_bytes(packed),
-        },
-    };
-    let text = unsafe { ws::inet_ntoa(addr) };
-    (!text.is_null()).then(|| {
-        unsafe { std::ffi::CStr::from_ptr(text as *const libc::c_char) }
-            .to_string_lossy()
-            .into_owned()
-    })
+    majit_rlib::rsocket::inet_ntoa(&packed).ok()
 }
 
 // ── descriptor inheritance ──
@@ -995,40 +952,20 @@ pub enum PtonError {
 
 /// `inet_pton` over the buffer it fills, sized by the family it was given.
 pub fn pton(family: libc::c_int, text: &std::ffi::CStr) -> Result<Vec<u8>, PtonError> {
-    let mut buf = [0u8; 16];
-    let result = unsafe {
-        inet_pton(
-            family,
-            text.as_ptr(),
-            buf.as_mut_ptr() as *mut core::ffi::c_void,
-        )
-    };
-    if result < 0 {
-        return Err(PtonError::Family(last_error_code()));
+    #[cfg(windows)]
+    init();
+    match majit_rlib::rsocket::inet_pton(family, text) {
+        Ok(packed) => Ok(packed),
+        Err(majit_rlib::rsocket::PtonError::Family(code)) => Err(PtonError::Family(code)),
+        Err(majit_rlib::rsocket::PtonError::Address) => Err(PtonError::Address),
     }
-    if result != 1 {
-        return Err(PtonError::Address);
-    }
-    let width = if family == AF_INET { 4 } else { 16 };
-    Ok(buf[..width].to_vec())
 }
 
 /// `inet_ntop` over the text buffer it fills.
 pub fn ntop(family: libc::c_int, packed: &[u8]) -> Option<String> {
-    let mut buf = [0u8; 64];
-    let text = unsafe {
-        inet_ntop(
-            family,
-            packed.as_ptr() as *const core::ffi::c_void,
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len() as SockLen,
-        )
-    };
-    (!text.is_null()).then(|| {
-        unsafe { std::ffi::CStr::from_ptr(text) }
-            .to_string_lossy()
-            .into_owned()
-    })
+    #[cfg(windows)]
+    init();
+    majit_rlib::rsocket::inet_ntop(family, packed).ok()
 }
 
 // The legacy `<netdb.h>` resolvers.

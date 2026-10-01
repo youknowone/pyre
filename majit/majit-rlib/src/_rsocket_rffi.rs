@@ -5,7 +5,8 @@
 //! `socketpair`, `if_nameindex`). `recvmsg_implementation`,
 //! `sendmsg_implementation`, `CMSG_SPACE_wrapper` and `CMSG_LEN_wrapper`
 //! stay out: each one is a separate C source. Windows here is `FD_*`,
-//! `select`, and `_WSAGetLastError`.
+//! `select`, `getsockname`, `getsockopt`, the byte-order conversions,
+//! `inet_addr`, `inet_ntoa`, `inet_pton`, `inet_ntop`, and `_WSAGetLastError`.
 
 #![allow(non_snake_case, non_camel_case_types)]
 
@@ -18,7 +19,7 @@ unsafe extern "system" {
 
 #[cfg(unix)]
 mod posix {
-    use crate::rffi::{INT, RFFI_SAVE_ERRNO};
+    use crate::rffi::{INT, RFFI_SAVE_ERRNO, UINT, USHORT};
 
     // `_rsocket_rffi.eci` includes. Linux-only headers (`netpacket/packet.h`,
     // `linux/netlink.h`) stay out with the packet-socket slice.
@@ -213,6 +214,37 @@ mod posix {
         compilation_info = ECI,
         save_err = RFFI_SAVE_ERRNO,
         macro = libc::getsockopt
+    );
+    // `htons` / `ntohs` / `htonl` / `ntohl`. Darwin and OpenBSD publish
+    // these as macros; the libc crate exposes the same functions on every
+    // unix target.
+    crate::rffi::llexternal!(
+        pub htons = "htons",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        macro = libc::htons
+    );
+    crate::rffi::llexternal!(
+        pub ntohs = "ntohs",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        macro = libc::ntohs
+    );
+    crate::rffi::llexternal!(
+        pub htonl = "htonl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        macro = libc::htonl
+    );
+    crate::rffi::llexternal!(
+        pub ntohl = "ntohl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        macro = libc::ntohl
     );
     crate::rffi::llexternal!(
         pub socketsetsockopt = "setsockopt",
@@ -523,7 +555,7 @@ pub use posix::*;
 
 #[cfg(windows)]
 mod winsock {
-    use crate::rffi::{INT, RFFI_SAVE_WSALASTERROR};
+    use crate::rffi::{INT, RFFI_SAVE_WSALASTERROR, UINT, USHORT};
 
     /// WinSock `FD_SETSIZE`. `constants_w_defaults` uses 64 when the header
     /// does not override it, and the SDK default is 64.
@@ -545,6 +577,13 @@ mod winsock {
         pub tv_usec: std::ffi::c_long,
     }
 
+    /// `struct sockaddr` (`sockaddr`). `sa_family` is `ADDRESS_FAMILY`.
+    #[repr(C)]
+    pub struct sockaddr {
+        pub sa_family: u16,
+        pub sa_data: [i8; 14],
+    }
+
     pub type fd_set_p = *mut fd_set;
 
     /// `_rsocket_rffi.geterrno` on Windows (`rwin32.GetLastError_saved`).
@@ -555,7 +594,7 @@ mod winsock {
 
     crate::rffi::external_compilation_info! {
         const ECI = {
-            includes: ["winsock2.h"],
+            includes: ["winsock2.h", "ws2tcpip.h"],
             libraries: ["ws2_32"],
         };
     }
@@ -644,6 +683,97 @@ mod winsock {
         pub select = "select",
         [INT, fd_set_p, fd_set_p, fd_set_p, *mut timeval],
         INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    // `socketgetsockname` / `socketgetsockopt` (`external`, `save_err=SAVE_ERR`).
+    // The descriptor is `lltype.Unsigned` (`socketfd_type` on Windows).
+    crate::rffi::llexternal!(
+        pub socketgetsockname = "getsockname",
+        [usize, *mut sockaddr, *mut INT],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub socketgetsockopt = "getsockopt",
+        [usize, INT, INT, *mut core::ffi::c_void, *mut INT],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    // `htons` / `ntohs` / `htonl` / `ntohl` (`external`, not the Darwin macro).
+    crate::rffi::llexternal!(
+        pub htons = "htons",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub ntohs = "ntohs",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub htonl = "htonl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub ntohl = "ntohl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+
+    /// `struct in_addr`. `S_addr` is the first field of `S_un`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct in_addr {
+        pub s_addr: u32,
+    }
+
+    // `inet_addr` / `inet_ntoa`. Windows has no `inet_aton`.
+    crate::rffi::llexternal!(
+        pub inet_addr = "inet_addr",
+        [*const std::ffi::c_char],
+        UINT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub inet_ntoa = "inet_ntoa",
+        [in_addr],
+        *mut std::ffi::c_char,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+
+    /// `AF_INET` / `AF_INET6` in WinSock.
+    pub const AF_INET: INT = 2;
+    pub const AF_INET6: INT = 23;
+
+    crate::rffi::llexternal!(
+        pub inet_pton = "inet_pton",
+        [INT, *const std::ffi::c_char, *mut core::ffi::c_void],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub inet_ntop = "inet_ntop",
+        [INT, *const core::ffi::c_void, *mut std::ffi::c_char, usize],
+        *const std::ffi::c_char,
         compilation_info = ECI,
         calling_conv = "win",
         save_err = RFFI_SAVE_WSALASTERROR

@@ -4616,6 +4616,32 @@ fn lookup_const_i64(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) -> O
     constants.get(&opref.raw()).copied()
 }
 
+/// Constant tid from the `gen_initialize_tid` store that follows
+/// `CallMallocNursery`. The store's base is that malloc's result, its
+/// offset is `-GcHeader::SIZE` (the header sits at `free`), and its
+/// width is one machine word.
+fn following_nursery_tid(
+    malloc: &Op,
+    next: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<i64> {
+    if next.opcode != OpCode::GcStore || next.num_args() < 4 {
+        return None;
+    }
+    if next.arg(0).to_opref() != malloc.pos().get() {
+        return None;
+    }
+    let offset = lookup_const_i64(constants, next.arg(1).to_opref())?;
+    if offset != -(GcHeader::SIZE as i64) {
+        return None;
+    }
+    let width = lookup_const_i64(constants, next.arg(3).to_opref())?;
+    if width != std::mem::size_of::<usize>() as i64 {
+        return None;
+    }
+    lookup_const_i64(constants, next.arg(2).to_opref())
+}
+
 fn missing_legacy_constant(opref: OpRef, where_: &str) -> ! {
     panic!(
         "{where_}: legacy constant {:?} has no constants-pool entry; \
@@ -15960,8 +15986,15 @@ impl CraneliftBackend {
                         // (malloc_cond: MOV [nursery_free], edx; continue)
                         builder.switch_to_block(fast_block);
                         builder.seal_block(fast_block);
-                        // `gen_initialize_tid` writes the whole header word.
                         builder.ins().store(flags, new_free, nf_ptr, 0);
+                        // `gen_initialize_tid` writes this word at `free`.
+                        if op_idx + 1 < ops.len()
+                            && let Some(tid) =
+                                following_nursery_tid(&ops[op_idx], &ops[op_idx + 1], &constants)
+                        {
+                            let tid_val = builder.ins().iconst(cl_types::I64, tid);
+                            builder.ins().store(flags, tid_val, free, 0);
+                        }
                         let hdr_sz = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                         let obj = builder.ins().iadd(free, hdr_sz);
                         // Pass original values through block params
@@ -31955,6 +31988,15 @@ mod tests {
         assert!(!obj.is_null());
         assert_eq!(unsafe { (*header_of(obj.0)).type_id() }, 7);
         assert_eq!(unsafe { *(obj.0 as *const u64) }, 0xDEAD);
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            tid_store_address_op(&clif, 7, "load"),
+            "fast path must store tid 7 at nursery free:\n{clif}"
+        );
+        assert!(
+            tid_store_address_op(&clif, 7, "iadd"),
+            "GcStore of tid 7 must still run:\n{clif}"
+        );
     }
 
     #[test]
@@ -32018,6 +32060,147 @@ mod tests {
         assert_eq!(obj1.0, obj0.0 + 24);
         assert_eq!(unsafe { (*header_of(obj0.0)).type_id() }, 1);
         assert_eq!(unsafe { (*header_of(obj1.0)).type_id() }, 2);
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            tid_store_address_op(&clif, 1, "load"),
+            "fast path must store tid 1 at nursery free:\n{clif}"
+        );
+        assert!(
+            tid_store_address_op(&clif, 1, "iadd"),
+            "GcStore of tid 1 must still run:\n{clif}"
+        );
+        assert!(
+            !tid_store_address_op(&clif, 2, "load"),
+            "interior tid 2 is not written at nursery free:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn following_nursery_tid_reads_pool_and_inline_consts() {
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(10001, -8);
+        constants.insert(10002, 7);
+        constants.insert(10003, 8);
+        let malloc = mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0);
+        let pooled = mk_op(
+            OpCode::GcStore,
+            &[
+                OpRef::ref_op(0),
+                OpRef::int_op(10001),
+                OpRef::int_op(10002),
+                OpRef::int_op(10003),
+            ],
+            OpRef::NONE.raw(),
+        );
+        assert_eq!(
+            super::following_nursery_tid(&malloc, &pooled, &constants),
+            Some(7)
+        );
+
+        let inline = mk_op(
+            OpCode::GcStore,
+            &[
+                OpRef::ref_op(0),
+                OpRef::const_int(-(GcHeader::SIZE as i64)),
+                OpRef::const_int(9),
+                OpRef::const_int(std::mem::size_of::<usize>() as i64),
+            ],
+            OpRef::NONE.raw(),
+        );
+        assert_eq!(
+            super::following_nursery_tid(&malloc, &inline, &constants),
+            Some(9)
+        );
+
+        let wrong_base = mk_op(
+            OpCode::GcStore,
+            &[
+                OpRef::ref_op(1),
+                OpRef::int_op(10001),
+                OpRef::int_op(10002),
+                OpRef::int_op(10003),
+            ],
+            OpRef::NONE.raw(),
+        );
+        assert_eq!(
+            super::following_nursery_tid(&malloc, &wrong_base, &constants),
+            None
+        );
+    }
+
+    fn tid_store_address_op(clif: &str, tid: i64, addr_prefix: &str) -> bool {
+        let defs = clif_value_defs(clif);
+        let want = format!("iconst.i64 {tid}");
+        for line in clif.lines() {
+            let Some((val, addr)) = clif_store_operands(line) else {
+                continue;
+            };
+            if clif_def_head(&ultimate_clif_def(&defs, &val)) != want {
+                continue;
+            }
+            if clif_def_head(&ultimate_clif_def(&defs, &addr)).starts_with(addr_prefix) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn clif_value_defs(clif: &str) -> std::collections::HashMap<String, String> {
+        let mut defs = std::collections::HashMap::new();
+        for line in clif.lines() {
+            let t = line.trim().split("  ;").next().unwrap_or("").trim();
+            if let Some((lhs, rhs)) = t.split_once(" = ") {
+                if clif_is_value(lhs) {
+                    defs.insert(lhs.to_string(), rhs.to_string());
+                }
+            } else if let Some((lhs, rhs)) = t.split_once(" -> ")
+                && clif_is_value(lhs.trim())
+            {
+                defs.insert(lhs.trim().to_string(), format!("alias {}", rhs.trim()));
+            }
+        }
+        defs
+    }
+
+    fn clif_is_value(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars.next() == Some('v') && chars.all(|c| c.is_ascii_digit())
+    }
+
+    fn ultimate_clif_def(defs: &std::collections::HashMap<String, String>, name: &str) -> String {
+        let mut cur = name.to_string();
+        for _ in 0..32 {
+            match defs.get(&cur).map(String::as_str) {
+                Some(rhs) => {
+                    if let Some(next) = rhs.strip_prefix("alias ") {
+                        cur = next.trim().to_string();
+                    } else {
+                        return rhs.to_string();
+                    }
+                }
+                None => return String::new(),
+            }
+        }
+        String::new()
+    }
+
+    fn clif_def_head(def: &str) -> &str {
+        def.split("  ;").next().unwrap_or(def).trim()
+    }
+
+    fn clif_store_operands(line: &str) -> Option<(String, String)> {
+        let t = line.trim().split("  ;").next()?.trim();
+        let rest = t.strip_prefix("store")?;
+        let (before, addr) = rest.rsplit_once(',')?;
+        let val = before.split_whitespace().last()?.trim();
+        if !clif_is_value(val) {
+            return None;
+        }
+        let addr = addr.trim();
+        if addr.contains('+') || addr.contains('-') || !clif_is_value(addr) {
+            return None;
+        }
+        Some((val.to_string(), addr.to_string()))
     }
 
     #[test]
