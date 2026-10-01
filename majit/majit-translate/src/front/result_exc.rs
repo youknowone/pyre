@@ -10938,8 +10938,13 @@ mod merged_continue_tests {
     #[test]
     fn merged_continue_projects_literal_ok_and_rewrites_both_questions() {
         let (mut graph, results) = merged_question_mark();
-        let outcome = rewire_result_exc_call_sites(&mut graph, &results, true)
-            .expect("merged continue rewires");
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &results,
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("merged continue rewires");
         assert_eq!(outcome.diamonds, 1);
         assert_eq!(outcome.tail_forwards, 0);
         assert_eq!(outcome.rewrapped, 0);
@@ -11227,9 +11232,13 @@ mod merged_continue_tests {
             ),
         ];
 
-        let outcome =
-            rewire_result_exc_call_sites(&mut graph, &[(result, None, ValueType::Int)], true)
-                .expect("fused question behind restore hops rewires");
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &[(result, None, ValueType::Int)],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("fused question behind restore hops rewires");
         assert_eq!(outcome.diamonds, 1);
         assert_eq!(outcome.rewrapped, 0);
         assert_model_links(&graph);
@@ -11475,9 +11484,13 @@ mod merged_continue_tests {
         graph.set_goto(sib, cont, vec![sib_args[0].clone()]);
         graph.set_branch(entry, flag, call_b, vec![scope.clone()], sib, vec![scope]);
 
-        let outcome =
-            rewire_result_exc_call_sites(&mut graph, &[(result, None, ValueType::Void)], true)
-                .expect("shared ordinary join rewires");
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &[(result, None, ValueType::Void)],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("shared ordinary join rewires");
         assert_eq!(outcome.diamonds, 1);
         assert_eq!(outcome.rewrapped, 0);
         assert_model_links(&graph);
