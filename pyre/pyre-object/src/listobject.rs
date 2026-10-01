@@ -2828,6 +2828,24 @@ pub fn ll_list_obj_set_len(l: &mut W_ListObject, n: usize) {
     l.set_length_relaxed(n);
 }
 
+/// `ll_length` for BytesListStrategy. The length word sits at the same
+/// offset as `bytes_items`; the oopspec reads that word.
+#[majit_macros::oopspec("list.bytes_len(l)")]
+pub fn ll_list_bytes_length(l: &W_ListObject) -> usize {
+    l.bytes_items.len()
+}
+
+/// `ll_getitem_fast` for BytesListStrategy: the erased bytes payload at a
+/// known-in-bounds index. The oopspec is `getfield_gc_r(bytes_items.block)`
+/// plus `getarrayitem_gc_r`.
+#[majit_macros::oopspec("list.bytes_getitem(l, index)")]
+pub fn ll_list_bytes_getitem_fast(
+    l: &W_ListObject,
+    index: usize,
+) -> *const crate::bytesobject::BytesBlock {
+    l.bytes_items[index]
+}
+
 /// `ll_length` for AsciiListStrategy. The length word sits at the same
 /// offset as `ascii_items`; the oopspec reads that word.
 #[majit_macros::oopspec("list.ascii_len(l)")]
@@ -3001,9 +3019,9 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
             Some(w_float_new(ll_list_float_getitem_fast(list, idx)))
         }
         ListStrategy::Bytes => {
-            let len = list.bytes_items.len() as i64;
+            let len = ll_list_bytes_length(list) as i64;
             let idx = ll_getitem_index(index, len)?;
-            Some(w_bytes_from_block(list.bytes_items[idx]))
+            Some(w_bytes_from_block(ll_list_bytes_getitem_fast(list, idx)))
         }
         ListStrategy::Ascii => {
             let len = ll_list_ascii_length(list) as i64;

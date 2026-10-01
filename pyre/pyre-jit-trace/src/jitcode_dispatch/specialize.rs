@@ -6929,7 +6929,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     }
 
     // Gate: EXACT list, non-negative int index in bounds, object-, int-,
-    // float- or ascii-storage.  A bool index (`is_int` accepts `W_BoolObject`)
+    // float-, ascii- or bytes-storage.  A bool index (`is_int` accepts `W_BoolObject`)
     // is fine:
     // bool shares int's `intval`, so the walk unboxes it through `&BOOL_TYPE`.
     // A list SUBCLASS instance shares `ob_type == &LIST_TYPE`
@@ -6955,6 +6955,10 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
             0i64
         } else if pyre_object::listobject::w_list_uses_ascii_storage(list_obj) {
             pyre_object::listobject::ListStrategy::Ascii as i64
+        } else if pyre_object::listobject::w_list_strategy(list_obj)
+            == pyre_object::listobject::ListStrategy::Bytes
+        {
+            pyre_object::listobject::ListStrategy::Bytes as i64
         } else {
             // Empty-strategy list: no concrete element to read.
             return Ok(None);
