@@ -3215,6 +3215,39 @@ fn intern_wtf8_value_is_a_weak_managed_str() {
     assert!(pyre_object::unicodeobject::get_interned_wtf8(constant_text).is_some());
 }
 
+/// `setup_context` reads `frame.last_instr`. A compiled caller keeps that
+/// coordinate in the virtualizable until the consumer forces it, so
+/// `warnings.warn(..., stacklevel=2)` reports the call in the loop.
+#[test]
+fn warning_stacklevel_reads_the_compiled_caller_line() {
+    run_on_worker(
+        r#"
+import warnings
+import pypyjit
+pypyjit.set_param("threshold=1,function_threshold=1")
+
+def leaf():
+    warnings.warn("hot-line", stacklevel=2)
+
+def main():
+    i = 0
+    while i < 80:
+        leaf()
+        i = i + 1
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    main()
+
+assert len(caught) == 80
+assert caught[-1].lineno == 12
+"#,
+        "warn_lineno.py",
+        "warning stacklevel lineno",
+        "a compiled caller warning did not report the call line",
+    );
+}
+
 /// `f_generator_wref` is a strong edge to the WEAKREF box
 /// `initialize_as_generator` stores; `get_generator` dereferences its
 /// `weakptr`. Collecting must forward the box slot and let the collector
