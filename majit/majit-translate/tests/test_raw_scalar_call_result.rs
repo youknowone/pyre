@@ -15,7 +15,8 @@
 //! that parameter as `int`, and `Rvalue::Ref` aliases the pointee word.
 //! Two borrows of one place share that address. A mutable raw parameter
 //! copies the written word back into the borrowed place, including a
-//! field projection.
+//! field projection. A call that returns the spill address is not
+//! lowered: the free would run before the caller dereferences it.
 
 use majit_charon_reader::ullbc::NameSeg;
 use majit_charon_reader::{FunDecl, Llbc};
@@ -1267,4 +1268,75 @@ fn mut_borrow_of_struct_field_writes_the_word_back() {
         "field read, spill, call, reload, field write, free\n{}",
         op_lines(&graph)
     );
+}
+
+fn lower_returned_address() -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let borrowed = borrow_ty(&word, "Shared");
+    let ptr = raw_ptr(&word, "Const");
+    let borrow = place(2, &borrowed);
+    let fun = |id: u64, name: &[&str], inputs: Vec<Value>, output: &Value, body: Value| {
+        json!({
+            "def_id": id,
+            "item_meta": meta(name),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+            "body": body
+        })
+    };
+    let caller = fun(
+        0,
+        &["probe", "write_hash"],
+        vec![word.clone()],
+        &ptr,
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": 1, "locals": [
+            local(0, None, &ptr),
+            local(1, Some("word"), &word),
+            local(2, None, &borrowed),
+            local(3, None, &ptr)
+        ]}, "body": [
+            {"statements": [
+                {"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                    "place": place(1, &word), "kind": "Shared", "ptr_metadata": null
+                }}]}}
+            ], "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [{"Move": borrow}], "dest": place(3, &ptr)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ptr),
+                {"Use": [{"Copy": place(3, &ptr)}, "Yes"]}
+            ]}}], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}),
+    );
+    let sink = fun(
+        1,
+        &["probe", "sink_pair"],
+        vec![ptr.clone()],
+        &ptr,
+        json!("Opaque"),
+    );
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": [],
+            "fun_decls": [caller, sink],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    lower_function(&llbc, "write_hash")
+}
+
+#[test]
+fn returned_spill_address_is_not_lowered() {
+    let err = lower_returned_address().expect_err("a returned spill address must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
 }

@@ -57,6 +57,8 @@
 //!     `Ptr` is the address, not the pointee word. Aliases of one
 //!     place share that address. A mutable parameter writes the word
 //!     back into the place, including a field or element projection.
+//!     The spill is freed at the call. A result that is a pointer or
+//!     a reference is not lowered: that address would outlive the free.
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
 //!   - `Aggregate` — a named struct is its fields (`OptVirtualize.make_vstruct`):
@@ -10235,7 +10237,8 @@ impl<'a> Lowering<'a> {
     /// `&x` with `&y` stay two addresses). The malloc is
     /// `OpKind::RawMalloc` so `_rewrite_raw_malloc` emits the fixed-size
     /// residual; a direct call of `ll_raw_malloc_fixedsize` would look
-    /// inside the helper.
+    /// inside the helper. A pointer or reference result can be this
+    /// address, so the call is left unlowered instead of freeing it.
     fn install_raw_scalar_address_call(
         &mut self,
         mir_bb: usize,
@@ -10243,17 +10246,18 @@ impl<'a> Lowering<'a> {
         spills: &[RawScalarBorrowSpill],
         arg_locals: &[Option<usize>],
         resolved_args: &[Variable],
-    ) -> Vec<RawScalarReload> {
+        dest_ty: &TyRef,
+    ) -> Result<Vec<RawScalarReload>, LowerError> {
         if spills.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let fun_id = spills[0].fun_id;
         let groups = {
             let OpKind::Call { target, args, .. } = &*op_kind else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
             if !self.call_target_is_fun(target, fun_id) || args.len() != resolved_args.len() {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let mut groups: Vec<RawScalarAddressGroup> = Vec::new();
             for spill in spills {
@@ -10293,6 +10297,11 @@ impl<'a> Lowering<'a> {
             }
             groups
         };
+        if !groups.is_empty() && self.raw_scalar_spill_result_escapes(dest_ty) {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: raw scalar spill address would escape through the call result"
+            )));
+        }
         let bb_id = self.block_id[mir_bb];
         let mut reloads = Vec::new();
         let mut replacements = Vec::new();
@@ -10338,12 +10347,36 @@ impl<'a> Lowering<'a> {
             });
         }
         let OpKind::Call { args, .. } = op_kind else {
-            return reloads;
+            return Ok(reloads);
         };
         for (index, ptr) in replacements {
             args[index] = LinkArg::Value(ptr);
         }
-        reloads
+        Ok(reloads)
+    }
+
+    /// The spill is freed on this block. The call result is that address
+    /// when it is a raw pointer or a reference, including the `Ok` or
+    /// `Some` payload. `identity(&x) -> *const i64` would then deref a
+    /// freed allocation. A status word (`hash_out` returns `i64`) is not
+    /// this address.
+    fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
+        let mut ty = clone_tyref(ty);
+        for _ in 0..4 {
+            if tyref_is_raw_pointer(&ty, self.llbc) || output_type_is_ref(&ty, self.llbc) {
+                return true;
+            }
+            if let Some(ok) = crate::front::result_exc::tyref_result_ok(&ty, self.llbc) {
+                ty = ok;
+                continue;
+            }
+            if let Some(payload) = crate::front::result_exc::tyref_option_payload(&ty, self.llbc) {
+                ty = payload;
+                continue;
+            }
+            return false;
+        }
+        false
     }
 
     /// Place a borrow temporary names, after peeling `&mut *p`.
@@ -20758,7 +20791,8 @@ impl<'a> Lowering<'a> {
             &raw_scalar_spills,
             &arg_locals,
             &resolved_call_args,
-        );
+            &call.dest.ty,
+        )?;
         self.local_var[dest_local] = Some(result_var.clone());
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
