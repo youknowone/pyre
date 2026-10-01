@@ -3239,6 +3239,31 @@ mod tests {
     use std::collections::HashMap;
     use std::rc::Rc;
 
+    #[test]
+    fn failed_subject_restores_a_shared_listitem_merge() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = Rc::clone(&ann.bookkeeper);
+        let a = crate::annotator::listdef::ListDef::new(
+            Some(Rc::clone(&bk)),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            false,
+            false,
+        );
+        let b = crate::annotator::listdef::ListDef::new(
+            Some(bk),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+            false,
+        );
+        let before = a.listitem_rc().borrow().s_value.clone();
+        {
+            let _guard = ann.enter_added_blocks_scope();
+            a.union_with(&b).expect("merge");
+            assert_ne!(a.listitem_rc().borrow().s_value, before);
+        }
+        assert_eq!(a.listitem_rc().borrow().s_value, before);
+    }
+
     fn mk_graph(name: &str, n_args: usize) -> GraphRef {
         let inputs: Vec<Hlvalue> = (0..n_args)
             .map(|i| Hlvalue::Variable(Variable::named(format!("a{i}"))))
