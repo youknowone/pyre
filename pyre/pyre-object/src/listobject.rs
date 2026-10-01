@@ -5539,6 +5539,11 @@ pub unsafe fn w_list_install_int_items(obj: PyObjectRef, values: &[i64]) -> bool
     let list = &mut *(obj as *mut W_ListObject);
     list.int_items.reload_block(fresh_slot);
     publish_empty_list_strategy(obj_slot, ListStrategy::Integer);
+    // `list_extend_set` sizes `allocated` with `list_resize` before the
+    // items land. The snapshot arm does that in `w_list_resize_for_extend`.
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
+    list.sync_allocated(0);
     true
 }
 
@@ -5575,6 +5580,10 @@ pub unsafe fn w_list_install_bytes_items(
     fresh.reload_block(fresh_slot);
     let _ = W_ListObject::install_bytes_items(crate::gc_roots::shadow_stack_get(obj_slot), fresh);
     publish_empty_list_strategy(obj_slot, ListStrategy::Bytes);
+    // Same `list_resize` `allocated` as [`w_list_install_int_items`].
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
+    list.sync_allocated(0);
     true
 }
 
@@ -5622,6 +5631,10 @@ pub unsafe fn w_list_install_ascii_items(
     fresh.reload_block(fresh_slot);
     let _ = W_ListObject::install_ascii_items(crate::gc_roots::shadow_stack_get(base), fresh);
     publish_empty_list_strategy(base, ListStrategy::Ascii);
+    // Same `list_resize` `allocated` as [`w_list_install_int_items`].
+    let obj = crate::gc_roots::shadow_stack_get(base);
+    let list = &mut *(obj as *mut W_ListObject);
+    list.sync_allocated(0);
     true
 }
 
