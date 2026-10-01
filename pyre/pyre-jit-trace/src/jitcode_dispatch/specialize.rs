@@ -885,6 +885,30 @@ extern "C" fn jit_inline_frame_locals_proxy_new(
     pyre_interpreter::pyframe::frame_locals_proxy::new(frame)
 }
 
+/// The frame and its `locals_cells_stack_w` were both allocated in this trace,
+/// and `heapcache` still calls both current (`new` / `new_array`,
+/// `saw_allocation`).
+///
+/// Those flags die at `reset_keep_likely_virtuals`, so a residual between the
+/// allocation and this read declines.  While they hold, the array is the
+/// `NewArrayClear` this trace stored into the frame: nothing unpublished sits
+/// beside it.  A frame the trace did not allocate — the catching portal — keeps
+/// its except-bound name in the virtualizable, and `jit_force_virtualizable`
+/// is what publishes that name.
+fn frame_locals_heap_is_trace_allocation<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    frame: OpRef,
+) -> bool {
+    if frame.is_constant() || !ctx.trace_ctx.heap_cache().saw_allocation(frame) {
+        return false;
+    }
+    let index = crate::descr::pyframe_locals_cells_stack_descr().index();
+    let Some(array) = ctx.trace_ctx.heapcache_getfield_cached(frame, index) else {
+        return false;
+    };
+    !array.is_constant() && ctx.trace_ctx.heap_cache().saw_allocation(array)
+}
+
 /// Prove the receiving code object still owns its host `CodeObject`, the
 /// `require_code` check every code-field getter runs before reading a slot.
 fn walker_guard_code_ptr_present<Sym: WalkSym>(
@@ -2337,8 +2361,14 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
 
     // `f_locals` on a frame this trace still owns reads that frame's shadow
     // (portal virtualizable or the inline level's own slots), including a
-    // `Void` concrete half. A finished frame's heap array is authoritative.
-    // Anything else stays on the forcing getter.
+    // `Void` concrete half, and publishes it before the proxy exists.
+    // `receiver_trace_locals` is also `None` for a finished frame this trace
+    // allocated. `frame_locals_heap_is_trace_allocation` is that case:
+    // `fget_getdictscope` only allocates the proxy, because the array stores
+    // already in the trace are the locals. Any other optimized frame stays on
+    // `bh_load_attr_fn`, whose `jit_force_virtualizable` publishes the
+    // virtualizable — including an except-bound name the heap array does not
+    // hold yet.
     if name == "f_locals"
         && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
         && unsafe {
@@ -2354,13 +2384,16 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
             return Ok(None);
         }
-        let Some(source) = ctx.receiver_trace_locals(obj, concrete_addr) else {
+        let concrete_frame = if let Some(source) = ctx.receiver_trace_locals(obj, concrete_addr) {
+            walker_publish_complete_frame_locals(ctx, obj, concrete_addr, &source)
+                as pyre_object::PyObjectRef
+        } else if frame_locals_heap_is_trace_allocation(ctx, obj) {
+            concrete_obj
+        } else {
             return Ok(None);
         };
-        let concrete_obj = walker_publish_complete_frame_locals(ctx, obj, concrete_addr, &source)
-            as pyre_object::PyObjectRef;
-        let concrete_proxy = pyre_interpreter::pyframe::frame_locals_proxy::new(concrete_obj);
-        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        let concrete_proxy = pyre_interpreter::pyframe::frame_locals_proxy::new(concrete_frame);
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_frame, w_type, version_tag)?;
         let proxy = ctx.trace_ctx.call_ref_typed_with_effect(
             jit_inline_frame_locals_proxy_new as *const (),
             &[obj],
