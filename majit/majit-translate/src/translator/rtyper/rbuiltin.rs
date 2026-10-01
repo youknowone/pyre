@@ -143,7 +143,7 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///   * rbuiltin.py — `object.__init__` is trivial and landed.
 ///     `EnvironmentError.__init__` stores `errno` / `strerror` /
 ///     `filename` through `InstanceRepr::setfield`.
-///     `WindowsError.__init__` still needs its `winerror` store.
+///     `WindowsError.__init__` stores `winerror` the same way.
 ///   * rbuiltin.py — `objectmodel.hlinvoke` (PBC-callable
 ///     dispatch)
 ///   * rbuiltin.py — `range` / `xrange` / `enumerate`
@@ -1803,6 +1803,36 @@ pub fn rtype_builtin_reversed(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usiz
     Err(rbuiltin_deferred("rtype_builtin_reversed"))
 }
 
+/// The receiver of an exception `__init__` hop, as `InstanceRepr`.
+///
+/// `genop` refuses a raw `args_v` entry, so the self value is the
+/// `inputarg` identity conversion.
+fn hop_instance_self(
+    hop: &HighLevelOp,
+    what: &str,
+) -> Result<(std::sync::Arc<crate::translator::rtyper::rclass::InstanceRepr>, Hlvalue), TyperError>
+{
+    use crate::translator::rtyper::rclass::InstanceRepr;
+    use crate::translator::rtyper::rtyper::ConvertedTo;
+
+    if hop.nb_args() == 0 {
+        return Err(TyperError::message(format!("{what}: missing self")));
+    }
+    let r_any = hop.args_r.borrow()[0]
+        .clone()
+        .ok_or_else(|| TyperError::message(format!("{what}: missing self repr")))?;
+    let raw = std::sync::Arc::into_raw(r_any);
+    if unsafe { (*raw).type_id() } != std::any::TypeId::of::<InstanceRepr>() {
+        let _ = unsafe { std::sync::Arc::from_raw(raw) };
+        return Err(TyperError::message(format!(
+            "{what}: self is not an InstanceRepr"
+        )));
+    }
+    let r_self = unsafe { std::sync::Arc::from_raw(raw as *const () as *const InstanceRepr) };
+    let v_self = hop.inputarg(ConvertedTo::Repr(r_self.as_ref()), 0)?;
+    Ok((r_self, v_self))
+}
+
 /// RPython `@typer_for(EnvironmentError.__init__) def
 /// rtype_EnvironmentError__init__(hop)` (rbuiltin.py).
 ///
@@ -1829,30 +1859,11 @@ pub fn rtype_EnvironmentError__init__(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
-    use crate::translator::rtyper::rclass::InstanceRepr;
     use crate::translator::rtyper::rstr::string_repr;
     use crate::translator::rtyper::rtyper::ConvertedTo;
 
     hop.exception_cannot_occur()?;
-    if hop.nb_args() == 0 {
-        return Err(TyperError::message(
-            "rtype_EnvironmentError__init__: missing self",
-        ));
-    }
-    // `genop` refuses a raw `args_v` entry. `inputarg` is the identity
-    // conversion when the source repr is already this instance.
-    let r_any = hop.args_r.borrow()[0].clone().ok_or_else(|| {
-        TyperError::message("rtype_EnvironmentError__init__: missing self repr")
-    })?;
-    let raw = std::sync::Arc::into_raw(r_any);
-    if unsafe { (*raw).type_id() } != std::any::TypeId::of::<InstanceRepr>() {
-        let _ = unsafe { std::sync::Arc::from_raw(raw) };
-        return Err(TyperError::message(
-            "rtype_EnvironmentError__init__: self is not an InstanceRepr",
-        ));
-    }
-    let r_self = unsafe { std::sync::Arc::from_raw(raw as *const () as *const InstanceRepr) };
-    let v_self = hop.inputarg(ConvertedTo::Repr(r_self.as_ref()), 0)?;
+    let (r_self, v_self) = hop_instance_self(hop, "rtype_EnvironmentError__init__")?;
     let nb = hop.nb_args();
     let signed = LowLevelType::Signed;
     let (v_errno, v_strerror, v_filename) = if nb <= 2 {
@@ -1904,17 +1915,39 @@ pub fn rtype_EnvironmentError__init__(
 /// RPython conditional `@typer_for(WindowsError.__init__) def
 /// rtype_WindowsError__init__(hop)` (rbuiltin.py).
 ///
-/// CPython 3 removed `WindowsError` as a distinct builtin, but upstream
-/// still exposes this helper when running on hosts where the class exists.
-/// The concrete field writes need the same `InstanceRepr::setfield` work as
-/// `rtype_EnvironmentError__init__`, so keep the public parity hook explicit
-/// and deferred.
+/// ```python
+/// hop.exception_cannot_occur()
+/// if hop.nb_args == 2:
+///     raise TyperError("WindowsError() should not be called with "
+///                      "a single argument")
+/// if hop.nb_args >= 3:
+///     v_self = hop.args_v[0]
+///     r_self = hop.args_r[0]
+///     v_error = hop.inputarg(lltype.Signed, arg=1)
+///     r_self.setfield(v_self, 'winerror', v_error, hop.llops)
+/// ```
 #[allow(non_snake_case)]
 pub fn rtype_WindowsError__init__(
-    _hop: &HighLevelOp,
+    hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
-    Err(rbuiltin_deferred("rtype_WindowsError__init__"))
+    use crate::translator::rtyper::rtyper::ConvertedTo;
+
+    hop.exception_cannot_occur()?;
+    if hop.nb_args() == 2 {
+        return Err(TyperError::message(
+            "WindowsError() should not be called with a single argument",
+        ));
+    }
+    if hop.nb_args() >= 3 {
+        let (r_self, v_self) = hop_instance_self(hop, "rtype_WindowsError__init__")?;
+        let signed = LowLevelType::Signed;
+        let v_error = hop.inputarg(ConvertedTo::from(&signed), 1)?;
+        let flags = crate::translator::rtyper::rclass::Flags::new();
+        let mut llops = hop.llops.borrow_mut();
+        r_self.setfield(v_self, "winerror", v_error, &mut llops, false, &flags)?;
+    }
+    Ok(None)
 }
 
 /// RPython `def rtype_hlinvoke(hop)` (rbuiltin.py).
@@ -5187,11 +5220,83 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
+    fn rtype_WindowsError_init_stores_winerror_and_rejects_one_argument() {
+        use crate::annotator::classdesc::{Attribute, ClassDef};
+        use crate::annotator::model::{SomeInstance, SomeInteger};
+        use crate::flowspace::model::{Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let bare = dummy_hop();
+        bare.args_v
+            .borrow_mut()
+            .extend([Hlvalue::Variable(Variable::new()), Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(1),
+                LowLevelType::Signed,
+            ))]);
+        let err = rtype_WindowsError__init__(&bare, &HashMap::new()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("WindowsError() should not be called with a single argument"));
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let classdef = ClassDef::new_standalone("WindowsError", None);
+        let mut winerror = Attribute::new("winerror");
+        winerror.s_value = SomeValue::Integer(SomeInteger::new(false, false));
+        winerror.readonly = false;
+        classdef
+            .borrow_mut()
+            .attrs
+            .insert("winerror".to_string(), winerror);
+        let r_self = getinstancerepr(&hop.rtyper, Some(&classdef), Flavor::Gc).expect("repr");
+        Repr::setup(r_self.as_ref()).expect("setup");
+        let v_self = Variable::new();
+        v_self.set_concretetype(Some(r_self.lowleveltype().clone()));
+        let r_dyn: std::sync::Arc<dyn Repr> = r_self;
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_self),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(7),
+                LowLevelType::Signed,
+            )),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::ByteStr(b"disk".to_vec()),
+                LowLevelType::Void,
+            )),
+        ]);
+        hop.args_s.borrow_mut().push(SomeValue::Instance(SomeInstance::new(
+            Some(classdef),
+            false,
+            std::collections::BTreeMap::new(),
+        )));
+        hop.args_r.borrow_mut().push(Some(r_dyn));
+
+        rtype_WindowsError__init__(&hop, &HashMap::new()).expect("rtype");
+        let ops = hop.llops.borrow();
+        let store = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "setfield")
+            .expect("winerror setfield");
+        let Hlvalue::Constant(name) = &store.args[1] else {
+            panic!("field name must be a constant");
+        };
+        assert_eq!(name.value, ConstValue::ByteStr(b"inst_winerror".to_vec()));
+        let Hlvalue::Constant(code) = &store.args[2] else {
+            panic!("winerror must be a constant");
+        };
+        assert_eq!(code.value, ConstValue::Int(7));
+    }
+
+    #[test]
     fn deferred_rbuiltin_parity_surface_reports_missing_rtype_operation() {
         let hop = dummy_hop();
         let typers: &[(&str, BuiltinTyperFn)] = &[
             ("rtype_builtin_reversed", rtype_builtin_reversed),
-            ("rtype_WindowsError__init__", rtype_WindowsError__init__),
             ("rtype_hlinvoke", rtype_hlinvoke),
             ("rtype_dict_constructor", rtype_dict_constructor),
         ];
