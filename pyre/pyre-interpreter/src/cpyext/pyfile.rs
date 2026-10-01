@@ -90,8 +90,11 @@ fn finish_line(line: PyObjectRef, n: c_int) -> Result<PyObjectRef, crate::PyErro
     if text {
         Ok(unsafe { pyre_object::w_str_slice_codepoints(line, 0, 1, (length - 1) as i64) })
     } else {
+        // Copy before the managed allocation. `w_bytes_from_bytes` can
+        // collect, and `line` is not rooted across that call.
         let data = unsafe { pyre_object::w_bytes_data(line) };
-        Ok(pyre_object::w_bytes_from_bytes(&data[..length - 1]))
+        let stripped = data[..length - 1].to_vec();
+        Ok(pyre_object::w_bytes_from_bytes(&stripped))
     }
 }
 
