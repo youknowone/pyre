@@ -1220,6 +1220,7 @@ impl Arguments {
                 input_argcount,
                 &names_w,
                 &mut mapping,
+                self.jit_few_keywords,
             )?;
             if num_remainingkwds > 0 {
                 if !w_kwds.is_null() {
@@ -1235,6 +1236,7 @@ impl Arguments {
                         &values_w,
                         pyre_object::gc_roots::shadow_stack_get(kwds_slot),
                         &mapping,
+                        self.jit_few_keywords,
                     )?;
                 } else {
                     // argument.py:270-271 — ArgErrUnknownKwds.  PyPy's
@@ -1631,6 +1633,21 @@ impl From<crate::PyError> for MatchSignatureError {
 /// pypy/interpreter/argument.py `_match_keywords`.
 ///
 /// ```python
+/// `argument.py` `_match_keywords` is
+/// `@jit.look_inside_iff(lambda ... jiton: jiton)`. The flag is
+/// `Arguments._jit_few_keywords`.
+fn match_keywords_jiton(
+    _signature: &crate::gateway::Signature,
+    _blindargs: usize,
+    _co_posonlyargcount: usize,
+    _input_argcount: usize,
+    _keyword_names_w: &[PyObjectRef],
+    _kwds_mapping: &mut [isize],
+    jiton: bool,
+) -> bool {
+    jiton
+}
+
 /// def _match_keywords(space, signature, blindargs, co_posonlyargcount,
 ///                     input_argcount, keyword_names_w, kwds_mapping, _):
 ///     num_kwds = num_remainingkwds = len(keyword_names_w)
@@ -1657,6 +1674,7 @@ impl From<crate::PyError> for MatchSignatureError {
 ///         raise ArgErrPosonlyAsKwds(wrong_posonly)
 ///     return num_remainingkwds
 /// ```
+#[majit_macros::look_inside_iff(match_keywords_jiton)]
 pub fn match_keywords(
     signature: &crate::gateway::Signature,
     blindargs: usize,
@@ -1664,6 +1682,7 @@ pub fn match_keywords(
     input_argcount: usize,
     keyword_names_w: &[PyObjectRef],
     kwds_mapping: &mut [isize],
+    _jiton: bool,
 ) -> Result<usize, MatchSignatureError> {
     let num_kwds = keyword_names_w.len();
     let mut num_remainingkwds = num_kwds;
@@ -1724,6 +1743,18 @@ pub fn match_keywords(
 /// pypy/interpreter/argument.py `_collect_keyword_args`.
 ///
 /// ```python
+/// `argument.py` `_collect_keyword_args` is
+/// `@jit.look_inside_iff(lambda ... jiton: jiton)`.
+fn collect_keyword_args_jiton(
+    _keyword_names_w: &[PyObjectRef],
+    _keywords_w: &[PyObjectRef],
+    _w_kwds: PyObjectRef,
+    _kwds_mapping: &[isize],
+    jiton: bool,
+) -> bool {
+    jiton
+}
+
 /// def _collect_keyword_args(space, keyword_names_w, keywords_w, w_kwds,
 ///                           kwds_mapping, _):
 ///     for i in range(len(keyword_names_w)):
@@ -1739,11 +1770,13 @@ pub fn match_keywords(
 /// helper walks the kwarg names and forwards every name that did NOT
 /// match (i.e. did not appear in `kwds_mapping`) into the `**kwargs`
 /// dict via `setitem`.
+#[majit_macros::look_inside_iff(collect_keyword_args_jiton)]
 pub fn collect_keyword_args(
     keyword_names_w: &[PyObjectRef],
     keywords_w: &[PyObjectRef],
     w_kwds: PyObjectRef,
     kwds_mapping: &[isize],
+    _jiton: bool,
 ) -> Result<(), crate::PyError> {
     // Every `setitem` is a collection point, so the dictionary and the pairs it
     // forwards are published before the first one and read back at each turn.
@@ -2417,7 +2450,7 @@ mod tests {
         let sig = crate::gateway::Signature::new(vec!["a", "b"], None, None, 0, 0);
         let names = [pyre_object::w_str_new("b")];
         let mut mapping = vec![-1isize; 2];
-        let remaining = match_keywords(&sig, 0, 0, 0, &names, &mut mapping)
+        let remaining = match_keywords(&sig, 0, 0, 0, &names, &mut mapping, true)
             .expect("kwarg name match should succeed");
         assert_eq!(remaining, 0);
         assert_eq!(mapping, vec![-1, 0]); // 'b' is signature index 1, slot 1 (= 1 - input_argcount=0)
@@ -2430,7 +2463,7 @@ mod tests {
         let sig = crate::gateway::Signature::new(vec!["a", "b"], None, None, 0, 1);
         let names = [pyre_object::w_str_new("a")];
         let mut mapping = vec![-1isize; 2];
-        let err = match_keywords(&sig, 0, 1, 0, &names, &mut mapping)
+        let err = match_keywords(&sig, 0, 1, 0, &names, &mut mapping, true)
             .expect_err("posonly kwarg should raise");
         match err {
             MatchSignatureError::Shape(ArgErr::PosonlyAsKwds { posonly_kwds }) => {
