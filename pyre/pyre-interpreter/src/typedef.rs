@@ -3704,18 +3704,16 @@ fn call_index_method_slow(
     unsafe { crate::baseobjspace::get_and_call_function(method, obj, w_type, &[]) }
 }
 
-/// Exact bool/int/float from `__index__`.  Anything else is `space.float`,
-/// kept out of this graph the way `tuple_new_slow` keeps `__len__` out.
+/// `space.index` on the value `__index__` already returned, then `float`.
+/// A float or other non-int is `TypeError`, not `space.float`.
 fn index_result_as_float(obj: PyObjectRef) -> Result<f64, crate::PyError> {
+    let obj = crate::baseobjspace::normalize_index_result(obj)?;
     unsafe {
         if pyre_object::is_bool(obj) {
             return Ok(pyre_object::w_bool_get_value(obj) as i64 as f64);
         }
         if pyre_object::is_int(obj) && pyre_object::is_exact_builtin_instance(obj) {
             return Ok(pyre_object::w_int_get_value(obj) as f64);
-        }
-        if pyre_object::is_float(obj) {
-            return Ok(pyre_object::w_float_get_value(obj));
         }
     }
     index_result_as_float_slow(obj)

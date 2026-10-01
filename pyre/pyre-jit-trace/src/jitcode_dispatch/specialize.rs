@@ -2340,12 +2340,11 @@ fn try_descend_complex_part<Sym: WalkSym>(
         return Ok(None);
     };
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    walker_guard_class(
-        ctx,
-        op_pc,
-        obj,
-        &pyre_object::COMPLEX_TYPE as *const _ as i64,
-    )?;
+    // Admission is `isinstance`. The guard is this object's layout: a
+    // strict subclass carries `COMPLEX_USER_TYPE`, and `GuardClass` of the
+    // base vtable would fail on the instance that was just recorded.
+    let layout = unsafe { (*concrete_obj).ob_type as *const () as i64 };
+    walker_guard_class(ctx, op_pc, obj, layout)?;
     let array_descr = crate::state::pyobject_gcarray_descr();
     let len = ctx.trace_ctx.const_int(1);
     let args_array =
