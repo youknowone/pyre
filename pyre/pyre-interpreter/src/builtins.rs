@@ -21501,10 +21501,7 @@ fn fileio_get_closed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         .get(1)
         .copied()
         .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
-    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
-        return Ok(w_bool_from(fileio.closed()));
-    }
-    fileio_get_slot(args, "__file_closed__")
+    Ok(w_bool_from(file_is_closed(self_obj)))
 }
 
 fn fileio_get_closefd(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
