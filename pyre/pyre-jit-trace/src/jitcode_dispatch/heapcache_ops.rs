@@ -64,6 +64,27 @@ fn index_in_array_bounds<Sym: WalkSym>(
     }
 }
 
+/// Constant index into an array that carries no length word.
+///
+/// `index_in_array_bounds` reads `arraylen_sanity_load`, which declines a
+/// descr with no `lendescr` because `bh_arraylen_gc` has no offset to read.
+/// A fat pointer's data (`Box<[T]>`) is that shape: the length is the
+/// metadata word, and the bytes themselves have no header. The bounds
+/// proof then fails closed, `GETARRAYITEM_GC` is recorded with no value,
+/// and `opimpl_goto_if_not` has no int.
+///
+/// The length check exists to refuse a Ref bit-pattern in an Int register
+/// (`bh_getarrayitem_gc_r` SIGBUS, `test.test_dict` `items ^ items`). A
+/// constant index is not that bit-pattern, so `execute_with_descr` still
+/// runs the load.
+fn headerless_const_index(index: OpRef, index_value: i64, descr: &majit_ir::DescrRef) -> bool {
+    index_value >= 0
+        && index.is_constant()
+        && descr
+            .as_array_descr()
+            .is_some_and(|array| array.len_descr().is_none())
+}
+
 /// `getarrayitem_gc_<i|r|f>/rid>X` handler. Operand layout `rid>X`:
 /// 1B r-reg(array) + 1B i-reg(index) + 2B descr + 1B X-dst.
 ///
@@ -112,7 +133,8 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
             let array_ptr = array_ref.0 as i64;
             if array_ptr != 0
                 && array_ptr != usize::MAX as i64
-                && index_in_array_bounds(ctx, array_ptr, index_value, &descr)
+                && (index_in_array_bounds(ctx, array_ptr, index_value, &descr)
+                    || headerless_const_index(index, index_value, &descr))
             {
                 let folded =
                     match ctx
@@ -210,8 +232,13 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
             // register.  `bh_getarrayitem_gc_r` then SIGBUS
             // (`test.test_dict` `items ^ items`).  On wasm32 that
             // bit-pattern still fits `i32`, so prove `0 <= index < len`
-            // instead of a magnitude heuristic.
-            if index_in_array_bounds(ctx, array_ptr, index_value, &descr) {
+            // instead of a magnitude heuristic. A headerless array has no
+            // length word to prove against; `headerless_const_index`
+            // still allows the constant-index load `execute_with_descr`
+            // would have run.
+            if index_in_array_bounds(ctx, array_ptr, index_value, &descr)
+                || headerless_const_index(index, index_value, &descr)
+            {
                 ctx.trace_ctx
                     .array_sanity_load(array_ptr, index_value, &descr, ty)
             } else {

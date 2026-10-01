@@ -15159,6 +15159,148 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
     drop(storage);
 }
 
+/// Headerless `GETARRAYITEM_GC` (`Box<[T]>` data, no `lendescr`).
+///
+/// `arraylen_sanity_load` declines that descr, so `index_in_array_bounds`
+/// cannot prove the index. A constant index is still the load
+/// `execute_with_descr` runs. A non-constant index, even one whose Box
+/// value is a small int, stays unstamped: that is the Ref-bit-pattern
+/// case `bh_getarrayitem_gc_r` SIGBUS'd on.
+#[test]
+fn getarrayitem_gc_headerless_const_index_stamps_the_byte() {
+    let byte = *insns_opname_to_byte()
+        .get("getarrayitem_gc_i/rid>i")
+        .expect("`getarrayitem_gc_i/rid>i` must be in insns table");
+    let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+    let cpu = PureArrayTestCpu;
+    let storage: Box<[u8]> = Box::new([0x40, 0x01]);
+    let ptr = storage.as_ptr() as i64;
+    let descr = crate::descr::make_array_descr(0, 1, None, majit_ir::Type::Int, false);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+
+    let mut tc = fresh_trace_ctx();
+    tc.set_cpu(Some(&cpu));
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let mut regs_i = distinct_const_ints(&mut tc, 8);
+    regs_r[2] = tc.const_ref(ptr);
+    regs_i[3] = tc.const_int(0);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("headerless getarrayitem");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 6);
+    let dst = wc.registers_i.get(5).expect("int register in range");
+    assert!(
+        !dst.is_constant(),
+        "a non-pure getarrayitem records the load"
+    );
+    assert_eq!(
+        wc.trace_ctx.concrete_of_opref(dst),
+        Some(majit_ir::Value::Int(0x40))
+    );
+    assert_eq!(wc.trace_ctx.num_ops(), ops_before + 1);
+    drop(wc);
+    drop(storage);
+
+    let mut tc = fresh_trace_ctx();
+    tc.set_cpu(Some(&cpu));
+    let storage: Box<[u8]> = Box::new([0x40, 0x01]);
+    let ptr = storage.as_ptr() as i64;
+    let descr = crate::descr::make_array_descr(0, 1, None, majit_ir::Type::Int, false);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let mut regs_i = distinct_const_ints(&mut tc, 8);
+    regs_r[2] = tc.const_ref(ptr);
+    let idx = tc.record_op(
+        majit_ir::OpCode::IntAdd,
+        &[tc.const_int(0), tc.const_int(0)],
+    );
+    tc.set_opref_concrete(idx, majit_ir::Value::Int(0));
+    regs_i[3] = idx;
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    step(&code, 0, &mut wc).expect("non-const headerless getarrayitem");
+    let dst = wc.registers_i.get(5).expect("int register in range");
+    assert_eq!(
+        wc.trace_ctx.concrete_of_opref(dst),
+        None,
+        "a non-constant index into a headerless array stays unstamped"
+    );
+    drop(wc);
+    drop(storage);
+}
+
 #[test]
 fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
     // Pre-cache (array, index, descr) →
