@@ -4003,18 +4003,24 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     }
     let green_key =
         majit_ir::GreenKey::with_types(green_values.clone(), green_types.iter().copied());
-    // `if warmrunnerstate.inlining:` gates the inline and the assembler arm
-    // alike; with it off, `do_recursive_call(assembler_call=False)` runs.
-    if !driver.meta_interp_mut().warm_state_mut().inlining() {
+    // `_opimpl_recursive_call` reads `targetjitdriver_sd.warmstate`, not the
+    // driver that is currently tracing.
+    if !driver
+        .meta_interp_mut()
+        .warm_state_for_driver(jd_index)
+        .inlining()
+    {
         return Ok(None);
     }
+    // `memmgr.max_unroll_recursion` is the shared manager. An extra driver's
+    // warmstate is built with `MemoryManager::new(0)`.
     let max_unroll = driver
         .meta_interp_mut()
         .warm_state_mut()
         .max_unroll_recursion() as usize;
     let can_inline = driver
         .meta_interp_mut()
-        .warm_state_mut()
+        .warm_state_for_driver(jd_index)
         .can_inline_callable_for_key(&green_key);
     let portal_index = portal_mainjitcode_index(jd_index);
     // `for f in self.metainterp.framestack`: count the frames running the
@@ -4039,7 +4045,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     if can_inline && count >= max_unroll {
         driver
             .meta_interp_mut()
-            .warm_state_mut()
+            .warm_state_for_driver(jd_index)
             .disable_noninlinable_function_for_key(&green_key);
     }
     let inline = can_inline && count < max_unroll;
