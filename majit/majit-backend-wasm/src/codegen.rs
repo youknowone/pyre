@@ -1353,7 +1353,13 @@ fn emit_residual_trampoline_call(
     op_idx: usize,
     op: &Op,
     home: Option<u32>,
-) {
+) -> Result<(), BackendError> {
+    if call_args.len() > MAX_CALL_ARGS {
+        return Err(BackendError::Unsupported(format!(
+            "wasm codegen: residual call has {} arguments; the call area holds {MAX_CALL_ARGS}",
+            call_args.len()
+        )));
+    }
     emit_call_area_addr(sink);
     emit_resolve(sink, constants, value_types, func);
     sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
@@ -1377,6 +1383,7 @@ fn emit_residual_trampoline_call(
         }
         sink.local_set(value_types.local(vi));
     }
+    Ok(())
 }
 
 /// Emit a width-correct integer load. The element address (i32) must be on
@@ -8636,7 +8643,10 @@ fn build_function(
                     if result_ty.is_some() {
                         sink.drop();
                     }
-                } else if op.getdescr().is_some() {
+                } else if op.getdescr().is_some() && !cfg!(target_arch = "wasm32") {
+                    // js/jit_glue.js reads every argument as a low i32 and
+                    // writes an i32 result. A taken conditional call there
+                    // would drop its effect, so the web compiler declines.
                     let jit_call = jit_call_idx.expect("COND_CALL needs jit_call");
                     let arg_refs: Vec<OpRef> = call_args.iter().map(|arg| arg.to_opref()).collect();
                     emit_residual_trampoline_call(
@@ -8650,7 +8660,12 @@ fn build_function(
                         op_idx,
                         op,
                         None,
-                    );
+                    )?;
+                } else if cfg!(target_arch = "wasm32") {
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: COND_CALL has no web trampoline that preserves its signature"
+                            .into(),
+                    ));
                 } else {
                     return Err(BackendError::Unsupported(
                         "wasm codegen: COND_CALL has no call descr".into(),
@@ -8768,7 +8783,7 @@ fn build_function(
                     } else if result_ty.is_some() {
                         sink.drop();
                     }
-                } else if op.getdescr().is_some() {
+                } else if op.getdescr().is_some() && !cfg!(target_arch = "wasm32") {
                     let jit_call = jit_call_idx.expect("COND_CALL_VALUE needs jit_call");
                     let arg_refs: Vec<OpRef> = call_args.iter().map(|arg| arg.to_opref()).collect();
                     emit_residual_trampoline_call(
@@ -8782,7 +8797,12 @@ fn build_function(
                         op_idx,
                         op,
                         has_result.then_some(vi),
-                    );
+                    )?;
+                } else if cfg!(target_arch = "wasm32") {
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: COND_CALL_VALUE has no web trampoline that preserves its signature"
+                            .into(),
+                    ));
                 } else {
                     return Err(BackendError::Unsupported(
                         "wasm codegen: COND_CALL_VALUE has no call descr".into(),
@@ -10577,7 +10597,7 @@ fn build_function(
                         op_idx,
                         op,
                         home,
-                    );
+                    )?;
                     // Mirror the direct path: a trampoline residual call may force and collect.
                     read_real_errno(&mut sink);
                     if can_collect {
